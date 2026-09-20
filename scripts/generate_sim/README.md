@@ -140,20 +140,21 @@ kill instant of a `kill_index_replica` run.
 
 Aggregate request rps = `session_rps × (1 + t2_ratio)`; the local profiles
 compress time 10× (`decode_base_ms` 4.3, `prefill_tps` 80000 → ~8.9 s mean
-lifetime; `prefill_chunk` 320 keeps one step's prefill under one decode
-step, since the engine's step time is max(prefill chunk, decode) — a
-larger chunk stretches every decode step while any prompt is prefilling) and bodies 10× (`image_bytes` 62000) together, per the design doc.
+lifetime, `prefill_chunk` 320) and bodies 10× (`image_bytes` 62000)
+together, per the design doc.
 
 ## Mock engine fidelity notes
 
 Two properties of `crates/mock_worker`'s realistic engine decide whether a
 cache-aware result means anything, and both are set by this harness:
 
-- `prefill_chunk` 320 (see the compression note below): the engine's step
+- `prefill_chunk` 320 (see the compression note above): the engine's step
   time is max(prefill chunk, decode step), so a large chunk stretches every
   decode step while any prompt is prefilling.
 - Reported usage is the running requests' pinned tokens, not physical KV
-  occupancy (SGLang's definition: used = total − available − evictable). A
+  occupancy (used = total − available − evictable). A block several running
+  requests share is pinned once, so a batch behind one system prefix does
+  not report it once per holder. A
   warm radix cache keeps KV physically full; reporting that as usage tripped
   the gateway's `--worker-overload-token-usage 0.9` gate on every warm
   worker and made cache-aware routing avoid the workers holding the

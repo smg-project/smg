@@ -264,16 +264,42 @@ class DrillValidation(unittest.TestCase):
             {"kill_index_replica": {"at_secs": 1}},  # no index_service to kill
             {"index_service": {"replicas": 2}, "partition_drill": {"at_secs": 1}},
             {"index_service": {"replicas": 2, "deferred_replicas": [0]}},
+            # Naming a replica outside the fleet, for each of the three
+            # drills that take one.
+            {"index_service": {"replicas": 2}, "kill_index_replica": {"at_secs": 1, "replica": 5}},
+            {"index_service": {"replicas": 2}, "flap_index_replica": {"at_secs": 1, "replica": 2}},
+            {"index_service": {"replicas": 2}, "hang_index_replica": {"at_secs": 1, "replica": -1}},
+            # Starting a replica that was never deferred.
+            {
+                "index_service": {"replicas": 2, "deferred_replicas": [1]},
+                "start_deferred_replica": {"at_secs": 1, "replica": 0},
+            },
         ]:
             with self.assertRaises(SystemExit, msg=str(bad)):
                 sim.validate_profile(bad)
-        sim.validate_profile(
+        for good in [
             {
                 "index_service": {"replicas": 2, "partitionable": True},
                 "partition_drill": {"at_secs": 1, "heal_after_secs": 1},
-            }
-        )
-        sim.validate_profile({"restart_smgs_at_secs": 60})
+            },
+            {"restart_smgs_at_secs": 60},
+            {"index_service": {"replicas": 2}, "kill_index_replica": {"at_secs": 1, "replica": 1}},
+            {
+                "index_service": {"replicas": 3, "deferred_replicas": [2]},
+                "start_deferred_replica": {"at_secs": 1, "replica": 2},
+            },
+        ]:
+            sim.validate_profile(good)
+
+    def test_the_bounds_check_guards_the_replica_the_drill_would_pick(self):
+        # Validation and the drills must agree on which replica an
+        # unspecified `replica` means, or a one-replica fleet passes the
+        # check and then the drill reaches for a replica that is not there.
+        self.assertEqual(sim.DEFAULT_DRILL_REPLICA, 1)
+        with self.assertRaises(SystemExit):
+            sim.validate_profile(
+                {"index_service": {"replicas": 1}, "kill_index_replica": {"at_secs": 1}}
+            )
 
     def test_every_committed_scenario_leg_validates(self):
         # Every leg's knobs must be ones the harness implements, so no

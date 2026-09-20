@@ -121,6 +121,11 @@ SUPPORTED_DRILLS = {
     "gateway_partition_drill",
 }
 DRILL_KEY_RE = re.compile(r"(_drill|_replica|_at_secs)$")
+# Which replica a per-replica drill picks when the profile does not say.
+# Validation and the drills themselves read the same name, so a change
+# here cannot leave the bounds check guarding a different replica than
+# the one the drill would act on.
+DEFAULT_DRILL_REPLICA = 1
 
 
 # ---- small helpers ----------------------------------------------------------
@@ -251,7 +256,7 @@ def validate_profile(profile):
         deferred = {int(r) for r in index_cfg.get("deferred_replicas") or []}
         for key in ("kill_index_replica", "flap_index_replica", "hang_index_replica"):
             cfg = profile.get(key) or {}
-            if cfg and not 0 <= int(cfg.get("replica", 1)) < replicas:
+            if cfg and not 0 <= int(cfg.get("replica", DEFAULT_DRILL_REPLICA)) < replicas:
                 problems.append(f"{key}.replica must be < index_service.replicas ({replicas})")
         cfg = profile.get("start_deferred_replica") or {}
         if cfg and int(cfg.get("replica", -1)) not in deferred:
@@ -746,12 +751,16 @@ def register_workers(profile, worker_ports=None, smg_ports=None):
     return registered
 
 
-def wait_ready(profile):
+def wait_ready(profile, stop=None):
     """Gate on every SMG reporting >= readiness_fraction of the fleet.
 
     A timeout FAILS the run: a report over a fleet that was never fully
     routable would describe a topology that did not exist (imbalance
     divides by workers_total, cache hit depends on the reachable set).
+
+    A caller on a background thread passes `stop` so the wait ends as
+    soon as the run is torn down, rather than polling gateways that are
+    already gone for the rest of the timeout.
     """
     total = int(profile["workers_total"])
     need = max(1, int(total * float(profile.get("readiness_fraction", 0.99))))
@@ -761,6 +770,8 @@ def wait_ready(profile):
     counts = {port: 0 for port in smg_ports}
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if stop is not None and stop.is_set():
+            raise RuntimeError("readiness wait cancelled: the run ended first")
         for port in smg_ports:
             try:
                 body = http_get(f"http://127.0.0.1:{port}/workers", timeout=60)
@@ -770,7 +781,10 @@ def wait_ready(profile):
         if all(n >= need for n in counts.values()):
             log("    ready: " + " ".join(f"{p}:{counts[p]}" for p in smg_ports))
             return counts
-        time.sleep(2)
+        if stop is None:
+            time.sleep(2)
+        else:
+            stop.wait(2)
     seen = " ".join(f"{p}:{counts[p]}" for p in smg_ports)
     raise RuntimeError(f"readiness timeout: need >= {need}/{total} workers per SMG, got {seen}")
 
@@ -1625,7 +1639,7 @@ class Drills:
         return epoch_ms()
 
     def _kill_index_replica(self, cfg):
-        replica = int(cfg.get("replica", 1))
+        replica = int(cfg.get("replica", DEFAULT_DRILL_REPLICA))
         if not self._sleep(cfg.get("at_secs", 60)):
             return
         log(f"drill: killing index-{replica}")
@@ -1637,7 +1651,7 @@ class Drills:
             self.meta["index_relaunched_at_ms"] = self._relaunch(replica, "-relaunch")
 
     def _flap_index_replica(self, cfg):
-        replica = int(cfg.get("replica", 1))
+        replica = int(cfg.get("replica", DEFAULT_DRILL_REPLICA))
         cycles = int(cfg.get("cycles", 3))
         period = float(cfg.get("period_secs", 20))
         if not self._sleep(cfg.get("at_secs", 45)):
@@ -1655,7 +1669,7 @@ class Drills:
         self.meta["index_flap_replica"] = replica
 
     def _hang_index_replica(self, cfg):
-        replica = int(cfg.get("replica", 1))
+        replica = int(cfg.get("replica", DEFAULT_DRILL_REPLICA))
         if not self._sleep(cfg.get("at_secs", 60)):
             return
         victims = self._live_replica(replica)
@@ -2052,6 +2066,7 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
     stop = threading.Event()
     sampler = None
     drills = None
+    restart_thread = None
     try:
         children += launch_mocks(profile, logs_dir, mock_bin)
         index_children, proxies = launch_index_service(profile, logs_dir, index_bin, bridge_bin)
@@ -2144,18 +2159,22 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
                             return
                         children.extend(new_smgs)
                     register_workers(profile)
+                    # The sampler reads this list each tick, so point it at
+                    # the new processes before the gate below: if the gate
+                    # fails it would otherwise spend the rest of the run
+                    # sampling pids that no longer exist.
+                    smg_pids[:] = [c["proc"].pid for c in new_smgs]
+                    meta["restarted_at_secs"] = restart_at
                     # Re-gate readiness: registration only waits for the
                     # POSTs, not for readiness_fraction, and metrics over a
                     # partial relaunched fleet would read as measured.
-                    meta["restart_ready"] = wait_ready(profile)
-                    # The sampler reads this list each tick; swap in the new pids.
-                    smg_pids[:] = [c["proc"].pid for c in new_smgs]
-                    meta["restarted_at_secs"] = restart_at
+                    meta["restart_ready"] = wait_ready(profile, stop)
                 except Exception as e:  # noqa: BLE001 — the outcome IS the result
                     log(f"WARN: SMG restart drill failed: {e!r}")
                     meta["restart_error"] = repr(e)
 
-            threading.Thread(target=_restart_smgs, daemon=True).start()
+            restart_thread = threading.Thread(target=_restart_smgs, daemon=True)
+            restart_thread.start()
         try:
             meta["loadgen_exit"] = loadgen["proc"].wait(timeout=duration * 3 + 300)
         except subprocess.TimeoutExpired:
@@ -2168,6 +2187,12 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
             sampler.join(timeout=30)
         if drills is not None:
             drills.join(timeout=10)
+        if restart_thread is not None:
+            # This one writes into `meta` too, so it has to be finished
+            # before anything below reads or dumps it.
+            restart_thread.join(timeout=30)
+            if restart_thread.is_alive():
+                meta["restart_error"] = "restart drill still running at teardown"
         if wants_index and (profile.get("index_service") or {}).get("dump_on_exit"):
             # Consistency audit before the replicas go away: pull every live
             # replica and diff their per-holder block sets.
@@ -2198,6 +2223,14 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
         raise SystemExit(
             f"loadgen exited {meta['loadgen_exit']}; the run is not usable "
             f"(see {run_dir / 'logs' / 'loadgen.log'})"
+        )
+    if meta.get("restart_error"):
+        # Same rule as above. The fleet never came back to the readiness
+        # the run was gated on, so every headline number spans a window
+        # in which part of it was unroutable.
+        raise SystemExit(
+            f"the gateway restart drill did not complete ({meta['restart_error']}); "
+            f"the run is not usable (see {run_dir / 'logs'})"
         )
     log(f"report: {run_dir / 'report.md'}")
     return run_dir
