@@ -95,7 +95,8 @@ drill records epoch-ms timestamps of what it did in `meta.json` (surfaced in
 instead of dying silently. Any key that looks like a drill but is not one of
 these fails the run at start — as does a drill scheduled at or past
 `duration_secs`, which would never fire — so a leg can never silently
-measure nothing.
+measure nothing. A start time of `0` is a real schedule, meaning fire as
+the run starts; leave the key out to skip the drill.
 
 | key | shape | effect |
 |---|---|---|

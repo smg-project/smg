@@ -381,6 +381,40 @@ class DrillValidation(unittest.TestCase):
         )
         self.assertEqual([k for k in meta if k.endswith("_error")], [])
 
+    def test_a_drill_at_the_start_of_the_run_is_a_schedule_not_an_absence(self):
+        # Reading "configured" off falsiness dropped a bare `0` on the floor:
+        # it cleared the timing check by looking unset and then never fired,
+        # while the same time written inside a config block did fire. Both
+        # shapes now go through one rule, so the two sides cannot disagree.
+        self.assertTrue(sim.drill_is_configured(0))
+        self.assertTrue(sim.drill_is_configured({"at_secs": 0}))
+        self.assertFalse(sim.drill_is_configured(None))
+        self.assertFalse(sim.drill_is_configured({}))
+
+        sim.validate_profile({"duration_secs": 60, "restart_smgs_at_secs": 0})
+        profile = {
+            "duration_secs": 60,
+            "index_service": {"replicas": 2},
+            "kill_index_replica": {"at_secs": 0, "replica": 1},
+        }
+        sim.validate_profile(profile)
+        meta = {}
+        drills = sim.Drills(
+            profile,
+            meta,
+            [],
+            threading.Lock(),
+            threading.Event(),
+            Path("/tmp"),
+            "index-bin",
+            [object() for _ in range(5)],
+        )
+        slept = []
+        drills._sleep = lambda secs: bool(slept.append(float(secs)))
+        drills.start_all()
+        drills.join(timeout=10)
+        self.assertEqual(slept, [0.0], "a drill set to fire at the start still runs")
+
     def test_every_committed_scenario_leg_validates(self):
         # Every leg's knobs must be ones the harness implements, so no
         # scenario can produce a comparison with no independent variable.

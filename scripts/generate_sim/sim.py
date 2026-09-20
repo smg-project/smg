@@ -222,6 +222,14 @@ def parse_override_arg(raw):
         return key, val
 
 
+def drill_is_configured(cfg):
+    """Whether `cfg` schedules a drill. `0` is a schedule — fire as the run
+    starts — so absence has to be spelled out rather than read off falsiness.
+    Validation and the launchers share this so a profile cannot clear the
+    timing check and then be skipped, or vice versa."""
+    return cfg is not None and cfg != {}
+
+
 def drill_at_secs(key, cfg):
     """How many seconds into the run drill `key` fires. `restart_smgs_at_secs`
     IS that number; every other drill carries it in its config block."""
@@ -286,7 +294,7 @@ def validate_profile(profile):
     if duration is not None:
         for key in sorted(SUPPORTED_DRILLS):
             cfg = profile.get(key)
-            if not cfg:
+            if not drill_is_configured(cfg):
                 continue
             at_secs = drill_at_secs(key, cfg)
             if at_secs >= float(duration):
@@ -1612,7 +1620,7 @@ class Drills:
             ("gateway_partition_drill", self._gateway_partition),
         ):
             cfg = self.profile.get(key)
-            if cfg:
+            if drill_is_configured(cfg):
                 thread = threading.Thread(
                     target=self._guarded, args=(key, target, cfg), daemon=True
                 )
@@ -2169,7 +2177,7 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
         # placements are process state, so affinity must rebuild from
         # scratch; requests during the blackout fail and count as errors.
         restart_at = profile.get("restart_smgs_at_secs")
-        if restart_at:
+        if drill_is_configured(restart_at):
 
             def _restart_smgs():
                 if stop.wait(float(restart_at)):
