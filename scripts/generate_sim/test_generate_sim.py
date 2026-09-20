@@ -435,23 +435,26 @@ class DivergenceClassificationTest(unittest.TestCase):
     def holder(blocks, digest, event_fed=False):
         return {"blocks": blocks, "digest": digest, "event_fed": event_fed, "dropped": False}
 
+    def summarise(self, base, other, capacity=CAP):
+        return sim.divergence_summary(sim.classify_divergence(base, other, capacity), capacity)
+
     def test_identical_replicas_converge(self):
         base = {"w1": self.holder(50, "a", True), "w2": self.holder(150, "b")}
-        d = sim.classify_divergence(base, dict(base), self.CAP)
+        d = self.summarise(base, dict(base))
         self.assertTrue(d["converged"])
         self.assertEqual(d["holders_differing"], 0)
 
     def test_event_fed_difference_is_never_converged(self):
         base = {"w1": self.holder(50, "a", True)}
         other = {"w1": self.holder(50, "b", True)}
-        d = sim.classify_divergence(base, other, self.CAP)
+        d = self.summarise(base, other)
         self.assertFalse(d["converged"])
         self.assertEqual(d["holders_differing_event_fed"], 1)
 
     def test_placement_difference_above_capacity_on_both_sides_is_cut_timing(self):
         base = {"w1": self.holder(190, "a")}
         other = {"w1": self.holder(101, "b")}
-        d = sim.classify_divergence(base, other, self.CAP)
+        d = self.summarise(base, other)
         self.assertTrue(d["converged"])
         self.assertEqual(d["holders_differing_placement_in_band"], 1)
         self.assertEqual(d["holders_differing"], 1)
@@ -459,28 +462,72 @@ class DivergenceClassificationTest(unittest.TestCase):
     def test_placement_difference_under_capacity_is_a_lost_update(self):
         base = {"w1": self.holder(190, "a")}
         other = {"w1": self.holder(99, "b")}
-        d = sim.classify_divergence(base, other, self.CAP)
+        d = self.summarise(base, other)
         self.assertFalse(d["converged"])
         self.assertEqual(d["holders_differing_placement_out_of_band"], 1)
+
+    def test_placement_difference_far_above_capacity_is_a_missing_cut(self):
+        # A replica that never cut just keeps growing, so "both sides are
+        # over the line" stops being evidence of timing once one of them
+        # is past the ceiling the cut itself runs on.
+        base = {"w1": self.holder(200, "a")}
+        other = {"w1": self.holder(101, "b")}
+        d = self.summarise(base, other)
+        self.assertFalse(d["converged"])
+        self.assertEqual(d["holders_differing_placement_out_of_band"], 1)
+        self.assertEqual(d["holders_differing_placement_in_band"], 0)
 
     def test_unknown_capacity_treats_every_placement_difference_as_real(self):
         base = {"w1": self.holder(190, "a")}
         other = {"w1": self.holder(150, "b")}
-        d = sim.classify_divergence(base, other, None)
+        d = self.summarise(base, other, None)
         self.assertFalse(d["converged"])
         self.assertEqual(d["holders_differing_placement_out_of_band"], 1)
+
+    def test_a_record_missing_a_field_never_gets_the_benign_verdict(self):
+        # The dump schema is owned elsewhere. A renamed or dropped field
+        # must not quietly turn every real difference into cut timing.
+        for missing in ("event_fed", "blocks"):
+            with self.subTest(missing=missing):
+                b = self.holder(150, "b")
+                del b[missing]
+                d = self.summarise({"w1": self.holder(190, "a")}, {"w1": b})
+                self.assertFalse(d["converged"])
+                self.assertEqual(d["holders_differing_placement_out_of_band"], 1)
 
     def test_holder_missing_on_one_replica_is_not_converged(self):
         base = {"w1": self.holder(10, "a"), "w2": self.holder(10, "c")}
         other = {"w1": self.holder(10, "a")}
-        d = sim.classify_divergence(base, other, self.CAP)
+        d = self.summarise(base, other)
         self.assertFalse(d["converged"])
         self.assertEqual(d["holders_only_in_one"], 1)
 
+    def test_a_holder_is_counted_once_across_several_peers(self):
+        # w1 differs benignly against one peer and for real against the
+        # other, so the worse verdict wins and it is still one holder.
+        # w2 matches one peer and differs benignly from the other, which
+        # is enough to count it. The total equals its own breakdown.
+        base = {"w1": self.holder(190, "a"), "w2": self.holder(190, "x")}
+        peers = [
+            {"w1": self.holder(101, "b"), "w2": self.holder(190, "x")},
+            {"w1": self.holder(99, "c"), "w2": self.holder(150, "y")},
+        ]
+        merged = {"event_fed": set(), "in_band": set(), "out_of_band": set(), "only_in_one": set()}
+        for peer in peers:
+            for bucket, keys in sim.classify_divergence(base, peer, self.CAP).items():
+                merged[bucket].update(keys)
+        d = sim.divergence_summary(merged, self.CAP)
+        self.assertEqual(d["holders_differing"], 2)
+        self.assertEqual(d["holders_differing_placement_out_of_band"], 1)
+        self.assertEqual(d["holders_differing_placement_in_band"], 1)
+        self.assertFalse(d["converged"])
+
     def test_capacity_comes_from_the_mock_kv_budget(self):
+        # Whole blocks only: rounding up would hold the whole fleet one
+        # block under the line and the band would never be entered.
         self.assertEqual(
             sim.placement_capacity_blocks({"mock": {"kv_tokens": 1_200_000, "block_size": 256}}),
-            4688,
+            4687,
         )
         self.assertIsNone(sim.placement_capacity_blocks({"mock": {}}))
 

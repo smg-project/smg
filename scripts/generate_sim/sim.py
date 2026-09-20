@@ -1859,7 +1859,37 @@ def placement_capacity_blocks(profile):
     block_size = mock.get("block_size")
     if not kv_tokens or not block_size:
         return None
-    return -(-int(kv_tokens) // int(block_size))
+    # Whole blocks only: a worker never holds the trailing partial one,
+    # so rounding up would put the whole fleet permanently one block
+    # under the line and the band below would never be entered.
+    return int(kv_tokens) // int(block_size)
+
+
+# How far above capacity two replicas may still be called a timing
+# difference rather than a missing cut.
+CAPACITY_BAND_FACTOR = 2
+
+
+def bucket_of(a, b, capacity_blocks):
+    """Which bucket one differing holder belongs in.
+
+    A record missing a field this needs never gets the benign verdict.
+    The dump schema is owned elsewhere, so a renamed or absent field
+    would otherwise turn every real divergence into cut timing and the
+    run would read as converged."""
+    if "event_fed" not in a or "event_fed" not in b:
+        return "out_of_band"
+    if a["event_fed"] or b["event_fed"]:
+        return "event_fed"
+    if capacity_blocks is None or "blocks" not in a or "blocks" not in b:
+        return "out_of_band"
+    low, high = min(a["blocks"], b["blocks"]), max(a["blocks"], b["blocks"])
+    # Both sides above the line and neither past the ceiling the cut
+    # runs on: the replicas simply cut at different moments. Past the
+    # ceiling one of them never cut at all, which is a real fault.
+    if low >= capacity_blocks and high < CAPACITY_BAND_FACTOR * capacity_blocks:
+        return "in_band"
+    return "out_of_band"
 
 
 def classify_divergence(base, other, capacity_blocks):
@@ -1871,24 +1901,35 @@ def classify_divergence(base, other, capacity_blocks):
     its capacity legitimately differ by WHEN they cut (the 1x-2x
     hysteresis band). Those are counted separately from a placement
     holder that differs while under capacity on either side, which
-    would be a lost update."""
-    differing_event, in_band, out_of_band, only_in_one = [], [], [], []
+    would be a lost update.
+
+    Returns the holder keys per bucket. A caller comparing more than
+    two replicas unions them and summarises once with
+    `divergence_summary`: a holder can differ against one peer and
+    agree with another, so counts do not combine."""
+    buckets = {"event_fed": [], "in_band": [], "out_of_band": [], "only_in_one": []}
     for key in set(base) | set(other):
         if key not in base or key not in other:
-            only_in_one.append(key)
+            buckets["only_in_one"].append(key)
             continue
         a, b = base[key], other[key]
         if a["digest"] == b["digest"]:
             continue
-        if a.get("event_fed") or b.get("event_fed"):
-            differing_event.append(key)
-        elif capacity_blocks is not None and min(a["blocks"], b["blocks"]) >= capacity_blocks:
-            in_band.append(key)
-        else:
-            out_of_band.append(key)
+        buckets[bucket_of(a, b, capacity_blocks)].append(key)
+    return buckets
+
+
+def divergence_summary(buckets, capacity_blocks):
+    """Count a (possibly unioned) bucket set. A holder inside the band
+    against one peer and outside it against another is the outside
+    case, counted once, so the total always equals its breakdown."""
+    event_fed = set(buckets["event_fed"])
+    out_of_band = set(buckets["out_of_band"]) - event_fed
+    in_band = set(buckets["in_band"]) - event_fed - out_of_band
+    only_in_one = set(buckets["only_in_one"])
     return {
-        "holders_differing": len(differing_event) + len(in_band) + len(out_of_band),
-        "holders_differing_event_fed": len(differing_event),
+        "holders_differing": len(event_fed) + len(in_band) + len(out_of_band),
+        "holders_differing_event_fed": len(event_fed),
         "holders_differing_placement_in_band": len(in_band),
         "holders_differing_placement_out_of_band": len(out_of_band),
         "holders_only_in_one": len(only_in_one),
@@ -1896,7 +1937,7 @@ def classify_divergence(base, other, capacity_blocks):
         # Converged = nothing a peer should have repaired is left: every
         # event-fed holder identical, every holder on every replica, and
         # no placement holder differing outside the capacity band.
-        "converged": not differing_event and not out_of_band and not only_in_one,
+        "converged": not event_fed and not out_of_band and not only_in_one,
     }
 
 
@@ -1931,21 +1972,15 @@ def dump_replicas(profile, run_dir, dump_bin, live_replicas):
     if len(good) >= 2:
         base_r = min(good)
         capacity = placement_capacity_blocks(profile)
-        merged = None
+        merged = {"event_fed": set(), "in_band": set(), "out_of_band": set(), "only_in_one": set()}
         for r, d in good.items():
             if r == base_r:
                 continue
             part = classify_divergence(good[base_r]["holders"], d["holders"], capacity)
-            if merged is None:
-                merged = part
-            else:
-                for k, v in part.items():
-                    if isinstance(v, int) and not isinstance(v, bool):
-                        merged[k] = max(merged[k], v)
-                    elif isinstance(v, bool):
-                        merged[k] = merged[k] and v
+            for k, v in part.items():
+                merged[k].update(v)
         summary["holders_compared"] = len(good[base_r]["holders"])
-        summary.update(merged)
+        summary.update(divergence_summary(merged, capacity))
     return summary
 
 
