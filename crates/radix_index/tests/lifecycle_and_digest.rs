@@ -92,8 +92,13 @@ async fn dropped_holder_stops_scoring_then_readvertise_restores() {
 #[tokio::test]
 async fn evicted_digest_chain_is_resent_full_and_recovers() {
     // Short TTL + frequent sweep so an idle placement holder is evicted.
+    // The TTL has to outlast the establish step's own latency: the publish
+    // is asynchronous, so a 50 ms TTL against a 20 ms sweep can retire the
+    // chain before the first wait ever observes it, and nothing republishes
+    // it before the eviction phase. 500 ms still evicts well inside the
+    // 10 s wait below, because a query does not refresh liveness.
     let cfg = EngineConfig {
-        inferred_ttl: Duration::from_millis(50),
+        inferred_ttl: Duration::from_millis(500),
         ..Default::default()
     };
     let url = spawn_index(cfg, Duration::from_millis(20));

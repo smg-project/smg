@@ -185,13 +185,23 @@ async fn peered_replicas_converge_through_moves_and_echoes() {
         let (tx, rx) = mpsc::channel::<proto::Update>(4);
         tx.send(placement.clone()).await.unwrap();
         drop(tx);
-        let _ = client
+        // `publish` returns as soon as the stream is accepted, well before
+        // the update is applied, and dropping the response can cancel the
+        // request before the inbound task even queues it. The server builds
+        // each acknowledgement after applying, so reading one is what makes
+        // this publish an established fact rather than something the
+        // convergence poll below might quietly paper over.
+        let mut acks = client
             .publish(tonic::Request::new(
                 tokio_stream::wrappers::ReceiverStream::new(rx),
             ))
             .await
             .expect("publish placement")
             .into_inner();
+        tonic::codegen::tokio_stream::StreamExt::next(&mut acks)
+            .await
+            .expect("placement ack")
+            .expect("placement ack ok");
     }
     let placement_chain_query = vec![201, 202, 203, 204];
     assert!(

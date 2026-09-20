@@ -29,7 +29,12 @@ use crate::{
 pub enum QueryOutcome {
     /// Per-holder answers, descending by contiguous depth.
     Scores(Vec<HolderAnswer>),
-    /// The index answered with no overlap.
+    /// No holder overlaps the query ANYWHERE. Not "no holder has a
+    /// usable prefix": a holder whose only overlap starts past position
+    /// 0 comes back under `Scores` with `matched_blocks: 0`, so a caller
+    /// after cache-hit candidates must filter on `matched_blocks > 0`
+    /// rather than on this variant. Reading a non-empty `Scores` as
+    /// "candidates exist" routes to a worker holding no usable prefix.
     Empty,
     /// Deadline elapsed; the late answer is dropped by id.
     Timeout,
@@ -37,19 +42,23 @@ pub enum QueryOutcome {
     Disconnected,
 }
 
-/// One holder's answer to a query. `holder` is the publisher's holder
-/// name: a worker URL, or `worker#lane` for a worker published as
-/// several independently evicted position sets, each with the
-/// publisher's opaque `lane_meta`.
+/// One holder's answer to a query. `holder` is whatever name the
+/// publisher filed the chain under. Every publisher in this repo files
+/// a worker URL and one holder per worker; the index does not require
+/// that and does not parse the name either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HolderAnswer {
     pub holder: String,
-    /// Consecutive covered blocks from position 0.
+    /// Consecutive covered blocks from position 0; 0 when the holder's
+    /// coverage starts past position 0, which is a normal answer and
+    /// not an error.
     pub matched_blocks: u32,
     pub total_blocks: u64,
     pub event_fed: bool,
     /// Every covered `[start, end)` run along the query, in path order.
     pub intervals: Vec<(u32, u32)>,
+    /// The publisher's opaque metadata for this holder, echoed back
+    /// verbatim. Empty for every publisher in this repo.
     pub lane_meta: Vec<u8>,
 }
 

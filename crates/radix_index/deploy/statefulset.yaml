@@ -40,36 +40,51 @@ spec:
       containers:
         - name: radix-index
           image: REGISTRY/radix-index-service:VERSION
+          # Peer and bootstrap addresses are PER-ORDINAL, and Kubernetes
+          # has no downward-API expression for "the other ordinal", so
+          # the entrypoint derives both from the pod's own name. One
+          # shared static address would be wrong for at least one pod,
+          # and the self-reference is the dangerous case: the gRPC
+          # listener is not up yet when the bootstrap pull runs, so the
+          # connect is refused, the server treats a refused bootstrap as
+          # a cold start, and /readyz goes green on an EMPTY index —
+          # indistinguishable from a sibling that legitimately had
+          # nothing to hand over. Self-relay is excluded for the same
+          # reason it is pointless: a pod re-applying its own accepted
+          # writes. `exec` keeps the server as PID 1 so SIGTERM still
+          # reaches it and terminationGracePeriodSeconds means something.
+          command: ["/bin/sh", "-c"]
           args:
-            - --bind=0.0.0.0
-            - --port=40000
-            - --metrics-port=40100
-            - --inferred-ttl-secs=180
-            # Relay to every sibling; self-relay is not a peer (each pod
-            # templates its own peer list via the ordinal hostname).
-            # For replicas: 2 the two pods are radix-index-0 / radix-index-1;
-            # an init script or an env-substituting entrypoint should drop
-            # the pod's own name from PEERS.
-            - --peers=$(PEERS)
-            - --bootstrap-from=$(BOOTSTRAP_FROM)
+            - |
+              ORDINAL="${POD_NAME##*-}"
+              PEERS=""
+              i=0
+              while [ "$i" -lt "$REPLICAS" ]; do
+                if [ "$i" -ne "$ORDINAL" ]; then
+                  PEERS="${PEERS:+$PEERS,}http://radix-index-$i.radix-index:40000"
+                fi
+                i=$((i + 1))
+              done
+              set -- --bind=0.0.0.0 --port=40000 --metrics-port=40100 \
+                     --inferred-ttl-secs=180
+              # Bootstrap from the first sibling, never from self. At
+              # replicas: 1 there is no sibling, so both flags are
+              # omitted and the cold start is the honest answer.
+              if [ -n "$PEERS" ]; then
+                set -- "$@" --peers="$PEERS" --bootstrap-from="${PEERS%%,*}"
+              fi
+              exec radix-index-service "$@"
           env:
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # Example for 2 replicas; template these per-ordinal in your
-            # deploy tooling (kustomize/helm) so each pod excludes itself.
-            - name: PEERS
-              value: "http://radix-index-0.radix-index:40000,http://radix-index-1.radix-index:40000"
-            # Per-ordinal: each pod must bootstrap from a SIBLING, never
-            # itself — the gRPC listener is not up yet when the bootstrap
-            # pull runs, so a self-reference is a refused connect and a
-            # cold start that /readyz cannot tell from a healthy empty
-            # pull. Template per-ordinal (kustomize/helm):
-            #   radix-index-0 -> http://radix-index-1.radix-index:40000
-            #   radix-index-1 -> http://radix-index-0.radix-index:40000
-            - name: BOOTSTRAP_FROM
-              value: "http://radix-index-1.radix-index:40000"
+            # MUST match spec.replicas: the entrypoint enumerates
+            # ordinals from it. Too low and the highest pods are never
+            # relayed to; too high and every pod wastes connects on a
+            # hostname that does not resolve.
+            - name: REPLICAS
+              value: "2"
           ports:
             - name: grpc
               containerPort: 40000
@@ -92,3 +107,54 @@ spec:
               memory: 8Gi
             limits:
               memory: 64Gi
+---
+# Ingress isolation. Both verbs are UNAUTHENTICATED, and with no policy
+# selecting these pods Kubernetes allows ingress from every pod in the
+# cluster: Publish mutates placement state, so anything on the network
+# can point every query at a worker holding nothing, and Pull streams
+# the whole index — every model, holder and prompt-chain hash — to any
+# caller that asks. This needs a NetworkPolicy-enforcing CNI; on a CNI
+# that ignores NetworkPolicy the object applies cleanly and enforces
+# nothing, so verify rather than assume. Ingress only, on purpose: the
+# relay and the bootstrap pull dial out to siblings, and a half-written
+# egress rule fails into exactly the silent cold start the per-ordinal
+# bootstrap above exists to prevent.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: radix-index
+spec:
+  podSelector:
+    matchLabels:
+      app: radix-index
+  policyTypes:
+    - Ingress
+  ingress:
+    # gRPC: the gateway queries and publishes placements, the bridge
+    # publishes the event feed, and siblings relay + bootstrap-Pull from
+    # each other. These caller labels are this reference's placeholders,
+    # like REGISTRY/VERSION above — match them to whatever your gateway
+    # and bridge deployments actually set, or the index answers nobody.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: smg-router
+        - podSelector:
+            matchLabels:
+              app: radix-index-bridge
+        - podSelector:
+            matchLabels:
+              app: radix-index
+      ports:
+        - port: 40000
+    # Admin plane. Kubelet probes /readyz and /healthz from the NODE, not
+    # from a pod, so they do not need this rule and stay green without
+    # it — which is the trap: drop this and the pods look healthy while
+    # the scrape dies, taking the anti-entropy and capacity-cut counters
+    # with it, the only signals that replicas are diverging.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 40100

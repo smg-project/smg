@@ -562,6 +562,39 @@ impl RadixTree {
         self.state_of(holder).keys.get(&key).map(|&(_, pos)| pos)
     }
 
+    /// Count a confirmation of `key` as a publish for recency: the
+    /// chain the holder holds it on takes a fresh tick, exactly as a
+    /// `store` landing there would. Touching the TIP of a path is
+    /// enough — `evict_oldest` propagates a chain's tick to its
+    /// covered ancestors. Returns whether the holder holds the key.
+    ///
+    /// A caller that CONFIRMS residency through [`Self::position_of`]
+    /// instead of storing must call this, for the same reason
+    /// [`Self::dup_prefix_touch`] exists: a hot chain re-confirmed
+    /// every round applies nothing, so its tick would stay frozen at
+    /// its last full publish and `evict_oldest` (ascending tick) would
+    /// retire it ahead of colder chains that happened to be sent whole
+    /// — inverting the recency order for exactly the chains the
+    /// confirm path makes cheap. Observable state (keys, spans,
+    /// answers) is untouched.
+    pub fn touch_chain_at(&self, id: HolderId, key: BlockKey) -> bool {
+        if self.live(id).is_none() {
+            return false;
+        }
+        let holder = id.parts().0;
+        let Some(&(chain, _)) = self.state_of(holder).keys.get(&key) else {
+            return false;
+        };
+        let tick = self.store_tick.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(t) = self.state_of(holder).chains.get(&chain) {
+            // Max, not store: concurrent touching walks take increasing
+            // ticks but land in any order, and a later tick must not be
+            // overwritten by an earlier one.
+            t.fetch_max(tick, Ordering::Relaxed);
+        }
+        true
+    }
+
     pub fn remove(&mut self, id: HolderId, keys: &[BlockKey]) -> u32 {
         if self.live(id).is_none() {
             return 0;
@@ -1012,12 +1045,36 @@ impl RadixTree {
             let mut run: Option<(u32, u32)> = None;
             let flush = |run: &mut Option<(u32, u32)>, out: &mut Vec<HolderRun>| {
                 if let Some((start, end)) = run.take() {
+                    // The spans say the holder covers every position of
+                    // this run and `audit()` enforces that the key map
+                    // names each one ("span coverage ... has no key map
+                    // entry") — but INDEXING on that turns a skew
+                    // between the two structures into a panic here, and
+                    // `runs` is the snapshot producer: unwinding out of
+                    // it with the keyspace lock held poisons the lock,
+                    // so a bootstrap bug takes the serving replica's
+                    // queries down too. Every other read in this file
+                    // degrades instead (`live` returns None, `coverage`
+                    // skips the holder), so this one does as well. Cut
+                    // at the first unnamed position rather than skipping
+                    // it: the snapshot zips `keys` against the run's
+                    // contents positionally, so a compacted list would
+                    // ship every later block under the wrong key — a
+                    // silent divergence, where a short run only costs
+                    // the puller blocks its feed puts back.
+                    let keys: Vec<BlockKey> = (start..end)
+                        .map_while(|p| pos_key.get(&(c, p)).copied())
+                        .collect();
+                    if keys.is_empty() {
+                        return;
+                    }
+                    let end = start + keys.len() as u32;
                     let mut path = prefix.clone();
                     path.extend((cd.base_pos..end).map(|p| cd.content_at(p)));
                     out.push(HolderRun {
                         start,
                         end,
-                        keys: (start..end).map(|p| pos_key[&(c, p)]).collect(),
+                        keys,
                         path,
                     });
                 }
@@ -1066,6 +1123,28 @@ impl RadixTree {
         out.reverse();
         debug_assert_eq!(out.len(), pos as usize + 1);
         Some(out)
+    }
+
+    /// Every block the holder holds, as `(pos, key, content)` in NO
+    /// defined order and with no allocation: the key map's iteration
+    /// order, which changes with its contents.
+    ///
+    /// [`Self::enumerate`] sorts because `snapshot_holder`'s chunks are
+    /// parent-linked and only reconstruct in position order. A
+    /// COMMUTATIVE consumer — the anti-entropy digest is an xor plus a
+    /// wrapping sum — buys that order and throws it away, paying an
+    /// O(blocks) `Vec` and an O(n log n) sort PER HOLDER on every
+    /// anti-entropy round, on both replicas, while the read path it
+    /// shares a process with is answering against a low-millisecond
+    /// routing deadline. Take this walk whenever the result cannot
+    /// depend on order; take `enumerate` when it can.
+    pub fn for_each_block(&self, id: HolderId, mut visit: impl FnMut(u32, BlockKey, ContentHash)) {
+        let Some(state) = self.live(id) else {
+            return;
+        };
+        for (&key, &(chain, pos)) in &state.keys {
+            visit(pos, key, self.chains[chain as usize].content_at(pos));
+        }
     }
 
     pub fn enumerate(
@@ -1879,5 +1958,89 @@ mod audit_tests {
         assert_eq!(t.evict_oldest(h, 1), 5, "eviction reaches the ceiling");
         assert_eq!(t.state_of(holder).keys.len(), 1);
         t.audit().expect("recovery erases the disagreement");
+    }
+
+    /// `runs` feeds the snapshot producer while the caller holds its
+    /// keyspace lock, so the same skew must degrade to a short run
+    /// rather than unwind: a panic there poisons that lock and takes
+    /// the serving replica's queries down with the bootstrap.
+    #[test]
+    fn runs_cuts_short_when_the_key_map_loses_a_covered_position() {
+        let mut t = RadixTree::new(Config::default());
+        let h = t.create_holder("w1");
+        t.store(h, None, &[(100, 1), (101, 2), (102, 3)])
+            .expect("store");
+        assert_eq!(t.runs(h).len(), 1, "one contiguous run to start");
+
+        // Drop the middle key but leave its span membership standing.
+        let holder = h.parts().0;
+        t.state_of_mut(holder).keys.remove(&101);
+        assert!(t.audit().is_err(), "the skew is an audit violation");
+
+        let runs = t.runs(h);
+        assert_eq!(runs.len(), 1, "the run is cut, not dropped or split");
+        assert_eq!((runs[0].start, runs[0].end), (0, 1));
+        assert_eq!(runs[0].keys, vec![100]);
+        assert_eq!(
+            runs[0].path.len(),
+            1,
+            "the content path stays in step with the keys"
+        );
+    }
+
+    /// The unsorted digest walk and the sorted snapshot walk must see
+    /// exactly the same triples: anti-entropy compares one replica's
+    /// fold against the other's, so a set that differs by even one
+    /// block makes the two disagree forever — a Pull storm that no
+    /// amount of pulling settles.
+    #[test]
+    fn for_each_block_visits_the_same_set_as_enumerate() {
+        let mut t = RadixTree::new(Config::default());
+        let h = t.create_holder("w1");
+        t.store(h, None, &[(100, 1), (101, 2), (102, 3)])
+            .expect("store");
+        // A fork off position 1 and a second root: more than one chain,
+        // so the walk cannot pass by visiting a single contents array.
+        t.store(h, Some(101), &[(200, 7)]).expect("fork");
+        t.store(h, None, &[(300, 9)]).expect("second root");
+
+        let mut unsorted: Vec<(u32, BlockKey, ContentHash)> = Vec::new();
+        t.for_each_block(h, |pos, key, content| unsorted.push((pos, key, content)));
+        let sorted: Vec<(u32, BlockKey, ContentHash)> = t.enumerate(h).collect();
+        assert_eq!(unsorted.len(), 5);
+        unsorted.sort_unstable();
+        assert_eq!(unsorted, sorted, "same triples, order aside");
+        let mut still_ordered = sorted.clone();
+        still_ordered.sort_unstable();
+        assert_eq!(
+            sorted, still_ordered,
+            "`enumerate` still hands back position order for the snapshot"
+        );
+
+        t.clear(h);
+        let mut visited = 0u32;
+        t.for_each_block(h, |_, _, _| visited += 1);
+        assert_eq!(visited, 0, "a cleared holder folds to nothing");
+    }
+
+    /// A residency confirm that applies nothing must still count as a
+    /// publish, or the chains a caller keeps confirming — the cheapest
+    /// ones it has — are evicted before the chains it had to send whole.
+    #[test]
+    fn touch_chain_at_makes_a_confirmed_chain_the_most_recent() {
+        let mut t = RadixTree::new(Config::default());
+        let h = t.create_holder("w1");
+        t.store(h, None, &[(100, 1), (101, 2)]).expect("store");
+        t.store(h, None, &[(200, 11), (201, 12)]).expect("store");
+        assert!(t.touch_chain_at(h, 101), "the holder holds the tip");
+        assert!(!t.touch_chain_at(h, 999), "an unheld key touches nothing");
+
+        // Room for one chain: the confirmed one outlives the chain that
+        // was stored after it.
+        assert_eq!(t.evict_oldest(h, 2), 2);
+        assert_eq!(t.position_of(h, 100), Some(0));
+        assert_eq!(t.position_of(h, 101), Some(1));
+        assert_eq!(t.position_of(h, 200), None, "untouched chain went first");
+        t.audit().expect("audit");
     }
 }

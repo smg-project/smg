@@ -44,6 +44,13 @@ fn main() {
     let blocks_per_holder: usize = parse_flag(&args, "--blocks-per-holder").unwrap_or(9000);
     let queries: usize = parse_flag(&args, "--queries").unwrap_or(20_000);
     let query_depth: usize = parse_flag(&args, "--query-depth").unwrap_or(78);
+    // Both are DIVISORS below, not just sizes: `q % holders` divides by
+    // zero and the percentile index `latencies.len() - 1` underflows. A
+    // zero passes `validate_flags` (it parses fine), so without these
+    // the run dies on an arithmetic panic that names neither flag
+    // instead of a startup error that names the typo.
+    assert!(holders > 0, "--holders must be > 0");
+    assert!(queries > 0, "--queries must be > 0");
 
     let keyspace = KeyspaceKey {
         model: "bench".into(),
@@ -105,10 +112,16 @@ fn main() {
     let pct = |p: f64| latencies[((latencies.len() as f64 * p) as usize).min(latencies.len() - 1)];
 
     println!("entries {entries}");
+    // RSS can SHRINK across the two samples (the allocator returning
+    // pages to the OS, or another thread's arena draining), and both
+    // samples are unsigned: a plain subtraction panics in debug and
+    // wraps to an absurd exabyte figure in release — silently corrupting
+    // the one number this bench exists to produce.
+    let rss_delta = rss_after.saturating_sub(rss_before);
     println!(
         "rss_total_mib {:.1}  rss_bytes_per_entry {:.1}",
-        (rss_after - rss_before) as f64 / 1024.0,
-        (rss_after - rss_before) as f64 * 1024.0 / entries.max(1) as f64
+        rss_delta as f64 / 1024.0,
+        rss_delta as f64 * 1024.0 / entries.max(1) as f64
     );
     println!(
         "apply_blocks_per_sec {:.0} (filled {applied_blocks} blocks in {fill_secs:.1}s)",

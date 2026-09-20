@@ -1,7 +1,8 @@
 //! The index engine: one `radix_tree::RadixTree` per keyspace, with
 //! epoch-scoped holder state, per-feed eviction semantics, and
-//! overlap queries. Pure and synchronous — the gRPC surface, relay,
-//! and bootstrap live in `server.rs`.
+//! overlap queries. Pure and synchronous apart from one cooperative
+//! yield point for runtime callers (`holder_digests_yielding`) — the
+//! gRPC surface, relay, and bootstrap live in `server.rs`.
 //!
 //! Correctness model (see `.claude/kv-index-service/01-design.md`):
 //! - Event feed: one worker-sequenced stream per (holder, epoch); apply
@@ -32,7 +33,7 @@ use radix_tree::{
     Config as TreeConfig, CoverageRun, HolderId, OverlapScratch, RadixTree, StoreError,
 };
 
-use crate::{ContentHash, SequenceHash};
+use crate::{server::LatencyHistogram, ContentHash, SequenceHash};
 
 /// One block on the wire: position-chained identity + content identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,10 +159,25 @@ pub struct KeyspaceKey {
 }
 
 /// Per-holder score in a query answer.
+///
+/// CONTRACT, and it is not the one the depth-only answer had: a holder
+/// is scored for ANY overlap with the query path, so `matched_blocks
+/// == 0` alongside a non-empty `intervals` is a normal answer — a
+/// holder that evicted its prefix and kept a mid-chain block reaches
+/// the consumer exactly like a position-set lane would. A consumer
+/// that means "has a usable prefix" must therefore test
+/// `matched_blocks > 0` (or the run at position 0) and NEVER the
+/// emptiness of the answer list: a query that nothing has a prefix for
+/// comes back as a non-empty list of zero-depth holders, and a gateway
+/// reading that as "cache-hit candidates exist, take the head" routes
+/// to a worker with no prefix at all instead of falling through to
+/// load-based placement. The ordering keeps such holders last (depth
+/// descending), but only the field says whether one is usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HolderScore {
     pub holder: String,
-    /// Consecutive covered blocks from position 0.
+    /// Consecutive covered blocks from position 0; 0 when the holder's
+    /// coverage of the query starts past position 0.
     pub matched_blocks: u32,
     pub total_blocks: u64,
     pub event_fed: bool,
@@ -260,17 +276,18 @@ pub struct Engine {
     /// Basis for the per-holder atomic freshness stamps.
     start: Instant,
     keyspaces: std::sync::RwLock<HashMap<KeyspaceKey, Arc<std::sync::RwLock<KeyspaceState>>>>,
-    /// Capacity cuts run under the keyspace write lock; their count
-    /// and duration are the write-lock hold time queries stall behind.
-    cuts: CutStats,
-}
-
-/// Capacity-cut accounting: count, summed and maximum duration (ns).
-#[derive(Debug, Default)]
-pub struct CutStats {
-    pub count: std::sync::atomic::AtomicU64,
-    pub ns_total: std::sync::atomic::AtomicU64,
-    pub ns_max: std::sync::atomic::AtomicU64,
+    /// Capacity cuts run under the keyspace write lock, so this is the
+    /// write-lock hold time queries stall behind — and it is a
+    /// HISTOGRAM, not a count plus a since-boot maximum. A `fetch_max`
+    /// gauge only ever rises, so the one pathological cut of a
+    /// bootstrap flood pins it for the life of the process and every
+    /// windowed query an operator would write ("did a cut hold the
+    /// lock past the query deadline recently?") reads the all-time
+    /// worst instead: a fleet that has recovered stays
+    /// indistinguishable from one still cutting badly. The buckets
+    /// give the recent tail back, and `_sum`/`_count` still carry the
+    /// total and the count the gauge pair used to.
+    cut_latency: LatencyHistogram,
 }
 
 impl Engine {
@@ -279,12 +296,16 @@ impl Engine {
             cfg,
             start: Instant::now(),
             keyspaces: std::sync::RwLock::new(HashMap::new()),
-            cuts: CutStats::default(),
+            cut_latency: LatencyHistogram::default(),
         }
     }
 
-    pub fn cut_stats(&self) -> &CutStats {
-        &self.cuts
+    /// Capacity-cut durations, ready to render as
+    /// `radix_index_capacity_cut_duration_seconds`. Bucket-for-bucket
+    /// comparable with the apply histogram, which already contains this
+    /// time: `enforce_capacity` runs inside the timed apply.
+    pub fn cut_latency(&self) -> &LatencyHistogram {
+        &self.cut_latency
     }
 
     fn now_ns(&self) -> u64 {
@@ -452,6 +473,21 @@ impl Engine {
                             })
                         });
                     if confirmed {
+                        // A confirm is a publish for the CHAIN, not just
+                        // for the holder: nothing is applied here, so
+                        // without the touch the chain keeps the recency
+                        // tick of its last FULL send while every cold
+                        // chain sent in full gets a fresh one, and
+                        // `evict_oldest` (ascending tick) then retires
+                        // the hot chain first — its next digest misses,
+                        // the publisher resends it whole, the worker
+                        // re-prefills, and the cycle repeats. The
+                        // holder-level `last_publish_ns` below is the
+                        // silence backstop and says nothing about which
+                        // chain is hot. Touching the tip's chain is
+                        // enough: the cut propagates a chain's tick to
+                        // its covered ancestors.
+                        shared.tree.touch_chain_at(holder.id, tip.0);
                         holder
                             .last_publish_ns
                             .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
@@ -676,10 +712,21 @@ impl Engine {
                 changed = true;
             }
         }
-        if update.dropped && !holder.dropped {
-            holder.dropped = true;
+        if update.dropped {
+            // Downgrade the soft-retire even when `dropped` already
+            // stands: the silence backstop sets BOTH flags, so gating
+            // this on the `dropped` transition would make an operator's
+            // explicit drop a no-op on a soft-retired holder — it would
+            // then sit out `INFERRED_RETIRE_MULTIPLIER` x `event_ttl` of
+            // silence instead of retiring one `inferred_ttl` after the
+            // departure signal, which is the ordering the sweep
+            // promises. `changed` stays gated on the `dropped`
+            // transition alone so a peer's echo still dies in one hop.
             holder.soft_retired = false; // a real departure signal
-            changed = true;
+            if !holder.dropped {
+                holder.dropped = true;
+                changed = true;
+            }
         }
 
         // Epoch gate: higher epoch supersedes (implicit clear), lower is
@@ -810,15 +857,6 @@ impl Engine {
         }
     }
 
-    /// Split placement apply: exclusive work for ONLY the uncovered
-    /// suffix, anchored at the last plain-duplicate key found by the
-    /// shared-lock walk. Returns None when holder posture changed
-    /// between the locks (the caller falls through to the general
-    /// path). A concurrent clear/truncate can invalidate the anchor —
-    /// then the FULL batch is stored instead (with the general path's
-    /// dangling-parent re-anchor), which is exactly what a full-batch
-    /// apply serialized after that clear would have produced: the
-    /// split is linearizable, never lossy.
     /// Runaway protection for placement-fed holders, NOT an eviction
     /// mirror: the placement feed carries no removal signal, so
     /// index-side eviction order can never match the worker's real
@@ -843,6 +881,18 @@ impl Engine {
     /// a re-applied echo lands and stays (unchanged on its return
     /// trip), and truncation is a rare event whose cost is amortized.
     ///
+    /// That echo argument is bounded by the chain length: a SINGLE
+    /// chain longer than 2x capacity cannot fit under the bound at
+    /// all, so every apply of it re-crosses, re-cuts, and relays, and
+    /// the storm survives for that holder. Nothing enforces the
+    /// premise that keeps it out of reach — a worker's declared
+    /// capacity comes from its own KV size, so it cannot hold a prompt
+    /// twice that cache, and the default (`u64::MAX`) makes the bound
+    /// unreachable — but an operator who sets a capacity below half
+    /// the longest prompt's block count gets the storm back. Both
+    /// sides are pinned by
+    /// `capacity_cut_leaves_headroom_so_echoes_die`.
+    ///
     /// The cut is recency-ordered (`evict_oldest`): the holder's
     /// least-recently-published chains go first, whole, and a chain
     /// whose descendants are still being published is as young as
@@ -860,14 +910,19 @@ impl Engine {
         if tree.holder_blocks(holder.id) > bound {
             let started = Instant::now();
             tree.evict_oldest(holder.id, capacity);
-            let ns = started.elapsed().as_nanos() as u64;
-            use std::sync::atomic::Ordering::Relaxed;
-            self.cuts.count.fetch_add(1, Relaxed);
-            self.cuts.ns_total.fetch_add(ns, Relaxed);
-            self.cuts.ns_max.fetch_max(ns, Relaxed);
+            self.cut_latency.observe(started.elapsed());
         }
     }
 
+    /// Split placement apply: exclusive work for ONLY the uncovered
+    /// suffix, anchored at the last plain-duplicate key found by the
+    /// shared-lock walk. Returns None when holder posture changed
+    /// between the locks (the caller falls through to the general
+    /// path). A concurrent clear/truncate can invalidate the anchor —
+    /// then the FULL batch is stored instead (with the general path's
+    /// dangling-parent re-anchor), which is exactly what a full-batch
+    /// apply serialized after that clear would have produced: the
+    /// split is linearizable, never lossy.
     fn apply_placement_suffix(
         &self,
         space: &Arc<std::sync::RwLock<KeyspaceState>>,
@@ -1008,8 +1063,13 @@ impl Engine {
         }
     }
 
-    /// Overlap query: per-holder matched prefix depth, dropped holders
-    /// excluded. Missing keyspace = empty answer (advisory semantics).
+    /// Overlap query: every holder covering ANY position of the query
+    /// path, dropped holders excluded, ordered by contiguous depth from
+    /// position 0. An empty Vec means no holder overlaps anywhere — it
+    /// does NOT mean "no holder has a usable prefix", which is
+    /// `matched_blocks == 0` on every answer instead (see
+    /// [`HolderScore`]). Missing keyspace = empty answer (advisory
+    /// semantics).
     pub fn find_matches(&self, keyspace: &KeyspaceKey, hashes: &[ContentHash]) -> Vec<HolderScore> {
         let Some(space) = self.space(keyspace) else {
             return Vec::new();
@@ -1129,7 +1189,19 @@ impl Engine {
             }
         }
         holder.dropped = update.dropped;
-        holder.soft_retired = false;
+        // `soft_retired` has no wire representation, so a snapshot of a
+        // backstop-soft-retired holder is indistinguishable from one of
+        // a genuinely departed one: take the protective reading and
+        // keep its blocks for the healing batch exactly as the serving
+        // replica does. Resetting to false instead discarded the state
+        // the source deliberately retained — the puller's own sweep
+        // then retired the holder one `inferred_ttl` into the silence,
+        // and when the worker's next delta batch healed it the puller
+        // had no parent to anchor on and held only the delta,
+        // permanently under-matching that worker against the replica it
+        // bootstrapped from. Mis-assuming the other way costs one
+        // retire window on a holder that really did depart.
+        holder.soft_retired = update.dropped;
         holder.epoch = update.epoch;
         holder.last_seq = update.seq;
         holder
@@ -1178,46 +1250,79 @@ impl Engine {
         }
     }
 
-    /// The keyspaces a `Pull` walks (a stable set; each is then
-    /// snapshotted holder by holder).
     /// Per-holder (epoch, seq, block count, set digest) across every
     /// keyspace — what anti-entropy compares between replicas. The digest
     /// is a commutative fold over content hashes (xor and a multiplied
     /// sum), so it compares block SETS regardless of storage order. One
     /// read lock per holder, like `snapshot_holder`, never a long hold.
+    ///
+    /// Uninterrupted: right for a test or a one-shot tool, but a caller
+    /// on an async runtime wants [`Self::holder_digests_yielding`].
     pub fn holder_digests(&self) -> Vec<HolderDigest> {
         let mut out = Vec::new();
         for key in self.snapshot_keys() {
             for holder_key in self.snapshot_holders(&key) {
-                let Some(space) = self.space(&key) else {
-                    continue;
-                };
-                let space = space.read().expect(LOCK_MSG);
-                let Some(holder) = space.holders.get(&holder_key) else {
-                    continue;
-                };
-                let (mut blocks, mut xor, mut sum) = (0u64, 0u64, 0u64);
-                // Position-bound: the same block set at different
-                // positions (a mis-placed run) must not digest equal.
-                for (pos, _k, content) in space.tree.enumerate(holder.id) {
-                    let entry = content ^ u64::from(pos).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-                    blocks += 1;
-                    xor ^= entry;
-                    sum = sum.wrapping_add(entry.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-                }
-                out.push(HolderDigest {
-                    keyspace: key.clone(),
-                    holder: holder_key,
-                    epoch: holder.epoch,
-                    last_seq: holder.last_seq,
-                    event_fed: holder.event_fed,
-                    blocks,
-                    digest_xor: xor,
-                    digest_sum: sum,
-                });
+                out.extend(self.holder_digest(&key, holder_key));
             }
         }
         out
+    }
+
+    /// [`Self::holder_digests`] with a cooperative yield between
+    /// holders.
+    ///
+    /// The fold is the WHOLE index and it runs once an anti-entropy
+    /// period on both replicas, so run straight through it holds a
+    /// runtime worker for the length of a full-index walk — and the
+    /// queries sharing that runtime are answering against a
+    /// low-millisecond routing deadline, so the tail it adds is paid by
+    /// the read path, not by anti-entropy. The unit of work is already
+    /// one holder under one read lock, so a yield between holders
+    /// bounds the stall at a single holder's fold and costs nothing
+    /// when the runtime has no other work. NOT `spawn_blocking`: that
+    /// would move the read locks onto a blocking thread, where a
+    /// waiting writer queues behind a walk the runtime can no longer
+    /// interleave.
+    pub async fn holder_digests_yielding(&self) -> Vec<HolderDigest> {
+        let mut out = Vec::new();
+        for key in self.snapshot_keys() {
+            for holder_key in self.snapshot_holders(&key) {
+                out.extend(self.holder_digest(&key, holder_key));
+                tokio::task::yield_now().await;
+            }
+        }
+        out
+    }
+
+    /// One holder's digest under one read lock. None when the keyspace
+    /// or the holder went away between the listing and the fold — a
+    /// retire racing the walk, which is expected, not an error.
+    fn holder_digest(&self, key: &KeyspaceKey, holder_key: String) -> Option<HolderDigest> {
+        let space = self.space(key)?;
+        let space = space.read().expect(LOCK_MSG);
+        let holder = space.holders.get(&holder_key)?;
+        let (mut blocks, mut xor, mut sum) = (0u64, 0u64, 0u64);
+        // Position-bound: the same block set at different positions (a
+        // mis-placed run) must not digest equal. Unsorted on purpose:
+        // xor and the wrapping sum are commutative, so `enumerate`'s
+        // Vec and its sort would be bought and thrown away once per
+        // holder per round — see `RadixTree::for_each_block`.
+        space.tree.for_each_block(holder.id, |pos, _key, content| {
+            let entry = content ^ u64::from(pos).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+            blocks += 1;
+            xor ^= entry;
+            sum = sum.wrapping_add(entry.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        });
+        Some(HolderDigest {
+            keyspace: key.clone(),
+            holder: holder_key,
+            epoch: holder.epoch,
+            last_seq: holder.last_seq,
+            event_fed: holder.event_fed,
+            blocks,
+            digest_xor: xor,
+            digest_sum: sum,
+        })
     }
 
     /// Drop every block of one holder ahead of a snapshot replacement
@@ -1239,6 +1344,8 @@ impl Engine {
         had
     }
 
+    /// The keyspaces a `Pull` walks (a stable set; each is then
+    /// snapshotted holder by holder).
     pub fn snapshot_keys(&self) -> Vec<KeyspaceKey> {
         self.all_spaces().into_iter().map(|(k, _)| k).collect()
     }
@@ -1412,7 +1519,6 @@ impl Engine {
     }
 }
 
-/// Point-in-time engine gauges (see [`Engine::stats`]).
 /// One holder's anti-entropy summary; see [`Engine::holder_digests`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HolderDigest {
@@ -1426,6 +1532,7 @@ pub struct HolderDigest {
     pub digest_sum: u64,
 }
 
+/// Point-in-time engine gauges (see [`Engine::stats`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EngineStats {
     pub keyspaces: usize,
@@ -1627,6 +1734,23 @@ mod tests {
             .into_iter()
             .map(|s| (s.holder, s.matched_blocks))
             .collect()
+    }
+
+    /// `(_count, _sum seconds)` of the capacity-cut histogram. Read
+    /// through the rendered text because `LatencyHistogram`'s counters
+    /// are private — which also pins what `/metrics` actually serves,
+    /// the only place these numbers are ever consumed.
+    fn cut_histogram(engine: &Engine) -> (u64, f64) {
+        let text = engine.cut_latency().render("cut");
+        let value = |prefix: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` line in:\n{text}"))
+                .to_owned()
+        };
+        let count = value("cut_count ").parse().expect("_count is an integer");
+        let sum = value("cut_sum ").parse().expect("_sum is seconds");
+        (count, sum)
     }
 
     #[test]
@@ -1839,10 +1963,12 @@ mod tests {
             default_capacity_blocks: 64,
             ..EngineConfig::default()
         });
+        let rounds = 40u64;
+        let per_round = 24u64;
         let mut seed = 1000u32;
-        for round in 0..40 {
+        for round in 0..rounds {
             // ~3 capacities of fresh chains per round, 8 blocks each.
-            for _ in 0..24 {
+            for _ in 0..per_round {
                 seed += 1;
                 engine.apply(&placement("w1", seed, 8));
             }
@@ -1866,6 +1992,17 @@ mod tests {
             );
             space.tree.audit().expect("audit");
         }
+        // Amortization, which only the counter can show: each cut takes
+        // the holder from the 2x bound back to 1x, so it cannot fire
+        // again until a full capacity (8 chains here) of fresh blocks
+        // has landed. A cut per apply is the storm this hysteresis
+        // exists to prevent, and it leaves every assertion above green.
+        let applies = rounds * per_round;
+        let (cuts, _) = cut_histogram(&engine);
+        assert!(
+            cuts <= applies / 8,
+            "{cuts} cuts for {applies} applies: the cut stopped leaving headroom"
+        );
     }
 
     /// Soak-shaped memory probe (ignored; run with --nocapture): 64
@@ -2041,6 +2178,42 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// The query contract the runs answer changed, pinned: scoring any
+    /// overlap is not lane-only behaviour — an ordinary event-fed
+    /// worker that evicted its own prefix answers with depth 0 too. A
+    /// non-empty answer list therefore does not mean "cache-hit
+    /// candidates exist"; only `matched_blocks > 0` does, and a
+    /// consumer that routes on the former sends the request to a worker
+    /// holding no prefix at all (see [`HolderScore`]).
+    #[test]
+    fn a_holder_with_only_mid_chain_coverage_answers_at_depth_zero() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(61, 4));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain.clone(),
+            }],
+        ));
+        engine.apply(&event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Removed {
+                seq_hashes: chain[..2].iter().map(|b| b.seq_hash).collect(),
+            }],
+        ));
+        let answers = engine.find_matches(&keyspace(), &prefix_hashes(61, 4));
+        assert_eq!(answers.len(), 1, "the overlap is still answered");
+        assert_eq!(answers[0].matched_blocks, 0, "no prefix from position 0");
+        assert_eq!(answers[0].intervals, vec![(2, 4)]);
+        assert!(
+            answers[0].lane_meta.is_empty(),
+            "no lane published this holder"
+        );
+    }
+
     /// Lifecycle control names the worker; its lanes follow. A lane can
     /// also be dropped on its own.
     #[test]
@@ -2135,8 +2308,19 @@ mod tests {
             default_capacity_blocks: 4,
             ..EngineConfig::default()
         });
-        engine.apply(&placement("w1", 3, 9)); // crosses 8 -> cut to 4
+        let long = placement("w1", 3, 9);
+        engine.apply(&long); // crosses 8 -> cut to 4
         assert_eq!(engine.entry_count(), 4);
+        // The histogram's `_count`, not the block count, is what tells
+        // "cut once" apart from "cut twice to the same size":
+        // `cuts ~= applies` is the storm, and it is invisible in
+        // `entry_count` alone.
+        let (cuts, seconds) = cut_histogram(&engine);
+        assert_eq!(cuts, 1, "one cut");
+        assert!(
+            seconds > 0.0,
+            "the cut's duration is what queries stall behind: keep it measured"
+        );
         // Fresh chains now accumulate up to the bound without cuts.
         let fresh = placement("w1", 7, 3);
         assert!(engine.apply(&fresh).changed);
@@ -2145,6 +2329,17 @@ mod tests {
         // the loop terminates in one hop.
         assert!(!engine.apply(&fresh).changed);
         assert_eq!(engine.entry_count(), 7);
+        assert_eq!(cut_histogram(&engine).0, 1, "no cut below the bound");
+        // The residual the docstring scopes: a chain longer than 2x
+        // capacity cannot fit under the bound, so its echo re-crosses
+        // and re-cuts forever. Pinned so the claim is not quietly
+        // widened — closing it needs a bound that knows the longest
+        // chain, not a wider promise here.
+        assert!(
+            engine.apply(&long).changed,
+            "a chain past 2x capacity re-applies as changed (known residual)"
+        );
+        assert!(cut_histogram(&engine).0 > 1);
     }
 
     /// The cut keeps what was published most recently, not what is
@@ -2198,6 +2393,42 @@ mod tests {
             vec![("w1".into(), 4)],
             "freshest intact"
         );
+    }
+
+    /// A confirmed digest is a publish for the cut's recency order too.
+    /// It applies nothing, so without a touch the chain keeps the tick
+    /// of its last FULL send while colder chains sent in full get fresh
+    /// ones — the cut then evicts precisely the chain the publisher
+    /// keeps confirming, whose next digest misses and costs a full
+    /// resend plus a re-prefill on the worker.
+    #[test]
+    fn confirmed_digest_refreshes_the_chain_for_the_capacity_cut() {
+        let engine = Engine::new(EngineConfig {
+            default_capacity_blocks: 8,
+            ..EngineConfig::default()
+        });
+        engine.apply(&placement("w1", 81, 4)); // the hot chain, sent first
+        engine.apply(&placement("w1", 82, 10));
+        assert_eq!(
+            engine.apply(&digest("w1", 81, 4)).outcome,
+            ApplyOutcome::Applied,
+            "the chain is resident, so the digest confirms"
+        );
+        engine.apply(&placement("w1", 83, 3)); // 17 > 16 -> cut to 8
+        assert_eq!(engine.entry_count(), 8);
+        assert_eq!(
+            scores(&engine, 81, 4),
+            vec![("w1".into(), 4)],
+            "the digest-confirmed chain survives the cut whole"
+        );
+        assert_eq!(
+            scores(&engine, 83, 3),
+            vec![("w1".into(), 3)],
+            "the freshest chain is intact"
+        );
+        // The chain nobody republished is the victim, trimmed
+        // deepest-first to what the ceiling leaves.
+        assert_eq!(scores(&engine, 82, 10), vec![("w1".into(), 1)]);
     }
 
     #[test]
@@ -2414,6 +2645,130 @@ mod tests {
         engine.sweep_idle();
         assert_eq!(engine.stats().holders, 0, "dropped idle holder must retire");
         assert_eq!(engine.stats().keyspaces, 0);
+    }
+
+    /// The backstop sets `dropped` AND `soft_retired`, so a real
+    /// departure signal arriving afterwards has no `dropped` transition
+    /// to ride: unless it downgrades the soft-retire, an operator's
+    /// explicit drop is a no-op and the holder sits out the whole
+    /// backstop window instead of retiring one idle TTL later.
+    #[test]
+    fn a_real_drop_downgrades_a_backstop_soft_retire() {
+        // Margins mirror the healing-batch test: the backstop window is
+        // 2 x event_ttl and `sleep` overshoots on a loaded box.
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::from_millis(1),
+            event_ttl: Duration::from_millis(200),
+            ..EngineConfig::default()
+        });
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(55, 4)),
+            }],
+        ));
+        std::thread::sleep(Duration::from_millis(250));
+        engine.sweep_idle(); // soft-retired: entry and blocks retained
+        assert_eq!(engine.stats().holders, 1);
+        assert_eq!(engine.entry_count(), 4);
+
+        // The fleet's removal workflow publishes the drop late.
+        engine.apply(&UpdateMsg {
+            dropped: true,
+            ..event_batch("w1", 0, Vec::new())
+        });
+        std::thread::sleep(Duration::from_millis(2));
+        engine.sweep_idle();
+        assert_eq!(
+            engine.stats().holders,
+            0,
+            "a real drop retires after the idle TTL, not the backstop window"
+        );
+    }
+
+    /// `soft_retired` has no wire representation, so a Pull of a
+    /// soft-retired holder must land as a soft-retire too. A puller
+    /// that reset the flag retired the holder one idle TTL into the
+    /// same silence and threw away exactly the state the source is
+    /// holding for the healing batch: the worker's next delta then had
+    /// no parent to anchor on there, so that replica under-matched the
+    /// worker permanently against the one it bootstrapped from.
+    #[test]
+    fn a_pulled_soft_retire_keeps_its_state_for_the_healing_batch() {
+        let cfg = || EngineConfig {
+            inferred_ttl: Duration::from_millis(1),
+            event_ttl: Duration::from_millis(200),
+            ..EngineConfig::default()
+        };
+        let engine = Engine::new(cfg());
+        let chain = placement_chain(&prefix_hashes(56, 5));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain.clone(),
+            }],
+        ));
+        std::thread::sleep(Duration::from_millis(250));
+        engine.sweep_idle(); // soft-retired, blocks retained
+
+        let replica = Engine::new(cfg());
+        for key in engine.snapshot_keys() {
+            for holder in engine.snapshot_holders(&key) {
+                for chunk in engine.snapshot_holder(&key, &holder) {
+                    replica.apply_snapshot(&chunk);
+                }
+            }
+        }
+        assert_eq!(replica.entry_count(), 5, "the puller lands the blocks");
+        // Past the idle TTL, inside the backstop window: the source
+        // holds, so the puller must hold.
+        std::thread::sleep(Duration::from_millis(2));
+        replica.sweep_idle();
+        assert_eq!(
+            replica.stats().holders,
+            1,
+            "a pulled soft-retire keeps its entry"
+        );
+        assert_eq!(replica.entry_count(), 5, "...and its blocks");
+        // The healing batch resolves its parent, so the OLD blocks
+        // score again — the same outcome the source replica gives.
+        replica.apply(&event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Stored {
+                parent: Some(chain[4].seq_hash),
+                blocks: placement_chain(&prefix_hashes(56, 6))[5..].to_vec(),
+            }],
+        ));
+        assert_eq!(scores(&replica, 56, 6), vec![("w1".into(), 6)]);
+    }
+
+    /// The two drivers must fold the same thing: anti-entropy compares
+    /// the local digest against a peer's, so a driver that skipped or
+    /// double-counted a holder would plan pulls forever against a
+    /// replica that is already converged.
+    #[tokio::test]
+    async fn the_yielding_digest_walk_matches_the_synchronous_one() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 91, 6));
+        engine.apply(&placement("w2", 92, 3));
+        // Mid-chain removal: the fold is position-bound, so this is
+        // where an order-dependent walk would show up as a difference.
+        engine.apply(&event_batch(
+            "w2",
+            1,
+            vec![WireEvent::Removed {
+                seq_hashes: vec![placement_chain(&prefix_hashes(92, 3))[1].seq_hash],
+            }],
+        ));
+        let sync = engine.holder_digests();
+        assert_eq!(sync.len(), 2, "both holders are folded");
+        assert!(sync.iter().all(|d| d.blocks > 0));
+        assert_eq!(engine.holder_digests_yielding().await, sync);
     }
 
     #[test]

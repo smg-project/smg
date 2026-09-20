@@ -4,7 +4,7 @@
 //! vocabulary as publishers, so replicas copy — they never agree.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -38,10 +38,25 @@ type PullStream = Pin<Box<dyn Stream<Item = Result<proto::Update, Status>> + Sen
 const RELAY_QUEUE: usize = 65_536;
 
 fn relay_queue_len() -> usize {
-    std::env::var("RADIX_RELAY_QUEUE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(RELAY_QUEUE)
+    parse_relay_queue(std::env::var("RADIX_RELAY_QUEUE").ok().as_deref())
+}
+
+/// Unset keeps the default; a value that IS set must be a positive
+/// integer. Fatal on anything else, like the flag parser in
+/// [`crate::cli`]: a typo'd bound (`64k`) that fell back to 65_536 would
+/// leave an overflow drill measuring the default depth and reporting a
+/// false negative, and `0` reaches `mpsc::channel(0)`, which panics
+/// inside service construction rather than here at startup.
+fn parse_relay_queue(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return RELAY_QUEUE;
+    };
+    let len = raw.trim().parse::<usize>().unwrap_or(0);
+    assert!(
+        len > 0,
+        "RADIX_RELAY_QUEUE must be a positive integer, got {raw:?}"
+    );
+    len
 }
 
 /// Process counters for the metrics endpoint. Shared between the gRPC
@@ -51,15 +66,28 @@ pub struct ServiceStats {
     pub applies: AtomicU64,
     pub queries: AtomicU64,
     pub relay_dropped: AtomicU64,
-    /// Engine time per applied update (the write path's own cost, not
-    /// including transport or queueing).
-    pub apply_latency: LatencyHistogram,
+    /// Engine time for one applied BATCH (the write path's own cost, not
+    /// including transport or queueing). Observed once per batch, never
+    /// divided across its members: one apply stalling 30 ms behind a
+    /// keyspace write lock inside a 256-update batch has to land in the
+    /// 25/50 ms buckets, but dividing first files all 256 observations
+    /// under 250 µs — and batches only reach 256 UNDER write pressure,
+    /// so the divisor is largest exactly when latency is worst and p99
+    /// would flatten as the system degrades. Per-update cost stays
+    /// exact as `_sum / applies_total`, with the tail still readable.
+    pub apply_batch_latency: LatencyHistogram,
     /// Engine time per answered query (the read path's own cost).
     pub query_latency: LatencyHistogram,
-    /// Anti-entropy rounds completed against a peer, and holders replaced
-    /// from a peer because it was provably ahead.
+    /// Anti-entropy rounds completed against a peer, holders replaced
+    /// from a peer because it was provably ahead, and rounds that failed
+    /// before they could compare anything. The failure count is the only
+    /// outward sign that the backstop is broken: `anti_entropy_rounds`
+    /// moves only after the digests call succeeds, so a wrong peer URL
+    /// or a peer too old to serve `Digests` otherwise looks exactly like
+    /// a converged fleet.
     pub anti_entropy_rounds: AtomicU64,
     pub anti_entropy_holders_pulled: AtomicU64,
+    pub anti_entropy_failures: AtomicU64,
     /// Flipped true once the bootstrap pull (if any) has completed; the
     /// admin listener's /readyz reports it.
     pub ready: AtomicBool,
@@ -67,9 +95,12 @@ pub struct ServiceStats {
 
 /// Upper bounds of the latency buckets, in microseconds. Spans the
 /// tens-of-µs an in-memory apply or query takes to the tens of ms a
-/// lock convoy would show; a gateway's 2 ms query deadline falls on a
-/// bucket edge so "over deadline" is readable straight off the
-/// histogram.
+/// lock convoy would show. ENGINE time only: a gateway's query deadline
+/// is a round-trip budget (serialization, network, queueing behind other
+/// work on the shared runtime, the ack hop back), and those are the
+/// parts that miss it under load — so this histogram can read entirely
+/// under 2 ms while the caller is timing out, and "over deadline" is
+/// only answerable from the client side.
 const LATENCY_BUCKETS_US: [u64; 12] = [
     10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 25_000, 50_000,
 ];
@@ -79,19 +110,25 @@ const LATENCY_BUCKETS_US: [u64; 12] = [
 #[derive(Debug, Default)]
 pub struct LatencyHistogram {
     buckets: [AtomicU64; LATENCY_BUCKETS_US.len() + 1],
-    sum_us: AtomicU64,
+    sum_ns: AtomicU64,
     count: AtomicU64,
 }
 
 impl LatencyHistogram {
     pub fn observe(&self, elapsed: Duration) {
-        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        // Nanoseconds, not `as_micros()`: truncation drops up to 1 µs per
+        // observation, and anything genuinely sub-µs truncates to zero —
+        // `_sum` would stay flat while `_count` climbed and the derived
+        // average would render as exactly 0, which reads as a broken
+        // exporter rather than as a fast path. Bucketing compares in ns
+        // too, so an 11 µs sample cannot round down into the 10 µs edge.
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let idx = LATENCY_BUCKETS_US
             .iter()
-            .position(|&bound| us <= bound)
+            .position(|&bound| ns <= bound.saturating_mul(1_000))
             .unwrap_or(LATENCY_BUCKETS_US.len());
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
-        self.sum_us.fetch_add(us, Ordering::Relaxed);
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -110,7 +147,7 @@ impl LatencyHistogram {
         out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {cumulative}\n"));
         out.push_str(&format!(
             "{name}_sum {}\n{name}_count {}\n",
-            self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.sum_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
             self.count.load(Ordering::Relaxed)
         ));
         out
@@ -250,8 +287,13 @@ impl RadixIndex for IndexService {
         // task blocks on send, tonic stops reading, and HTTP/2 flow
         // control pushes back on the publisher — instead of an
         // unbounded queue quietly absorbing an OOM (audit finding).
+        // The decoded form rides along with the wire form: the applier
+        // needs the first and the relay forwards the second, and decoding
+        // on the inbound side is what lets a malformed update be rejected
+        // to the publisher's face instead of normalised into a keyspace
+        // it never meant to write.
         let (delayed_tx, mut delayed_rx) =
-            mpsc::channel::<(tokio::time::Instant, proto::Update)>(65_536);
+            mpsc::channel::<(tokio::time::Instant, proto::Update, UpdateMsg)>(65_536);
         let apply_engine = Arc::clone(&engine);
         let apply_relay = relay.clone();
         let apply_stats = Arc::clone(&self.stats);
@@ -275,13 +317,23 @@ impl RadixIndex for IndexService {
                         Err(_) => break,
                     }
                 }
-                // Honor the latest injected staleness deadline in the
+                // Honor the LATEST injected staleness deadline in the
                 // batch (fault-drill legs); zero-delay batches fall
-                // through immediately.
-                if let Some((deadline, _)) = batch.last() {
-                    tokio::time::sleep_until(*deadline).await;
+                // through immediately. Deadlines are not monotonic
+                // within a batch — `delay` is picked per update from its
+                // own event kinds, so a zero-delay Removed update can
+                // follow a 200 ms Stored one — and taking the last
+                // element's deadline would drain the delayed update
+                // early, injecting less staleness than the leg
+                // configured and quietly understating what the sweep
+                // measures.
+                if let Some(deadline) = batch.iter().map(|(deadline, ..)| *deadline).max() {
+                    tokio::time::sleep_until(deadline).await;
                 }
-                let msgs: Vec<UpdateMsg> = batch.iter().map(|(_, u)| UpdateMsg::from(u)).collect();
+                let (protos, msgs): (Vec<proto::Update>, Vec<UpdateMsg>) = batch
+                    .into_iter()
+                    .map(|(_, proto, msg)| (proto, msg))
+                    .unzip();
                 let mut results: Vec<Applied> = Vec::with_capacity(msgs.len());
                 let apply_started = std::time::Instant::now();
                 let mut k = 0;
@@ -301,12 +353,16 @@ impl RadixIndex for IndexService {
                 apply_stats
                     .applies
                     .fetch_add(msgs.len() as u64, Ordering::Relaxed);
-                // Engine time per update: a batch's cost spread over its
-                // members, so the histogram reads per update either way.
-                let per_update = apply_started.elapsed() / msgs.len().max(1) as u32;
-                for _ in 0..msgs.len() {
-                    apply_stats.apply_latency.observe(per_update);
-                }
+                // ONE observation for the whole batch (see
+                // `ServiceStats::apply_batch_latency`): dividing the cost
+                // across the batch erases the convoy the histogram exists
+                // to show, and the divided form also cost 3 atomic
+                // read-modify-writes per update on three cache lines
+                // shared by every publisher stream — cross-core
+                // contention added straight to the write path.
+                apply_stats
+                    .apply_batch_latency
+                    .observe(apply_started.elapsed());
 
                 let mut closed = false;
                 for (idx, msg) in msgs.iter().enumerate() {
@@ -327,7 +383,7 @@ impl RadixIndex for IndexService {
                     // hop; bounded O(K^2) fan-out).
                     if applied.changed {
                         for peer in &apply_relay {
-                            if peer.try_send(batch[idx].1.clone()).is_err() {
+                            if peer.try_send(protos[idx].clone()).is_err() {
                                 apply_stats.relay_dropped.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -379,6 +435,22 @@ impl RadixIndex for IndexService {
                         .await;
                     break;
                 }
+                // Same reasoning as the scheme gate, one step further in:
+                // a missing keyspace, an unknown symbol kind or an event
+                // with no kind set used to be normalised away, which put
+                // the publisher's state in a keyspace none of its queries
+                // read while its acks kept arriving. Fail the stream so
+                // the misconfiguration is visible at the publisher.
+                let msg = match UpdateMsg::try_from(&update) {
+                    Ok(msg) => msg,
+                    Err(error) => {
+                        tracing::warn!(%error, holder = %update.holder, "malformed update; failing the publish stream");
+                        let _ = reject_tx
+                            .send(Err(Status::invalid_argument(error.to_string())))
+                            .await;
+                        break;
+                    }
+                };
                 let mut delay = Duration::ZERO;
                 for event in &update.events {
                     match event.kind.as_ref() {
@@ -388,7 +460,7 @@ impl RadixIndex for IndexService {
                     }
                 }
                 let deadline = tokio::time::Instant::now() + delay;
-                if delayed_tx.send((deadline, update)).await.is_err() {
+                if delayed_tx.send((deadline, update, msg)).await.is_err() {
                     break;
                 }
             }
@@ -489,18 +561,20 @@ impl RadixIndex for IndexService {
         )))
     }
 
-    /// Bootstrap stream, produced LAZILY one holder at a time as the
-    /// puller drains: the serving replica never materializes a second
-    /// copy of its whole index (at production sizing that transient was
-    /// a multi-GB spike on the HEALTHY replica whenever a sibling
-    /// restarted — the wrong direction for a fault-tolerance story).
+    /// The peer-visible half of anti-entropy: every holder's (epoch,
+    /// seq, block count, set digest) in one unary response, so a replica
+    /// can decide what it needs without streaming any state. A full-index
+    /// fold (see [`Engine::holder_digests_yielding`]) taking one read
+    /// lock per holder, never a long hold, and yielding between holders
+    /// so a large index does not stall the runtime worker.
     async fn digests(
         &self,
         _request: Request<proto::PullRequest>,
     ) -> Result<Response<proto::DigestsResponse>, Status> {
         let holders = self
             .engine
-            .holder_digests()
+            .holder_digests_yielding()
+            .await
             .into_iter()
             .map(|d| proto::HolderDigest {
                 keyspace: Some(keyspace_to_proto(&d.keyspace)),
@@ -542,6 +616,11 @@ impl RadixIndex for IndexService {
         )))
     }
 
+    /// Bootstrap stream, produced LAZILY one holder at a time as the
+    /// puller drains: the serving replica never materializes a second
+    /// copy of its whole index (at production sizing that transient was
+    /// a multi-GB spike on the HEALTHY replica whenever a sibling
+    /// restarted — the wrong direction for a fault-tolerance story).
     #[expect(
         clippy::disallowed_methods,
         reason = "per-stream producer task, bounded by the stream's lifetime"
@@ -592,22 +671,101 @@ fn keyspace_from_proto(ks: Option<&proto::Keyspace>) -> KeyspaceKey {
     }
 }
 
-/// The holders to pull from a peer, given both sides' digests.
+/// Holders our own sweeper retired recently, so a round does not read a
+/// peer's not-yet-swept copy as "we are behind" and resurrect them.
 ///
-/// A peer is *provably ahead* on a holder when it carries a higher
-/// (epoch, seq) watermark, or the same watermark over a different block
-/// set: sequenced (event-fed) state is deterministic per watermark, so a
-/// different set at the same seq means one side applied something the
-/// other never saw (a relay lost to a partition, a wedged peer, a
-/// bootstrap that landed between two batches). Placement-fed holders
-/// (seq 0) are unsequenced and inferred — replicas copy them, never
-/// agree on them by design (TTL and re-placement bound that divergence),
-/// so they are pulled only when missing entirely. Ties on watermark
-/// AND digest are converged and skipped; a peer BEHIND us is its
-/// problem to notice on its own round (the rule is symmetric).
+/// Retirement ([`Engine::sweep_idle`]) removes the holder entry outright
+/// on a local, clock-driven decision, so two replicas never make it at
+/// the same instant — they differ by up to a sweep interval plus skew.
+/// Absence carries no watermark, so without this the replica that swept
+/// first pulls the holder straight back (a zero-block holder still
+/// produces a snapshot chunk, which recreates the entry with a fresh
+/// idle clock, and if the pull beats the peer's own TTL clear the stale
+/// blocks come back too and answer queries again). Retirement would be
+/// undone instead of propagated: a dead worker's entry survives
+/// indefinitely and the placement-only keyspace it pins is never
+/// collected.
+///
+/// Nothing but retirement removes a holder entry, so a name that was in
+/// our digests last round and is gone this round was retired here — no
+/// extra bookkeeping in the engine is needed to notice it.
+#[derive(Debug)]
+pub struct RetiredHolders {
+    /// How long a retirement suppresses a pull. Must outrun the peer's
+    /// own sweep plus a round of its own; past it, whatever the peer
+    /// still carries is a live holder rather than our retirement, and a
+    /// worker that really came back is pulled normally.
+    window: Duration,
+    seen: HashSet<(KeyspaceKey, String)>,
+    tombstones: HashMap<(KeyspaceKey, String), std::time::Instant>,
+}
+
+impl RetiredHolders {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            seen: HashSet::new(),
+            tombstones: HashMap::new(),
+        }
+    }
+
+    /// Fold one round's local digests in and return the holders that are
+    /// still tombstoned. The first call only records what we hold, so a
+    /// cold replica pulls everything the peer has, as it must.
+    pub fn observe(&mut self, local: &[HolderDigest]) -> HashSet<(KeyspaceKey, String)> {
+        let now = std::time::Instant::now();
+        let window = self.window;
+        let current: HashSet<(KeyspaceKey, String)> = local
+            .iter()
+            .map(|d| (d.keyspace.clone(), d.holder.clone()))
+            .collect();
+        for gone in self.seen.difference(&current) {
+            self.tombstones.insert(gone.clone(), now);
+        }
+        self.tombstones
+            .retain(|_, stamped| now.duration_since(*stamped) < window);
+        self.seen = current;
+        self.tombstones.keys().cloned().collect()
+    }
+}
+
+/// The holders to pull from a peer, given both sides' digests, ignoring
+/// recent local retirements (see [`plan_anti_entropy_excluding`]).
 pub fn plan_anti_entropy(
     local: &[HolderDigest],
     remote: &[HolderDigest],
+) -> Vec<(KeyspaceKey, String)> {
+    plan_anti_entropy_excluding(local, remote, &HashSet::new())
+}
+
+/// The holders to pull from a peer, given both sides' digests and the
+/// holders we retired recently (`retired`, from [`RetiredHolders`]).
+///
+/// A peer is *provably ahead* on a holder when it carries a higher
+/// (epoch, seq) watermark, or the same watermark over a block set that
+/// wins the digest tie-break: sequenced (event-fed) state is
+/// deterministic per watermark, so a different set at the same seq means
+/// one side applied something the other never saw (a relay lost to a
+/// partition, a wedged peer, a bootstrap that landed between two
+/// batches). At an equal watermark neither side is authoritative, so the
+/// digest itself decides, under a total order both replicas evaluate
+/// identically — exactly one of them pulls. A bare "differs, so pull" is
+/// symmetric in the direction that never converges: two rounds racing on
+/// independent timers swap the two states instead of agreeing, and each
+/// swap is a clear plus a full snapshot replace under the write lock.
+///
+/// Placement-fed holders (seq 0) are unsequenced and inferred — replicas
+/// copy them, never agree on them by design (TTL and re-placement bound
+/// that divergence), so they are pulled only when missing entirely.
+/// Missing, however, is not the same as behind: a holder absent because
+/// we retired it seconds ago is skipped, or anti-entropy would undo
+/// retirements instead of propagating them. Ties on watermark AND digest
+/// are converged and skipped; a peer BEHIND us is its problem to notice
+/// on its own round.
+pub fn plan_anti_entropy_excluding(
+    local: &[HolderDigest],
+    remote: &[HolderDigest],
+    retired: &HashSet<(KeyspaceKey, String)>,
 ) -> Vec<(KeyspaceKey, String)> {
     let mut mine: HashMap<(&KeyspaceKey, &str), &HolderDigest> = HashMap::new();
     for d in local {
@@ -616,15 +774,21 @@ pub fn plan_anti_entropy(
     let mut pull = Vec::new();
     for theirs in remote {
         match mine.get(&(&theirs.keyspace, theirs.holder.as_str())) {
-            None => pull.push((theirs.keyspace.clone(), theirs.holder.clone())),
+            None => {
+                let id = (theirs.keyspace.clone(), theirs.holder.clone());
+                if !retired.contains(&id) {
+                    pull.push(id);
+                }
+            }
             Some(ours) => {
                 let ahead = (theirs.epoch, theirs.last_seq) > (ours.epoch, ours.last_seq);
                 let same_mark = (theirs.epoch, theirs.last_seq) == (ours.epoch, ours.last_seq);
-                let differs = theirs.digest_xor != ours.digest_xor
-                    || theirs.digest_sum != ours.digest_sum
-                    || theirs.blocks != ours.blocks;
+                // Total order over the digest: which set wins does not
+                // matter, agreeing on a winner does.
+                let theirs_wins = (theirs.blocks, theirs.digest_xor, theirs.digest_sum)
+                    > (ours.blocks, ours.digest_xor, ours.digest_sum);
                 let sequenced = theirs.event_fed || ours.event_fed;
-                if ahead || (same_mark && differs && sequenced) {
+                if ahead || (same_mark && theirs_wins && sequenced) {
                     pull.push((theirs.keyspace.clone(), theirs.holder.clone()));
                 }
             }
@@ -635,11 +799,30 @@ pub fn plan_anti_entropy(
 
 /// One anti-entropy round against `peer`: fetch its digests, plan, and
 /// replace every planned holder wholesale from the peer's snapshot.
-/// Returns the number of holders replaced.
+/// Returns the number of holders replaced. `retired` carries this
+/// replica's recent retirements across rounds (see [`RetiredHolders`]).
 pub async fn anti_entropy_round(
     engine: &Engine,
     peer: &str,
     stats: &ServiceStats,
+    retired: &mut RetiredHolders,
+) -> Result<usize, tonic::Status> {
+    let outcome = anti_entropy_round_inner(engine, peer, stats, retired).await;
+    if outcome.is_err() {
+        // Counted separately because `anti_entropy_rounds` only moves
+        // after the digests call succeeds: a round that never got to
+        // compare anything would otherwise leave no trace at all, and
+        // this is the only repair path once the missed deltas are gone.
+        stats.anti_entropy_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    outcome
+}
+
+async fn anti_entropy_round_inner(
+    engine: &Engine,
+    peer: &str,
+    stats: &ServiceStats,
+    retired: &mut RetiredHolders,
 ) -> Result<usize, tonic::Status> {
     let mut client = RadixIndexClient::connect(peer.to_string())
         .await
@@ -663,7 +846,9 @@ pub async fn anti_entropy_round(
             digest_sum: d.digest_sum,
         })
         .collect();
-    let plan = plan_anti_entropy(&engine.holder_digests(), &remote);
+    let local = engine.holder_digests_yielding().await;
+    let tombstoned = retired.observe(&local);
+    let plan = plan_anti_entropy_excluding(&local, &remote, &tombstoned);
     stats.anti_entropy_rounds.fetch_add(1, Ordering::Relaxed);
     if plan.is_empty() {
         return Ok(0);
@@ -679,22 +864,40 @@ pub async fn anti_entropy_round(
         .pull_holders(Request::new(proto::PullHoldersRequest { holders: refs }))
         .await?
         .into_inner();
-    // Clear each planned holder on its FIRST chunk, so blocks the peer
-    // removed while we were apart do not survive, then apply the chunks
-    // as authoritative snapshot state.
-    let mut cleared: std::collections::HashSet<(KeyspaceKey, String)> =
-        std::collections::HashSet::new();
+    // Buffer a holder's chunks, then clear and refill it back to back.
+    // Clearing on the first chunk and applying the rest as they arrive
+    // off the wire is safe for `Pull` (bootstrap runs before the replica
+    // serves, behind a 503 /readyz) but not here: anti-entropy repairs a
+    // LIVE replica, a holder above the snapshot chunk size arrives as
+    // several messages, and every query landing in that window saw the
+    // holder rebuilt only as far as the network had got. A peer that
+    // died mid-stream left it truncated for good — the snapshot has
+    // already stamped the peer's watermark on it, so a placement-fed
+    // holder is not even re-planned next round. The cost is one holder's
+    // chunks in memory, which the peer materialized anyway to send them.
     let mut replaced = 0usize;
+    let mut chunks: Vec<UpdateMsg> = Vec::new();
     while let Some(update) = stream.next().await {
-        let update = update?;
-        let msg = UpdateMsg::from(&update);
-        let id = (msg.keyspace.clone(), msg.holder.clone());
-        if !cleared.contains(&id) {
-            engine.clear_holder(&msg.keyspace, &msg.holder);
-            cleared.insert(id);
+        // A peer that sends a chunk we cannot read is a version or a
+        // corruption problem, not a per-holder one. Abort the round and
+        // let the next one re-plan rather than writing half a repair.
+        let msg = UpdateMsg::try_from(&update?)
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        // `pull_holders` emits one holder's chunks consecutively, so the
+        // first chunk of the next holder completes the previous one.
+        let boundary = chunks
+            .first()
+            .is_some_and(|head| head.keyspace != msg.keyspace || head.holder != msg.holder);
+        if boundary {
+            replace_holder(engine, &chunks);
             replaced += 1;
+            chunks.clear();
         }
-        engine.apply_snapshot(&msg);
+        chunks.push(msg);
+    }
+    if !chunks.is_empty() {
+        replace_holder(engine, &chunks);
+        replaced += 1;
     }
     stats
         .anti_entropy_holders_pulled
@@ -704,6 +907,35 @@ pub async fn anti_entropy_round(
     }
     Ok(replaced)
 }
+
+/// Swap one holder's state for the peer's snapshot: clear (so blocks the
+/// peer removed while we were apart do not survive), then apply every
+/// buffered chunk. Empty input is a peer that retired the holder between
+/// its digests and our pull — leave ours alone.
+fn replace_holder(engine: &Engine, chunks: &[UpdateMsg]) {
+    let Some(head) = chunks.first() else {
+        return;
+    };
+    engine.clear_holder(&head.keyspace, &head.holder);
+    for chunk in chunks {
+        engine.apply_snapshot(chunk);
+    }
+}
+
+/// Consecutive failed rounds against one peer before the log line moves
+/// from `debug!` to `warn!`, and how often it repeats after that. A
+/// partition heals on its own and must not be noisy; a wrong peer URL or
+/// a peer too old to serve `Digests` never recovers, and a backstop that
+/// has never run cannot be left to one log line from a week ago.
+const FAILURES_BEFORE_WARN: u32 = 3;
+const FAILURES_BETWEEN_WARNS: u32 = 40;
+
+/// How many anti-entropy periods a local retirement suppresses a pull
+/// for. The peer needs its own sweep (shorter than this period in every
+/// shipped configuration) plus a round of its own to reach the same
+/// decision, and until it does its copy is not evidence that we are
+/// behind.
+const RETIRE_TOMBSTONE_PERIODS: u32 = 3;
 
 /// Service-lifetime anti-entropy: every `interval`, one round per peer.
 /// `Duration::ZERO` disables it.
@@ -723,11 +955,29 @@ pub fn spawn_anti_entropy(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut retired = RetiredHolders::new(interval * RETIRE_TOMBSTONE_PERIODS);
+        let mut failures = vec![0u32; peers.len()];
         loop {
             tick.tick().await;
-            for peer in &peers {
-                if let Err(error) = anti_entropy_round(&engine, peer, &stats).await {
-                    tracing::debug!(peer, %error, "anti-entropy round skipped");
+            for (idx, peer) in peers.iter().enumerate() {
+                match anti_entropy_round(&engine, peer, &stats, &mut retired).await {
+                    Ok(_) => failures[idx] = 0,
+                    Err(error) => {
+                        failures[idx] = failures[idx].saturating_add(1);
+                        let consecutive = failures[idx];
+                        if consecutive == FAILURES_BEFORE_WARN
+                            || consecutive.is_multiple_of(FAILURES_BETWEEN_WARNS)
+                        {
+                            tracing::warn!(
+                                peer,
+                                %error,
+                                consecutive,
+                                "anti-entropy has not completed a round against this peer"
+                            );
+                        } else {
+                            tracing::debug!(peer, %error, "anti-entropy round skipped");
+                        }
+                    }
                 }
             }
         }
@@ -759,7 +1009,12 @@ pub async fn bootstrap_from(engine: &Engine, peer: &str) -> Result<usize, tonic:
         // bypasses seq-dedup so a holder spanning several chunks (all
         // carrying the same last_seq) reconstructs in full instead of
         // being truncated to the first chunk.
-        engine.apply_snapshot(&UpdateMsg::from(&update));
+        // Bootstrap runs behind the readiness gate, so failing here keeps
+        // a replica that cannot read its peer out of the serving set
+        // instead of letting it answer from a partial snapshot.
+        let msg = UpdateMsg::try_from(&update)
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        engine.apply_snapshot(&msg);
         applied += 1;
     }
     Ok(applied)
@@ -851,6 +1106,14 @@ pub async fn serve_until(
     stats: Arc<ServiceStats>,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
+    // Rejected here, not only in the CLI: the sweeper below is detached,
+    // so a zero interval panics tokio's timer inside a task nobody joins
+    // and the server keeps serving with TTL clearing, retirement and
+    // keyspace GC all silently off.
+    assert!(
+        !sweep_interval.is_zero(),
+        "sweep_interval must be non-zero (a zero interval panics tokio's timer inside the detached sweeper and silently disables TTL/retire)"
+    );
     spawn_anti_entropy(
         Arc::clone(&engine),
         peers.clone(),
@@ -884,6 +1147,9 @@ pub async fn serve_until(
         .await
 }
 
+/// How long an accepted admin connection has to send its request line.
+const ADMIN_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Admin plane on its own port: `/metrics` (Prometheus text),
 /// `/healthz` (liveness: the process answers), `/readyz` (readiness:
 /// bootstrap finished — 503 until then). Deliberately handwritten over
@@ -914,7 +1180,13 @@ pub async fn serve_admin(
         let stats = Arc::clone(&stats);
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            let Ok(n) = socket.read(&mut buf).await else {
+            // Bound the first read: a peer that connects and then sends
+            // nothing holds this task and its fd for the life of the
+            // process, and nothing else caps how many admin connections
+            // accumulate — a scrape target is trivially easy to point a
+            // half-open connection at.
+            let Ok(Ok(n)) = tokio::time::timeout(ADMIN_READ_TIMEOUT, socket.read(&mut buf)).await
+            else {
                 return;
             };
             let request = String::from_utf8_lossy(&buf[..n]);
@@ -945,6 +1217,9 @@ pub async fn serve_admin(
     }
 }
 
+/// Prometheus text for the admin plane. The apply histogram is per
+/// BATCH so the write-lock tail survives; the per-update average is
+/// `radix_index_apply_batch_duration_seconds_sum / radix_index_applies_total`.
 fn render_metrics(engine: &Engine, stats: &ServiceStats) -> String {
     let gauges = engine.stats();
     format!(
@@ -969,12 +1244,8 @@ fn render_metrics(engine: &Engine, stats: &ServiceStats) -> String {
             "radix_index_anti_entropy_rounds_total {}\n",
             "# TYPE radix_index_anti_entropy_holders_pulled_total counter\n",
             "radix_index_anti_entropy_holders_pulled_total {}\n",
-            "# TYPE radix_index_capacity_cuts_total counter\n",
-            "radix_index_capacity_cuts_total {}\n",
-            "# TYPE radix_index_capacity_cut_seconds_total counter\n",
-            "radix_index_capacity_cut_seconds_total {}\n",
-            "# TYPE radix_index_capacity_cut_seconds_max gauge\n",
-            "radix_index_capacity_cut_seconds_max {}\n",
+            "# TYPE radix_index_anti_entropy_failures_total counter\n",
+            "radix_index_anti_entropy_failures_total {}\n",
         ),
         gauges.keyspaces,
         gauges.holders,
@@ -986,20 +1257,30 @@ fn render_metrics(engine: &Engine, stats: &ServiceStats) -> String {
         stats.relay_dropped.load(Ordering::Relaxed),
         stats.anti_entropy_rounds.load(Ordering::Relaxed),
         stats.anti_entropy_holders_pulled.load(Ordering::Relaxed),
-        engine.cut_stats().count.load(Ordering::Relaxed),
-        engine.cut_stats().ns_total.load(Ordering::Relaxed) as f64 / 1e9,
-        engine.cut_stats().ns_max.load(Ordering::Relaxed) as f64 / 1e9,
+        stats.anti_entropy_failures.load(Ordering::Relaxed),
     ) + &stats
-        .apply_latency
-        .render("radix_index_apply_duration_seconds")
+        .apply_batch_latency
+        .render("radix_index_apply_batch_duration_seconds")
         + &stats
             .query_latency
             .render("radix_index_query_duration_seconds")
+        + &engine
+            .cut_latency()
+            .render("radix_index_capacity_cut_duration_seconds")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{EngineConfig, SequenceHash, WireBlock};
+
+    fn keyspace() -> KeyspaceKey {
+        KeyspaceKey {
+            model: "m".into(),
+            symbol_kind: SymbolKind::Tokens,
+            block_size: 4,
+        }
+    }
 
     fn digest(
         holder: &str,
@@ -1010,11 +1291,7 @@ mod tests {
         x: u64,
     ) -> HolderDigest {
         HolderDigest {
-            keyspace: KeyspaceKey {
-                model: "m".into(),
-                symbol_kind: SymbolKind::Tokens,
-                block_size: 4,
-            },
+            keyspace: keyspace(),
             holder: holder.into(),
             epoch,
             last_seq: seq,
@@ -1025,22 +1302,48 @@ mod tests {
         }
     }
 
+    /// One chunk of a holder's snapshot, shaped like `snapshot_holder`
+    /// emits them: every chunk carries the holder's true `seq`, and all
+    /// but the first are parent-linked to the previous chunk's tail.
+    fn chunk(holder: &str, parent: Option<u64>, blocks: &[(u64, u64)], seq: u64) -> UpdateMsg {
+        UpdateMsg {
+            keyspace: keyspace(),
+            holder: holder.into(),
+            epoch: 1,
+            seq,
+            events: vec![WireEvent::Stored {
+                parent: parent.map(SequenceHash),
+                blocks: blocks
+                    .iter()
+                    .map(|&(seq_hash, content)| WireBlock {
+                        seq_hash: SequenceHash(seq_hash),
+                        content_hash: ContentHash(content),
+                    })
+                    .collect(),
+            }],
+            added: None,
+            dropped: false,
+        }
+    }
+
     #[test]
     fn anti_entropy_pulls_only_where_the_peer_is_provably_ahead() {
         let local = vec![
             digest("a", 1, 10, true, 5, 0xA), // converged
             digest("b", 1, 10, true, 5, 0xB), // peer ahead on seq
-            digest("c", 1, 10, true, 5, 0xC), // same seq, different set (lost relay)
+            digest("c", 1, 10, true, 5, 0xC), // same seq, peer's set wins the tie
             digest("d", 1, 0, false, 5, 0xD), // placement-fed, differs: by design
             digest("e", 2, 3, true, 5, 0xE),  // we are ahead: their round's job
+            digest("g", 1, 10, true, 9, 0x9), // same seq, OUR set wins the tie
         ];
         let remote = vec![
             digest("a", 1, 10, true, 5, 0xA),
             digest("b", 1, 12, true, 6, 0xB1),
-            digest("c", 1, 10, true, 4, 0xC1),
+            digest("c", 1, 10, true, 6, 0xC1),
             digest("d", 1, 0, false, 7, 0xD1),
             digest("e", 1, 9, true, 5, 0xE1),
             digest("f", 1, 0, false, 2, 0xF), // missing locally: pulled
+            digest("g", 1, 10, true, 8, 0x8),
         ];
         let plan: Vec<String> = plan_anti_entropy(&local, &remote)
             .into_iter()
@@ -1050,7 +1353,94 @@ mod tests {
     }
 
     #[test]
-    fn latency_histogram_buckets_are_cumulative_and_deadline_readable() {
+    fn a_tied_watermark_is_broken_the_same_way_on_both_replicas() {
+        // Each side runs the rule against its own view. Without a total
+        // order over the digest both classify the other as ahead, so two
+        // rounds on independent timers swap the states instead of
+        // agreeing — and keep swapping, one full holder replace apiece.
+        let a = vec![digest("w", 1, 10, true, 5, 0xA)];
+        let b = vec![digest("w", 1, 10, true, 5, 0xB)];
+        let a_pulls = plan_anti_entropy(&a, &b).len();
+        let b_pulls = plan_anti_entropy(&b, &a).len();
+        assert_eq!(a_pulls + b_pulls, 1, "exactly one side may pull");
+    }
+
+    #[test]
+    fn a_holder_we_just_retired_is_not_pulled_back_from_the_peer() {
+        let mut retired = RetiredHolders::new(Duration::from_secs(60));
+        let before = vec![digest("w7", 1, 0, false, 4, 0x7)];
+        assert!(retired.observe(&before).is_empty(), "nothing retired yet");
+        // Our sweeper retired w7; the peer has not swept yet, so it still
+        // carries the holder. Pulling it back would restart w7's TTL
+        // clock here and pin the placement-only keyspace forever.
+        let tombstoned = retired.observe(&[]);
+        let plan = plan_anti_entropy_excluding(&[], &before, &tombstoned);
+        assert!(plan.is_empty(), "retirement must propagate, not be undone");
+    }
+
+    #[test]
+    fn a_holder_we_have_never_held_is_still_pulled() {
+        // A cold replica, and every genuinely new worker, must still
+        // arrive through the `None` arm.
+        let mut retired = RetiredHolders::new(Duration::from_secs(60));
+        let remote = vec![digest("w8", 1, 0, false, 4, 0x8)];
+        let tombstoned = retired.observe(&[]);
+        assert_eq!(
+            plan_anti_entropy_excluding(&[], &remote, &tombstoned).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_tombstone_expires_so_a_worker_that_came_back_is_pulled_again() {
+        // Past the window the peer has had its own sweep and a round of
+        // its own; whatever it still carries is live state, not our
+        // retirement. A zero window expires everything immediately.
+        let mut retired = RetiredHolders::new(Duration::ZERO);
+        let before = vec![digest("w7", 1, 0, false, 4, 0x7)];
+        retired.observe(&before);
+        let tombstoned = retired.observe(&[]);
+        assert!(tombstoned.is_empty());
+        assert_eq!(
+            plan_anti_entropy_excluding(&[], &before, &tombstoned).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_holder_swap_clears_once_and_keeps_every_chunk() {
+        let engine = Engine::new(EngineConfig::default());
+        // State from before the repair, including blocks the peer no
+        // longer has.
+        engine.apply_snapshot(&chunk("w1", None, &[(11, 101), (12, 102)], 7));
+        // The peer's answer for one holder, chunked as any holder above
+        // SNAPSHOT_CHUNK blocks arrives.
+        let chunks = vec![
+            chunk("w1", None, &[(21, 201), (22, 202)], 9),
+            chunk("w1", Some(22), &[(23, 203)], 9),
+        ];
+        replace_holder(&engine, &chunks);
+        let digests = engine.holder_digests();
+        assert_eq!(digests.len(), 1);
+        // 3: the clear ran ONCE ahead of the chunks, so neither the
+        // peer's removals survived (5) nor did the second chunk wipe the
+        // first (1).
+        assert_eq!(digests[0].blocks, 3, "{digests:?}");
+        assert_eq!(digests[0].last_seq, 9);
+    }
+
+    #[test]
+    fn a_swap_of_an_unknown_holder_is_a_no_op() {
+        // A peer that retired the holder between its digests and our
+        // pull sends no chunks; ours must be left alone.
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply_snapshot(&chunk("w1", None, &[(11, 101)], 7));
+        replace_holder(&engine, &[]);
+        assert_eq!(engine.holder_digests()[0].blocks, 1);
+    }
+
+    #[test]
+    fn latency_histogram_buckets_are_cumulative_and_span_the_engine_range() {
         let h = LatencyHistogram::default();
         h.observe(Duration::from_micros(7)); // <= 10 µs
         h.observe(Duration::from_micros(1_500)); // <= 2 ms
@@ -1062,5 +1452,49 @@ mod tests {
         assert!(text.contains("x_bucket{le=\"0.005\"} 3\n"));
         assert!(text.contains("x_bucket{le=\"+Inf\"} 4\n"));
         assert!(text.contains("x_count 4\n"));
+    }
+
+    #[test]
+    fn latency_histogram_keeps_sub_microsecond_observations() {
+        let h = LatencyHistogram::default();
+        for _ in 0..1_000 {
+            h.observe(Duration::from_nanos(400));
+        }
+        let text = h.render("x");
+        // Truncating to whole µs would have filed every one of these as
+        // 0: `_sum` flat, `_count` climbing, and the derived average
+        // rendering as exactly zero.
+        assert!(text.contains("x_sum 0.0004\n"), "{text}");
+        assert!(text.contains("x_count 1000\n"));
+    }
+
+    #[test]
+    fn latency_histogram_bucketing_does_not_round_down_into_the_floor() {
+        let h = LatencyHistogram::default();
+        h.observe(Duration::from_nanos(10_001)); // just over the 10 µs edge
+        let text = h.render("x");
+        assert!(text.contains("x_bucket{le=\"0.00001\"} 0\n"), "{text}");
+        assert!(text.contains("x_bucket{le=\"0.000025\"} 1\n"), "{text}");
+    }
+
+    #[test]
+    fn relay_queue_falls_back_only_when_unset() {
+        assert_eq!(parse_relay_queue(None), RELAY_QUEUE);
+        assert_eq!(parse_relay_queue(Some("128")), 128);
+    }
+
+    #[test]
+    #[should_panic(expected = "RADIX_RELAY_QUEUE")]
+    fn relay_queue_rejects_a_malformed_value() {
+        // Falling back to the default here would leave an overflow drill
+        // measuring the 65k default and reporting a false negative.
+        let _ = parse_relay_queue(Some("64k"));
+    }
+
+    #[test]
+    #[should_panic(expected = "RADIX_RELAY_QUEUE")]
+    fn relay_queue_rejects_zero() {
+        // `mpsc::channel(0)` panics inside service construction.
+        let _ = parse_relay_queue(Some("0"));
     }
 }

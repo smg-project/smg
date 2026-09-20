@@ -458,6 +458,13 @@ async fn main() {
     let workers: usize = parse_flag(&args, "--workers").unwrap_or(64);
     let chain_len: usize = parse_flag(&args, "--chain-len").unwrap_or(256);
     let hot_per_worker: usize = parse_flag(&args, "--hot-per-worker").unwrap_or(8);
+    // Both are DIVISORS in every traffic generator (`rng % workers`,
+    // `(rng >> 32) % hot_per_worker`), not just fleet sizes. A zero
+    // parses fine and passes `validate_flags`, so without these the run
+    // dies on a divide-by-zero inside a spawned task — a panic that
+    // names neither flag, after the warm fill has already run.
+    assert!(workers > 0, "--workers must be > 0");
+    assert!(hot_per_worker > 0, "--hot-per-worker must be > 0");
     let dup_pct: u64 = parse_flag(&args, "--dup-pct").unwrap_or(90);
     let secs: u64 = parse_flag(&args, "--secs").unwrap_or(15);
     // Per-publisher target updates/sec (0 = max hammer). Model a

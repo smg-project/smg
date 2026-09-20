@@ -267,6 +267,21 @@ fn adopt_epoch(local_epoch: u64, local_seq: u64, known: (u64, u64)) -> Option<u6
     None
 }
 
+/// Does this status mean the worker's event CURSOR is gone, as opposed
+/// to a transport blip we can resume across? Both codes say the backend
+/// can no longer serve `last_seq`: `OutOfRange` is the ring having
+/// wrapped past it, `DataLoss` the backend having dropped the buffer.
+/// Either way the events inside the lost window are unrecoverable, so
+/// resuming from the retained cursor leaves the index scoring blocks the
+/// holder evicted in that window; only a new epoch (implicit clear,
+/// replay from zero) is safe. Shared by the subscribe-time and
+/// mid-stream handlers so the two can never drift apart — they did:
+/// mid-stream took a plain `break` and resubscribed from the stale
+/// cursor.
+fn cursor_lost(code: tonic::Code) -> bool {
+    matches!(code, tonic::Code::OutOfRange | tonic::Code::DataLoss)
+}
+
 /// One worker's subscription loop: resume on plain failures, epoch-bump
 /// on loss signals or sequence gaps. Runs until the publish channel
 /// closes or the worker reports Unimplemented.
@@ -307,7 +322,7 @@ pub async fn worker_loop(
                         return;
                     }
                     // Cursor lost: new generation, replay from zero.
-                    tonic::Code::OutOfRange | tonic::Code::DataLoss => {
+                    code if cursor_lost(code) => {
                         epoch += 1;
                         last_seq = None;
                     }
@@ -318,7 +333,26 @@ pub async fn worker_loop(
             }
         };
         while let Some(batch) = stream.next().await {
-            let Ok(batch) = batch else { break };
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(status) => {
+                    // A mid-stream failure asks the same cursor question
+                    // as a failed subscribe, and it used to be answered
+                    // differently: the bare `break` here resubscribed
+                    // from the retained `last_seq`, so a worker that
+                    // accepted that stale cursor left the bridge resuming
+                    // inside a wrapped ring with no epoch bump — the
+                    // index kept scoring blocks the holder had already
+                    // evicted. The status was dropped too, so nothing in
+                    // the logs said the window had been lost.
+                    if cursor_lost(status.code()) {
+                        epoch += 1;
+                        last_seq = None;
+                    }
+                    tracing::warn!(%worker, %status, "KV event stream failed; resubscribing");
+                    break;
+                }
+            };
             if let Some(last) = last_seq {
                 if batch.sequence_number <= last {
                     continue; // duplicate replay
@@ -466,6 +500,26 @@ mod tests {
         assert_eq!(adopt_epoch(8, 0, (7, 500)), None);
         // Nothing acked yet while we are at the initial epoch: keep it.
         assert_eq!(adopt_epoch(1, 0, (0, 0)), None);
+    }
+
+    /// Cursor loss is classified by CODE alone, so it reads the same
+    /// whether the status arrives from `subscribe_kv_events` or from the
+    /// middle of an established stream. The two handlers disagreed once:
+    /// mid-stream took a bare `break`, resubscribed from the retained
+    /// cursor, and the index went on scoring blocks the holder had
+    /// evicted inside the lost window.
+    #[test]
+    fn cursor_loss_is_classified_by_code_alone() {
+        assert!(cursor_lost(tonic::Code::OutOfRange), "ring wrapped past us");
+        assert!(cursor_lost(tonic::Code::DataLoss), "buffer dropped");
+        // A transport blip keeps the cursor valid: resuming from
+        // `last_seq` is exactly right, and bumping the epoch here would
+        // wipe and refeed the holder on every flaky reconnect.
+        assert!(!cursor_lost(tonic::Code::Unavailable));
+        assert!(!cursor_lost(tonic::Code::DeadlineExceeded));
+        assert!(!cursor_lost(tonic::Code::Internal));
+        // Terminal for this worker, and handled before this predicate.
+        assert!(!cursor_lost(tonic::Code::Unimplemented));
     }
 
     /// The ledger tracks the running lexicographic max (epoch, seq) per
@@ -643,7 +697,8 @@ mod tests {
         let update = convert_batch(&batch, "m", 4, "w1", 1);
         assert_eq!(update.seq, 1, "wire seq is never the 0 sentinel");
         let engine = crate::Engine::new(crate::EngineConfig::default());
-        let applied = engine.apply(&crate::UpdateMsg::from(&update));
+        let msg = crate::UpdateMsg::try_from(&update).expect("bridge emits a well-formed update");
+        let applied = engine.apply(&msg);
         assert_eq!(applied.last_seq, 1, "applied as a sequenced event batch");
     }
 }
