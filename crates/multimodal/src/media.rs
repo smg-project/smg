@@ -2018,10 +2018,15 @@ fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) ->
         .unwrap_or(cfg.sample_fps)
 }
 
+/// Terms ffmpeg will accept in one expression before it refuses to parse any of it.
+const FFMPEG_MAX_SELECT_TERMS: usize = 100;
+
 /// Exact source frames for an ffmpeg decode, sampled the way the OpenCV path samples.
 #[derive(Debug, Clone, PartialEq)]
 struct FrameSelection {
     source_fps: f64,
+    /// Frames in the source, needed to state the selection as a formula.
+    total_frames: usize,
     /// Source index per output frame, duplicates included.
     frame_indices: Vec<usize>,
     /// Distinct indices in stream order, each with its repeat count.
@@ -2037,6 +2042,7 @@ impl FrameSelection {
         let unique_frames = counted_frame_indices(&frame_indices);
         Some(Self {
             source_fps,
+            total_frames,
             frame_indices,
             unique_frames,
         })
@@ -2047,13 +2053,46 @@ impl FrameSelection {
     }
 
     /// `select` over the distinct indices; `\,` keeps the filtergraph parser from splitting.
+    ///
+    /// Anything over a minute or two has more frames than ffmpeg will take as a
+    /// list, so those are described instead of enumerated.
     fn select_filter(&self) -> String {
+        if self.unique_frames.len() > FFMPEG_MAX_SELECT_TERMS {
+            if let Some(filter) = self.spread_select_filter() {
+                return filter;
+            }
+        }
         let terms: Vec<String> = self
             .unique_frames
             .iter()
             .map(|(idx, _)| format!("eq(n\\,{idx})"))
             .collect();
         format!("select='{}'", terms.join("+"))
+    }
+
+    /// The same frames as a fixed-size expression.
+    ///
+    /// `None` unless it picks out exactly the selection it is standing in for,
+    /// so a selection it cannot describe still gets the explicit list and the
+    /// caller's existing fallback.
+    fn spread_select_filter(&self) -> Option<String> {
+        let last = self.total_frames.checked_sub(1).filter(|last| *last > 0)?;
+        let denom = self
+            .frame_indices
+            .len()
+            .checked_sub(1)
+            .filter(|denom| *denom > 0)?;
+        let spread = |index: usize| {
+            let step = ((index * denom) as f64 / last as f64).round();
+            (step * last as f64 / denom as f64).floor() as usize
+        };
+        let described = (0..self.total_frames).filter(|index| spread(*index) == *index);
+        if !described.eq(self.unique_frames.iter().map(|(index, _)| *index)) {
+            return None;
+        }
+        Some(format!(
+            "select='eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))'"
+        ))
     }
 
     /// Repeat each distinct decoded frame so the result lines up with `frame_indices`.
@@ -2931,6 +2970,67 @@ mod video_sampling_tests {
             selection.select_filter(),
             r"select='eq(n\,0)+eq(n\,19)+eq(n\,39)+eq(n\,59)'"
         );
+    }
+
+    #[test]
+    fn a_long_selection_is_described_rather_than_listed() {
+        let long = VideoFetchConfig {
+            max_frames: 768,
+            ..cfg()
+        };
+        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), long)
+            .expect("frame rate and count are known");
+        assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
+
+        let filter = selection.select_filter();
+        assert_eq!(
+            filter,
+            r"select='eq(n\,floor(round(n*767/17999)*17999/767))'"
+        );
+        assert!(
+            filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
+            "ffmpeg refuses an expression this long as a list"
+        );
+    }
+
+    #[test]
+    fn the_described_selection_covers_the_same_frames() {
+        for (total, max_frames) in [(9_000, 768), (18_000, 768), (36_000, 768), (7_500, 300)] {
+            let selection = FrameSelection::from_metadata(
+                metadata(Some(30.0), Some(total)),
+                VideoFetchConfig {
+                    max_frames,
+                    ..cfg()
+                },
+            )
+            .expect("frame rate and count are known");
+            let last = total - 1;
+            let denom = selection.frame_indices.len() - 1;
+            let described: Vec<usize> = (0..total)
+                .filter(|index| {
+                    let step = ((index * denom) as f64 / last as f64).round();
+                    (step * last as f64 / denom as f64).floor() as usize == *index
+                })
+                .collect();
+            let listed: Vec<usize> = selection
+                .unique_frames
+                .iter()
+                .map(|(index, _)| *index)
+                .collect();
+            assert_eq!(described, listed, "total={total} max_frames={max_frames}");
+        }
+    }
+
+    #[test]
+    fn a_selection_the_formula_misses_keeps_the_explicit_list() {
+        let mut selection =
+            FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), cfg())
+                .expect("frame rate and count are known");
+        selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
+            .map(|index| (index * 3, 1))
+            .collect();
+        assert!(selection.spread_select_filter().is_none());
+        assert!(selection.select_filter().starts_with(r"select='eq(n\,0)+"));
     }
 
     #[test]
