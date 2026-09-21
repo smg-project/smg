@@ -247,10 +247,6 @@ mod tests {
                 Some(ThinkingKeyName::Thinking),
                 "{arch}: expected Thinking key name"
             );
-            assert!(
-                tokenizer.think_in_prefill(),
-                "{arch}: expected think_in_prefill=true"
-            );
         }
     }
 
@@ -481,7 +477,6 @@ mod tests {
             tokenizer.native_reasoning_effort_values(),
             &["low", "high", "xhigh", "max"]
         );
-        assert!(tokenizer.think_in_prefill());
         let out = tokenizer
             .apply_chat_template(
                 &[json!({"role": "user", "content": "q"})],

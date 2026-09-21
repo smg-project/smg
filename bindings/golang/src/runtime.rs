@@ -1,6 +1,7 @@
 //! Shared runtime and global resources for FFI
 
 use once_cell::sync::Lazy;
+use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tokio::runtime::Runtime;
 use tool_parser::ParserFactory;
 
@@ -14,3 +15,8 @@ pub static RUNTIME: Lazy<Runtime> =
 
 /// Global parser factory (initialized once)
 pub static PARSER_FACTORY: Lazy<ParserFactory> = Lazy::new(ParserFactory::new);
+
+/// Global reasoning parser factory: resolves the model's parser so the
+/// rendered prompt can be read for its reasoning markers.
+pub static REASONING_PARSER_FACTORY: Lazy<ReasoningParserFactory> =
+    Lazy::new(ReasoningParserFactory::new);

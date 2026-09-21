@@ -9,5 +9,6 @@ pub use parsers::{
     PassthroughParser, Qwen3Parser, QwenThinkingParser, Step3Parser,
 };
 pub use traits::{
-    ParseError, ParserConfig, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE,
+    ParseError, ParserConfig, ParserResult, PromptReasoning, ReasoningParser,
+    DEFAULT_MAX_BUFFER_SIZE,
 };

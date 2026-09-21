@@ -10,7 +10,7 @@ use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage},
     model_card::ModelCard,
 };
-use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
+use reasoning_parser::{ParserFactory as ReasoningParserFactory, PromptReasoning, ReasoningParser};
 use serde_json::Value;
 use tool_parser::{
     ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
@@ -112,17 +112,13 @@ impl ParserResolver {
     }
 }
 
-/// Determine if thinking is effectively ON based on the template's thinking
-/// toggle and the user's request.
+/// Whether thinking is effectively ON per the template's toggle and the
+/// user's request.
 ///
 /// `user_thinking`: `Some(true)` = user enabled thinking, `Some(false)` = user
 /// disabled it, `None` = not specified (use template default).
-pub fn should_mark_reasoning_started(
-    user_thinking: Option<bool>,
-    tokenizer: &dyn Tokenizer,
-) -> bool {
+pub fn thinking_effectively_on(user_thinking: Option<bool>, tokenizer: &dyn Tokenizer) -> bool {
     match tokenizer.thinking_toggle() {
-        ThinkingToggle::Always => true,
         ThinkingToggle::None => false,
         ThinkingToggle::DefaultOn => user_thinking != Some(false),
         ThinkingToggle::DefaultOff => user_thinking == Some(true),
@@ -220,69 +216,112 @@ fn resolve_thinking_pref(
         .or_else(|| thinking_from_reasoning_effort(reasoning_effort))
 }
 
-/// Whether the reasoning parser must start in reasoning mode, i.e. whether
-/// the rendered prompt ends inside `<think>`.
+/// What the rendered prompt says about the reasoning block the completion
+/// starts in. Read once per request, after rendering, by the reasoning parser
+/// that will consume the output: the completion continues the prompt, so the
+/// prompt's tail — not the template's toggles — is what the parser must
+/// agree with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReasoningPrefill {
+    /// The prompt ends inside the reasoning block: the parser starts armed
+    /// and a forced tool call must follow the reasoning.
+    pub starts_in_reasoning: bool,
+    /// A reasoning block is expected before the answer, whether the prompt
+    /// opened it or the model will: the engine defers grammars past it.
+    pub expects_reasoning: bool,
+}
+
+/// Read `prompt` with the reasoning parser resolved for `model`.
 ///
-/// The effective thinking preference decides, with one exception: a renderer
-/// that continues a trailing assistant message natively
-/// (`continue_final_message`, see `RendererCapabilities`) renders that
-/// message past its `</think>`, so the completion starts in content mode and
-/// the parser must not be armed.
-pub fn reasoning_starts_in_prefill(
-    kwargs: Option<&std::collections::HashMap<String, Value>>,
-    reasoning_effort: Option<&str>,
-    thinking: Option<bool>,
+/// Without a resolvable parser there is no marker vocabulary to read and only
+/// the template toggle speaks, as for a prompt with no marker at all.
+pub fn reasoning_prefill(
+    reasoning_parser_factory: &ReasoningParserFactory,
+    configured_parser: Option<&str>,
+    model: &str,
+    prompt: &str,
+    user_thinking: Option<bool>,
     continues_final_assistant: bool,
     tokenizer: &dyn Tokenizer,
-) -> bool {
-    if continues_final_assistant
-        && tokenizer
-            .renderer_capabilities()
-            .native_assistant_continuation
-    {
-        return false;
+) -> ReasoningPrefill {
+    let prompt_reasoning =
+        create_reasoning_parser(reasoning_parser_factory, configured_parser, model)
+            .map_or(PromptReasoning::Absent, |parser| {
+                parser.prompt_reasoning(prompt)
+            });
+    let expects_reasoning = match prompt_reasoning {
+        PromptReasoning::Open => true,
+        PromptReasoning::Closed => false,
+        // No marker rendered: the toggle says whether the model opens a block
+        // itself. A continued assistant message is already past any
+        // reasoning it had.
+        PromptReasoning::Absent => {
+            !continues_final_assistant && thinking_effectively_on(user_thinking, tokenizer)
+        }
+    };
+    ReasoningPrefill {
+        starts_in_reasoning: prompt_reasoning == PromptReasoning::Open,
+        expects_reasoning,
     }
-    should_mark_reasoning_started(
-        resolve_user_thinking(kwargs, reasoning_effort, thinking, tokenizer),
-        tokenizer,
-    )
 }
 
 /// Whether `continue_final_message` applies to the request: it asks to
 /// continue the trailing assistant message, and the request ends with one.
-pub fn continues_final_assistant(request: &ChatCompletionRequest) -> bool {
+fn continues_final_assistant(request: &ChatCompletionRequest) -> bool {
     request.continue_final_message
         && matches!(request.messages.last(), Some(ChatMessage::Assistant { .. }))
 }
 
-/// [`reasoning_starts_in_prefill`] for a chat request.
-pub fn chat_reasoning_starts_in_prefill(
+/// [`reasoning_prefill`] for a chat request rendered as `prompt`.
+pub fn chat_reasoning_prefill(
     request: &ChatCompletionRequest,
+    prompt: &str,
+    reasoning_parser_factory: &ReasoningParserFactory,
+    configured_parser: Option<&str>,
     tokenizer: &dyn Tokenizer,
-) -> bool {
-    reasoning_starts_in_prefill(
-        request.chat_template_kwargs.as_ref(),
-        request.effective_reasoning_effort(),
-        request.thinking_toggle(),
+) -> ReasoningPrefill {
+    reasoning_prefill(
+        reasoning_parser_factory,
+        configured_parser,
+        &request.model,
+        prompt,
+        resolve_user_thinking(
+            request.chat_template_kwargs.as_ref(),
+            request.effective_reasoning_effort(),
+            request.thinking_toggle(),
+            tokenizer,
+        ),
         continues_final_assistant(request),
         tokenizer,
     )
 }
 
-/// [`should_mark_reasoning_started`] for a Messages API request: the
-/// `thinking` block is the user's preference (`enabled`/`adaptive` on,
-/// `disabled` off, absent → the template's default).
-pub fn messages_reasoning_starts_in_prefill(
+/// [`reasoning_prefill`] for a Messages API request rendered as `prompt`:
+/// the `thinking` block is the user's preference (`enabled`/`adaptive` on,
+/// `disabled` off, absent → the template's default), and the prompt always
+/// ends with a generation prompt.
+pub fn messages_reasoning_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
+    prompt: &str,
+    reasoning_parser_factory: &ReasoningParserFactory,
+    configured_parser: Option<&str>,
     tokenizer: &dyn Tokenizer,
-) -> bool {
+) -> ReasoningPrefill {
     use openai_protocol::messages::ThinkingConfig;
     let user_thinking = match &request.thinking {
         Some(ThinkingConfig::Enabled { .. }) | Some(ThinkingConfig::Adaptive { .. }) => Some(true),
         Some(ThinkingConfig::Disabled) => Some(false),
         None => None,
     };
-    should_mark_reasoning_started(user_thinking, tokenizer)
+    reasoning_prefill(
+        reasoning_parser_factory,
+        configured_parser,
+        &request.model,
+        prompt,
+        user_thinking,
+        false,
+        tokenizer,
+    )
 }
 
 /// Whether a tool constraint already carries the model's reasoning block: a
@@ -470,31 +509,6 @@ mod tests {
         assert_eq!(resolve_thinking_pref(None, None, None, None), None);
     }
 
-    /// GLM-5.3 templates have no thinking toggle — reasoning is always on —
-    /// so the parser is armed no matter what the user asks for: a
-    /// `thinking: false` kwarg or `reasoning_effort: "none"` would otherwise
-    /// disarm it while the prompt still opens `<think>`.
-    #[test]
-    fn always_thinking_toggle_arms_the_parser_unconditionally() {
-        let tok = llm_tokenizer::MockTokenizer::new().with_thinking_toggle(ThinkingToggle::Always);
-        assert!(should_mark_reasoning_started(None, &tok));
-        assert!(should_mark_reasoning_started(Some(true), &tok));
-        assert!(should_mark_reasoning_started(Some(false), &tok));
-
-        let thinking_off =
-            std::collections::HashMap::from([("thinking".to_string(), Value::Bool(false))]);
-        assert_eq!(
-            extract_thinking_from_kwargs(Some(&thinking_off), &tok),
-            None
-        );
-        assert!(reasoning_starts_in_prefill(
-            Some(&thinking_off),
-            Some("none"),
-            false,
-            &tok
-        ));
-    }
-
     /// A kwargs `reasoning_effort` of `"none"` renders chat mode for native
     /// renderers, so it must disarm the parser too — even when the top-level
     /// field names a native level (the kwargs entry wins in the merge).
@@ -642,14 +656,15 @@ mod tests {
             resolve_user_thinking(Some(&explicit_on), None, None, &tok),
             Some(true)
         );
-        assert!(should_mark_reasoning_started(
+        assert!(thinking_effectively_on(
             resolve_user_thinking(Some(&explicit_on), None, None, &tok),
             &tok
         ));
 
-        // A native continuation renders the trailing assistant message past
-        // its `</think>`, so the parser is not armed for that request even
-        // though thinking is on; any other trailing role arms as usual.
+        // The rendered prompt decides. A continued assistant message rendered
+        // past its `</think>` leaves the parser disarmed even though thinking
+        // is on; a prompt ending in `<think>` arms it.
+        let factory = ReasoningParserFactory::new();
         let request = |continue_final: bool, last_role: &str| -> ChatCompletionRequest {
             serde_json::from_value(serde_json::json!({
                 "model": "m",
@@ -661,19 +676,41 @@ mod tests {
             }))
             .expect("chat request")
         };
-        assert!(chat_reasoning_starts_in_prefill(
-            &request(false, "assistant"),
-            &tok
-        ));
-        assert!(!chat_reasoning_starts_in_prefill(
-            &request(true, "assistant"),
-            &tok
-        ));
-        assert!(chat_reasoning_starts_in_prefill(
-            &request(true, "user"),
-            &tok
-        ));
-        assert!(!should_mark_reasoning_started(
+        let prefill = |request: &ChatCompletionRequest, prompt: &str| {
+            chat_reasoning_prefill(request, prompt, &factory, Some("deepseek_v41"), &tok)
+        };
+        assert_eq!(
+            prefill(
+                &request(false, "assistant"),
+                "<｜User｜>q<｜Assistant｜><think>"
+            ),
+            ReasoningPrefill {
+                starts_in_reasoning: true,
+                expects_reasoning: true
+            }
+        );
+        assert_eq!(
+            prefill(
+                &request(true, "assistant"),
+                "<｜User｜>q<｜Assistant｜><think>r</think>a"
+            ),
+            ReasoningPrefill::default()
+        );
+        // Continued without any rendered reasoning: nothing left to reason.
+        assert_eq!(
+            prefill(&request(true, "assistant"), "<｜User｜>q<｜Assistant｜>a"),
+            ReasoningPrefill::default()
+        );
+        // A trailing user turn and no marker: the toggle (on) says the model
+        // opens the block itself.
+        assert_eq!(
+            prefill(&request(true, "user"), "<｜User｜>a<｜Assistant｜>"),
+            ReasoningPrefill {
+                starts_in_reasoning: false,
+                expects_reasoning: true
+            }
+        );
+        assert!(!thinking_effectively_on(
             resolve_user_thinking(Some(&none_kw), Some("high"), None, &tok),
             &tok
         ));
@@ -691,12 +728,12 @@ mod tests {
             resolve_user_thinking(None, Some("max"), Some(false), &k3),
             Some(false)
         );
-        assert!(!should_mark_reasoning_started(
+        assert!(!thinking_effectively_on(
             resolve_user_thinking(None, Some("max"), Some(false), &k3),
             &k3
         ));
         // Absent `thinking`, K3 stays thinking-on by default.
-        assert!(should_mark_reasoning_started(
+        assert!(thinking_effectively_on(
             resolve_user_thinking(None, None, None, &k3),
             &k3
         ));
@@ -727,7 +764,10 @@ mod tests {
             Some(false)
         );
 
-        // End to end through the chat request: `thinking.effort` is the effective effort.
+        // End to end through the chat request: `thinking.effort` is the
+        // effective effort. The prompt carries no reasoning marker, so the
+        // resolved toggle decides whether reasoning is expected.
+        let factory = ReasoningParserFactory::new();
         let request = |thinking: Value| -> ChatCompletionRequest {
             serde_json::from_value(serde_json::json!({
                 "model": "kimi-k3",
@@ -737,18 +777,106 @@ mod tests {
             }))
             .expect("chat request")
         };
-        assert!(chat_reasoning_starts_in_prefill(
+        let expects = |request: &ChatCompletionRequest, tok: &dyn Tokenizer| {
+            chat_reasoning_prefill(
+                request,
+                "<|im_start|>assistant\n",
+                &factory,
+                Some("qwen3"),
+                tok,
+            )
+            .expects_reasoning
+        };
+        assert!(expects(
             &request(serde_json::json!({"type": "enabled"})),
             &k3
         ));
-        assert!(!chat_reasoning_starts_in_prefill(
+        assert!(!expects(
             &request(serde_json::json!({"type": "disabled"})),
             &k3
         ));
-        assert!(chat_reasoning_starts_in_prefill(
+        assert!(expects(
             &request(serde_json::json!({"effort": "high"})),
             &v41
         ));
+    }
+
+    /// The prompt's tail outranks the template toggle: GLM-5.3 has no toggle
+    /// and always opens `<think>`, so the parser is armed even when the user
+    /// asked for no thinking; a prefilled empty block disarms a default-on
+    /// template; with no marker rendered the toggle decides.
+    #[test]
+    fn prompt_tail_outranks_the_template_toggle() {
+        let factory = ReasoningParserFactory::new();
+        let prefill = |prompt: &str, user_thinking: Option<bool>, tok: &dyn Tokenizer| {
+            reasoning_prefill(
+                &factory,
+                Some("glm45"),
+                "glm-5.3",
+                prompt,
+                user_thinking,
+                false,
+                tok,
+            )
+        };
+        let armed = ReasoningPrefill {
+            starts_in_reasoning: true,
+            expects_reasoning: true,
+        };
+        let opens = ReasoningPrefill {
+            starts_in_reasoning: false,
+            expects_reasoning: true,
+        };
+
+        let no_toggle = llm_tokenizer::MockTokenizer::new();
+        let glm53 = "[gMASK]<sop><|user|>2+3?<|assistant|><think>";
+        assert_eq!(prefill(glm53, None, &no_toggle), armed);
+        assert_eq!(prefill(glm53, Some(false), &no_toggle), armed);
+
+        let default_on =
+            llm_tokenizer::MockTokenizer::new().with_thinking_toggle(ThinkingToggle::DefaultOn);
+        // GLM-4.5 with `enable_thinking: false` prefills an empty block.
+        assert_eq!(
+            prefill(
+                "<|user|>hi<|assistant|>\n<think></think>",
+                Some(false),
+                &default_on
+            ),
+            ReasoningPrefill::default()
+        );
+        // No marker rendered: the model opens the block itself when on.
+        assert_eq!(prefill("<|user|>hi<|assistant|>", None, &default_on), opens);
+        assert_eq!(
+            prefill("<|user|>hi<|assistant|>", Some(false), &default_on),
+            ReasoningPrefill::default()
+        );
+        // A continued assistant message is already past any reasoning it had.
+        assert_eq!(
+            reasoning_prefill(
+                &factory,
+                Some("glm45"),
+                "m",
+                "<|assistant|>partial answer",
+                None,
+                true,
+                &default_on,
+            ),
+            ReasoningPrefill::default()
+        );
+        // Without a resolvable parser there are no markers to read: the
+        // toggle speaks alone, and the parser is never reported armed.
+        assert_eq!(
+            reasoning_prefill(
+                &factory,
+                None,
+                "no-such-model",
+                "<|assistant|><think>",
+                None,
+                false,
+                &default_on,
+            ),
+            opens
+        );
     }
 
     #[test]

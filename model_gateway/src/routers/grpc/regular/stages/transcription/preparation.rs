@@ -19,7 +19,7 @@ use crate::routers::{
     grpc::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
-        regular::stages::chat::prepare_chat_like,
+        regular::stages::chat::{prepare_chat_like, PreparedChat},
     },
 };
 
@@ -71,12 +71,17 @@ impl PipelineStage for TranscriptionPreparationStage {
         // Run the shared chat preparation (template + multimodal audio
         // expansion + tokenize + stop decoder), then store the transcription
         // variant carrying the synthesized request and response contract.
-        let (token_ids, processed_messages, _tool_constraints) =
-            prepare_chat_like(ctx, &chat_request).await?;
+        let PreparedChat {
+            token_ids,
+            processed_messages,
+            tool_constraints: _,
+            reasoning,
+        } = prepare_chat_like(ctx, &chat_request).await?;
 
         ctx.state.preparation = Some(PreparationOutput::Transcription {
             token_ids,
             processed_messages,
+            reasoning,
             chat_request: std::sync::Arc::new(chat_request),
             format,
             family,

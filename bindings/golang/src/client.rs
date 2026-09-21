@@ -215,7 +215,8 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
 
     // Build GenerateRequest
     let request_id = format!("chatcmpl-{}", Uuid::now_v7());
-    let require_reasoning = chat_requires_reasoning(&chat_request, tokenizer.as_ref());
+    let require_reasoning =
+        chat_requires_reasoning(&chat_request, &processed_messages.text, tokenizer.as_ref());
     let proto_request = match client.build_generate_request_from_chat(
         request_id.clone(),
         &chat_request,

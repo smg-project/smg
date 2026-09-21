@@ -145,7 +145,6 @@ impl ProcessStage for MessageResponseProcessingStage {
                 execution_result,
                 messages_request,
                 dispatch,
-                tokenizer,
                 stop_decoder,
             )
             .await?;

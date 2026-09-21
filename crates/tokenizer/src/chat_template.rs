@@ -70,10 +70,6 @@ pub enum ThinkingToggle {
     /// `always_in_reasoning` config.
     #[default]
     None,
-    /// Template forces reasoning on: there is no toggle to honor and the
-    /// generation prompt always opens `<think>`, so the parser must start
-    /// armed regardless of the user's preference. (GLM-5.3)
-    Always,
     /// Template supports a thinking toggle that defaults to ON.
     /// If the user doesn't pass anything, thinking is enabled.
     /// (Qwen3, Qwen3.5, Nemotron, GLM-4.6, GLM-5, Kimi-K2.5)
@@ -84,24 +80,20 @@ pub enum ThinkingToggle {
     DefaultOff,
 }
 
-/// GLM-5.3 keeps the GLM-4.5 prompt and tool-call markers but replaces the
-/// `enable_thinking` toggle with an always-on "Reasoning Effort:" header.
-fn is_glm53_template(template: &str) -> bool {
-    template.contains("[gMASK]<sop>")
-        && template.contains("Reasoning Effort:")
-        && template.contains("<tool_call>")
-        && template.contains("<arg_key>")
-        && template.contains("<arg_value>")
-        && !template.contains("enable_thinking")
+/// Whether `needle` occurs in `template` as its own identifier, i.e. not as
+/// the tail of a longer name such as `clear_thinking`.
+fn contains_identifier(template: &str, needle: &str) -> bool {
+    template.match_indices(needle).any(|(at, _)| {
+        template[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+    })
 }
 
 /// Detect whether the chat template supports a thinking/reasoning toggle
 /// and what its default value is.
 pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<ThinkingKeyName>) {
-    if is_glm53_template(template) {
-        return (ThinkingToggle::Always, None);
-    }
-
     // Tri-state string toggle, detected only when the template actually
     // branches on the variable: only `thinking_mode == "enabled"` prefills
     // the think-start token, so the toggle defaults OFF.
@@ -116,10 +108,12 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
     }
 
     let has_enable_thinking = template.contains("enable_thinking");
-    // Trailing space prevents matching "thinking_mode", "thinking_budget", etc.
+    // Trailing space prevents matching "thinking_mode", "thinking_budget", etc.;
+    // the identifier check keeps `clear_thinking is defined` (GLM-5.x) from
+    // passing as a `thinking` toggle.
     let has_thinking_var = template.contains("if thinking ")
-        || template.contains("thinking is ")
-        || template.contains("thinking ==")
+        || contains_identifier(template, "thinking is ")
+        || contains_identifier(template, "thinking ==")
         || template.contains("set thinking ");
 
     if !has_enable_thinking && !has_thinking_var {
@@ -158,7 +152,7 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 /// - ChatTemplateContentFormat::String if template expects simple string content
 pub fn detect_chat_template_content_format(template: &str) -> ChatTemplateContentFormat {
     // Use AST-based detection (enabled by default)
-    detect_all_with_ast(template).0
+    detect_all_with_ast(template)
 }
 
 /// Flags tracking which OpenAI-style patterns we've seen
@@ -187,8 +181,6 @@ struct Detector<'a> {
     scope: std::collections::VecDeque<String>,
     scope_set: std::collections::HashSet<String>,
     flags: Flags,
-    /// Whether `<think>` appears inside an `add_generation_prompt` if-block
-    think_in_prefill: bool,
 }
 
 impl<'a> Detector<'a> {
@@ -198,13 +190,12 @@ impl<'a> Detector<'a> {
             scope: std::collections::VecDeque::new(),
             scope_set: std::collections::HashSet::new(),
             flags: Flags::default(),
-            think_in_prefill: false,
         }
     }
 
-    fn run(mut self) -> (Flags, bool) {
+    fn run(mut self) -> Flags {
         self.walk_stmt(self.ast);
-        (self.flags, self.think_in_prefill)
+        self.flags
     }
 
     fn push_scope(&mut self, var: String) {
@@ -269,43 +260,6 @@ impl<'a> Detector<'a> {
         }
     }
 
-    /// Check if an expression references a variable by name (walks through BinOp/UnaryOp).
-    fn expr_references_var(expr: &Expr, name: &str) -> bool {
-        match expr {
-            Expr::Var(v) => v.id == name,
-            Expr::BinOp(b) => {
-                Self::expr_references_var(&b.left, name)
-                    || Self::expr_references_var(&b.right, name)
-            }
-            Expr::UnaryOp(u) => Self::expr_references_var(&u.expr, name),
-            _ => false,
-        }
-    }
-
-    /// Check if a list of statements contains `<think>` in EmitRaw or string constants.
-    fn body_has_think_tag(stmts: &[Stmt]) -> bool {
-        for stmt in stmts {
-            match stmt {
-                Stmt::EmitRaw(raw) if raw.raw.contains("<think>") => return true,
-                Stmt::EmitExpr(e) => {
-                    if let Expr::Const(c) = &e.expr {
-                        if c.value.as_str().is_some_and(|s| s.contains("<think>")) {
-                            return true;
-                        }
-                    }
-                }
-                Stmt::IfCond(ic)
-                    if Self::body_has_think_tag(&ic.true_body)
-                        || Self::body_has_think_tag(&ic.false_body) =>
-                {
-                    return true;
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
     fn walk_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Template(t) => {
@@ -347,13 +301,6 @@ impl<'a> Detector<'a> {
             }
             Stmt::IfCond(ic) => {
                 self.inspect_expr_for_structure(&ic.expr);
-
-                // Detect <think> inside {% if add_generation_prompt [and ...] %} body
-                if !self.think_in_prefill
-                    && Self::expr_references_var(&ic.expr, "add_generation_prompt")
-                {
-                    self.think_in_prefill = Self::body_has_think_tag(&ic.true_body);
-                }
 
                 for b in &ic.true_body {
                     self.walk_stmt(b);
@@ -463,27 +410,24 @@ impl<'a> Detector<'a> {
     }
 }
 
-/// Single-pass detection of content format, think-in-prefill, and thinking toggle.
+/// Single-pass detection of content format and thinking toggle.
 fn detect_all(
     template: &str,
 ) -> (
     ChatTemplateContentFormat,
-    bool,
     ThinkingToggle,
     Option<ThinkingKeyName>,
 ) {
     let (thinking_toggle, thinking_key_name) = detect_thinking_toggle(template);
-    let (content_format, think_in_prefill) = detect_all_with_ast(template);
     (
-        content_format,
-        think_in_prefill,
+        detect_all_with_ast(template),
         thinking_toggle,
         thinking_key_name,
     )
 }
 
-/// AST detection of content format and think-in-prefill.
-fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool) {
+/// AST detection of content format.
+fn detect_all_with_ast(template: &str) -> ChatTemplateContentFormat {
     let ast = match parse(
         template,
         "template",
@@ -491,16 +435,14 @@ fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool) {
         WhitespaceConfig::default(),
     ) {
         Ok(ast) => ast,
-        Err(_) => return (ChatTemplateContentFormat::String, false),
+        Err(_) => return ChatTemplateContentFormat::String,
     };
 
-    let (flags, think_in_prefill) = Detector::new(&ast).run();
-    let content_format = if flags.any() {
+    if Detector::new(&ast).run().any() {
         ChatTemplateContentFormat::OpenAI
     } else {
         ChatTemplateContentFormat::String
-    };
-    (content_format, think_in_prefill)
+    }
 }
 
 /// Parameters for chat template application
@@ -1067,8 +1009,6 @@ pub struct ChatTemplateState {
     thinking_toggle: ThinkingToggle,
     /// The variable name used for the thinking toggle (if any).
     thinking_key_name: Option<ThinkingKeyName>,
-    /// Whether the template injects `<think>` in the generation prompt.
-    think_in_prefill: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1077,14 +1017,13 @@ impl std::fmt::Debug for ChatTemplateState {
             .field("has_template", &self.env.is_some())
             .field("content_format", &self.content_format)
             .field("thinking_toggle", &self.thinking_toggle)
-            .field("think_in_prefill", &self.think_in_prefill)
             .finish()
     }
 }
 
 impl ChatTemplateState {
     pub fn new(template: Option<String>) -> Result<Self> {
-        let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
+        let (content_format, thinking_toggle, thinking_key_name) =
             template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
         let env = template.map(build_environment).transpose()?;
         Ok(Self {
@@ -1092,7 +1031,6 @@ impl ChatTemplateState {
             content_format,
             thinking_toggle,
             thinking_key_name,
-            think_in_prefill,
         })
     }
 
@@ -1106,7 +1044,6 @@ impl ChatTemplateState {
             content_format: ChatTemplateContentFormat::default(),
             thinking_toggle: ThinkingToggle::None,
             thinking_key_name: None,
-            think_in_prefill: false,
         }
     }
 
@@ -1158,13 +1095,11 @@ impl ChatTemplateState {
     }
 
     pub fn set(&mut self, template: String) -> Result<()> {
-        let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
-            detect_all(&template);
+        let (content_format, thinking_toggle, thinking_key_name) = detect_all(&template);
         let env = build_environment(template)?;
         self.content_format = content_format;
         self.thinking_toggle = thinking_toggle;
         self.thinking_key_name = thinking_key_name;
-        self.think_in_prefill = think_in_prefill;
         self.env = Some(env);
         Ok(())
     }
@@ -1179,10 +1114,6 @@ impl ChatTemplateState {
 
     pub fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
         self.thinking_key_name
-    }
-
-    pub fn think_in_prefill(&self) -> bool {
-        self.think_in_prefill
     }
 }
 
@@ -1383,81 +1314,34 @@ mod tests {
         }
     }
 
-    /// GLM-5.3 shape: always-on thinking behind a `Reasoning Effort:` header
-    /// (no `enable_thinking` toggle) and the compact GLM-4.7 tool-call format;
-    /// HF revisions differ only in the `+` / `~` concat operator.
-    fn glm53_template(concat: &str) -> String {
-        format!(
-            "[gMASK]<sop>\n\
-             {{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined \
-             and reasoning_effort in ['low', 'high'] else 'max' -%}}\n\
-             <|system|>Reasoning Effort: {{{{ effective_reasoning_effort | capitalize }}}}\n\
-             {{% for tc in m.tool_calls %}}\n\
-             {{{{- '<tool_call>' {concat} tc.name -}}}}\n\
-             {{% set _args = tc.arguments %}}\
-             {{% for k, v in _args.items() %}}\
-             <arg_key>{{{{ k }}}}</arg_key><arg_value>{{{{ v }}}}</arg_value>\
-             {{% endfor %}}</tool_call>\n\
-             {{% endfor %}}\n\
-             {{%- if add_generation_prompt -%}}\
-             <|assistant|>{{{{- '<think>' -}}}}\
-             {{%- endif -%}}"
-        )
-    }
-
+    /// GLM-5.x templates carry a `clear_thinking` kwarg; its `is defined`
+    /// probe must not read as a `thinking` toggle the template lacks.
     #[test]
-    fn glm53_effort_template_forces_reasoning() {
-        for concat in ["+", "~"] {
-            let template = glm53_template(concat);
-            assert_eq!(
-                detect_thinking_toggle(&template),
-                (ThinkingToggle::Always, None),
-                "concat {concat}"
-            );
-
-            let state = ChatTemplateState::new(Some(template)).unwrap();
-            assert_eq!(state.thinking_toggle(), ThinkingToggle::Always);
-            assert_eq!(state.thinking_key_name(), None);
-            assert!(state.think_in_prefill());
-        }
-    }
-
-    #[test]
-    fn glm53_detection_survives_clear_thinking_false_positive() {
-        // The published GLM-5.3 template also uses `clear_thinking`, whose
-        // `clear_thinking is defined` branch must not be mistaken for a
-        // `thinking` toggle the template does not have.
-        let mut template = glm53_template("+");
-        template = template.replace(
-            "<|system|>",
-            "{%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}\n<|system|>",
-        );
+    fn identifier_suffixes_are_not_the_thinking_toggle() {
+        let clear_only = "[gMASK]<sop>\
+            {%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}\
+            {%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}";
         assert_eq!(
-            detect_thinking_toggle(&template),
-            (ThinkingToggle::Always, None)
-        );
-    }
-
-    #[test]
-    fn glm53_signature_requires_glm_tool_call_markers_and_no_toggle() {
-        // A GLM-4.5-style template keeps its enable_thinking toggle.
-        let glm45_template = "[gMASK]<sop>\n\
-            {%- set enable_thinking = enable_thinking if enable_thinking is defined else true -%}\n\
-            <tool_call>\n";
-        assert_eq!(
-            detect_thinking_toggle(glm45_template),
-            (
-                ThinkingToggle::DefaultOn,
-                Some(ThinkingKeyName::EnableThinking)
-            )
-        );
-
-        // "Reasoning Effort:" alone, without the GLM tool-call markers, is
-        // not the GLM-5.3 signature.
-        let effort_only = "Reasoning Effort: max\n{{ message.content }}";
-        assert_eq!(
-            detect_thinking_toggle(effort_only),
+            detect_thinking_toggle(clear_only),
             (ThinkingToggle::None, None)
+        );
+
+        // The bare variable still detects, however it is probed.
+        assert_eq!(
+            detect_thinking_toggle(
+                "{% if not thinking is defined %}{% set thinking = false %}{% endif %}"
+            ),
+            (ThinkingToggle::DefaultOff, Some(ThinkingKeyName::Thinking))
+        );
+        assert_eq!(
+            detect_thinking_toggle("{%- if thinking == true -%}<think>{%- endif -%}"),
+            (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking))
+        );
+        assert_eq!(
+            detect_thinking_toggle(
+                "{%- set clear_thinking = true -%}{%- if thinking is true -%}{%- endif -%}"
+            ),
+            (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking))
         );
     }
 

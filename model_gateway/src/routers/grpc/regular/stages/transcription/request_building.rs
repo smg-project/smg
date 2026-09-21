@@ -42,6 +42,7 @@ impl BuildStage for TranscriptionRequestBuildingStage {
         let PreparationOutput::Transcription {
             token_ids,
             processed_messages,
+            reasoning,
             chat_request,
             format,
             family,
@@ -63,6 +64,7 @@ impl BuildStage for TranscriptionRequestBuildingStage {
             processed_messages.text,
             token_ids,
             None,
+            reasoning,
             "transcription-",
             /* inject_pd_metadata */ false,
             ExecutionPlanKind::Single,
