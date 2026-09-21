@@ -227,22 +227,32 @@ jobs:
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
           protoc --version
 
-      # Crate versions are deliberately NOT patched to a dev version. Cargo
-      # verifies a packaged crate by building it against its dependencies as
-      # published, so a version that exists nowhere would fail verification.
-      # These tarballs are build artifacts of the night's commit, not a
-      # parallel version series.
+      # Two deliberate choices here, both forced by how `cargo package` works.
+      #
+      # Versions are NOT patched to a dev version: cargo verifies a packaged
+      # crate by building it against its dependencies AS PUBLISHED, so a
+      # version that exists nowhere could never verify.
+      #
+      # Verification is off for the same reason, one level down. A workspace
+      # crate can carry the same version number as its published release while
+      # its contents have moved on — `openai-protocol` currently does, and a
+      # dependent that uses a field added since the publish fails to build
+      # against the registry copy. A nightly is by definition ahead of what is
+      # published, so a verify build measures the registry, not this commit.
+      # `cargo package --list` is the check instead: it proves the manifest
+      # resolves and the file set is well formed, which is what the tarball is.
       - name: Package crates in dependency tier order
         run: |
           set -euo pipefail
           mkdir -p crate-dist filelists
 
           TIER1="crates/protocols crates/reasoning_parser crates/kv_index crates/data_connector crates/workflow crates/auth crates/mcp crates/mm_rdma crates/engine_zmq_client crates/radix_tree"
-          TIER2="crates/tool_parser crates/grpc_client clients/rust crates/mesh crates/wasm crates/tokenizer crates/rl"
+          TIER2="crates/tool_parser crates/grpc_client clients/rust crates/mesh crates/wasm crates/tokenizer crates/rl crates/external_router"
           TIER3="crates/multimodal"
           TIER4="model_gateway"
 
           failed=""
+          skipped=""
           for path in $TIER1 $TIER2 $TIER3 $TIER4; do
             name="$(grep -m1 '^name = ' "$path/Cargo.toml" | sed 's/name = "\(.*\)"/\1/')"
             echo "::group::cargo package ${name} (${path})"
@@ -254,15 +264,36 @@ jobs:
               echo "::endgroup::"
               continue
             fi
-            if ! cargo package -p "$name"; then
-              echo "::error::cargo package failed for ${name}"
-              failed="${failed} ${name}"
+            if ! cargo package --no-verify -p "$name" 2> "pkg-${name}.err"; then
+              # Packaging rewrites path dependencies to registry dependencies,
+              # so a crate whose dependency has never been published cannot be
+              # packaged at all. That is a fact about the registry, not about
+              # this commit, and it would fail every night until someone
+              # publishes it — so it is recorded loudly and skipped, while any
+              # other failure still fails the job.
+              if grep -q "no matching package named" "pkg-${name}.err"; then
+                dep="$(sed -n 's/.*no matching package named `\([^`]*\)`.*/\1/p' "pkg-${name}.err" | head -1)"
+                echo "::warning::skipping ${name}: depends on unpublished crate ${dep}"
+                skipped="${skipped} ${name}(needs ${dep})"
+              else
+                cat "pkg-${name}.err"
+                echo "::error::cargo package failed for ${name}"
+                failed="${failed} ${name}"
+              fi
             fi
+            rm -f "pkg-${name}.err"
             echo "::endgroup::"
           done
 
           find target/package -maxdepth 1 -name '*.crate' -exec cp {} crate-dist/ \;
           echo "Packaged $(find crate-dist -name '*.crate' | wc -l) crates"
+
+          {
+            echo "### Crates"
+            echo ""
+            echo "Packaged: $(find crate-dist -name '*.crate' | wc -l)"
+            [ -n "$skipped" ] && echo "Skipped (dependency not on crates.io):${skipped}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           if [ -n "$failed" ]; then
             echo "::error::crates failed to package:${failed}"
