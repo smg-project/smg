@@ -42,7 +42,6 @@ def test_tokenspeed_disagg_flags(worker_type, role):
     assert cmd[cmd.index("--disaggregation-transfer-backend") + 1] == "mooncake"
     assert "--dist-init-addr" in cmd
     assert cmd[cmd.index("--dist-init-addr") + 1] == "127.0.0.1:29500"
-    assert "--skip-server-warmup" in cmd
 
 
 def test_encode_and_prefill_carry_bootstrap_port():

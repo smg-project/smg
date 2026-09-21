@@ -500,7 +500,6 @@ class Worker:
                 cmd.append("--enable-prefix-caching")
             if self.worker_type == WorkerType.PREFILL:
                 cmd.append("--enforce-eager")
-            cmd.append("--skip-server-warmup")
 
         extra = spec.get("tokenspeed_args", [])
         if extra:
