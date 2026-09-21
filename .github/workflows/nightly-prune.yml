@@ -1,0 +1,262 @@
+name: Nightly Prune
+
+# Deletes dated nightly container images and nightly prereleases older than the
+# retention window. Nothing else is touched.
+#
+# The floating tags (:nightly, :nightly-<engine>), every release tag and the CI
+# TokenSpeed image are protected by construction: a package version is only
+# deletable when EVERY tag it carries is a dated nightly tag.
+
+on:
+  schedule:
+    # 08:00 UTC daily — after the gateway (06:00), artifacts (06:30) and
+    # engine images, so a prune never races the builds it is pruning for.
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'List what would be deleted without deleting anything'
+        type: boolean
+        default: true
+      retention_days:
+        description: 'Override the retention window (days)'
+        type: string
+        default: ''
+
+concurrency:
+  group: nightly-prune
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Single knob for the retention window. A dispatch input overrides it, then
+  # the repository variable, then this default.
+  RETENTION_DAYS: ${{ inputs.retention_days || vars.SMG_NIGHTLY_RETENTION_DAYS || '7' }}
+  # A scheduled run prunes; a dispatch run defaults to a dry run.
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+
+jobs:
+  prune:
+    name: Prune nightly images and releases
+    if: github.repository == 'smg-project/smg'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Report settings
+        run: |
+          set -euo pipefail
+          echo "retention window: ${RETENTION_DAYS} days"
+          echo "dry run: ${DRY_RUN}"
+          {
+            echo "## Nightly prune"
+            echo ""
+            echo "Retention window: **${RETENTION_DAYS} days**"
+            echo "Dry run: **${DRY_RUN}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prune container package versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          CUTOFF="$(date -u -d "${RETENTION_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)"
+          echo "cutoff: ${CUTOFF}"
+
+          # Every version of the single container package, newest first.
+          gh api --paginate \
+            "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/smg/versions" \
+            > versions.json
+
+          # A version is deletable only when it has at least one tag and EVERY
+          # tag is a dated nightly tag: nightly-YYYYMMDD-<sha7>, optionally
+          # followed by an engine and version suffix. This is what protects
+          # the floating tags — "nightly" and "nightly-vllm" do not match, so
+          # a version carrying either is kept even though both begin with
+          # "nightly". Release tags and :latest never match either.
+          #
+          # Untagged versions are left alone here: on a multi-arch package they
+          # are the per-platform children of a manifest list, and a child of a
+          # RELEASE image is also untagged and must survive. They are handled
+          # in the next step, which only removes children nothing references.
+          jq -r --arg cutoff "$CUTOFF" '
+            map(select(
+              (.metadata.container.tags | length) > 0
+              and (.metadata.container.tags | all(test("^nightly-[0-9]{8}-[0-9a-f]{7}")))
+              and (.created_at < $cutoff)
+            ))
+            | .[] | "\(.id)\t\(.created_at)\t\(.metadata.container.tags | join(","))"
+          ' versions.json > deletable.tsv || true
+
+          jq -r --arg cutoff "$CUTOFF" '
+            map(select(
+              (.metadata.container.tags | length) > 0
+              and (
+                ((.metadata.container.tags | all(test("^nightly-[0-9]{8}-[0-9a-f]{7}"))) | not)
+                or (.created_at >= $cutoff)
+              )
+            ))
+            | .[] | "\(.created_at)\t\(.metadata.container.tags | join(","))"
+          ' versions.json > kept.tsv || true
+
+          echo "deletable: $(wc -l < deletable.tsv)   kept (tagged): $(wc -l < kept.tsv)"
+
+          {
+            echo ""
+            echo "### Container versions"
+            echo ""
+            echo "Deletable: $(wc -l < deletable.tsv) — kept: $(wc -l < kept.tsv)"
+            echo ""
+            echo "<details><summary>Would delete</summary>"
+            echo ""
+            echo '```'
+            cat deletable.tsv
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "<details><summary>Kept</summary>"
+            echo ""
+            echo '```'
+            cat kept.tsv
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "dry run: no versions deleted"
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r id created tags; do
+            [ -n "$id" ] || continue
+            echo "deleting version ${id} (${created}) tags=${tags}"
+            gh api -X DELETE \
+              "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/smg/versions/${id}"
+          done < deletable.tsv
+
+      - name: Prune orphaned per-platform children
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          CUTOFF="$(date -u -d "${RETENTION_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Deleting a manifest list leaves its per-platform children behind as
+          # untagged versions, which is where the storage actually sits. They
+          # cannot be deleted by age alone: a release image is not rebuilt
+          # nightly, so ITS children are old and untagged too.
+          #
+          # So resolve the children every surviving tagged version references,
+          # and delete only untagged versions outside that set.
+          gh api --paginate \
+            "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/smg/versions" \
+            > versions.json
+
+          TOKEN="$(curl -fsSL -u "x:${GH_TOKEN}" \
+            "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY_OWNER}/smg:pull" \
+            | jq -r .token)" || TOKEN=""
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::warning::could not obtain a registry token; skipping child cleanup rather than guessing"
+            exit 0
+          fi
+
+          : > referenced.txt
+          # Every tagged version that still exists is authoritative about the
+          # children it needs.
+          jq -r '.[] | select((.metadata.container.tags | length) > 0) | .name' versions.json \
+            | sort -u > tagged_digests.txt
+
+          while read -r digest; do
+            [ -n "$digest" ] || continue
+            curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+              -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${GITHUB_REPOSITORY_OWNER}/smg/manifests/${digest}" 2>/dev/null \
+              | jq -r '.manifests[]?.digest // empty' >> referenced.txt || true
+          done < tagged_digests.txt
+
+          sort -u referenced.txt -o referenced.txt
+          echo "children referenced by surviving tags: $(wc -l < referenced.txt)"
+
+          jq -r --arg cutoff "$CUTOFF" '
+            .[] | select((.metadata.container.tags | length) == 0 and .created_at < $cutoff)
+            | "\(.id)\t\(.name)\t\(.created_at)"
+          ' versions.json > untagged.tsv || true
+
+          : > orphans.tsv
+          while IFS=$'\t' read -r id digest created; do
+            [ -n "$id" ] || continue
+            if ! grep -qx "$digest" referenced.txt; then
+              printf '%s\t%s\t%s\n' "$id" "$digest" "$created" >> orphans.tsv
+            fi
+          done < untagged.tsv
+
+          echo "untagged past cutoff: $(wc -l < untagged.tsv)   orphaned: $(wc -l < orphans.tsv)"
+          {
+            echo ""
+            echo "### Per-platform children"
+            echo ""
+            echo "Untagged past cutoff: $(wc -l < untagged.tsv) — orphaned (deletable): $(wc -l < orphans.tsv)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "dry run: no children deleted"
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r id digest created; do
+            [ -n "$id" ] || continue
+            echo "deleting orphaned child ${id} (${created}) ${digest}"
+            gh api -X DELETE \
+              "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/smg/versions/${id}"
+          done < orphans.tsv
+
+      - name: Prune nightly prereleases and their tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          CUTOFF="$(date -u -d "${RETENTION_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Only prereleases whose tag is a dated nightly tag. A published
+          # release, or anything not matching that shape, is never considered.
+          gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases" \
+            | jq -r --arg cutoff "$CUTOFF" '
+              .[] | select(.prerelease == true)
+                  | select(.tag_name | test("^nightly-[0-9]{8}-[0-9a-f]{7}$"))
+                  | select(.created_at < $cutoff)
+                  | "\(.tag_name)\t\(.created_at)"
+            ' > old_releases.tsv || true
+
+          echo "nightly prereleases past cutoff: $(wc -l < old_releases.tsv)"
+          {
+            echo ""
+            echo "### Prereleases"
+            echo ""
+            echo "Past cutoff: $(wc -l < old_releases.tsv)"
+            echo ""
+            echo '```'
+            cat old_releases.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "dry run: no releases deleted"
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r tag created; do
+            [ -n "$tag" ] || continue
+            echo "deleting release ${tag} (${created}) and its tag"
+            gh release delete "$tag" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag
+          done < old_releases.tsv
