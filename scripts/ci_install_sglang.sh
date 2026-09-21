@@ -29,7 +29,7 @@ echo "Using uv version: $(uv --version)"
 # Install CUDA toolkit (nvcc) — required for SGLang JIT kernel compilation.
 # SGLang >= 0.5.9 JIT-compiles CUDA kernels (RoPE, etc.) at runtime via tvm_ffi,
 # which invokes nvcc. The CI runners have CUDA runtime (driver) but not the compiler.
-# sglang 0.5.18 pins torch==2.13.0, whose default PyPI wheels are CUDA 13, so the
+# sglang 0.5.20 pins torch==2.13.0, whose default PyPI wheels are CUDA 13, so the
 # compiler must be nvcc 13 to match the runtime headers (a 12.x nvcc is replaced).
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 if [ ! -x "${CUDA_HOME}/bin/nvcc" ] || ! "${CUDA_HOME}/bin/nvcc" --version | grep -q "release 13\."; then
@@ -52,7 +52,7 @@ fi
 
 # Install SGLang with all dependencies
 echo "Installing SGLang..."
-$RETRY 3 10 uv pip install --prerelease=allow "sglang[all]==0.5.18"
+$RETRY 3 10 uv pip install --prerelease=allow "sglang[all]==0.5.20"
 
 # Install flashinfer-jit-cache: sglang bundles flashinfer_python but only for attention ops.
 # Multi-GPU models need trtllm_comm kernels (fused allreduce + layernorm) which FlashInfer
@@ -81,9 +81,9 @@ fi
 
 # Install mooncake for SGLang PD disaggregation (KV transfer)
 # Mooncake's native transfer engine requires InfiniBand/RDMA libraries at runtime.
-# Package and pin track upstream sglang v0.5.18 CI on the cu13 stack
+# Package and pin track upstream sglang v0.5.20 CI on the cu13 stack
 # (cuda13 wheel variant + nvrtc, since torch 2.13 defaults to CUDA 13):
-# https://github.com/sgl-project/sglang/blob/v0.5.18/scripts/ci/cuda/ci_install_dependency.sh
+# https://github.com/sgl-project/sglang/blob/v0.5.20/scripts/ci/cuda/ci_install_dependency.sh
 echo "Installing mooncake system dependencies..."
 bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
 $RETRY 3 10 sudo apt-get update -qq
@@ -93,9 +93,9 @@ $RETRY 3 10 uv pip install mooncake-transfer-engine-cuda13==0.3.12.post1 nvidia-
 
 # NIXL for SGLang PD disaggregation over NIXL (--disaggregation-transfer-backend
 # nixl), only on lanes that ask for it: Mooncake stays the default. Package,
-# pin and install shape track upstream sglang v0.5.18 CI (nixl and the backend
+# pin and install shape track upstream sglang v0.5.20 CI (nixl and the backend
 # matching torch's CUDA, both --no-deps):
-# https://github.com/sgl-project/sglang/blob/v0.5.18/scripts/ci/cuda/ci_install_dependency.sh
+# https://github.com/sgl-project/sglang/blob/v0.5.20/scripts/ci/cuda/ci_install_dependency.sh
 if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = "nixl" ]; then
     NIXL_VERSION="1.3.0"
     CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])")
