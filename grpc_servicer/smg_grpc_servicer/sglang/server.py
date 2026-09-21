@@ -123,7 +123,7 @@ async def serve_grpc(
     # This ensures the bootstrap server is ready when prefill schedulers try to register
     bootstrap_server = None
     if server_args.disaggregation_mode == "prefill":
-        bootstrap_server = start_disagg_service(server_args)
+        bootstrap_server = start_disagg_service()
         if bootstrap_server:
             logger.info(
                 "Bootstrap server started for disaggregation mode on %s:%s",
