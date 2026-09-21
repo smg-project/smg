@@ -6,7 +6,6 @@ for orchestration without tokenization.
 """
 
 import asyncio
-import dataclasses
 import hashlib
 import json
 import logging
@@ -478,7 +477,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Get server information."""
         logger.debug("Receive server info request")
 
-        server_args_dict = dataclasses.asdict(self.server_args)
+        # 0.5.20 turned ServerArgs from a dataclass into a plain class, so
+        # dataclasses.asdict() raises. vars() reads the instance attributes on
+        # both shapes. The nested values below are stringified anyway, so the
+        # shallow read loses nothing the gateway reads.
+        server_args_dict = vars(self.server_args)
         server_args_struct = Struct()
 
         def make_serializable(obj):
