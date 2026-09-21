@@ -207,7 +207,7 @@ install_tokenspeed_from_source() {
     # --no-build-isolation kernel compile below, so the build links matching CUDA 13
     # headers instead of the default PyPI (cu12.x) torch. Pin tracks TokenSpeed's
     # torch requirement; bump alongside the ref in .github/versions/tokenspeed.ref.
-    $RETRY 3 10 uv pip install "torch==2.11.0+cu130"
+    $RETRY 3 10 uv pip install "torch==2.14.0+cu130"
 
     # The kernel's host-stub compile binds crt/host_runtime.h from torch's bundled
     # cu13 headers (site-packages/nvidia/cu*/include/crt) no matter the -I order,
