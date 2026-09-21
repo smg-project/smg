@@ -228,7 +228,7 @@ MODEL_SPECS: dict[str, dict] = {
         "sglang_args": [
             "--context-length=196608",
             "--attention-backend=fa3",
-            "--cuda-graph-max-bs=256",
+            "--cuda-graph-max-bs-decode=256",
             "--max-running-requests=300",
             "--mem-fraction-static=0.85",
             "--enable-multimodal",
