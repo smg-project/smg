@@ -28,6 +28,7 @@ import signal
 import socket
 import statistics
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -36,6 +37,12 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+
+# Enforced, not assumed: the proxy's accept loop catches TimeoutError, which
+# socket.timeout only became in 3.10. On 3.9 the accept thread would die
+# quietly and a healed partition drill would never accept again.
+if sys.version_info < (3, 10):
+    sys.exit("sim.py requires Python 3.10+ (socket.timeout became TimeoutError in 3.10)")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -398,8 +405,8 @@ class TcpProxy:
             try:
                 client, _ = self._server.accept()
             except TimeoutError:
-                # socket.timeout is an alias of TimeoutError from Python
-                # 3.10 on (the harness requires 3.10+).
+                # socket.timeout is an alias of TimeoutError from 3.10 on;
+                # the floor is enforced at import.
                 continue
             except OSError:
                 return

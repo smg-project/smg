@@ -8,6 +8,9 @@ open-loop `sim-loadgen` crate. No Kubernetes, no production access.
 
 ## Quick start
 
+Python 3.10 or newer (`sim.py` exits at import on older interpreters; macOS's
+system `/usr/bin/python3` is 3.9, so use a Homebrew or uv-managed one).
+
 ```sh
 # Smoke run on a laptop (24 workers, 2 SMGs, 40 s):
 python3 scripts/generate_sim/sim.py run \
