@@ -47,7 +47,12 @@ impl RegistryRlView {
                 .unwrap_or_else(|| Arc::new(worker.http_client().clone()));
             return (Some(worker.base_url().to_string()), Some(client));
         }
-        let Some(advertised) = spec.labels.get(CONTROL_URL_LABEL) else {
+        let Some(advertised) = spec
+            .labels
+            .get(CONTROL_URL_LABEL)
+            .map(String::as_str)
+            .filter(|v| !v.trim().is_empty())
+        else {
             return (None, None);
         };
         let url = resolve_control_url(advertised, worker.url());
@@ -174,6 +179,19 @@ mod tests {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://engine:30000")
                 .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        let info = view_over(vec![worker]).list().pop().expect("one worker");
+        assert!(info.control_url.is_none());
+        assert!(info.control_client.is_none());
+    }
+
+    #[test]
+    fn grpc_worker_with_a_blank_label_has_no_control_endpoint() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://engine:30000")
+                .connection_mode(ConnectionMode::Grpc)
+                .label("rl.control_url", "  ")
                 .build(),
         );
         let info = view_over(vec![worker]).list().pop().expect("one worker");
