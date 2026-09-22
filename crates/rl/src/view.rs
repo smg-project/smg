@@ -13,7 +13,7 @@ pub struct RlWorkerInfo {
     pub id: String,
     /// `Worker::url()`; carries an `@<rank>` suffix for DP-aware workers.
     pub url: String,
-    /// `Worker::base_url()`; the address control calls are sent to.
+    /// `Worker::base_url()`; see `control_url` for where control calls go.
     pub base_url: String,
     pub api_key: Option<String>,
     pub model_id: String,

@@ -56,6 +56,10 @@ pub struct RlWorkerEntry {
     pub model_id: String,
     pub worker_type: String,
     pub connection_mode: String,
+    /// Base URL of the worker's RL control routes: the worker itself for an
+    /// HTTP worker, the engine-advertised or operator-supplied
+    /// `rl.control_url` otherwise; `null` when the worker has none.
+    pub control_url: Option<String>,
     pub tp_size: Option<u64>,
     pub dp_size: Option<u64>,
     pub pp_size: Option<u64>,
@@ -150,6 +154,7 @@ mod tests {
             model_id: "m".to_string(),
             worker_type: "regular".to_string(),
             connection_mode: "http".to_string(),
+            control_url: Some("http://a:1".to_string()),
             tp_size: Some(1),
             dp_size: None,
             pp_size: None,
