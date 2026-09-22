@@ -19,7 +19,7 @@ use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 
 #[cfg(test)]
 mod dp_removal_tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
 
     use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, WorkerStatus, WorkerType};
     use smg::{
@@ -130,15 +130,29 @@ mod dp_removal_tests {
         }
     }
 
+    /// Snapshot `(worker id, revision)` for each worker, as discovery does.
+    fn guards(context: &AppContext, workers: &[&Arc<dyn Worker>]) -> HashMap<String, u64> {
+        workers
+            .iter()
+            .map(|worker| {
+                let id = context
+                    .worker_registry
+                    .get_id_by_url(worker.url())
+                    .expect("worker is registered");
+                (id.as_str().to_string(), worker.revision())
+            })
+            .collect()
+    }
+
     async fn run_removal(
         context: &Arc<AppContext>,
         url: &str,
-        expected_revision: Option<u64>,
+        expected_revisions: Option<HashMap<String, u64>>,
     ) -> Result<String, String> {
         let engine = &context.workflow_engines.get().unwrap().worker_removal;
         let data = create_worker_removal_workflow_data(
             url.to_string(),
-            expected_revision,
+            expected_revisions,
             Arc::clone(context),
         );
         let instance = engine
@@ -148,6 +162,74 @@ mod dp_removal_tests {
         engine
             .wait_for_completion(instance, url, Duration::from_secs(10))
             .await
+    }
+
+    /// A DP group collapses to one removal job but holds independent
+    /// revisions per rank. Guarding it with a single revision retained only
+    /// the ranks that happened to share that value and silently left the
+    /// others registered against a Pod that was already gone. Per-rank
+    /// guards drain the ranks still at their observed revision and skip only
+    /// the one that moved.
+    #[tokio::test]
+    async fn dp_group_removal_skips_only_the_rank_whose_revision_moved() {
+        let context = create_test_context(RouterConfig {
+            dp_aware: true,
+            disable_load_monitoring: true,
+            ..Default::default()
+        })
+        .await;
+        let base = "http://worker:30000".to_string();
+        let rank0 = register(&context, &base, WorkerType::Decode, Some(0));
+        let rank1 = register(&context, &base, WorkerType::Decode, Some(1));
+
+        // Both ranks sit at the same revision, which is exactly the case a
+        // scalar guard could not distinguish. Claim rank1 moved on since the
+        // snapshot; rank0 is still current.
+        let mut expected = guards(&context, &[&rank0]);
+        let rank1_id = context
+            .worker_registry
+            .get_id_by_url(rank1.url())
+            .expect("rank1 is registered");
+        expected.insert(rank1_id.as_str().to_string(), rank1.revision() + 1);
+
+        run_removal(&context, "worker:30000", Some(expected))
+            .await
+            .unwrap();
+
+        assert!(
+            context.worker_registry.get_by_url(rank0.url()).is_none(),
+            "the rank still at its observed revision must drain"
+        );
+        assert!(
+            context.worker_registry.get_by_url(rank1.url()).is_some(),
+            "the rank whose revision moved must be skipped, not dropped"
+        );
+    }
+
+    /// A rank registered after the snapshot has no guard entry at all, so it
+    /// is a different incarnation and must be left for the next pass.
+    #[tokio::test]
+    async fn dp_group_removal_leaves_ranks_absent_from_the_snapshot() {
+        let context = create_test_context(RouterConfig {
+            dp_aware: true,
+            disable_load_monitoring: true,
+            ..Default::default()
+        })
+        .await;
+        let base = "http://worker:30000".to_string();
+        let rank0 = register(&context, &base, WorkerType::Decode, Some(0));
+        let rank1 = register(&context, &base, WorkerType::Decode, Some(1));
+
+        // Snapshot rank0 only, as if rank1 appeared afterwards.
+        run_removal(&context, "worker:30000", Some(guards(&context, &[&rank0])))
+            .await
+            .unwrap();
+
+        assert!(context.worker_registry.get_by_url(rank0.url()).is_none());
+        assert!(
+            context.worker_registry.get_by_url(rank1.url()).is_some(),
+            "an unguarded rank is a later incarnation and must survive"
+        );
     }
 
     #[tokio::test]
@@ -172,12 +254,17 @@ mod dp_removal_tests {
                 );
 
                 // A mismatched revision must preserve every current registration.
-                run_removal(&context, "worker:30000", Some(plain.revision() + 1))
+                let stale: HashMap<String, u64> = guards(&context, &[&plain, &rank0, &rank1])
+                    .into_iter()
+                    .map(|(id, revision)| (id, revision + 1))
+                    .collect();
+                run_removal(&context, "worker:30000", Some(stale))
                     .await
                     .unwrap();
                 assert_eq!(context.worker_registry.len(), 4);
 
-                run_removal(&context, "worker:30000", Some(plain.revision()))
+                let current = guards(&context, &[&plain, &rank0, &rank1]);
+                run_removal(&context, "worker:30000", Some(current))
                     .await
                     .unwrap();
                 for removed in [plain, rank0, rank1] {
@@ -187,7 +274,7 @@ mod dp_removal_tests {
                 assert_eq!(context.worker_registry.len(), 1);
 
                 // Discovery removal is idempotent; an explicit missing target errors.
-                run_removal(&context, "worker:30000", Some(0))
+                run_removal(&context, "worker:30000", Some(HashMap::new()))
                     .await
                     .unwrap();
                 assert!(run_removal(&context, "worker:30000", None).await.is_err());

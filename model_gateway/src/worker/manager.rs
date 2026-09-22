@@ -908,10 +908,14 @@ async fn submit_removal_job(
         expected_revision,
         "Removing failed worker from registry"
     );
+    // Guard the failed worker by its own id. The url is a DP base, so the
+    // removal step matches the whole rank group; a bare revision would take
+    // out every sibling that happens to sit at the same revision.
+    let expected_revisions = HashMap::from([(worker_id.as_str().to_string(), expected_revision)]);
     if let Err(e) = job_queue
         .submit(Job::RemoveWorker {
             url: url.clone(),
-            expected_revision: Some(expected_revision),
+            expected_revisions: Some(expected_revisions),
         })
         .await
     {

@@ -207,13 +207,13 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
 /// Helper to create initial workflow data for worker removal
 pub fn create_worker_removal_workflow_data(
     url: String,
-    expected_revision: Option<u64>,
+    expected_revisions: Option<std::collections::HashMap<String, u64>>,
     app_context: Arc<AppContext>,
 ) -> WorkerRemovalWorkflowData {
     WorkerRemovalWorkflowData {
         config: WorkerRemovalRequest {
             url,
-            expected_revision,
+            expected_revisions,
         },
         workers_to_remove: None,
         worker_urls: Vec::new(),

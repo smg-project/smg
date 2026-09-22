@@ -4,6 +4,7 @@
 //! them asynchronously in background worker tasks.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
@@ -43,7 +44,11 @@ pub enum Job {
     },
     RemoveWorker {
         url: String,
-        expected_revision: Option<u64>,
+        /// Per-worker revision guards keyed by registry worker id. A DP group
+        /// shares one canonical URL but each rank holds its own revision, so
+        /// one scalar cannot guard the group. `None` removes every match
+        /// unguarded.
+        expected_revisions: Option<HashMap<String, u64>>,
     },
     InitializeWorkersFromConfig {
         router_config: Box<RouterConfig>,
@@ -425,7 +430,7 @@ impl JobQueue {
             }
             Job::RemoveWorker {
                 url,
-                expected_revision,
+                expected_revisions,
             } => {
                 let engines = context
                     .workflow_engines
@@ -434,7 +439,7 @@ impl JobQueue {
 
                 let workflow_data = create_worker_removal_workflow_data(
                     url.to_string(),
-                    *expected_revision,
+                    expected_revisions.clone(),
                     Arc::clone(context),
                 );
 

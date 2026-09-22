@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::{
     app_context::AppContext,
     observability::metrics::{metrics_labels, Metrics},
-    worker::WorkerOrigin,
+    worker::{registry::WorkerId, WorkerOrigin},
     workflow::{Job, WorkerRegistrationMode},
 };
 
@@ -57,12 +57,32 @@ pub(super) struct DesiredState {
 /// A registry worker owned by K8s discovery (stamped with [`POD_UID_LABEL`]).
 #[derive(Debug, Clone)]
 pub(super) struct OwnedWorker {
+    /// The registry id. A DP group shares one canonical [`Self::url`], so the
+    /// id is what distinguishes its ranks — and what the removal guard needs
+    /// to pin each rank to its own revision.
+    pub(super) id: WorkerId,
     /// Scheme- and DP-rank-stripped `host:port`.
     pub(super) url: String,
     pub(super) pod_uid: String,
     /// Revision guard for removal: a concurrently replaced worker is skipped
     /// and re-evaluated on the next pass instead of removed blindly.
     pub(super) revision: u64,
+}
+
+/// One canonical URL to remove, carrying every registry worker that shares it.
+///
+/// DP-rank expansions collapse to one canonical URL but hold independent
+/// revisions, so a single scalar cannot guard the group: it would silently
+/// drop the ranks whose revision differs, leaving them registered against a
+/// Pod that is already gone.
+#[derive(Debug, Clone)]
+pub(super) struct RemovalTarget {
+    pub(super) url: String,
+    /// Uniform across the group: ranks sharing a canonical URL come from one
+    /// Pod, and a uid mismatch is what put the group here.
+    pub(super) pod_uid: String,
+    /// `(id, revision)` as observed in this snapshot, one entry per rank.
+    pub(super) guards: Vec<(WorkerId, u64)>,
 }
 
 /// `http://10.0.0.1:8080@2` → `10.0.0.1:8080`.
@@ -88,6 +108,7 @@ fn k8s_owned_workers(app_context: &AppContext) -> Vec<OwnedWorker> {
             }
             let pod_uid = worker.metadata().spec.labels.get(POD_UID_LABEL)?.clone();
             Some(OwnedWorker {
+                id,
                 url: canonical_host_port(worker.url()).to_string(),
                 pod_uid,
                 revision: worker.revision(),
@@ -103,8 +124,9 @@ pub(super) struct ReconcileActions {
     pub(super) add: Vec<DesiredWorker>,
     /// Workers to remove: URL gone from the desired set, or owned by a pod
     /// uid that no longer holds the URL (covers a stale-scheme sibling the
-    /// same-URL Upsert cannot replace).
-    pub(super) remove: Vec<OwnedWorker>,
+    /// same-URL Upsert cannot replace). One entry per canonical URL, carrying
+    /// every rank that shares it.
+    pub(super) remove: Vec<RemovalTarget>,
 }
 
 pub(super) fn compute_actions(
@@ -114,16 +136,34 @@ pub(super) fn compute_actions(
     let mut actions = ReconcileActions::default();
 
     let mut registered_uid: HashMap<&str, &str> = HashMap::new();
+    // DP-rank expansions share one canonical URL: remove it once, but keep
+    // every rank's own `(id, revision)` so the guard cannot drop the ranks
+    // whose revision happens to differ from an arbitrarily chosen one.
+    let mut remove_by_url: HashMap<&str, RemovalTarget> = HashMap::new();
     for worker in registered {
         registered_uid.insert(worker.url.as_str(), worker.pod_uid.as_str());
         match desired.uid_by_url.get(worker.url.as_str()) {
             Some(uid) if *uid == worker.pod_uid => {}
-            _ => actions.remove.push(worker.clone()),
+            _ => remove_by_url
+                .entry(worker.url.as_str())
+                .or_insert_with(|| RemovalTarget {
+                    url: worker.url.clone(),
+                    pod_uid: worker.pod_uid.clone(),
+                    guards: Vec::new(),
+                })
+                .guards
+                .push((worker.id.clone(), worker.revision)),
         }
     }
-    // DP-rank expansions share one canonical URL; remove it once.
+    actions.remove = remove_by_url.into_values().collect();
+    // `HashMap` iteration order is unspecified; sort so a pass submits jobs
+    // and logs them in a stable order.
     actions.remove.sort_unstable_by(|a, b| a.url.cmp(&b.url));
-    actions.remove.dedup_by(|a, b| a.url == b.url);
+    for target in &mut actions.remove {
+        target
+            .guards
+            .sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    }
 
     for worker in &desired.addable {
         match registered_uid.get(worker.url.as_str()) {
@@ -201,7 +241,7 @@ pub(super) async fn reconcile(
             .get_status(url)
             .is_some_and(|status| status.status == "pending" || status.status == "processing")
     };
-    let removals: Vec<&OwnedWorker> = actions
+    let removals: Vec<&RemovalTarget> = actions
         .remove
         .iter()
         .filter(|worker| !in_flight(&worker.url))
@@ -229,12 +269,21 @@ pub(super) async fn reconcile(
 
     for worker in removals {
         info!(
-            "Removing worker {}: pod unready, gone, terminating, or replaced",
-            worker.url
+            "Removing worker {} ({} registration(s), pod {}): pod unready, gone, \
+             terminating, or replaced",
+            worker.url,
+            worker.guards.len(),
+            worker.pod_uid
         );
         let job = Job::RemoveWorker {
             url: worker.url.clone(),
-            expected_revision: Some(worker.revision),
+            expected_revisions: Some(
+                worker
+                    .guards
+                    .iter()
+                    .map(|(id, revision)| (id.as_str().to_string(), *revision))
+                    .collect(),
+            ),
         };
         match job_queue.submit(job).await {
             Ok(()) => Metrics::record_discovery_deregistration(
@@ -317,10 +366,16 @@ mod tests {
     }
 
     fn owned(url: &str, uid: &str) -> OwnedWorker {
+        owned_rank(url, uid, url, 1)
+    }
+
+    /// One rank of a DP group: same canonical `url`, distinct id and revision.
+    fn owned_rank(url: &str, uid: &str, id: &str, revision: u64) -> OwnedWorker {
         OwnedWorker {
+            id: WorkerId::from_string(id.to_string()),
             url: url.to_string(),
             pod_uid: uid.to_string(),
-            revision: 1,
+            revision,
         }
     }
 
@@ -372,12 +427,50 @@ mod tests {
 
     #[test]
     fn test_compute_actions_dp_ranks_removed_once() {
-        let registered = [owned("10.0.0.1:8080", "u1"), owned("10.0.0.1:8080", "u1")];
+        let registered = [
+            owned_rank("10.0.0.1:8080", "u1", "w@0", 1),
+            owned_rank("10.0.0.1:8080", "u1", "w@1", 1),
+        ];
         let actions = compute_actions(&DesiredState::default(), &registered);
         assert_eq!(actions.remove.len(), 1);
         assert_eq!(actions.remove[0].url, "10.0.0.1:8080");
-        assert_eq!(actions.remove[0].revision, 1);
+        assert_eq!(actions.remove[0].guards.len(), 2);
         assert!(actions.add.is_empty());
+    }
+
+    /// The group collapses to one removal job, but every rank must keep its
+    /// own revision. Carrying a single revision retained only the ranks that
+    /// happened to share it and left the others registered against a Pod that
+    /// was already gone.
+    #[test]
+    fn dp_ranks_keep_their_own_revision_when_diverged() {
+        let registered = [
+            owned_rank("10.0.0.1:8080", "u1", "w@0", 7),
+            owned_rank("10.0.0.1:8080", "u1", "w@1", 2),
+        ];
+        let actions = compute_actions(&DesiredState::default(), &registered);
+        assert_eq!(actions.remove.len(), 1, "one job per canonical URL");
+        let guards: Vec<(&str, u64)> = actions.remove[0]
+            .guards
+            .iter()
+            .map(|(id, revision)| (id.as_str(), *revision))
+            .collect();
+        assert_eq!(guards, vec![("w@0", 7), ("w@1", 2)]);
+    }
+
+    /// Two pods behind one canonical URL keep separate guards per rank, so a
+    /// shared revision value cannot make one pod's rank stand in for another's.
+    #[test]
+    fn diverged_ranks_do_not_collapse_on_equal_revisions() {
+        let registered = [
+            owned_rank("10.0.0.1:8080", "u1", "w@0", 3),
+            owned_rank("10.0.0.1:8080", "u1", "w@1", 3),
+            owned_rank("10.0.0.1:8081", "u1", "x@0", 3),
+        ];
+        let actions = compute_actions(&DesiredState::default(), &registered);
+        assert_eq!(actions.remove.len(), 2, "one job per canonical URL");
+        assert_eq!(actions.remove[0].guards.len(), 2);
+        assert_eq!(actions.remove[1].guards.len(), 1);
     }
 
     #[test]

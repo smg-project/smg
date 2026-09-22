@@ -195,7 +195,7 @@ mod tests {
         let data = WorkerRemovalWorkflowData {
             config: super::super::find_workers_to_remove::WorkerRemovalRequest {
                 url: worker_urls.first().cloned().unwrap_or_default(),
-                expected_revision: None,
+                expected_revisions: None,
             },
             workers_to_remove: Some(WorkerList::from_workers(&workers)),
             worker_urls,

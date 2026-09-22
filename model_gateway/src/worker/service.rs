@@ -517,7 +517,7 @@ impl WorkerService {
 
         let job = Job::RemoveWorker {
             url: url.clone(),
-            expected_revision: None,
+            expected_revisions: None,
         };
 
         let job_queue = self.get_job_queue()?;

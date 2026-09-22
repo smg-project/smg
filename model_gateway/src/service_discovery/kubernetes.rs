@@ -1217,7 +1217,10 @@ mod tests {
     }
 
     fn owned(url: &str, uid: &str) -> reconciler::OwnedWorker {
+        use crate::worker::registry::WorkerId;
+
         reconciler::OwnedWorker {
+            id: WorkerId::from_string(url.to_string()),
             url: url.to_string(),
             pod_uid: uid.to_string(),
             revision: 1,
