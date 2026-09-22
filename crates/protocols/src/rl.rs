@@ -48,7 +48,7 @@ pub struct RlWorkerEntry {
     pub id: String,
     /// Registry URL; carries an `@<rank>` suffix for DP-aware workers.
     pub url: String,
-    /// The address control calls are sent to.
+    /// `Worker::base_url()`; see `control_url` for where control calls go.
     pub base_url: String,
     /// Engine name (`sglang`, `vllm`, ...); `unknown` when undetected.
     pub engine: String,
