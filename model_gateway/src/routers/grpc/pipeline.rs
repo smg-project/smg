@@ -1517,6 +1517,7 @@ mod request_release_tests {
                     cached_tokens: 0,
                     output_logprobs: None,
                     index: 0,
+                    weight_version: None,
                 })),
             }),
             Ok(ts::GenerateResponse {
