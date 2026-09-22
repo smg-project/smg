@@ -1735,6 +1735,17 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Whether the request carries a KV handoff from the prefill worker
+    /// (either the modern JSON params or the legacy typed host/port).
+    pub fn has_kv_transfer_params(&self) -> bool {
+        match self {
+            Self::Vllm(req) => {
+                req.kv_transfer_params_json.is_some() || req.kv_transfer_params.is_some()
+            }
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => false,
+        }
+    }
+
     /// Set encode->prefill bootstrap info for backends that receive multimodal embeddings
     /// out-of-band from encode workers.
     pub(crate) fn set_encode_bootstrap_info(&mut self, items: Vec<EncodeItemBootstrapInfo>) {

@@ -1014,11 +1014,14 @@ async fn execute_sequential_pd(
         && workers
             .decode_worker()
             .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
-    let mut decode_request = match sequential_pd_decode_form(
-        &proto_request,
-        decode_language_model_only,
-        relay_kv_params,
-    )? {
+    let decode_form =
+        sequential_pd_decode_form(&proto_request, decode_language_model_only, relay_kv_params)?;
+    // A stripped multimodal leg has no local-recompute fallback: the image
+    // KV exists only on the prefill worker. Text requests strip to a no-op
+    // and keep the fallback, so only mm requests need the handoff checked.
+    let stripped_mm_decode = matches!(decode_form, SequentialPdDecodeForm::TextPlusHashes)
+        && proto_request.has_mm_inputs();
+    let mut decode_request = match decode_form {
         SequentialPdDecodeForm::Full => proto_request.clone(),
         SequentialPdDecodeForm::TextPlusHashes => proto_request.clone_without_mm(),
         SequentialPdDecodeForm::IdentityOnly => proto_request.clone_without_mm_pixels(),
@@ -1160,6 +1163,28 @@ async fn execute_sequential_pd(
             );
         }
         _ => {}
+    }
+
+    // A stripped multimodal leg cannot fall back to a local recompute: the
+    // image KV exists only on the prefill worker, so without a handoff the
+    // decode engine would recompute the prompt as pure text and answer
+    // image-blind. Fail instead of dispatching.
+    if stripped_mm_decode && !decode_request.has_kv_transfer_params() {
+        error!(
+            function = "execute_sequential_pd",
+            request_id = %decode_request.request_id(),
+            "stripped multimodal decode leg has no kv_transfer_params to pull from"
+        );
+        let mut response = error::bad_gateway(
+            "pd_decode_missing_kv_transfer_params",
+            "the prefill worker returned no kv_transfer_params for this multimodal \
+             request, and the language-model-only decode worker cannot recompute the \
+             prompt locally (outdated smg-grpc-servicer or missing kv-transfer-config \
+             on the prefill worker?)"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
     }
 
     // Send request to decode
@@ -1922,6 +1947,21 @@ mod tests {
             sequential_pd_decode_form(&text, true, false).expect("text n>1"),
             SequentialPdDecodeForm::TextPlusHashes
         );
+    }
+
+    #[test]
+    fn has_kv_transfer_params_reads_both_wire_forms() {
+        let mut json = ProtoGenerateRequest::Vllm(Box::default());
+        assert!(!json.has_kv_transfer_params());
+        json.set_kv_transfer_params_json("{\"do_remote_prefill\":true}".to_string());
+        assert!(json.has_kv_transfer_params());
+
+        let mut typed = ProtoGenerateRequest::Vllm(Box::default());
+        typed.set_kv_transfer_params("10.0.0.1".to_string(), 8998);
+        assert!(typed.has_kv_transfer_params());
+
+        // Non-vLLM backends carry no connector handoff field.
+        assert!(!tokenspeed_request(1, None).has_kv_transfer_params());
     }
 
     #[tokio::test]
