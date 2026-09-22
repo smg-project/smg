@@ -88,7 +88,9 @@ pub async fn run_fanout(
             }
             Err(e) => {
                 let connection_mode = match &e {
-                    RlError::UnsupportedConnectionMode { mode, .. } => Some(mode.clone()),
+                    RlError::NoControlEndpoint {
+                        connection_mode, ..
+                    } => Some(connection_mode.clone()),
                     _ => None,
                 };
                 report.failed.push(RlFailedCall {
@@ -225,6 +227,8 @@ mod tests {
         let bad = FakeEngine::start(StatusCode::INTERNAL_SERVER_ERROR, json!({"e": 1}), 0).await;
         let mut grpc = worker("g1", &format!("{}/grpc", good.url), RuntimeType::Sglang);
         grpc.connection_mode = ConnectionMode::Grpc;
+        grpc.control_url = None;
+        grpc.control_client = None;
         let app = crate::router::<()>(state(
             vec![
                 worker("w1", &good.url, RuntimeType::Sglang),
@@ -261,7 +265,8 @@ mod tests {
         assert_eq!(by_id("w2")["error"], "upstream_error");
         assert_eq!(by_id("w2")["status"], 500);
         assert_eq!(by_id("w3")["error"], "upstream_unreachable");
-        assert_eq!(by_id("g1")["error"], "unsupported_connection_mode");
+        assert_eq!(by_id("g1")["error"], "no_control_endpoint");
+        assert_eq!(by_id("g1")["connection_mode"], "grpc");
         assert_eq!(
             body["results"]["w2"]["status"], 500,
             "failed also in results"
