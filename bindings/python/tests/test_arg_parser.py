@@ -604,6 +604,12 @@ class TestParseRouterArgs:
 
         with pytest.raises(SystemExit):
             parse_router_args(["--mm-processing", "routers"])
+        # Same spelling rules as the Rust CLI: case-insensitive, sign-checked.
+        assert parse_router_args(["--mm-processing", "Router"]).mm_processing == "router"
+        for flag in ("--mm-pixel-cache-mb", "--rdma-slot-ttl-s"):
+            with pytest.raises(SystemExit):
+                parse_router_args([flag, "-1"])
+        assert parse_router_args(["--mm-pixel-cache-mb", "0"]).mm_pixel_cache_mb == 0
 
     def test_parse_routing_key_headers(self):
         """Ordered list flag; unset keeps the x-smg-routing-key default."""

@@ -180,7 +180,8 @@ const MAX_RDMA_ARENA_BYTES: usize = 8 * 1024 * 1024 * 1024;
 /// A const rather than an env knob: it only ever widens the lost-notif leak window
 /// (a capacity nit, never correctness -- the crate's per-lease gen framing makes a
 /// recycled-under-read slot detectable independent of the TTL), and 30s dwarfs any
-/// Encode-RPC delivery jitter. `SMG_RDMA_SLOT_TTL_S` remains the full-TTL override.
+/// Encode-RPC delivery jitter. `--rdma-slot-ttl-s` / `SMG_RDMA_SLOT_TTL_S` remains
+/// the full-TTL override.
 const RDMA_SLOT_TTL_SLACK: Duration = Duration::from_secs(30);
 
 /// Process-wide RDMA pixel exporter, built lazily on first use from env-derived
@@ -283,13 +284,15 @@ fn worker_max_hold() -> Duration {
 /// force-reclaims it. MUST exceed [`worker_max_hold`] or the TTL races a still-valid
 /// READ: the reaper frees the slot, the next image re-leases the SAME address, and
 /// the late READ silently returns the WRONG image's pixels. Derived by default
-/// (= `worker_max_hold` + [`RDMA_SLOT_TTL_SLACK`]); `SMG_RDMA_SLOT_TTL_S` overrides,
-/// but an override that does not exceed the hold is rejected (see [`resolve_slot_ttl`]).
+/// (= `worker_max_hold` + [`RDMA_SLOT_TTL_SLACK`]); `--rdma-slot-ttl-s` /
+/// `SMG_RDMA_SLOT_TTL_S` overrides, but an override that does not exceed the hold is
+/// rejected (see [`resolve_slot_ttl`]).
 fn derive_rdma_slot_ttl() -> Duration {
     resolve_slot_ttl(mm_settings().rdma_slot_ttl_s.value, worker_max_hold())
 }
 
-/// Apply the TTL invariant to an optional `SMG_RDMA_SLOT_TTL_S` override: honor it
+/// Apply the TTL invariant to an optional `--rdma-slot-ttl-s` / `SMG_RDMA_SLOT_TTL_S`
+/// override: honor it
 /// only if it strictly exceeds `hold` (otherwise the reaper could reclaim a slot the
 /// worker is still READing and cross-wire images). A too-small override is ignored
 /// with a warning in favor of the derived `hold + RDMA_SLOT_TTL_SLACK`. Pure (takes
@@ -303,7 +306,7 @@ fn resolve_slot_ttl(override_secs: Option<u64>, hold: Duration) -> Duration {
         warn!(
             ttl_s = secs,
             hold_s = hold.as_secs(),
-            "SMG_RDMA_SLOT_TTL_S must exceed the worker's max hold; ignoring override"
+            "--rdma-slot-ttl-s / SMG_RDMA_SLOT_TTL_S must exceed the worker's max hold; ignoring override"
         );
     }
     hold + RDMA_SLOT_TTL_SLACK

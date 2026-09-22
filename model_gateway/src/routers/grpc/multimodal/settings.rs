@@ -228,13 +228,20 @@ pub(crate) fn init_mm_settings(settings: MultimodalSettings) {
 }
 
 /// The process-wide settings. Never seeded (tests, embedded use): resolved
-/// lazily from env and the built-in defaults, and an unreadable env value
-/// falls back to the default instead of stopping anything.
+/// lazily from env and the built-in defaults, and an unreadable
+/// `SMG_MM_PROCESSING` falls back to its default while the other settings
+/// keep their env values.
 pub(crate) fn mm_settings() -> &'static MultimodalSettings {
     SETTINGS.get_or_init(|| {
-        MultimodalSettings::resolve(&RouterConfig::default()).unwrap_or_else(|error| {
-            warn!(error = %error, "unreadable multimodal env setting; using the default");
-            MultimodalSettings::default()
+        let config = RouterConfig::default();
+        MultimodalSettings::resolve(&config).unwrap_or_else(|error| {
+            warn!(error = %error, "unreadable {ENV_PROCESSING}; using the default placement");
+            MultimodalSettings::resolve_with(&config, |name| {
+                (name != ENV_PROCESSING)
+                    .then(|| std::env::var(name).ok())
+                    .flatten()
+            })
+            .unwrap_or_default()
         })
     })
 }
@@ -340,6 +347,30 @@ mod tests {
             blank.processing,
             Setting::from_default(MmProcessingMode::Auto)
         );
+    }
+
+    /// Without `SMG_MM_PROCESSING` in the reader, the other settings resolve
+    /// on their own: what the never-seeded path falls back to when the
+    /// placement env is unreadable.
+    #[test]
+    fn the_other_settings_survive_an_unreadable_placement_env() {
+        let full = env(&[
+            ("SMG_MM_PROCESSING", "routers"),
+            ("SMG_MM_PIXEL_CACHE_MB", "256"),
+            ("SMG_LOG_MM_TIMING", "1"),
+        ]);
+        let config = RouterConfig::default();
+        assert!(MultimodalSettings::resolve_with(&config, &full).is_err());
+        let rest = MultimodalSettings::resolve_with(&config, |name| {
+            (name != ENV_PROCESSING).then(|| full(name)).flatten()
+        })
+        .unwrap();
+        assert_eq!(
+            rest.processing,
+            Setting::from_default(MmProcessingMode::Auto)
+        );
+        assert_eq!(rest.pixel_cache_mb, from_env(256));
+        assert_eq!(rest.log_mm_timing, from_env(true));
     }
 
     /// The numeric and boolean env knobs keep their lenient reading: an

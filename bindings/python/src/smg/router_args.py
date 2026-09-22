@@ -31,6 +31,15 @@ def _parse_int_csv(value: str) -> list[int]:
     return [int(item) for item in value.split(",") if item]
 
 
+def _non_negative_int(value: str) -> int:
+    """argparse type for the unsigned Rust settings; rejects a minus sign here
+    rather than in the binding's conversion after parsing."""
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return number
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
@@ -960,7 +969,7 @@ class RouterArgs:
         )
         parser.add_argument(
             f"--{prefix}mm-processing",
-            type=str,
+            type=str.lower,
             choices=["auto", "router", "worker"],
             default=RouterArgs.mm_processing,
             help=(
@@ -973,7 +982,7 @@ class RouterArgs:
         )
         parser.add_argument(
             f"--{prefix}mm-pixel-cache-mb",
-            type=int,
+            type=_non_negative_int,
             default=RouterArgs.mm_pixel_cache_mb,
             help=(
                 "Pixel cache budget in MiB for router-side preprocessed media; 0 keeps"
@@ -1001,7 +1010,7 @@ class RouterArgs:
         )
         parser.add_argument(
             f"--{prefix}rdma-slot-ttl-s",
-            type=int,
+            type=_non_negative_int,
             default=RouterArgs.rdma_slot_ttl_s,
             help=(
                 "Seconds a leased RDMA pixel slot lives without a free notification;"
