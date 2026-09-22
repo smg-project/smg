@@ -46,6 +46,20 @@ to stand in for a training loop's live weights. `--chunk` (default 64) is how
 many parameters ride on one `update_weights_from_distributed` call, so a large
 model streams in batches instead of one enormous request.
 
+`--master-address` is this host's address **as the engines see it**: every
+engine is handed it and dials it to join the trainer's process group. The
+default, `127.0.0.1`, only works when the engines share a host with the
+trainer. Against engines on other hosts, pass the trainer's routable address —
+otherwise each engine dials its own loopback, none arrives, and the rendezvous
+stalls for `--timeout` before failing. The script refuses to start when `--smg`
+names a non-loopback host and `--master-address` is still loopback.
+
+```bash
+python examples/rl/refit_from_trainer.py --smg http://smg:30000 \
+  --master-address trainer-0.internal \
+  --model-path /ckpt/step-42 --weight-version 42 --selector engine=tokenspeed
+```
+
 Ranks are laid out from each worker's `tp_size`: the trainer takes rank 0 and
 engine *k* takes `rank_offsets[k] .. rank_offsets[k] + tp_size - 1`, so two
 TP-1 engines make a world of 3. `init_weights_update_group` goes to each worker
@@ -57,8 +71,21 @@ A TokenSpeed engine launched without an explicit parallelism flag reports no
 `--tp-size` when that assumption is wrong: a bad rank layout deadlocks the
 group instead of failing.
 
-Exit code 0 on success, 1 on any failure. The group is destroyed and the
-engines resumed even when a refit fails part-way.
+Exit code 0 on success, 1 on any failure — including a refit that lands but
+whose teardown does not.
+
+An HTTP-level failure is cleaned up: the group is destroyed, the cache flushed
+and the engines resumed on the way out, and the engines are named on stderr as
+serving a part-old, part-new model if any chunk had already gone out. An engine
+that stops participating in the collective is different. By then the trainer's
+main thread is inside NCCL, so torch's watchdog takes the process down without
+raising into Python, no cleanup runs, and the fleet stays paused. Un-pause it
+by hand:
+
+```python
+from smg.rl import RL
+RL("http://smg:30000").fanout("continue_generation", {}, selector="engine=tokenspeed")
+```
 
 ## Selector cheatsheet
 

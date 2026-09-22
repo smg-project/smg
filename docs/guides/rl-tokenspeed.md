@@ -50,11 +50,16 @@ by the engine on the gRPC response.
 `examples/rl/refit_from_trainer.py` is that refit, end to end:
 
     python examples/rl/refit_from_trainer.py --smg http://smg:30000 \
+      --master-address trainer-0.internal \
       --model-path /ckpt/step-42 --weight-version 42 --selector engine=tokenspeed
 
 It runs on the trainer's host, needs `torch` built with CUDA and
 `transformers`, and loads `--model-path` onto `--device` (default `cuda:0`) in
-place of a live policy. Ranks come from each worker's `tp_size`: the trainer
+place of a live policy. `--master-address` is the trainer host's address as the
+engines see it, since each engine dials it to join the group; the default
+`127.0.0.1` only works when engines and trainer share a host, and the script
+refuses to start when `--smg` names a non-loopback host while
+`--master-address` is still loopback. Ranks come from each worker's `tp_size`: the trainer
 takes rank 0 and engine *k* takes `rank_offset_k .. rank_offset_k + tp_k - 1`,
 so `world_size = 1 + sum(tp)`. An engine launched without an explicit
 parallelism flag reports no `tp_size` (TokenSpeed leaves `attn_tp_size` unset,
@@ -64,8 +69,17 @@ per-worker call, because each worker gets a different `rank_offset`; the
 broadcast is a fan-out, because the body is identical. `--chunk` (default 64) parameters ride
 on each `update_weights_from_distributed` call, so a large policy streams in
 batches. The version is stamped only on the last chunk, so a refit is never
-advertised as complete before every weight has landed. The group is destroyed
-and the engines resumed even when the refit fails part-way.
+advertised as complete before every weight has landed.
+
+An HTTP-level failure is cleaned up: the group is destroyed, the cache flushed,
+the engines resumed, and any engine left holding a part-old, part-new model is
+named on stderr. An engine that stops participating in the collective is not.
+The trainer's main thread is inside NCCL by then, so torch's watchdog takes the
+process down without raising into Python and nothing resumes the fleet. Recover
+with a `continue_generation` fan-out:
+
+    python -c 'from smg.rl import RL; RL("http://smg:30000").fanout(
+        "continue_generation", {}, selector="engine=tokenspeed")'
 
 The engine expects the checkpoint's own HuggingFace parameter names, in
 broadcast order; its `load_weights` does the fused/stacked mapping (`q_proj`,
