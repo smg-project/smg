@@ -3,6 +3,20 @@
 from collections.abc import Sequence
 
 
+def engine_accepts_mm_inputs(model_config) -> bool:
+    """Whether the engine accepts multimodal inputs at all.
+
+    A decode worker started with ``--language-model-only`` sets every
+    modality limit to 0: vLLM keeps ``is_multimodal_model`` true (the
+    architecture is multimodal) but reports ``supports_multimodal_inputs``
+    false, has no vision encoder and an encoder-cache budget of 0. The
+    router reads this through the worker's ``supports_vision`` label to
+    decide whether a decode leg may carry an mm payload. Older vLLM builds
+    lack the property; fall back to the architecture check.
+    """
+    return getattr(model_config, "supports_multimodal_inputs", model_config.is_multimodal_model)
+
+
 def has_preprocessed_mm_payload(mm_inputs) -> bool:
     """True when the payload carries tensors the preprocessed path can use.
 

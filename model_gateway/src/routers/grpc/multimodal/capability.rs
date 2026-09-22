@@ -13,7 +13,28 @@ use anyhow::Result;
 use llm_multimodal::Modality;
 
 use super::MultimodalIntermediate;
-use crate::worker::RuntimeType;
+use crate::worker::{RuntimeType, Worker};
+
+/// Worker label carrying the engine's vision-input capability (the vLLM
+/// gRPC servicer's `GetModelInfoResponse.supports_vision`). `"false"` on a
+/// multimodal architecture means the engine runs `--language-model-only`:
+/// no vision encoder, encoder-cache budget 0, so no multimodal payload may
+/// reach it. A multimodal model reports `"true"`; a text-only model also
+/// reports `"false"`, which is harmless — its requests carry no mm payload
+/// to strip in the first place.
+pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
+
+/// Whether the worker's engine accepts no multimodal inputs at all (a vLLM
+/// `--language-model-only` worker). Absent label (non-vLLM runtimes, older
+/// servicers) reads as multimodal-capable so behavior stays as today.
+pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
+    worker
+        .metadata()
+        .spec
+        .labels
+        .get(SUPPORTS_VISION_LABEL)
+        .is_some_and(|value| value == "false")
+}
 
 /// Whether `runtime` accepts multimodal inputs of `modality`.
 ///

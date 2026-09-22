@@ -11,6 +11,11 @@ the legs fetch and process the media themselves, and each class asserts the
 path the gateway took: Qwen3-VL forwards references, Phi-3.5 stays on the
 router path because its placeholder is not one a vLLM worker expands.
 
+The language-model-only lanes run the decode pool with
+``--language-model-only`` (no vision encoder, encoder-cache budget 0): the
+grid-less model takes the fully stripped decode leg, while the M-RoPE model
+cannot pair with such a pool and must be rejected with a clear 400.
+
 Usage:
     E2E_RUNTIME=vllm pytest e2e_test/router/test_pd_multimodal.py -v
 """
@@ -22,6 +27,7 @@ import io
 import logging
 from pathlib import Path
 
+import httpx
 import pytest
 from infra import assert_mm_processing
 from PIL import Image
@@ -150,3 +156,80 @@ class TestPDMultimodalMrope:
             answer = _first_word(choice.message.content)
             logger.info("PD multimodal n=2 answer (pug in blanket): %s", answer)
             assert answer == "yes", f"Expected 'yes' from each sample, got: {answer}"
+
+
+def _post_blanket(gateway, model: str, image_url: str, **sampling) -> httpx.Response:
+    return httpx.post(
+        f"{gateway.base_url}/v1/chat/completions",
+        json={
+            "model": model,
+            "messages": _blanket_messages(image_url),
+            **sampling,
+        },
+        timeout=120.0,
+    )
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(2)
+@pytest.mark.model("microsoft/Phi-3.5-vision-instruct")
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "setup_backend",
+    [("pd_grpc", (1, 1, {"decode_args": ["--language-model-only"]}))],
+    indirect=True,
+)
+class TestPDMultimodalLanguageModelOnlyDecode:
+    """Language-model-only decode pool (the production P/D shape).
+
+    The decode workers run with no vision encoder and an encoder-cache
+    budget of 0; the gateway strips the decode leg down to the expanded
+    token ids, the KV handoff and the per-image content hashes, so the
+    decode engine sees a pure-text prompt and never schedules its encoder
+    cache. Grid-less (standard-RoPE) model: isolation still comes from the
+    hash-derived cache_salt.
+    """
+
+    def test_different_images_same_prefix_do_not_alias(self, setup_backend):
+        backend, model, client, gateway = setup_backend
+        _assert_no_cross_image_aliasing(client, model)
+        # A language-model-only decode worker cannot expand media references,
+        # so the media stay router-processed.
+        assert_mm_processing(gateway, worker_expandable=False)
+
+    def test_parallel_sampling_is_rejected_clearly(self, setup_backend):
+        # n>1 has no KV handoff; a pixel-less decode worker cannot recompute
+        # a multimodal prompt locally, so the gateway must say so in a 400
+        # rather than fail deep in the engine.
+        backend, model, client, gateway = setup_backend
+        resp = _post_blanket(gateway, model, _PUG_IMAGE, temperature=0.1, max_tokens=16, n=2)
+        logger.info("n>1 on language-model-only decode: %s %s", resp.status_code, resp.text[:300])
+        assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text[:300]}"
+        assert "language-model-only" in resp.text
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(2)
+@pytest.mark.model("Qwen/Qwen3-VL-8B-Instruct")
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "setup_backend",
+    [("pd_grpc", (1, 1, {"decode_args": ["--language-model-only"]}))],
+    indirect=True,
+)
+class TestPDMultimodalMropeLanguageModelOnlyDecode:
+    """M-RoPE models cannot pair with a language-model-only decode pool.
+
+    The decode leg needs the grid tensors for positions; the pixel-less
+    decode worker cannot accept them. The gateway rejects the pairing with a
+    clear 400 instead of silently mis-rotating positions.
+    """
+
+    def test_mrope_request_is_rejected_clearly(self, setup_backend):
+        backend, model, client, gateway = setup_backend
+        resp = _post_blanket(gateway, model, _PUG_IMAGE, temperature=0, max_tokens=16)
+        logger.info(
+            "M-RoPE on language-model-only decode: %s %s", resp.status_code, resp.text[:300]
+        )
+        assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text[:300]}"
+        assert "language-model-only" in resp.text

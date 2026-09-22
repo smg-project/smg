@@ -63,7 +63,11 @@ from smg_grpc_servicer.vllm.mm_processor import (
     build_mm_processor,
     env_int,
 )
-from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
+from smg_grpc_servicer.vllm.mm_salt import (
+    engine_accepts_mm_inputs,
+    has_preprocessed_mm_payload,
+    mm_identity_cache_salt,
+)
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 
 from ..pd_pairing import pairing_protocol_from_env
@@ -630,7 +634,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             is_generation=model_config.runner_type == "generate",
             max_context_length=model_config.max_model_len,
             vocab_size=model_config.get_vocab_size(),
-            supports_vision=model_config.is_multimodal_model,
+            supports_vision=engine_accepts_mm_inputs(model_config),
             served_model_name=model_config.served_model_name or model_config.model,
             tokenizer_path=model_config.tokenizer or "",
             model_type=getattr(hf_config, "model_type", "") or "",
@@ -673,9 +677,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         mm_processor = ""
         mm_media_ref_schemes = ""
+        # A --language-model-only engine accepts no multimodal inputs, so it
+        # must not advertise worker-side media processing either: the router
+        # would send media references this worker cannot expand.
         if (
             self._mm_processor is not None
-            and self.engine.model_config.is_multimodal_model
+            and engine_accepts_mm_inputs(self.engine.model_config)
             and await self._mm_processor.probe()
         ):
             mm_processor = self._mm_processor.name

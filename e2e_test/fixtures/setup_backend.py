@@ -246,7 +246,9 @@ def setup_backend(request: pytest.FixtureRequest):
         trailing dict may add ``prefill_kv`` / ``decode_kv`` lists naming
         each worker's KV transfer backend, so one fleet can mix transports,
         and ``prefill_env`` / ``decode_env`` dicts of engine environment
-        for one leg (a deployment-injected ``SMG_PAIRING_PROTOCOL``)
+        for one leg (a deployment-injected ``SMG_PAIRING_PROTOCOL``) or
+        ``prefill_args`` / ``decode_args`` lists of engine CLI flags for one
+        leg (a ``--language-model-only`` decode pool)
       - ``@pytest.mark.gateway(policy=..., timeout=..., extra_args=...)``: Gateway config
 
     Returns:
@@ -314,6 +316,9 @@ def setup_backend(request: pytest.FixtureRequest):
         for key in ("prefill_env", "decode_env"):
             if key in leg_options:
                 workers_config = {**workers_config, key: dict(leg_options[key])}
+        for key in ("prefill_args", "decode_args"):
+            if key in leg_options:
+                workers_config = {**workers_config, key: list(leg_options[key])}
     log_dir = os.environ.get("E2E_LOG_DIR") or gateway_config.get("log_dir")
 
     fail_count = _worker_start_failures.get(engine, 0)
@@ -445,6 +450,13 @@ def _per_worker_kv(raw, count: int, leg: str) -> list[str] | None:
     return backends
 
 
+def _merge_engine_args(shared: list[str] | None, leg_only: list[str] | None) -> list[str] | None:
+    """Combine the class-wide engine flags with one PD leg's own flags."""
+    if not leg_only:
+        return shared
+    return [*(shared or []), *leg_only]
+
+
 def _start_pd_leg(
     *,
     model_id: str,
@@ -532,8 +544,12 @@ def _setup_pd(
 
     parallel_start = bool(workers_config.get("parallel_start"))
     # The class marker's engine flags (a decode window, a context length)
-    # reach every leg, as they do for regular workers.
+    # reach every leg, as they do for regular workers. The ``prefill_args`` /
+    # ``decode_args`` leg options add flags to one leg only (a
+    # ``--language-model-only`` decode pool, say).
     extra_engine_args = workers_config.get("extra_engine_args")
+    prefill_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("prefill_args"))
+    decode_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("decode_args"))
     all_workers: list = []
     try:
         prefill_workers = _start_pd_leg(
@@ -547,7 +563,7 @@ def _setup_pd(
             wait_ready=not parallel_start,
             tp=prefill_tp,
             kv_backends=prefill_kv,
-            extra_engine_args=extra_engine_args,
+            extra_engine_args=prefill_engine_args,
             extra_env=workers_config.get("prefill_env"),
         )
         all_workers.extend(prefill_workers)
@@ -565,7 +581,7 @@ def _setup_pd(
             wait_ready=not parallel_start,
             tp=decode_tp,
             kv_backends=decode_kv,
-            extra_engine_args=extra_engine_args,
+            extra_engine_args=decode_engine_args,
             extra_env=workers_config.get("decode_env"),
         )
         all_workers.extend(decode_workers)

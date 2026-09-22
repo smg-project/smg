@@ -54,3 +54,32 @@ def test_salt_is_order_sensitive():
     assert mm_salt.mm_identity_cache_salt(["h1", "h2"]) != mm_salt.mm_identity_cache_salt(
         ["h2", "h1"]
     )
+
+
+class _ModelConfig:
+    """Minimal stand-in for vLLM's ModelConfig."""
+
+    def __init__(self, is_multimodal_model, supports_multimodal_inputs=None):
+        self.is_multimodal_model = is_multimodal_model
+        if supports_multimodal_inputs is not None:
+            self.supports_multimodal_inputs = supports_multimodal_inputs
+
+
+def test_engine_accepts_mm_inputs_full_vision_worker():
+    assert mm_salt.engine_accepts_mm_inputs(_ModelConfig(True, True))
+
+
+def test_engine_accepts_mm_inputs_language_model_only():
+    # --language-model-only keeps the multimodal architecture but zeroes
+    # every modality limit: the engine accepts no multimodal inputs.
+    assert not mm_salt.engine_accepts_mm_inputs(_ModelConfig(True, False))
+
+
+def test_engine_accepts_mm_inputs_text_model():
+    assert not mm_salt.engine_accepts_mm_inputs(_ModelConfig(False, False))
+
+
+def test_engine_accepts_mm_inputs_older_vllm_falls_back_to_architecture():
+    # vLLM builds without supports_multimodal_inputs keep today's behavior.
+    assert mm_salt.engine_accepts_mm_inputs(_ModelConfig(True))
+    assert not mm_salt.engine_accepts_mm_inputs(_ModelConfig(False))

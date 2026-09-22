@@ -1058,6 +1058,23 @@ fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInput
     })
 }
 
+/// The content identity of a multimodal batch for a language-model-only PD
+/// decode leg: only the per-image hashes survive. The servicer folds them
+/// into the request's `cache_salt`, so two requests whose text and expanded
+/// placeholder-token runs match but whose images differ cannot alias in the
+/// decode-side prefix cache. A hash-less batch carries no identity worth
+/// keeping.
+fn vllm_mm_hash_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInputs> {
+    if mm.mm_hashes.is_empty() {
+        return None;
+    }
+    Some(vllm::MultimodalInputs {
+        mm_hashes: mm.mm_hashes.clone(),
+        modality: mm.modality,
+        ..Default::default()
+    })
+}
+
 pub fn collect_vllm_multimodal_inputs_shm_handles(
     inputs: &vllm::MultimodalInputs,
 ) -> Vec<common::ShmHandle> {
@@ -1502,6 +1519,52 @@ impl ProtoGenerateRequest {
             }
             Self::Trtllm(req) => Self::Trtllm(req.clone()),
             Self::Mlx(req) => Self::Mlx(req.clone()),
+        }
+    }
+
+    /// Clone for a PD decode leg on a language-model-only decode worker (no
+    /// vision encoder, encoder-cache budget 0 — the production vLLM P/D
+    /// shape). The prefill-expanded `input_ids` and the KV handoff stay, but
+    /// every multimodal payload beyond the content hashes goes: pixels,
+    /// placeholders, grid tensors and media references. The decode engine
+    /// then sees a pure-text TokensPrompt and never touches its (zero-budget)
+    /// encoder cache, mirroring the Dynamo P/D contract; the kept hashes ride
+    /// into `cache_salt` servicer-side so different images cannot alias in
+    /// the decode prefix cache. Non-vLLM backends have no language-model-only
+    /// mode, so they take the pixel-stripping clone.
+    pub fn clone_without_mm(&mut self) -> Self {
+        match self {
+            Self::Vllm(req) => {
+                let mm = req.mm_inputs.take();
+                let extra = std::mem::take(&mut req.extra_mm_inputs);
+                let refs = req.media_refs.take();
+                let mut clone = Self::Vllm(req.clone());
+                if let Self::Vllm(clone_req) = &mut clone {
+                    clone_req.mm_inputs = mm.as_ref().and_then(vllm_mm_hash_identity);
+                    clone_req.extra_mm_inputs =
+                        extra.iter().filter_map(vllm_mm_hash_identity).collect();
+                }
+                req.mm_inputs = mm;
+                req.extra_mm_inputs = extra;
+                req.media_refs = refs;
+                clone
+            }
+            _ => self.clone_without_mm_pixels(),
+        }
+    }
+
+    /// Whether any vLLM multimodal batch carries M-RoPE grid tensors. The
+    /// decode leg of a grid-dependent model (Qwen-VL family) derives its
+    /// positions from them, so they cannot be stripped for a
+    /// language-model-only decode worker.
+    pub fn has_vllm_mrope_grids(&self) -> bool {
+        match self {
+            Self::Vllm(req) => req.mm_inputs.iter().chain(&req.extra_mm_inputs).any(|mm| {
+                mm.model_specific_tensors
+                    .keys()
+                    .any(|key| VLLM_MROPE_GRID_KEYS.contains(&key.as_str()))
+            }),
+            _ => false,
         }
     }
 
