@@ -3,6 +3,7 @@
 pub mod builder;
 pub mod capacity;
 pub mod circuit_breaker;
+pub mod endpoint;
 pub mod error;
 pub mod event;
 pub mod expected_wait;
@@ -34,6 +35,9 @@ pub mod worker;
 pub use builder::BasicWorkerBuilder;
 pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+// `endpoint::Endpoint` is deliberately not re-exported here: `model_type::Endpoint`
+// already occupies that name at this level and means an API route, not an address.
+pub use endpoint::{endpoint_key, EndpointError, EndpointKey};
 pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
