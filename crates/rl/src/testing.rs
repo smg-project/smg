@@ -37,10 +37,11 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
     labels.insert("dp_size".to_string(), "1".to_string());
     labels.insert("pp_size".to_string(), "1".to_string());
     labels.insert("weight_version".to_string(), "default".to_string());
+    let base_url = url.split('@').next().unwrap_or(url).to_string();
     RlWorkerInfo {
         id: id.to_string(),
         url: url.to_string(),
-        base_url: url.split('@').next().unwrap_or(url).to_string(),
+        base_url: base_url.clone(),
         api_key: None,
         model_id: "mock-model".to_string(),
         runtime,
@@ -50,7 +51,8 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
         is_dp_aware: url.contains('@'),
         dp_size: None,
         labels,
-        http_client: Some(test_client()),
+        control_url: Some(base_url),
+        control_client: Some(test_client()),
     }
 }
 
