@@ -268,6 +268,8 @@ fn map_finish(reason: &str) -> EngineCoreFinishReason {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use engine_zmq_client::{
         connect_handshake, protocol::vllm::request::EngineCoreRequest, EngineCoreClient,
     };
@@ -292,6 +294,8 @@ mod tests {
             output_tokens: 4,
             realistic: false,
             engine: EngineParams::default(),
+            server_args: BTreeMap::new(),
+            weight_version: None,
         }
     }
 
