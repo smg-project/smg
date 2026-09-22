@@ -190,6 +190,22 @@ def _fanout_into(
         box["error"] = e
 
 
+def _fanout_problems(res: FanoutResult) -> dict[str, str]:
+    """Worker id -> why its leg of the fan-out failed, empty when all passed.
+
+    A non-2xx lands in both `failed` and `results`; `failed` carries the better
+    message, so it wins. The `results` pass also catches a 200 that carries
+    `success: false`, which SMG counts as a success.
+    """
+    bad = {
+        wid: f"HTTP {r.status} {json.dumps(r.body)[:120]}"
+        for wid, r in res.results.items()
+        if _call_failed(r)
+    }
+    bad.update({f.worker_id: f"{f.error}: {f.message}" for f in res.failed})
+    return bad
+
+
 def _await_fanout(
     box: dict[str, Any],
     thread: threading.Thread,
@@ -214,15 +230,7 @@ def _await_fanout(
                 f"joined {sorted(reached - expected)}, left {sorted(expected - reached)}"
             )
 
-    # A non-2xx lands in both `failed` and `results`; `failed` carries the
-    # better message, so it wins. The `results` pass also catches a 200 that
-    # carries `success: false`, which SMG treats as a success.
-    bad = {
-        wid: f"HTTP {r.status} {json.dumps(r.body)[:120]}"
-        for wid, r in res.results.items()
-        if _call_failed(r)
-    }
-    bad.update({f.worker_id: f"{f.error}: {f.message}" for f in res.failed})
+    bad = _fanout_problems(res)
     if bad:
         detail = ", ".join(f"{wid} ({why})" for wid, why in sorted(bad.items()))
         raise RuntimeError(f"{label} failed on {detail}")
@@ -381,8 +389,9 @@ def _teardown(
                 "flush_cache", {}, selector=selector, timeout=timeout, allow_partial=True
             )
             _print_fanout("flush_cache", res)
-            if res.failed:
-                detail = ", ".join(f"{f.worker_id} ({f.error})" for f in res.failed)
+            bad = _fanout_problems(res)
+            if bad:
+                detail = ", ".join(f"{wid} ({why})" for wid, why in sorted(bad.items()))
                 problems.append(f"flush_cache failed on {detail}")
         except Exception as e:  # same
             problems.append(f"flush_cache failed: {e}")
@@ -392,30 +401,43 @@ def _teardown(
 def _generate_weight_version(
     smg: str, model: str, api_key: str | None, timeout: float, attempts: int = 5
 ) -> str:
-    """The version an engine reports, retried: this fires right after resume."""
+    """The version an engine reports, retried: this fires right after resume.
+
+    Every attempt and every pause between them draws on one `--timeout` budget,
+    so retrying buys resilience against a hiccup right after `continue_generation`
+    without multiplying how long the script can sit here.
+    """
     body: dict[str, Any] = {"text": "1+1=", "sampling_params": {"max_new_tokens": 4}}
     if model:
         body["model"] = model
     headers = {"content-type": "application/json"}
     if api_key:
         headers["authorization"] = f"Bearer {api_key}"
+    deadline = time.monotonic() + timeout
     last: Exception | None = None
     for attempt in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             req = urllib.request.Request(
                 f"{smg}/generate", data=json.dumps(body).encode(), headers=headers, method="POST"
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=remaining) as resp:
                 out = json.loads(resp.read())
             first = out[0] if isinstance(out, list) else out
             meta = first.get("meta_info") if isinstance(first, dict) else None
             return str((meta or {}).get("weight_version"))
         except Exception as e:
             last = e
-            if attempt + 1 < attempts:
-                print(f"  /generate attempt {attempt + 1} failed ({e}), retrying", file=sys.stderr)
-                time.sleep(2.0)
-    raise RuntimeError(f"/generate did not answer in {attempts} attempts: {last}") from last
+        if attempt + 1 >= attempts:
+            break
+        nap = min(2.0, deadline - time.monotonic())
+        if nap <= 0:
+            break
+        print(f"  /generate attempt {attempt + 1} failed ({last}), retrying", file=sys.stderr)
+        time.sleep(nap)
+    raise RuntimeError(f"/generate did not answer within {timeout:g}s: {last}") from last
 
 
 def _refit(rl: RL, args: argparse.Namespace) -> tuple[str, list[str]]:
@@ -536,7 +558,11 @@ def main() -> int:
     ap.add_argument("--model", default=None, help="model name for the trailing /generate")
     ap.add_argument("--api-key", default=None, help="SMG control-plane key, if configured")
     ap.add_argument(
-        "--timeout", type=float, default=600.0, help="seconds for each control call and the group"
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="seconds for each control call, for the group rendezvous, and for the "
+        "whole trailing /generate check including its retries",
     )
     args = ap.parse_args()
     if args.chunk < 1:
