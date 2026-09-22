@@ -45,14 +45,29 @@ broadcast (slime's path): the trainer calls, per worker, through `/v1/rl`,
 with `pause_generation` / `continue_generation` fanned out around the
 `update_weights_from_distributed` call, same as a disk refit. The next
 `/generate` through SMG reports the new `meta_info.weight_version`, stamped
-by the engine on the gRPC response. A worked trainer-side example will land
-under `examples/rl` once available; until then, drive the three calls
-directly with `smg.rl.RL.call`/`fanout` as shown in `crates/rl/README.md`.
-Ranks come from each worker's `tp_size`: discovery reads it from the engine's
-server args and falls back to TokenSpeed's own spelling, `attn_tp_size`, so an
-engine launched with either reports a width. An engine launched with neither
-(TokenSpeed leaves `attn_tp_size` unset unless asked) reports `tp_size: null`,
-and a trainer must then assume 1 or be told.
+by the engine on the gRPC response.
+
+`examples/rl/refit_from_trainer.py` is that refit, end to end:
+
+    python examples/rl/refit_from_trainer.py --smg http://smg:30000 \
+      --model-path /ckpt/step-42 --weight-version 42 --selector engine=tokenspeed
+
+It runs on the trainer's host, needs `torch` built with CUDA and
+`transformers`, and loads `--model-path` onto `--device` (default `cuda:0`) in
+place of a live policy. Ranks come from each worker's `tp_size`: the trainer
+takes rank 0 and engine *k* takes `rank_offset_k .. rank_offset_k + tp_k - 1`,
+so `world_size = 1 + sum(tp)`. `init_weights_update_group` is a per-worker
+call, because each worker gets a different `rank_offset`; the broadcast is a
+fan-out, because the body is identical. `--chunk` (default 64) parameters ride
+on each `update_weights_from_distributed` call, so a large policy streams in
+batches. The version is stamped only on the last chunk, so a refit is never
+advertised as complete before every weight has landed. The group is destroyed
+and the engines resumed even when the refit fails part-way.
+
+The engine expects the checkpoint's own HuggingFace parameter names, in
+broadcast order; its `load_weights` does the fused/stacked mapping (`q_proj`,
+`k_proj`, `v_proj` into `qkv_proj`, and so on) exactly as it did for the
+initial load.
 
 ## Security
 
