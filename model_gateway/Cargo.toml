@@ -116,7 +116,7 @@ tracing-log = "0.2"
 tracing-appender = "0.2.5"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", features = ["trace", "grpc-tonic"] }
+opentelemetry-otlp = { version = "0.33", features = ["trace", "grpc-tonic"] }
 tracing-opentelemetry = "0.33"
 kube = { version = "3.0.1", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.27.0", features = ["v1_33"] }
