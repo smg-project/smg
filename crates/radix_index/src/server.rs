@@ -1008,6 +1008,16 @@ pub fn spawn_anti_entropy(
 ///
 /// The engine must therefore be empty on entry, as it is at startup.
 pub async fn bootstrap_from(engine: &Engine, peer: &str) -> Result<usize, tonic::Status> {
+    // Self-enforcing precondition: on a stream error the pulled prefix is
+    // discarded with `clear_all`, which on a populated engine would wipe
+    // state that was never part of the pull. Keyspaces, not blocks: a
+    // holder emptied by `Cleared` keeps its entry and watermark with zero
+    // blocks, and that is state too.
+    assert_eq!(
+        engine.stats().keyspaces,
+        0,
+        "bootstrap_from requires an empty engine: on failure it discards ALL engine state, not just the pulled prefix"
+    );
     let Ok(client) = RadixIndexClient::connect(peer.to_string()).await else {
         // Not an error (a lone first replica boots cold by design), but
         // never silent: a wrong or not-yet-up peer is otherwise
@@ -1543,5 +1553,40 @@ mod tests {
     fn relay_queue_rejects_zero() {
         // `mpsc::channel(0)` panics inside service construction.
         let _ = parse_relay_queue(Some("0"));
+    }
+
+    /// The precondition is enforced, not merely documented: a bootstrap on
+    /// a populated engine must fail loudly before it can wipe anything.
+    #[tokio::test]
+    #[should_panic(expected = "bootstrap_from requires an empty engine")]
+    async fn bootstrap_refuses_a_populated_engine() {
+        let engine = Engine::new(EngineConfig::default());
+        let update = UpdateMsg {
+            keyspace: KeyspaceKey {
+                model: "m".into(),
+                symbol_kind: SymbolKind::Tokens,
+                block_size: 4,
+            },
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::Stored {
+                parent: None,
+                blocks: crate::engine::placement_chain(&[ContentHash(1), ContentHash(2)]),
+            }],
+            added: None,
+            dropped: false,
+        };
+        engine.apply(&update);
+        // Cleared empties the blocks but the holder and its keyspace stay:
+        // still not an empty engine.
+        engine.apply(&UpdateMsg {
+            events: vec![WireEvent::Cleared],
+            seq: 1,
+            ..update
+        });
+        assert_eq!(engine.entry_count(), 0);
+        assert_eq!(engine.stats().keyspaces, 1);
+        let _ = bootstrap_from(&engine, "http://127.0.0.1:1").await;
     }
 }
