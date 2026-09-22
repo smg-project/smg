@@ -301,6 +301,7 @@ fn map_finish(reason: &str) -> EngineCoreFinishReason {
 
 #[cfg(test)]
 mod tests {
+
     use engine_zmq_client::{
         connect_handshake, protocol::vllm::request::EngineCoreRequest, EngineCoreClient,
     };

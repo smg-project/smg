@@ -1,6 +1,6 @@
 //! Runtime configuration for the mock worker fleet, parsed from CLI flags.
 
-use std::{path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use crate::engine::{Calibration, EngineParams, LoadsLike, TimingModel};
 
@@ -38,6 +38,12 @@ pub struct Config {
     pub realistic: bool,
     /// Engine-simulator parameters (only used when `realistic`).
     pub engine: EngineParams,
+    /// Extra `server_args` entries the gRPC `GetServerInfo` advertises, as
+    /// string values (e.g. `rl.control_url`). Empty leaves `server_args` unset.
+    pub server_args: BTreeMap<String, String>,
+    /// Weight version stamped on every gRPC generate chunk and completion;
+    /// `None` leaves the field unset, like an engine that predates it.
+    pub weight_version: Option<String>,
     /// Port of the process-wide admin API (fleet, request records, cache
     /// dumps, resets); off when `None`.
     pub admin_port: Option<u16>,
@@ -156,6 +162,8 @@ impl Default for Config {
             output_tokens: 8,
             realistic: false,
             engine: EngineParams::default(),
+            server_args: BTreeMap::new(),
+            weight_version: None,
             admin_port: None,
             context_length: 32768,
             grpc_max_message_bytes: usize::MAX,
@@ -274,6 +282,14 @@ impl Config {
                 "--prefix-cache" => {
                     cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
                 }
+                "--server-arg" => {
+                    let raw = value(&mut args, &flag)?;
+                    let (k, v) = raw
+                        .split_once('=')
+                        .ok_or_else(|| format!("--server-arg expects key=value, got {raw}"))?;
+                    cfg.server_args.insert(k.to_string(), v.to_string());
+                }
+                "--weight-version" => cfg.weight_version = Some(value(&mut args, &flag)?),
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
             }
@@ -379,6 +395,8 @@ fn usage() -> String {
        --tokenizer <path>       tokenizer path for gRPC autoload (default = model)\n\
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
+       --server-arg <k=v>       extra GetServerInfo server_args entry (repeatable)\n\
+       --weight-version <v>     weight version stamped on generate responses (default unset)\n\
        --capture <path>         append each gRPC Generate request to <path> as a JSON line\n\
      \n\
      Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\

@@ -33,6 +33,7 @@ serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+prost-types.workspace = true
 rmpv.workspace = true
 zeromq.workspace = true
 
