@@ -341,11 +341,15 @@ def _refit(rl: RL, args: argparse.Namespace) -> str:
         if missing:
             raise RuntimeError(f"workers vanished between discovery and pause: {missing}")
         targets = [by_id[wid] for wid in sorted(pause.results)]
+        # A TokenSpeed engine launched without an explicit parallelism flag
+        # reports no tp_size, and a wrong tp_size lays the ranks out wrong and
+        # deadlocks the group. Assume 1 unless --tp-size says otherwise.
+        fallback = args.tp_size or 1
         for worker in targets:
             if worker.tp_size is None:
-                print(f"  {worker.id}: no tp_size reported, assuming 1", file=sys.stderr)
-        world_size, offsets = rank_layout([w.tp_size or 1 for w in targets])
-        layout = ", ".join(f"{w.id}@{o}+{w.tp_size or 1}" for w, o in zip(targets, offsets))
+                print(f"  {worker.id}: no tp_size reported, using {fallback}", file=sys.stderr)
+        world_size, offsets = rank_layout([w.tp_size or fallback for w in targets])
+        layout = ", ".join(f"{w.id}@{o}+{w.tp_size or fallback}" for w, o in zip(targets, offsets))
         print(f"world_size={world_size} (trainer at rank 0), {layout}")
 
         pg = None
@@ -393,12 +397,20 @@ def main() -> int:
     ap.add_argument("--master-port", type=int, default=None, help="default: a free port")
     ap.add_argument("--group-name", default="smg_refit", help="weight-update group name")
     ap.add_argument("--chunk", type=int, default=64, help="parameters per broadcast call")
+    ap.add_argument(
+        "--tp-size",
+        type=int,
+        default=None,
+        help="tp_size to assume for workers that report none (default 1)",
+    )
     ap.add_argument("--model", default=None, help="model name for the trailing /generate")
     ap.add_argument("--api-key", default=None, help="SMG control-plane key, if configured")
     ap.add_argument("--timeout", type=float, default=600.0)
     args = ap.parse_args()
     if args.chunk < 1:
         ap.error("--chunk must be >= 1")
+    if args.tp_size is not None and args.tp_size < 1:
+        ap.error("--tp-size must be >= 1")
     if args.master_port is None:
         args.master_port = _free_port()
     if not torch.cuda.is_available():

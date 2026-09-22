@@ -56,9 +56,12 @@ It runs on the trainer's host, needs `torch` built with CUDA and
 `transformers`, and loads `--model-path` onto `--device` (default `cuda:0`) in
 place of a live policy. Ranks come from each worker's `tp_size`: the trainer
 takes rank 0 and engine *k* takes `rank_offset_k .. rank_offset_k + tp_k - 1`,
-so `world_size = 1 + sum(tp)`. `init_weights_update_group` is a per-worker
-call, because each worker gets a different `rank_offset`; the broadcast is a
-fan-out, because the body is identical. `--chunk` (default 64) parameters ride
+so `world_size = 1 + sum(tp)`. An engine launched without an explicit
+parallelism flag reports no `tp_size` (TokenSpeed leaves `attn_tp_size` unset,
+so discovery has nothing to fold into the label); the script assumes 1 and says
+so on stderr, and `--tp-size` overrides it. `init_weights_update_group` is a
+per-worker call, because each worker gets a different `rank_offset`; the
+broadcast is a fan-out, because the body is identical. `--chunk` (default 64) parameters ride
 on each `update_weights_from_distributed` call, so a large policy streams in
 batches. The version is stamped only on the last chunk, so a refit is never
 advertised as complete before every weight has landed. The group is destroyed
