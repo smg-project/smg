@@ -78,8 +78,11 @@ pub(super) struct OwnedWorker {
 #[derive(Debug, Clone)]
 pub(super) struct RemovalTarget {
     pub(super) url: String,
-    /// Uniform across the group: ranks sharing a canonical URL come from one
-    /// Pod, and a uid mismatch is what put the group here.
+    /// Pod uid of whichever member the registry happened to yield first.
+    /// Ranks of one DP group do share it, but a stale-scheme sibling can not:
+    /// `grpc://h:p` and `http://h:p` canonicalize alike, so two registrations
+    /// from different Pods can land in one target. Logged only, never matched
+    /// on — the removal is decided by [`Self::guards`].
     pub(super) pod_uid: String,
     /// `(id, revision)` as observed in this snapshot, one entry per rank.
     pub(super) guards: Vec<(WorkerId, u64)>,
