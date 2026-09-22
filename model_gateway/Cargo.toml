@@ -114,7 +114,7 @@ futures-util = "0.3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tracing-log = "0.2"
 tracing-appender = "0.2.5"
-opentelemetry = "0.32"
+opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", features = ["trace", "grpc-tonic"] }
 tracing-opentelemetry = "0.33"
