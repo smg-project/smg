@@ -109,7 +109,12 @@ pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
         worker_type: enum_str(&info.worker_type),
         connection_mode: enum_str(&info.connection_mode),
         control_url: info.control_url.clone(),
-        tp_size: int_label(&info.labels, "tp_size"),
+        // TokenSpeed spells its tensor-parallel width `attn_tp_size` and leaves
+        // it unset unless the operator asks for one, so a plain launch reports
+        // no `tp_size` at all. A trainer laying out NCCL ranks needs the real
+        // width, and a wrong one deadlocks the weight-update group.
+        tp_size: int_label(&info.labels, "tp_size")
+            .or_else(|| int_label(&info.labels, "attn_tp_size")),
         dp_size: int_label(&info.labels, "dp_size"),
         pp_size: int_label(&info.labels, "pp_size"),
         dp_ranks,
@@ -255,6 +260,32 @@ mod tests {
         assert_eq!(m["weight_version"], "default");
         assert_eq!(m["role"], "reward");
         assert_eq!(m["tp_size"], "1");
+    }
+
+    #[test]
+    fn tp_size_falls_back_to_tokenspeeds_attn_tp_size() {
+        // A TokenSpeed engine launched without an explicit parallelism flag
+        // reports `attn_tp_size` and no `tp_size`; a trainer needs the width to
+        // lay out its NCCL ranks.
+        let mut w = worker("w1", "http://a:1", RuntimeType::TokenSpeed);
+        w.labels.remove("tp_size");
+        w.labels.insert("attn_tp_size".to_string(), "2".to_string());
+        assert_eq!(entry(&w, 1).tp_size, Some(2));
+    }
+
+    #[test]
+    fn an_explicit_tp_size_wins_over_attn_tp_size() {
+        let mut w = worker("w1", "http://a:1", RuntimeType::TokenSpeed);
+        w.labels.insert("tp_size".to_string(), "4".to_string());
+        w.labels.insert("attn_tp_size".to_string(), "2".to_string());
+        assert_eq!(entry(&w, 1).tp_size, Some(4));
+    }
+
+    #[test]
+    fn tp_size_is_null_when_neither_label_is_present() {
+        let mut w = worker("w1", "http://a:1", RuntimeType::TokenSpeed);
+        w.labels.remove("tp_size");
+        assert_eq!(entry(&w, 1).tp_size, None);
     }
 
     #[tokio::test]
