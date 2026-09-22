@@ -1,14 +1,18 @@
 name: Nightly Artifacts
 
-# Publishes last night's wheels and crate tarballs as a dated prerelease on
-# this repo, so "last night's smg" is installable without building it.
+# Publishes last night's wheels and crate tarballs to GitHub Packages, so
+# "last night's smg" is downloadable without building it.
 #
-# Runs between the two nightly image builds (06:00 gateway, 07:00 engines) so
-# one prerelease page can name the images of the same night.
+# They go to the container registry as an OCI artifact rather than to a
+# release. GitHub Packages has no Python or Cargo registry, but the container
+# registry stores arbitrary files, and this keeps the night's output beside
+# the night's images under one package listing. It also creates no git tags,
+# which the repository's tag ruleset forbids.
+#
+# Runs between the two nightly image builds (06:00 gateway, 07:00 engines).
 #
 # Deliberately not published to PyPI or crates.io: versions there are
-# permanent and cannot be pruned. Retention for these prereleases is handled
-# by nightly-prune.yml.
+# permanent and cannot be pruned. Retention is handled by nightly-prune.yml.
 
 on:
   schedule:
@@ -34,6 +38,8 @@ permissions:
   contents: read
 
 env:
+  # The GHCR package the nightly files land in, beside the image package.
+  ARTIFACT_PACKAGE: smg-nightly
   # A pull_request run is always a dry run; a dispatch run honours the input.
   DRY_RUN: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
 
@@ -305,22 +311,21 @@ jobs:
           name: nightly-crate-dist
           path: crate-dist/
 
-  release:
-    name: Publish prerelease
+  publish:
+    name: Publish to GitHub Packages
     needs: [prepare, build-smg, build-python-packages, package-crates]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v7
-
       - uses: actions/download-artifact@v7
         with:
           path: staging
           pattern: nightly-*
           merge-multiple: true
 
-      - name: List what will be attached
+      - name: List what will be published
         run: |
           set -euo pipefail
           ls -la staging
@@ -335,11 +340,17 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Create prerelease
+      - uses: oras-project/setup-oras@v1
+
+      - name: Log in to the container registry
+        if: env.DRY_RUN != 'true'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push the artifact
         if: env.DRY_RUN != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
           IMAGE_SUFFIX: ${{ needs.prepare.outputs.image_suffix }}
           SMG_VERSION: ${{ needs.prepare.outputs.smg_version }}
           PROTO_VERSION: ${{ needs.prepare.outputs.proto_version }}
@@ -347,49 +358,35 @@ jobs:
         run: |
           set -euo pipefail
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          REPO="ghcr.io/${OWNER}/${ARTIFACT_PACKAGE}"
 
-          cat > notes.md <<EOF
-          Nightly build of \`${GITHUB_SHA}\`.
+          cd staging
+          # One artifact holding the night's wheels, sdist and crate tarballs.
+          # The dated tag matches the image tags of the same night; the
+          # floating tag always points at the newest, and is deliberately NOT
+          # a dated tag so nightly-prune.yml never considers it for deletion.
+          oras push \
+            "${REPO}:nightly-${IMAGE_SUFFIX}" \
+            --artifact-type application/vnd.smg.nightly.v1+json \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "vnd.smg.smg-version=${SMG_VERSION}" \
+            --annotation "vnd.smg.proto-version=${PROTO_VERSION}" \
+            --annotation "vnd.smg.servicer-version=${SERVICER_VERSION}" \
+            ./*
+          oras tag "${REPO}:nightly-${IMAGE_SUFFIX}" nightly
 
-          Not published to PyPI or crates.io. These files are pruned after seven days.
-
-          ## Wheels
-
-          | Package | Version |
-          |---|---|
-          | smg | ${SMG_VERSION} |
-          | smg-grpc-proto | ${PROTO_VERSION} |
-          | smg-grpc-servicer | ${SERVICER_VERSION} |
-
-          Install the gateway wheel straight from this release:
-
-          \`\`\`
-          pip install https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/<wheel filename>
-          \`\`\`
-
-          ## Crates
-
-          The \`.crate\` tarballs are the 19 workspace crates packaged at this commit,
-          carrying their current workspace versions. crates.io is untouched.
-
-          ## Images of the same night
-
-          \`\`\`
-          ghcr.io/${OWNER}/smg:nightly-${IMAGE_SUFFIX}
-          ghcr.io/${OWNER}/smg:nightly-${IMAGE_SUFFIX}-vllm-<ver>
-          ghcr.io/${OWNER}/smg:nightly-${IMAGE_SUFFIX}-sglang-<ver>
-          ghcr.io/${OWNER}/smg:nightly-${IMAGE_SUFFIX}-trtllm-<ver>
-          ghcr.io/${OWNER}/smg:nightly-${IMAGE_SUFFIX}-tokenspeed-<ver>
-          \`\`\`
-          EOF
-
-          gh release create "$RELEASE_TAG" staging/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Nightly ${IMAGE_SUFFIX}" \
-            --notes-file notes.md \
-            --prerelease
+          {
+            echo ""
+            echo "Published to \`${REPO}:nightly-${IMAGE_SUFFIX}\` (also tagged \`nightly\`)."
+            echo ""
+            echo "Pull everything with:"
+            echo ""
+            echo '```'
+            echo "oras pull ${REPO}:nightly-${IMAGE_SUFFIX}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dry run summary
         if: env.DRY_RUN == 'true'
-        run: echo "DRY_RUN is set; built and checked everything, created no release." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "DRY_RUN is set; built and checked everything, published nothing." >> "$GITHUB_STEP_SUMMARY"
