@@ -19,7 +19,7 @@ pb = servicer_mod.tokenspeed_scheduler_pb2
 TokenSpeedSchedulerServicer = servicer_mod.TokenSpeedSchedulerServicer
 
 
-def _servicer(*, advertise=True, paused=None, api_key="s3cret"):
+def _servicer(*, advertise=True, paused=None, paused_sync=None, api_key="s3cret"):
     s = TokenSpeedSchedulerServicer.__new__(TokenSpeedSchedulerServicer)
     s.server_args = SimpleNamespace(
         model="m",
@@ -44,6 +44,8 @@ def _servicer(*, advertise=True, paused=None, api_key="s3cret"):
             return paused
 
         llm.is_scheduler_paused = _is_paused
+    if paused_sync is not None:
+        llm.is_scheduler_paused = lambda: paused_sync
     s.async_llm = llm
     return s
 
@@ -71,6 +73,11 @@ class TestGetServerInfo:
         assert _server_info(_servicer(paused=True)).is_paused is True
         assert _server_info(_servicer(paused=False)).is_paused is False
         assert _server_info(_servicer()).is_paused is False
+
+    def test_reports_pause_state_from_a_synchronous_query(self, monkeypatch):
+        """``is_scheduler_paused`` is not pinned to be a coroutine function."""
+        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
+        assert _server_info(_servicer(paused_sync=True)).is_paused is True
 
     def test_secrets_never_leave_the_engine(self, monkeypatch):
         monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
