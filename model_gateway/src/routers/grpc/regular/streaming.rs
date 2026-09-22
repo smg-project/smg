@@ -3492,11 +3492,13 @@ mod tests {
             ));
         }
         assert_eq!(tracker.snapshot().completion_tokens, 3);
-        tracker.record_complete(&ProtoGenerateComplete::Vllm(proto::GenerateComplete {
-            prompt_tokens: 10,
-            completion_tokens: 3,
-            ..Default::default()
-        }));
+        tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
+            proto::GenerateComplete {
+                prompt_tokens: 10,
+                completion_tokens: 3,
+                ..Default::default()
+            },
+        )));
         assert_eq!(tracker.snapshot().completion_tokens, 3);
     }
 

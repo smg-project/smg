@@ -70,6 +70,8 @@ class Worker:
     # (a deployment-injected SMG_PAIRING_PROTOCOL, for instance).
     extra_env: dict[str, str] | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
+    # Where the engine's output lands when it is not shown on the terminal.
+    log_path: str | None = field(default=None, repr=False)
     _log_file: IO[Any] | None = field(default=None, repr=False)
     # Used memory per GPU just before launch; ``stop`` waits for it to come back.
     _gpu_mem_baseline: dict[int, int] | None = field(default=None, repr=False)
@@ -628,6 +630,13 @@ class Worker:
             env.update(self.extra_env)
         return env
 
+    def read_log(self) -> str:
+        """The engine's captured output so far; empty when it goes to the terminal."""
+        if self.log_path is None:
+            return ""
+        with open(self.log_path, encoding="utf-8", errors="replace") as log:
+            return log.read()
+
     def _spawn_process(self, cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
         """Spawn the worker subprocess with output routing."""
         show_output = os.environ.get(ENV_SHOW_WORKER_LOGS, "0") == "1"
@@ -645,6 +654,7 @@ class Worker:
             else:
                 log_path = os.path.join(tempfile.gettempdir(), f"smg-worker-{safe_name}.log")
             self._log_file = open(log_path, "w", encoding="utf-8")
+            self.log_path = log_path
             stdout_target = self._log_file
             stderr_target = subprocess.STDOUT
 

@@ -29,7 +29,9 @@ from pathlib import Path
 
 import httpx
 import pytest
-from infra import assert_mm_processing
+from infra import assert_mm_processing, get_mm_processing
+from infra.constants import MM_PROCESSING_WORKER
+from infra.mm_processing import mm_processing_samples
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,16 @@ _FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "images"
 _PROBE_SIZE = (448, 448)
 
 _PROMPT = "Is the dog wrapped in a blanket? Answer with one word: yes or no."
+
+# The servicer's request line for a pixel-less leg built from an identity.
+_DECODE_FROM_IDENTITY = "preprocessed_mm=True, media_refs=0"
+
+
+def _worker_path_count(gateway) -> float:
+    """Requests the gateway has sent down the worker-side media path."""
+    return sum(
+        value for labels, value in mm_processing_samples(gateway) if labels["mode"] == "worker"
+    )
 
 
 def _fixture_image_data_url(name: str) -> str:
@@ -156,6 +168,32 @@ class TestPDMultimodalMrope:
             answer = _first_word(choice.message.content)
             logger.info("PD multimodal n=2 answer (pug in blanket): %s", answer)
             assert answer == "yes", f"Expected 'yes' from each sample, got: {answer}"
+
+    def test_worker_media_is_processed_once_on_the_prefill_leg(self, setup_backend):
+        # With worker-side processing the prefill leg fetches and processes
+        # the image and answers with its identity; the decode leg is served
+        # from that identity, without references and without pixels.
+        if get_mm_processing() != MM_PROCESSING_WORKER:
+            pytest.skip("router-side lane: the legs receive preprocessed tensors")
+        backend, model, client, gateway = setup_backend
+        prefill, decode = gateway.prefill_workers[0], gateway.decode_workers[0]
+        worker_before = _worker_path_count(gateway)
+        prefill_before = prefill.read_log().count("media_refs=1")
+        decode_refs_before = decode.read_log().count("media_refs=1")
+        decode_identity_before = decode.read_log().count(_DECODE_FROM_IDENTITY)
+
+        assert _ask_blanket(client, model, _PUG_IMAGE) == "yes"
+
+        assert _worker_path_count(gateway) == worker_before + 1
+        assert prefill.read_log().count("media_refs=1") == prefill_before + 1, (
+            "the prefill leg processed the reference"
+        )
+        assert decode.read_log().count("media_refs=1") == decode_refs_before, (
+            "the decode leg received no reference to process"
+        )
+        assert decode.read_log().count(_DECODE_FROM_IDENTITY) == decode_identity_before + 1, (
+            "the decode leg was served from the prefill's media identity"
+        )
 
 
 def _post_blanket(gateway, model: str, image_url: str, **sampling) -> httpx.Response:

@@ -1657,6 +1657,21 @@ impl ProtoGenerateRequest {
         matches!(self, Self::Vllm(req) if req.media_refs.is_some())
     }
 
+    /// Replace this vLLM request's media references with the identity the
+    /// prefill leg produced: the expanded prompt ids and the pixel-less
+    /// per-modality inputs, in the shape a router-preprocessed decode leg has.
+    pub fn apply_media_identity(&mut self, identity: &vllm::MediaIdentity) {
+        let Self::Vllm(req) = self else {
+            return;
+        };
+        if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() {
+            tokenized.input_ids.clone_from(&identity.prompt_token_ids);
+        }
+        req.mm_inputs.clone_from(&identity.mm_inputs);
+        req.extra_mm_inputs.clone_from(&identity.extra_mm_inputs);
+        req.media_refs = None;
+    }
+
     /// Number of parallel samples requested (1 when unset). vLLM, SGLang
     /// and TokenSpeed carry it in their sampling params; the others have no
     /// per-request sample count.
@@ -1907,7 +1922,7 @@ impl ProtoGenerateResponse {
                     ProtoResponseVariant::Chunk(ProtoGenerateStreamChunk::Vllm(chunk))
                 }
                 Some(vllm::generate_response::Response::Complete(complete)) => {
-                    ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(complete))
+                    ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(Box::new(complete)))
                 }
                 None => ProtoResponseVariant::None,
             },
@@ -2135,7 +2150,10 @@ impl ProtoGenerateStreamChunk {
 #[derive(Clone)]
 pub enum ProtoGenerateComplete {
     Sglang(sglang::GenerateComplete),
-    Vllm(vllm::GenerateComplete),
+    // Boxed: the media identity a PD prefill leg returns made this variant
+    // several times the size of the others, and completions move through
+    // the same channel as every streamed chunk.
+    Vllm(Box<vllm::GenerateComplete>),
     Trtllm(trtllm::GenerateComplete),
     Mlx(mlx::GenerateComplete),
     TokenSpeed(tokenspeed::GenerateComplete),
@@ -2443,6 +2461,15 @@ impl ProtoGenerateComplete {
                 .kv_transfer_params
                 .as_ref()
                 .map(|params| (params.remote_host.clone(), params.remote_port)),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
+        }
+    }
+
+    /// The media identity a prefill leg returned for its processed
+    /// references (vLLM only; absent from older servicers).
+    pub fn media_identity(&self) -> Option<&vllm::MediaIdentity> {
+        match self {
+            Self::Vllm(c) => c.media_identity.as_ref(),
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
@@ -3409,11 +3436,9 @@ mod tests {
                 .chunk_semantics()
                 .is_delta()
         );
-        assert!(
-            ProtoGenerateComplete::Vllm(vllm::GenerateComplete::default())
-                .chunk_semantics()
-                .is_delta()
-        );
+        assert!(ProtoGenerateComplete::Vllm(Box::default())
+            .chunk_semantics()
+            .is_delta());
 
         // Every other shape reports running totals.
         for chunk in [

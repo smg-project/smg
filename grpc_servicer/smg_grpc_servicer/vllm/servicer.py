@@ -54,6 +54,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
     params_to_response_fields,
     resolve_pd_connector,
 )
+from smg_grpc_servicer.vllm.media_identity import build_media_identity
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
     DEFAULT_MAX_INFLIGHT,
@@ -281,6 +282,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
 
         kv_transfer_params: dict | None = None
+        # What a PD prefill leg learned about its media, for the decode leg.
+        media_identity = None
         engine_started = False
         try:
             arrival_time = time.time()
@@ -312,6 +315,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 finally:
                     self._mm_inflight.release()
+                # A PD prefill leg answers with the identity so decode is
+                # served without pixels or references.
+                if kv_transfer_params is not None:
+                    media_identity = build_media_identity(prompt)
             elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
@@ -410,6 +417,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                                 completion=completion,
                                 num_logprobs=num_logprobs,
                                 num_prompt_logprobs=num_prompt_logprobs,
+                                media_identity=media_identity,
                             )
 
                 # For non-streaming, send complete response when finished
@@ -420,6 +428,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             completion=completion,
                             num_logprobs=num_logprobs,
                             num_prompt_logprobs=num_prompt_logprobs,
+                            media_identity=media_identity,
                         )
 
         except asyncio.CancelledError:
@@ -1184,6 +1193,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         completion: "CompletionOutput | None" = None,
         num_logprobs: int | None = None,
         num_prompt_logprobs: int | None = None,
+        media_identity: "vllm_engine_pb2.MediaIdentity | None" = None,
     ) -> vllm_engine_pb2.GenerateResponse:
         """
         Build a final completion response from vLLM output.
@@ -1197,6 +1207,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                        If None, uses output.outputs[0] for backwards compatibility.
             num_logprobs: Number of top logprobs for output tokens
             num_prompt_logprobs: Number of top logprobs for prompt tokens
+            media_identity: A PD prefill leg's processed media, for the decode leg
 
         Returns:
             GenerateResponse with complete field set
@@ -1239,6 +1250,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         # Build matched_stop kwargs from stop_reason (int token ID or str stop sequence)
         stop_kwargs = {}
+        # A proto package predating the field cannot carry the identity.
+        if (
+            media_identity is not None
+            and "media_identity" in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
+        ):
+            stop_kwargs["media_identity"] = media_identity
         if completion.stop_reason is not None:
             if isinstance(completion.stop_reason, int):
                 stop_kwargs["matched_token_id"] = completion.stop_reason

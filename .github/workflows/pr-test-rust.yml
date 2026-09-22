@@ -1014,7 +1014,7 @@ jobs:
       test_timeout: 34
       test_dirs: e2e_test/router/test_pd_multimodal.py
       mm_processing: worker
-      min_selected: 3 # the 3 PD multimodal cases
+      min_selected: 4 # the 4 PD multimodal cases
     secrets: inherit
 
   # === 4 GPU ===

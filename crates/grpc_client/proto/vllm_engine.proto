@@ -319,6 +319,20 @@ message GenerateComplete {
 
   uint32 spec_accepted_tokens = 13;
   uint32 spec_draft_tokens = 14;
+
+  // Identity of worker-processed media, returned by the prefill leg so the
+  // decode leg can be served without pixels: the expanded prompt ids plus one
+  // pixel-less MultimodalInputs per modality (hashes, placeholders, grid
+  // tensors). Absent on non-PD requests and from older servicers.
+  MediaIdentity media_identity = 15;
+}
+
+// What the prefill worker learned about the media it processed, in the shape
+// the decode leg already accepts from a router-preprocessed request.
+message MediaIdentity {
+  repeated uint32 prompt_token_ids = 1;
+  MultimodalInputs mm_inputs = 2;
+  repeated MultimodalInputs extra_mm_inputs = 3;
 }
 
 // =====================

@@ -151,10 +151,12 @@ mod tests {
             token_ids: vec![1, 2, 3],
             ..Default::default()
         }));
-        tracker.record_complete(&ProtoGenerateComplete::Vllm(vllm::GenerateComplete {
-            completion_tokens: 99,
-            ..Default::default()
-        }));
+        tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
+            vllm::GenerateComplete {
+                completion_tokens: 99,
+                ..Default::default()
+            },
+        )));
         assert_eq!(
             tracker.total(),
             3,
