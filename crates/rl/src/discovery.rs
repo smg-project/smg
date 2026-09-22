@@ -227,7 +227,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["dp_ranks"], 2);
 
@@ -236,7 +236,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["dp_ranks"], 1);
     }
@@ -264,7 +264,7 @@ mod tests {
             .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["protocol_version"], 1);
     }
@@ -282,18 +282,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["total"], 1);
         let e = &body["workers"][0];
         assert_eq!(e["id"], "w1");
         assert_eq!(e["engine"], "sglang");
         assert_eq!(e["engine_version"], "0.5.15");
-        assert_eq!(
-            e["tp_size"],
-            serde_json::Value::Null,
-            "garbage label -> null"
-        );
+        assert_eq!(e["tp_size"], Value::Null, "garbage label -> null");
         assert_eq!(e["dp_size"], 1);
         assert_eq!(e["dp_ranks"], 1);
         assert_eq!(e["health"], "ready");
@@ -340,7 +336,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(by_id("g1")["control_url"], "http://a:40100");
-        assert_eq!(by_id("n1")["control_url"], serde_json::Value::Null);
+        assert_eq!(by_id("n1")["control_url"], Value::Null);
         assert_eq!(by_id("g1")["engine"], "tokenspeed");
     }
 }
