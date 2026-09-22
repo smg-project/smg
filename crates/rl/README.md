@@ -17,8 +17,9 @@ reports `protocol_version` (currently 1), bumped only for incompatible changes.
 ## Control endpoints
 
 Control calls go to a worker's **control endpoint**, not necessarily its data
-transport. An HTTP worker is controlled through itself. A gRPC or ZMQ worker
-needs the `rl.control_url` label: TokenSpeed engines advertise it in server
+transport. An HTTP worker is controlled through itself; an `rl.control_url`
+label on an HTTP worker is ignored. A gRPC or ZMQ worker needs the
+`rl.control_url` label: TokenSpeed engines advertise it in server
 info (SMG's discovery turns it into the label), and any worker can be given one
 at `POST /workers` or through the worker update route. A wildcard bind host in
 the advertised URL (`0.0.0.0`, `::`) is replaced by the worker's own host. The
