@@ -4397,6 +4397,7 @@ dependencies = [
  "engine-servicer",
  "engine-zmq-client",
  "futures",
+ "prost-types",
  "reqwest 0.13.4",
  "rmp-serde",
  "rmpv",
