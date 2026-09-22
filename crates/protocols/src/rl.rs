@@ -110,13 +110,13 @@ pub struct RlFailedCall {
     pub worker_id: String,
     pub url: String,
     /// `upstream_error`, `upstream_unreachable`, `upstream_timeout`, or
-    /// `unsupported_connection_mode`.
+    /// `no_control_endpoint`.
     pub error: String,
     pub message: String,
     /// The engine's HTTP status, for `upstream_error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// The worker's connection mode, for `unsupported_connection_mode`.
+    /// The worker's connection mode, for `no_control_endpoint`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_mode: Option<String>,
 }
