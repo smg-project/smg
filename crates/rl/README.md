@@ -35,7 +35,7 @@ them (`"source": "label"`), else from the built-in table (`"source": "static"`).
 
 Flags: `--enable-rl`, `--rl-control-timeout-secs` (600), `--rl-fanout-concurrency` (32).
 Recommended RL launch profile: `--enable-rl --disable-health-check --disable-circuit-breaker --request-timeout-secs 14400`.
-TokenSpeed rollout engines: `python3 -m smg_grpc_servicer.tokenspeed --model … --port 30000 --rl-control-host <reachable> --rl-control-port 30400 [--rl-control-api-key …]`, registered as `grpc://host:30000`; see `docs/guides/rl-tokenspeed.md`.
+TokenSpeed rollout engines: `python3 -m smg_grpc_servicer.tokenspeed --model … --port 30000 --rl-control-host <reachable> --rl-control-port 30400 [--rl-control-api-key …]`, registered as `grpc://host:30000`. TokenSpeed refits are trainer-driven over NCCL (`init_weights_update_group` → `update_weights_from_distributed` → `destroy_weights_update_group`, each proxied per worker through `/v1/rl`); `update_weights_from_disk` answers HTTP 501 on TokenSpeed. See `docs/guides/rl-tokenspeed.md`.
 
 ## Python client
 
