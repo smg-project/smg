@@ -299,6 +299,13 @@ Blocked: same.
 
 Blocked: same. See below.
 
+`remote/acc-cleanup.sh` is written and ready for the moment access returns. It
+stops only what this lane started — the gateway on 30100, the engines on
+30106/30107, and any leftover trainer — then reports the compute apps on GPUs
+0, 1 and 2 by matching `nvidia-smi --query-compute-apps=pid,gpu_uuid` against
+those three GPUs' UUIDs from `nvidia-smi -L`. It never touches the `slime-rl`
+container, GPUs 4–7, or anything on ports 311xx/312xx.
+
 ## State left on the node
 
 Nothing here is destructive, but it needs a hand once access is back.
@@ -316,8 +323,10 @@ Nothing here is destructive, but it needs a hand once access is back.
   restarted before serving anything.
 - Two engines that are **not ours** were running on GPUs 4 and 5
   (`smg_grpc_servicer.tokenspeed ... Qwen/Qwen3-0.6B`, control ports
-  31210/31211). They appeared after the initial GPU check came back clean, so
-  another lane started them. They were left alone.
+  31210/31211). They appeared after the initial GPU check came back clean. The
+  lead has since confirmed that everything on GPUs 4–7 is theirs — a `slime-rl`
+  container, TokenSpeed `ts serve` engines on ports 312xx inside `ts-rl`, and an
+  SMG on port 31100. All of it was left alone and must stay that way.
 
 To resume: `oci session authenticate --profile iad`, recreate the bastion
 session, then re-point `h200.sh` / `h200-rsync.sh` at the new session OCID.
