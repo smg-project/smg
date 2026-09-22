@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::{
     app_context::AppContext,
     observability::metrics::{metrics_labels, Metrics},
-    worker::{registry::WorkerId, WorkerOrigin},
+    worker::{registry::WorkerId, EndpointKey, WorkerOrigin},
     workflow::{Job, WorkerRegistrationMode},
 };
 
@@ -32,8 +32,13 @@ pub const POD_UID_LABEL: &str = "smg.ai/pod-uid";
 /// (pod IP + data port) plus the metadata needed to build its spec.
 #[derive(Debug, Clone)]
 pub(super) struct DesiredWorker {
-    /// Bare host:port so DetectConnectionModeStep dual-probes HTTP and gRPC.
+    /// The address to register: bare host:port, so DetectConnectionModeStep
+    /// dual-probes HTTP and gRPC.
     pub(super) url: String,
+    /// Canonical identity of [`Self::url`], compared against the registry.
+    /// Parsed once by the provider so a bad address is reported against the
+    /// record that published it.
+    pub(super) key: EndpointKey,
     pub(super) worker_type: WorkerType,
     pub(super) bootstrap_port: Option<u16>,
     pub(super) pod_name: String,
@@ -46,10 +51,10 @@ pub(super) struct DesiredWorker {
 /// Desired view of the cluster derived from the store snapshot.
 #[derive(Debug, Default)]
 pub(super) struct DesiredState {
-    /// Owning pod uid per worker URL for Ready, non-terminating Pods.
+    /// Owning pod uid per canonical endpoint for Ready, non-terminating Pods.
     /// Registered workers whose URL is absent — or owned by a different Pod
     /// uid — enter the existing drain/remove workflow.
-    pub(super) uid_by_url: HashMap<String, String>,
+    pub(super) uid_by_url: HashMap<EndpointKey, String>,
     /// Workers on Running, Ready Pods — registration candidates.
     pub(super) addable: Vec<DesiredWorker>,
 }
@@ -57,12 +62,12 @@ pub(super) struct DesiredState {
 /// A registry worker owned by K8s discovery (stamped with [`POD_UID_LABEL`]).
 #[derive(Debug, Clone)]
 pub(super) struct OwnedWorker {
-    /// The registry id. A DP group shares one canonical [`Self::url`], so the
+    /// The registry id. A DP group shares one canonical [`Self::key`], so the
     /// id is what distinguishes its ranks — and what the removal guard needs
     /// to pin each rank to its own revision.
     pub(super) id: WorkerId,
-    /// Scheme- and DP-rank-stripped `host:port`.
-    pub(super) url: String,
+    /// Canonical identity of the registered address.
+    pub(super) key: EndpointKey,
     pub(super) pod_uid: String,
     /// Revision guard for removal: a concurrently replaced worker is skipped
     /// and re-evaluated on the next pass instead of removed blindly.
@@ -77,7 +82,7 @@ pub(super) struct OwnedWorker {
 /// Pod that is already gone.
 #[derive(Debug, Clone)]
 pub(super) struct RemovalTarget {
-    pub(super) url: String,
+    pub(super) key: EndpointKey,
     /// Pod uid of whichever member the registry happened to yield first.
     /// Ranks of one DP group do share it, but a stale-scheme sibling can not:
     /// `grpc://h:p` and `http://h:p` canonicalize alike, so two registrations
@@ -86,15 +91,6 @@ pub(super) struct RemovalTarget {
     pub(super) pod_uid: String,
     /// `(id, revision)` as observed in this snapshot, one entry per rank.
     pub(super) guards: Vec<(WorkerId, u64)>,
-}
-
-/// `http://10.0.0.1:8080@2` → `10.0.0.1:8080`.
-fn canonical_host_port(url: &str) -> &str {
-    let stripped = ["http://", "https://", "grpc://", "grpcs://", "ipc://"]
-        .iter()
-        .find_map(|scheme| url.strip_prefix(scheme))
-        .unwrap_or(url);
-    stripped.split('@').next().unwrap_or(stripped)
 }
 
 /// Snapshot the registry workers this reconciler owns: locally registered
@@ -110,9 +106,23 @@ fn k8s_owned_workers(app_context: &AppContext) -> Vec<OwnedWorker> {
                 return None;
             }
             let pod_uid = worker.metadata().spec.labels.get(POD_UID_LABEL)?.clone();
+            // A registered address the shared parser rejects is one this
+            // reconciler cannot safely match against a desired endpoint, so it
+            // is left alone rather than guessed at.
+            let key = match crate::worker::endpoint_key(worker.url()) {
+                Ok(key) => key,
+                Err(e) => {
+                    warn!(
+                        worker_url = %worker.url(),
+                        error = %e,
+                        "Skipping discovery-owned worker with an unparsable address"
+                    );
+                    return None;
+                }
+            };
             Some(OwnedWorker {
                 id,
-                url: canonical_host_port(worker.url()).to_string(),
+                key,
                 pod_uid,
                 revision: worker.revision(),
             })
@@ -138,19 +148,19 @@ pub(super) fn compute_actions(
 ) -> ReconcileActions {
     let mut actions = ReconcileActions::default();
 
-    let mut registered_uid: HashMap<&str, &str> = HashMap::new();
+    let mut registered_uid: HashMap<&EndpointKey, &str> = HashMap::new();
     // DP-rank expansions share one canonical URL: remove it once, but keep
     // every rank's own `(id, revision)` so the guard cannot drop the ranks
     // whose revision happens to differ from an arbitrarily chosen one.
-    let mut remove_by_url: HashMap<&str, RemovalTarget> = HashMap::new();
+    let mut remove_by_key: HashMap<&EndpointKey, RemovalTarget> = HashMap::new();
     for worker in registered {
-        registered_uid.insert(worker.url.as_str(), worker.pod_uid.as_str());
-        match desired.uid_by_url.get(worker.url.as_str()) {
+        registered_uid.insert(&worker.key, worker.pod_uid.as_str());
+        match desired.uid_by_url.get(&worker.key) {
             Some(uid) if *uid == worker.pod_uid => {}
-            _ => remove_by_url
-                .entry(worker.url.as_str())
+            _ => remove_by_key
+                .entry(&worker.key)
                 .or_insert_with(|| RemovalTarget {
-                    url: worker.url.clone(),
+                    key: worker.key.clone(),
                     pod_uid: worker.pod_uid.clone(),
                     guards: Vec::new(),
                 })
@@ -158,10 +168,10 @@ pub(super) fn compute_actions(
                 .push((worker.id.clone(), worker.revision)),
         }
     }
-    actions.remove = remove_by_url.into_values().collect();
+    actions.remove = remove_by_key.into_values().collect();
     // `HashMap` iteration order is unspecified; sort so a pass submits jobs
     // and logs them in a stable order.
-    actions.remove.sort_unstable_by(|a, b| a.url.cmp(&b.url));
+    actions.remove.sort_unstable_by(|a, b| a.key.cmp(&b.key));
     for target in &mut actions.remove {
         target
             .guards
@@ -169,7 +179,7 @@ pub(super) fn compute_actions(
     }
 
     for worker in &desired.addable {
-        match registered_uid.get(worker.url.as_str()) {
+        match registered_uid.get(&worker.key) {
             Some(uid) if *uid == worker.pod_uid => {}
             _ => actions.add.push(worker.clone()),
         }
@@ -247,7 +257,7 @@ pub(super) async fn reconcile(
     let removals: Vec<&RemovalTarget> = actions
         .remove
         .iter()
-        .filter(|worker| !in_flight(&worker.url))
+        .filter(|target| !in_flight(target.key.as_str()))
         .collect();
     let additions: Vec<&DesiredWorker> = actions
         .add
@@ -270,18 +280,20 @@ pub(super) async fn reconcile(
         desired_count
     );
 
-    for worker in removals {
+    for target in removals {
         info!(
             "Removing worker {} ({} registration(s), pod {}): pod unready, gone, \
              terminating, or replaced",
-            worker.url,
-            worker.guards.len(),
-            worker.pod_uid
+            target.key,
+            target.guards.len(),
+            target.pod_uid
         );
+        // The canonical key is scheme-less, which `find_workers_by_url`
+        // resolves against every spelling the group was registered under.
         let job = Job::RemoveWorker {
-            url: worker.url.clone(),
+            url: target.key.as_str().to_string(),
             expected_revisions: Some(
-                worker
+                target
                     .guards
                     .iter()
                     .map(|(id, revision)| (id.as_str().to_string(), *revision))
@@ -293,7 +305,7 @@ pub(super) async fn reconcile(
                 metrics_labels::DISCOVERY_KUBERNETES,
                 metrics_labels::DEREGISTRATION_RECONCILED,
             ),
-            Err(e) => error!("Failed to submit worker removal for {}: {}", worker.url, e),
+            Err(e) => error!("Failed to submit worker removal for {}: {}", target.key, e),
         }
     }
 
@@ -333,20 +345,34 @@ mod tests {
     use super::*;
     use crate::service_discovery::testing::create_test_app_context;
 
+    fn key(url: &str) -> EndpointKey {
+        crate::worker::endpoint_key(url).expect(url)
+    }
+
+    /// What `canonical_host_port` used to assert, now served by the shared
+    /// parser — plus the spellings it got wrong: an uppercase scheme kept its
+    /// prefix, and `@` inside a path or userinfo truncated the key.
     #[test]
-    fn test_canonical_host_port() {
-        assert_eq!(canonical_host_port("10.0.0.1:8080"), "10.0.0.1:8080");
-        assert_eq!(canonical_host_port("http://10.0.0.1:8080"), "10.0.0.1:8080");
-        assert_eq!(
-            canonical_host_port("grpc://10.0.0.1:8080@2"),
-            "10.0.0.1:8080"
-        );
-        assert_eq!(canonical_host_port("10.0.0.1:8080@0"), "10.0.0.1:8080");
+    fn ownership_grouping_uses_the_shared_canonical_key() {
+        for spelling in [
+            "10.0.0.1:8080",
+            "http://10.0.0.1:8080",
+            "grpc://10.0.0.1:8080@2",
+            "10.0.0.1:8080@0",
+            "HTTPS://10.0.0.1:8080",
+        ] {
+            assert_eq!(key(spelling).as_str(), "10.0.0.1:8080", "{spelling}");
+        }
+        // Both were truncated by `canonical_host_port`'s split on the first
+        // `@`: to `/tmp/a` and to `user`.
+        assert_eq!(key("ipc:///tmp/a@b.sock").as_str(), "/tmp/a@b.sock");
+        assert_eq!(key("http://user@host:8080").as_str(), "user@host:8080");
     }
 
     fn desired_worker(url: &str, uid: &str) -> DesiredWorker {
         DesiredWorker {
             url: url.to_string(),
+            key: key(url),
             worker_type: WorkerType::Regular,
             bootstrap_port: None,
             pod_name: "w".to_string(),
@@ -362,7 +388,7 @@ mod tests {
         for worker in workers {
             state
                 .uid_by_url
-                .insert(worker.url.clone(), worker.pod_uid.clone());
+                .insert(worker.key.clone(), worker.pod_uid.clone());
             state.addable.push(worker.clone());
         }
         state
@@ -372,11 +398,11 @@ mod tests {
         owned_rank(url, uid, url, 1)
     }
 
-    /// One rank of a DP group: same canonical `url`, distinct id and revision.
+    /// One rank of a DP group: same canonical key, distinct id and revision.
     fn owned_rank(url: &str, uid: &str, id: &str, revision: u64) -> OwnedWorker {
         OwnedWorker {
             id: WorkerId::from_string(id.to_string()),
-            url: url.to_string(),
+            key: key(url),
             pod_uid: uid.to_string(),
             revision,
         }
@@ -411,7 +437,7 @@ mod tests {
         let actions = compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
         assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].url, "10.0.0.2:8080");
+        assert_eq!(actions.remove[0].key.as_str(), "10.0.0.2:8080");
     }
 
     #[test]
@@ -436,7 +462,7 @@ mod tests {
         ];
         let actions = compute_actions(&DesiredState::default(), &registered);
         assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].url, "10.0.0.1:8080");
+        assert_eq!(actions.remove[0].key.as_str(), "10.0.0.1:8080");
         assert_eq!(actions.remove[0].guards.len(), 2);
         assert!(actions.add.is_empty());
     }
@@ -502,7 +528,7 @@ mod tests {
 
         let owned = k8s_owned_workers(&app_context);
         assert_eq!(owned.len(), 1);
-        assert_eq!(owned[0].url, "10.0.0.1:8080");
+        assert_eq!(owned[0].key.as_str(), "10.0.0.1:8080");
         assert_eq!(owned[0].pod_uid, "uid-1");
     }
 
@@ -539,6 +565,7 @@ mod tests {
         let app_context = create_test_app_context();
         let desired = DesiredWorker {
             url: "10.0.0.1:8081".to_string(),
+            key: key("10.0.0.1:8081"),
             worker_type: WorkerType::Prefill,
             bootstrap_port: Some(9080),
             pod_name: "prefill-0".to_string(),

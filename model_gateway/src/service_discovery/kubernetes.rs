@@ -640,13 +640,23 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
         }
         for (index, port) in info.ports.iter().enumerate() {
             let url = SocketAddr::new(info.ip, *port).to_string();
-            if state.uid_by_url.contains_key(&url) {
+            // A socket address always parses; the fallible form keeps the
+            // provider honest if the address ever stops coming from one.
+            let Ok(key) = crate::worker::endpoint_key(&url) else {
+                warn!(
+                    "Pod {} has an unusable worker address '{}', skipping",
+                    info.name, url
+                );
+                continue;
+            };
+            if state.uid_by_url.contains_key(&key) {
                 continue;
             }
-            state.uid_by_url.insert(url.clone(), info.uid.clone());
+            state.uid_by_url.insert(key.clone(), info.uid.clone());
             if info.is_healthy() {
                 state.addable.push(DesiredWorker {
                     url,
+                    key,
                     worker_type: worker_type_for(info.pod_type.as_ref(), config.disaggregated_mode),
                     bootstrap_port: info.bootstrap_ports.get(index).copied().flatten(),
                     pod_name: info.name.clone(),
@@ -683,6 +693,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::worker::{registry::WorkerId, EndpointKey};
 
     fn create_k8s_pod(
         name: Option<&str>,
@@ -1216,12 +1227,14 @@ mod tests {
         pods.into_iter().map(Arc::new).collect()
     }
 
-    fn owned(url: &str, uid: &str) -> reconciler::OwnedWorker {
-        use crate::worker::registry::WorkerId;
+    fn key(url: &str) -> EndpointKey {
+        crate::worker::endpoint_key(url).expect(url)
+    }
 
+    fn owned(url: &str, uid: &str) -> reconciler::OwnedWorker {
         reconciler::OwnedWorker {
             id: WorkerId::from_string(url.to_string()),
-            url: url.to_string(),
+            key: key(url),
             pod_uid: uid.to_string(),
             revision: 1,
         }
@@ -1262,11 +1275,11 @@ mod tests {
 
         assert_eq!(desired.uid_by_url.len(), 2);
         assert_eq!(
-            desired.uid_by_url.get("10.0.0.1:8080"),
+            desired.uid_by_url.get(&key("10.0.0.1:8080")),
             Some(&"uid-w".to_string())
         );
         assert_eq!(
-            desired.uid_by_url.get("10.0.0.1:8081"),
+            desired.uid_by_url.get(&key("10.0.0.1:8081")),
             Some(&"uid-w".to_string())
         );
         assert_eq!(desired.addable.len(), 2);
