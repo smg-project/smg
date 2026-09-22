@@ -4318,6 +4318,7 @@ dependencies = [
  "axum",
  "engine-zmq-client",
  "futures",
+ "prost-types",
  "serde_json",
  "smg-grpc-client",
  "tempfile",
