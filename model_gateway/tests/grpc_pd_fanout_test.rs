@@ -11,7 +11,11 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use llm_tokenizer::{
     chat_template::ChatTemplateParams,
@@ -129,6 +133,8 @@ async fn start_mock_grpc_worker() -> u16 {
         output_tokens: OUTPUT_TOKENS,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        server_args: BTreeMap::new(),
+        weight_version: None,
     });
     tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
     port
