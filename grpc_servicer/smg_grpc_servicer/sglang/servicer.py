@@ -477,11 +477,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Get server information."""
         logger.debug("Receive server info request")
 
-        # 0.5.20 turned ServerArgs from a dataclass into a plain class, so
-        # dataclasses.asdict() raises. vars() reads the instance attributes on
-        # both shapes. The nested values below are stringified anyway, so the
-        # shallow read loses nothing the gateway reads.
-        server_args_dict = vars(self.server_args)
+        # 0.5.20 turned ServerArgs from a dataclass into a msgspec Struct, so
+        # dataclasses.asdict() raises. A Struct keeps its declared fields OUT
+        # of __dict__ (upstream carries `dict=True` only so the underscore
+        # extras have somewhere to live), which is why vars() returns those
+        # extras and none of the fields the gateway reads. msgspec's own
+        # asdict is the conversion upstream uses on this type.
+        server_args_dict = msgspec.structs.asdict(self.server_args)
         server_args_struct = Struct()
 
         def make_serializable(obj):
