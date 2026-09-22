@@ -119,6 +119,12 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         }
     }
 
+    /// `<|image|>` is vLLM's single-token image target; video is not, its
+    /// target is the three-token `<|begin_of_video|>…<|end_of_video|>` block.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image)
+    }
+
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
@@ -402,5 +408,13 @@ mod tests {
             spec.prompt_replacements_for(&metadata, &input, Modality::Video),
             Err(ModelRegistryError::InvalidPreprocessedField { .. })
         ));
+    }
+
+    #[test]
+    fn only_the_image_anchor_can_be_expanded_by_the_worker() {
+        let spec = Glm53FlashSpec;
+        assert!(spec.worker_expandable(Modality::Image));
+        assert!(!spec.worker_expandable(Modality::Video));
+        assert!(!spec.worker_expandable(Modality::Audio));
     }
 }
