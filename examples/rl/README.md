@@ -52,6 +52,11 @@ TP-1 engines make a world of 3. `init_weights_update_group` goes to each worker
 separately (every one needs its own `rank_offset`); the broadcast itself is one
 fan-out per chunk, since the body is identical everywhere.
 
+A TokenSpeed engine launched without an explicit parallelism flag reports no
+`tp_size` at all, and the script then assumes 1 and says so on stderr. Pass
+`--tp-size` when that assumption is wrong: a bad rank layout deadlocks the
+group instead of failing.
+
 Exit code 0 on success, 1 on any failure. The group is destroyed and the
 engines resumed even when a refit fails part-way.
 
