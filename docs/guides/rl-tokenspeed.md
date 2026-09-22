@@ -48,6 +48,11 @@ with `pause_generation` / `continue_generation` fanned out around the
 by the engine on the gRPC response. A worked trainer-side example will land
 under `examples/rl` once available; until then, drive the three calls
 directly with `smg.rl.RL.call`/`fanout` as shown in `crates/rl/README.md`.
+Ranks come from each worker's `tp_size`: discovery reads it from the engine's
+server args and falls back to TokenSpeed's own spelling, `attn_tp_size`, so an
+engine launched with either reports a width. An engine launched with neither
+(TokenSpeed leaves `attn_tp_size` unset unless asked) reports `tp_size: null`,
+and a trainer must then assume 1 or be told.
 
 ## Security
 
