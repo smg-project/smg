@@ -32,6 +32,7 @@ import pytest
 from infra import assert_mm_processing, get_mm_processing
 from infra.constants import MM_PROCESSING_WORKER
 from infra.mm_processing import mm_processing_samples
+from infra.pd_logs import assert_worker_logs_captured
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -177,8 +178,11 @@ class TestPDMultimodalMrope:
             pytest.skip("router-side lane: the legs receive preprocessed tensors")
         backend, model, client, gateway = setup_backend
         prefill, decode = gateway.prefill_workers[0], gateway.decode_workers[0]
-        if prefill.log_path is None or decode.log_path is None:
-            pytest.skip("worker output goes to the terminal; the log assertions need captured logs")
+        # A serving worker has logged its startup, so an empty log means the
+        # output is not captured: a skip locally (SHOW_WORKER_LOGS=1), a
+        # failure in CI, where the lane always writes log files.
+        for leg, worker in (("prefill", prefill), ("decode", decode)):
+            assert_worker_logs_captured(worker.read_log(), f"the {leg} leg's media placement")
         worker_before = _worker_path_count(gateway)
         prefill_before = prefill.read_log().count("media_refs=1")
         decode_refs_before = decode.read_log().count("media_refs=1")
