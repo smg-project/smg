@@ -366,7 +366,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::grpc::multimodal::config::MultimodalConfigRegistry,
+        routers::grpc::multimodal::{
+            config::MultimodalConfigRegistry, settings::MultimodalSettings,
+        },
         worker::{BasicWorkerBuilder, ModelCard, WorkerType},
     };
 
@@ -393,9 +395,13 @@ mod tests {
     }
 
     fn components(mode: MmProcessingMode) -> MultimodalComponents {
-        let mut components =
-            MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None, None)
-                .expect("components");
+        let mut components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .expect("components");
         components.processing = mode;
         components
     }

@@ -932,6 +932,12 @@ fn video_decode_backend_override() -> Option<&'static str> {
         .as_deref()
 }
 
+/// Switch video-decode timing logs on or off before the first decode; a
+/// later call, or one after `SMG_LOG_MM_TIMING` was already read, is a no-op.
+pub fn init_log_video_decode_timing(enabled: bool) {
+    let _ = LOG_VIDEO_DECODE_TIMING.set(enabled);
+}
+
 fn log_video_decode_timing_enabled() -> bool {
     *LOG_VIDEO_DECODE_TIMING.get_or_init(|| {
         std::env::var("SMG_LOG_MM_TIMING")

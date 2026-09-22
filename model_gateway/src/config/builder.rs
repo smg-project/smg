@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use openai_protocol::worker::TransportMode;
+use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
 use super::{
@@ -324,6 +324,42 @@ impl RouterConfigBuilder {
     /// Per-request image-count limit replacing each model spec's built-in limit.
     pub fn mm_per_request_image_limit(mut self, limit: Option<usize>) -> Self {
         self.config.mm_per_request_image_limit = limit;
+        self
+    }
+
+    /// Where media for vLLM gRPC workers is fetched and preprocessed.
+    pub fn mm_processing(mut self, mode: Option<MmProcessingMode>) -> Self {
+        self.config.mm_processing = mode;
+        self
+    }
+
+    /// Host-DRAM budget (MiB) for router-side preprocessed media.
+    pub fn mm_pixel_cache_mb(mut self, mb: Option<usize>) -> Self {
+        self.config.mm_pixel_cache_mb = mb;
+        self
+    }
+
+    /// Serve cached pixels over RDMA (legacy switch for the RDMA lane).
+    pub fn mm_pixel_rdma(mut self, enabled: bool) -> Self {
+        self.config.mm_pixel_rdma = enabled;
+        self
+    }
+
+    /// Listener IP for the RDMA metadata exchange.
+    pub fn rdma_listen_ip(mut self, ip: Option<impl Into<String>>) -> Self {
+        self.config.rdma_listen_ip = ip.map(Into::into);
+        self
+    }
+
+    /// Full-TTL override (seconds) for leased RDMA pixel slots.
+    pub fn rdma_slot_ttl_s(mut self, secs: Option<u64>) -> Self {
+        self.config.rdma_slot_ttl_s = secs;
+        self
+    }
+
+    /// Emit per-request multimodal timing at INFO.
+    pub fn log_mm_timing(mut self, enabled: bool) -> Self {
+        self.config.log_mm_timing = enabled;
         self
     }
 

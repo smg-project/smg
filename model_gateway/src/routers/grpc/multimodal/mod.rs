@@ -15,10 +15,7 @@
 //! - [`refs`]: router-vs-worker processing resolution and the media-reference
 //!   payload for workers that process media themselves.
 
-use std::{
-    collections::HashSet,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashSet, sync::Arc};
 
 use llm_multimodal::{
     AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
@@ -58,6 +55,7 @@ mod plan;
 mod process;
 mod refs;
 mod serialize;
+mod settings;
 mod transport;
 
 pub(crate) use assemble::{
@@ -80,18 +78,14 @@ pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, resolve_mm_processing,
     worker_accepts_media_refs, MmProcessing, MmRefsError,
 };
+pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
 
-/// Whether verbose multimodal timing logs are enabled via `SMG_LOG_MM_TIMING`.
-/// Read from the environment once and cached; the flag is not expected to change
-/// at runtime, and this is called on every multimodal request.
-fn log_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
+/// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
+/// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal
+/// request.
+pub(crate) fn log_mm_timing_enabled() -> bool {
+    mm_settings().log_mm_timing.value
 }
 
 /// Output of the multimodal processing pipeline.

@@ -16,8 +16,8 @@ pub use audio::AudioPreProcessor;
 pub use encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
 pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, TransformError};
 pub use media::{
-    FrameSampling, ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource,
-    VideoFetchConfig,
+    init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,
+    MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
 pub use registry::{
     MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,

@@ -58,13 +58,16 @@ Related knobs: `SMG_VLLM_MM_MAX_INFLIGHT` (default 64) bounds concurrent media
 jobs; `SMG_VLLM_MM_MAX_ITEMS` (default 16) caps references per request;
 `SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps inline `data:` payloads.
 
-On the router side, `SMG_MM_PROCESSING` selects `auto` (default: forward when
+On the router side, `--mm-processing` selects `auto` (default: forward when
 the model's spec opts in and every registered worker of the model advertises
 `mm_processor`), `router` (always preprocess) or `worker` (strict: 400 when a
 request cannot be forwarded); the outcome is counted in
-`smg_mm_processing_total{model,mode,reason}`. It is read from the router's
-environment only and has no router-config equivalent. Any other value stops the
-router at startup instead of quietly reverting to `auto`. On the worker path the
+`smg_mm_processing_total{model,mode,reason}`, and the startup line
+`multimodal processing mode` names the value and its source (`flag`, `env` or
+`default`). `SMG_MM_PROCESSING` is the deprecated env fallback: it applies only
+when the flag is absent, logs a deprecation line, and goes away in the next
+minor release. Any other value stops the router at startup instead of quietly
+reverting to `auto`. On the worker path the
 router never expands placeholders, so routing decisions that weigh the prompt's token
 count (cache-aware policies, load estimates) see one token per media item where
 the worker will schedule the full placeholder run. The `E2E_MM_PROCESSING=worker`

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
-pub use openai_protocol::worker::TransportMode;
+pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use serde::{Deserialize, Serialize};
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
@@ -172,6 +172,31 @@ pub struct RouterConfig {
     /// spec's built-in limit; beats `SMG_IMAGE_MAX_COUNT`. Unset keeps spec limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_per_request_image_limit: Option<usize>,
+    /// Where media for vLLM gRPC workers is fetched and preprocessed (`auto` |
+    /// `router` | `worker`); when unset, falls back to `SMG_MM_PROCESSING`,
+    /// then `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_processing: Option<MmProcessingMode>,
+    /// Host-DRAM budget (MiB) for router-side preprocessed media; when unset,
+    /// falls back to `SMG_MM_PIXEL_CACHE_MB`, then 0 (no cache).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_pixel_cache_mb: Option<usize>,
+    /// Serve cached pixels over RDMA (the legacy switch; `multimodal_tensor_transport
+    /// = rdma` is the first-class one); when unset, falls back to `SMG_MM_PIXEL_RDMA`.
+    #[serde(default)]
+    pub mm_pixel_rdma: bool,
+    /// Listener IP for the RDMA metadata exchange; when unset, falls back to
+    /// `SMG_RDMA_LISTEN_IP`, and without either the lane stays on the inline path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma_listen_ip: Option<String>,
+    /// Full-TTL override (seconds) for leased RDMA pixel slots; when unset, falls
+    /// back to `SMG_RDMA_SLOT_TTL_S`, then the TTL derived from the worker's hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma_slot_ttl_s: Option<u64>,
+    /// Emit per-request multimodal timing at INFO; when unset, falls back to
+    /// `SMG_LOG_MM_TIMING`.
+    #[serde(default)]
+    pub log_mm_timing: bool,
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -1156,6 +1181,12 @@ impl Default for RouterConfig {
             multimodal_shm_min_bytes: None,
             multimodal_max_inflight_bytes: None,
             mm_per_request_image_limit: None,
+            mm_processing: None,
+            mm_pixel_cache_mb: None,
+            mm_pixel_rdma: false,
+            rdma_listen_ip: None,
+            rdma_slot_ttl_s: None,
+            log_mm_timing: false,
             dp_aware: false,
             dp_minimum_tokens_scheduler: false,
             api_key: None,
@@ -1389,6 +1420,54 @@ mod tests {
         assert!(json.contains("health_check_port"));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.health_check_port, Some(8081));
+    }
+
+    #[test]
+    fn test_multimodal_settings_serde_roundtrip_and_backward_compat() {
+        // Unset by default, and the optional ones stay out of serialized output.
+        let config = RouterConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        for key in [
+            "mm_processing",
+            "mm_pixel_cache_mb",
+            "rdma_listen_ip",
+            "rdma_slot_ttl_s",
+        ] {
+            assert!(!json.contains(key), "unset {key} must be omitted");
+        }
+
+        // Config files predating the fields deserialize to the defaults.
+        let mut without: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = without.as_object_mut().unwrap();
+        object.remove("mm_pixel_rdma").unwrap();
+        object.remove("log_mm_timing").unwrap();
+        let without: RouterConfig = serde_json::from_value(without).unwrap();
+        assert_eq!(without.mm_processing, None);
+        assert_eq!(without.mm_pixel_cache_mb, None);
+        assert!(!without.mm_pixel_rdma);
+        assert_eq!(without.rdma_listen_ip, None);
+        assert_eq!(without.rdma_slot_ttl_s, None);
+        assert!(!without.log_mm_timing);
+
+        // When set, every value round-trips, the mode as its lowercase name.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .mm_processing(Some(MmProcessingMode::Worker))
+            .mm_pixel_cache_mb(Some(512))
+            .mm_pixel_rdma(true)
+            .rdma_listen_ip(Some("10.0.0.7"))
+            .rdma_slot_ttl_s(Some(600))
+            .log_mm_timing(true)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""mm_processing":"worker""#));
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.mm_processing, Some(MmProcessingMode::Worker));
+        assert_eq!(with.mm_pixel_cache_mb, Some(512));
+        assert!(with.mm_pixel_rdma);
+        assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(with.rdma_slot_ttl_s, Some(600));
+        assert!(with.log_mm_timing);
     }
 
     #[test]

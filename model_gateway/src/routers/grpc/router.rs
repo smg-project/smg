@@ -27,7 +27,7 @@ use super::{
     context::SharedComponents,
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     mode::Mode,
-    multimodal::MultimodalComponents,
+    multimodal::{mm_settings, MultimodalComponents},
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::responses,
     utils::ParserResolver,
@@ -103,6 +103,7 @@ impl GrpcRouter {
                 ctx.multimodal_config_registry.clone(),
                 ctx.router_config.mm_per_request_image_limit,
                 ctx.router_config.multimodal_max_inflight_bytes,
+                mm_settings(),
             )
             .map_err(|e| format!("multimodal components: {e:#}"))?,
         ));

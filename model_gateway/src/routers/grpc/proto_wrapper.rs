@@ -42,7 +42,10 @@ use smg_grpc_client::{
 };
 use smg_mm_rdma::RdmaExporter;
 
-use crate::routers::grpc::{multimodal::mm_rdma_exporter, zmq_client::ZmqGenerateStream};
+use crate::routers::grpc::{
+    multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+    zmq_client::ZmqGenerateStream,
+};
 
 /// How a streaming response's per-token payloads (token ids, sampled
 /// logprobs, token counts) relate across the responses of one stream.
@@ -692,12 +695,7 @@ fn vllm_tensor_payload(
 }
 
 fn log_tokenspeed_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
+    log_mm_timing_enabled()
 }
 
 static TOKENSPEED_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);

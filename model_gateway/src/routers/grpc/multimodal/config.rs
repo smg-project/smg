@@ -14,7 +14,8 @@ use tracing::{debug, warn};
 
 use super::{
     inflight::MultimodalInflight,
-    pixel_cache::{pixel_cache_from_env, PixelCache},
+    pixel_cache::{pixel_cache_with_budget, PixelCache},
+    settings::MultimodalSettings,
 };
 
 /// Cached model configuration files loaded from the tokenizer directory.
@@ -253,32 +254,15 @@ pub(crate) struct MultimodalComponents {
     pub inflight: Option<Arc<MultimodalInflight>>,
 }
 
-/// Router-wide multimodal processing mode from `SMG_MM_PROCESSING` (default `auto`).
-///
-/// A value that cannot be read stops startup. Carrying on with the default
-/// would leave the router doing the opposite of what the operator asked for,
-/// and a warning in the startup log is easy to miss.
-fn mm_processing_from_env() -> Result<MmProcessingMode> {
-    mm_processing_from_value(std::env::var("SMG_MM_PROCESSING").ok().as_deref())
-}
-
-fn mm_processing_from_value(value: Option<&str>) -> Result<MmProcessingMode> {
-    match value {
-        Some(value) if !value.trim().is_empty() => value
-            .parse::<MmProcessingMode>()
-            .map_err(|message| anyhow::anyhow!("{message}"))
-            .context("SMG_MM_PROCESSING"),
-        _ => Ok(MmProcessingMode::Auto),
-    }
-}
-
 impl MultimodalComponents {
     /// Create multimodal components with default registries and a reference
     /// to the shared `MultimodalConfigRegistry` owned by `AppContext`.
+    /// `settings` is the resolved flag > env > default bundle.
     pub fn new(
         config_registry: Arc<MultimodalConfigRegistry>,
         image_limit_override: Option<usize>,
         max_inflight_bytes: Option<usize>,
+        settings: &MultimodalSettings,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -287,8 +271,12 @@ impl MultimodalComponents {
         let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
             .context("Failed to create MediaConnector")?;
 
-        let processing = mm_processing_from_env()?;
-        tracing::info!(mode = %processing, "multimodal processing mode");
+        let processing = settings.processing.value;
+        tracing::info!(
+            mode = %processing,
+            source = settings.processing.source.as_str(),
+            "multimodal processing mode"
+        );
 
         let inflight = max_inflight_bytes
             .map(|bytes| {
@@ -311,7 +299,7 @@ impl MultimodalComponents {
             vision_processor_registry: Arc::new(VisionProcessorRegistry::with_defaults()),
             model_registry: Arc::new(ModelRegistry::default()),
             config_registry,
-            pixel_cache: pixel_cache_from_env(),
+            pixel_cache: pixel_cache_with_budget(settings.pixel_cache_mb.value),
             modality_limit_overrides: image_limit_override
                 .map(|limit| HashMap::from([(Modality::Image, limit)]))
                 .unwrap_or_default(),
@@ -487,27 +475,31 @@ mod tests {
         assert!(Arc::ptr_eq(&got, &cfg));
     }
 
-    /// A mode that is nearly right would otherwise resolve to the default and
-    /// run the opposite of what the operator asked for.
+    /// The resolved settings, not the environment, decide the placement mode
+    /// and the pixel cache the components come up with.
     #[test]
-    fn an_unreadable_processing_mode_stops_startup() {
-        assert_eq!(
-            mm_processing_from_value(Some("worker")).unwrap(),
-            MmProcessingMode::Worker
+    fn components_take_placement_and_pixel_cache_from_the_settings() {
+        use super::super::settings::{Setting, SettingSource};
+
+        let settings = MultimodalSettings {
+            processing: Setting {
+                value: MmProcessingMode::Worker,
+                source: SettingSource::Flag,
+            },
+            ..MultimodalSettings::default()
+        };
+        let components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(components.processing, MmProcessingMode::Worker);
+        assert!(
+            components.pixel_cache.is_none(),
+            "0 MiB keeps the cache off"
         );
-        assert_eq!(
-            mm_processing_from_value(Some(" Router ")).unwrap(),
-            MmProcessingMode::Router
-        );
-        assert_eq!(
-            mm_processing_from_value(None).unwrap(),
-            MmProcessingMode::Auto
-        );
-        assert_eq!(
-            mm_processing_from_value(Some("  ")).unwrap(),
-            MmProcessingMode::Auto
-        );
-        assert!(mm_processing_from_value(Some("routers")).is_err());
     }
 
     fn components(max_inflight_bytes: Option<usize>) -> Result<MultimodalComponents> {
@@ -515,6 +507,7 @@ mod tests {
             Arc::new(MultimodalConfigRegistry::new()),
             None,
             max_inflight_bytes,
+            &MultimodalSettings::default(),
         )
     }
 

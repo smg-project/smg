@@ -571,6 +571,40 @@ class TestParseRouterArgs:
         defaults = parse_router_args([])
         assert defaults.mm_per_request_image_limit is None
 
+    def test_parse_mm_settings_flags(self):
+        """Media placement and engine-side media knobs; unset leaves each to its env fallback."""
+        router_args = parse_router_args(
+            [
+                "--mm-processing",
+                "worker",
+                "--mm-pixel-cache-mb",
+                "256",
+                "--mm-pixel-rdma",
+                "--rdma-listen-ip",
+                "10.0.0.7",
+                "--rdma-slot-ttl-s",
+                "600",
+                "--log-mm-timing",
+            ]
+        )
+        assert router_args.mm_processing == "worker"
+        assert router_args.mm_pixel_cache_mb == 256
+        assert router_args.mm_pixel_rdma is True
+        assert router_args.rdma_listen_ip == "10.0.0.7"
+        assert router_args.rdma_slot_ttl_s == 600
+        assert router_args.log_mm_timing is True
+
+        defaults = parse_router_args([])
+        assert defaults.mm_processing is None
+        assert defaults.mm_pixel_cache_mb is None
+        assert defaults.mm_pixel_rdma is False
+        assert defaults.rdma_listen_ip is None
+        assert defaults.rdma_slot_ttl_s is None
+        assert defaults.log_mm_timing is False
+
+        with pytest.raises(SystemExit):
+            parse_router_args(["--mm-processing", "routers"])
+
     def test_parse_routing_key_headers(self):
         """Ordered list flag; unset keeps the x-smg-routing-key default."""
         router_args = parse_router_args(
@@ -1469,6 +1503,12 @@ class TestRouterArgsFieldOrder:
         "rl_control_timeout_secs",
         "rl_fanout_concurrency",
         "multimodal_max_inflight_bytes",
+        "mm_processing",
+        "mm_pixel_cache_mb",
+        "mm_pixel_rdma",
+        "rdma_listen_ip",
+        "rdma_slot_ttl_s",
+        "log_mm_timing",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

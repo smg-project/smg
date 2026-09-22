@@ -4,7 +4,9 @@ use llm_multimodal::{ImageSource, Tokenizer, TransformError, VisionPreProcessor}
 use ndarray::Array2;
 
 use super::*;
-use crate::routers::grpc::multimodal::config::MultimodalConfigRegistry;
+use crate::routers::grpc::multimodal::{
+    config::MultimodalConfigRegistry, settings::MultimodalSettings,
+};
 
 #[derive(Default)]
 struct Calls {
@@ -101,8 +103,13 @@ fn setup(
             reorder,
         }),
     );
-    let mut components =
-        MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None, None).unwrap();
+    let mut components = MultimodalComponents::new(
+        Arc::new(MultimodalConfigRegistry::new()),
+        None,
+        None,
+        &MultimodalSettings::default(),
+    )
+    .unwrap();
     components.vision_processor_registry = Arc::new(registry);
     components.pixel_cache = Some(Arc::new(PixelCache::new(1024 * 1024)));
     (

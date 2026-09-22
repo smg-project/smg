@@ -20,6 +20,7 @@ use openai_protocol::worker::TransportMode;
 use smg_mm_rdma::{RdmaConfig, RdmaExporter};
 use tracing::{error, info, warn};
 
+use super::settings::mm_settings;
 use crate::routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable};
 
 const DEFAULT_SHM_MIN_BYTES: usize = 64 * 1024;
@@ -198,7 +199,7 @@ pub(crate) fn mm_rdma_exporter() -> Option<&'static RdmaExporter> {
                 // exchange, so every export would fall back to inline anyway. Skip
                 // building the NIXL agent + (2 GiB default) arena for nothing.
                 warn!(
-                    "EPD RDMA: lane enabled but SMG_RDMA_LISTEN_IP is unset; staying on the inline path"
+                    "EPD RDMA: lane enabled but no listener IP (--rdma-listen-ip / SMG_RDMA_LISTEN_IP); staying on the inline path"
                 );
                 return None;
             }
@@ -215,13 +216,9 @@ pub(crate) fn mm_rdma_exporter() -> Option<&'static RdmaExporter> {
 
 /// Whether the RDMA pixel lane is active: the first-class `TransportMode::Rdma`
 /// (`--multimodal-tensor-transport rdma` / `SMG_MM_TENSOR_TRANSPORT=rdma`), with
-/// the legacy `SMG_MM_PIXEL_RDMA` env as a backward-compatible fallback.
+/// the legacy `--mm-pixel-rdma` / `SMG_MM_PIXEL_RDMA` switch as a fallback.
 fn rdma_lane_enabled() -> bool {
-    mm_transport_defaults().mode == TransportMode::Rdma
-        || matches!(
-            std::env::var("SMG_MM_PIXEL_RDMA").as_deref(),
-            Ok("1") | Ok("true")
-        )
+    mm_transport_defaults().mode == TransportMode::Rdma || mm_settings().pixel_rdma.value
 }
 
 /// Build the exporter config from the `SMG_RDMA_*` env knobs. All RDMA policy lives
@@ -239,7 +236,11 @@ fn build_rdma_config_from_env() -> RdmaConfig {
         // Empty listener IP => the exporter cannot do the cross-node metadata
         // exchange, so the caller stays on the inline path (checked before we build
         // the exporter in `mm_rdma_exporter`).
-        listen_ip: std::env::var("SMG_RDMA_LISTEN_IP").unwrap_or_default(),
+        listen_ip: mm_settings()
+            .rdma_listen_ip
+            .value
+            .clone()
+            .unwrap_or_default(),
         listen_port: rdma_env_parse("SMG_RDMA_LISTEN_PORT", 18515),
         agent_name: RDMA_GATEWAY_AGENT_NAME.to_string(),
         pool_slots,
@@ -285,10 +286,7 @@ fn worker_max_hold() -> Duration {
 /// (= `worker_max_hold` + [`RDMA_SLOT_TTL_SLACK`]); `SMG_RDMA_SLOT_TTL_S` overrides,
 /// but an override that does not exceed the hold is rejected (see [`resolve_slot_ttl`]).
 fn derive_rdma_slot_ttl() -> Duration {
-    let override_secs = std::env::var("SMG_RDMA_SLOT_TTL_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
-    resolve_slot_ttl(override_secs, worker_max_hold())
+    resolve_slot_ttl(mm_settings().rdma_slot_ttl_s.value, worker_max_hold())
 }
 
 /// Apply the TTL invariant to an optional `SMG_RDMA_SLOT_TTL_S` override: honor it
