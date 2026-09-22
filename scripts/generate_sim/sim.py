@@ -41,7 +41,9 @@ from pathlib import Path
 # Enforced, not assumed: the proxy's accept loop catches TimeoutError, which
 # socket.timeout only became in 3.10. On 3.9 the accept thread would die
 # quietly and a healed partition drill would never accept again.
-if sys.version_info < (3, 10):
+# ruff folds this to "always false" under the repo's 3.10 floor (UP036);
+# the guard exists precisely for an interpreter below that floor.
+if sys.version_info < (3, 10):  # noqa: UP036
     sys.exit("sim.py requires Python 3.10+ (socket.timeout became TimeoutError in 3.10)")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
