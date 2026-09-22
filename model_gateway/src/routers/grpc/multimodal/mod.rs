@@ -62,7 +62,9 @@ pub(crate) use assemble::{
     assemble_multimodal_data, assemble_multimodal_data_after_encode,
     assemble_tokenspeed_for_encode, encode_routing_hashes,
 };
-pub(crate) use capability::{ensure_backend_supports_modalities, worker_language_model_only};
+pub(crate) use capability::{
+    ensure_backend_supports_modalities, worker_language_model_only, SUPPORTS_VISION_LABEL,
+};
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,

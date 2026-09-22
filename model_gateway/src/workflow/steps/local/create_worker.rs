@@ -13,7 +13,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_dp::DpInfo;
 use crate::{
-    routers::grpc::zmq_client::zmq_handshake_address,
+    routers::grpc::{multimodal::SUPPORTS_VISION_LABEL, zmq_client::zmq_handshake_address},
     worker::{
         circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
         resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
@@ -488,7 +488,7 @@ fn build_model_card(
 
     // Infer model_type capabilities from discovered signals
     let has_vision = labels
-        .get("supports_vision")
+        .get(SUPPORTS_VISION_LABEL)
         .or_else(|| labels.get("has_image_understanding"))
         .map(|s| s == "true")
         .unwrap_or(false);
