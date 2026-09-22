@@ -1032,9 +1032,18 @@ mod tests {
                     ("kv_cache_dtype".to_string(), string_value("auto")),
                     ("attention_backend".to_string(), string_value("flashinfer")),
                     ("pipeline_parallel_size".to_string(), number_value(2.0)),
-                    ("rl.control_url".to_string(), string_value("http://10.0.0.5:40100")),
-                    ("rl.pause_modes".to_string(), string_value("wait,abort,keep")),
-                    ("rl.reports_weight_version".to_string(), string_value("true")),
+                    (
+                        "rl.control_url".to_string(),
+                        string_value("http://10.0.0.5:40100"),
+                    ),
+                    (
+                        "rl.pause_modes".to_string(),
+                        string_value("wait,abort,keep"),
+                    ),
+                    (
+                        "rl.reports_weight_version".to_string(),
+                        string_value("true"),
+                    ),
                     // Not in TOKENSPEED_GRPC_KEYS — must not become a label.
                     ("host".to_string(), string_value("127.0.0.1")),
                 ]),

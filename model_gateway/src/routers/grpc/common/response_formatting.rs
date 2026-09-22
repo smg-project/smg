@@ -193,6 +193,10 @@ mod tests {
         assert_eq!(effective_weight_version(Some("v7"), Some("v3")), "v7");
         assert_eq!(effective_weight_version(None, Some("v3")), "v3");
         assert_eq!(effective_weight_version(None, None), "default");
-        assert_eq!(effective_weight_version(Some(""), None), "default", "empty is unset");
+        assert_eq!(
+            effective_weight_version(Some(""), None),
+            "default",
+            "empty is unset"
+        );
     }
 }
