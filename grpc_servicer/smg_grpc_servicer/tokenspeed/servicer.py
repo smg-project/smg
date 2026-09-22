@@ -1115,6 +1115,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             if params.HasField(_field):
                 out[_field] = getattr(params, _field)
 
+        if params.HasField("sampling_seed"):
+            out["seed"] = params.sampling_seed
+
         if params.min_new_tokens:
             # ``min_new_tokens`` is non-optional; 0 is the "no minimum" sentinel.
             out["min_new_tokens"] = params.min_new_tokens
