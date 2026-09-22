@@ -3,11 +3,13 @@ name: Nightly Prune
 # Deletes dated nightly package versions older than the retention window.
 # Nothing else is touched.
 #
-# Two packages: the container images, and the nightly wheel/crate artifact
-# pushed by nightly-artifacts.yml. Both are GHCR packages, so one rule covers
-# them. No releases or git tags are involved: the repository's tag ruleset
-# forbids creating or deleting tags, which is why the nightly files go to
-# Packages rather than to a release.
+# Two places: the nightly container images in this repo's GHCR package, and
+# the nightly prereleases in smg-project/artifacts. Nothing in THIS repo's
+# git history is touched — its tag ruleset forbids that, which is why the
+# nightly files live in the artifacts repo in the first place.
+#
+# Pruning the artifacts repo needs ARTIFACTS_REPO_TOKEN; without it that half
+# logs and skips rather than failing.
 #
 # The floating tags (:nightly, :nightly-<engine>), every release tag and the CI
 # TokenSpeed image are protected by construction: a package version is only
@@ -38,7 +40,8 @@ permissions:
 
 env:
   # The GHCR packages that carry dated nightly tags.
-  PACKAGES: "smg smg-nightly"
+  PACKAGES: "smg"
+  ARTIFACTS_REPO: smg-project/artifacts
   # Single knob for the retention window. A dispatch input overrides it, then
   # the repository variable, then this default.
   RETENTION_DAYS: ${{ inputs.retention_days || vars.SMG_NIGHTLY_RETENTION_DAYS || '7' }}
@@ -237,3 +240,49 @@ jobs:
             gh api -X DELETE \
               "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/smg/versions/${id}"
           done < orphans.tsv
+
+      - name: Prune nightly prereleases in the artifacts repo
+        env:
+          GH_TOKEN: ${{ secrets.ARTIFACTS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::ARTIFACTS_REPO_TOKEN is not set; skipping release pruning"
+            exit 0
+          fi
+
+          CUTOFF="$(date -u -d "${RETENTION_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Only prereleases whose tag is a dated nightly tag. A published
+          # release, or anything not matching that shape, is never considered.
+          gh api --paginate "/repos/${ARTIFACTS_REPO}/releases" \
+            | jq -r --arg cutoff "$CUTOFF" '
+              .[] | select(.prerelease == true)
+                  | select(.tag_name | test("^nightly-[0-9]{8}-[0-9a-f]{7}$"))
+                  | select(.created_at < $cutoff)
+                  | "\(.tag_name)\t\(.created_at)"
+            ' > old_releases.tsv || true
+
+          echo "nightly prereleases past cutoff: $(wc -l < old_releases.tsv)"
+          {
+            echo ""
+            echo "### Prereleases in ${ARTIFACTS_REPO}"
+            echo ""
+            echo "Past cutoff: $(wc -l < old_releases.tsv)"
+            echo ""
+            echo '```'
+            cat old_releases.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "dry run: no releases deleted"
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r tag created; do
+            [ -n "$tag" ] || continue
+            echo "deleting release ${tag} (${created}) and its tag"
+            gh release delete "$tag" --repo "${ARTIFACTS_REPO}" --yes --cleanup-tag
+          done < old_releases.tsv
