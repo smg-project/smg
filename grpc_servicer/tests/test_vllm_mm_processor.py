@@ -85,6 +85,13 @@ class TestVideoFrameBudget:
             "video": {"num_frames": 32}
         }
 
+    def test_an_explicit_every_frame_setting_is_capped_too(self):
+        # vLLM reads num_frames <= 0 as "every frame": the very case the budget is for.
+        for every in (-1, 0):
+            assert mm_processor.clamp_video_frames({"video": {"num_frames": every}}, 16) == {
+                "video": {"num_frames": 16}
+            }
+
     def test_an_unknown_default_is_capped_to_the_budget(self):
         assert mm_processor.clamp_video_frames(None, 16) == {"video": {"num_frames": 16}}
         assert mm_processor.clamp_video_frames({"image": {}}, 16, default_frames=None) == {

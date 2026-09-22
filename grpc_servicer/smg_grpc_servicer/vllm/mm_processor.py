@@ -131,14 +131,16 @@ def clamp_video_frames(
     """vLLM's media kwargs with the video frame count capped at `max_frames`.
 
     A copy: the engine config keeps its own value. `default_frames` is what vLLM
-    samples when the kwargs set nothing; unknown, the budget itself is used.
+    samples when the kwargs set nothing; unknown, the budget itself is used. A
+    non-positive count means every frame to vLLM, so it is capped as well.
     """
     if max_frames <= 0:
         return media_io_kwargs
     kwargs = dict(media_io_kwargs or {})
     video = dict(kwargs.get("video") or {})
     current = video.get("num_frames", default_frames)
-    video["num_frames"] = max_frames if current is None else min(int(current), max_frames)
+    unbounded = current is None or int(current) <= 0
+    video["num_frames"] = max_frames if unbounded else min(int(current), max_frames)
     kwargs["video"] = video
     return kwargs
 
