@@ -2287,7 +2287,7 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Weight version the engine reported for this chunk. Only TokenSpeed
+    /// Weight version the engine reported for this completion. Only TokenSpeed
     /// carries it on the wire; an empty string counts as unset.
     pub fn weight_version(&self) -> Option<&str> {
         match self {
