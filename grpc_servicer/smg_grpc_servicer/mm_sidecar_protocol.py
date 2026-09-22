@@ -24,10 +24,16 @@ ENV_REDIS_URL = "SMG_VLLM_MM_REDIS_URL"
 ENV_TIMEOUT_MS = "SMG_VLLM_MM_SIDECAR_TIMEOUT_MS"
 ENV_MAX_QUEUE = "SMG_VLLM_MM_SIDECAR_MAX_QUEUE"
 ENV_NAMESPACE = "SMG_VLLM_MM_SIDECAR_NAMESPACE"
+ENV_MAX_RESULT_BYTES = "SMG_VLLM_MM_MAX_RESULT_BYTES"
+ENV_MAX_VIDEO_FRAMES = "SMG_VLLM_MM_MAX_VIDEO_FRAMES"
 
 DEFAULT_REDIS_URL = "redis://127.0.0.1:6379/0"
 DEFAULT_TIMEOUT_MS = 30_000
 DEFAULT_MAX_QUEUE = 256
+# Redis's own proto-max-bulk-len default; a result at or above it is refused.
+DEFAULT_MAX_RESULT_BYTES = 512 * 1024 * 1024
+# 0: vLLM's media kwargs decide how many frames a video is sampled to.
+DEFAULT_MAX_VIDEO_FRAMES = 0
 
 HELLO_TTL_S = 15
 HELLO_REFRESH_S = 5
@@ -46,6 +52,10 @@ CLIENT_ERROR_CODES = frozenset(
 )
 # Everything else is UNAVAILABLE (503) so the router retries elsewhere.
 RETRYABLE_ERROR_CODES = frozenset({"expired", "processor_error", "fingerprint_mismatch"})
+# The result was processed but could not be delivered: too big for the
+# transport (the caller's, 400) or refused by it (retryable, reported at once).
+CODE_RESULT_TOO_LARGE = "result_too_large"
+CODE_RESULT_PUSH_FAILED = "result_push_failed"
 
 
 class Fingerprint(msgspec.Struct, frozen=True):

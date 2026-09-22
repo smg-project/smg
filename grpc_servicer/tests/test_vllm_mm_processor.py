@@ -55,6 +55,43 @@ class TestEnvInt:
         with pytest.raises(ValueError, match="K="):
             mm_processor.env_int({"K": raw}, "K", 7)
 
+    def test_zero_is_allowed_only_when_asked_for(self):
+        assert mm_processor.env_int({"K": "0"}, "K", 7, minimum=0) == 0
+        with pytest.raises(ValueError, match="K='-1' must be at least 0"):
+            mm_processor.env_int({"K": "-1"}, "K", 7, minimum=0)
+
+
+class TestVideoFrameBudget:
+    def test_no_budget_leaves_the_kwargs_alone(self):
+        kwargs = {"video": {"num_frames": 40, "fps": 2}}
+        assert mm_processor.clamp_video_frames(kwargs, 0) is kwargs
+        assert mm_processor.clamp_video_frames(None, 0) is None
+
+    def test_a_budget_caps_an_explicit_frame_count(self):
+        kwargs = {"video": {"num_frames": 40, "fps": 2}, "image": {"x": 1}}
+        assert mm_processor.clamp_video_frames(kwargs, 16) == {
+            "video": {"num_frames": 16, "fps": 2},
+            "image": {"x": 1},
+        }
+        assert kwargs["video"]["num_frames"] == 40, "the engine config is not mutated"
+
+    def test_a_budget_never_raises_the_frame_count(self):
+        kwargs = {"video": {"num_frames": 8}}
+        assert mm_processor.clamp_video_frames(kwargs, 16) == {"video": {"num_frames": 8}}
+        assert mm_processor.clamp_video_frames({}, 16, default_frames=32) == {
+            "video": {"num_frames": 16}
+        }
+        assert mm_processor.clamp_video_frames({}, 64, default_frames=32) == {
+            "video": {"num_frames": 32}
+        }
+
+    def test_an_unknown_default_is_capped_to_the_budget(self):
+        assert mm_processor.clamp_video_frames(None, 16) == {"video": {"num_frames": 16}}
+        assert mm_processor.clamp_video_frames({"image": {}}, 16, default_frames=None) == {
+            "image": {},
+            "video": {"num_frames": 16},
+        }
+
 
 class TestItemBytes:
     def test_non_data_urls_are_unbounded(self):
@@ -143,6 +180,83 @@ class TestBuildProcessor:
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEMS": "-1"}
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEMS"):
             mm_processor.build_mm_processor(self._Engine(), env=env)
+
+    def test_invalid_frame_budget_is_rejected_when_on(self):
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_VIDEO_FRAMES": "-4"}
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_VIDEO_FRAMES"):
+            mm_processor.build_mm_processor(self._Engine(), env=env)
+
+
+class TestInProcessConstruction:
+    """The frame budget reaches the connector the in-process processor fetches with."""
+
+    @staticmethod
+    def _stub_vllm(monkeypatch, loaded):
+        def module(name, **attrs):
+            mod = types.ModuleType(name)
+            mod.__dict__.update(attrs)
+            monkeypatch.setitem(sys.modules, name, mod)
+            return mod
+
+        class _Registry:
+            @staticmethod
+            def load(name, **kwargs):
+                loaded.update(kwargs)
+                return object()
+
+        class _VideoMediaIO:
+            def __init__(self, image_io, num_frames: int = 32, **kwargs):
+                pass
+
+        module(
+            "vllm", __version__="0.29.0", envs=types.SimpleNamespace(VLLM_MEDIA_CONNECTOR="http")
+        )
+        module("vllm.exceptions", VLLMClientError=ValueError)
+        module("vllm.multimodal")
+        module("vllm.multimodal.media")
+        module("vllm.multimodal.media.connector", MEDIA_CONNECTOR_REGISTRY=_Registry)
+        module("vllm.multimodal.video", VideoMediaIO=_VideoMediaIO)
+        module("vllm.transformers_utils")
+        module("vllm.transformers_utils.processor", get_video_processor_cls_name=lambda cfg: "vp")
+
+    @staticmethod
+    def _engine(media_io_kwargs):
+        mm_config = types.SimpleNamespace(
+            media_io_kwargs=media_io_kwargs, get_limit_per_prompt=lambda modality: 4
+        )
+        model_config = types.SimpleNamespace(
+            get_multimodal_config=lambda: mm_config,
+            allowed_local_media_path="",
+            allowed_media_domains=["example.com"],
+        )
+
+        class _Renderer:
+            async def process_for_engine_async(self, prompt, *, arrival_time, skip_mm_cache):
+                return prompt
+
+        return types.SimpleNamespace(model_config=model_config, renderer=_Renderer())
+
+    def test_budget_caps_the_connectors_video_frames(self, monkeypatch):
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded)
+        engine = self._engine({"video": {"num_frames": 40}})
+        mm_processor.InProcessMediaProcessor(engine, max_video_frames=16)
+        assert loaded["media_io_kwargs"] == {"video": {"num_frames": 16}}
+        assert engine.model_config.get_multimodal_config().media_io_kwargs == {
+            "video": {"num_frames": 40}
+        }
+
+    def test_budget_above_vllms_default_keeps_the_default(self, monkeypatch):
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded)
+        mm_processor.InProcessMediaProcessor(self._engine(None), max_video_frames=64)
+        assert loaded["media_io_kwargs"] == {"video": {"num_frames": 32}}
+
+    def test_no_budget_passes_the_engine_kwargs_through(self, monkeypatch):
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded)
+        mm_processor.InProcessMediaProcessor(self._engine({"video": {"num_frames": 40}}))
+        assert loaded["media_io_kwargs"] == {"video": {"num_frames": 40}}
 
 
 class TestRedisClient:

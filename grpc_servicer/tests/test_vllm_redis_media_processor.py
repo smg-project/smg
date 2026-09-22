@@ -227,6 +227,27 @@ class TestSubmitAndWait:
         with pytest.raises(mm_processor.MmProcessorUnavailable, match="expired"):
             run(processor(client)._submit_and_wait(self.job()))
 
+    def test_an_oversized_result_is_the_callers_error(self):
+        client = FakeRedis(
+            responder=lambda job: proto.failure(
+                job.job_id, proto.CODE_RESULT_TOO_LARGE, "encoded media result is 9 bytes"
+            )
+        )
+        with pytest.raises(ValueError, match="^media_too_large: encoded media result is 9 bytes"):
+            run(processor(client)._submit_and_wait(self.job()))
+
+    def test_an_undelivered_result_is_retryable_at_once(self):
+        client = FakeRedis(
+            responder=lambda job: proto.failure(
+                job.job_id, proto.CODE_RESULT_PUSH_FAILED, "ConnectionResetError: reset"
+            )
+        )
+        with pytest.raises(
+            mm_processor.MmProcessorUnavailable,
+            match="^sidecar_push_failed: ConnectionResetError: reset",
+        ):
+            run(processor(client)._submit_and_wait(self.job()))
+
     def test_undecodable_result_is_retryable(self):
         client = FakeRedis(responder=lambda job: b"\xc1not-a-result")
         with pytest.raises(mm_processor.MmProcessorUnavailable, match="undecodable result"):

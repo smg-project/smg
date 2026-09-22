@@ -19,6 +19,7 @@ use crate::{
                 KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             pd_admission,
+            retry::mark_non_retryable,
         },
         error,
         grpc::{
@@ -550,7 +551,13 @@ fn start_failure_response(
     } else {
         error!(function = function, error = %e, "{}", description);
     }
-    e.to_http_error(code, format!("{description}: {}", e.message()))
+    let mut response = e.to_http_error(code, format!("{description}: {}", e.message()));
+    // The worker already spent its whole media-sidecar budget on this input;
+    // another attempt costs the same again. Other sidecar failures fail fast.
+    if e.code() == tonic::Code::Unavailable && e.message().starts_with("sidecar_timeout") {
+        mark_non_retryable(&mut response);
+    }
+    response
 }
 
 async fn execute_single_embed(
@@ -1177,6 +1184,45 @@ mod tests {
                 .unwrap(),
             "start_generation_failed"
         );
+    }
+
+    #[test]
+    fn a_spent_sidecar_budget_is_not_retried_but_a_fast_sidecar_failure_is() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let start = |status: tonic::Status| {
+            start_failure_response(
+                &status,
+                "execute_single",
+                "Failed to start generation",
+                "start_generation_failed",
+            )
+        };
+
+        let timed_out = start(tonic::Status::unavailable(
+            "sidecar_timeout: no result for job ef684cf9 within 300000 ms",
+        ));
+        assert_eq!(timed_out.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_retryable_response(&timed_out));
+
+        for message in [
+            "sidecar_overloaded: 8 jobs queued (cap 8)",
+            "sidecar_unavailable: connection refused",
+            "sidecar_protocol: undecodable result",
+            "sidecar_push_failed: ConnectionResetError: reset",
+            "worker is saturated",
+        ] {
+            let failed = start(tonic::Status::unavailable(message));
+            assert_eq!(failed.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert!(is_retryable_response(&failed), "{message}");
+        }
+
+        // The prefix is the worker's; the same words under another code mean something else.
+        let rejected = start(tonic::Status::invalid_argument(
+            "sidecar_timeout mentioned in a client error",
+        ));
+        assert_eq!(rejected.status(), http::StatusCode::BAD_REQUEST);
+        assert!(!is_retryable_response(&rejected));
     }
 
     #[test]

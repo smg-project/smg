@@ -16,10 +16,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import time
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
+    CODE_RESULT_PUSH_FAILED,
+    CODE_RESULT_TOO_LARGE,
+    DEFAULT_MAX_RESULT_BYTES,
+    DEFAULT_MAX_VIDEO_FRAMES,
     DEFAULT_REDIS_URL,
+    ENV_MAX_RESULT_BYTES,
+    ENV_MAX_VIDEO_FRAMES,
     HELLO_REFRESH_S,
     HELLO_TTL_S,
     RESULT_TTL_S,
@@ -36,7 +43,12 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     resolve_namespace,
 )
 from smg_grpc_servicer.vllm.media_refs import advertised_schemes, parse_scheme_list, url_scheme
-from smg_grpc_servicer.vllm.mm_processor import fingerprint_from_model_config
+from smg_grpc_servicer.vllm.mm_processor import (
+    clamp_video_frames,
+    env_int,
+    fingerprint_from_model_config,
+    vllm_default_video_frames,
+)
 
 logger = logging.getLogger("smg_grpc_servicer.vllm.mm_sidecar")
 
@@ -49,6 +61,10 @@ JOB_WAIT_MARGIN_S = 2
 RECONNECT_PAUSE_S = 1
 # The least time a finished job's answer gets to reach the requester.
 PUSH_FLOOR_S = 5
+# A failure notice is small; the second push gets at most this long.
+FAILURE_PUSH_S = 5.0
+# Redis's per-value cap; a push at or above it is refused, not queued.
+REDIS_BULK_LIMIT = "proto-max-bulk-len"
 
 
 def build_config(args: argparse.Namespace):
@@ -103,9 +119,18 @@ class Sidecar:
         self._concurrency = max(1, concurrency)
         self._fingerprint = config_fingerprint(vllm_config)
         self._keys = Keys.for_namespace(resolve_namespace(self._fingerprint, namespace))
+        # Lowered further by redis's own cap once connected (`_learn_result_limit`).
+        self._max_result_bytes = env_int(os.environ, ENV_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_BYTES)
+        self._max_video_frames = env_int(
+            os.environ, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0
+        )
+        # The fingerprint keeps the engine's kwargs: the budget bounds this
+        # sidecar's sampling, it does not describe a different engine.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
             envs.VLLM_MEDIA_CONNECTOR,
-            media_io_kwargs=mm_config.media_io_kwargs,
+            media_io_kwargs=clamp_video_frames(
+                mm_config.media_io_kwargs, self._max_video_frames, vllm_default_video_frames()
+            ),
             allowed_local_media_path=model_config.allowed_local_media_path,
             allowed_media_domains=model_config.allowed_media_domains,
         )
@@ -119,6 +144,7 @@ class Sidecar:
             )
 
     async def run(self) -> None:
+        await self._learn_result_limit()
         logger.info(
             "media sidecar serving under %s (concurrency=%d) fingerprint=%s",
             self._keys.prefix,
@@ -133,12 +159,35 @@ class Sidecar:
             for task in tasks:
                 task.cancel()
 
+    async def _learn_result_limit(self) -> None:
+        """Cap results at redis's bulk limit when it is lower than the configured one.
+
+        Managed redis often refuses CONFIG; the configured limit then stands.
+        """
+        try:
+            reply = await asyncio.wait_for(self._client.config_get(REDIS_BULK_LIMIT), HELLO_TTL_S)
+            (value,) = reply.values()
+            redis_limit = int(value)
+        except Exception as e:  # noqa: BLE001 - CONFIG unavailable or unreadable: keep the configured limit
+            logger.info(
+                "result limit %d bytes (%s not readable: %s)",
+                self._max_result_bytes,
+                REDIS_BULK_LIMIT,
+                e,
+            )
+            return
+        self._max_result_bytes = min(self._max_result_bytes, redis_limit)
+        logger.info(
+            "result limit %d bytes (%s=%d)", self._max_result_bytes, REDIS_BULK_LIMIT, redis_limit
+        )
+
     async def _heartbeat(self) -> None:
         mapping = {
             **self._fingerprint.to_hello(),
             "schema": str(SCHEMA_VERSION),
             "schemes": self._schemes,
             "started_at": str(int(self._started_at)),
+            "max_result_bytes": str(self._max_result_bytes),
         }
         while True:
             try:
@@ -185,19 +234,61 @@ class Sidecar:
             except Exception as e:  # noqa: BLE001 - one bad job must not kill the worker
                 logger.exception("worker %d: job %s failed", index, job.job_id)
                 result = failure(job.job_id, "processor_error", repr(e))
+            raw = encode_result(result)
+            if len(raw) >= self._max_result_bytes:
+                # Redis would refuse the value; the requester gets told why instead.
+                logger.warning(
+                    "worker %d: result for %s is %d bytes, at or above the %d-byte transport "
+                    "limit (%d items: %s); answering %s",
+                    index,
+                    job.job_id,
+                    len(raw),
+                    self._max_result_bytes,
+                    len(job.items),
+                    ",".join(sorted({item.modality for item in job.items})),
+                    CODE_RESULT_TOO_LARGE,
+                )
+                result = failure(
+                    job.job_id,
+                    CODE_RESULT_TOO_LARGE,
+                    f"encoded media result is {len(raw)} bytes, transport limit "
+                    f"{self._max_result_bytes} bytes; reduce video length, fps or resolution",
+                )
+                raw = encode_result(result)
+            await self._deliver(index, job, raw)
+
+    async def _deliver(self, index: int, job: Job, raw: bytes) -> None:
+        """Answer on the job's result key; a refused answer is replaced by a small one."""
+        key = self._keys.result(job.job_id)
+        try:
+            await self._push(key, raw, self._push_budget(job))
+        except Exception as first:  # noqa: BLE001 - the requester is told, not left to time out
+            logger.warning("worker %d: result push failed for %s: %s", index, job.job_id, first)
+            notice = failure(
+                job.job_id, CODE_RESULT_PUSH_FAILED, f"{type(first).__name__}: {first}"
+            )
             try:
-                key = self._keys.result(job.job_id)
-                pipe = self._client.pipeline(transaction=True)
-                pipe.lpush(key, encode_result(result))
-                pipe.expire(key, RESULT_TTL_S)
-                # An answer is worth only as long as the requester is still
-                # waiting for it, and this push carries the whole payload, so
-                # it gets the time the job has left and no more. Unbounded, a
-                # worker that lands on a stalled connection is gone for good
-                # while the sidecar goes on advertising it.
-                await asyncio.wait_for(pipe.execute(), self._push_budget(job))
-            except Exception as e:  # noqa: BLE001 - the servicer times out and retries
-                logger.warning("worker %d: result push failed for %s: %s", index, job.job_id, e)
+                await self._push(
+                    key, encode_result(notice), min(self._push_budget(job), FAILURE_PUSH_S)
+                )
+            except Exception as second:  # noqa: BLE001 - the servicer times out and retries
+                logger.error(
+                    "worker %d: result push failed twice for %s: %s; then %s",
+                    index,
+                    job.job_id,
+                    first,
+                    second,
+                )
+
+    async def _push(self, key: str, raw: bytes, budget: float) -> None:
+        pipe = self._client.pipeline(transaction=True)
+        pipe.lpush(key, raw)
+        pipe.expire(key, RESULT_TTL_S)
+        # An answer is worth only as long as the requester is still waiting for
+        # it, and this push carries the whole payload, so it gets the time the
+        # job has left and no more. Unbounded, a worker that lands on a stalled
+        # connection is gone for good while the sidecar goes on advertising it.
+        await asyncio.wait_for(pipe.execute(), budget)
 
     @staticmethod
     def _push_budget(job: Job) -> float:

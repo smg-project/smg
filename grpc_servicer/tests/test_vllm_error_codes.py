@@ -103,6 +103,13 @@ def test_value_error_still_maps_to_invalid_argument(split_hierarchy):
     assert errors.grpc_code_for(ValueError("bad")) is grpc.StatusCode.INVALID_ARGUMENT
 
 
+def test_an_oversized_media_result_is_the_callers_error(split_hierarchy):
+    # The sidecar's result_too_large answer reaches the servicer as this ValueError.
+    errors, _ = split_hierarchy
+    too_large = ValueError("media_too_large: encoded media result is 600000000 bytes")
+    assert errors.grpc_code_for(too_large) is grpc.StatusCode.INVALID_ARGUMENT
+
+
 def test_not_found_maps_to_not_found(split_hierarchy):
     errors, classes = split_hierarchy
     assert errors.grpc_code_for(classes["VLLMNotFoundError"]("lora")) is grpc.StatusCode.NOT_FOUND

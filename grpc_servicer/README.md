@@ -56,7 +56,9 @@ labels and keeps sending preprocessed tensors. vLLM's `--allowed-media-domains`,
 `--allowed-media-domains` the worker fetches from any host the router forwards.
 Related knobs: `SMG_VLLM_MM_MAX_INFLIGHT` (default 64) bounds concurrent media
 jobs; `SMG_VLLM_MM_MAX_ITEMS` (default 16) caps references per request;
-`SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps inline `data:` payloads.
+`SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps inline `data:` payloads;
+`SMG_VLLM_MM_MAX_VIDEO_FRAMES` (default 0, meaning vLLM's own `--media-io-kwargs`
+decide) caps the frames a video is sampled to, so long clips stay bounded.
 
 On the router side, `SMG_MM_PROCESSING` selects `auto` (default: forward when
 the model's spec opts in and every registered worker of the model advertises
@@ -93,7 +95,13 @@ namespace is derived from all of these): the worker advertises
 `smg:mm:v1:{namespace}`; results carry full tensors keyed by a per-attempt job
 id and expire after 120 s. Knobs: `SMG_VLLM_MM_SIDECAR_TIMEOUT_MS` (30000),
 `SMG_VLLM_MM_SIDECAR_MAX_QUEUE` (256, fail fast when the queue is deeper),
-`SMG_VLLM_MM_SIDECAR_NAMESPACE` (override the derived namespace).
+`SMG_VLLM_MM_SIDECAR_NAMESPACE` (override the derived namespace). On the sidecar,
+`SMG_VLLM_MM_MAX_RESULT_BYTES` (default 512 MiB, lowered to Redis's
+`proto-max-bulk-len` when that is smaller) caps an encoded result and
+`SMG_VLLM_MM_MAX_VIDEO_FRAMES` caps video sampling as above. A result over the
+cap is answered as a 400 `media_too_large` instead of being pushed, and a result
+Redis refuses is reported to the worker at once; a sidecar timeout is not
+retried by the router, since the worker already spent the whole budget on it.
 
 ### MLX
 
