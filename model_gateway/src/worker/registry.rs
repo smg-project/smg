@@ -12,6 +12,8 @@
 //! removed, not per request. See [`crate::worker::hash_ring`] for the ring
 //! itself — this file only wires registry events to ring rebuilds.
 
+#[cfg(test)]
+use std::sync::mpsc as test_mpsc;
 use std::{
     collections::{BTreeSet, HashSet},
     ops::Deref,
@@ -253,6 +255,13 @@ type ModelIndex = Arc<DashMap<String, Arc<ModelWorkerSnapshot>>>;
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>>>;
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct HashRingTestHooks {
+    before_rebuild: Option<test_mpsc::Sender<()>>,
+    after_snapshot: Option<(test_mpsc::Sender<()>, test_mpsc::Receiver<()>)>,
+}
+
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
@@ -302,6 +311,15 @@ pub struct WorkerRegistry {
     /// Consistent hash rings per model for O(log n) routing.
     /// Rebuilt on worker add/remove (copy-on-write).
     hash_rings: Arc<DashMap<String, Arc<HashRing>>>,
+
+    /// Orders snapshots and publication for both per-model and wildcard rings.
+    /// Membership writers release their index guards before taking this lock;
+    /// routing readers never take it. Hold it through the wildcard rebuild so
+    /// a late publication cannot restore a superseded membership snapshot.
+    hash_ring_update: parking_lot::Mutex<()>,
+
+    #[cfg(test)]
+    hash_ring_test_hooks: parking_lot::Mutex<HashRingTestHooks>,
 
     /// Workers indexed by worker type
     type_workers: Arc<DashMap<WorkerType, Vec<WorkerId>>>,
@@ -381,6 +399,9 @@ impl WorkerRegistry {
             global_routing_update: parking_lot::Mutex::new(()),
             model_alias_index: Arc::new(DashMap::new()),
             hash_rings: Arc::new(DashMap::new()),
+            hash_ring_update: parking_lot::Mutex::new(()),
+            #[cfg(test)]
+            hash_ring_test_hooks: parking_lot::Mutex::new(HashRingTestHooks::default()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
@@ -1929,9 +1950,30 @@ impl WorkerRegistry {
     /// which at fleet scale turns a registration wave quadratic and
     /// saturates the runtime.
     fn rebuild_hash_ring(&self, model_id: &str) {
+        #[cfg(test)]
+        if let Some(started) = self.hash_ring_test_hooks.lock().before_rebuild.take() {
+            started.send(()).expect("rebuild observer is listening");
+        }
+
+        // Different worker IDs may mutate the same model concurrently. Lock
+        // before reading membership, not just before inserting the ring: an
+        // older snapshot must never publish after a newer one has completed.
+        let _update = self.hash_ring_update.lock();
+
         // Clone the copy-on-write slice out so the ring build never runs
         // under the index shard guard.
         let workers = self.model_index.get(model_id).map(|entry| entry.clone());
+
+        #[cfg(test)]
+        {
+            let pause = self.hash_ring_test_hooks.lock().after_snapshot.take();
+            if let Some((started, resume)) = pause {
+                started.send(()).expect("snapshot observer is listening");
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("test releases the paused snapshot");
+            }
+        }
 
         match workers {
             Some(workers) => {
@@ -1955,6 +1997,7 @@ impl WorkerRegistry {
     /// Rebuild the ring stored under [`UNKNOWN_MODEL_ID`], which requests that
     /// name no model are routed against. Those requests may land on any worker,
     /// so the ring spans every model's workers, deduplicated by URL.
+    /// Called only by `rebuild_hash_ring` while holding `hash_ring_update`.
     fn rebuild_wildcard_hash_ring(&self) {
         let model_ids: Vec<String> = self
             .model_index
@@ -4448,6 +4491,242 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
+    }
+
+    /// Pause one real membership operation after its model snapshot, then let
+    /// another operation reach the rebuild. No sleep determines the ordering.
+    fn overlapping_hash_ring_updates(
+        registry: &Arc<WorkerRegistry>,
+        first: impl FnOnce(&WorkerRegistry) + Send + 'static,
+        second: impl FnOnce(&WorkerRegistry) + Send + 'static,
+    ) -> bool {
+        use std::{sync::mpsc, time::Duration};
+
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        registry.hash_ring_test_hooks.lock().after_snapshot = Some((snapshot_tx, resume_rx));
+
+        let (first_done_tx, first_done_rx) = mpsc::channel();
+        let first_registry = Arc::clone(registry);
+        let first_thread = std::thread::spawn(move || {
+            first(&first_registry);
+            first_done_tx.send(()).expect("first completion receiver");
+        });
+        snapshot_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first update reaches its snapshot");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        registry.hash_ring_test_hooks.lock().before_rebuild = Some(started_tx);
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_registry = Arc::clone(registry);
+        let second_thread = std::thread::spawn(move || {
+            second(&second_registry);
+            second_done_tx.send(()).expect("second completion receiver");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second update changes membership and reaches the rebuild");
+
+        // The unfixed implementation completes the second publication here,
+        // before the first overwrites it with its stale snapshot. The fixed
+        // implementation must wait for the first publication to finish.
+        let blocked = matches!(
+            second_done_rx.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        resume_tx.send(()).expect("release first update");
+        first_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first membership operation completes");
+        if blocked {
+            second_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second membership operation completes");
+        }
+        first_thread.join().expect("first update did not panic");
+        second_thread.join().expect("second update did not panic");
+        blocked
+    }
+
+    #[test]
+    fn concurrent_hash_ring_registration_keeps_encode_selectable() {
+        use crate::policies::{ConsistentHashingPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .model(ModelCard::new("epd-model"))
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let encode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://encode:8080")
+                .model(ModelCard::new("epd-model"))
+                .worker_type(WorkerType::Encode)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let second_encode = Arc::clone(&encode);
+        let blocked = overlapping_hash_ring_updates(
+            &registry,
+            move |registry| {
+                registry.register(prefill).expect("register prefill");
+            },
+            move |registry| {
+                registry.register(second_encode).expect("register encode");
+            },
+        );
+
+        assert_eq!(registry.get_by_model("epd-model").len(), 2);
+        assert!(encode.is_healthy_and_eligible());
+        let info = SelectWorkerInfo {
+            routing_key: Some("image-hash"),
+            hash_ring: registry.get_hash_ring("epd-model"),
+            ..Default::default()
+        };
+        assert_eq!(
+            ConsistentHashingPolicy::new().select_worker(&[encode], &info),
+            Some(0),
+            "a registered, healthy encode worker must remain selectable"
+        );
+        assert_eq!(info.hash_ring.expect("model ring").worker_count(), 2);
+        assert_eq!(
+            registry
+                .get_hash_ring(UNKNOWN_MODEL_ID)
+                .expect("wildcard ring")
+                .worker_count(),
+            2
+        );
+        assert!(blocked, "ring publications must be serialized");
+    }
+
+    fn assert_hash_ring_urls(registry: &WorkerRegistry, model_id: &str, urls: &[&str]) {
+        let ring = registry.get_hash_ring(model_id);
+        if urls.is_empty() {
+            assert!(ring.is_none(), "removed model {model_id} has no ring");
+            return;
+        }
+        let ring = ring.expect("nonempty model has a ring");
+        assert_eq!(ring.worker_count(), urls.len(), "model {model_id}");
+        for &url in urls {
+            assert_eq!(
+                ring.find_healthy_url("key", |candidate| candidate == url),
+                Some(url),
+                "model {model_id} must contain {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_hash_ring_registration_preserves_wildcard_union() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let blocked = overlapping_hash_ring_updates(
+            &registry,
+            |registry| {
+                registry
+                    .register(worker_serving("http://first:8080", &["model-a", "model-b"]))
+                    .expect("register multi-model worker");
+            },
+            |registry| {
+                registry
+                    .register(worker_serving("http://second:8080", &["model-b"]))
+                    .expect("register other worker");
+            },
+        );
+        assert_hash_ring_urls(&registry, "model-a", &["http://first:8080"]);
+        assert_hash_ring_urls(
+            &registry,
+            "model-b",
+            &["http://first:8080", "http://second:8080"],
+        );
+        assert_hash_ring_urls(
+            &registry,
+            UNKNOWN_MODEL_ID,
+            &["http://first:8080", "http://second:8080"],
+        );
+        assert!(blocked, "different models also serialize wildcard updates");
+    }
+
+    #[test]
+    fn concurrent_hash_ring_removal_does_not_restore_the_last_worker() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let first_id = registry
+            .register(worker_serving("http://first:8080", &["model"]))
+            .expect("first worker");
+        let second_id = registry
+            .register(worker_serving("http://second:8080", &["model"]))
+            .expect("second worker");
+        let blocked = overlapping_hash_ring_updates(
+            &registry,
+            move |registry| {
+                registry.remove(&first_id).expect("remove first worker");
+            },
+            move |registry| {
+                registry.remove(&second_id).expect("remove last worker");
+            },
+        );
+        assert!(registry.get_by_model("model").is_empty());
+        assert_hash_ring_urls(&registry, "model", &[]);
+        assert_hash_ring_urls(&registry, UNKNOWN_MODEL_ID, &[]);
+        assert!(blocked, "removals serialize ring publications");
+    }
+
+    #[test]
+    fn concurrent_hash_ring_removal_does_not_erase_a_new_registration() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let old_id = registry
+            .register(worker_serving("http://old:8080", &["model"]))
+            .expect("old worker");
+        let blocked = overlapping_hash_ring_updates(
+            &registry,
+            move |registry| {
+                registry.remove(&old_id).expect("remove old worker");
+            },
+            |registry| {
+                registry
+                    .register(worker_serving("http://new:8080", &["model"]))
+                    .expect("new worker");
+            },
+        );
+        assert_eq!(registry.get_by_model("model").len(), 1);
+        assert_hash_ring_urls(&registry, "model", &["http://new:8080"]);
+        assert_hash_ring_urls(&registry, UNKNOWN_MODEL_ID, &["http://new:8080"]);
+        assert!(blocked, "registration waits for the older removal");
+    }
+
+    #[test]
+    fn concurrent_hash_ring_replace_preserves_changed_models() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let first_id = registry
+            .register(worker_serving("http://first:8080", &["old", "kept"]))
+            .expect("first worker");
+        let second_id = registry
+            .register(worker_serving("http://second:8080", &["old"]))
+            .expect("second worker");
+        let blocked = overlapping_hash_ring_updates(
+            &registry,
+            move |registry| {
+                assert!(registry.replace(
+                    &first_id,
+                    worker_serving("http://first:8080", &["new", "kept"]),
+                ));
+            },
+            move |registry| {
+                registry
+                    .remove(&second_id)
+                    .expect("remove last old-model worker");
+            },
+        );
+        assert!(registry.get_by_model("old").is_empty());
+        assert_hash_ring_urls(&registry, "old", &[]);
+        assert_hash_ring_urls(&registry, "new", &["http://first:8080"]);
+        assert_hash_ring_urls(&registry, "kept", &["http://first:8080"]);
+        assert_hash_ring_urls(&registry, UNKNOWN_MODEL_ID, &["http://first:8080"]);
+        assert!(blocked, "replace and remove serialize ring publications");
     }
 
     #[test]
