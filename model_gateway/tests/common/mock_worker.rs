@@ -190,9 +190,10 @@ impl RequestRecorder {
             .clone()
     }
 
-    /// The `authorization` header each recorded RL control request carried,
-    /// oldest first and index-aligned with [`Self::bodies`]. `None` is a
-    /// request that arrived without the header.
+    /// The `authorization` header of each RL control request received,
+    /// oldest first (RL control routes only; not aligned with
+    /// [`Self::bodies`]). `None` is a request that arrived without the
+    /// header.
     #[expect(
         clippy::expect_used,
         reason = "test helper - panicking on failure is intentional"
