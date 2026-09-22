@@ -19,6 +19,7 @@ WORKER = {
     "model_id": "m",
     "worker_type": "regular",
     "connection_mode": "http",
+    "control_url": "http://e:1",
     "tp_size": 1,
     "dp_size": 1,
     "pp_size": 1,
@@ -89,6 +90,7 @@ def test_workers_and_worker(stub):
     ws = rl.workers()
     assert len(ws) == 1 and ws[0].id == "w1" and ws[0].engine == "sglang"
     assert ws[0].capabilities["pause_modes"] == ["abort"]
+    assert ws[0].control_url == "http://e:1"
     assert rl.worker("w1").weight_version == "7"
     assert _Stub.seen[0]["auth"] == "Bearer k"
 
@@ -155,11 +157,13 @@ def test_worker_from_json_defaults_missing_dicts():
     del d["labels"]
     del d["capabilities"]
     del d["role"]
+    del d["control_url"]
     d["future_field"] = 1
     w = Worker.from_json(d)
     assert w.labels == {}
     assert w.capabilities == {}
     assert w.role is None
+    assert w.control_url is None
 
 
 def test_call_raises_on_smg_error_envelope(stub):
