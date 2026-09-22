@@ -1700,3 +1700,47 @@ def test_stamp_rl_control_labels_patches_each_worker(monkeypatch):
     assert patch[0][1] == "http://127.0.0.1:8000/workers/w1"
     assert json.loads(patch[0][2]) == {"labels": {"rl.control_url": "http://127.0.0.1:30400"}}
     assert patch[0][3] == "Bearer adm"
+
+
+def test_stamp_rl_control_labels_stops_retrying_after_a_4xx(monkeypatch):
+    import json
+    import time
+    import urllib.error
+
+    from smg import serve
+
+    calls = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = json.dumps(payload).encode()
+            self.status = 200
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=0):
+        calls.append((req.get_method(), req.full_url, req.data, req.get_header("Authorization")))
+        if req.get_method() == "GET":
+            return _Resp({"workers": [{"id": "w1", "url": "ipc:///tmp/engine-30000"}]})
+        raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", {}, None)
+
+    monkeypatch.setattr(serve.urllib.request, "urlopen", fake_urlopen)
+    start = time.monotonic()
+    serve._stamp_rl_control_labels(
+        "http://127.0.0.1:8000",
+        "adm",
+        [("ipc:///tmp/engine-30000", "http://127.0.0.1:30400")],
+        deadline_s=5.0,
+    )
+    elapsed = time.monotonic() - start
+
+    patch = [c for c in calls if c[0] == "PATCH"]
+    assert len(patch) == 1, "a 4xx must not be retried"
+    assert elapsed < 3.0, "giving up on the 4xx must not wait out the deadline"
