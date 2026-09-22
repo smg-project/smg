@@ -1,16 +1,21 @@
 # TokenSpeed RL control plane — acceptance run on the H200 node
 
-Status: **BLOCKED on acceptance item 1 (refit).** The control plane itself —
-discovery, per-worker proxy, fan-out, pause/resume, group setup and teardown —
-worked on every call. The weight transfer did not: TokenSpeed's engine answers
-`update_weights_from_distributed` with HTTP 200 without ever entering the NCCL
-collective, so the trainer blocks in `ncclCommInitRank` and the engine loads the
-uninitialized receive buffers into the model. Evidence and the isolated
-reproduction that rules out the trainer-side code are below.
+Status: **BLOCKED on acceptance item 1 (refit), root cause found, engine fix in
+flight.** The control plane itself — discovery, per-worker proxy, fan-out,
+pause/resume, group setup and teardown — worked on every call. The weight
+transfer did not: TokenSpeed's engine answers `update_weights_from_distributed`
+with HTTP 200 without ever entering the NCCL collective, so the trainer blocks
+in `ncclCommInitRank` and the engine loads the uninitialized receive buffers
+into the model. The cause is that the engine's device-bound world group makes
+torch build the weight-update communicator with `ncclCommSplit` off a size-1
+parent instead of `ncclCommInitRank`; see **Root cause** below. A TokenSpeed fix
+is being committed on the companion branch. Nothing in SMG or in
+`refit_from_trainer.py` needs to change — the isolated three-rank reproduction
+below runs the same trainer code successfully.
 
 The run was then cut short: the OCI bastion session expired mid-run and cannot
-be renewed without an interactive `oci session authenticate`. Steps f–i were not
-reached and the node was not cleaned up. See **State left on the node**.
+be renewed without an interactive `oci session authenticate`. Steps e–i were not
+completed and the node was not cleaned up. See **State left on the node**.
 
 ## Environment
 
@@ -248,30 +253,45 @@ the 1.17 s cost of the lazy NCCL init in this test versus the engine's 64 ms
 round trip — the engine never paid that cost, which is what "it never entered
 the collective" looks like from the outside.
 
-### What to look at next in TokenSpeed
+### Root cause — confirmed: `ncclCommSplit` instead of `ncclCommInitRank`
 
 A non-root NCCL broadcast that returns immediately, leaves the buffer untouched
 and raises nothing is what you get from a collective that was never issued to a
-real multi-rank communicator. Candidates, in the order worth checking:
+real multi-rank communicator. The mechanism, confirmed on the companion branch:
 
-1. The effective size/rank of `self._weight_update_pg` at broadcast time
-   (`dist.get_world_size(pg)` / `dist.get_rank(pg)`), versus the `world_size=3`
-   the join logged. A size-1 communicator makes a broadcast a local no-op.
-2. Whether the forward thread is inside an open NCCL group scope
-   (`ncclGroupStart` / torch's `_coalescing_manager`) when the update runs,
-   which defers collectives instead of executing them.
-3. Whether the engine's own default process group and its bound device change
-   how `_new_process_group_helper` builds the new group in that process
-   (the engine has one; the trainer does not).
+TokenSpeed builds its own world process group with a bound `device_id`. When a
+process has a device-bound default group, torch's `_new_process_group_helper`
+sets `split_from` on the new group, so the engine's weight-update communicator
+is created with **`ncclCommSplit` off the engine's own size-1 communicator**
+rather than with `ncclCommInitRank` against the unique id the trainer published
+through the store. Splitting a size-1 parent yields a size-1 child, and a
+broadcast on a size-1 communicator is a local no-op: it returns in microseconds,
+touches nothing, and reports success. That is the 64 ms round trip and the
+uninitialized buffers, exactly.
+
+The trainer has no default process group, so nothing binds a device, so it takes
+the `ncclCommInitRank` path and waits for peers that joined a different
+communicator and will never arrive. Both sides behave correctly in isolation,
+which is why the three-rank reproduction passes.
+
+The fix is engine-side and is being committed on the companion branch: clear the
+bound device around the helper so the weight-update group is built with
+`ncclCommInitRank`, and refuse to join at all if `split_from` is still set, so a
+future regression fails loudly instead of silently corrupting the model.
 
 `remote/acc-instrument.py add` was applied on the node to log, inside
 `update_weights_from_distributed`, `dist.get_world_size(pg)`,
 `dist.get_rank(pg)`, `type(self.model).__name__`, and the mean of each received
 buffer plus a receive count. The engines were restarted with it, but the bastion
-session expired before that run could be read. Running
-`~/smg-rl-ts/remote/acc-refit.sh run diag2 1` and reading
-`~/smg-rl-ts/logs/acc-engine-0.log` for `RLDEBUG` should answer (1) and the
-model-class question in one shot.
+session expired before that run could be read. It is no longer needed to find
+the cause; it is still worth one run on the fixed engine as a positive control,
+since it prints the received means and would show a real transfer.
+
+**Note for whoever syncs the fixed TokenSpeed tree:** that instrumentation is an
+uncommitted modification in the node's checkout at
+`~/tokenspeed-rl/src/python/tokenspeed/runtime/execution/model_runner.py`. Run
+`python3 ~/smg-rl-ts/remote/acc-instrument.py remove` before pulling or rsyncing
+the fix over it, or the edit will collide with the incoming change.
 
 ## Fan-out overhead (step f) — PASS on the calls that ran
 
@@ -328,8 +348,25 @@ Nothing here is destructive, but it needs a hand once access is back.
   container, TokenSpeed `ts serve` engines on ports 312xx inside `ts-rl`, and an
   SMG on port 31100. All of it was left alone and must stay that way.
 
-To resume: `oci session authenticate --profile iad`, recreate the bastion
-session, then re-point `h200.sh` / `h200-rsync.sh` at the new session OCID.
+## Resume order
+
+The bastion session has to be re-created first: `oci session authenticate
+--profile iad`, create a new bastion session, then re-point `h200.sh` and
+`h200-rsync.sh` at the new OCID. Every profile's token on the Mac is expired and
+refresh is refused, so this needs a browser.
+
+Then, in order:
+
+1. `python3 ~/smg-rl-ts/remote/acc-instrument.py remove`, before anything
+   overwrites the node's TokenSpeed checkout.
+2. Sync both trees: this worktree to `~/smg-rl-ts/src`, and the fixed TokenSpeed
+   branch to `~/tokenspeed-rl/src`.
+3. `~/smg-rl-ts/remote/acc-engines.sh down`, then `up`, then `wait` — the
+   engines must restart both to pick up the fixed engine code and to drop the
+   weights the failed refits corrupted.
+4. Re-run step e: `~/smg-rl-ts/remote/acc-refit.sh run 1` and then `run 2`,
+   expecting `OK` and `weight_version` 1 then 2 on the trailing `/generate`.
+5. Steps f, g and h as specified, then `~/smg-rl-ts/remote/acc-cleanup.sh down`.
 
 ## Criteria — acceptance item 1
 
@@ -340,7 +377,7 @@ session, then re-point `h200.sh` / `h200-rsync.sh` at the new session OCID.
 | `pause_generation` / `continue_generation` fan-outs | PASS |
 | `init_weights_update_group` per worker with the computed `rank_offset` | PASS (engines joined at ranks 1 and 2 of a world of 3) |
 | `destroy_weights_update_group` fan-out | PASS (200, `success: true`, idempotent) |
-| Refit every engine and see the new `weight_version` on the next `/generate` | **FAIL** — engine returns success without receiving; trainer deadlocks |
+| Refit every engine and see the new `weight_version` on the next `/generate` | **FAIL** — engine returns success without receiving; trainer deadlocks. Engine-side `ncclCommSplit` bug, fix in flight; re-run after it lands |
 | Fan-out overhead < 5 ms | PASS on the three fan-outs that ran (0 ms each) |
 | Failure injection: 207 + `upstream_unreachable`, breakers closed | NOT RUN |
 | Flag off: `/v1/rl/*` 404, `/workers` intact, no `smg_rl_` metrics | NOT RUN |
