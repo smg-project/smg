@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 
@@ -930,6 +931,14 @@ def _stamp_rl_control_labels(
                     pass
                 logger.info("stamped rl.control_url=%s on %s", pending[url], url)
                 del pending[url]
+            except urllib.error.HTTPError as e:
+                if 400 <= e.code < 500:
+                    logger.warning(
+                        "rl.control_url stamping got HTTP %s for %s; not retrying", e.code, url
+                    )
+                    del pending[url]
+                else:
+                    logger.warning("rl.control_url stamping failed for %s: %s", url, e)
             except Exception as e:  # noqa: BLE001
                 logger.warning("rl.control_url stamping failed for %s: %s", url, e)
         if pending:
@@ -960,7 +969,11 @@ class ServeOrchestrator:
             self._launch_workers()
             self._wait_healthy()
             router_args = self._build_router_args()
-            if getattr(router_args, "enable_rl", False) and self.backend == "tokenspeed":
+            if (
+                getattr(router_args, "enable_rl", False)
+                and self.backend == "tokenspeed"
+                and getattr(self.args, "connection_mode", "grpc") == "zmq"
+            ):
                 control = getattr(self.launcher, "control_url", None)
                 if callable(control):
                     targets = [
