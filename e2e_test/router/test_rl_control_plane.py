@@ -76,6 +76,25 @@ class RlControlPlaneBehavior:
         )
         assert completion.choices
 
+
+@pytest.mark.engine("sglang")
+@pytest.mark.gpu(1)
+@pytest.mark.e2e
+@pytest.mark.gateway(policy="round_robin", extra_args=["--enable-rl"])
+@pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
+class TestRlControlPlaneSglang(RlControlPlaneBehavior):
+    ENGINE = "sglang"
+    CONNECTION_MODE = "http"
+
+    def test_single_worker_proxy_server_info(self, setup_backend):
+        _backend, _model, _client, gateway = setup_backend
+        wid = self._workers(gateway)["workers"][0]["id"]
+        resp = httpx.get(
+            f"{gateway.base_url}/v1/rl/workers/{wid}/engine/server_info", timeout=TIMEOUT
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["body"].get("tp_size") is not None
+
     def test_refit_from_disk_is_visible_on_the_next_generate(self, setup_backend):
         _backend, model, _client, gateway = setup_backend
         w = self._workers(gateway)["workers"][0]
@@ -107,25 +126,6 @@ class RlControlPlaneBehavior:
         assert first["meta_info"]["weight_version"] == "e2e-refit", first["meta_info"]
 
 
-@pytest.mark.engine("sglang")
-@pytest.mark.gpu(1)
-@pytest.mark.e2e
-@pytest.mark.gateway(policy="round_robin", extra_args=["--enable-rl"])
-@pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
-class TestRlControlPlaneSglang(RlControlPlaneBehavior):
-    ENGINE = "sglang"
-    CONNECTION_MODE = "http"
-
-    def test_single_worker_proxy_server_info(self, setup_backend):
-        _backend, _model, _client, gateway = setup_backend
-        wid = self._workers(gateway)["workers"][0]["id"]
-        resp = httpx.get(
-            f"{gateway.base_url}/v1/rl/workers/{wid}/engine/server_info", timeout=TIMEOUT
-        )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["body"].get("tp_size") is not None
-
-
 @pytest.mark.engine("tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
@@ -145,6 +145,57 @@ class TestRlControlPlaneTokenSpeed(RlControlPlaneBehavior):
         )
         assert resp.status_code == 200, resp.text
         assert "weight_version" in resp.json()["body"]
+
+    def test_discovery_advertises_distributed_refits_only(self, setup_backend):
+        _backend, _model, _client, gateway = setup_backend
+        w = self._workers(gateway)["workers"][0]
+        assert w["capabilities"]["update_from"] == ["distributed"]
+        assert w["capabilities"]["source"] == "label"
+
+    def test_disk_refit_is_refused_per_worker_and_the_engine_keeps_serving(self, setup_backend):
+        _backend, model, client, gateway = setup_backend
+        w = self._workers(gateway)["workers"][0]
+        model_path = w["labels"].get("model_path") or w["labels"].get("model")
+        assert model_path, w["labels"]
+
+        resp = httpx.post(
+            f"{gateway.base_url}/v1/rl/engine/pause_generation",
+            params={"selector": self.selector},
+            json={},
+            timeout=TIMEOUT,
+        )
+        assert resp.status_code == 200, resp.text
+
+        resp = httpx.post(
+            f"{gateway.base_url}/v1/rl/engine/update_weights_from_disk",
+            params={"selector": self.selector},
+            json={"model_path": model_path, "weight_version": "e2e-refused", "flush_cache": True},
+            timeout=REFIT_TIMEOUT,
+        )
+        assert resp.status_code == 207, resp.text
+        body = resp.json()
+        assert body["succeeded"] == 0
+        assert len(body["failed"]) == 1, body["failed"]
+        failure = body["failed"][0]
+        assert failure["error"] == "upstream_error"
+        assert failure["status"] == 501
+        outcome = body["results"][failure["worker_id"]]
+        assert "distributed" in outcome["body"]["message"]
+
+        resp = httpx.post(
+            f"{gateway.base_url}/v1/rl/engine/continue_generation",
+            params={"selector": self.selector},
+            json={},
+            timeout=TIMEOUT,
+        )
+        assert resp.status_code == 200, resp.text
+
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Say hi"}],
+            max_tokens=4,
+        )
+        assert completion.choices
 
 
 @pytest.mark.engine("sglang")
