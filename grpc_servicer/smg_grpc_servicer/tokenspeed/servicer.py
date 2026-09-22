@@ -14,6 +14,7 @@ import asyncio
 import dataclasses
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -642,12 +643,20 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         )
 
     async def _is_paused(self) -> bool:
-        """Live scheduler pause state; False on engines without the query."""
+        """Live scheduler pause state; False on engines without the query.
+
+        ``is_scheduler_paused`` is pre-existing on the engine and its
+        signature is not pinned by this branch, so accept it whether it
+        returns a bool directly or a coroutine.
+        """
         query = getattr(self.async_llm, "is_scheduler_paused", None)
         if not callable(query):
             return False
         try:
-            return bool(await query())
+            result = query()
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
         except Exception:  # noqa: BLE001 — a failed probe must not break discovery
             logger.warning("is_scheduler_paused failed; reporting not paused", exc_info=True)
             return False
