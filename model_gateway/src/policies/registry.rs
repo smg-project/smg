@@ -347,20 +347,32 @@ impl PolicyRegistry {
         let marker_units = namespace
             .map(|_| (CacheNamespace::token_marker_len(block) / block.max(1)) as u32)
             .unwrap_or(0);
-        let keyed = match namespace {
-            Some(ns) => ns.prefixed_tokens(tokens, block),
-            None => CacheNamespace::unpartitioned_tokens(tokens).to_vec(),
+        // Borrow the prompt on the common unpartitioned path; only a
+        // partition prepends a marker and has to own a copy.
+        let keyed: std::borrow::Cow<[u32]> = match namespace {
+            Some(ns) => ns.prefixed_tokens(tokens, block).into(),
+            None => CacheNamespace::unpartitioned_tokens(tokens).into(),
         };
-        let hashes: Vec<u64> = kv_index::compute_request_content_hashes(&keyed, block)
+        let mut hashes: Vec<u64> = kv_index::compute_request_content_hashes(&keyed, block)
             .iter()
             .map(|h| h.0)
             .collect();
         let started = std::time::Instant::now();
-        let (label, scores) = if hashes.is_empty() {
-            // Shorter than one keyspace block, so there is nothing the
-            // index could match. Counted as an empty answer rather than
-            // skipped: the request did participate, and the caller must
-            // see a miss so it takes the load-only pick.
+        let (label, scores) = if super::remote_index::too_short_to_score(
+            hashes.len(),
+            keyed.len(),
+            block,
+            marker_units,
+        ) {
+            // Nothing the index could credit: shorter than one keyspace
+            // block, or (partitioned) a chain that is marker only, or a
+            // prompt whose last-token bound cannot clear the marker.
+            // Counted as an empty answer rather than skipped: the request
+            // did participate, and the caller must see a miss so it takes
+            // the load-only pick. The chain is dropped too, so a success
+            // path never publishes a marker-only placement nothing can
+            // score.
+            hashes.clear();
             (TOO_SHORT_TO_HASH, Vec::new())
         } else {
             let outcome = handle
@@ -501,6 +513,15 @@ impl PolicyRegistry {
         // String-mode publishes go to the `Bytes` keyspace and never
         // refine (HTTP has no output tokens to append); the token path
         // may re-hash prompt (+) output.
+        // A prompt too short to hash has nothing to publish; counting the
+        // client's silent early return as a publish would put the counter
+        // ahead of what the index receives by the short-prompt share.
+        if prediction.bytes && prediction.content_hashes.is_empty() {
+            return;
+        }
+        if !prediction.bytes && prediction.content_hashes.is_empty() && refine_tokens.is_none() {
+            return;
+        }
         if prediction.bytes {
             handle.client().publish_placement_bytes(
                 &prediction.model,
@@ -517,9 +538,9 @@ impl PolicyRegistry {
             // chain unpartitioned would advertise the placement in a
             // keyspace no query of this request's tenant ever reaches.
             Some(tokens) => {
-                let keyed = match prediction.namespace {
-                    Some(ns) => ns.prefixed_tokens(tokens, prediction.block_size),
-                    None => CacheNamespace::unpartitioned_tokens(tokens).to_vec(),
+                let keyed: std::borrow::Cow<[u32]> = match prediction.namespace {
+                    Some(ns) => ns.prefixed_tokens(tokens, prediction.block_size).into(),
+                    None => CacheNamespace::unpartitioned_tokens(tokens).into(),
                 };
                 kv_index::compute_request_content_hashes(&keyed, prediction.block_size)
                     .iter()
@@ -528,6 +549,9 @@ impl PolicyRegistry {
             }
             None => prediction.content_hashes.clone(),
         };
+        if hashes.is_empty() {
+            return;
+        }
         handle.client().publish_placement(
             &prediction.model,
             prediction.block_size as u32,

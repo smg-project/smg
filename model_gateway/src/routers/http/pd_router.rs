@@ -2162,6 +2162,9 @@ impl RouterTrait for PDRouter {
                 rid_key: None,
                 cache_namespace: None,
                 candidate_filter: None,
+                // count_tokens picks one prefill worker without a decode leg
+                // and never consults the shared index.
+                remote: crate::policies::RemoteLookup::NotAttempted,
             },
         ) else {
             return error::service_unavailable(

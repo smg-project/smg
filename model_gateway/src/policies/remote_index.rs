@@ -5,7 +5,7 @@
 //! call. With the flag unset the handle is `None` and every caller's
 //! fast path is a `None` check.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use radix_index::client::{QueryOutcome, RemoteIndex};
 
@@ -144,6 +144,26 @@ pub(crate) const TOO_SHORT_TO_HASH: &str = "remote_too_short";
 /// rather than prompt. It comes off every score, so a worker that
 /// shares only the namespace scores nothing and the echoed prediction
 /// stays in prompt units whether or not the request was partitioned.
+/// Is a keyed prompt too short for the index to ever credit a worker?
+/// `fold_answers` bounds every answer by `(keyed_len - 1) / unit` blocks
+/// (the last token is always computed) and takes the marker blocks back
+/// off, so a prompt whose bound does not clear the marker folds to
+/// nothing whatever the index answers. Asking would spend the deadline
+/// on a query that cannot score and file it as unscorable instead of
+/// too short.
+pub(crate) fn too_short_to_score(
+    hashes_len: usize,
+    keyed_len: usize,
+    unit: usize,
+    marker_units: u32,
+) -> bool {
+    if unit == 0 {
+        return true;
+    }
+    let limit = (keyed_len.saturating_sub(1) / unit) as u32;
+    hashes_len as u32 <= marker_units || limit <= marker_units
+}
+
 pub(crate) fn fold_answers(
     answers: Vec<radix_index::client::HolderAnswer>,
     keyed_len: usize,
@@ -154,7 +174,11 @@ pub(crate) fn fold_answers(
         return Vec::new();
     }
     let limit = (keyed_len.saturating_sub(1) / unit) as u32;
-    let mut scores: Vec<(String, u32)> = Vec::with_capacity(answers.len());
+    // Two answers naming one worker would otherwise let the blend see it
+    // twice and weigh it twice; keep the deeper claim. One pass over the
+    // answers: a well-shared prefix on a large fleet answers with every
+    // worker, and a linear dedup would be quadratic in that count.
+    let mut by_url: HashMap<String, u32> = HashMap::with_capacity(answers.len());
     for answer in answers {
         let depth = answer
             .matched_blocks
@@ -163,13 +187,12 @@ pub(crate) fn fold_answers(
         if depth == 0 {
             continue;
         }
-        // Two answers naming one worker would otherwise let the blend
-        // see it twice and weigh it twice; keep the deeper claim.
-        match scores.iter_mut().find(|(url, _)| *url == answer.holder) {
-            Some(entry) => entry.1 = entry.1.max(depth),
-            None => scores.push((answer.holder, depth)),
-        }
+        by_url
+            .entry(answer.holder)
+            .and_modify(|d| *d = (*d).max(depth))
+            .or_insert(depth);
     }
+    let mut scores: Vec<(String, u32)> = by_url.into_iter().collect();
     // Sorted here rather than trusting the answer order, so the blend's
     // input ordering is a property of this function and a change to the
     // index's reply order cannot quietly reorder equal-overlap workers.
@@ -182,6 +205,43 @@ mod tests {
     use radix_index::client::HolderAnswer;
 
     use super::*;
+
+    /// A partitioned prompt of up to one block has a marker-only chain:
+    /// nothing the index says can clear the marker, so it is too short,
+    /// like an unpartitioned prompt of exactly one block.
+    #[test]
+    fn too_short_covers_marker_only_and_single_block_prompts() {
+        // Unpartitioned: no hashes, or exactly one block (limit 0).
+        assert!(too_short_to_score(0, 10, 128, 0));
+        assert!(too_short_to_score(1, 128, 128, 0));
+        assert!(!too_short_to_score(1, 129, 128, 0));
+        // Partitioned with a one-block marker: a sub-block prompt pads to
+        // the marker block only; a prompt of a block and a bit clears it.
+        assert!(too_short_to_score(1, 128 + 50, 128, 1));
+        assert!(too_short_to_score(2, 128 + 128, 128, 1));
+        assert!(!too_short_to_score(2, 128 + 129, 128, 1));
+        assert!(too_short_to_score(3, 300, 0, 0), "a zero unit never scores");
+    }
+
+    /// Duplicate holders fold to the deeper claim in one pass, and the
+    /// order is the function's, not the reply's.
+    #[test]
+    fn fold_dedups_by_deepest_claim_regardless_of_reply_order() {
+        let answers = vec![
+            answer("w2", 3),
+            answer("w1", 5),
+            answer("w2", 7),
+            answer("w3", 5),
+        ];
+        assert_eq!(
+            fold_answers(answers, 10 * 4, 4, 0),
+            vec![
+                ("w2".to_string(), 7),
+                ("w1".to_string(), 5),
+                ("w3".to_string(), 5)
+            ]
+        );
+    }
 
     fn answer(holder: &str, matched_blocks: u32) -> HolderAnswer {
         HolderAnswer {
