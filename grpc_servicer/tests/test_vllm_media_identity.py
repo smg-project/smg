@@ -119,6 +119,12 @@ class TestBuildMediaIdentity:
         assert media_identity.build_media_identity(prompt).mm_inputs.mm_hashes == ["h1", "h2"]
 
 
+class TestSupport:
+    def test_the_installed_proto_carries_the_identity(self):
+        # The proto package built from this tree (as CI does) has the field.
+        assert media_identity.media_identity_supported()
+
+
 class TestTensorToProto:
     def test_round_trips_and_widens_unnamed_dtypes(self):
         for tensor in (

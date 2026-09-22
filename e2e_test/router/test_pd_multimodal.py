@@ -177,6 +177,8 @@ class TestPDMultimodalMrope:
             pytest.skip("router-side lane: the legs receive preprocessed tensors")
         backend, model, client, gateway = setup_backend
         prefill, decode = gateway.prefill_workers[0], gateway.decode_workers[0]
+        if prefill.log_path is None or decode.log_path is None:
+            pytest.skip("worker output goes to the terminal; the log assertions need captured logs")
         worker_before = _worker_path_count(gateway)
         prefill_before = prefill.read_log().count("media_refs=1")
         decode_refs_before = decode.read_log().count("media_refs=1")

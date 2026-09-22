@@ -156,24 +156,28 @@ fn pd_fanout_width(request: &ProtoGenerateRequest, protocol: PdProtocol) -> Opti
 }
 
 /// Give the decode leg the media identity the prefill leg produced, so it
-/// is served without pixels or references. Only with a KV handoff: without
-/// one decode recomputes the prompt and needs the references itself. A
-/// prefill that returned no identity (an older servicer) leaves the leg as
-/// it is, and decode reprocesses the media.
+/// is served without pixels or references. Only once decode actually holds
+/// a KV handoff (`handed_off`): without one it recomputes the prompt and
+/// needs the references itself, and a pixel-less leg without KV is refused
+/// by the servicer. A prefill that was asked for an identity (`solicited`:
+/// its request carried KV params) but returned none is an older servicer;
+/// the leg is left as it is, and decode reprocesses the media.
 fn apply_prefill_media_identity(
     decode_request: &mut ProtoGenerateRequest,
-    relay_kv_params: bool,
+    handed_off: bool,
+    solicited: bool,
     identity: Option<&vllm::MediaIdentity>,
 ) {
-    if !relay_kv_params || !decode_request.has_vllm_media_refs() {
+    if !handed_off || !decode_request.has_vllm_media_refs() {
         return;
     }
     match identity {
         Some(identity) => decode_request.apply_media_identity(identity),
-        None => warn!(
+        None if solicited => warn!(
             request_id = %decode_request.request_id(),
             "prefill worker returned no media identity; decode leg will reprocess media"
         ),
+        None => {}
     }
 }
 
@@ -1143,14 +1147,14 @@ async fn execute_sequential_pd(
 
     debug!("vLLM PD: prefill completed, sending decode request");
 
-    apply_prefill_media_identity(
-        &mut decode_request,
-        relay_kv_params,
-        prefill_media_identity.as_ref(),
-    );
     if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
         decode_request.set_data_parallel_rank(rank as i32);
     }
+    // The prefill request carried KV params, so the servicer was asked for
+    // the media identity; and whether decode ends up holding a handoff.
+    let identity_solicited =
+        mooncake_transfer_id.is_some() || (mode == KvConnectorMode::Nixl && relay_kv_params);
+    let mut handed_off = false;
     match (&mode, prefill_kv_params) {
         // Modern Mooncake: synthesized params under the minted transfer_id
         (
@@ -1173,6 +1177,7 @@ async fn execute_sequential_pd(
                 host,
                 *port,
             ));
+            handed_off = true;
         }
         // Legacy Mooncake (no engine_id discovered, or n>1): typed host/port injection
         (KvConnectorMode::Mooncake { host, port, .. }, _) => {
@@ -1182,6 +1187,7 @@ async fn execute_sequential_pd(
                 "vLLM PD: injecting kv_transfer_params into decode request"
             );
             decode_request.set_kv_transfer_params(host.clone(), *port);
+            handed_off = true;
         }
         (KvConnectorMode::Nixl | KvConnectorMode::Passthrough, Some(json)) if relay_kv_params => {
             debug!(
@@ -1190,6 +1196,7 @@ async fn execute_sequential_pd(
                 "vLLM PD: relaying prefill kv_transfer_params to decode request"
             );
             decode_request.set_kv_transfer_params_json(json);
+            handed_off = true;
         }
         (KvConnectorMode::Nixl, None) if relay_kv_params => {
             Metrics::record_pd_kv_transfer_failure();
@@ -1202,6 +1209,12 @@ async fn execute_sequential_pd(
         }
         _ => {}
     }
+    apply_prefill_media_identity(
+        &mut decode_request,
+        handed_off,
+        identity_solicited,
+        prefill_media_identity.as_ref(),
+    );
 
     // A stripped multimodal leg cannot fall back to a local recompute: the
     // image KV exists only on the prefill worker, so without a handoff the
@@ -1742,11 +1755,24 @@ mod tests {
     }
 
     /// Without a KV handoff decode recomputes the prompt locally, so it needs
-    /// the media itself and the identity must not replace its references.
+    /// the media itself and the identity must not replace its references:
+    /// n>1 never hands off, and a NIXL prefill that returned no params does
+    /// not either, even when it did return an identity.
     #[test]
     fn n_greater_than_one_keeps_media_refs_on_decode() {
         let mut decode = media_refs_request("n2", 2).clone_without_mm_pixels();
-        apply_prefill_media_identity(&mut decode, false, Some(&identity()));
+        apply_prefill_media_identity(&mut decode, false, false, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+    }
+
+    #[test]
+    fn an_identity_without_a_kv_handoff_keeps_the_references() {
+        let mut decode = media_refs_request("no-kv", 1).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, false, true, Some(&identity()));
         assert!(decode.has_vllm_media_refs());
         let ProtoGenerateRequest::Vllm(request) = &decode else {
             panic!("expected vLLM request");
@@ -1757,7 +1783,7 @@ mod tests {
     #[test]
     fn decode_leg_from_media_identity_has_no_refs_and_no_pixels() {
         let mut decode = media_refs_request("relay", 1).clone_without_mm_pixels();
-        apply_prefill_media_identity(&mut decode, true, Some(&identity()));
+        apply_prefill_media_identity(&mut decode, true, true, Some(&identity()));
         assert!(!decode.has_vllm_media_refs());
         let ProtoGenerateRequest::Vllm(request) = &decode else {
             panic!("expected vLLM request");
@@ -1776,12 +1802,15 @@ mod tests {
     }
 
     /// An older servicer returns no identity: the decode leg keeps its
-    /// references and reprocesses, as before.
+    /// references and reprocesses, as before; the same when no identity was
+    /// asked for (a prefill request without KV params).
     #[test]
     fn missing_identity_leaves_the_decode_leg_untouched() {
-        let mut decode = media_refs_request("old", 1).clone_without_mm_pixels();
-        apply_prefill_media_identity(&mut decode, true, None);
-        assert!(decode.has_vllm_media_refs());
+        for solicited in [true, false] {
+            let mut decode = media_refs_request("old", 1).clone_without_mm_pixels();
+            apply_prefill_media_identity(&mut decode, true, solicited, None);
+            assert!(decode.has_vllm_media_refs(), "solicited={solicited}");
+        }
     }
 
     #[test]

@@ -54,7 +54,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
     params_to_response_fields,
     resolve_pd_connector,
 )
-from smg_grpc_servicer.vllm.media_identity import build_media_identity
+from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
     DEFAULT_MAX_INFLIGHT,
@@ -318,7 +318,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # A PD prefill leg answers with the identity so decode is
                 # served without pixels or references.
                 if kv_transfer_params is not None:
-                    media_identity = build_media_identity(prompt)
+                    if media_identity_supported():
+                        media_identity = build_media_identity(prompt)
+                    else:
+                        logger.warning(
+                            "Request %s: the installed smg-grpc-proto has no media_identity; "
+                            "the decode leg will reprocess the media",
+                            request_id,
+                        )
             elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
