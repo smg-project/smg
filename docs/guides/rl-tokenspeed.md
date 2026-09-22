@@ -28,11 +28,26 @@ Register the engines with their control key so the proxy authenticates:
 
 ## Refit
 
-    python3 examples/rl/refit_from_disk.py --smg http://smg:30000 \
-      --model-path /ckpt/step-42 --weight-version 42 --selector engine=tokenspeed
+TokenSpeed's scheduler has no receive path for a disk or tensor refit:
+`update_weights_from_disk` and `update_weights_from_tensor` both answer HTTP
+501 (`{"success": false, "message": "... is not implemented by this build's
+scheduler; supported sources: distributed"}`) and the engine keeps serving.
+`examples/rl/refit_from_disk.py` is for SGLang only — do not point it at a
+TokenSpeed selector.
 
-The next `/generate` through SMG reports `meta_info.weight_version: "42"`,
-stamped by the engine on the gRPC response.
+The only refit path TokenSpeed implements is the trainer-driven NCCL
+broadcast (slime's path): the trainer calls, per worker, through `/v1/rl`,
+
+    init_weights_update_group   (once, to join the trainer's process group)
+    update_weights_from_distributed   (once per refit)
+    destroy_weights_update_group      (on teardown)
+
+with `pause_generation` / `continue_generation` fanned out around the
+`update_weights_from_distributed` call, same as a disk refit. The next
+`/generate` through SMG reports the new `meta_info.weight_version`, stamped
+by the engine on the gRPC response. A worked trainer-side example will land
+under `examples/rl` once available; until then, drive the three calls
+directly with `smg.rl.RL.call`/`fanout` as shown in `crates/rl/README.md`.
 
 ## Security
 
@@ -43,6 +58,6 @@ as the worker's `api_key`.
 ## Older engines
 
 Engines that predate advertisement get SMG's static capability row (`wait`
-and `abort`, `disk` and `distributed`) and need the label supplied at
+and `abort`, `distributed` only) and need the label supplied at
 registration: `{"url":"grpc://…","labels":{"rl.control_url":"http://…:30400"}}`.
 See `crates/rl/NOTES.md` for their route-level drift.
