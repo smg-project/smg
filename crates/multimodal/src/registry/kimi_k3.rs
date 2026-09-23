@@ -82,12 +82,6 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
         Self::pad_token_id(metadata)
     }
 
-    /// `<|media_pad|>` is the single token vLLM's `kimi_k3` prompt updates
-    /// replace with the dimensioned media block.
-    fn worker_expandable(&self, modality: Modality) -> bool {
-        matches!(modality, Modality::Image)
-    }
-
     fn modality_limits(
         &self,
         _metadata: &ModelMetadata,
@@ -286,11 +280,15 @@ mod tests {
     }
 
     #[test]
-    fn image_anchor_can_be_expanded_by_the_worker() {
+    /// vLLM's `kimi_k3` prompt updates target `<|kimi_image_placeholder|>`
+    /// (id 163838), not the gateway's `<|media_pad|>` anchor (id 163605), so
+    /// a forwarded reference fails the engine's prompt replacement: media
+    /// stay router-side.
+    fn media_are_processed_router_side() {
         use crate::registry::ModelProcessorSpec;
 
         let spec = super::KimiK3VisionSpec;
-        assert!(spec.worker_expandable(Modality::Image));
+        assert!(!spec.worker_expandable(Modality::Image));
         assert!(!spec.worker_expandable(Modality::Video));
         assert!(!spec.worker_expandable(Modality::Audio));
     }
