@@ -86,6 +86,21 @@ broadcast order; its `load_weights` does the fused/stacked mapping (`q_proj`,
 `k_proj`, `v_proj` into `qkv_proj`, and so on) exactly as it did for the
 initial load.
 
+## `/generate` parity with slime
+
+slime's rollout client speaks SGLang's native `/generate` format directly over
+gRPC: it sends one prompt per request (`text` as a string, or `input_ids` as a
+flat token list) and never sets `model`. The gRPC router matches SGLang's
+shape for that case: a single prompt with `n` unset (or `1`) and exactly one
+response comes back as one JSON object, so `resp["meta_info"]` indexes
+directly instead of unwrapping a one-element list; a batch or `n > 1` still
+comes back as a list. When `model` is omitted, the gateway resolves it to the
+single model the fleet is serving; with zero or more than one model behind
+the gateway an unnamed request still 404s (`model_not_found`), since there is
+no longer a single unambiguous target. Sending `text` as a list of prompts
+(SGLang's batch text form) is not accepted on the gRPC path — send one prompt
+per request, or use `input_ids` as a list of lists for a token-id batch.
+
 ## Security
 
 The control app accepts weight updates from anyone who can reach it. Bind it

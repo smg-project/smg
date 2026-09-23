@@ -37,7 +37,7 @@ use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     routers::RouterTrait,
-    worker::{WorkerRegistry, WorkerType},
+    worker::{WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
 /// `501 NOT_IMPLEMENTED`, returned by endpoints this router's mode doesn't
@@ -326,10 +326,31 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing generate request for model: {}", model_id);
 
+        // slime (and other native RL clients) never send `model` on
+        // `/generate`, so the request lands here carrying the wildcard
+        // placeholder. When the fleet serves exactly one model there is only
+        // one sane target, so default to it instead of 404ing a request the
+        // registry could otherwise route without ambiguity. Zero or several
+        // served models keep the current behavior: model_not_found.
+        let resolved_model_id: Cow<'_, str> = if model_id == UNKNOWN_MODEL_ID {
+            match self.worker_registry.get_models().as_slice() {
+                [only] => {
+                    debug!(
+                        "Defaulting model-less generate request to the single served model: {}",
+                        only
+                    );
+                    Cow::Owned(only.clone())
+                }
+                _ => Cow::Borrowed(model_id),
+            }
+        } else {
+            Cow::Borrowed(model_id)
+        };
+
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
         // `route_chat_impl`.
-        let model_id_cloned = self.resolve_canonical_model_id(model_id);
+        let model_id_cloned = self.resolve_canonical_model_id(&resolved_model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
         let rate_limit_cell = Arc::new(RateLimitCell::new());

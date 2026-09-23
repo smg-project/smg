@@ -16,9 +16,10 @@ use axum::response::{IntoResponse, Response};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
+    common::InputIds,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
-    generate::GenerateRequest,
+    generate::{GenerateRequest, GenerateResponse},
     messages::CreateMessageRequest,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
@@ -822,6 +823,12 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
     ) -> Response {
+        // `into_dispatch` drops the request by construction (see the module
+        // doc), so the dispatch-phase context below has no way to answer
+        // "was this a single prompt?" by the time the response comes back.
+        // Cloning the `Arc` up front is cheap and keeps a handle alive
+        // purely for that shape inspection.
+        let request_for_response = Arc::clone(&request);
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
@@ -842,7 +849,8 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    let body = generate_response_body(&request_for_response, response);
+                    axum::Json(body).into_response()
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -1196,6 +1204,108 @@ impl RequestPipeline {
         let load_guards = dctx.load_guards.take();
 
         Ok((execution_result, load_guards))
+    }
+}
+
+/// SGLang answers a single prompt with one object and a batch (or `n>1`)
+/// with a list -- see the doc comment on [`GenerateResponse`]. Mirror that
+/// shape here so native clients that never batch (slime, verl) can index
+/// `meta_info` directly instead of unwrapping a one-element list.
+fn generate_response_body(
+    request: &GenerateRequest,
+    responses: Vec<GenerateResponse>,
+) -> serde_json::Value {
+    let single_prompt =
+        request.text.is_some() || matches!(request.input_ids, Some(InputIds::Single(_)));
+    let n = request
+        .sampling_params
+        .as_ref()
+        .and_then(|sp| sp.n)
+        .unwrap_or(1);
+    if single_prompt && n <= 1 && responses.len() == 1 {
+        let mut responses = responses;
+        return serde_json::json!(responses.remove(0));
+    }
+    serde_json::json!(responses)
+}
+
+#[cfg(test)]
+mod generate_response_body_tests {
+    use openai_protocol::generate::{GenerateFinishReason, GenerateFinishType, GenerateMetaInfo};
+
+    use super::*;
+
+    fn request(body: serde_json::Value) -> GenerateRequest {
+        serde_json::from_value(body).expect("valid GenerateRequest fixture")
+    }
+
+    fn response(weight_version: &str) -> GenerateResponse {
+        GenerateResponse {
+            text: "hi".to_string(),
+            output_ids: vec![1, 2, 3],
+            meta_info: GenerateMetaInfo {
+                id: "req-1".to_string(),
+                finish_reason: GenerateFinishReason::Stop {
+                    finish_type: GenerateFinishType::Stop,
+                },
+                prompt_tokens: 3,
+                weight_version: weight_version.to_string(),
+                input_token_logprobs: None,
+                output_token_logprobs: None,
+                completion_tokens: 3,
+                cached_tokens: 0,
+                reasoning_tokens: None,
+                e2e_latency: 0.1,
+                matched_stop: None,
+            },
+        }
+    }
+
+    #[test]
+    fn single_text_prompt_with_one_response_is_an_object() {
+        let req = request(serde_json::json!({"model": "m", "text": "hello"}));
+        let body = generate_response_body(&req, vec![response("v1")]);
+        assert!(body.is_object(), "expected an object, got {body}");
+        assert_eq!(body["meta_info"]["weight_version"], "v1");
+    }
+
+    #[test]
+    fn single_flat_input_ids_with_one_response_is_an_object() {
+        let req = request(serde_json::json!({"model": "m", "input_ids": [1, 2, 3]}));
+        let body = generate_response_body(&req, vec![response("v1")]);
+        assert!(body.is_object(), "expected an object, got {body}");
+    }
+
+    #[test]
+    fn n_greater_than_one_stays_a_list_even_with_text() {
+        let req = request(serde_json::json!({
+            "model": "m",
+            "text": "hello",
+            "sampling_params": {"n": 2},
+        }));
+        let body = generate_response_body(&req, vec![response("v1"), response("v1")]);
+        assert!(body.is_array(), "expected a list, got {body}");
+        assert_eq!(body.as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn batch_input_ids_stays_a_list() {
+        let req = request(serde_json::json!({
+            "model": "m",
+            "input_ids": [[1, 2], [3, 4]],
+        }));
+        let body = generate_response_body(&req, vec![response("v1"), response("v1")]);
+        assert!(body.is_array(), "expected a list, got {body}");
+    }
+
+    #[test]
+    fn single_prompt_with_more_than_one_response_stays_a_list() {
+        // Shouldn't happen in practice (a single prompt dispatches once),
+        // but the helper must not silently drop a response if it did.
+        let req = request(serde_json::json!({"model": "m", "text": "hello"}));
+        let body = generate_response_body(&req, vec![response("v1"), response("v2")]);
+        assert!(body.is_array(), "expected a list, got {body}");
+        assert_eq!(body.as_array().map(Vec::len), Some(2));
     }
 }
 
