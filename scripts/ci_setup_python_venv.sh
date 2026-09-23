@@ -111,7 +111,7 @@ if [ -n "${GITHUB_PATH:-}" ]; then
     # which no longer ships for current FlashInfer releases); the pip
     # nvidia-cuda-nvcc wheel lands under site-packages, where shutil.which never
     # looks. With the toolkit installed but off PATH, a bare-metal runner runs
-    # every lane with FlashInfer silently disabled, and vLLM 0.27.1's MXFP8
+    # every lane with FlashInfer silently disabled, and the pinned vLLM's MXFP8
     # kernel selector then picks a FlashInfer kernel it cannot run
     # ("module 'vllm.utils.flashinfer' has no attribute 'mm_mxfp8'"). The k8s
     # GPU images ship the CUDA runtime but no toolkit, so this is a no-op there.
