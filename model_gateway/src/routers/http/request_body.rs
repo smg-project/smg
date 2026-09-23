@@ -156,10 +156,16 @@ impl<'a> RawBody<'a> {
     }
 
     /// `serde_json::Map::insert` under `preserve_order`: an existing field
-    /// keeps its position, a new one goes last.
+    /// keeps its position, a new one goes last. A value equal to the one
+    /// present changes nothing, so the body stays unmutated.
     pub(crate) fn insert(&mut self, name: &str, value: Box<RawValue>) {
         match self.fields.iter_mut().find(|(field, _)| field == name) {
-            Some((_, slot)) => *slot = Cow::Owned(value),
+            Some((_, slot)) => {
+                if slot.get() == value.get() {
+                    return;
+                }
+                *slot = Cow::Owned(value);
+            }
             None => self.fields.push((name.to_owned(), Cow::Owned(value))),
         }
         self.mutated = true;
@@ -595,6 +601,18 @@ mod tests {
         assert!(raw.contains("d"));
         assert!(!raw.contains("a"));
         assert!(RawBody::parse(b"[1,2]").is_err());
+    }
+
+    /// The prefill leg always sets `stream: false`; a non-streaming request
+    /// already carries it, and marking the body mutated for that re-serialized
+    /// a body the parsed bytes could have served as they were.
+    #[test]
+    fn insert_of_an_unchanged_value_does_not_mark_the_body() {
+        let mut raw = RawBody::parse(br#"{"stream":false}"#).unwrap();
+        raw.insert("stream", to_raw_value(&false).unwrap());
+        assert!(!raw.mutated());
+        raw.insert("stream", to_raw_value(&true).unwrap());
+        assert!(raw.mutated());
     }
 
     #[test]
