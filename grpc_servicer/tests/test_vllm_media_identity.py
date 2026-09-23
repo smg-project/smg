@@ -78,14 +78,17 @@ class TestBuildMediaIdentity:
         assert grid.tolist() == [[1, 4, 6], [1, 2, 2]]
         assert list(identity.extra_mm_inputs) == []
 
-    def test_a_second_modality_goes_to_extra_mm_inputs(self):
+    # Qwen-VL processors spell the video timing `second_per_grid_ts`; the
+    # Qwen-Omni family and the router's own processors `video_second_per_grid`.
+    @pytest.mark.parametrize("timing_key", ["second_per_grid_ts", "video_second_per_grid"])
+    def test_a_second_modality_goes_to_extra_mm_inputs(self, timing_key):
         prompt = _image_prompt()
         prompt["mm_hashes"]["video"] = ["v1"]
         prompt["mm_placeholders"]["video"] = [_range(7, 1)]
         prompt["mm_kwargs"]["video"] = [
             {
                 "video_grid_thw": _elem(torch.tensor([2, 2, 2])),
-                "second_per_grid_ts": _elem(torch.tensor(0.5)),
+                timing_key: _elem(torch.tensor(0.5)),
             }
         ]
         identity = media_identity.build_media_identity(prompt)
@@ -93,8 +96,8 @@ class TestBuildMediaIdentity:
         (video,) = identity.extra_mm_inputs
         assert video.modality == common_pb2.VIDEO
         assert list(video.mm_hashes) == ["v1"]
-        assert set(video.model_specific_tensors) == {"video_grid_thw", "second_per_grid_ts"}
-        seconds = tensor_from_proto(video.model_specific_tensors["second_per_grid_ts"])
+        assert set(video.model_specific_tensors) == {"video_grid_thw", timing_key}
+        seconds = tensor_from_proto(video.model_specific_tensors[timing_key])
         assert seconds.dtype == torch.float32 and seconds.tolist() == [0.5]
         assert not video.HasField("im_token_id")
 
