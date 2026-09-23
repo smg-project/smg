@@ -11,6 +11,19 @@ use validator;
 // Default value helpers
 // ============================================================================
 
+/// A typed request as a `Value` whose `f32` fields print as the shortest
+/// decimal that round-trips the parsed value. `serde_json::to_value` stores
+/// an `f32` widened to `f64`, so a client's `"top_p": 0.95` would go
+/// upstream as `0.949999988079071`; the writer prints the `f32` itself, so
+/// encode with it and parse that back. This restores what the parsed `f32`
+/// holds, not the client's original token: precision the parse discarded
+/// (`0.950000001` is the same `f32` as `0.95`) is gone, and numbers kept
+/// as `Value` (an `other` map, nested values) were normalized at parse time
+/// (`1e2` is `100.0`, `-0` is `-0.0`).
+pub fn to_value_exact<T: Serialize>(value: &T) -> serde_json::Result<Value> {
+    serde_json::from_slice(&serde_json::to_vec(value)?)
+}
+
 /// Default model for endpoints where model is optional (e.g., /generate).
 /// Uses UNKNOWN_MODEL_ID so routers treat it as "any available worker."
 pub fn default_unknown_model() -> String {
@@ -1078,6 +1091,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn to_value_exact_keeps_f32_fields_as_the_client_wrote_them() {
+        let request: crate::chat::ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 0.95,
+            "temperature": 0.7
+        }))
+        .unwrap();
+        // The widening this guards against: 0.95f32 is 0.949999988079071 as f64.
+        assert_ne!(
+            serde_json::to_value(&request).unwrap()["top_p"],
+            json!(0.95)
+        );
+        let exact = to_value_exact(&request).unwrap();
+        assert_eq!(exact["top_p"], json!(0.95));
+        assert_eq!(exact["temperature"], json!(0.7));
+        assert_eq!(exact["model"], json!("glm-5.3-flash"));
+    }
 
     #[derive(Deserialize)]
     struct NullableBoolTest {
