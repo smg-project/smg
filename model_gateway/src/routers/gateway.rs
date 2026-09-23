@@ -515,11 +515,7 @@ impl RouterTrait for Gateway {
                     .route_messages_count_tokens(headers, tenant_meta, body, model_id)
                     .await
             }
-            None => (
-                StatusCode::NOT_IMPLEMENTED,
-                "No HTTP worker available for Messages token counting",
-            )
-                .into_response(),
+            None => NO_ROUTER.into_response(),
         }
     }
 
@@ -923,10 +919,9 @@ mod tests {
                     .unwrap();
             }
             let tenant = test_tenant_meta();
-            for (model, expected) in [
-                ("m", StatusCode::OK),
-                ("missing", StatusCode::NOT_IMPLEMENTED),
-            ] {
+            // An unknown model is a 404 like every other route: Anthropic
+            // SDKs read a 501 as "endpoint unsupported".
+            for (model, expected) in [("m", StatusCode::OK), ("missing", StatusCode::NOT_FOUND)] {
                 let body = serde_json::from_value(serde_json::json!({
                     "model": model, "messages": []
                 }))
