@@ -23,6 +23,8 @@ use llm_multimodal::{
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
+use crate::routers::grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS;
+
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
 /// seam: `llm-multimodal` deliberately depends on no tokenizer crate, so the
 /// flattening from [`Encoding`] to plain ids lives here, on the caller side.
@@ -134,6 +136,19 @@ impl MultimodalIntermediate {
 
     pub(crate) fn batches(&self) -> &[PrecomputedMultimodalIntermediate] {
         &self.batches
+    }
+
+    /// Whether any batch carries the M-RoPE grid tensors a decode leg derives
+    /// its positions from: such a leg cannot be served by a decode worker
+    /// without a vision encoder.
+    pub(crate) fn has_mrope_grids(&self) -> bool {
+        self.batches.iter().any(|batch| {
+            batch
+                .preprocessed
+                .model_specific
+                .keys()
+                .any(|key| VLLM_MROPE_GRID_KEYS.contains(&key.as_str()))
+        })
     }
 
     pub(crate) fn into_batches(self) -> Vec<PrecomputedMultimodalIntermediate> {
