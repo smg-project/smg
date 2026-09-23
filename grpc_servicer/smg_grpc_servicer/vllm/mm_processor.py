@@ -131,15 +131,24 @@ def clamp_video_frames(
     """vLLM's media kwargs with the video frame count capped at `max_frames`.
 
     A copy: the engine config keeps its own value. `default_frames` is what vLLM
-    samples when the kwargs set nothing; unknown, the budget itself is used. A
-    non-positive count means every frame to vLLM, so it is capped as well.
+    samples when the kwargs set nothing; unknown, and nothing set, sampling is
+    left alone, since a maximum must never raise it. A non-positive count means
+    every frame to vLLM, so it is capped as well.
     """
     if max_frames <= 0:
         return media_io_kwargs
     kwargs = dict(media_io_kwargs or {})
     video = dict(kwargs.get("video") or {})
     current = video.get("num_frames", default_frames)
-    unbounded = current is None or int(current) <= 0
+    if current is None:
+        logger.warning(
+            "%s=%d not applied: vLLM's default video frame count is unknown and "
+            "media_io_kwargs sets none; sampling is left as vLLM decides",
+            ENV_MAX_VIDEO_FRAMES,
+            max_frames,
+        )
+        return media_io_kwargs
+    unbounded = int(current) <= 0
     video["num_frames"] = max_frames if unbounded else min(int(current), max_frames)
     kwargs["video"] = video
     return kwargs
@@ -148,10 +157,12 @@ def clamp_video_frames(
 def vllm_default_video_frames() -> int | None:
     """The frame count vLLM's video loader falls back to."""
     try:
-        from vllm.multimodal.video import VideoMediaIO
+        # Re-exported from vllm.multimodal.media.video; vllm.multimodal.video
+        # is not a module on the vLLM this servicer targets.
+        from vllm.multimodal.media import VideoMediaIO
 
         default = inspect.signature(VideoMediaIO.__init__).parameters["num_frames"].default
-    except Exception:  # noqa: BLE001 - an unknown default is capped to the budget itself
+    except Exception:  # noqa: BLE001 - an unknown default leaves sampling untouched
         return None
     return default if isinstance(default, int) else None
 

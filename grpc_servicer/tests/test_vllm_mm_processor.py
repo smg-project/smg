@@ -5,6 +5,7 @@ Run with: pytest grpc_servicer/tests/test_vllm_mm_processor.py
 
 import asyncio
 import importlib.util
+import logging
 import sys
 import types
 from dataclasses import dataclass
@@ -92,12 +93,32 @@ class TestVideoFrameBudget:
                 "video": {"num_frames": 16}
             }
 
-    def test_an_unknown_default_is_capped_to_the_budget(self):
-        assert mm_processor.clamp_video_frames(None, 16) == {"video": {"num_frames": 16}}
-        assert mm_processor.clamp_video_frames({"image": {}}, 16, default_frames=None) == {
-            "image": {},
-            "video": {"num_frames": 16},
-        }
+    def test_an_unknown_default_leaves_sampling_untouched(self, caplog):
+        # A budget caps sampling and never raises it: with vLLM's default
+        # unknown and no explicit count, writing the budget could do just that.
+        assert mm_processor.clamp_video_frames(None, 16) is None
+        kwargs = {"image": {}}
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert mm_processor.clamp_video_frames(kwargs, 16, default_frames=None) is kwargs
+        assert sum("SMG_VLLM_MM_MAX_VIDEO_FRAMES" in r.getMessage() for r in caplog.records) == 1
+
+    def test_vllms_default_is_read_from_the_media_package(self, monkeypatch):
+        # vllm.multimodal.media re-exports VideoMediaIO; vllm.multimodal.video
+        # does not exist on the vLLM this servicer targets.
+        class _VideoMediaIO:
+            def __init__(self, image_io, num_frames: int = 24, **kwargs):
+                pass
+
+        media = types.ModuleType("vllm.multimodal.media")
+        media.VideoMediaIO = _VideoMediaIO
+        monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+        monkeypatch.setitem(sys.modules, "vllm.multimodal", types.ModuleType("vllm.multimodal"))
+        monkeypatch.setitem(sys.modules, "vllm.multimodal.media", media)
+        monkeypatch.delitem(sys.modules, "vllm.multimodal.video", raising=False)
+        assert mm_processor.vllm_default_video_frames() == 24
+        del media.VideoMediaIO
+        assert mm_processor.vllm_default_video_frames() is None
 
 
 class TestItemBytes:
@@ -345,7 +366,7 @@ class TestInProcessConstruction:
     """The frame budget reaches the connector the in-process processor fetches with."""
 
     @staticmethod
-    def _stub_vllm(monkeypatch, loaded):
+    def _stub_vllm(monkeypatch, loaded, video_io=True):
         def module(name, **attrs):
             mod = types.ModuleType(name)
             mod.__dict__.update(attrs)
@@ -367,9 +388,11 @@ class TestInProcessConstruction:
         )
         module("vllm.exceptions", VLLMClientError=ValueError)
         module("vllm.multimodal")
-        module("vllm.multimodal.media")
+        media = module("vllm.multimodal.media")
+        if video_io:
+            media.VideoMediaIO = _VideoMediaIO
+            module("vllm.multimodal.media.video", VideoMediaIO=_VideoMediaIO)
         module("vllm.multimodal.media.connector", MEDIA_CONNECTOR_REGISTRY=_Registry)
-        module("vllm.multimodal.video", VideoMediaIO=_VideoMediaIO)
         module("vllm.transformers_utils")
         module("vllm.transformers_utils.processor", get_video_processor_cls_name=lambda cfg: "vp")
 
@@ -411,6 +434,12 @@ class TestInProcessConstruction:
         self._stub_vllm(monkeypatch, loaded)
         mm_processor.InProcessMediaProcessor(self._engine({"video": {"num_frames": 40}}))
         assert loaded["media_io_kwargs"] == {"video": {"num_frames": 40}}
+
+    def test_unknown_default_leaves_num_frames_absent(self, monkeypatch):
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded, video_io=False)
+        mm_processor.InProcessMediaProcessor(self._engine({"image": {}}), max_video_frames=64)
+        assert loaded["media_io_kwargs"] == {"image": {}}
 
 
 class TestRedisClient:
