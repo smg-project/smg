@@ -54,6 +54,7 @@ from smg_grpc_servicer.vllm.media_refs import (
 logger = logging.getLogger(__name__)
 
 ENV_PROCESSOR = "SMG_VLLM_MM_PROCESSOR"
+PROCESSOR_FLAG = "--mm-processor"
 ENV_MAX_INFLIGHT = "SMG_VLLM_MM_MAX_INFLIGHT"
 ENV_MAX_ITEM_BYTES = "SMG_VLLM_MM_MAX_ITEM_BYTES"
 ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
@@ -79,7 +80,9 @@ class MmProcessorUnavailable(Exception):
 def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
     raw = (env.get(ENV_PROCESSOR) or MODE_OFF).strip().lower()
     if raw not in VALID_MODES:
-        raise ValueError(f"{ENV_PROCESSOR}={raw!r} is not one of {'|'.join(VALID_MODES)}")
+        raise ValueError(
+            f"{PROCESSOR_FLAG} / {ENV_PROCESSOR}={raw!r} is not one of {'|'.join(VALID_MODES)}"
+        )
     return raw
 
 
@@ -207,11 +210,11 @@ def _require_inprocess_apis(engine) -> None:
             get_video_processor_cls_name,
         )
     except ImportError as e:
-        raise ValueError(f"{ENV_PROCESSOR}=inprocess needs vllm>={MIN_VLLM_VERSION} ({e})") from e
+        raise ValueError(f"{PROCESSOR_FLAG}=inprocess needs vllm>={MIN_VLLM_VERSION} ({e})") from e
     process = getattr(getattr(engine, "renderer", None), "process_for_engine_async", None)
     if process is None or "skip_mm_cache" not in inspect.signature(process).parameters:
         raise ValueError(
-            f"{ENV_PROCESSOR}=inprocess needs vllm>={MIN_VLLM_VERSION} "
+            f"{PROCESSOR_FLAG}=inprocess needs vllm>={MIN_VLLM_VERSION} "
             f"(installed {vllm.__version__}: renderer.process_for_engine_async lacks skip_mm_cache)"
         )
 
@@ -261,7 +264,7 @@ class InProcessMediaProcessor:
             logger.warning(
                 "%s=inprocess with no --allowed-media-domains: this worker will fetch media "
                 "from any host the router forwards",
-                ENV_PROCESSOR,
+                PROCESSOR_FLAG,
             )
 
     async def probe(self) -> bool:
@@ -615,7 +618,7 @@ def _redis_client(redis_url: str):
         import redis.asyncio as redis_asyncio
     except ImportError as e:
         raise ValueError(
-            f"{ENV_PROCESSOR}=redis requires the redis client: "
+            f"{PROCESSOR_FLAG}=redis requires the redis client: "
             "pip install smg-grpc-servicer[vllm,vllm-redis]"
         ) from e
 

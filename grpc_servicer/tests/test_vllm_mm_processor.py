@@ -38,7 +38,8 @@ class TestResolveMode:
         )
 
     def test_rejects_unknown_mode(self):
-        with pytest.raises(ValueError, match="SMG_VLLM_MM_PROCESSOR='sidecar'"):
+        # The flag is the interface now; the message names it first.
+        with pytest.raises(ValueError, match="--mm-processor / SMG_VLLM_MM_PROCESSOR='sidecar'"):
             mm_processor.resolve_mm_processor_mode({"SMG_VLLM_MM_PROCESSOR": "sidecar"})
 
 

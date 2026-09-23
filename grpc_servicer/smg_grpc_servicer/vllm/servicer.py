@@ -57,6 +57,7 @@ from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_id
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
     ENV_PROCESSOR,
+    PROCESSOR_FLAG,
     MmProcessorUnavailable,
     MmSettings,
     build_mm_processor,
@@ -306,8 +307,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 if self._mm_processor is None:
                     raise ValueError(
-                        f"media_refs sent but {ENV_PROCESSOR} is off on this worker; check the "
-                        "router's SMG_MM_PROCESSING and this worker's mm_processor label"
+                        f"media_refs sent but {PROCESSOR_FLAG} ({ENV_PROCESSOR}) is off on this "
+                        "worker; check the router's --mm-processing and this worker's "
+                        "mm_processor label"
                     )
                 items = parse_media_refs(request.media_refs)
                 validate_schemes(items, self._mm_processor.accepted_schemes)
