@@ -24,7 +24,10 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 
-    #[serde(default = "super::common::default_unknown_model")]
+    #[serde(
+        default = "super::common::default_unknown_model",
+        skip_serializing_if = "super::common::is_unknown_model"
+    )]
     pub model: String,
 
     /// Input IDs for tokenized input
@@ -414,6 +417,23 @@ mod tests {
 
         let r = req();
         assert_eq!(r.routing_tokens(), None);
+    }
+
+    #[test]
+    fn absent_model_reads_as_the_wildcard_and_is_not_serialized_back() {
+        let request: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hi" })).unwrap();
+        assert_eq!(request.model, crate::UNKNOWN_MODEL_ID);
+        let v = serde_json::to_value(&request).unwrap();
+        assert!(
+            v.get("model").is_none(),
+            "wildcard placeholder serialized: {v}"
+        );
+
+        let explicit: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hi", "model": "m" })).unwrap();
+        let v = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(v["model"], "m");
     }
 
     #[test]
