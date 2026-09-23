@@ -1,29 +1,18 @@
 //! z.ai (GLM) contract rules, from the providers-verifier golden set recorded
-//! against GLM-5.3-Flash on 2026-09-22 with the native and the OpenAI SDK.
+//! against GLM-5.3-Flash and docs.z.ai.
 //!
-//! What the vendor does, and what this profile encodes:
-//! - thinking cannot be switched off: `thinking.type = disabled` is a 400,
-//!   and so is every `reasoning_effort` outside low/high/max (`none`,
-//!   `minimal`, `medium`, `xhigh` and unknown values all 400); a GLM-5.3
-//!   series rule (`is_glm53`), pinned the way the Kimi profile pins K3:
-//!   docs.z.ai has GLM-5.2 taking `disabled` and mapping the other efforts,
-//!   and earlier generations taking every value; `adaptive`, a Kimi value
-//!   no GLM schema defines, is a 400 for every model;
-//! - `thinking.clear_thinking` round-trips: `false` keeps the history's
-//!   reasoning in the rendered prompt, `true` drops it; it is carried to the
-//!   chat template as the `clear_thinking` kwarg;
-//! - `tool_stream` is accepted; SMG streams tool-call deltas regardless, so
-//!   the flag is consumed here rather than forwarded to an engine that does
-//!   not know it;
-//! - sampling defaults are temperature 1 and top_p 0.95 for the models
-//!   docs.z.ai lists them for (GLM-5.x, GLM-4.7, GLM-4.6; GLM-4.5 and older
-//!   differ and keep the engine's own); out-of-range values the vendor
-//!   clamps silently stay 400 here (the OpenAI contract);
-//! - an unknown `tools[].type` is a 400;
-//! - `file_url` content blocks are z.ai-only (the vendor fetches the file) and
-//!   are rejected here with a named code rather than as an unknown part.
-//! `max_tokens` beyond the model's window is the gateway's business, where the
-//! window is known (`context_length_exceeded`, as for over-long inputs).
+//! The GLM-5.3 series cannot switch thinking off and takes efforts
+//! low/high/max; other GLM generations keep their thinking switch and the
+//! documented wider set (GLM-5-Next is not pinned: its contract is not
+//! recorded, and the registry's media grouping says nothing about it). The
+//! sampling defaults go to the models docs.z.ai lists them for. Everything
+//! else is z.ai-wide: `thinking.clear_thinking` reaches the chat template,
+//! `tool_stream` is consumed, unknown tool types and `file_url` blocks are
+//! 400s. `file_url` is refused at ingress on every backend, deliberately:
+//! the vendor fetches the file itself and no self-hosted engine does, and
+//! validation runs before the backend is known; a pass-through for an
+//! upstream z.ai proxy would need the backend at validation time.
+//! `max_tokens` beyond the window is the gateway's (`context_length_exceeded`).
 
 use serde_json::Value;
 
@@ -40,11 +29,15 @@ const DEFAULT_TOP_P: f32 = 0.95;
 /// The model ids docs.z.ai lists those defaults for.
 const DEFAULTS_MARKERS: [&str; 5] = ["glm-5", "glm5", "glm_5", "glm-4.6", "glm-4.7"];
 
-/// The GLM-5.3 series, the one that cannot switch thinking off.
-const GLM53_MARKERS: [&str; 3] = ["glm-5.3", "glm5.3", "glm_5.3"];
+/// The GLM-5.3 series, the one that cannot switch thinking off, in the
+/// spellings the multimodal registry matches too (`registry/glm53_flash.rs`).
+const GLM53_MARKERS: [&str; 5] = ["glm-5.3", "glm5.3", "glm_5.3", "glm-5-3", "glm5-3"];
 
 /// The effort levels the GLM-5.3 series accepts.
-const REASONING_EFFORTS: [&str; 3] = ["low", "high", "max"];
+const GLM53_EFFORTS: [&str; 3] = ["low", "high", "max"];
+
+/// The effort levels docs.z.ai documents for the other GLM generations.
+const REASONING_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// The one tool type the vendor takes.
 const TOOL_TYPE: &str = "function";
@@ -94,7 +87,14 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     let glm53 = is_glm53(&req.model);
     validate_thinking_type(req, glm53)?;
     if glm53 {
-        validate_glm53_thinking(req)?;
+        validate_thinking_enabled(req)?;
+        validate_efforts(req, &GLM53_EFFORTS, "low, high or max")?;
+    } else {
+        validate_efforts(
+            req,
+            &REASONING_EFFORTS,
+            "none, minimal, low, medium, high, xhigh or max",
+        )?;
     }
     validate_tools(req)?;
     validate_content_parts(req)
@@ -127,10 +127,10 @@ fn validate_thinking_type(
 }
 
 /// The GLM-5.3 series thinks always: `disabled` (documented as unsupported)
-/// is rejected, and the effort must be one the series takes, in each
-/// spelling the request carries: both are forwarded, so a bad value hidden
-/// behind the preferred one still counts.
-fn validate_glm53_thinking(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+/// is rejected.
+fn validate_thinking_enabled(
+    req: &ChatCompletionRequest,
+) -> Result<(), validator::ValidationError> {
     if req
         .thinking
         .as_ref()
@@ -141,6 +141,17 @@ fn validate_glm53_thinking(req: &ChatCompletionRequest) -> Result<(), validator:
             "thinking cannot be disabled for this model".into(),
         ));
     }
+    Ok(())
+}
+
+/// The effort must be one the model takes, in each spelling the request
+/// carries: both are forwarded, so a bad value hidden behind the preferred
+/// one still counts.
+fn validate_efforts(
+    req: &ChatCompletionRequest,
+    allowed: &[&str],
+    hint: &str,
+) -> Result<(), validator::ValidationError> {
     let efforts = [
         (
             "thinking.effort",
@@ -149,12 +160,8 @@ fn validate_glm53_thinking(req: &ChatCompletionRequest) -> Result<(), validator:
         ("reasoning_effort", req.reasoning_effort.as_deref()),
     ];
     for (field, effort) in efforts {
-        if effort.is_some_and(|effort| !REASONING_EFFORTS.contains(&effort)) {
-            return Err(pinned(
-                "reasoning_effort_not_allowed",
-                field,
-                "low, high or max",
-            ));
+        if effort.is_some_and(|effort| !allowed.contains(&effort)) {
+            return Err(pinned("reasoning_effort_not_allowed", field, hint));
         }
     }
     Ok(())
@@ -399,6 +406,14 @@ mod tests {
                 Ok(()),
                 "{model}"
             );
+            // The documented set is wider than GLM-5.3's, but still a set.
+            for effort in ["turbo", "ultra"] {
+                assert_eq!(
+                    validate(&with_model(model, json!({"reasoning_effort": effort}))),
+                    Err("reasoning_effort_not_allowed".into()),
+                    "{model} {effort}"
+                );
+            }
             // `adaptive` is a Kimi value; docs.z.ai defines enabled/disabled only.
             assert_eq!(
                 validate(&with_model(
@@ -431,13 +446,23 @@ mod tests {
             )),
             Err("thinking_disabled_not_supported".into())
         );
-        for model in ["GLM-5.3-Flash", "glm-5.3", "zai-org/glm5.3-air", "glm_5.3"] {
+        // Dash-spelled ids are the same family (registry/glm53_flash.rs);
+        // GLM-5-Next is not, its thinking contract being unrecorded.
+        for model in [
+            "GLM-5.3-Flash",
+            "glm-5.3",
+            "zai-org/glm5.3-air",
+            "glm_5.3",
+            "glm-5-3-flash",
+            "glm5-3",
+        ] {
             assert!(is_glm53(model), "{model}");
         }
         for model in [
             "zai-org/GLM-5.2",
             "glm-5",
             "glm-5.30",
+            "zai-org/GLM-5-Next",
             "glm-4.6",
             "chatglm3-6b",
         ] {
