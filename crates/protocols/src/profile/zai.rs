@@ -4,17 +4,20 @@
 //! What the vendor does, and what this profile encodes:
 //! - thinking cannot be switched off: `thinking.type = disabled` is a 400,
 //!   and so is every `reasoning_effort` outside low/high/max (`none`,
-//!   `minimal`, `medium`, `xhigh` and unknown values all 400); this and the
-//!   sampling defaults are GLM-5 rules (`is_glm5`), as the Kimi profile pins
-//!   K3 alone: an earlier GLM generation keeps its own thinking switch;
+//!   `minimal`, `medium`, `xhigh` and unknown values all 400); a GLM-5.3
+//!   series rule (`is_glm53`), pinned the way the Kimi profile pins K3:
+//!   docs.z.ai has GLM-5.2 taking `disabled` and mapping the other efforts,
+//!   and earlier generations taking every value;
 //! - `thinking.clear_thinking` round-trips: `false` keeps the history's
 //!   reasoning in the rendered prompt, `true` drops it; it is carried to the
 //!   chat template as the `clear_thinking` kwarg;
 //! - `tool_stream` is accepted; SMG streams tool-call deltas regardless, so
 //!   the flag is consumed here rather than forwarded to an engine that does
 //!   not know it;
-//! - sampling defaults are temperature 1 and top_p 0.95; out-of-range values
-//!   the vendor clamps silently stay 400 here (the OpenAI contract);
+//! - sampling defaults are temperature 1 and top_p 0.95 for the models
+//!   docs.z.ai lists them for (GLM-5.x, GLM-4.7, GLM-4.6; GLM-4.5 and older
+//!   differ and keep the engine's own); out-of-range values the vendor
+//!   clamps silently stay 400 here (the OpenAI contract);
 //! - an unknown `tools[].type` is a 400;
 //! - `file_url` content blocks are z.ai-only (the vendor fetches the file) and
 //!   are rejected here with a named code rather than as an unknown part.
@@ -33,7 +36,13 @@ use crate::{
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_TOP_P: f32 = 0.95;
 
-/// The effort levels GLM-5.3 accepts; thinking cannot be turned off.
+/// The model ids docs.z.ai lists those defaults for.
+const DEFAULTS_MARKERS: [&str; 5] = ["glm-5", "glm5", "glm_5", "glm-4.6", "glm-4.7"];
+
+/// The GLM-5.3 series, the one that cannot switch thinking off.
+const GLM53_MARKERS: [&str; 3] = ["glm-5.3", "glm5.3", "glm_5.3"];
+
+/// The effort levels the GLM-5.3 series accepts.
 const REASONING_EFFORTS: [&str; 3] = ["low", "high", "max"];
 
 /// The one tool type the vendor takes.
@@ -48,20 +57,26 @@ const CLEAR_THINKING: &str = "clear_thinking";
 /// The vendor-side file content block SMG does not fetch.
 const FILE_URL: &str = "file_url";
 
-/// Whether a model id names the GLM-5 generation the thinking rules and
-/// sampling defaults were recorded against: a segment such as `GLM-5`,
-/// `glm-5.3-flash` or `glm5-turbo`, the `5` not followed by another digit.
-fn is_glm5(model: &str) -> bool {
+/// Whether any `/`-separated segment of a model id starts with one of the
+/// markers, the marker's last digit not continued by another (`glm-5.3`
+/// names the 5.3 series, not a `glm-5.30`).
+fn model_matches(model: &str, markers: &[&str]) -> bool {
     model.split('/').any(|segment| {
-        ["glm-5", "glm5", "glm_5"].iter().any(|marker| {
+        markers.iter().any(|marker| {
             super::starts_with_ignore_ascii_case(segment, marker)
                 && !segment[marker.len()..].starts_with(|c: char| c.is_ascii_digit())
         })
     })
 }
 
+/// The GLM-5.3 series (`GLM-5.3`, `glm-5.3-flash`, `glm5.3-air`), whose
+/// thinking rules were recorded and are documented as its own.
+fn is_glm53(model: &str) -> bool {
+    model_matches(model, &GLM53_MARKERS)
+}
+
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
-    if is_glm5(&req.model) {
+    if model_matches(&req.model, &DEFAULTS_MARKERS) {
         req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
         req.top_p.get_or_insert(DEFAULT_TOP_P);
     }
@@ -75,7 +90,7 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
 }
 
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
-    if is_glm5(&req.model) {
+    if is_glm53(&req.model) {
         validate_thinking(req)?;
     }
     validate_tools(req)?;
@@ -338,42 +353,91 @@ mod tests {
         assert_eq!(validate(&image), Ok(()));
     }
 
-    /// The thinking rules and sampling defaults were recorded against
-    /// GLM-5.3; an earlier generation keeps its own thinking switch and
-    /// sampling, while the vendor-level rules still apply.
+    /// Only the GLM-5.3 series cannot switch thinking off (docs.z.ai: "can
+    /// only be enabled", efforts low/high/max); GLM-5.2 takes `disabled`
+    /// and maps the other efforts, earlier generations take everything,
+    /// while the vendor-level rules apply to all of them.
     #[test]
-    fn glm5_rules_do_not_reach_earlier_generations() {
-        let glm4 = |fields: Value| {
+    fn glm53_thinking_rules_do_not_reach_other_generations() {
+        let with_model = |model: &str, fields: Value| {
             let mut req = request(fields);
-            req.model = "zai-org/GLM-4.6".to_string();
+            req.model = model.to_string();
             req
         };
-        assert_eq!(
-            validate(&glm4(json!({"thinking": {"type": "disabled"}}))),
-            Ok(())
-        );
-        assert_eq!(
-            validate(&glm4(json!({"reasoning_effort": "medium"}))),
-            Ok(())
-        );
-        let mut req = glm4(json!({"tool_stream": true}));
-        ProviderProfile::Zai.normalize_chat(&mut req);
-        assert_eq!(req.temperature, None);
-        assert_eq!(req.top_p, None);
-        assert!(!req.other.contains_key(TOOL_STREAM));
-        assert_eq!(
-            validate(&glm4(json!({
-                "messages": [{"role": "user", "content": [
-                    {"type": "file_url", "file_url": {"url": "https://a/f.txt"}}
-                ]}]
-            }))),
-            Err("content_part_not_supported".into())
-        );
-        for model in ["GLM-5.3-Flash", "glm-5", "z-ai/glm5-turbo", "glm_5_air"] {
-            assert!(is_glm5(model), "{model}");
+        for model in ["zai-org/GLM-5.2", "glm-5", "zai-org/GLM-4.6"] {
+            assert_eq!(
+                validate(&with_model(
+                    model,
+                    json!({"thinking": {"type": "disabled"}})
+                )),
+                Ok(()),
+                "{model}"
+            );
+            assert_eq!(
+                validate(&with_model(model, json!({"reasoning_effort": "none"}))),
+                Ok(()),
+                "{model}"
+            );
+            assert_eq!(
+                validate(&with_model(
+                    model,
+                    json!({
+                        "messages": [{"role": "user", "content": [
+                            {"type": "file_url", "file_url": {"url": "https://a/f.txt"}}
+                        ]}]
+                    })
+                )),
+                Err("content_part_not_supported".into()),
+                "{model}"
+            );
+            let mut req = with_model(model, json!({"tool_stream": true}));
+            ProviderProfile::Zai.normalize_chat(&mut req);
+            assert!(!req.other.contains_key(TOOL_STREAM), "{model}");
         }
-        for model in ["zai-org/GLM-4.6", "glm-4.5-air", "glm-51", "chatglm3-6b"] {
-            assert!(!is_glm5(model), "{model}");
+        assert_eq!(
+            validate(&with_model(
+                "glm-5.3",
+                json!({"thinking": {"type": "disabled"}})
+            )),
+            Err("thinking_disabled_not_supported".into())
+        );
+        for model in ["GLM-5.3-Flash", "glm-5.3", "zai-org/glm5.3-air", "glm_5.3"] {
+            assert!(is_glm53(model), "{model}");
+        }
+        for model in [
+            "zai-org/GLM-5.2",
+            "glm-5",
+            "glm-5.30",
+            "glm-4.6",
+            "chatglm3-6b",
+        ] {
+            assert!(!is_glm53(model), "{model}");
+        }
+    }
+
+    /// docs.z.ai lists temperature 1 / top_p 0.95 for GLM-5.x, GLM-4.7 and
+    /// GLM-4.6; GLM-4.5 and older differ, so they keep the engine's own.
+    #[test]
+    fn vendor_sampling_defaults_follow_the_documented_models() {
+        for model in [
+            "zai-org/GLM-5.3-Flash",
+            "glm-5.2",
+            "glm-5",
+            "GLM-4.7",
+            "zai-org/glm-4.6",
+        ] {
+            let mut req = request(json!({}));
+            req.model = model.to_string();
+            ProviderProfile::Zai.normalize_chat(&mut req);
+            assert_eq!(req.temperature, Some(1.0), "{model}");
+            assert_eq!(req.top_p, Some(0.95), "{model}");
+        }
+        for model in ["glm-4.5-air", "THUDM/glm-4-9b-chat", "glm-4.60"] {
+            let mut req = request(json!({}));
+            req.model = model.to_string();
+            ProviderProfile::Zai.normalize_chat(&mut req);
+            assert_eq!(req.temperature, None, "{model}");
+            assert_eq!(req.top_p, None, "{model}");
         }
     }
 
