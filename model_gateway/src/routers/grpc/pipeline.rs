@@ -823,12 +823,22 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
     ) -> Response {
-        // `into_dispatch` drops the request by construction (see the module
-        // doc), so the dispatch-phase context below has no way to answer
-        // "was this a single prompt?" by the time the response comes back.
-        // Cloning the `Arc` up front is cheap and keeps a handle alive
-        // purely for that shape inspection.
-        let request_for_response = Arc::clone(&request);
+        // The response needs to know the request's shape (single prompt vs.
+        // batch, and `n`) to answer like SGLang, but `into_dispatch` drops
+        // the request by construction (see the module doc) -- the dispatch
+        // phase runs with no request, on purpose. Read the two scalars off
+        // the request now, before it moves into the context, instead of
+        // retaining a handle across dispatch.
+        //
+        // `single_prompt` is false for `InputIds::Batch`, but that shape
+        // never reaches here: the preparation stage 400s it first.
+        let single_prompt =
+            request.text.is_some() || matches!(request.input_ids, Some(InputIds::Single(_)));
+        let n = request
+            .sampling_params
+            .as_ref()
+            .and_then(|sp| sp.n)
+            .unwrap_or(1);
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
@@ -849,7 +859,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    let body = generate_response_body(&request_for_response, response);
+                    let body = generate_response_body(single_prompt, n, response);
                     axum::Json(body).into_response()
                 }
                 Some(other) => self.wrong_response_type(
@@ -1207,26 +1217,35 @@ impl RequestPipeline {
     }
 }
 
-/// SGLang answers a single prompt with one object and a batch (or `n>1`)
-/// with a list -- see the doc comment on [`GenerateResponse`]. Mirror that
-/// shape here so native clients that never batch (slime, verl) can index
-/// `meta_info` directly instead of unwrapping a one-element list.
+/// A `/generate` response body: a bare object for a single prompt, a list
+/// otherwise. `#[serde(untagged)]` makes `One` serialize as its inner
+/// object with no wrapper, matching SGLang's shape -- see the doc comment
+/// on [`GenerateResponse`].
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum GenerateBody {
+    One(Box<GenerateResponse>),
+    Many(Vec<GenerateResponse>),
+}
+
+/// SGLang answers a single prompt with one object and a batch (or `n > 1`)
+/// with a list. Mirror that shape here so native clients that never batch
+/// (slime, verl) can index `meta_info` directly instead of unwrapping a
+/// one-element list.
+///
+/// `single_prompt` and `n` are read off the request in `execute_generate`
+/// (the only caller) before it moves into the dispatch context, which is
+/// request-free by construction -- see the module doc.
 fn generate_response_body(
-    request: &GenerateRequest,
+    single_prompt: bool,
+    n: u32,
     responses: Vec<GenerateResponse>,
-) -> serde_json::Value {
-    let single_prompt =
-        request.text.is_some() || matches!(request.input_ids, Some(InputIds::Single(_)));
-    let n = request
-        .sampling_params
-        .as_ref()
-        .and_then(|sp| sp.n)
-        .unwrap_or(1);
+) -> GenerateBody {
     if single_prompt && n <= 1 && responses.len() == 1 {
         let mut responses = responses;
-        return serde_json::json!(responses.remove(0));
+        return GenerateBody::One(Box::new(responses.remove(0)));
     }
-    serde_json::json!(responses)
+    GenerateBody::Many(responses)
 }
 
 #[cfg(test)]
@@ -1234,10 +1253,6 @@ mod generate_response_body_tests {
     use openai_protocol::generate::{GenerateFinishReason, GenerateFinishType, GenerateMetaInfo};
 
     use super::*;
-
-    fn request(body: serde_json::Value) -> GenerateRequest {
-        serde_json::from_value(body).expect("valid GenerateRequest fixture")
-    }
 
     fn response(weight_version: &str) -> GenerateResponse {
         GenerateResponse {
@@ -1261,51 +1276,54 @@ mod generate_response_body_tests {
         }
     }
 
-    #[test]
-    fn single_text_prompt_with_one_response_is_an_object() {
-        let req = request(serde_json::json!({"model": "m", "text": "hello"}));
-        let body = generate_response_body(&req, vec![response("v1")]);
-        assert!(body.is_object(), "expected an object, got {body}");
-        assert_eq!(body["meta_info"]["weight_version"], "v1");
+    fn to_value(body: GenerateBody) -> serde_json::Value {
+        serde_json::to_value(body).expect("GenerateBody always serializes")
     }
 
     #[test]
-    fn single_flat_input_ids_with_one_response_is_an_object() {
-        let req = request(serde_json::json!({"model": "m", "input_ids": [1, 2, 3]}));
-        let body = generate_response_body(&req, vec![response("v1")]);
-        assert!(body.is_object(), "expected an object, got {body}");
+    fn single_prompt_with_one_response_is_an_object() {
+        let value = to_value(generate_response_body(true, 1, vec![response("v1")]));
+        assert!(value.is_object(), "expected an object, got {value}");
+        assert_eq!(value["meta_info"]["weight_version"], "v1");
     }
 
     #[test]
-    fn n_greater_than_one_stays_a_list_even_with_text() {
-        let req = request(serde_json::json!({
-            "model": "m",
-            "text": "hello",
-            "sampling_params": {"n": 2},
-        }));
-        let body = generate_response_body(&req, vec![response("v1"), response("v1")]);
-        assert!(body.is_array(), "expected a list, got {body}");
-        assert_eq!(body.as_array().map(Vec::len), Some(2));
+    fn n_greater_than_one_stays_a_list_even_for_a_single_prompt() {
+        let value = to_value(generate_response_body(
+            true,
+            2,
+            vec![response("v1"), response("v1")],
+        ));
+        assert!(value.is_array(), "expected a list, got {value}");
+        assert_eq!(value.as_array().map(Vec::len), Some(2));
     }
 
     #[test]
-    fn batch_input_ids_stays_a_list() {
-        let req = request(serde_json::json!({
-            "model": "m",
-            "input_ids": [[1, 2], [3, 4]],
-        }));
-        let body = generate_response_body(&req, vec![response("v1"), response("v1")]);
-        assert!(body.is_array(), "expected a list, got {body}");
+    fn a_batch_request_stays_a_list() {
+        // `single_prompt = false` here stands in for a batch `input_ids`
+        // request. That shape is unreachable over gRPC today --
+        // `GeneratePreparationStage::resolve_generate_input` rejects
+        // `InputIds::Batch` with 400 before any response exists -- but the
+        // helper still needs to answer it correctly if that ever changes.
+        let value = to_value(generate_response_body(
+            false,
+            1,
+            vec![response("v1"), response("v1")],
+        ));
+        assert!(value.is_array(), "expected a list, got {value}");
     }
 
     #[test]
     fn single_prompt_with_more_than_one_response_stays_a_list() {
         // Shouldn't happen in practice (a single prompt dispatches once),
         // but the helper must not silently drop a response if it did.
-        let req = request(serde_json::json!({"model": "m", "text": "hello"}));
-        let body = generate_response_body(&req, vec![response("v1"), response("v2")]);
-        assert!(body.is_array(), "expected a list, got {body}");
-        assert_eq!(body.as_array().map(Vec::len), Some(2));
+        let value = to_value(generate_response_body(
+            true,
+            1,
+            vec![response("v1"), response("v2")],
+        ));
+        assert!(value.is_array(), "expected a list, got {value}");
+        assert_eq!(value.as_array().map(Vec::len), Some(2));
     }
 }
 

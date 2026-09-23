@@ -328,12 +328,24 @@ impl GrpcRouter {
 
         // slime (and other native RL clients) never send `model` on
         // `/generate`, so the request lands here carrying the wildcard
-        // placeholder. When the fleet serves exactly one model there is only
-        // one sane target, so default to it instead of 404ing a request the
-        // registry could otherwise route without ambiguity. Zero or several
-        // served models keep the current behavior: model_not_found.
+        // placeholder. When the fleet serves exactly one real model there is
+        // only one sane target, so default to it instead of 404ing a
+        // request the registry could otherwise route without ambiguity.
+        // Zero or several served models keep the current behavior:
+        // model_not_found. An untagged worker (no model card, no
+        // `model_id` label) registers under the wildcard itself
+        // (`Worker::model_id`'s fallback), so it is filtered out here --
+        // otherwise it would either mask a real single-model fleet behind a
+        // spurious second entry, or, in an untagged-only fleet, make the
+        // default resolve the wildcard to itself and 500 instead of 404ing.
         let resolved_model_id: Cow<'_, str> = if model_id == UNKNOWN_MODEL_ID {
-            match self.worker_registry.get_models().as_slice() {
+            let served_models: Vec<String> = self
+                .worker_registry
+                .get_models()
+                .into_iter()
+                .filter(|served| served != UNKNOWN_MODEL_ID)
+                .collect();
+            match served_models.as_slice() {
                 [only] => {
                     debug!(
                         "Defaulting model-less generate request to the single served model: {}",

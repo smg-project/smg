@@ -95,11 +95,14 @@ shape for that case: a single prompt with `n` unset (or `1`) and exactly one
 response comes back as one JSON object, so `resp["meta_info"]` indexes
 directly instead of unwrapping a one-element list; a batch or `n > 1` still
 comes back as a list. When `model` is omitted, the gateway resolves it to the
-single model the fleet is serving; with zero or more than one model behind
-the gateway an unnamed request still 404s (`model_not_found`), since there is
-no longer a single unambiguous target. Sending `text` as a list of prompts
-(SGLang's batch text form) is not accepted on the gRPC path — send one prompt
-per request, or use `input_ids` as a list of lists for a token-id batch.
+single real model at least one worker is tagged with (an untagged worker
+doesn't count as a model of its own); with zero or more than one such model
+behind the gateway an unnamed request still 404s (`model_not_found`), since
+there is no longer a single unambiguous target. Sending `text` as a list of
+prompts (SGLang's batch text form) is rejected before it reaches any
+router — the JSON body fails to parse (422) on every path, gRPC included,
+since `text` is a plain string field. Use `input_ids` as a list of lists for
+a token-id batch instead; gRPC rejects that too (400), but HTTP accepts it.
 
 ## Security
 
