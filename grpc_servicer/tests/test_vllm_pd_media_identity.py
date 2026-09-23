@@ -154,3 +154,27 @@ async def test_decode_leg_from_identity_never_touches_the_processor(monkeypatch)
     decode = await _complete(servicer, _request(kv=True, identity=prefill.media_identity))
     assert processor.calls == [], "the decode leg carried identity, not references"
     assert not decode.HasField("media_identity")
+
+
+@pytest.mark.asyncio
+async def test_an_identity_that_cannot_be_built_does_not_fail_the_request(monkeypatch, caplog):
+    # The identity is an optimisation with a fallback (decode reprocesses the
+    # media), so a shape it did not anticipate must not turn a served request
+    # into an error.
+    from smg_grpc_servicer.vllm import servicer as servicer_module
+
+    def explode(prompt):
+        raise RuntimeError("stack expects each tensor to be equal size")
+
+    monkeypatch.setattr(servicer_module, "build_media_identity", explode)
+    processor = _Processor()
+    servicer = _servicer(monkeypatch, processor)
+    with caplog.at_level("WARNING", logger="smg_grpc_servicer.vllm.servicer"):
+        complete = await _complete(servicer, _request(refs=True, kv=True))
+    assert processor.calls == ["req-pd"]
+    assert list(complete.output_ids) == [42]
+    assert not complete.HasField("media_identity")
+    assert any(
+        "media identity not built" in r.getMessage() and "equal size" in r.getMessage()
+        for r in caplog.records
+    )

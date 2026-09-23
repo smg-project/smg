@@ -325,9 +325,20 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 finally:
                     self._mm_inflight.release()
                 # A PD prefill leg answers with the identity so decode is
-                # served without pixels or references.
+                # served without pixels or references. The identity is an
+                # optimisation with a fallback (decode reprocesses), so a
+                # shape it cannot read must not fail a served request.
                 if kv_transfer_params is not None:
-                    media_identity = build_media_identity(prompt)
+                    try:
+                        media_identity = build_media_identity(prompt)
+                    except Exception as e:  # noqa: BLE001 - any failure falls back
+                        logger.warning(
+                            "Request %s: media identity not built (%s); the decode leg "
+                            "will reprocess the media",
+                            request_id,
+                            e,
+                        )
+                        media_identity = None
             elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
