@@ -1895,7 +1895,10 @@ mod tests {
                     ("aspect_ratios".to_string(), grid.clone()),
                     // Flat-classified grid keys keep their sizes tensor.
                     ("second_per_grid_ts".to_string(), grid.clone()),
-                    ("ts_sizes".to_string(), grid),
+                    ("ts_sizes".to_string(), grid.clone()),
+                    // The Omni family's and the router's own spelling of the
+                    // video timing.
+                    ("video_second_per_grid".to_string(), grid),
                 ]),
                 flat_keys: std::collections::HashMap::from([(
                     "second_per_grid_ts".to_string(),
@@ -1929,7 +1932,7 @@ mod tests {
             original_mm.pixel_values.is_some(),
             "prefill leg keeps pixels"
         );
-        assert_eq!(original_mm.model_specific_tensors.len(), 5);
+        assert_eq!(original_mm.model_specific_tensors.len(), 6);
         assert_eq!(original_mm.batched_keys.len(), 3);
         let decode_mm = decode.mm_inputs.expect("decode leg keeps identity");
         assert!(
@@ -1940,7 +1943,12 @@ mod tests {
         decode_keys.sort();
         assert_eq!(
             decode_keys,
-            vec!["image_grid_thw", "second_per_grid_ts", "ts_sizes"]
+            vec![
+                "image_grid_thw",
+                "second_per_grid_ts",
+                "ts_sizes",
+                "video_second_per_grid"
+            ]
         );
         assert_eq!(decode_mm.batched_keys, vec!["image_grid_thw".to_string()]);
         assert_eq!(

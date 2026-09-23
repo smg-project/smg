@@ -1274,8 +1274,16 @@ pub enum ProtoGenerateRequest {
 }
 
 /// Per-item grid metadata the engine reads to compute M-RoPE positions
-/// (`_get_mrope_input_positions` in vLLM); a few ints per item.
-const VLLM_MROPE_GRID_KEYS: [&str; 3] = ["image_grid_thw", "video_grid_thw", "second_per_grid_ts"];
+/// (`_get_mrope_input_positions` in vLLM); a few ints per item. The video
+/// timing has two spellings: `second_per_grid_ts` from the Qwen-VL
+/// processors, `video_second_per_grid` from the Qwen-Omni family and this
+/// gateway's own processors. The servicer's `GRID_KEYS` mirrors this list.
+const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
+    "image_grid_thw",
+    "video_grid_thw",
+    "second_per_grid_ts",
+    "video_second_per_grid",
+];
 
 impl ProtoGenerateRequest {
     /// Append stop token ids to the request's sampling params (TRT-LLM keeps
