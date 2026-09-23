@@ -497,11 +497,14 @@ class Worker:
             # ``logprobs=True`` requests get real per-token data back.
             "--enable-output-logprobs",
         ]
+        # Only the port: every TokenSpeed build accepts ``--rl-control-port``,
+        # while ``--rl-control-host`` is newer and would take down every
+        # TokenSpeed lane on a CI image that predates it. The engine binds the
+        # control app next to its gRPC listener, and the gateway resolves a
+        # wildcard host to the worker's own, so nothing here needs the flag.
         if self.rl_control_port is None:
             self.rl_control_port = get_open_port()
-        cmd.extend(
-            ["--rl-control-host", DEFAULT_HOST, "--rl-control-port", str(self.rl_control_port)]
-        )
+        cmd.extend(["--rl-control-port", str(self.rl_control_port)])
         if self.worker_type in (WorkerType.ENCODE, WorkerType.PREFILL, WorkerType.DECODE):
             cmd.extend(["--disaggregation-mode", self.worker_type.value])
             if self.bootstrap_port is not None:

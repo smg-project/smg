@@ -68,7 +68,8 @@ def test_regular_tokenspeed_worker_has_no_disagg_flags():
 def test_regular_tokenspeed_worker_exposes_its_rl_control_app():
     w = _ts_worker(WorkerType.REGULAR)
     cmd = w._build_cmd()
-    assert cmd[cmd.index("--rl-control-host") + 1] == "127.0.0.1"
+    # Port only: ``--rl-control-host`` is newer than the CI engine image.
+    assert "--rl-control-host" not in cmd
     port = int(cmd[cmd.index("--rl-control-port") + 1])
     assert port == w.rl_control_port and port > 0 and port != w.port
 
