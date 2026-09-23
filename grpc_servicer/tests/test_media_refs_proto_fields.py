@@ -52,16 +52,45 @@ class TestGetServerInfoResponseMediaFields:
         fields = vllm_engine_pb2.GetServerInfoResponse.DESCRIPTOR.fields_by_name
         assert fields["mm_processor"].number == 16
         assert fields["mm_media_ref_schemes"].number == 17
+        assert fields["mm_processor_source"].number == 18
 
     def test_empty_by_default(self):
         info = vllm_engine_pb2.GetServerInfoResponse()
         assert info.mm_processor == ""
         assert info.mm_media_ref_schemes == ""
+        assert info.mm_processor_source == ""
 
     def test_roundtrip(self):
         info = vllm_engine_pb2.GetServerInfoResponse(
-            mm_processor="inprocess", mm_media_ref_schemes="http,https,data"
+            mm_processor="inprocess",
+            mm_media_ref_schemes="http,https,data",
+            mm_processor_source="flag",
         )
         parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
         assert parsed.mm_processor == "inprocess"
         assert parsed.mm_media_ref_schemes == "http,https,data"
+        assert parsed.mm_processor_source == "flag"
+
+
+class TestGenerateCompleteMediaIdentity:
+    def test_field_number(self):
+        field = vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name["media_identity"]
+        assert field.number == 15
+        assert field.message_type is vllm_engine_pb2.MediaIdentity.DESCRIPTOR
+
+    def test_unset_by_default(self):
+        assert not vllm_engine_pb2.GenerateComplete().HasField("media_identity")
+
+    def test_roundtrip(self):
+        complete = vllm_engine_pb2.GenerateComplete(
+            media_identity=vllm_engine_pb2.MediaIdentity(
+                prompt_token_ids=[7, 8, 100, 100, 9],
+                mm_inputs=vllm_engine_pb2.MultimodalInputs(mm_hashes=["h1"]),
+                extra_mm_inputs=[vllm_engine_pb2.MultimodalInputs(mm_hashes=["h2"])],
+            )
+        )
+        parsed = vllm_engine_pb2.GenerateComplete.FromString(complete.SerializeToString())
+        assert parsed.HasField("media_identity")
+        assert list(parsed.media_identity.prompt_token_ids) == [7, 8, 100, 100, 9]
+        assert list(parsed.media_identity.mm_inputs.mm_hashes) == ["h1"]
+        assert [list(m.mm_hashes) for m in parsed.media_identity.extra_mm_inputs] == [["h2"]]

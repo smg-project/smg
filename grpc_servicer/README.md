@@ -111,8 +111,9 @@ id and expire after 120 s. Knobs: `--mm-sidecar-timeout-ms`
 (`SMG_VLLM_MM_SIDECAR_TIMEOUT_MS`, 30000), `--mm-sidecar-max-queue`
 (`SMG_VLLM_MM_SIDECAR_MAX_QUEUE`, 256, fail fast when the queue is deeper),
 `--mm-sidecar-namespace` (`SMG_VLLM_MM_SIDECAR_NAMESPACE`, override the derived
-namespace). The sidecar resolves `--redis-url`, `--namespace` and
-`--mm-sidecar-timeout-ms` the same way, so the two processes cannot disagree.
+namespace). The sidecar resolves `--redis-url` and `--namespace` the same way,
+so the two processes cannot disagree on the namespace; the timeout travels
+with each job as its deadline.
 On the sidecar, `SMG_VLLM_MM_MAX_RESULT_BYTES` (default 512 MiB, lowered to
 Redis's `proto-max-bulk-len` when that is smaller) caps an encoded result and
 `SMG_VLLM_MM_MAX_VIDEO_FRAMES` caps video sampling as above. A result over the

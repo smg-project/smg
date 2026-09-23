@@ -61,11 +61,12 @@ JOB_WAIT_MARGIN_S = 2
 # How long a worker holds off after a refused or unanswered wait.
 RECONNECT_PAUSE_S = 1
 # The worker settings this process runs on, and the flags it spells them as.
-SIDECAR_SETTINGS = ("redis_url", "sidecar_namespace", "sidecar_timeout_ms")
+# The worker's job timeout is not one of them: it reaches the sidecar as
+# each job's deadline.
+SIDECAR_SETTINGS = ("redis_url", "sidecar_namespace")
 SIDECAR_FLAGS = {
     "redis_url": "--redis-url",
     "sidecar_namespace": "--namespace",
-    "sidecar_timeout_ms": "--mm-sidecar-timeout-ms",
 }
 # The least time a finished job's answer gets to reach the requester.
 PUSH_FLOOR_S = 5
@@ -414,19 +415,17 @@ async def serve(args: argparse.Namespace) -> None:
     import redis.asyncio as redis_asyncio
     from vllm.renderers.registry import renderer_from_config
 
-    # The same flag > env > default resolution as the worker, for the three
+    # The same flag > env > default resolution as the worker, for the two
     # settings this process runs on, so the two cannot disagree on the
-    # namespace or the timeout.
+    # namespace.
     settings = MmSettings(
         redis_url=getattr(args, "redis_url", None),
         sidecar_namespace=getattr(args, "namespace", None),
-        sidecar_timeout_ms=getattr(args, "mm_sidecar_timeout_ms", None),
     ).resolve(only=SIDECAR_SETTINGS, flags=SIDECAR_FLAGS)
     logger.info(
-        "media sidecar settings: redis_url=%s namespace=%s sidecar_timeout_ms=%d (%s)",
+        "media sidecar settings: redis_url=%s namespace=%s (%s)",
         redacted_url(settings.redis_url),
         settings.sidecar_namespace or "<derived>",
-        settings.sidecar_timeout_ms,
         ", ".join(f"{name}={source}" for name, source in sorted(settings.sources.items())),
     )
     vllm_config = build_config(args)
@@ -473,13 +472,6 @@ def build_parser(add_engine_args, parser_cls=argparse.ArgumentParser):
         "--namespace",
         default=None,
         help="override the derived key namespace (falls back to SMG_VLLM_MM_SIDECAR_NAMESPACE)",
-    )
-    parser.add_argument(
-        "--mm-sidecar-timeout-ms",
-        type=int,
-        default=None,
-        help="the worker's job timeout, for the startup log (falls back to "
-        "SMG_VLLM_MM_SIDECAR_TIMEOUT_MS)",
     )
     parser.add_argument("--concurrency", type=int, default=2)
     return add_engine_args(parser)

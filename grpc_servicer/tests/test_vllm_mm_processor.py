@@ -638,6 +638,28 @@ class TestProcess:
             run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
 
 
+class TestBlankSettings:
+    def test_a_blank_flag_falls_through_to_env_and_default(self):
+        env = {"SMG_VLLM_MM_REDIS_URL": "redis://cache:6379/0"}
+        settings = mm_processor.MmSettings(redis_url="", processor=" ").resolve(env)
+        assert settings.redis_url == "redis://cache:6379/0"
+        assert settings.sources["redis_url"] == "env"
+        assert settings.processor == "off"
+        assert settings.sources["processor"] == "default"
+        settings = mm_processor.MmSettings(redis_url="   ").resolve({})
+        assert settings.redis_url == mm_processor.DEFAULT_REDIS_URL
+        assert settings.sources["redis_url"] == "default"
+
+    def test_a_blank_env_value_is_unset_everywhere(self):
+        env = {"SMG_VLLM_MM_PROCESSOR": " ", "SMG_VLLM_MM_REDIS_URL": " "}
+        assert mm_processor.resolve_mm_processor_mode(env) == "off"
+        settings = mm_processor.MmSettings().resolve(env)
+        assert settings.processor == "off"
+        assert settings.sources["processor"] == "default"
+        assert settings.redis_url == mm_processor.DEFAULT_REDIS_URL
+        assert settings.sources["redis_url"] == "default"
+
+
 class TestServicerWiring:
     """With vLLM installed, the servicer constructor stays two-argument and reads the env."""
 
@@ -676,3 +698,47 @@ class TestServicerWiring:
             "VllmEngineServicer initialized (mm_processor=off, source=flag)" in r.getMessage()
             for r in caplog.records
         )
+
+    @pytest.mark.parametrize("source", ["flag", "env"])
+    def test_server_info_names_where_the_processor_mode_came_from(self, monkeypatch, source):
+        # The response field is set whenever a processor is advertised; the
+        # proto floor guarantees the field, so there is no descriptor probe.
+        pytest.importorskip("vllm")
+        from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+
+        if source == "env":
+            monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "off")
+            settings = None
+        else:
+            monkeypatch.delenv("SMG_VLLM_MM_PROCESSOR", raising=False)
+            settings = mm_processor.MmSettings(processor="off")
+
+        class _Engine:
+            vllm_config = types.SimpleNamespace(
+                kv_events_config=None,
+                kv_transfer_config=None,
+                parallel_config=types.SimpleNamespace(data_parallel_size=1),
+            )
+            model_config = types.SimpleNamespace(
+                is_multimodal_model=True, supports_multimodal_inputs=True
+            )
+
+        class _Processor:
+            name = "inprocess"
+            schemes = "http,https"
+            max_inflight = 4
+
+            async def probe(self):
+                return True
+
+        servicer = VllmEngineServicer(_Engine(), start_time=0.0, mm_settings=settings)
+        assert servicer._mm_settings.source == source
+        servicer._mm_processor = _Processor()
+        info = run(servicer.GetServerInfo(None, None))
+        assert info.mm_processor == "inprocess"
+        assert info.mm_processor_source == source
+
+        servicer._mm_processor = None
+        info = run(servicer.GetServerInfo(None, None))
+        assert info.mm_processor == ""
+        assert info.mm_processor_source == ""
