@@ -92,6 +92,28 @@ pub struct PDRouter {
     pub api_key: Option<String>,
 }
 
+/// One attempt's load guards, one per leg, released as each leg ends: the
+/// prefill's when its body drains, the decode's with the client stream.
+struct PdLoadGuards {
+    prefill: WorkerLoadGuard,
+    decode: WorkerLoadGuard,
+}
+
+impl PdLoadGuards {
+    fn into_vec(self) -> Vec<WorkerLoadGuard> {
+        vec![self.prefill, self.decode]
+    }
+}
+
+/// Who records the prefill leg's outcome for an attempt: the attempt, from
+/// the response status, or the drain task once the prefill body is known
+/// (the early-commit path, where the response is the decode's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefillOutcome {
+    FromStatus,
+    Drained,
+}
+
 #[derive(Clone)]
 struct PDRequestContext<'a> {
     route: &'static str,
@@ -507,10 +529,10 @@ impl PDRouter {
             let key = view
                 .rid_key
                 .or_else(|| self.policy_registry.sticky_header_key(headers));
-            vec![
-                WorkerLoadGuard::with_key(prefill.clone(), key),
-                WorkerLoadGuard::with_key(decode.clone(), key),
-            ]
+            PdLoadGuards {
+                prefill: WorkerLoadGuard::with_key(prefill.clone(), key),
+                decode: WorkerLoadGuard::with_key(decode.clone(), key),
+            }
         });
 
         if prefill.metadata().spec.runtime_type == RuntimeType::Vllm {
@@ -584,7 +606,7 @@ impl PDRouter {
                     context,
                     Arc::clone(&prefill),
                     Arc::clone(&decode),
-                    load_guards,
+                    load_guards.into_vec(),
                 )
                 .await;
         }
@@ -675,6 +697,7 @@ impl PDRouter {
         // disabled.
         lease.release_dispatch();
 
+        let mut prefill_outcome = PrefillOutcome::FromStatus;
         let response = self
             .execute_dual_dispatch_internal(
                 headers,
@@ -683,29 +706,51 @@ impl PDRouter {
                 Arc::clone(&prefill),
                 Arc::clone(&decode),
                 load_guards,
+                &mut prefill_outcome,
             )
             .await;
 
-        let status = response.status();
-        prefill.record_outcome(status.as_u16());
+        Self::record_attempt_outcomes(
+            prefill.as_ref(),
+            decode.as_ref(),
+            response.status(),
+            prefill_outcome,
+        );
+        response
+    }
+
+    /// Record an attempt's outcome on both legs. On the early-commit path the
+    /// drain records the prefill's once its body is known: the attempt's
+    /// status is the decode's there, and recording it on the prefill would
+    /// reset the failures the drain counts.
+    fn record_attempt_outcomes(
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+        status: StatusCode,
+        prefill_outcome: PrefillOutcome,
+    ) {
+        let attempt_records_prefill = prefill_outcome == PrefillOutcome::FromStatus;
+        if attempt_records_prefill {
+            prefill.record_outcome(status.as_u16());
+        }
         decode.record_outcome(status.as_u16());
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
             let error_type = error_type_from_status(status);
-            Metrics::record_worker_error(
-                metrics_labels::WORKER_PREFILL,
-                metrics_labels::CONNECTION_HTTP,
-                error_type,
-            );
+            if attempt_records_prefill {
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::CONNECTION_HTTP,
+                    error_type,
+                );
+            }
             Metrics::record_worker_error(
                 metrics_labels::WORKER_DECODE,
                 metrics_labels::CONNECTION_HTTP,
                 error_type,
             );
         }
-
-        response
     }
 
     async fn handle_decode_error_response(
@@ -822,6 +867,10 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attempt carries both legs, their guards and who records the prefill"
+    )]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
@@ -829,7 +878,8 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
-        load_guards: Vec<WorkerLoadGuard>,
+        load_guards: PdLoadGuards,
+        prefill_outcome: &mut PrefillOutcome,
     ) -> Response {
         let (prefill_body, decode_body) = leg_bodies;
 
@@ -911,7 +961,12 @@ impl PDRouter {
             );
 
             return self
-                .handle_decode_error_response(decode_response, &context, decode, load_guards)
+                .handle_decode_error_response(
+                    decode_response,
+                    &context,
+                    decode,
+                    load_guards.into_vec(),
+                )
                 .await;
         }
 
@@ -934,8 +989,13 @@ impl PDRouter {
         // so it stays a retryable status rather than an in-band stream error.
         if context.is_stream && !context.return_logprob && prefill_response.status().is_success() {
             let model_id = context.model_id.to_string();
-            let mut load_guards = load_guards;
-            let prefill_load_guard = load_guards.remove(0);
+            let PdLoadGuards {
+                prefill: prefill_load_guard,
+                decode: decode_load_guard,
+            } = load_guards;
+            // The drain owns the prefill's outcome for this attempt: recorded
+            // once, when the body is known, with the error metric alongside.
+            *prefill_outcome = PrefillOutcome::Drained;
             // The body must still be read to the end: dropping a response with
             // an unread body closes the connection, which the prefill engine
             // treats as a client disconnect and aborts mid KV transfer,
@@ -948,12 +1008,21 @@ impl PDRouter {
                 let _prefill_load_guard = prefill_load_guard;
                 let prefill_drain_start = Instant::now();
                 let mut chunks = prefill_response.bytes_stream();
+                let mut drained = StatusCode::OK;
                 while let Some(chunk) = chunks.next().await {
                     if let Err(e) = chunk {
                         warn!("Error consuming prefill response: {e}");
-                        prefill.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                        drained = StatusCode::BAD_GATEWAY;
                         break;
                     }
+                }
+                prefill.record_outcome(drained.as_u16());
+                if drained.is_server_error() {
+                    Metrics::record_worker_error(
+                        metrics_labels::WORKER_PREFILL,
+                        metrics_labels::CONNECTION_HTTP,
+                        error_type_from_status(drained),
+                    );
                 }
                 Metrics::record_pd_prefill_duration(
                     metrics_labels::BACKEND_PD,
@@ -963,7 +1032,14 @@ impl PDRouter {
                 );
             });
             return self
-                .forward_decode_body(decode_response, status, &context, decode, load_guards, None)
+                .forward_decode_body(
+                    decode_response,
+                    status,
+                    &context,
+                    decode,
+                    vec![decode_load_guard],
+                    None,
+                )
                 .await;
         }
 
@@ -991,7 +1067,7 @@ impl PDRouter {
             status,
             &context,
             decode,
-            load_guards,
+            load_guards.into_vec(),
             prefill_body,
         )
         .await
@@ -2272,6 +2348,10 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    /// Ceiling on a real HTTP round trip in these tests: a guard against a
+    /// hang, not a budget, since a loaded machine can take seconds.
+    const ROUND_TRIP_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
     use openai_protocol::model_card::ModelCard;
     use tokio::sync::oneshot;
 
@@ -2724,7 +2804,7 @@ mod tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 socket.shutdown().await.unwrap();
             };
-            let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (response, ()) = tokio::time::timeout(ROUND_TRIP_GUARD, async {
                 tokio::join!(
                     router.route_messages_count_tokens(
                         Some(&headers),
@@ -2871,6 +2951,136 @@ mod tests {
         check_prefill_drain(true).await;
     }
 
+    /// On the early-commit path the drain owns the prefill outcome: the
+    /// attempt's status (the decode's 2xx) must not reset the failures the
+    /// drain records, or a prefill whose body keeps failing never trips a
+    /// breaker with a threshold above one.
+    #[test]
+    fn a_drained_prefill_outcome_is_not_overwritten_by_the_attempt_status() {
+        let breaker = crate::worker::CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..Default::default()
+        };
+        let worker = |name: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("http://{name}:8000"))
+                    .worker_type(WorkerType::Prefill)
+                    .circuit_breaker_config(breaker.clone())
+                    .build(),
+            )
+        };
+        let decode = worker("decode");
+        for (outcome, trips) in [
+            (PrefillOutcome::Drained, true),
+            (PrefillOutcome::FromStatus, false),
+        ] {
+            let prefill = worker("prefill");
+            for _ in 0..2 {
+                // What the drain records when the prefill body fails.
+                prefill.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                PDRouter::record_attempt_outcomes(
+                    prefill.as_ref(),
+                    decode.as_ref(),
+                    StatusCode::OK,
+                    outcome,
+                );
+            }
+            assert_eq!(!prefill.circuit_breaker_can_execute(), trips, "{outcome:?}");
+        }
+        assert!(decode.circuit_breaker_can_execute());
+    }
+
+    /// Streaming /v1/messages takes the same early commit as chat: the client
+    /// stream starts on the decode head while the prefill body is still open.
+    #[tokio::test]
+    async fn stream_messages_commits_on_the_decode_head() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let prefill_release = Arc::clone(&release);
+        let prefill = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let release = Arc::clone(&prefill_release);
+                async move {
+                    let body = futures_util::stream::unfold(
+                        (0u8, release),
+                        move |(step, release)| async move {
+                            match step {
+                                0 => Some((
+                                    Ok::<_, std::io::Error>(Bytes::from_static(b": keepalive\n\n")),
+                                    (1, release),
+                                )),
+                                1 => {
+                                    release.notified().await;
+                                    Some((Ok(Bytes::from_static(b"data: {}\n\n")), (2, release)))
+                                }
+                                _ => None,
+                            }
+                        },
+                    );
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(body),
+                    )
+                }
+            }),
+        );
+        let decode = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async { ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE) }),
+        );
+        let router = create_test_pd_router();
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            spawn_stub(prefill).await,
+            WorkerType::Prefill,
+            true,
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            spawn_stub(decode).await,
+            WorkerType::Decode,
+            true,
+        ));
+        router.worker_registry.register_or_replace(prefill.clone());
+        router.worker_registry.register_or_replace(decode.clone());
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid messages request");
+
+        let response = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            router.route_messages(None, &tenant, request, UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("the client stream must not wait for the prefill body");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("decode stream must complete while prefill is still open")
+        .expect("response body");
+        assert_eq!(&body[..], DECODE_SSE.as_bytes());
+        assert_eq!(
+            prefill.load(),
+            1,
+            "the prefill guard is held until its body drains"
+        );
+        release.notify_one();
+        tokio::time::timeout(ROUND_TRIP_GUARD, async {
+            while prefill.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefill load must be released after draining");
+        assert!(prefill.circuit_breaker_can_execute());
+    }
+
     async fn check_prefill_drain(fail_body: bool) {
         let release = Arc::new(tokio::sync::Notify::new());
         let (report_tx, report_rx) = oneshot::channel();
@@ -2947,14 +3157,14 @@ mod tests {
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            ROUND_TRIP_GUARD,
             router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream must not wait for the prefill body");
         assert_eq!(response.status(), StatusCode::OK);
         let body = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            ROUND_TRIP_GUARD,
             axum::body::to_bytes(response.into_body(), usize::MAX),
         )
         .await
@@ -2965,12 +3175,12 @@ mod tests {
         assert_eq!(decode.load(), 0);
 
         release.notify_one();
-        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), report_rx)
+        let completed = tokio::time::timeout(ROUND_TRIP_GUARD, report_rx)
             .await
             .expect("prefill body must be released")
             .expect("probe report");
         assert_eq!(completed, !fail_body);
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(ROUND_TRIP_GUARD, async {
             while prefill.load() != 0 {
                 tokio::task::yield_now().await;
             }

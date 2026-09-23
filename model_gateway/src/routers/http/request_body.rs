@@ -120,9 +120,16 @@ pub(crate) struct RawBody<'a> {
 }
 
 impl<'a> RawBody<'a> {
-    /// Parse the top level of a JSON object; anything else is an error.
+    /// Parse the top level of a JSON object; anything else is an error that
+    /// names the shape (a syntax error keeps serde's diagnosis).
     pub(crate) fn parse(bytes: &'a [u8]) -> serde_json::Result<Self> {
-        serde_json::from_slice(bytes)
+        serde_json::from_slice(bytes).map_err(|e| {
+            if e.is_data() {
+                serde::de::Error::custom("request body must be a JSON object")
+            } else {
+                e
+            }
+        })
     }
 
     /// Whether an edit changed the body since it was parsed. A body that
@@ -156,10 +163,16 @@ impl<'a> RawBody<'a> {
     }
 
     /// `serde_json::Map::insert` under `preserve_order`: an existing field
-    /// keeps its position, a new one goes last.
+    /// keeps its position, a new one goes last. A value equal to the one
+    /// present changes nothing, so the body stays unmutated.
     pub(crate) fn insert(&mut self, name: &str, value: Box<RawValue>) {
         match self.fields.iter_mut().find(|(field, _)| field == name) {
-            Some((_, slot)) => *slot = Cow::Owned(value),
+            Some((_, slot)) => {
+                if slot.get() == value.get() {
+                    return;
+                }
+                *slot = Cow::Owned(value);
+            }
             None => self.fields.push((name.to_owned(), Cow::Owned(value))),
         }
         self.mutated = true;
@@ -217,9 +230,15 @@ impl<'de> Deserialize<'de> for RawBody<'de> {
             where
                 A: MapAccess<'de>,
             {
-                let mut fields = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                let mut fields: Vec<(String, Cow<'de, RawValue>)> =
+                    Vec::with_capacity(map.size_hint().unwrap_or(0));
                 while let Some((name, value)) = map.next_entry::<String, &'de RawValue>()? {
-                    fields.push((name, Cow::Borrowed(value)));
+                    // As a `Value` map: a repeated key keeps its first
+                    // position and takes the last value.
+                    match fields.iter_mut().find(|(field, _)| *field == name) {
+                        Some((_, slot)) => *slot = Cow::Borrowed(value),
+                        None => fields.push((name, Cow::Borrowed(value))),
+                    }
                 }
                 Ok(RawBody {
                     fields,
@@ -595,6 +614,116 @@ mod tests {
         assert!(raw.contains("d"));
         assert!(!raw.contains("a"));
         assert!(RawBody::parse(b"[1,2]").is_err());
+    }
+
+    /// The invariant "byte-identical to a `Value`" has a precondition on
+    /// the input: a `Value` keeps one entry per key, the last value in the
+    /// first position. Today's input is serde output of a typed struct, but
+    /// an alias rewrite must not be defeated if that ever changes: Python's
+    /// `json` takes the last duplicate, and a body with two `model` keys
+    /// would carry the client's alias past a rewrite of the first.
+    #[test]
+    fn duplicate_top_level_keys_keep_the_last_value_in_the_first_position() {
+        let bytes = br#"{"model":"alias","x":1,"model":"other","x":2}"#;
+        let mut raw = RawBody::parse(bytes).unwrap();
+        assert_eq!(raw.get("model").map(RawValue::get), Some(r#""other""#));
+        assert_eq!(raw.get("x").map(RawValue::get), Some("2"));
+        let oracle: Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(
+            raw.to_bytes(None).unwrap(),
+            serde_json::to_vec(&oracle).unwrap()
+        );
+        raw.set_model(to_raw_value("canonical").unwrap());
+        assert_eq!(
+            String::from_utf8(raw.to_bytes(None).unwrap()).unwrap(),
+            r#"{"model":"canonical","x":2}"#
+        );
+    }
+
+    #[test]
+    fn insert_of_an_unchanged_value_does_not_mark_the_body() {
+        let mut raw = RawBody::parse(br#"{"stream":false}"#).unwrap();
+        raw.insert("stream", to_raw_value(&false).unwrap());
+        assert!(
+            !raw.mutated(),
+            "the prefill leg's stream:false is often already there"
+        );
+        raw.insert("stream", to_raw_value(&true).unwrap());
+        assert!(raw.mutated());
+    }
+
+    #[test]
+    fn a_non_object_body_names_the_shape_it_needs() {
+        for bytes in [&b"[1,2]"[..], b"\"text\"", b"42", b"null"] {
+            let Err(error) = RawBody::parse(bytes) else {
+                panic!("{} parsed as an object", String::from_utf8_lossy(bytes));
+            };
+            let error = error.to_string();
+            assert!(
+                error.contains("must be a JSON object"),
+                "{}: {error}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        // A syntax error keeps serde's diagnosis.
+        let Err(syntax) = RawBody::parse(b"{") else {
+            panic!("an unterminated object parsed");
+        };
+        assert!(!syntax.to_string().contains("must be a JSON object"));
+    }
+
+    /// The PD edits over adversarial bodies, against the `Value` pipeline:
+    /// the same fields come out, with every untouched number as the client
+    /// wrote it (a `Value` would normalize `1e308` and `-0.0` on its way).
+    #[test]
+    fn adversarial_bodies_survive_the_pd_edits() {
+        let cases: &[&[u8]] = &[
+            br#"{"model":"alias","model":"other","stream":true}"#,
+            // A JSON escape and raw UTF-8 in key names.
+            r#"{"mod\u00e8le":1,"模型":2,"model":"alias"}"#.as_bytes(),
+            br#"{"model":"alias","big":1e308,"neg":-0.0,"exp":1e2}"#,
+            br#"{"model":"alias","p53":9007199254740993,"u64":18446744073709551615}"#,
+            br#"{"":"empty","model":"alias"}"#,
+            br#"{"model":"alias","kv_transfer_params":{"x":1},"bootstrap_room":7,"data_parallel_rank":3}"#,
+        ];
+        for bytes in cases {
+            let mut raw = RawBody::parse(bytes).unwrap();
+            let mut oracle: Value = serde_json::from_slice(bytes).unwrap();
+            let map = oracle.as_object_mut().unwrap();
+
+            raw.set_model(to_raw_value("canonical").unwrap());
+            map.insert("model".to_owned(), json!("canonical"));
+            raw.insert("bootstrap_room", to_raw_value(&11).unwrap());
+            map.insert("bootstrap_room".to_owned(), json!(11));
+            raw.insert("data_parallel_rank", to_raw_value(&1).unwrap());
+            map.insert("data_parallel_rank".to_owned(), json!(1));
+            assert_eq!(
+                raw.remove("kv_transfer_params"),
+                map.remove("kv_transfer_params").is_some()
+            );
+            raw.insert("stream", to_raw_value(&false).unwrap());
+            map.insert("stream".to_owned(), json!(false));
+
+            let out = raw.to_bytes(None).unwrap();
+            let parsed: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(parsed, oracle, "{}", String::from_utf8_lossy(bytes));
+            let text = String::from_utf8(out).unwrap();
+            for verbatim in [
+                "1e308",
+                "-0.0",
+                "1e2",
+                "9007199254740993",
+                "18446744073709551615",
+            ] {
+                if String::from_utf8_lossy(bytes).contains(verbatim) {
+                    assert!(
+                        text.contains(verbatim),
+                        "{verbatim} kept verbatim in {text}"
+                    );
+                }
+            }
+            assert_eq!(text.matches("\"model\"").count(), 1, "{text}");
+        }
     }
 
     #[test]
