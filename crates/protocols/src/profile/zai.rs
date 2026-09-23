@@ -4,7 +4,9 @@
 //! What the vendor does, and what this profile encodes:
 //! - thinking cannot be switched off: `thinking.type = disabled` is a 400,
 //!   and so is every `reasoning_effort` outside low/high/max (`none`,
-//!   `minimal`, `medium`, `xhigh` and unknown values all 400);
+//!   `minimal`, `medium`, `xhigh` and unknown values all 400); this and the
+//!   sampling defaults are GLM-5 rules (`is_glm5`), as the Kimi profile pins
+//!   K3 alone: an earlier GLM generation keeps its own thinking switch;
 //! - `thinking.clear_thinking` round-trips: `false` keeps the history's
 //!   reasoning in the rendered prompt, `true` drops it; it is carried to the
 //!   chat template as the `clear_thinking` kwarg;
@@ -46,9 +48,23 @@ const CLEAR_THINKING: &str = "clear_thinking";
 /// The vendor-side file content block SMG does not fetch.
 const FILE_URL: &str = "file_url";
 
+/// Whether a model id names the GLM-5 generation the thinking rules and
+/// sampling defaults were recorded against: a segment such as `GLM-5`,
+/// `glm-5.3-flash` or `glm5-turbo`, the `5` not followed by another digit.
+fn is_glm5(model: &str) -> bool {
+    model.split('/').any(|segment| {
+        ["glm-5", "glm5", "glm_5"].iter().any(|marker| {
+            super::starts_with_ignore_ascii_case(segment, marker)
+                && !segment[marker.len()..].starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
-    req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
-    req.top_p.get_or_insert(DEFAULT_TOP_P);
+    if is_glm5(&req.model) {
+        req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
+        req.top_p.get_or_insert(DEFAULT_TOP_P);
+    }
     if let Some(clear) = req.thinking.as_ref().and_then(|t| t.clear_thinking) {
         req.chat_template_kwargs
             .get_or_insert_default()
@@ -59,7 +75,9 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
 }
 
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
-    validate_thinking(req)?;
+    if is_glm5(&req.model) {
+        validate_thinking(req)?;
+    }
     validate_tools(req)?;
     validate_content_parts(req)
 }
@@ -318,6 +336,45 @@ mod tests {
             ]}]
         }));
         assert_eq!(validate(&image), Ok(()));
+    }
+
+    /// The thinking rules and sampling defaults were recorded against
+    /// GLM-5.3; an earlier generation keeps its own thinking switch and
+    /// sampling, while the vendor-level rules still apply.
+    #[test]
+    fn glm5_rules_do_not_reach_earlier_generations() {
+        let glm4 = |fields: Value| {
+            let mut req = request(fields);
+            req.model = "zai-org/GLM-4.6".to_string();
+            req
+        };
+        assert_eq!(
+            validate(&glm4(json!({"thinking": {"type": "disabled"}}))),
+            Ok(())
+        );
+        assert_eq!(
+            validate(&glm4(json!({"reasoning_effort": "medium"}))),
+            Ok(())
+        );
+        let mut req = glm4(json!({"tool_stream": true}));
+        ProviderProfile::Zai.normalize_chat(&mut req);
+        assert_eq!(req.temperature, None);
+        assert_eq!(req.top_p, None);
+        assert!(!req.other.contains_key(TOOL_STREAM));
+        assert_eq!(
+            validate(&glm4(json!({
+                "messages": [{"role": "user", "content": [
+                    {"type": "file_url", "file_url": {"url": "https://a/f.txt"}}
+                ]}]
+            }))),
+            Err("content_part_not_supported".into())
+        );
+        for model in ["GLM-5.3-Flash", "glm-5", "z-ai/glm5-turbo", "glm_5_air"] {
+            assert!(is_glm5(model), "{model}");
+        }
+        for model in ["zai-org/GLM-4.6", "glm-4.5-air", "glm-51", "chatglm3-6b"] {
+            assert!(!is_glm5(model), "{model}");
+        }
     }
 
     #[test]

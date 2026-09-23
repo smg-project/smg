@@ -87,7 +87,6 @@ impl ProviderProfile {
                 return ProviderProfile::Minimax;
             }
             if starts_with_ignore_ascii_case(segment, "glm")
-                || starts_with_ignore_ascii_case(segment, "chatglm")
                 || starts_with_ignore_ascii_case(segment, "zai")
                 || starts_with_ignore_ascii_case(segment, "z-ai")
             {
@@ -272,7 +271,6 @@ mod tests {
             "GLM-5.3-Flash",
             "zai-org/GLM-5.3-Flash",
             "/models/glm-4.7",
-            "THUDM/chatglm3-6b",
             "z-ai/glm-5",
         ] {
             assert_eq!(
@@ -288,6 +286,8 @@ mod tests {
             "my-kimi-alias",
             "openai/gpt-4o",
             "my-glm-alias",
+            // ChatGLM predates the z.ai chat contract.
+            "THUDM/chatglm3-6b",
         ] {
             assert_eq!(
                 ProviderProfile::for_model(model),
