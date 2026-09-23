@@ -7,7 +7,8 @@
 //!   `minimal`, `medium`, `xhigh` and unknown values all 400); a GLM-5.3
 //!   series rule (`is_glm53`), pinned the way the Kimi profile pins K3:
 //!   docs.z.ai has GLM-5.2 taking `disabled` and mapping the other efforts,
-//!   and earlier generations taking every value;
+//!   and earlier generations taking every value; `adaptive`, a Kimi value
+//!   no GLM schema defines, is a 400 for every model;
 //! - `thinking.clear_thinking` round-trips: `false` keeps the history's
 //!   reasoning in the rendered prompt, `true` drops it; it is carried to the
 //!   chat template as the `clear_thinking` kwarg;
@@ -90,35 +91,55 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
 }
 
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
-    if is_glm53(&req.model) {
-        validate_thinking(req)?;
+    let glm53 = is_glm53(&req.model);
+    validate_thinking_type(req, glm53)?;
+    if glm53 {
+        validate_glm53_thinking(req)?;
     }
     validate_tools(req)?;
     validate_content_parts(req)
 }
 
-/// Thinking is always on: `disabled` (documented as unsupported) and
-/// `adaptive` (not a z.ai value) are rejected, and the effort must be one
-/// the model takes, in each spelling the request carries: both are
-/// forwarded, so a bad value hidden behind the preferred one still counts.
-fn validate_thinking(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
-    if let Some(thinking) = &req.thinking {
-        match thinking.r#type {
-            Some(ThinkingType::Disabled) => {
-                return Err(error(
-                    "thinking_disabled_not_supported",
-                    "thinking cannot be disabled for this model".into(),
-                ));
-            }
-            Some(ThinkingType::Adaptive) => {
-                return Err(pinned(
-                    "thinking_type_not_supported",
-                    "thinking.type",
-                    "enabled",
-                ));
-            }
-            Some(ThinkingType::Enabled) | None => {}
-        }
+/// `thinking.type` is `enabled` or `disabled` at z.ai, whatever the model;
+/// `adaptive` is a Kimi value and is rejected profile-wide. The hint names
+/// what the model takes: the GLM-5.3 series has no `disabled`.
+fn validate_thinking_type(
+    req: &ChatCompletionRequest,
+    glm53: bool,
+) -> Result<(), validator::ValidationError> {
+    let adaptive = req
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.r#type == Some(ThinkingType::Adaptive));
+    if adaptive {
+        let allowed = if glm53 {
+            "enabled"
+        } else {
+            "enabled or disabled"
+        };
+        return Err(pinned(
+            "thinking_type_not_supported",
+            "thinking.type",
+            allowed,
+        ));
+    }
+    Ok(())
+}
+
+/// The GLM-5.3 series thinks always: `disabled` (documented as unsupported)
+/// is rejected, and the effort must be one the series takes, in each
+/// spelling the request carries: both are forwarded, so a bad value hidden
+/// behind the preferred one still counts.
+fn validate_glm53_thinking(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+    if req
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.r#type == Some(ThinkingType::Disabled))
+    {
+        return Err(error(
+            "thinking_disabled_not_supported",
+            "thinking cannot be disabled for this model".into(),
+        ));
     }
     let efforts = [
         (
@@ -376,6 +397,15 @@ mod tests {
             assert_eq!(
                 validate(&with_model(model, json!({"reasoning_effort": "none"}))),
                 Ok(()),
+                "{model}"
+            );
+            // `adaptive` is a Kimi value; docs.z.ai defines enabled/disabled only.
+            assert_eq!(
+                validate(&with_model(
+                    model,
+                    json!({"thinking": {"type": "adaptive"}})
+                )),
+                Err("thinking_type_not_supported".into()),
                 "{model}"
             );
             assert_eq!(
