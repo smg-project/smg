@@ -22,6 +22,22 @@ because the struct grew a field. The gateway-level test relies on
 `TestRouterConfig` disabling health checks, so the mock stopped mid-test
 stays registered and the fan-out still targets it.
 
+Gateway-side changes that carry RL data but are not crate couplings (the RL
+crate does not call into them; they exist so the data plane reports what the
+control plane changed): `src/routers/grpc/client.rs` lifts `rl.control_url`
+and the `rl.*` capability keys from TokenSpeed gRPC server info into worker
+labels (`TOKENSPEED_GRPC_KEYS`); `src/routers/grpc/proto_wrapper.rs`,
+`src/routers/grpc/common/response_formatting.rs` (`effective_weight_version`),
+`src/routers/grpc/regular/{processor,streaming}.rs` and
+`src/routers/grpc/pipeline.rs` carry the engine-reported
+`meta_info.weight_version`; `src/routers/grpc/router.rs` and
+`src/routers/grpc/pipeline.rs` give slime's model-less single-prompt
+`/generate` SGLang's shape; `src/routers/http/router.rs` (with
+`crates/protocols/src/generate.rs`) stops forwarding the wildcard `model`
+placeholder. `model_gateway/tests/rl_tokenspeed_control_endpoint_test.rs`
+drives a TokenSpeed gRPC worker through `/v1/rl` via its control endpoint and
+checks the generate shape.
+
 Wire types are not a gateway coupling: they live in `crates/protocols/src/rl.rs`
 (`openai_protocol::rl`) next to the `/workers` types, and
 `clients/openapi-gen/src/main.rs` registers the `/v1/rl/*` paths.
