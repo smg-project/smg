@@ -3514,6 +3514,10 @@ mod tests {
         });
         assert_eq!(chunk.weight_version(), Some("v7"));
         let sglang = ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default());
-        assert_eq!(sglang.weight_version(), None, "no other proto carries the field");
+        assert_eq!(
+            sglang.weight_version(),
+            None,
+            "no other proto carries the field"
+        );
     }
 }
