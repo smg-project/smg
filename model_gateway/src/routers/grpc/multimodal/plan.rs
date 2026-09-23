@@ -161,6 +161,9 @@ pub(crate) async fn prepare_placeholder_tokens(
         &components.modality_limit_overrides,
     )
     .map_err(|error| anyhow::anyhow!("invalid media request for model {}: {error}", spec.name()))?;
+    spec.validate_image_formats(plan.parts()).map_err(|error| {
+        anyhow::anyhow!("invalid media request for model {}: {error}", spec.name())
+    })?;
     let mut placeholders = PlaceholderTokens::default();
     for &modality in plan.modalities() {
         let token = spec

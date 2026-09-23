@@ -88,6 +88,11 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         MediaPartOrder::Authored
     }
 
+    /// z.ai answers a `.bmp` image with a 400.
+    fn rejected_image_formats(&self) -> &'static [image::ImageFormat] {
+        &[image::ImageFormat::Bmp]
+    }
+
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
         Ok(IMAGE.to_string())
     }
@@ -408,6 +413,16 @@ mod tests {
             spec.prompt_replacements_for(&metadata, &input, Modality::Video),
             Err(ModelRegistryError::InvalidPreprocessedField { .. })
         ));
+    }
+
+    #[test]
+    fn bmp_images_are_rejected_as_at_the_vendor() {
+        use crate::registry::ModelProcessorSpec;
+
+        assert_eq!(
+            Glm53FlashSpec.rejected_image_formats(),
+            &[image::ImageFormat::Bmp]
+        );
     }
 
     #[test]

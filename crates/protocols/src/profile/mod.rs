@@ -64,6 +64,13 @@ impl ProviderProfile {
         matches!(self, ProviderProfile::Minimax)
     }
 
+    /// Whether the gateway rejects a `max_tokens` the selected worker's
+    /// window cannot hold (`context_length_exceeded`), as the vendor does.
+    /// Other profiles leave the output budget to the engine.
+    pub fn enforces_output_budget(self) -> bool {
+        matches!(self, ProviderProfile::Zai)
+    }
+
     /// Select the profile from a model id.
     ///
     /// Matches the way the tool and reasoning parser factories do: any
@@ -236,6 +243,18 @@ mod tests {
         assert!(!ProviderProfile::Kimi.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::Zai.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::OpenAi.parses_tool_calls_without_tools());
+    }
+
+    #[test]
+    fn only_the_zai_profile_enforces_the_output_budget() {
+        assert!(ProviderProfile::Zai.enforces_output_budget());
+        for profile in [
+            ProviderProfile::OpenAi,
+            ProviderProfile::Kimi,
+            ProviderProfile::Minimax,
+        ] {
+            assert!(!profile.enforces_output_budget(), "{profile:?}");
+        }
     }
 
     #[test]

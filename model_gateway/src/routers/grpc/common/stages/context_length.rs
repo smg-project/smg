@@ -72,7 +72,7 @@ pub(crate) fn enforce_output_budget(
     let RequestType::Chat(request) = request_type else {
         return Ok(());
     };
-    if ProviderProfile::for_model(&request.model) != ProviderProfile::Zai {
+    if !ProviderProfile::for_model(&request.model).enforces_output_budget() {
         return Ok(());
     }
     let Some(limit) = selection_context_length(workers, model_id) else {
@@ -205,6 +205,21 @@ mod tests {
     fn a_zai_budget_beyond_the_window_is_a_400_context_length_exceeded() {
         assert_rejected(enforce_output_budget(
             &chat("glm-5.3-flash", Some(10_000_000)),
+            &single(Some(131_072)),
+            MODEL,
+        ));
+        // The preferred spelling counts the same, and wins over max_tokens.
+        let mut body = serde_json::json!({
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 131_073,
+            "max_tokens": 16
+        });
+        let request = RequestType::Chat(Arc::new(
+            serde_json::from_value(body.take()).expect("chat request deserializes"),
+        ));
+        assert_rejected(enforce_output_budget(
+            &request,
             &single(Some(131_072)),
             MODEL,
         ));
