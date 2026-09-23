@@ -137,9 +137,6 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             warn!("Error transforming SSE stream: {}", e);
             utils::send_error_sse(&tx, &e, "stream_error").await;
         }
-
-        // Send final [DONE] event
-        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
     });
 
     // Build SSE response with transformed stream
@@ -404,9 +401,13 @@ impl StreamingResponseAccumulator {
         // Add tool calls
         output.extend(self.tool_calls.into_iter().map(|mut item| {
             if let ResponseOutputItem::FunctionToolCall {
-                name, namespace, ..
+                name,
+                namespace,
+                status,
+                ..
             } = &mut item
             {
+                *status = "completed".to_string();
                 (*name, *namespace) =
                     resolve_function_identity(self.original_request.tools.as_deref(), name);
             }
@@ -425,7 +426,7 @@ impl StreamingResponseAccumulator {
                     reason: IncompleteReason::MaxOutputTokens,
                 }),
             ),
-            Some("tool_calls") => (ResponseStatus::InProgress, None),
+            Some("tool_calls") => (ResponseStatus::Completed, None),
             Some("failed") | Some("error") => (ResponseStatus::Failed, None),
             _ => (ResponseStatus::Completed, None),
         };
@@ -501,9 +502,6 @@ pub(super) fn execute_tool_loop_streaming(
             warn!("Streaming tool loop error: {}", e);
             utils::send_error_sse(&tx, &e, "tool_loop_error").await;
         }
-
-        // Send [DONE]
-        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
     });
 
     // Build SSE response
@@ -1199,5 +1197,28 @@ mod tests {
         assert_eq!(wire["output"][0]["name"], "lookup");
         assert_eq!(wire["output"][0]["namespace"], "weather");
         assert_eq!(wire["output"][0]["arguments"], "{}");
+    }
+    #[test]
+    fn stored_streamed_tool_calls_have_terminal_status() {
+        for (finish_reason, expected_status) in
+            [("tool_calls", "completed"), ("length", "incomplete")]
+        {
+            let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
+            let chunk = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{}"}}
+                ]},"finish_reason":finish_reason}]
+            })).unwrap();
+            accumulator.process_chunk(&chunk);
+            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
+            assert_eq!(wire["status"], expected_status);
+            assert_eq!(wire["output"][0]["status"], "completed");
+            assert_eq!(wire["output"][0]["call_id"], "call_weather");
+            assert_eq!(wire["output"][0]["arguments"], "{}");
+            if finish_reason == "length" {
+                assert_eq!(wire["incomplete_details"]["reason"], "max_output_tokens");
+            }
+        }
     }
 }

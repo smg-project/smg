@@ -890,7 +890,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Close the in-flight reasoning item, if any: `reasoning_text.done`
-    /// followed by `output_item.done` carrying the full text.
+    /// followed by `content_part.done` and `output_item.done` with the full text.
     async fn close_reasoning_item(&mut self, tx: &SseSender) -> Result<(), String> {
         let Some(reasoning) = self.reasoning_item.take() else {
             return Ok(());
@@ -900,6 +900,15 @@ impl ResponseStreamEventEmitter {
             &reasoning.item_id,
             &reasoning.text,
         );
+        self.send_event(&event, tx).await?;
+        let event = json!({
+            "type": "response.content_part.done",
+            "sequence_number": self.next_sequence(),
+            "output_index": reasoning.output_index,
+            "item_id": reasoning.item_id,
+            "content_index": 0,
+            "part": { "type": "reasoning_text", "text": reasoning.text }
+        });
         self.send_event(&event, tx).await?;
 
         let mut item = json!({
@@ -999,6 +1008,15 @@ impl ResponseStreamEventEmitter {
                         "status": "in_progress"
                     });
                     let event = self.emit_output_item_added(output_index, &item);
+                    self.send_event(&event, tx).await?;
+                    let event = json!({
+                        "type": "response.content_part.added",
+                        "sequence_number": self.next_sequence(),
+                        "output_index": output_index,
+                        "item_id": item_id,
+                        "content_index": 0,
+                        "part": { "type": "reasoning_text", "text": "" }
+                    });
                     self.send_event(&event, tx).await?;
                     self.reasoning_item = Some(ReasoningStreamItem {
                         output_index,
@@ -1513,9 +1531,11 @@ mod process_chunk_tests {
             types(&events),
             [
                 "response.output_item.added",
+                "response.content_part.added",
                 "response.reasoning_text.delta",
                 "response.reasoning_text.delta",
                 "response.reasoning_text.done",
+                "response.content_part.done",
                 "response.output_item.done",
                 "response.output_item.added",
                 "response.function_call_arguments.delta",
@@ -1524,6 +1544,16 @@ mod process_chunk_tests {
                 "response.output_item.done",
             ]
         );
+        assert_eq!(
+            events[1]["part"],
+            json!({"type": "reasoning_text", "text": ""})
+        );
+        assert_eq!(events[5]["part"], output[0]["content"][0]);
+        for event in &events[1..6] {
+            assert_eq!(event["item_id"], output[0]["id"]);
+            assert_eq!(event["output_index"], 0);
+            assert_eq!(event["content_index"], 0);
+        }
         let seq: Vec<u64> = events
             .iter()
             .map(|e| e["sequence_number"].as_u64().unwrap())
@@ -1545,9 +1575,9 @@ mod process_chunk_tests {
         assert_eq!(output[1]["arguments"], "{\"city\":\"Paris\"}");
         assert_eq!(output[1]["status"], "completed");
         // Each output_item.done carries the item response.completed reports.
-        assert_eq!(events[4]["item"], output[0]);
-        assert_eq!(events[9]["item"], output[1]);
-        assert_eq!(events[8]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(events[6]["item"], output[0]);
+        assert_eq!(events[11]["item"], output[1]);
+        assert_eq!(events[10]["arguments"], "{\"city\":\"Paris\"}");
     }
 
     #[tokio::test]
@@ -1601,8 +1631,10 @@ mod process_chunk_tests {
             types(&events),
             [
                 "response.output_item.added",
+                "response.content_part.added",
                 "response.reasoning_text.delta",
                 "response.reasoning_text.done",
+                "response.content_part.done",
                 "response.output_item.done",
                 "response.output_item.added",
                 "response.content_part.added",
@@ -1613,10 +1645,52 @@ mod process_chunk_tests {
                 "response.output_item.done",
             ]
         );
+        assert_eq!(events[1]["part"]["type"], "reasoning_text");
+        assert_eq!(events[4]["part"], output[0]["content"][0]);
+        assert_eq!(events[7]["part"]["type"], "output_text");
+        assert_eq!(events[11]["part"], output[1]["content"][0]);
+        assert_eq!(events[1]["item_id"], output[0]["id"]);
+        assert_eq!(events[7]["item_id"], output[1]["id"]);
         assert_eq!(output[0]["type"], "reasoning");
         assert!(output[0].get("encrypted_content").is_none());
         assert_eq!(output[1]["type"], "message");
         assert_eq!(output[1]["content"][0]["text"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn reasoning_truncation_closes_content_part_before_incomplete() {
+        let (events, terminal) = stream_with_terminal(
+            json!({"model": "test-model", "input": "hi"}),
+            &[
+                chunk(json!({"reasoning_content": "still thinking"}), None),
+                chunk(json!({}), Some("length")),
+            ],
+        )
+        .await;
+        assert_eq!(
+            types(&events),
+            [
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert_eq!(
+            terminal["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(
+            events[4]["part"],
+            json!({"type": "reasoning_text", "text": "still thinking"})
+        );
+        assert_eq!(events[4]["part"], events[5]["item"]["content"][0]);
+        assert_eq!(events[1]["item_id"], events[4]["item_id"]);
+        assert_eq!(events[5]["item"], terminal["response"]["output"][0]);
     }
 
     #[tokio::test]

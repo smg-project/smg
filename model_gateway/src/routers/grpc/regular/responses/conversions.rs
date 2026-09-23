@@ -610,8 +610,8 @@ pub(crate) fn chat_to_responses(
                 name,
                 namespace,
                 arguments: tool_call.function.arguments.clone().unwrap_or_default(),
-                output: None, // Tool hasn't been executed yet
-                status: "in_progress".to_string(),
+                output: None, // Tool execution belongs to the next turn.
+                status: "completed".to_string(),
             });
         }
     }
@@ -627,7 +627,7 @@ pub(crate) fn chat_to_responses(
                 reason: IncompleteReason::MaxOutputTokens,
             }),
         ),
-        Some("tool_calls") => (ResponseStatus::InProgress, None), // Waiting for tool execution
+        Some("tool_calls") => (ResponseStatus::Completed, None),
         Some("failed") | Some("error") => (ResponseStatus::Failed, None),
         _ => (ResponseStatus::Completed, None), // Default to completed
     };
@@ -1014,5 +1014,29 @@ mod tests {
             "weather.lookup"
         );
         assert_eq!(wire["tools"][0]["function"]["name"], "weather.lookup");
+    }
+    #[test]
+    fn generated_tool_calls_complete_the_response_without_executing_tools() {
+        let request = ResponsesRequest::default();
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{}"}},
+                {"id":"call_time","type":"function","function":{"name":"time","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"}]
+        })).unwrap();
+        let wire = serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+        assert_eq!(wire["status"], "completed");
+        assert_eq!(wire["output"].as_array().unwrap().len(), 2);
+        for (item, call_id) in wire["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(["call_weather", "call_time"])
+        {
+            assert_eq!(item["status"], "completed");
+            assert_eq!(item["call_id"], call_id);
+            assert_eq!(item["arguments"], "{}");
+        }
     }
 }
