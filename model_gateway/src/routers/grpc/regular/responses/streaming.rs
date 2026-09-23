@@ -42,8 +42,9 @@ use uuid::Uuid;
 
 use super::{
     common::{
-        build_next_request, convert_mcp_tools_to_chat_tools, extract_all_tool_calls_from_chat,
-        prepare_chat_tools_and_choice, ExtractedToolCall, ResponsesCallContext, ToolLoopState,
+        apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
+        extract_all_tool_calls_from_chat, prepare_chat_tools_and_choice, ExtractedToolCall,
+        McpToolCallLimit, ResponsesCallContext, ToolLoopState,
     },
     conversions,
 };
@@ -614,6 +615,11 @@ async fn execute_tool_loop_streaming_internal(
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
         if state.iteration > DEFAULT_MAX_ITERATIONS {
+            // Reaching an equal user cap is still normal completion, even
+            // when no further model iteration is allowed by the safety guard.
+            if max_tool_calls.is_some_and(|limit| state.total_calls >= limit) {
+                break None;
+            }
             break Some(
                 json!({"code": "max_tool_calls_exceeded", "message": format!("Tool loop exceeded maximum iterations ({DEFAULT_MAX_ITERATIONS})")}),
             );
@@ -691,7 +697,7 @@ async fn execute_tool_loop_streaming_internal(
             );
 
             // Separate MCP and function tool calls using session-exposed names.
-            let (mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
+            let (mut mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
                 tool_calls
                     .into_iter()
                     .partition(|tc| session.has_exposed_tool(tc.name.as_str()));
@@ -702,26 +708,8 @@ async fn execute_tool_loop_streaming_internal(
                 function_tool_calls.len()
             );
 
-            // Check combined limit (only count MCP tools since function tools will be returned)
-            let effective_limit = match max_tool_calls {
-                Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
-                None => DEFAULT_MAX_ITERATIONS,
-            };
-
-            if state.total_calls + mcp_tool_calls.len() > effective_limit {
-                warn!(
-                    "Reached tool call limit: {} + {} > {} (max_tool_calls={:?}, safety_limit={})",
-                    state.total_calls,
-                    mcp_tool_calls.len(),
-                    effective_limit,
-                    max_tool_calls,
-                    DEFAULT_MAX_ITERATIONS
-                );
-                // Reaching the processing cap ignores further calls; it is not
-                // a failed generation. The iteration safety guard above still
-                // terminates runaway loops with a failed response.
-                break None;
-            }
+            let tool_call_limit =
+                apply_mcp_tool_call_limit(&mut mcp_tool_calls, state.total_calls, max_tool_calls);
 
             // Process each MCP tool call
             for tool_call in mcp_tool_calls {
@@ -915,6 +903,16 @@ async fn execute_tool_loop_streaming_internal(
                     output_item,
                     success,
                 );
+            }
+
+            if let Some(limit) = tool_call_limit {
+                break match limit {
+                    McpToolCallLimit::User => None,
+                    McpToolCallLimit::Safety => Some(json!({
+                        "code": "max_tool_calls_exceeded",
+                        "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
+                    })),
+                };
             }
 
             // process_chunk already emitted these function-call items.

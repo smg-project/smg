@@ -31,14 +31,23 @@ const MODEL: &str = "responses-stream-contract-model";
     clippy::disallowed_methods,
     reason = "test helper: failures should panic; the in-process worker is aborted after the request"
 )]
-async fn responses_events_with_output(
+async fn responses_result_with_output(
     tools: Value,
     output: Option<&str>,
     max_tool_calls: Option<u32>,
     expected_status: &str,
-) -> Vec<Value> {
+    stream: bool,
+) -> (Value, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let output_chunks = output.map(|text| {
+        text.split_inclusive("</tool_call>")
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    let output_tokens = output_chunks.as_ref().map_or(2, |chunks| {
+        u32::try_from(chunks.len() + 1).expect("scripted output fits in the worker token count")
+    });
     let worker_config = Arc::new(mock_worker::config::Config {
         host: "127.0.0.1".to_string(),
         http_base_port: 0,
@@ -51,7 +60,7 @@ async fn responses_events_with_output(
         model_id: MODEL.to_string(),
         tokenizer_path: MODEL.to_string(),
         gen_delay: Duration::ZERO,
-        output_tokens: 2,
+        output_tokens,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
     });
@@ -86,8 +95,11 @@ async fn responses_events_with_output(
     if output.is_some() {
         config.tool_call_parser = Some("qwen".into());
     }
-    let tokenizer: Arc<dyn Tokenizer> = match output {
-        Some(text) => Arc::new(scripted_tokenizer::ScriptedTokenizer::new(text)),
+    let tokenizer: Arc<dyn Tokenizer> = match output_chunks {
+        Some(chunks) if chunks.len() > 1 => {
+            Arc::new(scripted_tokenizer::ScriptedTokenizer::from_chunks(chunks))
+        }
+        Some(chunks) => Arc::new(scripted_tokenizer::ScriptedTokenizer::new(&chunks.concat())),
         None => Arc::new(MockTokenizer::new()),
     };
     tokenizers
@@ -104,7 +116,7 @@ async fn responses_events_with_output(
     let router = RouterFactory::create_router(&context).await.unwrap();
     let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let request = serde_json::from_value(json!({
-        "model": MODEL, "input": "Hello", "stream": true, "store": false,
+        "model": MODEL, "input": "Hello", "stream": stream, "store": false,
         "max_output_tokens": 16, "tools": tools, "max_tool_calls": max_tool_calls,
     }))
     .unwrap();
@@ -124,6 +136,11 @@ async fn responses_events_with_output(
         "{}",
         String::from_utf8_lossy(&bytes)
     );
+    if !stream {
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["status"], expected_status, "{response}");
+        return (response, vec![]);
+    }
     assert_eq!(
         content_type
             .unwrap()
@@ -163,7 +180,18 @@ async fn responses_events_with_output(
         .windows(2)
         .all(|pair| pair[0]["sequence_number"].as_u64().unwrap()
             < pair[1]["sequence_number"].as_u64().unwrap()));
-    events
+    (events.last().unwrap()["response"].clone(), events)
+}
+
+async fn responses_events_with_output(
+    tools: Value,
+    output: Option<&str>,
+    max_tool_calls: Option<u32>,
+    expected_status: &str,
+) -> Vec<Value> {
+    responses_result_with_output(tools, output, max_tool_calls, expected_status, true)
+        .await
+        .1
 }
 
 async fn responses_events(tools: Value) -> Vec<Value> {
@@ -257,4 +285,131 @@ async fn mcp_iteration_safety_limit_emits_failed_terminal_response() {
         .unwrap()
         .contains("maximum iterations"));
     assert!(terminal["response"]["incomplete_details"].is_null());
+}
+
+/// Exercise the same generated MCP batch through both regular Responses paths.
+async fn mcp_cap_response(
+    stream: bool,
+    cap: Option<u32>,
+    batch_size: usize,
+    expected_status: &str,
+) -> Result<Value, Box<dyn Error + Send + Sync>> {
+    let mut mcp = common::mock_mcp_server::MockMCPServer::start().await?;
+    let output: String = (0..batch_size)
+        .map(|index| {
+            let call =
+                json!({"name":"brave_web_search","arguments":{"query":format!("query-{index}")}});
+            format!("<tool_call>\n{call}\n</tool_call>\n")
+        })
+        .collect();
+    let (response, _) = responses_result_with_output(
+        json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+        Some(&output), cap, expected_status, stream,
+    ).await;
+    mcp.stop().await;
+    Ok(response)
+}
+
+/// Check retained MCP results, including which calls from each batch ran.
+fn assert_executed_mcp_queries(response: &Value, expected: &[&str]) {
+    assert!(response["output"].is_array(), "{response}");
+    let calls: Vec<_> = response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "mcp_call")
+        .collect();
+    assert_eq!(calls.len(), expected.len(), "{response}");
+    for (call, expected_query) in calls.into_iter().zip(expected) {
+        assert_eq!(call["name"], "brave_web_search");
+        assert_eq!(call["status"], "completed");
+        assert!(
+            call["arguments"].as_str().is_some_and(|args| {
+                serde_json::from_str::<Value>(args)
+                    .is_ok_and(|args| args["query"] == *expected_query)
+            }),
+            "expected {expected_query}: {response}"
+        );
+        assert!(
+            call["output"].as_str().is_some_and(
+                |result| result.contains(&format!("Mock search results for: {expected_query}"))
+            ),
+            "expected {expected_query}: {response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_cap_zero_completes_in_both_response_modes() {
+    for stream in [false, true] {
+        let response = mcp_cap_response(stream, Some(0), 1, "completed")
+            .await
+            .unwrap();
+        assert!(response["error"].is_null());
+        assert!(response["incomplete_details"].is_null());
+        assert_executed_mcp_queries(&response, &[]);
+    }
+}
+
+#[tokio::test]
+async fn mcp_cap_preserves_previous_results_in_both_response_modes() {
+    for stream in [false, true] {
+        let response = mcp_cap_response(stream, Some(1), 1, "completed")
+            .await
+            .unwrap();
+        assert!(response["error"].is_null());
+        assert_executed_mcp_queries(&response, &["query-0"]);
+    }
+}
+
+#[tokio::test]
+async fn mcp_cap_executes_allowed_prefix_of_parallel_batch() {
+    for stream in [true, false] {
+        let response = mcp_cap_response(stream, Some(2), 3, "completed")
+            .await
+            .unwrap();
+        assert!(response["error"].is_null());
+        assert_executed_mcp_queries(&response, &["query-0", "query-1"]);
+    }
+}
+
+#[tokio::test]
+async fn mcp_cap_applies_remaining_budget_to_later_batches() {
+    for stream in [false, true] {
+        let response = mcp_cap_response(stream, Some(3), 2, "completed")
+            .await
+            .unwrap();
+        assert!(response["error"].is_null());
+        assert_executed_mcp_queries(&response, &["query-0", "query-1", "query-0"]);
+    }
+}
+
+#[tokio::test]
+async fn mcp_cap_at_internal_limit_still_completes_normally() {
+    for stream in [true, false] {
+        let response = mcp_cap_response(stream, Some(10), 1, "completed")
+            .await
+            .unwrap();
+        assert!(response["error"].is_null());
+        assert_executed_mcp_queries(&response, &["query-0"; 10]);
+    }
+}
+
+#[tokio::test]
+async fn mcp_cap_cannot_disable_internal_safety_limit() {
+    for stream in [false, true] {
+        for cap in [None, Some(20)] {
+            for batch_size in [1, 12] {
+                let response = mcp_cap_response(stream, cap, batch_size, "failed")
+                    .await
+                    .unwrap();
+                assert_eq!(response["error"]["code"], "max_tool_calls_exceeded");
+                let queries: Vec<_> = (0..10)
+                    .map(|index| format!("query-{}", index % batch_size))
+                    .collect();
+                let expected: Vec<_> = queries.iter().map(String::as_str).collect();
+                assert_executed_mcp_queries(&response, &expected);
+            }
+        }
+    }
 }

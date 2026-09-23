@@ -24,7 +24,10 @@ use tracing::{debug, warn};
 use crate::{
     middleware::TenantRequestMeta,
     routers::{
-        common::{openai_bridge, persistence_utils::split_stored_message_content},
+        common::{
+            mcp_utils::DEFAULT_MAX_ITERATIONS, openai_bridge,
+            persistence_utils::split_stored_message_content,
+        },
         error,
         grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
     },
@@ -127,6 +130,41 @@ pub(super) struct ExtractedToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: String,
+}
+
+/// Why a generated MCP batch must stop after its permitted calls execute.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum McpToolCallLimit {
+    User,
+    Safety,
+}
+
+/// Keep the prefix of MCP calls that fits the remaining request budget.
+///
+/// A batch that fits may continue to a final model answer. An overflowing
+/// batch executes its permitted prefix, then stops normally for a user cap
+/// or fails for the internal safety cap. A user cap wins when both are equal.
+pub(super) fn apply_mcp_tool_call_limit(
+    calls: &mut Vec<ExtractedToolCall>,
+    total_calls: usize,
+    max_tool_calls: Option<usize>,
+) -> Option<McpToolCallLimit> {
+    let effective_limit = max_tool_calls
+        .unwrap_or(DEFAULT_MAX_ITERATIONS)
+        .min(DEFAULT_MAX_ITERATIONS);
+    let remaining = effective_limit.saturating_sub(total_calls);
+    if calls.len() <= remaining {
+        return None;
+    }
+
+    calls.truncate(remaining);
+    Some(
+        if max_tool_calls.is_some_and(|limit| limit <= DEFAULT_MAX_ITERATIONS) {
+            McpToolCallLimit::User
+        } else {
+            McpToolCallLimit::Safety
+        },
+    )
 }
 
 /// Extract all tool calls from chat response (for parallel tool call support)
