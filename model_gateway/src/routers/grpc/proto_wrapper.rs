@@ -1274,8 +1274,16 @@ pub enum ProtoGenerateRequest {
 }
 
 /// Per-item grid metadata the engine reads to compute M-RoPE positions
-/// (`_get_mrope_input_positions` in vLLM); a few ints per item.
-const VLLM_MROPE_GRID_KEYS: [&str; 3] = ["image_grid_thw", "video_grid_thw", "second_per_grid_ts"];
+/// (`_get_mrope_input_positions` in vLLM); a few ints per item. The video
+/// timing has two spellings: `second_per_grid_ts` from the Qwen-VL
+/// processors, `video_second_per_grid` from the Qwen-Omni family and this
+/// gateway's own processors. The servicer's `GRID_KEYS` mirrors this list.
+const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
+    "image_grid_thw",
+    "video_grid_thw",
+    "second_per_grid_ts",
+    "video_second_per_grid",
+];
 
 impl ProtoGenerateRequest {
     /// Append stop token ids to the request's sampling params (TRT-LLM keeps
@@ -1522,16 +1530,13 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Clone for a PD decode leg on a language-model-only decode worker (no
-    /// vision encoder, encoder-cache budget 0 — the production vLLM P/D
-    /// shape). The prefill-expanded `input_ids` and the KV handoff stay, but
-    /// every multimodal payload beyond the content hashes goes: pixels,
-    /// placeholders, grid tensors and media references. The decode engine
-    /// then sees a pure-text TokensPrompt and never touches its (zero-budget)
-    /// encoder cache, mirroring the Dynamo P/D contract; the kept hashes ride
-    /// into `cache_salt` servicer-side so different images cannot alias in
-    /// the decode prefix cache. Non-vLLM backends have no language-model-only
-    /// mode, so they take the pixel-stripping clone.
+    /// Clone for a PD decode leg on a `--language-model-only` decode worker
+    /// (no vision encoder, encoder-cache budget 0): the prefill-expanded
+    /// `input_ids` and the KV handoff stay, every multimodal payload beyond
+    /// the content hashes goes, so the engine sees a text prompt. The
+    /// servicer folds the kept hashes into `cache_salt`, keeping different
+    /// images apart in the decode prefix cache. Non-vLLM backends have no
+    /// such mode and take the pixel-stripping clone.
     pub fn clone_without_mm(&mut self) -> Self {
         match self {
             Self::Vllm(req) => {
@@ -1660,16 +1665,24 @@ impl ProtoGenerateRequest {
     /// Replace this vLLM request's media references with the identity the
     /// prefill leg produced: the expanded prompt ids and the pixel-less
     /// per-modality inputs, in the shape a router-preprocessed decode leg has.
-    pub fn apply_media_identity(&mut self, identity: &vllm::MediaIdentity) {
+    /// Applied whole or not at all: an identity without ids, or a leg whose
+    /// input is not tokenized, leaves the leg as it is (`false`), so it
+    /// reprocesses the references rather than run an empty prompt.
+    pub fn apply_media_identity(&mut self, identity: &vllm::MediaIdentity) -> bool {
         let Self::Vllm(req) = self else {
-            return;
+            return false;
         };
-        if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() {
-            tokenized.input_ids.clone_from(&identity.prompt_token_ids);
+        let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() else {
+            return false;
+        };
+        if identity.prompt_token_ids.is_empty() {
+            return false;
         }
+        tokenized.input_ids.clone_from(&identity.prompt_token_ids);
         req.mm_inputs.clone_from(&identity.mm_inputs);
         req.extra_mm_inputs.clone_from(&identity.extra_mm_inputs);
         req.media_refs = None;
+        true
     }
 
     /// Number of parallel samples requested (1 when unset). vLLM, SGLang

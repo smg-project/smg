@@ -175,13 +175,22 @@ fn apply_prefill_media_identity(
     if !handed_off || !relay_kv_params || !decode_request.has_vllm_media_refs() {
         return;
     }
-    match identity {
+    let applied = match identity {
         Some(identity) => decode_request.apply_media_identity(identity),
-        None if solicited => warn!(
+        None if solicited => {
+            warn!(
+                request_id = %decode_request.request_id(),
+                "prefill worker returned no media identity; decode leg will reprocess media"
+            );
+            return;
+        }
+        None => return,
+    };
+    if !applied {
+        warn!(
             request_id = %decode_request.request_id(),
-            "prefill worker returned no media identity; decode leg will reprocess media"
-        ),
-        None => {}
+            "prefill worker's media identity is unusable; decode leg will reprocess media"
+        );
     }
 }
 
@@ -1027,25 +1036,19 @@ async fn execute_sequential_pd(
     // Decode normally reuses the request minus pixels: it receives KV via
     // the P/D transfer, and prefill reads and unlinks any /dev/shm
     // segments, so a reused ShmHandle would be unreadable. Same request_id
-    // on both legs is load-bearing for NIXL P/D correlation on vLLM <
-    // 0.13. The pixel-free leg is the clone, so pixel tensors are never
-    // duplicated and die with the prefill send; the per-image mm identity
-    // and grid tensors survive for decode-side hashing and positions.
-    // Media references are resolved by the prefill leg and relayed to
-    // decode as that same identity once prefill completes.
-    // Without a KV handoff (n>1) decode recomputes the prompt locally and
-    // must run the vision encoder, so that leg keeps the full multimodal
-    // payload (SHM-backed tensors cannot serve both legs and fail loudly
-    // on the decode read).
+    // on both legs is load-bearing for NIXL P/D correlation. The pixel-free
+    // leg is the clone, so pixel tensors are never duplicated and die with
+    // the prefill send; the per-image mm identity and grid tensors survive
+    // for decode-side hashing and positions. Media references are resolved
+    // by the prefill leg and relayed to decode as that same identity once
+    // prefill completes. Without a KV handoff (n>1) decode recomputes the
+    // prompt locally and must run the vision encoder, so that leg keeps the
+    // full multimodal payload.
     //
-    // A decode worker started with `--language-model-only` (the production
-    // vLLM P/D shape — Dynamo pairs the same way) has no vision encoder and
-    // an encoder-cache budget of 0, so even the identity payload fails to
-    // schedule there. Its model info reports supports_vision=false; for such
-    // a worker the decode leg is stripped down to the Dynamo contract: the
-    // prefill-expanded input_ids, the KV handoff, and the per-image content
-    // hashes that the servicer folds into cache_salt so different images
-    // cannot alias in the decode prefix cache.
+    // A `--language-model-only` decode worker (supports_vision=false) has no
+    // vision encoder and an encoder-cache budget of 0, so even the identity
+    // payload fails to schedule there: its leg keeps the prefill-expanded
+    // input_ids, the KV handoff and the content hashes only.
     let decode_language_model_only = proto_request.is_vllm()
         && workers
             .decode_worker()
@@ -1821,6 +1824,39 @@ mod tests {
         assert_eq!(tokenized.original_text, "describe <|image|>");
     }
 
+    /// An identity the leg cannot take, empty ids or a leg that is not
+    /// tokenized, leaves the references in place: better a reprocessed
+    /// decode than an empty prompt.
+    #[test]
+    fn an_unusable_identity_leaves_the_decode_leg_untouched() {
+        let mut empty = identity();
+        empty.prompt_token_ids.clear();
+        let mut decode = media_refs_request("empty", 1).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&empty));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+
+        let mut decode = media_refs_request("text", 1).clone_without_mm_pixels();
+        if let ProtoGenerateRequest::Vllm(request) = &mut decode {
+            request.input = Some(vllm::generate_request::Input::Text(
+                "describe <|image|>".to_string(),
+            ));
+        }
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+        assert!(matches!(
+            request.input,
+            Some(vllm::generate_request::Input::Text(_))
+        ));
+    }
+
     /// An older servicer returns no identity: the decode leg keeps its
     /// references and reprocesses, as before; the same when no identity was
     /// asked for (a prefill request without KV params).
@@ -1853,7 +1889,10 @@ mod tests {
                     ("aspect_ratios".to_string(), grid.clone()),
                     // Flat-classified grid keys keep their sizes tensor.
                     ("second_per_grid_ts".to_string(), grid.clone()),
-                    ("ts_sizes".to_string(), grid),
+                    ("ts_sizes".to_string(), grid.clone()),
+                    // The Omni family's and the router's own spelling of the
+                    // video timing.
+                    ("video_second_per_grid".to_string(), grid),
                 ]),
                 flat_keys: std::collections::HashMap::from([(
                     "second_per_grid_ts".to_string(),
@@ -1887,7 +1926,7 @@ mod tests {
             original_mm.pixel_values.is_some(),
             "prefill leg keeps pixels"
         );
-        assert_eq!(original_mm.model_specific_tensors.len(), 5);
+        assert_eq!(original_mm.model_specific_tensors.len(), 6);
         assert_eq!(original_mm.batched_keys.len(), 3);
         let decode_mm = decode.mm_inputs.expect("decode leg keeps identity");
         assert!(
@@ -1898,7 +1937,12 @@ mod tests {
         decode_keys.sort();
         assert_eq!(
             decode_keys,
-            vec!["image_grid_thw", "second_per_grid_ts", "ts_sizes"]
+            vec![
+                "image_grid_thw",
+                "second_per_grid_ts",
+                "ts_sizes",
+                "video_second_per_grid"
+            ]
         );
         assert_eq!(decode_mm.batched_keys, vec!["image_grid_thw".to_string()]);
         assert_eq!(
