@@ -19,12 +19,17 @@ use openai_protocol::{
     rerank::RerankRequest,
     responses::ResponsesRequest,
 };
-use serde::Serialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{
+    json,
+    value::{to_raw_value, RawValue},
+    Value,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
+use super::request_body::RawBody;
 use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
@@ -44,7 +49,6 @@ use crate::{
             overload,
             placement::{self, PairFailure, PlacementFailure, PlacementInputs},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
-            request_to_value,
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
             sse::{SseEncoder, SSE_CHANNEL_BUFFER},
@@ -96,6 +100,14 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     model_id: &'a str,
     headers: Option<HeaderMap>,
+}
+
+/// The bootstrap rendezvous an SGLang prefill worker hands out for one
+/// request, as the raw JSON values both legs carry.
+struct BootstrapFields {
+    host: Box<RawValue>,
+    port: Box<RawValue>,
+    room: Box<RawValue>,
 }
 
 impl PDRouter {
@@ -270,68 +282,64 @@ impl PDRouter {
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
 
-    fn inject_bootstrap_into_value(
-        mut original: Value,
+    /// The bootstrap rendezvous for one request, generated once so both legs
+    /// carry the same rooms: one value per prompt for a batch, scalars
+    /// otherwise.
+    fn bootstrap_fields(
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
-    ) -> Result<Value, String> {
-        let obj = original
-            .as_object_mut()
-            .ok_or_else(|| "Request must be a JSON object".to_string())?;
-
-        if let Some(n) = batch_size {
-            let mut hosts = Vec::with_capacity(n);
-            let mut ports = Vec::with_capacity(n);
-            let mut rooms = Vec::with_capacity(n);
-            for _ in 0..n {
-                hosts.push(prefill_worker.bootstrap_host());
-                ports.push(prefill_worker.bootstrap_port());
-                rooms.push(super::pd_types::generate_room_id());
+    ) -> serde_json::Result<BootstrapFields> {
+        let host = prefill_worker.bootstrap_host();
+        let port = prefill_worker.bootstrap_port();
+        match batch_size {
+            Some(n) => {
+                let rooms: Vec<u64> = (0..n)
+                    .map(|_| super::pd_types::generate_room_id())
+                    .collect();
+                Ok(BootstrapFields {
+                    host: to_raw_value(&vec![host; n])?,
+                    port: to_raw_value(&vec![port; n])?,
+                    room: to_raw_value(&rooms)?,
+                })
             }
-            obj.insert(
-                Self::BOOTSTRAP_HOST_KEY.to_string(),
-                Value::Array(hosts.into_iter().map(Value::from).collect()),
-            );
-            obj.insert(
-                Self::BOOTSTRAP_PORT_KEY.to_string(),
-                Value::Array(
-                    ports
-                        .into_iter()
-                        .map(|p| match p {
-                            Some(v) => Value::from(v),
-                            None => Value::Null,
-                        })
-                        .collect(),
-                ),
-            );
-            obj.insert(
-                Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::Array(rooms.into_iter().map(Value::from).collect()),
-            );
-        } else {
-            obj.insert(
-                Self::BOOTSTRAP_HOST_KEY.to_string(),
-                Value::from(prefill_worker.bootstrap_host()),
-            );
-            obj.insert(
-                Self::BOOTSTRAP_PORT_KEY.to_string(),
-                match prefill_worker.bootstrap_port() {
-                    Some(v) => Value::from(v),
-                    None => Value::Null,
-                },
-            );
-            obj.insert(
-                Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::from(super::pd_types::generate_room_id()),
-            );
+            None => Ok(BootstrapFields {
+                host: to_raw_value(host)?,
+                port: to_raw_value(&port)?,
+                room: to_raw_value(&super::pd_types::generate_room_id())?,
+            }),
         }
-        Ok(original)
     }
 
-    fn inject_dp_rank_to_json(json_val: &mut Value, rank: isize, rank_key: &str) {
-        if let Some(obj) = json_val.as_object_mut() {
-            obj.insert(rank_key.to_string(), Value::Number(rank.into()));
+    fn inject_bootstrap(body: &mut RawBody<'_>, fields: BootstrapFields) {
+        body.insert(Self::BOOTSTRAP_HOST_KEY, fields.host);
+        body.insert(Self::BOOTSTRAP_PORT_KEY, fields.port);
+        body.insert(Self::BOOTSTRAP_ROOM_KEY, fields.room);
+    }
+
+    fn inject_dp_rank(
+        body: &mut RawBody<'_>,
+        rank: isize,
+        rank_key: &str,
+    ) -> serde_json::Result<()> {
+        body.insert(rank_key, to_raw_value(&rank)?);
+        Ok(())
+    }
+
+    /// The `kv_transfer_params` a prefill response carries, if any. A
+    /// missing field and `null` both mean the engine returned nothing to
+    /// relay. The slice is forwarded as the engine wrote it, so the rest of
+    /// the response is never materialized.
+    fn harvest_kv_transfer_params(prefill_bytes: &[u8]) -> Option<Box<RawValue>> {
+        #[derive(Deserialize)]
+        struct Handoff<'a> {
+            #[serde(borrow)]
+            kv_transfer_params: Option<&'a RawValue>,
         }
+        serde_json::from_slice::<Handoff>(prefill_bytes)
+            .ok()?
+            .kv_transfer_params
+            .filter(|params| params.get() != "null")
+            .map(ToOwned::to_owned)
     }
 
     async fn execute_dual_dispatch<T: Serialize>(
@@ -517,37 +525,46 @@ impl PDRouter {
             };
             let legs =
                 lease.serialize_legs_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
-                    let mut json_request = request_to_value(view.request, raw_body_len)
-                        .map_err(|e| Box::new(Self::handle_serialization_error(e)))?;
-                    super::set_request_model(&mut json_request, context.model_id);
+                    let serialization_error =
+                        |e: serde_json::Error| Box::new(Self::handle_serialization_error(e));
+                    let bytes = serialize_json_sized(view.request, raw_body_len)
+                        .map_err(serialization_error)?;
+                    let mut body = RawBody::parse(&bytes).map_err(serialization_error)?;
+                    body.set_model(to_raw_value(context.model_id).map_err(serialization_error)?);
 
                     // The KV handoff is single-consumer: with n>1 each fan-out
                     // child on decode would pull, and the first completion
                     // frees the prefill blocks under its siblings.
-                    let relay = Self::sampling_n(&json_request) <= 1;
-                    let mut prefill_json = json_request.clone();
-                    Self::sanitize_prefill_for_kv_handoff(&mut prefill_json, context.route);
+                    let relay = Self::sampling_n(&body) <= 1;
+                    let mut prefill_body = body.clone();
+                    Self::sanitize_prefill_for_kv_handoff(&mut prefill_body, context.route)
+                        .map_err(serialization_error)?;
                     if relay {
                         let params = match (&mode, &transfer_id) {
                             (KvConnectorMode::Nixl, _) => {
-                                serde_json::from_str::<Value>(NIXL_PREFILL_KV_PARAMS).ok()
+                                RawValue::from_string(NIXL_PREFILL_KV_PARAMS.to_owned()).ok()
                             }
                             (KvConnectorMode::Mooncake { .. }, Some(id)) => {
-                                serde_json::from_str::<Value>(&mooncake_prefill_params(id)).ok()
+                                RawValue::from_string(mooncake_prefill_params(id)).ok()
                             }
                             _ => None,
                         };
-                        if let (Some(obj), Some(params)) = (prefill_json.as_object_mut(), params) {
-                            obj.insert("kv_transfer_params".to_string(), params);
+                        if let Some(params) = params {
+                            prefill_body.insert("kv_transfer_params", params);
                         }
                     }
 
-                    Ok((
-                        serialize_json_sized(&prefill_json, raw_body_len)
-                            .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
-                        serialize_json_sized(&json_request, raw_body_len)
-                            .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
-                    ))
+                    let prefill_bytes = prefill_body
+                        .to_bytes(raw_body_len)
+                        .map_err(serialization_error)?;
+                    // The decode leg is the request as serialized unless the
+                    // model id changed.
+                    let decode_bytes = if body.mutated() {
+                        body.to_bytes(raw_body_len).map_err(serialization_error)?
+                    } else {
+                        bytes
+                    };
+                    Ok((prefill_bytes, decode_bytes))
                 });
             let (prefill_body, decode_body) = match legs {
                 Ok(pair) => pair,
@@ -573,24 +590,25 @@ impl PDRouter {
         }
 
         let legs = lease.serialize_legs_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
-            let mut json_request = request_to_value(view.request, raw_body_len)
-                .map_err(|e| Box::new(Self::handle_serialization_error(e)))?;
+            let serialization_error =
+                |e: serde_json::Error| Box::new(Self::handle_serialization_error(e));
+            let bytes =
+                serialize_json_sized(view.request, raw_body_len).map_err(serialization_error)?;
+            // Only a non-object body fails to parse, the shape the bootstrap
+            // injection has always refused.
+            let mut body = RawBody::parse(&bytes).map_err(|e| {
+                Metrics::record_pd_bootstrap_failure();
+                serialization_error(e)
+            })?;
             // The prefill and decode workers only know the canonical name, so
             // forward that, not the alias the client sent.
-            super::set_request_model(&mut json_request, context.model_id);
+            body.set_model(to_raw_value(context.model_id).map_err(serialization_error)?);
+            let bootstrap = Self::bootstrap_fields(prefill.as_ref(), context.batch_size)
+                .map_err(serialization_error)?;
+            Self::inject_bootstrap(&mut body, bootstrap);
 
-            json_request = Self::inject_bootstrap_into_value(
-                json_request,
-                prefill.as_ref(),
-                context.batch_size,
-            )
-            .map_err(|e| {
-                Metrics::record_pd_bootstrap_failure();
-                Self::handle_serialization_error(e)
-            })?;
-
-            let mut prefill_json_request = json_request.clone();
-            let mut decode_json_request = json_request;
+            let mut prefill_body = body.clone();
+            let mut decode_body = body;
 
             let mut prefill_rank = prefill.dp_rank().map(|rank| rank as isize);
             let mut decode_rank = decode.dp_rank().map(|rank| rank as isize);
@@ -623,15 +641,14 @@ impl PDRouter {
             }
 
             if let Some(p_rank) = prefill_rank {
-                Self::inject_dp_rank_to_json(&mut prefill_json_request, p_rank, "routed_dp_rank");
-                Self::inject_dp_rank_to_json(
-                    &mut decode_json_request,
-                    p_rank,
-                    "disagg_prefill_dp_rank",
-                );
+                Self::inject_dp_rank(&mut prefill_body, p_rank, "routed_dp_rank")
+                    .map_err(serialization_error)?;
+                Self::inject_dp_rank(&mut decode_body, p_rank, "disagg_prefill_dp_rank")
+                    .map_err(serialization_error)?;
             }
             if let Some(d_rank) = decode_rank {
-                Self::inject_dp_rank_to_json(&mut decode_json_request, d_rank, "routed_dp_rank");
+                Self::inject_dp_rank(&mut decode_body, d_rank, "routed_dp_rank")
+                    .map_err(serialization_error)?;
             }
             if prefill_rank.is_some() || decode_rank.is_some() {
                 debug!(
@@ -641,10 +658,12 @@ impl PDRouter {
             }
 
             Ok((
-                serialize_json_sized(&prefill_json_request, raw_body_len)
-                    .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
-                serialize_json_sized(&decode_json_request, raw_body_len)
-                    .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
+                prefill_body
+                    .to_bytes(raw_body_len)
+                    .map_err(serialization_error)?,
+                decode_body
+                    .to_bytes(raw_body_len)
+                    .map_err(serialization_error)?,
             ))
         });
         let (prefill_body, decode_body) = match legs {
@@ -979,39 +998,39 @@ impl PDRouter {
     }
 
     /// The request's fan-out factor, read from the serialized body.
-    fn sampling_n(json: &Value) -> u64 {
-        json.get("n").and_then(Value::as_u64).unwrap_or(1)
+    fn sampling_n(body: &RawBody<'_>) -> u64 {
+        body.get("n")
+            .and_then(|n| serde_json::from_str::<u64>(n.get()).ok())
+            .unwrap_or(1)
     }
 
     /// Sanitize the prefill leg for a KV handoff: the prefill engine computes
     /// KV for the prompt and must produce (at most) one token, unstreamed.
     /// The output-cap key is per-endpoint.
-    fn sanitize_prefill_for_kv_handoff(json: &mut Value, route: &str) {
-        let Some(obj) = json.as_object_mut() else {
-            return;
-        };
-        obj.insert("stream".to_string(), Value::Bool(false));
+    fn sanitize_prefill_for_kv_handoff(
+        body: &mut RawBody<'_>,
+        route: &str,
+    ) -> serde_json::Result<()> {
+        let one = || to_raw_value(&1);
+        body.insert("stream", to_raw_value(&false)?);
         // stream_options without stream=true is rejected by strict engines.
-        obj.remove("stream_options");
-        if obj.contains_key("n") {
-            obj.insert("n".to_string(), Value::from(1));
+        body.remove("stream_options");
+        if body.contains("n") {
+            body.insert("n", one()?);
         }
         // A min_tokens floor would force decode-phase work onto the prefill leg.
-        obj.remove("min_tokens");
+        body.remove("min_tokens");
         match route {
             // The engine rejects requests carrying both cap spellings, so
             // overwrite the one the client used.
-            "/v1/chat/completions" if obj.contains_key("max_completion_tokens") => {
-                obj.insert("max_completion_tokens".to_string(), Value::from(1));
-                obj.remove("max_tokens");
+            "/v1/chat/completions" if body.contains("max_completion_tokens") => {
+                body.insert("max_completion_tokens", one()?);
+                body.remove("max_tokens");
             }
-            "/v1/responses" => {
-                obj.insert("max_output_tokens".to_string(), Value::from(1));
-            }
-            _ => {
-                obj.insert("max_tokens".to_string(), Value::from(1));
-            }
+            "/v1/responses" => body.insert("max_output_tokens", one()?),
+            _ => body.insert("max_tokens", one()?),
         }
+        Ok(())
     }
 
     /// vLLM PD over HTTP: send the tagged prefill leg, wait for it, harvest
@@ -1039,14 +1058,14 @@ impl PDRouter {
         let headers = Some(&headers_with_trace);
         let runtime = prefill.metadata().spec.runtime_type.as_str();
 
-        let mut decode_json = match serde_json::from_slice::<Value>(&decode_body) {
-            Ok(json) => json,
+        let decode_leg = match RawBody::parse(&decode_body) {
+            Ok(body) => body,
             Err(e) => return Self::handle_serialization_error(e),
         };
         // The KV handoff is single-consumer, so an n>1 fan-out cannot use it —
         // and without the handoff a prefill leg is pure wasted GPU work plus
         // serial latency. Skip prefill entirely and let decode own the prompt.
-        let relay = Self::sampling_n(&decode_json) <= 1;
+        let relay = Self::sampling_n(&decode_leg) <= 1;
         Metrics::record_pd_kv_connector_mode(mode.metrics_label());
 
         let dispatch_start = Instant::now();
@@ -1123,10 +1142,7 @@ impl PDRouter {
 
             // Harvest the handoff params the prefill engine returned (NIXL and
             // opportunistic passthrough; Mooncake returns nothing and is minted).
-            serde_json::from_slice::<Value>(&prefill_bytes)
-                .ok()
-                .and_then(|json| json.get("kv_transfer_params").cloned())
-                .filter(|params| !params.is_null())
+            Self::harvest_kv_transfer_params(&prefill_bytes)
         } else {
             debug!(
                 "vLLM PD over HTTP: n>1 fan-out cannot consume a KV handoff; \
@@ -1145,8 +1161,7 @@ impl PDRouter {
                 _,
             ) if relay && transfer_id.is_some() => {
                 let id = transfer_id.as_deref().unwrap_or_default();
-                serde_json::from_str::<Value>(&mooncake_decode_params(id, engine_id, host, *port))
-                    .ok()
+                RawValue::from_string(mooncake_decode_params(id, engine_id, host, *port)).ok()
             }
             (KvConnectorMode::Mooncake { .. }, _) => {
                 // Legacy typed host/port injection is a sidecar-proto shape
@@ -1170,14 +1185,19 @@ impl PDRouter {
             }
             _ => None,
         };
-        if let (Some(obj), Some(params)) = (decode_json.as_object_mut(), decode_params) {
-            obj.insert("kv_transfer_params".to_string(), params);
-        }
-        // The leg's own serialized length bounds the reserialization; the
+        // The decode leg goes out as serialized unless the handoff params are
+        // added; then the leg's own length bounds the reserialization and the
         // slack covers the injected kv_transfer_params.
-        let decode_body = match serialize_json_sized(&decode_json, Some(decode_body.len())) {
-            Ok(body) => Bytes::from(body),
-            Err(e) => return Self::handle_serialization_error(e),
+        let decode_body = match decode_params {
+            Some(params) => {
+                let mut decode_leg = decode_leg;
+                decode_leg.insert("kv_transfer_params", params);
+                match decode_leg.to_bytes(Some(decode_body.len())) {
+                    Ok(body) => Bytes::from(body),
+                    Err(e) => return Self::handle_serialization_error(e),
+                }
+            }
+            None => decode_body,
         };
 
         let decode_request = self.build_post_with_headers(
@@ -2322,12 +2342,11 @@ mod tests {
             .bootstrap_port(Some(8998))
             .build();
 
-        let body = PDRouter::inject_bootstrap_into_value(
-            serde_json::to_value(&request).unwrap(),
-            &prefill,
-            None,
-        )
-        .unwrap();
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let mut leg = RawBody::parse(&bytes).unwrap();
+        let fields = PDRouter::bootstrap_fields(&prefill, None).unwrap();
+        PDRouter::inject_bootstrap(&mut leg, fields);
+        let body: Value = serde_json::from_slice(&leg.to_bytes(None).unwrap()).unwrap();
 
         assert_eq!(body["stream_options"]["step_usage_chunks"], json!("all"));
         assert_eq!(body["stream_options"]["include_usage"], json!(true));
@@ -3113,11 +3132,53 @@ mod tests {
         assert_eq!(body.get("kv_transfer_params"), None);
     }
 
+    /// The prefill sanitizer as it edits a `Value`: the wire contract the
+    /// raw editor reproduces byte for byte.
+    fn sanitize_prefill_value(json: &mut Value, route: &str) {
+        let Some(obj) = json.as_object_mut() else {
+            return;
+        };
+        obj.insert("stream".to_string(), Value::Bool(false));
+        obj.remove("stream_options");
+        if obj.contains_key("n") {
+            obj.insert("n".to_string(), Value::from(1));
+        }
+        obj.remove("min_tokens");
+        match route {
+            "/v1/chat/completions" if obj.contains_key("max_completion_tokens") => {
+                obj.insert("max_completion_tokens".to_string(), Value::from(1));
+                obj.remove("max_tokens");
+            }
+            "/v1/responses" => {
+                obj.insert("max_output_tokens".to_string(), Value::from(1));
+            }
+            _ => {
+                obj.insert("max_tokens".to_string(), Value::from(1));
+            }
+        }
+    }
+
+    /// Sanitize `body` for `route` through the raw editor, check the bytes
+    /// against the `Value` oracle, and return the result parsed.
+    fn sanitized_prefill(body: Value, route: &str) -> Value {
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let mut raw = RawBody::parse(&bytes).unwrap();
+        PDRouter::sanitize_prefill_for_kv_handoff(&mut raw, route).unwrap();
+        let raw_bytes = raw.to_bytes(Some(bytes.len())).unwrap();
+
+        let mut oracle = body;
+        sanitize_prefill_value(&mut oracle, route);
+        assert_eq!(raw_bytes, serde_json::to_vec(&oracle).unwrap(), "{route}");
+        serde_json::from_slice(&raw_bytes).unwrap()
+    }
+
     #[test]
     fn prefill_sanitization_is_route_aware() {
-        let mut chat = json!({"max_completion_tokens": 99, "max_tokens": 88, "n": 3,
-            "stream": true, "stream_options": {"include_usage": true}, "min_tokens": 5});
-        PDRouter::sanitize_prefill_for_kv_handoff(&mut chat, "/v1/chat/completions");
+        let chat = sanitized_prefill(
+            json!({"max_completion_tokens": 99, "max_tokens": 88, "n": 3,
+                "stream": true, "stream_options": {"include_usage": true}, "min_tokens": 5}),
+            "/v1/chat/completions",
+        );
         assert_eq!(chat.get("max_completion_tokens"), Some(&Value::from(1)));
         assert_eq!(chat.get("max_tokens"), None, "both caps would be rejected");
         assert_eq!(chat.get("n"), Some(&Value::from(1)));
@@ -3125,13 +3186,104 @@ mod tests {
         assert_eq!(chat.get("stream_options"), None);
         assert_eq!(chat.get("min_tokens"), None);
 
-        let mut responses = json!({"max_output_tokens": 99, "stream": true});
-        PDRouter::sanitize_prefill_for_kv_handoff(&mut responses, "/v1/responses");
+        // Without the long cap spelling a chat leg is capped like a completion.
+        let chat = sanitized_prefill(
+            json!({"messages": [], "max_tokens": 88, "stream": false}),
+            "/v1/chat/completions",
+        );
+        assert_eq!(chat.get("max_tokens"), Some(&Value::from(1)));
+
+        let responses = sanitized_prefill(
+            json!({"max_output_tokens": 99, "stream": true}),
+            "/v1/responses",
+        );
         assert_eq!(responses.get("max_output_tokens"), Some(&Value::from(1)));
 
-        let mut completion = json!({"prompt": "hi"});
-        PDRouter::sanitize_prefill_for_kv_handoff(&mut completion, "/v1/completions");
+        let completion = sanitized_prefill(json!({"prompt": "hi"}), "/v1/completions");
         assert_eq!(completion.get("max_tokens"), Some(&Value::from(1)));
+    }
+
+    #[test]
+    fn bootstrap_and_rank_edits_match_the_value_pipeline_bytes() {
+        let prefill =
+            create_test_worker("http://prefill:8000".to_string(), WorkerType::Prefill, true);
+        for batch_size in [None, Some(3)] {
+            let fields = PDRouter::bootstrap_fields(prefill.as_ref(), batch_size).unwrap();
+            let as_value = |raw: &RawValue| serde_json::from_str::<Value>(raw.get()).unwrap();
+            let (host, port, room) = (
+                as_value(&fields.host),
+                as_value(&fields.port),
+                as_value(&fields.room),
+            );
+            match batch_size {
+                Some(n) => {
+                    assert_eq!(host.as_array().unwrap().len(), n);
+                    assert_eq!(port.as_array().unwrap().len(), n);
+                    assert_eq!(room.as_array().unwrap().len(), n);
+                }
+                None => assert!(room.is_u64()),
+            }
+
+            let request = json!({
+                "model": "alias",
+                "input_ids": [[1, 2], [3, 4], [5, 6]],
+                "stream": false
+            });
+            let bytes = serde_json::to_vec(&request).unwrap();
+            let mut body = RawBody::parse(&bytes).unwrap();
+            body.set_model(to_raw_value("canonical").unwrap());
+            PDRouter::inject_bootstrap(&mut body, fields);
+            let mut prefill_leg = body.clone();
+            let mut decode_leg = body;
+            PDRouter::inject_dp_rank(&mut prefill_leg, 2, "routed_dp_rank").unwrap();
+            PDRouter::inject_dp_rank(&mut decode_leg, 2, "disagg_prefill_dp_rank").unwrap();
+            PDRouter::inject_dp_rank(&mut decode_leg, 5, "routed_dp_rank").unwrap();
+
+            // The same edits on a Value, the pipeline these bytes replace.
+            let mut oracle = request;
+            super::super::set_request_model(&mut oracle, "canonical");
+            let obj = oracle.as_object_mut().unwrap();
+            obj.insert("bootstrap_host".to_string(), host);
+            obj.insert("bootstrap_port".to_string(), port);
+            obj.insert("bootstrap_room".to_string(), room);
+            let mut oracle_prefill = oracle.clone();
+            let mut oracle_decode = oracle;
+            oracle_prefill
+                .as_object_mut()
+                .unwrap()
+                .insert("routed_dp_rank".to_string(), Value::from(2));
+            let decode_obj = oracle_decode.as_object_mut().unwrap();
+            decode_obj.insert("disagg_prefill_dp_rank".to_string(), Value::from(2));
+            decode_obj.insert("routed_dp_rank".to_string(), Value::from(5));
+
+            assert_eq!(
+                prefill_leg.to_bytes(Some(bytes.len())).unwrap(),
+                serde_json::to_vec(&oracle_prefill).unwrap()
+            );
+            assert_eq!(
+                decode_leg.to_bytes(Some(bytes.len())).unwrap(),
+                serde_json::to_vec(&oracle_decode).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn harvested_kv_transfer_params_are_the_prefill_response_slice() {
+        let harvested = |body: &str| {
+            PDRouter::harvest_kv_transfer_params(body.as_bytes())
+                .map(|params| params.get().to_owned())
+        };
+        assert_eq!(
+            harvested(
+                r#"{"id":"x","kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#
+            )
+            .as_deref(),
+            Some(r#"{"remote_engine_id":"eng0","remote_block_ids":[1,2]}"#)
+        );
+        assert_eq!(harvested(r#"{"kv_transfer_params":null}"#), None);
+        assert_eq!(harvested(r#"{"id":"x"}"#), None);
+        assert_eq!(harvested("[1,2]"), None);
+        assert_eq!(harvested("not json"), None);
     }
 
     #[tokio::test]

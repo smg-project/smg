@@ -668,6 +668,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().mutates_request()
     }
 
+    /// Whether [`Worker::prepare_request`] is the built-in edit, the
+    /// `data_parallel_rank` insert for a DP-aware worker, and nothing else.
+    /// The HTTP proxy path then applies that edit on raw JSON slices instead
+    /// of round-tripping the body through `serde_json::Value`. An
+    /// implementation with its own `prepare_request` keeps the default,
+    /// `false`, so its edits and errors still run.
+    fn uses_builtin_prepare_request(&self) -> bool {
+        false
+    }
+
     /// Get the model ID this worker serves.
     fn model_id(&self) -> &str {
         self.metadata().model_id()
@@ -1499,6 +1509,12 @@ impl BasicWorker {
 
 #[async_trait]
 impl Worker for BasicWorker {
+    /// [`BasicWorker`] keeps the trait's default `prepare_request`, so the
+    /// HTTP proxy path may apply the DP-rank edit on raw slices.
+    fn uses_builtin_prepare_request(&self) -> bool {
+        true
+    }
+
     fn kv_engine_id(&self) -> Option<String> {
         self.kv_engine_id.load_full().map(|id| (*id).clone())
     }
