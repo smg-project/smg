@@ -611,7 +611,12 @@ pub(crate) fn chat_to_responses(
                 namespace,
                 arguments: tool_call.function.arguments.clone().unwrap_or_default(),
                 output: None, // Tool execution belongs to the next turn.
-                status: "completed".to_string(),
+                status: if matches!(choice.finish_reason.as_deref(), Some("failed" | "error")) {
+                    "in_progress"
+                } else {
+                    "completed"
+                }
+                .to_string(),
             });
         }
     }
@@ -1037,6 +1042,29 @@ mod tests {
             assert_eq!(item["status"], "completed");
             assert_eq!(item["call_id"], call_id);
             assert_eq!(item["arguments"], "{}");
+        }
+    }
+
+    #[test]
+    fn failed_generation_does_not_complete_partial_tool_calls() {
+        for finish_reason in ["failed", "error"] {
+            let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                    {"id":"call_weather","type":"function","function":{
+                        "name":"weather","arguments":"{\"city\":"
+                    }}
+                ]},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            let response = chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap();
+            let wire = serde_json::to_value(response).unwrap();
+            assert_eq!(wire["status"], "failed", "{finish_reason}");
+            assert_eq!(wire["output"].as_array().unwrap().len(), 1);
+            let item = &wire["output"][0];
+            assert_eq!(item["status"], "in_progress", "{finish_reason}");
+            assert_eq!(item["call_id"], "call_weather");
+            assert_eq!(item["arguments"], "{\"city\":");
         }
     }
 }

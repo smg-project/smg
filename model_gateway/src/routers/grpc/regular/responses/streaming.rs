@@ -407,7 +407,10 @@ impl StreamingResponseAccumulator {
                 ..
             } = &mut item
             {
-                *status = "completed".to_string();
+                // Failed generations do not close the item in the stream either.
+                if !matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
+                    *status = "completed".to_string();
+                }
                 (*name, *namespace) =
                     resolve_function_identity(self.original_request.tools.as_deref(), name);
             }
@@ -1219,6 +1222,36 @@ mod tests {
             if finish_reason == "length" {
                 assert_eq!(wire["incomplete_details"]["reason"], "max_output_tokens");
             }
+        }
+    }
+
+    #[test]
+    fn failed_generation_does_not_complete_stored_partial_tool_calls() {
+        for finish_reason in ["failed", "error"] {
+            let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
+            let partial = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"call_weather","type":"function","function":{
+                        "name":"weather","arguments":"{\"city\":"
+                    }}
+                ]},"finish_reason":null}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&partial);
+            let failure = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&failure);
+            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
+            assert_eq!(wire["status"], "failed", "{finish_reason}");
+            assert_eq!(wire["output"].as_array().unwrap().len(), 1);
+            let item = &wire["output"][0];
+            assert_eq!(item["status"], "in_progress", "{finish_reason}");
+            assert_eq!(item["call_id"], "call_weather");
+            assert_eq!(item["arguments"], "{\"city\":");
         }
     }
 }
