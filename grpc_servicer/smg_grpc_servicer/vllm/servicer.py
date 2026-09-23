@@ -323,10 +323,21 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 finally:
                     self._mm_inflight.release()
                 # A PD prefill leg answers with the identity so decode is
-                # served without pixels or references.
+                # served without pixels or references. The identity is an
+                # optimisation with a fallback (decode reprocesses), so a
+                # shape it cannot read must not fail a served request.
                 if kv_transfer_params is not None:
                     if media_identity_supported():
-                        media_identity = build_media_identity(prompt)
+                        try:
+                            media_identity = build_media_identity(prompt)
+                        except Exception as e:  # noqa: BLE001 - any failure falls back
+                            logger.warning(
+                                "Request %s: media identity not built (%s); the decode leg "
+                                "will reprocess the media",
+                                request_id,
+                                e,
+                            )
+                            media_identity = None
                     else:
                         logger.warning(
                             "Request %s: the installed smg-grpc-proto has no media_identity; "
