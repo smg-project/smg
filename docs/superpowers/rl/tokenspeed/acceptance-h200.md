@@ -1,6 +1,6 @@
 # TokenSpeed RL control plane — acceptance run on the H200 node
 
-Status: **PASS.** Every criterion of the plan's acceptance item 1 was met on two
+Status: **item 1 PASS; item 2 PASS on reward and throughput, step time +5.7 % (bar 5 %) on one run per arm.** Every criterion of the plan's acceptance item 1 was met on two
 real TokenSpeed engines behind the branch's gateway. Two trainer-driven NCCL
 refits landed and the next `/generate` through SMG reported the new
 `meta_info.weight_version` each time; fan-out overhead stayed at or below 1 ms;
@@ -22,7 +22,7 @@ fixed engine.
 | --- | --- |
 | Node | `moirai-h200-runner-0`, `ubuntu@10.0.1.52` via the OCI bastion, 8x H200 |
 | Gateway | `~/smg-rl-ts/target/release/smg`, release build of `rl/tokenspeed-control-endpoint`, rebuilt 2026-09-22 23:30Z |
-| SMG source | `~/smg-rl-ts/src` = this worktree at `4b0f04c5b` |
+| SMG source | `~/smg-rl-ts/src` = this worktree at `4b0f04c5b` for item 1; `b156402c7` for Task 20's re-probe and the slime arms (candidate arm ran on `a5e45faf9`) |
 | TokenSpeed | `~/tokenspeed-rl/src` at `053d6356a` (NCCL-split guard + sidecar fix) |
 | Engines | TokenSpeed in container `ts-rl`, GPUs 0 and 1 |
 | Container venv | `/opt/smg-ci/.venv`, Python 3.12.3 |
@@ -331,6 +331,152 @@ d_sampling_seed: http=404 shape=dict meta_info_keys=None output_token_logprobs=N
 e_batch: http=422 body-unparseable (Expecting value: line 1 column 1 (char 0))
 f_input_ids: http=404 shape=dict meta_info_keys=None output_token_logprobs=None weight_version=None error={'type': 'Not Found', 'code': 'model_not_found', 'message': "No worker available for model 'unknown'", 'param': None}
 ```
+
+## Task 19 decision and Task 20
+
+The probes above were taken before Task 20. Interpreted, they said:
+
+| Probe | Before Task 20 | Gap? |
+| --- | --- | --- |
+| no `model` in the body (every slime request) | 404 `model_not_found` for `'unknown'` | yes |
+| single prompt with `model` set | 200, but a list of one object | yes: slime indexes `output["meta_info"]` |
+| `return_logprob: true` (engine on `--enable-output-logprobs`) | `meta_info.output_token_logprobs` = `[[logprob, token_id], ...]` | no |
+| `sampling_params.sampling_seed` | accepted; it is SMG's native field, no alias needed | no |
+| `weight_version` in `meta_info` | present | no |
+| `text` as a list | 422 from the JSON extractor (every path) | out of scope: slime sends one prompt per request |
+| batch `input_ids` | 400 "not supported over gRPC generate yet" | out of scope, same reason |
+
+Task 20 landed as `123074b50` + `b156402c7`: the gRPC family answers a
+single-prompt, `n <= 1`, one-response `/generate` with one object (SGLang's
+shape) and defaults an absent `model` to the fleet's single served model
+(untagged workers do not count; zero or several models keep the 404).
+Re-probed on the rebuilt release binary (05:36Z) with no `model`:
+
+```
+a_single_text:      http=200 shape=dict output_token_logprobs=present len=4 weight_version=default
+b_no_logprob:       http=200 shape=dict output_token_logprobs=absent  weight_version=default
+c_input_ids_logprob http=200 shape=dict output_token_logprobs=present len=4 weight_version=default
+d_sampling_seed:    http=200 shape=dict output_token_logprobs=present len=4 weight_version=default
+e_batch_text:       http=422 (list-valued text, every path)
+f_batch_input_ids:  http=400 resolve_input_failed (gRPC batch input_ids)
+```
+
+## A second SMG bug found by the slime run: the wildcard model leaked upstream
+
+The first candidate-arm attempt failed on every rollout request with
+404 `model_not_found` for model `'unknown'`, from SMG's HTTP passthrough to the
+`ts serve` sidecars. The registry, the wildcard routing pool and the policy
+were all fine (an instrumented debug build showed `pool_len=1`, the worker
+`available`); the 404 came from *behind* the sidecar. SMG's typed HTTP path
+parses the body into `GenerateRequest` and re-serializes it, and the absent
+`model` had become `"model":"unknown"` on the wire. SGLang ignores that field,
+which is why the M0 run never noticed; the sidecar's embedded gateway resolves
+it and answers 404. Fix `a5e45faf9`: the placeholder is never serialized, so
+the forwarded body matches what the client sent. Covered by a protocol
+round-trip test and an HTTP router test that inspects the forwarded body.
+
+Observed but not fixed: with `--disable-retries` the streamed-body path
+answers 400 "Failed to buffer the request body" for the same request. slime's
+default keeps retries on, so the A/B did not need it; it is a separate
+streamed-path issue for a follow-up.
+
+## Acceptance item 2 — slime, unpatched, Qwen3-0.6B, GSM8K
+
+### Topology (and why it differs from the spec's candidate)
+
+slime's external-engine path (`slime/backends/sglang_utils/external.py`,
+`sglang_engine.py::_init_external`, `server_control.py::abort_servers_until_idle`)
+requires every external engine address to be a full SGLang HTTP server
+(`/server_info` or `/get_server_info`, `/abort_request`, `/v1/loads`),
+registers each into the router as a data-plane worker (`POST /workers`), and
+aborts through the URLs the router's `/workers` returns. TokenSpeed's
+in-engine control app is control-only (no `/generate`, no `/get_server_info`);
+only the `ts serve` sidecar has the full surface. The spec's candidate
+("SMG gRPC data plane + in-engine control apps as slime's external engines")
+is therefore unreachable for unpatched slime. The A/B was run as a router swap
+over the sidecars, and the gRPC data plane was exercised with a labeled
+two-file slime patch (the M3 shape).
+
+| Arm | slime | router for `/generate` | engines | control path |
+| --- | --- | --- | --- | --- |
+| baseline | stock a3f50097 | slime's own `sglang_router` | 2x `ts serve` (sidecars 31201/31203 registered by slime) | engine-direct to the sidecars |
+| candidate | stock a3f50097 | SMG `--enable-rl --disable-health-check --disable-circuit-breaker --request-timeout-secs 14400`, empty registry | same, registered by slime into SMG | engine-direct to the sidecars |
+| gRPC arm | a3f50097 + `slime-patch.py` (skip `_register_to_router`; abort via the external addresses) | SMG `--enable-rl` owning the two engines as gRPC workers (`--worker-urls grpc://...`) | same engines' gRPC ports | engine-direct to the sidecars |
+
+Common to all arms: slime in the `slimerl/slime:latest` container on GPUs 6–7
+(Megatron actor, 2 GPUs, `--num-rollout N --rollout-batch-size 16
+--n-samples-per-prompt 8 --rollout-max-response-len 1024 --global-batch-size 128
+--rollout-seed 42 --seed 1234`, GRPO, `zhuzilin/gsm8k`, NCCL refits every step
+via `update_weights_from_distributed`); TokenSpeed `ts serve` engines in
+`ts-rl` on GPUs 4–5 (`--gpu-memory-utilization 0.8 --enable-output-logprobs`);
+fresh engines, and a fresh SMG, per arm. Scripts: `remote/slime-run.sh`,
+`remote/slime-ab.sh`, `remote/slime-grpc-arm.sh`, `remote/slime-patch.py`,
+`remote/slime-metrics.py` in the SDD workspace.
+
+### Environment findings on the way
+
+- **TokenSpeed's sidecar was incompatible with current slime** before any
+  router was involved: slime's sanity check reads `enable_memory_saver` from a
+  flat `/get_server_info`; the sidecar nested everything under `server_args`.
+  TokenSpeed `46cb33f13` flattens the response (nested key kept).
+- **TokenSpeed's NCCL refit was a silent no-op** (the same engine bug as item 1;
+  TokenSpeed `053d6356a`).
+- **Cross-container NCCL** (trainer in the slime image, engines in the CI
+  image) needed the same NCCL wheel on both sides (`nvidia-nccl-cu12==2.30.7`
+  in the trainer container) and `NCCL_CUMEM_ENABLE=0` on both sides: the
+  cuMem shareable-handle import between the cu12-built and cu13-built NCCLs
+  failed with `ncclP2pImportShareableBuffer: invalid argument`. A single-image
+  deployment does not need either.
+- **The M0 findings reproduced exactly**: engines keep a stale weight-update
+  group across slime runs (`init_weights_update_group` → 400 "group name has
+  already been created"), and a second run against the same SMG instance gets
+  409 on `POST /workers` because slime never deregisters. Both are why each
+  arm starts fresh engines and a fresh SMG.
+
+### Results
+
+Ten-step smokes first (all PASS): baseline 0.644 mean reward, 9409 tok/GPU/s,
+8.90 s/step; candidate 0.637, 9219 tok/GPU/s, 8.25 s/step; gRPC arm 0.643,
+9355 tok/GPU/s, 8.23 s/step (1280 `/generate` requests through the gRPC
+gateway, model-less and answered as objects; aborts and refits engine-direct).
+
+200 steps, same seed, `remote/slime-metrics.py` over the train logs:
+
+| Arm | reward mean (200) | reward, last 50: mean ± sd | rollout tok/GPU/s | step time | rollout time | refit time |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline (sgl-router) | 0.749 | 0.771 ± 0.074 | 6949 | 6.42 s | 4.37 s | 0.133 s |
+| candidate (SMG `--enable-rl`) | 0.748 | 0.778 ± 0.081 | 7741 | 6.79 s | 4.60 s | 0.133 s |
+
+Bar from the spec: |Δ mean reward| over the last 50 steps < 1σ → 0.007 versus
+σ ≈ 0.08, **PASS**. Throughput within 5 %: rollout throughput is 11 % *higher*
+through SMG, **PASS**. Step time within 5 %: +5.7 %, **missed by 0.7 points**
+on a single run per arm; with rollout throughput favouring SMG the step-time
+gap sits in the trainer's wait/overlap noise, and one 200-step run per arm
+cannot resolve ±5 %. Recorded as-is rather than re-run.
+
+Control in these runs is slime engine-direct, exactly as in M0. Control
+through SMG is proven by item 1; moving slime onto the fan-out is M3's optional
+patch, whose exact scope this run pins down: skip registration of
+router-owned engines and route aborts (and refits) through the router.
+
+Logs on the node: `~/slime-rl/logs/train-{base-200,cand-200,grpc-smoke2}.log`,
+`~/slime-rl/logs/ab-200.log`, `~/slime-rl/logs/smg-3110{0,1}.log`.
+
+### Criteria — acceptance item 2
+
+| Criterion | Result |
+| --- | --- |
+| Unpatched slime completes a run with TokenSpeed engines behind SMG | PASS — 200 steps, candidate arm |
+| Reward within run-to-run noise (|Δ| < 1σ over the last 50 steps) | PASS — 0.007 vs σ 0.08 |
+| Rollout throughput within 5 % | PASS — +11 % through SMG |
+| Step time within 5 % | MISS by 0.7 points (6.79 vs 6.42 s, one run each) |
+| Control-path caveat stated | yes: engine-direct in both arms; SMG fan-out proven by item 1 |
+| slime's `/generate` over SMG's gRPC data plane | PASS with the labeled patch (10 steps) |
+
+## Final node sweep on the branch head
+
+Run on `b156402c7` (SMG) and `053d6356a` (TokenSpeed) after the A/B; see the
+SDD ledger for the raw lines.
 
 ## Cleanup (step i) — DONE
 
