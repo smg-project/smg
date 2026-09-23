@@ -79,11 +79,10 @@ pub(crate) fn serialize_json_sized<T: serde::Serialize>(
     Ok(buf)
 }
 
-/// A typed request as a `Value`, for the forwarding paths that edit it.
-/// `serde_json::to_value` stores an `f32` widened to `f64`, so a client's
-/// `"top_p": 0.95` would reach the engine as `0.949999988079071`. The writer
-/// prints each `f32` in its shortest round-trip form, so encode with it and
-/// parse that back: every number goes out as the client wrote it.
+/// A typed request as a `Value`, for the forwarding paths that edit it:
+/// `openai_protocol::common::to_value_exact` with the buffer pre-sized from
+/// the raw request length. Every typed `f32` goes out as the client wrote
+/// it (`serde_json::to_value` would widen `0.95` to `0.949999988079071`).
 pub(crate) fn request_to_value<T: serde::Serialize>(
     value: &T,
     raw_len: Option<usize>,

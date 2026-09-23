@@ -17,7 +17,9 @@ type PrometheusFamily = MetricFamily<PrometheusType, PrometheusValue>;
 /// allows colons, and engines prefix their metrics with one (`sglang:`, `vllm:`).
 /// Colons are swapped for an escape sequence before parsing and restored in the
 /// rendered output, so `/engine_metrics` exposes the exact metric names, HELP
-/// text, and label values the engines exported.
+/// text, and label values the engines exported. A label name is the one place
+/// a colon is illegal, so there the escape becomes `_` instead: restoring it
+/// would make the whole page unscrapeable.
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
     let colon_escape = unused_colon_escape(&metric_packs);
     let mut expositions = vec![];
@@ -34,6 +36,7 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
                 continue;
             }
         };
+        let exposition = sanitize_label_names(exposition, &colon_escape);
         let exposition = transform_metrics(exposition, &metric_pack.labels);
         expositions.push(exposition);
     }
@@ -65,6 +68,60 @@ fn unused_colon_escape(metric_packs: &[MetricPack]) -> String {
         }
         n += 1;
     }
+}
+
+/// Rebuild every family whose label names carry the colon escape with `_`
+/// in its place: label values keep their positions, so the samples move over
+/// unchanged.
+fn sanitize_label_names(
+    mut exposition: PrometheusExposition,
+    colon_escape: &str,
+) -> PrometheusExposition {
+    let families = std::mem::take(&mut exposition.families);
+    for (name, family) in families {
+        let family = if family
+            .get_label_names()
+            .iter()
+            .any(|n| n.contains(colon_escape))
+        {
+            let label_names: Vec<String> = family
+                .get_label_names()
+                .iter()
+                .map(|n| n.replace(colon_escape, "_"))
+                .collect();
+            // Two names that sanitize to one would render a sample with
+            // duplicate label names, which invalidates the whole scrape.
+            let mut unique = label_names.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            if unique.len() != label_names.len() {
+                warn!(
+                    "aggregate_metrics dropped family {name}: label names collide once sanitized"
+                );
+                continue;
+            }
+            let rebuilt = PrometheusFamily::new(
+                family.family_name.clone(),
+                label_names,
+                family.family_type.clone(),
+                family.help.clone(),
+                family.unit.clone(),
+            );
+            match rebuilt.with_samples(family.into_iter_samples()) {
+                Ok(rebuilt) => rebuilt,
+                Err(err) => {
+                    warn!(
+                        "aggregate_metrics could not sanitize label names: family={name} err={err:?}"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            family
+        };
+        exposition.families.insert(name, family);
+    }
+    exposition
 }
 
 fn transform_metrics(

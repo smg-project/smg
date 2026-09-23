@@ -1717,6 +1717,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
                 http::header::AUTHORIZATION,
                 http::header::HeaderName::from_static("anthropic-version"),
                 http::header::HeaderName::from_static("anthropic-beta"),
+                http::header::HeaderName::from_static("x-api-key"),
             ])
             .expose_headers([http::header::HeaderName::from_static("x-request-id")])
     };
