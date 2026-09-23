@@ -175,13 +175,22 @@ fn apply_prefill_media_identity(
     if !handed_off || !relay_kv_params || !decode_request.has_vllm_media_refs() {
         return;
     }
-    match identity {
+    let applied = match identity {
         Some(identity) => decode_request.apply_media_identity(identity),
-        None if solicited => warn!(
+        None if solicited => {
+            warn!(
+                request_id = %decode_request.request_id(),
+                "prefill worker returned no media identity; decode leg will reprocess media"
+            );
+            return;
+        }
+        None => return,
+    };
+    if !applied {
+        warn!(
             request_id = %decode_request.request_id(),
-            "prefill worker returned no media identity; decode leg will reprocess media"
-        ),
-        None => {}
+            "prefill worker's media identity is unusable; decode leg will reprocess media"
+        );
     }
 }
 
@@ -1819,6 +1828,39 @@ mod tests {
         };
         assert_eq!(tokenized.input_ids, vec![7, 8, 100, 100, 100, 9]);
         assert_eq!(tokenized.original_text, "describe <|image|>");
+    }
+
+    /// An identity the leg cannot take, empty ids or a leg that is not
+    /// tokenized, leaves the references in place: better a reprocessed
+    /// decode than an empty prompt.
+    #[test]
+    fn an_unusable_identity_leaves_the_decode_leg_untouched() {
+        let mut empty = identity();
+        empty.prompt_token_ids.clear();
+        let mut decode = media_refs_request("empty", 1).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&empty));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+
+        let mut decode = media_refs_request("text", 1).clone_without_mm_pixels();
+        if let ProtoGenerateRequest::Vllm(request) = &mut decode {
+            request.input = Some(vllm::generate_request::Input::Text(
+                "describe <|image|>".to_string(),
+            ));
+        }
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+        assert!(matches!(
+            request.input,
+            Some(vllm::generate_request::Input::Text(_))
+        ));
     }
 
     /// An older servicer returns no identity: the decode leg keeps its

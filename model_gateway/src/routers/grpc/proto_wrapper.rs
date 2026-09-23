@@ -1660,16 +1660,24 @@ impl ProtoGenerateRequest {
     /// Replace this vLLM request's media references with the identity the
     /// prefill leg produced: the expanded prompt ids and the pixel-less
     /// per-modality inputs, in the shape a router-preprocessed decode leg has.
-    pub fn apply_media_identity(&mut self, identity: &vllm::MediaIdentity) {
+    /// Applied whole or not at all: an identity without ids, or a leg whose
+    /// input is not tokenized, leaves the leg as it is (`false`), so it
+    /// reprocesses the references rather than run an empty prompt.
+    pub fn apply_media_identity(&mut self, identity: &vllm::MediaIdentity) -> bool {
         let Self::Vllm(req) = self else {
-            return;
+            return false;
         };
-        if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() {
-            tokenized.input_ids.clone_from(&identity.prompt_token_ids);
+        let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() else {
+            return false;
+        };
+        if identity.prompt_token_ids.is_empty() {
+            return false;
         }
+        tokenized.input_ids.clone_from(&identity.prompt_token_ids);
         req.mm_inputs.clone_from(&identity.mm_inputs);
         req.extra_mm_inputs.clone_from(&identity.extra_mm_inputs);
         req.media_refs = None;
+        true
     }
 
     /// Number of parallel samples requested (1 when unset). vLLM, SGLang

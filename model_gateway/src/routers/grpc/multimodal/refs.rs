@@ -211,7 +211,8 @@ pub(crate) fn resolve_mm_processing(
 
 /// Post-selection check: every leg must accept references, and every URL
 /// scheme in the plan must be one every leg that advertised schemes fetches
-/// (both PD legs process the same references).
+/// (the prefill leg processes them; the decode leg does too whenever the
+/// identity relay does not apply, as with n>1).
 pub(crate) fn ensure_selection_supports_media_refs(
     workers: &WorkerSelection,
     plan: &MediaPlan,
