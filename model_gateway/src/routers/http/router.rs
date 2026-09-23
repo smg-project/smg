@@ -2883,7 +2883,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let (_headers, body) = captured.lock().await.take().unwrap();
-        let forwarded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let forwarded: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(forwarded["text"], "hello");
         assert!(
             forwarded.get("model").is_none(),
