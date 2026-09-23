@@ -30,7 +30,9 @@ use common::{
 };
 use http_body_util::BodyExt;
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-use openai_protocol::generate::GenerateRequest;
+use openai_protocol::{
+    generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
+};
 use serde_json::{json, Value};
 use smg::{
     app_context::AppContext,
@@ -38,7 +40,7 @@ use smg::{
     middleware::TenantRequestMeta,
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::UNKNOWN_MODEL_ID,
+    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType, UNKNOWN_MODEL_ID},
 };
 use tokio::net::TcpListener;
 use tower::ServiceExt;
@@ -196,6 +198,33 @@ async fn register(app: &axum::Router, spec: Value) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED, "{spec}");
+}
+
+/// Register a TokenSpeed gRPC worker straight into the registry, bypassing
+/// discovery. `tagged` gives it a model card for `MODEL`; untagged, it has no
+/// model card and no `model_id` label, so `Worker::model_id`'s fallback
+/// reports [`UNKNOWN_MODEL_ID`] and the registry's model index carries an
+/// extra `"unknown"` entry alongside the real model -- the shape the
+/// model-less `/generate` default must see through.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn register_directly(ctx: &Arc<AppContext>, grpc_port: u16, tagged: bool) {
+    let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{grpc_port}"))
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Grpc)
+        .runtime_type(RuntimeType::TokenSpeed)
+        .health_config(HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        });
+    if tagged {
+        builder = builder.model(ModelCard::new(MODEL));
+    }
+    ctx.worker_registry
+        .register(Arc::new(builder.build()))
+        .expect("TokenSpeed worker registered");
 }
 
 /// The discovery rows once `n` workers are registered and ready. Registration
@@ -544,6 +573,46 @@ async fn model_less_generate_defaults_to_the_single_served_model() {
 
     let resp = f
         .router
+        .route_generate(None, &tenant(), request, UNKNOWN_MODEL_ID)
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert!(body.is_object(), "single prompt -> object, got {body}");
+    assert_eq!(body["meta_info"]["weight_version"], ENGINE_VERSION);
+}
+
+/// An untagged worker (no model card, no `model_id` label) registers under
+/// the wildcard itself and must not defeat the single-model default: the
+/// registry then carries one real model plus the wildcard's own entry, and
+/// the default has to see through the latter.
+#[tokio::test]
+async fn model_less_generate_defaults_when_an_untagged_worker_is_also_registered() {
+    let ctx = grpc_rl_context().await;
+    let tagged_port = start_mock_grpc_engine(BTreeMap::new()).await;
+    let untagged_port = start_mock_grpc_engine(BTreeMap::new()).await;
+    register_directly(&ctx, tagged_port, true);
+    register_directly(&ctx, untagged_port, false);
+    let mut served = ctx.worker_registry.get_models();
+    served.sort();
+    assert_eq!(
+        served,
+        vec![MODEL.to_string(), UNKNOWN_MODEL_ID.to_string()],
+        "the untagged worker registers under the wildcard placeholder itself, \
+         which the model-less default must filter out"
+    );
+
+    let router: Arc<dyn RouterTrait> = Arc::from(
+        RouterFactory::create_router(&ctx)
+            .await
+            .expect("gRPC RL router should build"),
+    );
+    let request: GenerateRequest = serde_json::from_value(json!({
+        "input_ids": [1, 2, 3],
+        "sampling_params": {"max_new_tokens": 3},
+    }))
+    .unwrap();
+
+    let resp = router
         .route_generate(None, &tenant(), request, UNKNOWN_MODEL_ID)
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
