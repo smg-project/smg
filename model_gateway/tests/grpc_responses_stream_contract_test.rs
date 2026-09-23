@@ -8,7 +8,7 @@ mod common;
 #[path = "common/scripted_tokenizer.rs"]
 mod scripted_tokenizer;
 
-use std::{sync::Arc, time::Duration};
+use std::{error::Error, sync::Arc, time::Duration};
 
 use axum::{body::to_bytes, http::StatusCode};
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
@@ -210,19 +210,51 @@ async fn mcp_client_function_return_emits_one_terminal_response() {
     assert_eq!(calls[0]["status"], "completed");
 }
 
-#[tokio::test]
-async fn mcp_tool_limit_emits_failed_terminal_response() {
-    let mut mcp = common::mock_mcp_server::MockMCPServer::start()
-        .await
-        .unwrap();
+async fn mcp_repeated_tool_call_events(
+    max_tool_calls: Option<u32>,
+    expected_status: &str,
+) -> Result<Vec<Value>, Box<dyn Error + Send + Sync>> {
+    let mut mcp = common::mock_mcp_server::MockMCPServer::start().await?;
     let events = responses_events_with_output(json!([
         {"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}
-    ]), Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>"), Some(0), "failed").await;
+    ]), Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>"), max_tool_calls, expected_status).await;
     mcp.stop().await;
+    Ok(events)
+}
+
+#[tokio::test]
+async fn mcp_user_tool_limit_emits_completed_terminal_response() {
+    for limit in [0, 1] {
+        let events = mcp_repeated_tool_call_events(Some(limit), "completed")
+            .await
+            .unwrap();
+        let terminal = events.last().unwrap();
+        assert!(terminal["response"]["error"].is_null());
+        assert!(terminal["response"]["incomplete_details"].is_null());
+        let executed_calls = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "response.output_item.done" && event["item"]["type"] == "mcp_call"
+            })
+            .count();
+        assert_eq!(
+            executed_calls, limit as usize,
+            "ignore calls exceeding the user cap"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_iteration_safety_limit_emits_failed_terminal_response() {
+    let events = mcp_repeated_tool_call_events(None, "failed").await.unwrap();
     let terminal = events.last().unwrap();
     assert_eq!(
         terminal["response"]["error"]["code"],
         "max_tool_calls_exceeded"
     );
+    assert!(terminal["response"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("maximum iterations"));
     assert!(terminal["response"]["incomplete_details"].is_null());
 }

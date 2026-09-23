@@ -717,9 +717,10 @@ async fn execute_tool_loop_streaming_internal(
                     max_tool_calls,
                     DEFAULT_MAX_ITERATIONS
                 );
-                break Some(
-                    json!({"code": "max_tool_calls_exceeded", "message": "Maximum tool call limit exceeded"}),
-                );
+                // Reaching the processing cap ignores further calls; it is not
+                // a failed generation. The iteration safety guard above still
+                // terminates runaway loops with a failed response.
+                break None;
             }
 
             // Process each MCP tool call
@@ -1118,6 +1119,8 @@ impl ChatResponseAccumulator {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
 
@@ -1289,7 +1292,7 @@ mod tests {
         let body = Body::from_stream(futures_util::stream::iter(
             frames.into_iter().map(Ok::<_, std::convert::Infallible>),
         ));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
             ResponsesRequest {
