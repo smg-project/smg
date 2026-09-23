@@ -1,9 +1,10 @@
 """Server-Sent Events (SSE) parser.
 
 Handles three SSE protocol variants:
-1. OpenAI: `data: {...}\\n\\n` lines, terminated by `data: [DONE]\\n\\n`
+1. Chat Completions: `data: {...}\\n\\n` lines, terminated by `data: [DONE]\\n\\n`
 2. Anthropic: `event: type\\ndata: {...}\\n\\n` pairs
-3. Responses API: `event: type\\ndata: {...}\\n\\n` plus `data: [DONE]`
+3. Responses API: `event: type\\ndata: {...}\\n\\n` pairs, ending with a
+   `response.completed`, `response.incomplete`, or `response.failed` event and EOF.
 """
 
 from __future__ import annotations

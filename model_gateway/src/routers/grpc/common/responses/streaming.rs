@@ -413,6 +413,26 @@ impl ResponseStreamEventEmitter {
         })
     }
 
+    /// Close any remaining reasoning part and emit exactly one terminal event.
+    pub async fn emit_terminal(
+        &mut self,
+        usage: Option<&serde_json::Value>,
+        error: Option<&serde_json::Value>,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        self.close_reasoning_item(tx).await?;
+        let mut event = self.emit_completed(usage);
+        if let Some(error) = error {
+            event["type"] = json!("response.failed");
+            event["response"]["status"] = json!("failed");
+            event["response"]["error"] = error.clone();
+            if let Some(response) = event["response"].as_object_mut() {
+                response.remove("incomplete_details");
+            }
+        }
+        self.send_event(&event, tx).await
+    }
+
     /// Convert tool entries to JSON values using the shared bridge builder.
     fn tool_entries_to_json(
         tools: &[mcp::ToolEntry],
@@ -971,7 +991,10 @@ impl ResponseStreamEventEmitter {
                     "call_id": item.call_id,
                     "name": item.name,
                     "arguments": item.arguments,
-                    "status": "completed",
+                    "status": super::utils::function_call_status(
+                        self.finish_reason.as_deref(),
+                        &item.arguments,
+                    ),
                 })
             };
             let event = self.emit_output_item_done(item.output_index, &full);
@@ -1745,6 +1768,33 @@ mod process_chunk_tests {
         assert_eq!(output[1]["type"], "function_call");
         assert_eq!(output[1]["name"], "get_time");
         assert_eq!(output[1]["arguments"], "{\"tz\":");
+        assert_eq!(output[0]["status"], "completed");
+        assert_eq!(output[1]["status"], "incomplete");
+        assert_eq!(events[5]["item"], output[0]);
+        assert_eq!(events[7]["item"], output[1]);
+    }
+
+    #[tokio::test]
+    async fn length_finish_keeps_complete_streamed_tool_arguments_completed() {
+        let (events, terminal) = stream_with_terminal(
+            json!({"model":"test-model","input":"hi"}),
+            &[
+                chunk(
+                    json!({"tool_calls":[{"index":0,"id":"call_a","type":"function",
+                "function":{"name":"weather","arguments":"{}"}}]}),
+                    None,
+                ),
+                chunk(json!({}), Some("length")),
+            ],
+        )
+        .await;
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(terminal["response"]["output"][0]["status"], "completed");
+        let done = events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap();
+        assert_eq!(done["item"], terminal["response"]["output"][0]);
     }
 
     #[tokio::test]

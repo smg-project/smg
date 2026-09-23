@@ -27,6 +27,18 @@ use crate::{
     worker::WorkerRegistry,
 };
 
+/// Map a Chat finish reason to a generated function-call item's status.
+/// On token-limit truncation, preserve complete arguments and mark partial JSON incomplete.
+pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str) -> &'static str {
+    match finish_reason {
+        Some("failed" | "error") => "in_progress",
+        Some("length") if serde_json::from_str::<serde_json::Value>(arguments).is_err() => {
+            "incomplete"
+        }
+        _ => "completed",
+    }
+}
+
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
 ///
 /// Checks if the request declares MCP tools or builtin tool types

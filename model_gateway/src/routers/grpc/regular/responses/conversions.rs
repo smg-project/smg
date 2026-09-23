@@ -26,7 +26,7 @@ use tracing::warn;
 
 use crate::routers::grpc::common::responses::utils::{
     custom_tool_input, custom_tool_names, decode_reasoning_content, encode_reasoning_content,
-    extract_tools_from_response_tools, resolve_function_identity,
+    extract_tools_from_response_tools, function_call_status, resolve_function_identity,
 };
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
@@ -579,7 +579,12 @@ pub(crate) fn chat_to_responses(
                     annotations: vec![],
                     logprobs: choice.logprobs.clone(),
                 }],
-                status: "completed".to_string(),
+                status: if matches!(choice.finish_reason.as_deref(), Some("failed" | "error")) {
+                    "in_progress"
+                } else {
+                    "completed"
+                }
+                .to_string(),
                 phase: None,
             });
         }
@@ -611,11 +616,10 @@ pub(crate) fn chat_to_responses(
                 namespace,
                 arguments: tool_call.function.arguments.clone().unwrap_or_default(),
                 output: None, // Tool execution belongs to the next turn.
-                status: if matches!(choice.finish_reason.as_deref(), Some("failed" | "error")) {
-                    "in_progress"
-                } else {
-                    "completed"
-                }
+                status: function_call_status(
+                    choice.finish_reason.as_deref(),
+                    tool_call.function.arguments.as_deref().unwrap_or_default(),
+                )
                 .to_string(),
             });
         }
@@ -1046,11 +1050,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_generation_does_not_complete_partial_tool_calls() {
+    fn failed_generation_does_not_complete_partial_messages_or_tool_calls() {
         for finish_reason in ["failed", "error"] {
             let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
                 "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
-                "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                "choices":[{"index":0,"message":{"role":"assistant","content":"Partial reply","tool_calls":[
                     {"id":"call_weather","type":"function","function":{
                         "name":"weather","arguments":"{\"city\":"
                     }}
@@ -1060,11 +1064,55 @@ mod tests {
             let response = chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap();
             let wire = serde_json::to_value(response).unwrap();
             assert_eq!(wire["status"], "failed", "{finish_reason}");
-            assert_eq!(wire["output"].as_array().unwrap().len(), 1);
-            let item = &wire["output"][0];
+            assert_eq!(wire["output"].as_array().unwrap().len(), 2);
+            assert_eq!(wire["output"][0]["type"], "message");
+            assert_eq!(
+                wire["output"][0]["status"], "in_progress",
+                "{finish_reason}"
+            );
+            assert_eq!(wire["output"][0]["content"][0]["text"], "Partial reply");
+            let item = &wire["output"][1];
             assert_eq!(item["status"], "in_progress", "{finish_reason}");
             assert_eq!(item["call_id"], "call_weather");
             assert_eq!(item["arguments"], "{\"city\":");
         }
+    }
+
+    #[test]
+    fn length_truncated_tool_call_preserves_earlier_completed_calls() {
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{}"}},
+                {"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
+            ]},"finish_reason":"length"}]
+        })).unwrap();
+        let response = chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap();
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["status"], "incomplete");
+        assert_eq!(wire["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(wire["output"].as_array().unwrap().len(), 2);
+        assert_eq!(wire["output"][0]["status"], "completed");
+        assert_eq!(wire["output"][0]["arguments"], "{}");
+        assert_eq!(wire["output"][1]["status"], "incomplete");
+        assert_eq!(wire["output"][1]["call_id"], "call_time");
+        assert_eq!(wire["output"][1]["arguments"], "{\"tz\":");
+    }
+
+    #[test]
+    fn length_finish_preserves_a_fully_parsed_tool_call() {
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{}"}}
+            ]},"finish_reason":"length"}]
+        })).unwrap();
+        let wire = serde_json::to_value(
+            chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["status"], "incomplete");
+        assert_eq!(wire["output"][0]["status"], "completed");
+        assert_eq!(wire["output"][0]["arguments"], "{}");
     }
 }

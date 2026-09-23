@@ -58,8 +58,8 @@ use crate::{
         grpc::{
             common::responses::{
                 build_sse_response, persist_response_if_needed,
-                streaming::{attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter},
-                utils::resolve_function_identity,
+                streaming::{attach_mcp_server_label, ResponseStreamEventEmitter},
+                utils::{function_call_status, resolve_function_identity},
                 ResponsesContext,
             },
             utils,
@@ -179,9 +179,18 @@ async fn process_and_transform_sse_stream(
     // Convert body to data stream
     let mut stream = body.into_data_stream();
 
+    let mut terminal_error = None;
     // Process stream chunks (each chunk is a complete SSE event)
     while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("Stream read error: {e}"))?;
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                terminal_error = Some(
+                    json!({"code": "stream_error", "message": format!("Stream read error: {error}")}),
+                );
+                break;
+            }
+        };
 
         // Convert chunk to string
         let event_str = String::from_utf8_lossy(&chunk);
@@ -206,7 +215,16 @@ async fn process_and_transform_sse_stream(
                     event_emitter.process_chunk(&chat_chunk, &tx).await?;
                 }
                 Err(_) => {
-                    // Not a valid chat chunk - might be error event, pass through
+                    if let Ok(value) = serde_json::from_str::<Value>(json_str) {
+                        if let Some(error) = value.get("error") {
+                            terminal_error = Some(json!({
+                                "code": error.get("code").or_else(|| error.get("type")).and_then(Value::as_str).unwrap_or("server_error"),
+                                "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
+                            }));
+                            break;
+                        }
+                    }
+                    // Pass through unrecognized non-error events.
                     debug!("Non-chunk SSE event, passing through: {}", event);
                     if tx
                         .send(Ok(Bytes::from(format!("{event}\n\n"))))
@@ -239,11 +257,16 @@ async fn process_and_transform_sse_stream(
         usage_obj
     });
 
-    let completed_event = event_emitter.emit_completed(usage_json.as_ref());
-    event_emitter.send_event(&completed_event, &tx).await?;
+    event_emitter
+        .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
+        .await?;
 
     // Finalize and persist accumulated response
-    let final_response = accumulator.finalize();
+    if terminal_error.is_some() {
+        accumulator.finish_reason = Some("failed".into());
+    }
+    let mut final_response = accumulator.finalize();
+    final_response.error = terminal_error;
     persist_response_if_needed(
         conversation_storage,
         conversation_item_storage,
@@ -381,7 +404,12 @@ impl StreamingResponseAccumulator {
                     annotations: vec![],
                     logprobs: None,
                 }],
-                status: "completed".to_string(),
+                status: if matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
+                    "in_progress"
+                } else {
+                    "completed"
+                }
+                .to_string(),
                 phase: None,
             });
         }
@@ -403,14 +431,13 @@ impl StreamingResponseAccumulator {
             if let ResponseOutputItem::FunctionToolCall {
                 name,
                 namespace,
+                arguments,
                 status,
                 ..
             } = &mut item
             {
-                // Failed generations do not close the item in the stream either.
-                if !matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
-                    *status = "completed".to_string();
-                }
+                *status =
+                    function_call_status(self.finish_reason.as_deref(), arguments).to_string();
                 (*name, *namespace) =
                     resolve_function_identity(self.original_request.tools.as_deref(), name);
             }
@@ -579,16 +606,17 @@ async fn execute_tool_loop_streaming_internal(
     // Flag to track if mcp_list_tools has been emitted
     let mut mcp_list_tools_emitted = false;
 
-    loop {
+    let mut terminal_usage = None;
+    let terminal_error = loop {
         state.iteration += 1;
 
         // Record tool loop iteration metric
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
         if state.iteration > DEFAULT_MAX_ITERATIONS {
-            return Err(format!(
-                "Tool loop exceeded maximum iterations ({DEFAULT_MAX_ITERATIONS})"
-            ));
+            break Some(
+                json!({"code": "max_tool_calls_exceeded", "message": format!("Tool loop exceeded maximum iterations ({DEFAULT_MAX_ITERATIONS})")}),
+            );
         }
 
         trace!("Streaming MCP tool loop iteration {}", state.iteration);
@@ -631,7 +659,26 @@ async fn execute_tool_loop_streaming_internal(
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
-            convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx).await?;
+            match convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx).await {
+                Ok(response) => response,
+                Err(message) => break Some(json!({"code": "stream_error", "message": message})),
+            };
+        terminal_usage = accumulated_response.usage.as_ref().map(|u| {
+            json!({
+                "input_tokens": u.prompt_tokens,
+                "output_tokens": u.completion_tokens,
+                "total_tokens": u.total_tokens,
+            })
+        });
+        // A truncated generation cannot request execution of a partial MCP call.
+        if accumulated_response
+            .choices
+            .first()
+            .and_then(|choice| choice.finish_reason.as_deref())
+            == Some("length")
+        {
+            break None;
+        }
 
         // Check for tool calls (extract all of them for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
@@ -670,7 +717,9 @@ async fn execute_tool_loop_streaming_internal(
                     max_tool_calls,
                     DEFAULT_MAX_ITERATIONS
                 );
-                break;
+                break Some(
+                    json!({"code": "max_tool_calls_exceeded", "message": "Maximum tool call limit exceeded"}),
+                );
             }
 
             // Process each MCP tool call
@@ -867,68 +916,10 @@ async fn execute_tool_loop_streaming_internal(
                 );
             }
 
-            // If there are function tool calls, emit events and exit MCP loop
+            // process_chunk already emitted these function-call items.
+            // Return them to the client without duplicating their events.
             if !function_tool_calls.is_empty() {
-                trace!(
-                    "Found {} function tool call(s) - emitting events and exiting MCP loop",
-                    function_tool_calls.len()
-                );
-
-                // Emit function_tool_call events for each function tool
-                for tool_call in function_tool_calls {
-                    // Allocate output_index for this function_tool_call item
-                    let (output_index, item_id) =
-                        emitter.allocate_output_index(OutputItemKind::FunctionCall);
-
-                    // Build initial function_call item
-                    let item = json!({
-                        "id": item_id,
-                        "type": "function_call",
-                        "call_id": tool_call.call_id,
-                        "name": tool_call.name,
-                        "status": "in_progress",
-                        "arguments": ""
-                    });
-
-                    // Emit output_item.added
-                    let event = emitter.emit_output_item_added(output_index, &item);
-                    emitter.send_event(&event, &tx).await?;
-
-                    // Emit function_call_arguments.delta
-                    let event = emitter.emit_function_call_arguments_delta(
-                        output_index,
-                        &item_id,
-                        &tool_call.arguments,
-                    );
-                    emitter.send_event(&event, &tx).await?;
-
-                    // Emit function_call_arguments.done
-                    let event = emitter.emit_function_call_arguments_done(
-                        output_index,
-                        &item_id,
-                        &tool_call.arguments,
-                    );
-                    emitter.send_event(&event, &tx).await?;
-
-                    // Build complete item
-                    let item_complete = json!({
-                        "id": item_id,
-                        "type": "function_call",
-                        "call_id": tool_call.call_id,
-                        "name": tool_call.name,
-                        "status": "completed",
-                        "arguments": tool_call.arguments
-                    });
-
-                    // Emit output_item.done
-                    let event = emitter.emit_output_item_done(output_index, &item_complete);
-                    emitter.send_event(&event, &tx).await?;
-
-                    emitter.complete_output_item(output_index);
-                }
-
-                // Break loop to return response to caller
-                break;
+                break None;
             }
 
             // Build next request with conversation history
@@ -956,21 +947,12 @@ async fn execute_tool_loop_streaming_internal(
         // Text message events already emitted naturally by process_chunk during stream processing
         // (OpenAI router approach - text only appears on final iteration when no tool calls)
 
-        // Emit final response.completed event
-        let usage_json = accumulated_response.usage.as_ref().map(|u| {
-            json!({
-                "input_tokens": u.prompt_tokens,
-                "output_tokens": u.completion_tokens,
-                "total_tokens": u.total_tokens
-            })
-        });
-        let event = emitter.emit_completed(usage_json.as_ref());
-        emitter.send_event(&event, &tx).await?;
+        break None;
+    };
 
-        break;
-    }
-
-    Ok(())
+    emitter
+        .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
+        .await
 }
 
 /// Convert chat stream to Responses API events while accumulating for tool call detection
@@ -1001,6 +983,14 @@ async fn convert_and_accumulate_stream(
 
                 // Accumulate for tool call detection
                 accumulator.process_chunk(&chat_chunk);
+            } else if let Ok(value) = serde_json::from_str::<Value>(json_str) {
+                if let Some(error) = value.get("error") {
+                    return Err(error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Upstream generation failed")
+                        .to_string());
+                }
             }
         }
     }
@@ -1226,12 +1216,12 @@ mod tests {
     }
 
     #[test]
-    fn failed_generation_does_not_complete_stored_partial_tool_calls() {
+    fn failed_generation_does_not_complete_stored_partial_messages_or_tool_calls() {
         for finish_reason in ["failed", "error"] {
             let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
             let partial = serde_json::from_value(serde_json::json!({
                 "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                "choices":[{"index":0,"delta":{"tool_calls":[
+                "choices":[{"index":0,"delta":{"content":"Partial reply","tool_calls":[
                     {"index":0,"id":"call_weather","type":"function","function":{
                         "name":"weather","arguments":"{\"city\":"
                     }}
@@ -1247,11 +1237,99 @@ mod tests {
             accumulator.process_chunk(&failure);
             let wire = serde_json::to_value(accumulator.finalize()).unwrap();
             assert_eq!(wire["status"], "failed", "{finish_reason}");
-            assert_eq!(wire["output"].as_array().unwrap().len(), 1);
-            let item = &wire["output"][0];
+            assert_eq!(wire["output"].as_array().unwrap().len(), 2);
+            assert_eq!(wire["output"][0]["type"], "message");
+            assert_eq!(
+                wire["output"][0]["status"], "in_progress",
+                "{finish_reason}"
+            );
+            assert_eq!(wire["output"][0]["content"][0]["text"], "Partial reply");
+            let item = &wire["output"][1];
             assert_eq!(item["status"], "in_progress", "{finish_reason}");
             assert_eq!(item["call_id"], "call_weather");
             assert_eq!(item["arguments"], "{\"city\":");
         }
+    }
+
+    #[test]
+    fn length_truncated_stored_tool_call_preserves_earlier_completed_calls() {
+        let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
+        let partial = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+            "choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{}"}},
+                {"index":1,"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
+            ]},"finish_reason":null}]
+        })).unwrap();
+        accumulator.process_chunk(&partial);
+        let limit = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+            "choices":[{"index":0,"delta":{},"finish_reason":"length"}]
+        }))
+        .unwrap();
+        accumulator.process_chunk(&limit);
+        let wire = serde_json::to_value(accumulator.finalize()).unwrap();
+        assert_eq!(wire["status"], "incomplete");
+        assert_eq!(wire["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(wire["output"].as_array().unwrap().len(), 2);
+        assert_eq!(wire["output"][0]["status"], "completed");
+        assert_eq!(wire["output"][0]["arguments"], "{}");
+        assert_eq!(wire["output"][1]["status"], "incomplete");
+        assert_eq!(wire["output"][1]["call_id"], "call_time");
+        assert_eq!(wire["output"][1]["arguments"], "{\"tz\":");
+    }
+
+    #[tokio::test]
+    async fn upstream_error_closes_reasoning_and_emits_failed_response() {
+        let reasoning = json!({"id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+            "choices":[{"index":0,"delta":{"reasoning_content":"Partial reasoning"},"finish_reason":null}]});
+        let frames = vec![format!("data: {reasoning}\n\n"),
+            "data: {\"error\":{\"message\":\"engine unavailable\",\"type\":\"internal_error\"}}\n\n".into(),
+            "data: [DONE]\n\n".into()];
+        let body = Body::from_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(false),
+                ..Default::default()
+            },
+            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        let mut events: Vec<Value> = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            events.push(serde_json::from_str(data).unwrap());
+        }
+        let added = events
+            .iter()
+            .find(|e| e["type"] == "response.content_part.added")
+            .unwrap();
+        let done = events
+            .iter()
+            .find(|e| e["type"] == "response.content_part.done")
+            .expect("open reasoning must close even on error");
+        assert_eq!(added["item_id"], done["item_id"]);
+        assert_eq!(done["part"]["text"], "Partial reasoning");
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal["type"], "response.failed");
+        assert_eq!(terminal["response"]["status"], "failed");
+        assert_eq!(
+            terminal["response"]["error"]["message"],
+            "engine unavailable"
+        );
+        assert!(!events.iter().any(|e| e["type"] == "response.completed"));
     }
 }
