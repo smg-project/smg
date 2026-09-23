@@ -43,7 +43,10 @@ fn is_wildcard_host(host: &str) -> bool {
 
 /// `host:port` → (`host`, `Some(port)`), with IPv6 brackets kept on the host.
 fn split_host_port(authority: &str) -> (&str, Option<&str>) {
-    if let Some(end) = authority.strip_prefix('[').and_then(|_| authority.find(']')) {
+    if let Some(end) = authority
+        .strip_prefix('[')
+        .and_then(|_| authority.find(']'))
+    {
         let host = &authority[..=end];
         let port = authority[end + 1..].strip_prefix(':');
         return (host, port);
