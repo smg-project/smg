@@ -53,7 +53,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
     params_to_response_fields,
     resolve_pd_connector,
 )
-from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
+from smg_grpc_servicer.vllm.media_identity import build_media_identity
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
     ENV_PROCESSOR,
@@ -329,23 +329,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # optimisation with a fallback (decode reprocesses), so a
                 # shape it cannot read must not fail a served request.
                 if kv_transfer_params is not None:
-                    if media_identity_supported():
-                        try:
-                            media_identity = build_media_identity(prompt)
-                        except Exception as e:  # noqa: BLE001 - any failure falls back
-                            logger.warning(
-                                "Request %s: media identity not built (%s); the decode leg "
-                                "will reprocess the media",
-                                request_id,
-                                e,
-                            )
-                            media_identity = None
-                    else:
+                    try:
+                        media_identity = build_media_identity(prompt)
+                    except Exception as e:  # noqa: BLE001 - any failure falls back
                         logger.warning(
-                            "Request %s: the installed smg-grpc-proto has no media_identity; "
-                            "the decode leg will reprocess the media",
+                            "Request %s: media identity not built (%s); the decode leg "
+                            "will reprocess the media",
                             request_id,
+                            e,
                         )
+                        media_identity = None
             elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
@@ -735,9 +728,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             pairing_protocol=pairing_protocol_from_env(),
             **pairing_fields(self.engine.vllm_config),
         )
-        # Where the processor mode came from, for the gateway's /workers; a
-        # proto package predating the field simply leaves it out.
-        if mm_processor and "mm_processor_source" in info.DESCRIPTOR.fields_by_name:
+        # Where the processor mode came from, for the gateway's /workers.
+        if mm_processor:
             info.mm_processor_source = self._mm_settings.source
         return info
 
@@ -1282,11 +1274,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         # Build matched_stop kwargs from stop_reason (int token ID or str stop sequence)
         stop_kwargs = {}
-        # A proto package predating the field cannot carry the identity.
-        if (
-            media_identity is not None
-            and "media_identity" in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
-        ):
+        if media_identity is not None:
             stop_kwargs["media_identity"] = media_identity
         if completion.stop_reason is not None:
             if isinstance(completion.stop_reason, int):

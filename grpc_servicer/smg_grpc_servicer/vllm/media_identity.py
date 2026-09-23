@@ -29,11 +29,6 @@ _MODALITIES = {"image": common_pb2.IMAGE, "video": common_pb2.VIDEO, "audio": co
 _WIRE_DTYPES = {dtype: name for name, dtype in PROTO_DTYPE_MAP.items()}
 
 
-def media_identity_supported() -> bool:
-    """Whether the installed proto package can carry an identity at all."""
-    return "media_identity" in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
-
-
 def tensor_to_proto(tensor: torch.Tensor) -> vllm_engine_pb2.TensorData:
     """A grid-sized tensor as inline wire bytes, widened to a dtype the wire
     names. Bytes go through a Python list: no numpy, and grids are tiny."""
