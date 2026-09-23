@@ -25,8 +25,9 @@ python examples/rl/refit_from_disk.py --smg http://127.0.0.1:30000 \
 Exit code 0 on success, 1 on a version mismatch; a failed fan-out raises
 `smg.rl.FanoutError` naming the workers that failed (the others completed).
 
-SGLang only. TokenSpeed answers `update_weights_from_disk` with HTTP 501 and
-keeps serving — use `refit_from_trainer.py` there.
+SGLang only. TokenSpeed answers `update_weights_from_disk` (and
+`update_weights_from_tensor`) with HTTP 501 and keeps serving — use
+`refit_from_trainer.py` there.
 
 ## refit_from_trainer.py
 
