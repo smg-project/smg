@@ -165,32 +165,30 @@ on demand when a workflow uses the corresponding `runnerScaleSetName` as its
 
 ## Maintaining the runner image
 
-The [Dockerfile](Dockerfile) updates the runner runtime and bundled Node runtimes
-on top of the existing `v0.0.3` image, pinned by digest. It preserves the custom
-startup scripts, container hooks, Docker client, and other installed tools, and
-verifies the runner archive's SHA-256 before extracting it.
+Mirror the [official GitHub Actions runner image](https://github.com/actions/runner/pkgs/container/actions-runner)
+to OCIR by pulling, tagging, and pushing it. The official image includes the
+startup scripts, container hooks, Docker client, and runner user/group settings
+used by these pools, so no custom build is needed. These pools use Linux amd64.
 
-The published `2.337.0` image digest is
-`sha256:df427c441ea192d3129d9f2e206ade6bb5e03f41b44c7d745f7a02351e5164fd`.
-To build and validate an image from the repository root with OCIR access:
+With access to the destination OCIR repository:
 
 ```bash
-docker build --platform linux/amd64 \
-  -f scripts/k8s-runner-resources/Dockerfile \
-  -t fra.ocir.io/idqj093njucb/action-runner:2.337.0 \
-  scripts/k8s-runner-resources
+docker pull --platform linux/amd64 ghcr.io/actions/actions-runner:2.337.0
 
-docker run --rm --network none \
+docker tag ghcr.io/actions/actions-runner:2.337.0 \
+  fra.ocir.io/idqj093njucb/action-runner:2.337.0
+
+docker run --rm --platform linux/amd64 --network none \
   --entrypoint /home/runner/bin/Runner.Listener \
   fra.ocir.io/idqj093njucb/action-runner:2.337.0 --version
+
+# After the version check reports 2.337.0:
+docker push fra.ocir.io/idqj093njucb/action-runner:2.337.0
 ```
 
-For a future runner release, update `RUNNER_VERSION` and `RUNNER_SHA256` in the
-Dockerfile using the matching Linux x64 archive from the [official runner release](https://github.com/actions/runner/releases),
-and use that version as the image tag. After validation, push that new tag to OCIR
-and update **both** image references in all four active `runner-values-*.yaml`
-files. Keep published tags immutable; use a revision suffix if rebuilding the
-same runner version with different image contents.
+For a future runner release, substitute its version in the commands above and
+update **both** image references in all four active `runner-values-*.yaml` files
+after publishing the image. Redeploy the scale sets using step 4.
 
 If runners report `Runner version ... is deprecated and cannot receive messages`,
 refresh the image and redeploy the scale sets. If GPU pods remain pending despite
