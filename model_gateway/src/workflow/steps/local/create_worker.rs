@@ -310,7 +310,7 @@ fn take_kv_transfer_metadata(
     labels: &mut HashMap<String, String>,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let connector_label = labels.remove("kv_connector");
-    let role = labels.remove("kv_role");
+    let role_label = labels.remove("kv_role");
     let engine_id_label = labels.remove("kv_engine_id");
     (
         config
@@ -318,7 +318,11 @@ fn take_kv_transfer_metadata(
             .clone()
             .filter(|s| !s.is_empty())
             .or(connector_label),
-        role,
+        config
+            .kv_role
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or(role_label),
         config
             .kv_engine_id
             .clone()
@@ -878,6 +882,29 @@ mod tests {
         assert_eq!(spec.labels["tier"], "gold");
         assert_eq!(spec.dp_rank, None);
         assert_eq!(spec.dp_size, None);
+    }
+
+    /// The dedicated `kv_role` field follows the same precedence as the
+    /// connector and engine id: it wins over the legacy label, and an empty
+    /// value falls back to the label. A `POST /workers` carrying a top-level
+    /// `kv_role` and no label used to lose the role here.
+    #[test]
+    fn dedicated_kv_role_wins_over_the_label() {
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        spec.kv_role = Some("kv_producer".to_string());
+        let mut labels = HashMap::new();
+        let (_, role, _) = take_kv_transfer_metadata(&spec, &mut labels);
+        assert_eq!(role.as_deref(), Some("kv_producer"));
+
+        labels.insert("kv_role".to_string(), "kv_consumer".to_string());
+        let (_, role, _) = take_kv_transfer_metadata(&spec, &mut labels);
+        assert_eq!(role.as_deref(), Some("kv_producer"));
+        assert!(!labels.contains_key("kv_role"));
+
+        spec.kv_role = Some(String::new());
+        labels.insert("kv_role".to_string(), "kv_consumer".to_string());
+        let (_, role, _) = take_kv_transfer_metadata(&spec, &mut labels);
+        assert_eq!(role.as_deref(), Some("kv_consumer"));
     }
 
     #[test]
