@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "engine-zmq-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -3772,7 +3772,7 @@ dependencies = [
 
 [[package]]
 name = "kv-index"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -3901,7 +3901,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llm-multimodal"
-version = "1.11.0"
+version = "1.12.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3937,7 +3937,7 @@ dependencies = [
 
 [[package]]
 name = "llm-tokenizer"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4910,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "openai-protocol"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "axum",
  "bitflags 2.13.2",
@@ -4929,7 +4929,7 @@ dependencies = [
 
 [[package]]
 name = "openapi-gen"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "openai-protocol",
@@ -6271,7 +6271,7 @@ dependencies = [
 
 [[package]]
 name = "reasoning-parser"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "parking_lot",
  "regex",
@@ -7417,7 +7417,7 @@ dependencies = [
 
 [[package]]
 name = "smg"
-version = "1.10.1"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7610,7 +7610,7 @@ dependencies = [
 
 [[package]]
 name = "smg-golang"
-version = "1.10.1"
+version = "1.11.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -7632,7 +7632,7 @@ dependencies = [
 
 [[package]]
 name = "smg-grpc-client"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "futures",
  "h2",
@@ -7657,7 +7657,7 @@ dependencies = [
 
 [[package]]
 name = "smg-mcp"
-version = "2.3.3"
+version = "2.3.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -7736,7 +7736,7 @@ dependencies = [
 
 [[package]]
 name = "smg-python"
-version = "1.10.1"
+version = "1.11.0"
 dependencies = [
  "once_cell",
  "pyo3",
@@ -8747,7 +8747,7 @@ dependencies = [
 
 [[package]]
 name = "tool-parser"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "num-traits",

@@ -1,6 +1,6 @@
 [package]
 name = "openapi-gen"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Generate OpenAPI 3.1 spec from openai-protocol types"
 publish = false
