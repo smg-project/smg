@@ -124,6 +124,22 @@ class TestResolveKvEventsConfig:
 
 
 class TestConvertEvent:
+    @pytest.mark.parametrize(
+        "hashes,tokens,block_size",
+        [
+            ([4, 8, 10, 12], list(range(1, 13)), 2),  # Leading and interior holes.
+            ([2, 6], list(range(1, 7)), 2),  # Interior hole.
+            ([1, 2], [1, 2], 2),  # More hashes than token blocks.
+            ([1], [1, 2, 3], 2),  # Partial token block.
+            ([1], [], 0),
+            ([1], [], -1),
+        ],
+    )
+    def test_unaligned_store_is_skipped(self, hashes, tokens, block_size, caplog):
+        ev = BlockStored(hashes, None, tokens, block_size)
+        assert kv_events.convert_event(ev, event_id=7) is None
+        assert "Skipping BlockStored" in caplog.text
+
     def test_block_stored_single_block(self):
         ev = BlockStored(
             block_hashes=[111], parent_block_hash=None, token_ids=[1, 2, 3, 4], block_size=4
@@ -197,6 +213,22 @@ class TestConvertEvent:
 
 
 class TestConvertBatch:
+    def test_skipped_store_preserves_batch_and_later_events(self):
+        batch = KVEventBatch(
+            ts=12.5,
+            events=[
+                BlockStored([4, 8, 10, 12], None, list(range(1, 13)), 2),
+                BlockStored([14], None, [13, 14], 2),
+            ],
+            data_parallel_rank=2,
+        )
+        proto, next_id = kv_events.convert_batch(batch, seq_num=99, event_id_start=10)
+        assert (proto.sequence_number, proto.timestamp, proto.dp_rank) == (99, 12.5, 2)
+        assert [e.event_id for e in proto.events] == [12]
+        assert next_id == 12
+        block = proto.events[0].stored.blocks[0]
+        assert (block.block_hash, list(block.token_ids), block.block_size) == (14, [13, 14], 2)
+
     def test_seq_timestamp_and_event_ids(self):
         batch = KVEventBatch(
             ts=12.5,

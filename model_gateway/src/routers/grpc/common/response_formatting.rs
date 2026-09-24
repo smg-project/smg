@@ -34,10 +34,13 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
         .max()
         .unwrap_or(0);
     let total_reasoning_tokens: u32 = responses.iter().map(|r| r.reasoning_tokens()).sum();
+    let total_spec_accepted: u32 = responses.iter().map(|r| r.spec_accepted_tokens()).sum();
+    let total_spec_drafted: u32 = responses.iter().map(|r| r.spec_draft_tokens()).sum();
 
     Usage::from_counts(total_prompt_tokens, total_completion_tokens)
         .with_cached_tokens(total_cached_tokens)
         .with_reasoning_tokens(total_reasoning_tokens)
+        .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
 }
 
 /// Tracks per-index completion token counts across streaming chunks.
@@ -124,6 +127,22 @@ mod tests {
     }
 
     #[test]
+    fn build_usage_then_unbilled_charges_the_stub_once_for_n_greater_than_1() {
+        let usage =
+            build_usage(&[complete(10, 10, 4), complete(10, 10, 6)]).with_unbilled_prompt_tokens(3);
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(7)
+        );
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
     fn completion_token_tracker_follows_chunk_semantics() {
         // Delta stream (the vLLM shape, which the ZMQ lane also emits for
         // TokenSpeed workers): the chunks carry the counts.
@@ -132,10 +151,12 @@ mod tests {
             token_ids: vec![1, 2, 3],
             ..Default::default()
         }));
-        tracker.record_complete(&ProtoGenerateComplete::Vllm(vllm::GenerateComplete {
-            completion_tokens: 99,
-            ..Default::default()
-        }));
+        tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
+            vllm::GenerateComplete {
+                completion_tokens: 99,
+                ..Default::default()
+            },
+        )));
         assert_eq!(
             tracker.total(),
             3,

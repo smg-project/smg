@@ -826,6 +826,38 @@ fn test_validate_text_format_json_schema_empty_name() {
     );
 }
 
+/// Test text format validation (JSON schema must be a JSON object)
+#[test]
+fn test_validate_text_format_json_schema_schema_not_object() {
+    fn request(schema: serde_json::Value) -> ResponsesRequest {
+        ResponsesRequest {
+            input: ResponseInput::Text("test".to_string()),
+            text: Some(TextConfig {
+                format: Some(TextFormat::JsonSchema {
+                    name: "weather".to_string(),
+                    schema,
+                    description: None,
+                    strict: None,
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    let err = request(json!("x"))
+        .validate()
+        .expect_err("scalar schema should be invalid");
+    assert!(
+        format!("{err:?}").contains("json_schema_schema_not_object"),
+        "Expected error code json_schema_schema_not_object, got: {err:?}",
+    );
+
+    assert!(
+        request(json!({})).validate().is_ok(),
+        "empty object schema should stay valid"
+    );
+}
+
 // ============================================================================
 // Cross-Field Validation Tests (Schema-Level)
 // ============================================================================
@@ -1040,7 +1072,7 @@ fn test_validate_input_items_structure() {
         input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
             id: None,
             call_id: "call_123".to_string(),
-            output: "result".to_string(),
+            output: "result".to_string().into(),
             status: None,
         }]),
         ..Default::default()

@@ -30,7 +30,7 @@ pub mod helpers;
 pub use cohere::CohereParser;
 pub use deepseek::DeepSeekParser;
 pub use deepseek31::DeepSeek31Parser;
-pub use deepseek_dsml::DeepSeekDsmlParser;
+pub use deepseek_dsml::{DeepSeekDsmlParser, DsmlDialect};
 pub use glm4_moe::Glm4MoeParser;
 pub use inkling::InklingParser;
 pub use json::JsonParser;

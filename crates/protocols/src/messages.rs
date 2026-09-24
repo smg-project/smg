@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::{common::GenerationRequest, validated::Normalizable};
+use crate::{
+    common::{CachePartition, GenerationRequest},
+    validated::Normalizable,
+};
 
 // ============================================================================
 // Request Types
@@ -114,6 +117,16 @@ impl CreateMessageRequest {
 }
 
 impl GenerationRequest for CreateMessageRequest {
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Engine extensions in the passthrough map, forwarded to the
+            // backend as-is.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.other.get("extra_key").and_then(Value::as_str),
+            lora_path: self.other.get("lora_path").and_then(Value::as_str),
+        }
+    }
+
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
     }
@@ -127,47 +140,52 @@ impl GenerationRequest for CreateMessageRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        let mut buffer = String::new();
-        let mut has_content = false;
+        routing_text(self.system.as_ref(), &self.messages)
+    }
+}
 
-        let push = |s: &str, has_content: &mut bool, buffer: &mut String| {
-            if s.is_empty() {
-                return;
-            }
-            if *has_content {
-                buffer.push(' ');
-            }
-            buffer.push_str(s);
-            *has_content = true;
-        };
+/// The system and message text a Messages request routes on.
+fn routing_text(system: Option<&SystemContent>, messages: &[InputMessage]) -> String {
+    let mut buffer = String::new();
+    let mut has_content = false;
 
-        if let Some(system) = &self.system {
-            match system {
-                SystemContent::String(s) => push(s, &mut has_content, &mut buffer),
-                SystemContent::Blocks(blocks) => {
-                    for block in blocks {
-                        let SystemContentBlock::Text(text_block) = block;
+    let push = |s: &str, has_content: &mut bool, buffer: &mut String| {
+        if s.is_empty() {
+            return;
+        }
+        if *has_content {
+            buffer.push(' ');
+        }
+        buffer.push_str(s);
+        *has_content = true;
+    };
+
+    if let Some(system) = system {
+        match system {
+            SystemContent::String(s) => push(s, &mut has_content, &mut buffer),
+            SystemContent::Blocks(blocks) => {
+                for block in blocks {
+                    let SystemContentBlock::Text(text_block) = block;
+                    push(&text_block.text, &mut has_content, &mut buffer);
+                }
+            }
+        }
+    }
+
+    for msg in messages {
+        match &msg.content {
+            InputContent::String(s) => push(s, &mut has_content, &mut buffer),
+            InputContent::Blocks(blocks) => {
+                for block in blocks {
+                    if let InputContentBlock::Text(text_block) = block {
                         push(&text_block.text, &mut has_content, &mut buffer);
                     }
                 }
             }
         }
-
-        for msg in &self.messages {
-            match &msg.content {
-                InputContent::String(s) => push(s, &mut has_content, &mut buffer),
-                InputContent::Blocks(blocks) => {
-                    for block in blocks {
-                        if let InputContentBlock::Text(text_block) = block {
-                            push(&text_block.text, &mut has_content, &mut buffer);
-                        }
-                    }
-                }
-            }
-        }
-
-        buffer
     }
+
+    buffer
 }
 
 impl Tool {
@@ -1127,6 +1145,24 @@ pub struct CountMessageTokensRequest {
 
     /// Tool definitions
     pub tools: Option<Vec<Tool>>,
+
+    /// Additional backend-specific token counting options.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+impl GenerationRequest for CountMessageTokensRequest {
+    fn is_stream(&self) -> bool {
+        false
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        routing_text(self.system.as_ref(), &self.messages)
+    }
 }
 
 /// Response from token counting
@@ -2462,5 +2498,22 @@ mod tests {
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[1].role, Role::System); // preserved in place
+    }
+
+    #[test]
+    fn cache_partition_reads_passthrough_fields() {
+        use crate::common::GenerationRequest;
+
+        let request: CreateMessageRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_salt": "tenant-a"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert!(partition.extra_key.is_none());
+        assert!(partition.lora_path.is_none());
     }
 }

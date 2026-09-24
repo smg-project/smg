@@ -756,3 +756,85 @@ async fn test_deepseek_dsml_v4_streaming_malformed_empty_name_does_not_trap_buff
 
     assert_eq!(tool_names, vec!["search"]);
 }
+
+/// Shared streaming fix: a `string="false"` value that does not parse yet is
+/// held back instead of being emitted as a raw string, so the finished array
+/// arrives as one consistent delta stream (before, the stream started with
+/// `"[1, true, nul` and could never be continued into `[1,true,null]`). The
+/// opener arrives whole, as the tokenizer emits it; the value streams per
+/// character.
+#[tokio::test]
+async fn test_deepseek_v4_streaming_holds_back_unparsed_false_values() {
+    let tools = create_test_tools();
+    let opener = concat!(
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"search\">\n",
+        "<｜DSML｜parameter name=\"flags\" string=\"false\">",
+    );
+    let closer = "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    let mut parser = DeepSeekDsmlParser::v4();
+    let mut args = String::new();
+    let mut chunks = vec![opener.to_string()];
+    chunks.extend("[1, true, null]".chars().map(|c| c.to_string()));
+    chunks.push(closer.to_string());
+    for chunk in &chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        for item in result.calls {
+            assert!(
+                !item.parameters.contains("\"[1"),
+                "unparsed value leaked as a string: {}",
+                item.parameters
+            );
+            args.push_str(&item.parameters);
+        }
+    }
+    assert_eq!(args, r#"{"flags":[1,true,null]}"#);
+}
+
+/// End of stream right after the block opener: the opener is tool syntax,
+/// not content, so nothing is flushed; a held-back `<` with no sentinel is.
+#[tokio::test]
+async fn test_deepseek_v4_end_of_stream_drops_a_truncated_opener() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v4();
+    let first = parser.parse_incremental("Hello ", &tools).await.unwrap();
+    assert_eq!(first.normal_text, "Hello ");
+    let second = parser
+        .parse_incremental("<｜DSML｜tool_calls>", &tools)
+        .await
+        .unwrap();
+    assert_eq!(second.normal_text, "");
+    assert!(second.calls.is_empty());
+    assert_eq!(parser.take_unstreamed_normal_text(), "");
+
+    let mut parser = DeepSeekDsmlParser::v4();
+    parser.parse_incremental("a <", &tools).await.unwrap();
+    assert_eq!(parser.take_unstreamed_normal_text(), "a <");
+}
+
+/// Shared streaming fix: a `string="true"` value starting with a newline and
+/// continuing with multi-byte text is taken raw, so the delta offsets never
+/// slice a character (the previous trim made the finished value diverge from
+/// the streamed bytes and panicked on `current_args[sent_len..]`).
+#[tokio::test]
+async fn test_deepseek_v4_streaming_keeps_leading_whitespace_in_string_values() {
+    let tools = create_test_tools();
+    let opener = concat!(
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"search\">\n",
+        "<｜DSML｜parameter name=\"query\" string=\"true\">",
+    );
+    let closer = "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    let mut parser = DeepSeekDsmlParser::v4();
+    let mut args = String::new();
+    let mut chunks = vec![opener.to_string()];
+    chunks.extend("\n杭州市".chars().map(|c| c.to_string()));
+    chunks.push(closer.to_string());
+    for chunk in &chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        for item in result.calls {
+            args.push_str(&item.parameters);
+        }
+    }
+    assert_eq!(args, "{\"query\":\"\\n杭州市\"}");
+}

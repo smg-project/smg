@@ -220,6 +220,16 @@ impl GenerationRequest for CompletionRequest {
         self.stream
     }
 
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Engine extensions carried in the passthrough map, not typed
+            // fields: vLLM/SGLang `cache_salt`, SGLang `extra_key`.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.other.get("extra_key").and_then(Value::as_str),
+            lora_path: self.lora_path.as_deref(),
+        }
+    }
+
     fn get_model(&self) -> Option<&str> {
         Some(&self.model)
     }

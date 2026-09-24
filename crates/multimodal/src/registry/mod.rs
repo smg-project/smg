@@ -1,22 +1,28 @@
+mod deepseek_v41;
 mod glm53_flash;
 mod inkling;
 mod kimi_k25;
 mod kimi_k3;
 mod llama4;
 mod llava;
+mod minimax_m3;
 mod phi3_v;
-mod qwen3_asr;
+pub mod qwen3_asr;
 mod qwen3_omni;
 mod qwen3_vl;
 mod qwen_vl;
 mod traits;
+pub mod transcription;
 
+use deepseek_v41::DeepseekV41VisionSpec;
+pub use deepseek_v41::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
 use kimi_k3::KimiK3VisionSpec;
 use llama4::Llama4Spec;
 use llava::{LlavaNextSpec, LlavaSpec};
+use minimax_m3::MiniMaxM3VisionSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -25,8 +31,8 @@ use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
-    MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
-    Tokenizer,
+    MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+    RegistryResult, Tokenizer,
 };
 
 pub struct ModelRegistry {
@@ -37,6 +43,8 @@ impl ModelRegistry {
     pub fn new() -> Self {
         Self {
             specs: vec![
+                // DeepSeek-V4.1 matches only its own model_type / id, so it can lead.
+                LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
@@ -44,6 +52,7 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(KimiK3VisionSpec)),
                 LazySpec::new(|| Box::new(KimiK25VisionSpec)),
                 LazySpec::new(|| Box::new(Llama4Spec)),
+                LazySpec::new(|| Box::new(MiniMaxM3VisionSpec)),
                 // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
                 LazySpec::new(|| Box::new(LlavaSpec)),

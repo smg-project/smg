@@ -34,7 +34,7 @@ use crate::{
         grpc::{
             common::responses::{
                 collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
-                ResponsesContext,
+                utils::resolve_function_identity, ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
         },
@@ -471,10 +471,13 @@ fn build_tool_response(
         let output_str = to_string(&result.output)
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize tool output: {e}\"}}"));
 
+        let (name, namespace) =
+            resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
         output.push(ResponseOutputItem::FunctionToolCall {
             id: Some(tool_call.id.clone()),
             call_id: tool_call.id.clone(),
-            name: tool_call.function.name.clone(),
+            name,
+            namespace,
             arguments: tool_call.function.arguments.clone().unwrap_or_default(),
             output: Some(output_str),
             status: if result.is_error {
@@ -490,10 +493,13 @@ fn build_tool_response(
     for tool_call in function_tool_calls {
         let call_id = tool_call.id.clone();
         let arguments = tool_call.function.arguments.unwrap_or_default();
+        let (name, namespace) =
+            resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
         output.push(ResponseOutputItem::FunctionToolCall {
             id: Some(tool_call.id),
             call_id,
-            name: tool_call.function.name,
+            name,
+            namespace,
             arguments,
             output: None, // No output = needs execution
             status: "completed".to_string(),
@@ -526,4 +532,33 @@ fn build_tool_response(
             }),
         }))
         .build()
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+
+    #[test]
+    fn namespace_function_response_preserves_identity() {
+        let request = namespace_test_request();
+        let call = serde_json::from_value(json!({
+            "id": "call_test", "type": "function",
+            "function": {"name": "weather.lookup", "arguments": "{}"}
+        }))
+        .unwrap();
+        let response = build_tool_response(
+            vec![],
+            vec![],
+            vec![call],
+            None,
+            String::new(),
+            Usage::from_counts(1, 1),
+            "resp_test".into(),
+            Arc::new(request),
+        );
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["output"][0]["name"], "lookup");
+        assert_eq!(wire["output"][0]["namespace"], "weather");
+    }
 }

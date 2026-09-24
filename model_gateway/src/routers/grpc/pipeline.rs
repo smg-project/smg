@@ -48,7 +48,8 @@ use super::{
                 MessageResponseProcessingStage,
             },
             ChatGeneratePreparationStage, ChatGenerateRequestBuildingStage,
-            ChatGenerateResponseProcessingStage,
+            ChatGenerateResponseProcessingStage, TranscriptionPreparationStage,
+            TranscriptionRequestBuildingStage, TranscriptionResponseProcessingStage,
         },
         streaming,
     },
@@ -80,6 +81,7 @@ pub(crate) enum Endpoint {
     Harmony,
     Embeddings,
     Classify,
+    Transcription,
 }
 
 /// Construction dependencies shared by every endpoint pipeline.
@@ -364,6 +366,27 @@ impl RequestPipeline {
                     response_processing: Box::new(ClassifyResponseProcessingStage::new()),
                 }
             }
+            Endpoint::Transcription => {
+                // Transcription is Regular-only (whole-file, single worker).
+                if !matches!(mode, Mode::Regular) {
+                    return None;
+                }
+                // Plain text decode: no configured parsers needed.
+                let (processor, _streaming) = PipelineDeps::default_processors(backend);
+                PipelineStages {
+                    preparation: Box::new(TranscriptionPreparationStage),
+                    // Whole-file transcription was never tenant rate-limited on
+                    // the old wrapping path; keep that.
+                    rate_limit: None,
+                    worker_selection,
+                    encode: None,
+                    // Regular-only: no PD metadata, single-plan (see the stage).
+                    request_building: Box::new(TranscriptionRequestBuildingStage::new()),
+                    response_processing: Box::new(TranscriptionResponseProcessingStage::new(
+                        processor,
+                    )),
+                }
+            }
         };
 
         Some(Self {
@@ -402,6 +425,24 @@ impl RequestPipeline {
                 "Worker selection not completed",
             )
         })?;
+        // The window is a property of the selected worker's model card, so
+        // this has to follow selection; it precedes client acquisition so a
+        // request no engine could accept never reaches one (#2380).
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            error!(function = "run_ingress", "Preparation stage not completed");
+            error::internal_error(
+                "preparation_stage_not_completed",
+                "Preparation stage not completed",
+            )
+        })?;
+        step!(
+            "ContextLength",
+            enforce_context_length(prep, workers, &ctx.input.model_id)
+        )?;
+        step!(
+            "OutputBudget",
+            enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
+        )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
             acquire_clients(workers, &ctx.input.model_id).await
@@ -472,7 +513,7 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan).await?;
+        execute_plan(dctx, attempt_plan, last_attempt).await?;
         self.stages
             .response_processing
             .process(dctx, spec.clone())
@@ -579,6 +620,8 @@ impl RequestPipeline {
             );
             // The failed attempt's worker load must not stay elevated through
             // the backoff window (a fresh context dropped them here before).
+            // This releases its PD admission claim too, so the retry is not
+            // queued behind its own predecessor's bootstrap rooms.
             dctx.load_guards = None;
 
             let Some(config) = retry_config else {
@@ -744,7 +787,10 @@ impl RequestPipeline {
                     let usage = response.usage.as_ref();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        usage.map_or(0, |u| u.prompt_tokens),
+                        // The engine's count: the usage shown excludes the unbilled stub.
+                        usage.map_or(0, |u| {
+                            u.prompt_tokens + dctx.response.unbilled_prompt_tokens
+                        }),
                         usage.map_or(0, |u| u.completion_tokens),
                     )
                     .await;
@@ -926,6 +972,45 @@ impl RequestPipeline {
                     ENDPOINT,
                 ),
                 None => self.no_response_produced("execute_embeddings", &dctx.model_id, ENDPOINT),
+            },
+            Err(response) => response,
+        }
+    }
+
+    /// Execute the complete pipeline for an audio transcription request.
+    pub async fn execute_transcription(
+        &self,
+        request: Arc<openai_protocol::transcription::TranscriptionRequest>,
+        audio: Arc<openai_protocol::transcription::AudioFile>,
+        headers: Option<http::HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+        tenant_request_meta: Option<TenantRequestMeta>,
+    ) -> Response {
+        let mut ctx =
+            RequestContext::for_transcription(request, audio, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+
+        // Same label the HTTP layer records for /v1/audio/transcriptions, so
+        // the endpoint's metrics don't split across backends.
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS;
+        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Transcription { text, format }) => {
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    super::regular::stages::transcription::render(format, text)
+                }
+                Some(other) => self.wrong_response_type(
+                    "execute_transcription",
+                    "Transcription",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => {
+                    self.no_response_produced("execute_transcription", &dctx.model_id, ENDPOINT)
+                }
             },
             Err(response) => response,
         }
@@ -1168,8 +1253,12 @@ mod build_parity_tests {
             Endpoint::Embeddings | Endpoint::Classify => {
                 "EmbeddingRequestBuildingStage".to_string()
             }
+            Endpoint::Transcription => "TranscriptionRequestBuildingStage".to_string(),
         };
-        let rate_limit = !matches!(endpoint, Endpoint::Embeddings | Endpoint::Classify);
+        let rate_limit = !matches!(
+            endpoint,
+            Endpoint::Embeddings | Endpoint::Classify | Endpoint::Transcription
+        );
         // Harmony never carries the encode stage.
         let encode = encode && !matches!(endpoint, Endpoint::Harmony);
         (
@@ -1217,7 +1306,11 @@ mod build_parity_tests {
         assert_parity(Endpoint::Harmony, Mode::Regular, &deps);
         assert_parity(Endpoint::Harmony, Mode::PrefillDecode, &deps);
 
-        for endpoint in [Endpoint::Embeddings, Endpoint::Classify] {
+        for endpoint in [
+            Endpoint::Embeddings,
+            Endpoint::Classify,
+            Endpoint::Transcription,
+        ] {
             assert!(
                 RequestPipeline::build(endpoint, Mode::PrefillDecode, &deps).is_none(),
                 "{endpoint:?} PD must be invalid"
@@ -1335,6 +1428,7 @@ mod alias_pipeline_tests {
 #[cfg(test)]
 mod request_release_tests {
     use std::{
+        path::{Path, PathBuf},
         pin::Pin,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1343,8 +1437,11 @@ mod request_release_tests {
         time::Duration,
     };
 
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use futures::Stream;
-    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+    use llm_tokenizer::{
+        traits::Tokenizer, HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
+    };
     use openai_protocol::{
         completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
     };
@@ -1358,11 +1455,16 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        routers::grpc::multimodal::{
+            MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+        },
         worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
     };
 
     const MODEL: &str = "request-release-test-model";
 
+    /// The `(offset, length)` placeholder ranges of one generate call.
+    type PlaceholderRanges = Vec<(u32, u32)>;
     type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
     type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
     type TokenizerStream =
@@ -1373,17 +1475,24 @@ mod request_release_tests {
     /// probe reaches zero strong references or a deadline passes, recording
     /// the outcome in `released`. An ungated stub (no probe) answers
     /// immediately -- used for the PD prefill leg. `fail_first` makes the
-    /// first generate call return UNAVAILABLE, for retry-replay tests; every
-    /// call's input token ids and engine request id are recorded.
+    /// first generate call return UNAVAILABLE, for retry-replay tests;
+    /// `fail_always` fails every call, and `answer_after` stalls the generate
+    /// RPC, standing in for an engine that answers only at its own deadline.
+    /// Every call's input token ids and engine request id are recorded, as is
+    /// every aborted request id.
     #[derive(Clone, Default)]
     struct GatedScheduler {
         probe: Option<Weak<CompletionRequest>>,
         gate_rpc: bool,
         released: Arc<AtomicBool>,
         fail_first: bool,
+        fail_always: bool,
+        answer_after: Option<Duration>,
         calls: Arc<AtomicUsize>,
         seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
+        seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
         seen_request_ids: Arc<Mutex<Vec<String>>>,
+        aborted_request_ids: Arc<Mutex<Vec<String>>>,
     }
 
     impl GatedScheduler {
@@ -1421,6 +1530,7 @@ mod request_release_tests {
                     output_logprobs: None,
                     matched_stop: None,
                     index: 0,
+                    ..Default::default()
                 })),
             }),
         ]
@@ -1441,6 +1551,23 @@ mod request_release_tests {
             request: TonicRequest<ts::GenerateRequest>,
         ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
             let request = request.into_inner();
+            self.seen_mm_placeholders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(
+                    request
+                        .mm_inputs
+                        .as_ref()
+                        .map(|mm| {
+                            mm.items
+                                .iter()
+                                .flat_map(|item| {
+                                    item.placeholders.iter().map(|p| (p.offset, p.length))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
             self.seen_input_ids
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1449,8 +1576,13 @@ mod request_release_tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(request.request_id.clone());
-            if self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            if self.fail_always
+                || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0)
+            {
                 return Err(Status::unavailable("release-test induced failure"));
+            }
+            if let Some(delay) = self.answer_after {
+                tokio::time::sleep(delay).await;
             }
             if self.gate_rpc {
                 if let Some(probe) = &self.probe {
@@ -1486,8 +1618,12 @@ mod request_release_tests {
 
         async fn abort(
             &self,
-            _request: TonicRequest<ts::AbortRequest>,
+            request: TonicRequest<ts::AbortRequest>,
         ) -> Result<TonicResponse<ts::AbortResponse>, Status> {
+            self.aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.into_inner().request_id);
             Ok(TonicResponse::new(ts::AbortResponse {
                 success: true,
                 message: String::new(),
@@ -1888,6 +2024,398 @@ mod request_release_tests {
             assert!(ids[0].starts_with("cmpl_") && ids[1].starts_with("cmpl_"));
             assert_ne!(ids[0], ids[1], "each attempt gets a fresh engine id");
         }
+    }
+
+    /// A prefill leg that cannot start must answer the client immediately
+    /// rather than waiting out the decode leg's own deadline, and the decode
+    /// room it stranded must be aborted rather than left for the engine to
+    /// time out. The decode stub here answers only after `DECODE_DELAY`,
+    /// standing in for an engine whose transfer deadline is what the client
+    /// used to wait on.
+    #[tokio::test]
+    async fn a_failed_prefill_answers_now_and_aborts_the_decode_room() {
+        const DECODE_DELAY: Duration = Duration::from_secs(2);
+
+        let prefill_port = spawn_stub(GatedScheduler {
+            fail_always: true,
+            ..Default::default()
+        })
+        .await;
+        let aborted = Arc::new(Mutex::new(Vec::new()));
+        let decode_request_ids = Arc::new(Mutex::new(Vec::new()));
+        let decode_port = spawn_stub(GatedScheduler {
+            answer_after: Some(DECODE_DELAY),
+            aborted_request_ids: Arc::clone(&aborted),
+            seen_request_ids: Arc::clone(&decode_request_ids),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+        let components = components(worker_registry).await;
+
+        let started = Instant::now();
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let answered_in = started.elapsed();
+
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "prefill_worker_failed_to_start"
+        );
+        assert!(
+            answered_in < DECODE_DELAY,
+            "the prefill failure must not wait for the decode leg, took {answered_in:?}"
+        );
+
+        // The decode leg is retired off the request path: once its dispatch
+        // lands, its stream drops and that is what sends the abort.
+        let deadline = Instant::now() + DECODE_DELAY + Duration::from_secs(8);
+        loop {
+            if !aborted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stranded decode room was never aborted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let aborted = aborted.lock().unwrap_or_else(PoisonError::into_inner);
+        let dispatched = decode_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            aborted.as_slice(),
+            dispatched.as_slice(),
+            "the abort must name the decode leg's own request id"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // DeepSeek-V4.1 parity through the pipeline with the real checkpoint
+    // tokenizer. Needs `DEEPSEEK_V41_MODEL_DIR` (or the tokenizer crate's
+    // download cache); skips otherwise, like the tokenizer crate's parity
+    // test.
+    // ------------------------------------------------------------------
+
+    const V41_RENDER_FIXTURES: &str = include_str!(
+        "../../../../crates/tokenizer/tests/fixtures/deepseek_v41/render_fixtures.json"
+    );
+    const V41_ID_FIXTURES: &str = include_str!(
+        "../../../../crates/tokenizer/tests/fixtures/deepseek_v41/render_ids_fixtures.json"
+    );
+    const V41_CORN_PNG: &[u8] =
+        include_bytes!("../../../../crates/multimodal/tests/fixtures/images/deepseek_v41_corn.png");
+    /// `<｜deepseek_image｜>` in the checkpoint's `config.json`.
+    const V41_IMAGE_TOKEN_ID: u32 = 129264;
+    /// The reference span for `deepseek_v41_corn.png` (450x308), recorded in
+    /// the multimodal crate's goldens.
+    const V41_CORN_TOKENS: usize = 189;
+
+    fn deepseek_v41_model_dir() -> Option<PathBuf> {
+        let dir = std::env::var_os("DEEPSEEK_V41_MODEL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../crates/tokenizer/.tokenizer_cache/deepseek_v41")
+            });
+        (dir.join("tokenizer.json").is_file() && dir.join("config.json").is_file()).then_some(dir)
+    }
+
+    #[expect(
+        clippy::print_stderr,
+        reason = "test diagnostic: says why the parity test did not run"
+    )]
+    fn skip_no_tokenizer() {
+        eprintln!("skipping: no DeepSeek-V4.1 tokenizer (set DEEPSEEK_V41_MODEL_DIR)");
+    }
+
+    /// The recorded request (`messages`, kwargs) and reference ids of one
+    /// tokenizer-crate fixture case.
+    fn v41_fixture(name: &str) -> (serde_json::Value, Vec<u32>) {
+        let render: serde_json::Value =
+            serde_json::from_str(V41_RENDER_FIXTURES).expect("render fixtures");
+        let ids: serde_json::Value = serde_json::from_str(V41_ID_FIXTURES).expect("id fixtures");
+        let find = |doc: &serde_json::Value| {
+            doc["cases"]
+                .as_array()
+                .expect("cases")
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap_or_else(|| panic!("fixture case {name}"))
+                .clone()
+        };
+        let case = find(&render);
+        let ids = find(&ids)["ids"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|id| id.as_u64().expect("token id") as u32)
+            .collect();
+        (case, ids)
+    }
+
+    async fn v41_components(
+        dir: &Path,
+        worker_registry: Arc<WorkerRegistry>,
+        with_multimodal: bool,
+    ) -> Arc<SharedComponents> {
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let tokenizer_path = dir.join("tokenizer.json");
+        let tokenizer = Arc::new(
+            HuggingFaceTokenizer::from_file(tokenizer_path.to_str().expect("utf-8 tokenizer path"))
+                .expect("load the DeepSeek-V4.1 tokenizer"),
+        ) as Arc<dyn Tokenizer>;
+        // The tokenizer's source is the checkpoint directory: the multimodal
+        // config registry reads `config.json` (image_token_id) from it.
+        let source = dir.to_string_lossy().into_owned();
+        tokenizer_registry
+            .load(
+                "deepseek-v41",
+                MODEL,
+                &source,
+                || async move { Ok(tokenizer) },
+            )
+            .await
+            .expect("register the DeepSeek-V4.1 tokenizer");
+        let multimodal = with_multimodal.then(|| {
+            Arc::new(
+                MultimodalComponents::new(
+                    Arc::new(MultimodalConfigRegistry::new()),
+                    None,
+                    None,
+                    &MultimodalSettings::default(),
+                )
+                .expect("multimodal components"),
+            )
+        });
+        Arc::new(SharedComponents {
+            tokenizer_registry,
+            worker_registry,
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: utils::ParserResolver::disabled(),
+            multimodal,
+        })
+    }
+
+    /// Status, body, and the input ids and placeholders of every attempt a
+    /// chat request produced.
+    type ChatRun = (
+        http::StatusCode,
+        bytes::Bytes,
+        Vec<Vec<u32>>,
+        Vec<PlaceholderRanges>,
+    );
+
+    /// Runs one chat request against a recording TokenSpeed stub.
+    async fn v41_run_chat(
+        dir: &Path,
+        request: serde_json::Value,
+        with_multimodal: bool,
+    ) -> ChatRun {
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let seen_mm = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            seen_mm_placeholders: Arc::clone(&seen_mm),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = v41_components(dir, worker_registry, with_multimodal).await;
+        let request: Arc<ChatCompletionRequest> =
+            Arc::new(serde_json::from_value(request).expect("chat request"));
+        let response = pipeline
+            .execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let ids = seen_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mm = seen_mm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        (status, body, ids, mm)
+    }
+
+    /// The prompt ids the worker receives equal the reference encoder's ids
+    /// for a recorded multi-turn chat-mode case, and a `continue_final_message`
+    /// request keeps its trailing assistant message and renders it the
+    /// reference way (no EOS, no generation header) instead of as a prefix.
+    #[tokio::test]
+    async fn deepseek_v41_prompt_ids_match_the_reference_through_the_pipeline() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+
+        let (case, expected) = v41_fixture("hf_2");
+        let (status, body, ids, _) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": case["messages"],
+                "chat_template_kwargs": {"thinking": false, "drop_thinking": true},
+                "max_tokens": 1,
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            ids,
+            vec![expected],
+            "hf_2: prompt ids differ from the reference"
+        );
+
+        let (case, expected) = v41_fixture("continue_final_message");
+        let (status, body, ids, _) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": case["messages"],
+                "continue_final_message": true,
+                "chat_template_kwargs": {"thinking": true, "drop_thinking": true},
+                "max_tokens": 1,
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            ids,
+            vec![expected],
+            "continue_final_message: prompt ids differ from the reference's no-EOS rendering"
+        );
+    }
+
+    /// A renderer validation error (an effort level the reference rejects) is
+    /// the client's mistake, so it surfaces as 400, not 500.
+    #[tokio::test]
+    async fn deepseek_v41_invalid_effort_is_a_bad_request() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let (status, body, ids, _) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "reasoning_effort": "medium",
+                "max_tokens": 1,
+            }),
+            false,
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Invalid reasoning effort"), "{body}");
+        assert!(ids.is_empty(), "nothing must reach the worker");
+    }
+
+    /// One image expands to exactly the reference span: `<｜deepseek_image｜>`
+    /// is inlined at the part's position by the renderer and replaced by
+    /// `image_token_id` repeated once per span position (189 for the corn
+    /// example), and the worker is told that span as the placeholder range.
+    #[tokio::test]
+    async fn deepseek_v41_image_expands_to_the_reference_span() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let data_url = format!("data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG));
+        let (status, body, ids, mm) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": {"url": data_url}}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(ids.len(), 1);
+        let prompt = &ids[0];
+        let count = prompt
+            .iter()
+            .filter(|&&id| id == V41_IMAGE_TOKEN_ID)
+            .count();
+        assert_eq!(count, V41_CORN_TOKENS, "image span length");
+        let first = prompt
+            .iter()
+            .position(|&id| id == V41_IMAGE_TOKEN_ID)
+            .expect("the image span is present");
+        assert!(
+            prompt[first..first + V41_CORN_TOKENS]
+                .iter()
+                .all(|&id| id == V41_IMAGE_TOKEN_ID),
+            "the image span is contiguous"
+        );
+        assert_eq!(mm, vec![vec![(first as u32, V41_CORN_TOKENS as u32)]]);
     }
 }
 

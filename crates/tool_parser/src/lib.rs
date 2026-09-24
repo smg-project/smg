@@ -4,6 +4,7 @@
 // Core modules
 pub mod errors;
 pub mod factory;
+mod json_format;
 pub mod partial_json;
 pub mod traits;
 pub mod types;

@@ -4,11 +4,12 @@
 //! them asynchronously in background worker tasks.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
@@ -43,7 +44,11 @@ pub enum Job {
     },
     RemoveWorker {
         url: String,
-        expected_revision: Option<u64>,
+        /// Per-worker revision guards keyed by registry worker id. A DP group
+        /// shares one canonical URL but each rank holds its own revision, so
+        /// one scalar cannot guard the group. `None` removes every match
+        /// unguarded.
+        expected_revisions: Option<HashMap<String, u64>>,
     },
     InitializeWorkersFromConfig {
         router_config: Box<RouterConfig>,
@@ -215,6 +220,39 @@ impl JobQueue {
         (queue_depth, available_permits)
     }
 
+    /// Submit unless a job for this URL is already pending or processing.
+    /// Returns `Ok(false)` when an earlier submission is still in flight. The
+    /// status-map entry is taken atomically, so concurrent callers enqueue
+    /// exactly one job per URL (#1533).
+    pub async fn submit_if_idle(&self, job: Job) -> Result<bool, String> {
+        let worker_url = job.worker_url().to_string();
+        if !Self::claim(&self.status_map, &worker_url, job.job_type()) {
+            return Ok(false);
+        }
+        self.submit(job).await.map(|()| true).inspect_err(|_| {
+            // A failed submission owns no job, so its claim must not block the next one.
+            self.status_map.remove(&worker_url);
+        })
+    }
+
+    /// Only an in-flight job of the same type counts: the status map is keyed
+    /// by name across job types, so an MCP server or WASM module named like a
+    /// worker URL must not block that worker's AddWorker.
+    fn claim(status_map: &DashMap<String, JobStatus>, url: &str, job_type: &'static str) -> bool {
+        match status_map.entry(url.to_string()) {
+            Entry::Occupied(e)
+                if e.get().job_type == job_type
+                    && matches!(e.get().status.as_str(), "pending" | "processing") =>
+            {
+                false
+            }
+            entry => {
+                entry.insert(JobStatus::pending(job_type, url));
+                true
+            }
+        }
+    }
+
     /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
@@ -293,6 +331,21 @@ impl JobQueue {
             Some(ctx) => {
                 let result = Self::execute_job(&job, &ctx).await;
                 let duration = start.elapsed();
+                // Only `POST /workers` (CreateOnly) reserves an id for its 202; a failed
+                // upsert from discovery or startup owns no reservation to drop. Release
+                // before the status turns terminal, so a retry cannot reserve the same
+                // mapping in between and have it deleted from under it (#1533).
+                if result.is_err()
+                    && matches!(
+                        job,
+                        Job::AddWorker {
+                            registration_mode: WorkerRegistrationMode::CreateOnly,
+                            ..
+                        }
+                    )
+                {
+                    ctx.worker_registry.release_reservation(&worker_url);
+                }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
             }
             None => {
@@ -377,7 +430,7 @@ impl JobQueue {
             }
             Job::RemoveWorker {
                 url,
-                expected_revision,
+                expected_revisions,
             } => {
                 let engines = context
                     .workflow_engines
@@ -386,8 +439,7 @@ impl JobQueue {
 
                 let workflow_data = create_worker_removal_workflow_data(
                     url.to_string(),
-                    context.router_config.dp_aware,
-                    *expected_revision,
+                    expected_revisions.clone(),
                     Arc::clone(context),
                 );
 
@@ -929,6 +981,50 @@ mod tests {
             failed.timestamp + 300,
             300
         ));
+    }
+
+    /// Concurrent creates for one URL must enqueue exactly one AddWorker, and a
+    /// terminal status must not block the next attempt (#1533).
+    #[test]
+    fn claim_admits_one_in_flight_job_per_url() {
+        let map = Arc::new(DashMap::new());
+        let won: Vec<bool> = (0..16)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                std::thread::spawn(move || JobQueue::claim(&map, "http://w:8000", "AddWorker"))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(won.iter().filter(|&&w| w).count(), 1);
+
+        map.insert(
+            "http://w:8000".to_string(),
+            JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string()),
+        );
+        assert!(JobQueue::claim(&map, "http://w:8000", "AddWorker"));
+
+        // A different job type under the same key is not a competing claim.
+        map.insert(
+            "http://w:8000".to_string(),
+            JobStatus::pending("RegisterMcpServer", "http://w:8000"),
+        );
+        assert!(JobQueue::claim(&map, "http://w:8000", "AddWorker"));
+    }
+
+    /// A submission that fails must not leave its claim behind, or the next
+    /// create for the URL would be told a job is in flight when none is (#1533).
+    #[tokio::test]
+    async fn failed_submit_if_idle_releases_its_claim() {
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        let job = || Job::AddWorker {
+            config: Box::new(WorkerSpec::new("http://w:8000")),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+        };
+        assert!(queue.submit_if_idle(job()).await.is_err());
+        // Before the rollback this returned Ok(false): a 202 with no job behind it.
+        assert!(queue.submit_if_idle(job()).await.is_err());
     }
 
     /// The queue channel and dispatch semaphore are sized from the config,

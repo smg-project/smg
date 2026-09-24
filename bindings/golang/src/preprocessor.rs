@@ -64,7 +64,9 @@ fn preprocess_impl(
         chat_request.tools.as_ref(),
         chat_request.tool_choice.as_ref(),
     ) {
-        match registry.generate_tool_constraint(None, tools, tool_choice) {
+        // No parser is configured here, so the registry falls back to a JSON
+        // schema, which carries no reasoning prefix.
+        match registry.generate_tool_constraint(None, tools, tool_choice, false) {
             Ok(Some(c)) => {
                 let json_str = serde_json::to_string(&c.to_tuple()).map_err(|e| {
                     (

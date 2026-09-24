@@ -27,6 +27,12 @@ type ParserCreator = Arc<dyn Fn() -> Box<dyn ToolParser> + Send + Sync>;
 /// Takes (tools, at_least_one) and returns the full xgrammar structural tag value.
 type BuildStructuralTagFn = Arc<dyn Fn(&[Tool], bool) -> serde_json::Value + Send + Sync>;
 
+/// Function that builds the reasoning block a parser's structural tag is
+/// wrapped in when the prompt ends inside the model's thinking block: one
+/// xgrammar format element (a `tag` with an empty `begin`, free text, and the
+/// think-end token as `end`) the model must complete before the calls start.
+type ReasoningPrefixFn = fn() -> serde_json::Value;
+
 /// Constraint type returned by [`ParserRegistry::generate_tool_constraint`].
 #[derive(Debug, Clone)]
 pub enum ToolConstraint {
@@ -60,6 +66,7 @@ impl ToolConstraint {
 struct ParserEntry {
     creator: ParserCreator,
     build_structural_tag: Option<BuildStructuralTagFn>,
+    reasoning_prefix: Option<ReasoningPrefixFn>,
 }
 
 /// Registry for model-specific tool parsers with pooling support.
@@ -97,6 +104,7 @@ impl ParserRegistry {
             Arc::new(ParserEntry {
                 creator: Arc::new(creator),
                 build_structural_tag: None,
+                reasoning_prefix: None,
             }),
         );
     }
@@ -119,8 +127,50 @@ impl ParserRegistry {
             Arc::new(ParserEntry {
                 creator: Arc::new(creator),
                 build_structural_tag: Some(Arc::new(build_structural_tag)),
+                reasoning_prefix: None,
             }),
         );
+    }
+
+    /// Register the reasoning block for a parser that already has a structural
+    /// tag builder.
+    ///
+    /// When [`Self::generate_tool_constraint`] is called with `reasoning`
+    /// set, the parser's tag becomes `sequence[prefix, tag.format]`: the
+    /// model reasons, closes its thinking block, and only then emits the
+    /// forced call — the layout of xgrammar's built-in tags with
+    /// `reasoning=True`. Parsers without a prefix keep their unwrapped tag
+    /// whatever `reasoning` says.
+    pub fn register_reasoning_prefix(&self, name: &str, reasoning_prefix: ReasoningPrefixFn) {
+        let mut entries = self.entries.write();
+        let Some(existing) = entries.get(name).map(Arc::clone) else {
+            debug_assert!(false, "reasoning prefix for unregistered parser {name}");
+            return;
+        };
+        debug_assert!(
+            existing.build_structural_tag.is_some(),
+            "reasoning prefix for parser {name} without a structural tag"
+        );
+        entries.insert(
+            name.to_string(),
+            Arc::new(ParserEntry {
+                creator: Arc::clone(&existing.creator),
+                build_structural_tag: existing.build_structural_tag.clone(),
+                reasoning_prefix: Some(reasoning_prefix),
+            }),
+        );
+    }
+
+    /// Whether the configured parser wraps its structural tag in a reasoning
+    /// block when asked (see [`Self::register_reasoning_prefix`]). False when
+    /// no parser is configured, like [`Self::has_structural_tag_for_parser`].
+    pub fn has_reasoning_prefix(&self, configured: Option<&str>) -> bool {
+        configured.is_some_and(|name| {
+            self.entries
+                .read()
+                .get(name)
+                .is_some_and(|entry| entry.reasoning_prefix.is_some())
+        })
     }
 
     /// Map a model name/pattern to a parser
@@ -188,11 +238,18 @@ impl ParserRegistry {
     /// If `configured_parser` supports structural tags → `StructuralTag(json)`.
     /// Otherwise → `JsonSchema(schema)` for required/function tool_choice.
     /// Returns `Ok(None)` for auto/none tool_choice.
+    ///
+    /// `reasoning` says the rendered prompt ends inside the model's thinking
+    /// block (the gateway's `chat_reasoning_starts_in_prefill`). A parser that
+    /// registered a reasoning prefix then gets its tag wrapped so the forced
+    /// call follows the reasoning instead of preempting it; every other
+    /// constraint is unchanged and applies from the first generated token.
     pub fn generate_tool_constraint(
         &self,
         configured_parser: Option<&str>,
         tools: &[Tool],
         tool_choice: &ToolChoice,
+        reasoning: bool,
     ) -> Result<Option<ToolConstraint>, String> {
         if tools.is_empty() {
             return Ok(None);
@@ -210,7 +267,10 @@ impl ParserRegistry {
             let entries = self.entries.read();
             if let Some(entry) = entries.get(name) {
                 if let Some(build_fn) = entry.build_structural_tag.as_ref() {
-                    let tag = build_fn(tools, at_least_one);
+                    let mut tag = build_fn(tools, at_least_one);
+                    if let (true, Some(prefix)) = (reasoning, entry.reasoning_prefix) {
+                        tag = wrap_in_reasoning_prefix(tag, prefix())?;
+                    }
                     let json_str = serde_json::to_string(&tag)
                         .map_err(|e| format!("Failed to serialize structural tag: {e}"))?;
                     return Ok(Some(ToolConstraint::StructuralTag(json_str)));
@@ -327,8 +387,18 @@ impl ParserFactory {
         registry.register_parser("deepseek31", || Box::new(DeepSeek31Parser::new()));
         registry.register_parser("deepseek32", || Box::new(DeepSeekDsmlParser::v32()));
         registry.register_parser("deepseek_v4", || Box::new(DeepSeekDsmlParser::v4()));
+        registry.register_parser_with_structural_tag(
+            "deepseek_v41",
+            || Box::new(DeepSeekDsmlParser::v41()),
+            DeepSeekDsmlParser::build_v41_structural_tag,
+        );
         registry.register_parser("glm45_moe", || Box::new(Glm4MoeParser::glm45()));
-        registry.register_parser("glm47_moe", || Box::new(Glm4MoeParser::glm47()));
+        registry.register_parser_with_structural_tag(
+            "glm47_moe",
+            || Box::new(Glm4MoeParser::glm47()),
+            Glm4MoeParser::build_structural_tag,
+        );
+        registry.register_reasoning_prefix("glm47_moe", Glm4MoeParser::reasoning_prefix);
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
         registry.register_parser("sarashina", || Box::new(SarashinaParser::new()));
         registry.register_parser_with_structural_tag(
@@ -421,6 +491,14 @@ impl ParserFactory {
         // V4 DSML format (outer block: tool_calls — same parser as V3.2, different block name)
         registry.map_model("deepseek-v4*", "deepseek_v4");
         registry.map_model("deepseek-ai/DeepSeek-V4*", "deepseek_v4");
+        // V4.1 DSML format (spaced tags); its stems are longer than V4's, so they win
+        registry.map_model("deepseek-v4.1*", "deepseek_v41");
+        registry.map_model("deepseek_v41*", "deepseek_v41");
+        registry.map_model("deepseek-v41*", "deepseek_v41");
+        registry.map_model("deepseek-ai/DeepSeek-V4.1*", "deepseek_v41");
+        // Longest matching stem wins: without this the org-prefixed dot-less
+        // spelling would resolve through `deepseek-ai/DeepSeek-V4*` to V4.
+        registry.map_model("deepseek-ai/DeepSeek-V41*", "deepseek_v41");
         registry.map_model("deepseek-*", "pythonic");
 
         // GLM models
@@ -537,6 +615,27 @@ impl Default for ParserFactory {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `sequence[prefix, tag.format]`: the model's reasoning block, then the calls
+/// the builder produced. Needs the extended structural-tag shape (a top-level
+/// `format`), which every builder in this crate emits.
+fn wrap_in_reasoning_prefix(
+    mut tag: serde_json::Value,
+    prefix: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let format = tag
+        .get_mut("format")
+        .map(serde_json::Value::take)
+        .ok_or_else(|| {
+            "structural tag has no `format` to wrap in a reasoning prefix".to_string()
+        })?;
+    Ok(json!({
+        "format": {
+            "type": "sequence",
+            "elements": [prefix, format],
+        }
+    }))
 }
 
 /// Build JSON schema for required tool calls (array with minItems: 1).

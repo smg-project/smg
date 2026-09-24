@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
     common::Tool,
-    responses::{ResponseTool, ResponsesRequest, ResponsesResponse},
+    responses::{CustomTool, NamespaceTool, ResponseTool, ResponsesRequest, ResponsesResponse},
 };
 use serde_json::to_value;
 use smg_data_connector::{
@@ -22,6 +23,18 @@ use crate::routers::{
     },
     error,
 };
+
+/// Map a Chat finish reason to a generated function-call item's status.
+/// On token-limit truncation, preserve complete arguments and mark partial JSON incomplete.
+pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str) -> &'static str {
+    match finish_reason {
+        Some("failed" | "error") => "in_progress",
+        Some("length") if serde_json::from_str::<serde_json::Value>(arguments).is_err() => {
+            "incomplete"
+        }
+        _ => "completed",
+    }
+}
 
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
 ///
@@ -106,6 +119,9 @@ pub(crate) async fn ensure_mcp_connection(
 ///
 /// - **Regular router**: Extracts function tools during the initial conversion from
 ///   ResponsesRequest to ChatCompletionRequest. MCP tools are merged later by the tool loop.
+///
+/// Custom tools (`{"type": "custom"}`) are downgraded to function tools with a
+/// single `input: string` parameter; `chat_to_responses` maps the calls back.
 pub(crate) fn extract_tools_from_response_tools(
     response_tools: Option<&[ResponseTool]>,
 ) -> Vec<Tool> {
@@ -115,14 +131,150 @@ pub(crate) fn extract_tools_from_response_tools(
 
     tools
         .iter()
-        .filter_map(|rt| match rt {
-            ResponseTool::Function(ft) => Some(Tool {
+        .flat_map(|tool| match tool {
+            ResponseTool::Function(ft) => vec![Tool {
                 tool_type: "function".to_string(),
                 function: ft.function.clone(),
-            }),
-            _ => None,
+            }],
+            ResponseTool::Custom(ct) => vec![Tool {
+                tool_type: "function".to_string(),
+                function: custom_tool_as_function(ct),
+            }],
+            ResponseTool::Namespace(namespace) => namespace
+                .tools
+                .iter()
+                .map(|member| {
+                    let mut function = match member {
+                        NamespaceTool::Function(ft) => ft.function.clone(),
+                        NamespaceTool::Custom(ct) => custom_tool_as_function(ct),
+                    };
+                    function.name = format!("{}.{}", namespace.name, function.name);
+                    Tool {
+                        tool_type: "function".to_string(),
+                        function,
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
         })
         .collect()
+}
+
+/// Downgrade a Responses custom tool to a chat function tool whose single
+/// `input` string parameter carries the free-form payload.
+pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::common::Function {
+    openai_protocol::common::Function {
+        name: ct.name.clone(),
+        description: ct.description.clone(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "The raw payload to pass to this custom tool."
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        }),
+        strict: Some(false),
+    }
+}
+
+/// Recover a custom tool's raw `input` from the `{"input": "..."}` arguments
+/// of its downgraded function call.
+pub(crate) fn custom_tool_input(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| v.get("input")?.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Collect the names of all declared custom tools (top-level and namespaced),
+/// used to map function-shaped calls back to `custom_tool_call` items.
+pub(crate) fn custom_tool_names(
+    response_tools: Option<&[ResponseTool]>,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let Some(tools) = response_tools else {
+        return names;
+    };
+    for tool in tools {
+        match tool {
+            ResponseTool::Custom(ct) => {
+                names.insert(ct.name.clone());
+            }
+            ResponseTool::Namespace(namespace) => {
+                for member in &namespace.tools {
+                    if let NamespaceTool::Custom(ct) = member {
+                        names.insert(format!("{}.{}", namespace.name, ct.name));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Version tag for the opaque `reasoning.encrypted_content` payload.
+const REASONING_BLOB_PREFIX: &str = "smg-reasoning-v1.";
+
+/// Encode reasoning text as the opaque `encrypted_content` blob a `store=false`
+/// client hands back on its next turn. The gateway is stateless, so the blob
+/// carries the text itself (version-tagged base64): opaque, not confidential.
+pub(crate) fn encode_reasoning_content(text: &str) -> String {
+    format!("{REASONING_BLOB_PREFIX}{}", BASE64_STANDARD.encode(text))
+}
+
+/// Recover reasoning text from a blob produced by [`encode_reasoning_content`].
+/// Blobs from other producers yield `None`.
+pub(crate) fn decode_reasoning_content(blob: &str) -> Option<String> {
+    let payload = blob.strip_prefix(REASONING_BLOB_PREFIX)?;
+    String::from_utf8(BASE64_STANDARD.decode(payload).ok()?).ok()
+}
+
+/// Recover structured identity only for a declared namespace member.
+/// Literal top-level names (including dots) take precedence over namespace matches.
+pub(crate) fn resolve_function_identity(
+    tools: Option<&[ResponseTool]>,
+    name: &str,
+) -> (String, Option<String>) {
+    let tools = tools.unwrap_or_default();
+    if !tools
+        .iter()
+        .any(|tool| matches!(tool, ResponseTool::Function(ft) if ft.function.name == name))
+    {
+        for tool in tools {
+            if let ResponseTool::Namespace(namespace) = tool {
+                for member in &namespace.tools {
+                    if let NamespaceTool::Function(ft) = member {
+                        if name == format!("{}.{}", namespace.name, ft.function.name) {
+                            return (ft.function.name.clone(), Some(namespace.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (name.to_string(), None)
+}
+
+/// Synthetic same-name members used by namespace routing regression tests.
+#[cfg(test)]
+pub(crate) fn namespace_test_request() -> ResponsesRequest {
+    serde_json::from_value(serde_json::json!({
+        "model": "test-model",
+        "input": "Check the weather",
+        "tools": [
+            {"type": "namespace", "name": "weather", "description": "Weather tools", "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object", "properties": {}}}
+            ]},
+            {"type": "namespace", "name": "travel", "description": "Travel tools", "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object", "properties": {}}}
+            ]}
+        ]
+    })).unwrap()
 }
 
 /// Persist response to storage if store=true
@@ -156,5 +308,45 @@ pub(crate) async fn persist_response_if_needed(
         } else {
             debug!("Persisted response: {}", response.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespace_function_identity_roundtrips_and_preserves_literal_names() {
+        let mut request: ResponsesRequest = namespace_test_request();
+        let tools = extract_tools_from_response_tools(request.tools.as_deref());
+        assert_eq!(
+            tools
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["weather.lookup", "travel.lookup"]
+        );
+        for namespace in ["weather", "travel"] {
+            assert_eq!(
+                resolve_function_identity(request.tools.as_deref(), &format!("{namespace}.lookup")),
+                ("lookup".into(), Some(namespace.into()))
+            );
+        }
+        for name in ["lookup", "unknown.lookup"] {
+            assert_eq!(
+                resolve_function_identity(request.tools.as_deref(), name),
+                (name.into(), None)
+            );
+        }
+        request.tools.as_mut().unwrap().push(
+            serde_json::from_value(
+                serde_json::json!({"type":"function","name":"weather.lookup","parameters":{}}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            resolve_function_identity(request.tools.as_deref(), "weather.lookup"),
+            ("weather.lookup".into(), None)
+        );
     }
 }

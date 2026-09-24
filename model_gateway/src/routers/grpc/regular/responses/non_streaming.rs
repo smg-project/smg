@@ -8,16 +8,18 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use openai_protocol::responses::{ResponseStatus, ResponsesRequest, ResponsesResponse};
+use openai_protocol::responses::{
+    ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+};
 use serde_json::json;
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 
 use super::{
     common::{
-        build_next_request, convert_mcp_tools_to_chat_tools, extract_all_tool_calls_from_chat,
-        load_conversation_history, prepare_chat_tools_and_choice, ExtractedToolCall,
-        ResponsesCallContext, ToolLoopState,
+        apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
+        extract_all_tool_calls_from_chat, load_conversation_history, prepare_chat_tools_and_choice,
+        ExtractedToolCall, McpToolCallLimit, ResponsesCallContext, ToolLoopState,
     },
     conversions,
 };
@@ -145,7 +147,7 @@ pub(super) async fn execute_tool_loop(
     params: &ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
 ) -> Result<ResponsesResponse, Response> {
-    let mut state = ToolLoopState::new(original_request.input.clone());
+    let mut state = ToolLoopState::new(original_request);
 
     // Configuration: max iterations as safety limit
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
@@ -202,6 +204,8 @@ pub(super) async fn execute_tool_loop(
             )
             .await?;
 
+        state.record_usage(chat_response.usage.as_ref());
+
         // Check for function calls (extract all for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&chat_response);
 
@@ -249,6 +253,7 @@ pub(super) async fn execute_tool_loop(
                 );
             }
 
+            responses_response.usage = state.usage.map(ResponsesUsage::Modern);
             return Ok(responses_response);
         } else {
             state.iteration += 1;
@@ -263,7 +268,7 @@ pub(super) async fn execute_tool_loop(
             );
 
             // Separate MCP and function tool calls using session-exposed names.
-            let (mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
+            let (mut mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
                 tool_calls
                     .into_iter()
                     .partition(|tc| session.has_exposed_tool(tc.name.as_str()));
@@ -277,7 +282,7 @@ pub(super) async fn execute_tool_loop(
             // If ANY tool call is a function tool, return to caller immediately
             if !function_tool_calls.is_empty() {
                 // Convert chat response to responses format (includes all tool calls)
-                let responses_response = conversions::chat_to_responses(
+                let mut responses_response = conversions::chat_to_responses(
                     &chat_response,
                     original_request,
                     params.response_id.clone(),
@@ -297,60 +302,14 @@ pub(super) async fn execute_tool_loop(
                 })?;
 
                 // Return response with function tool calls to caller
+                responses_response.usage = state.usage.map(ResponsesUsage::Modern);
                 return Ok(responses_response);
             }
 
-            // All MCP tools - check combined limit BEFORE executing
-            let effective_limit = match max_tool_calls {
-                Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
-                None => DEFAULT_MAX_ITERATIONS,
-            };
-
-            if state.total_calls + mcp_tool_calls.len() > effective_limit {
-                warn!(
-                    "Reached tool call limit: {} + {} > {} (max_tool_calls={:?}, safety_limit={})",
-                    state.total_calls,
-                    mcp_tool_calls.len(),
-                    effective_limit,
-                    max_tool_calls,
-                    DEFAULT_MAX_ITERATIONS
-                );
-
-                // Convert chat response to responses format and mark as incomplete
-                let mut responses_response = conversions::chat_to_responses(
-                    &chat_response,
-                    original_request,
-                    params.response_id.clone(),
-                )
-                .map_err(|e| {
-                    error!(
-                        function = "tool_loop",
-                        iteration = state.iteration,
-                        error = %e,
-                        context = "max_tool_calls_limit",
-                        "Failed to convert ChatCompletionResponse to ResponsesResponse"
-                    );
-                    error::internal_error(
-                        "convert_to_responses_format_failed",
-                        format!("Failed to convert to responses format: {e}"),
-                    )
-                })?;
-
-                // Tool-call limit reached before executing the remaining calls:
-                // an aborted run, not a successful answer. Per the design,
-                // exhausting `max_tool_calls` is a `failed` status with an
-                // `error` payload (truncation `incomplete_details` is reserved
-                // for `max_output_tokens` / `content_filter`).
-                responses_response.status = ResponseStatus::Failed;
-                responses_response.error = Some(json!({
-                    "code": "max_tool_calls_exceeded",
-                    "message": format!(
-                        "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
-                    ),
-                }));
-
-                return Ok(responses_response);
-            }
+            // Only execute calls that fit; preserve their results before ending
+            // the response when this batch exceeds the remaining allowance.
+            let tool_call_limit =
+                apply_mcp_tool_call_limit(&mut mcp_tool_calls, state.total_calls, max_tool_calls);
 
             // Convert tool calls to execution inputs, merging caller-declared
             // hosted-tool config from `original_request.tools` into dispatch args.
@@ -441,6 +400,48 @@ pub(super) async fn execute_tool_loop(
 
                 // Increment total calls counter
                 state.total_calls += 1;
+            }
+
+            if let Some(limit) = tool_call_limit {
+                let mut responses_response = conversions::chat_to_responses(
+                    &chat_response,
+                    original_request,
+                    params.response_id.clone(),
+                )
+                .map_err(|e| {
+                    error!(function = "tool_loop", iteration = state.iteration,
+                        error = %e, context = "tool_call_limit",
+                        "Failed to convert ChatCompletionResponse to ResponsesResponse");
+                    error::internal_error(
+                        "convert_to_responses_format_failed",
+                        format!("Failed to convert to responses format: {e}"),
+                    )
+                })?;
+
+                // This branch contains only MCP calls. Return their executed
+                // results, not the generated calls that were ignored by the cap.
+                responses_response
+                    .output
+                    .retain(|item| !matches!(item, ResponseOutputItem::FunctionToolCall { .. }));
+                openai_bridge::inject_client_visible_mcp_output_items(
+                    &session,
+                    &mut responses_response.output,
+                    state.mcp_call_items,
+                    &user_function_names,
+                );
+
+                // A user processing cap is a normal stop. Only the internal
+                // safety cap introduces an error; keep generation status intact.
+                if limit == McpToolCallLimit::Safety {
+                    responses_response.status = ResponseStatus::Failed;
+                    responses_response.incomplete_details = None;
+                    responses_response.error = Some(json!({
+                        "code": "max_tool_calls_exceeded",
+                        "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
+                    }));
+                }
+                responses_response.usage = state.usage.map(ResponsesUsage::Modern);
+                return Ok(responses_response);
             }
 
             // Build resume request with conversation history

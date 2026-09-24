@@ -18,9 +18,11 @@ else
         # Install lsof if not already available
         if ! command -v lsof >/dev/null 2>&1; then
             if command -v sudo >/dev/null 2>&1; then
+                bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
                 sudo apt-get update
                 sudo apt-get install -y lsof
             else
+                bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
                 apt-get update
                 apt-get install -y lsof
             fi

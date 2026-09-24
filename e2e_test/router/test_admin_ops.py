@@ -39,8 +39,8 @@ def _wait_for_trace_artifacts(output_dir: Path) -> list[Path]:
     return []
 
 
-class AdminOpsBehavior:
-    """Shared admin-endpoint assertions, parametrized per engine below."""
+class FlushCacheBehavior:
+    """Shared cache-flush assertions for engines exposing FlushCache."""
 
     def test_flush_cache_full_cycle(self, setup_backend):
         backend, model, client, gateway = setup_backend
@@ -71,6 +71,10 @@ class AdminOpsBehavior:
             max_tokens=8,
         )
         assert completion.choices, "generation after cache flush should succeed"
+
+
+class AdminOpsBehavior(FlushCacheBehavior):
+    """Shared flush and profiling assertions, parametrized per engine below."""
 
     def test_start_and_stop_profile_produces_traces(self, setup_backend, tmp_path):
         _backend, model, client, gateway = setup_backend
@@ -149,3 +153,11 @@ class TestAdminOps(AdminOpsBehavior):
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestAdminOpsTokenSpeed(AdminOpsBehavior):
     """TokenSpeed runs gRPC-only behind the gateway."""
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(1)
+@pytest.mark.e2e
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestFlushCacheVllm(FlushCacheBehavior):
+    """vLLM exposes cache flush over gRPC."""

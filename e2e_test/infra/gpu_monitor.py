@@ -214,7 +214,7 @@ class GPUMonitor:
         monitor.start(target_pid=12345)
         # ... run benchmark ...
         result = monitor.stop()
-        monitor.assert_thresholds({"gpu_util_p50_min": 99})
+        misses = monitor.threshold_misses({"gpu_util_p50_min": 99})
     """
 
     def __init__(
@@ -324,37 +324,37 @@ class GPUMonitor:
             result.get("count", 0),
         )
 
-    def assert_thresholds(self, thresholds: dict[str, float] | None) -> None:
-        """Assert GPU utilization meets thresholds.
+    def threshold_misses(self, thresholds: dict[str, float] | None) -> list[str]:
+        """Return one line per GPU-utilization threshold that was missed.
 
         Supported thresholds:
             - gpu_util_mean_min: Minimum mean GPU utilization %
             - gpu_util_p50_min: Minimum p50 GPU utilization %
         """
         if not thresholds:
-            return
+            return []
 
         result = self._result or self._read_result()
         if not result or result.get("count", 0) <= 0:
             logger.warning("GPU utilization monitor produced no samples")
-            return
+            return []
 
         overall = result.get("overall", {})
+        misses: list[str] = []
 
         mean_threshold = thresholds.get("gpu_util_mean_min")
         if mean_threshold is not None:
             mean_value = overall.get("mean", 0.0)
-            assert mean_value >= mean_threshold, (
-                f"GPU utilization mean below threshold: {mean_value:.2f}% < {mean_threshold}%"
-            )
+            if mean_value < mean_threshold:
+                misses.append(f"GPU utilization mean: {mean_value:.2f}% < {mean_threshold}%")
 
         p50_threshold = thresholds.get("gpu_util_p50_min")
         if p50_threshold is not None:
             p50_value = overall.get("p50")
             if p50_value is not None:
-                assert p50_value >= p50_threshold, (
-                    f"GPU utilization p50 below threshold: {p50_value:.2f}% < {p50_threshold}%"
-                )
+                if p50_value < p50_threshold:
+                    misses.append(f"GPU utilization p50: {p50_value:.2f}% < {p50_threshold}%")
+        return misses
 
 
 def should_monitor(thresholds: dict[str, Any] | None) -> bool:

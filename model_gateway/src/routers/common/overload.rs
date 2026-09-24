@@ -22,8 +22,8 @@ use crate::{
     routers::{common::retry::mark_non_retryable, error},
     worker::{
         overload::{
-            BRANCH_ALL_OVERLOADED_SHED, BRANCH_OVERLOADED_AT_DISPATCH, STAGE_DISPATCH,
-            STAGE_SELECTION,
+            BRANCH_ALL_OVERLOADED_SHED, BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED,
+            STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
         },
         Worker,
     },
@@ -34,6 +34,13 @@ use crate::{
 /// the shed helpers are free functions called from every router; the value is
 /// a client hint, not a correctness input. Default matches the config default.
 static SHED_RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(10);
+
+/// Client-visible, gateway-owned code for a worker-overload-protection shed.
+///
+/// This deliberately covers both an all-overloaded candidate pool and the
+/// selection-to-dispatch re-check, where another worker may still be eligible.
+pub(crate) const WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE: &str =
+    "worker_overload_protection_shed";
 
 /// Latch the poll interval the shed responses advertise. Called once at
 /// startup when the load monitor is built.
@@ -82,6 +89,33 @@ pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<
     ))
 }
 
+/// Shed a disaggregated dispatch the decode leg cannot admit: the `rooms`
+/// bootstrap rooms it needs do not fit in the engine's running `window`, and
+/// none freed inside the admission wait.
+///
+/// Same client-visible answer as the two vetoes above — the request was never
+/// sent, and the wait already outlived any backoff a retry would add — under
+/// its own decision branch, because here the *pair* is full rather than a
+/// threshold being crossed. The counts are in the message because the two
+/// causes need different operator responses: a transient full window versus a
+/// batched request that is permanently wider than the pair.
+pub(crate) fn shed_pd_admission(
+    worker: &str,
+    model_id: &str,
+    window: usize,
+    rooms: usize,
+) -> Response {
+    shed(
+        BRANCH_PD_ADMISSION_SHED,
+        STAGE_PD_ADMISSION,
+        worker,
+        format!(
+            "Decode worker '{worker}' for model '{model_id}' could not admit {rooms} \
+             request(s) within its running window of {window}"
+        ),
+    )
+}
+
 /// One decision line, one counter, one response — marked non-retryable: the
 /// veto clears at the poll interval, which no backoff window outlives, and a
 /// terminal shed is what keeps the counter per-request rather than per-attempt.
@@ -90,7 +124,8 @@ pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<
 fn shed(branch: &'static str, stage: &'static str, worker: &str, message: String) -> Response {
     Metrics::record_worker_overload_shed(stage);
     debug!(branch, stage, worker, "Overload shed");
-    let mut response = error::service_unavailable("no_available_workers", message);
+    let mut response =
+        error::service_unavailable(WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE, message);
     response.headers_mut().insert(
         RETRY_AFTER,
         HeaderValue::from(SHED_RETRY_AFTER_SECS.load(Ordering::Relaxed)),
@@ -127,10 +162,10 @@ mod tests {
         )
     }
 
-    /// The shed is the existing `no_available_workers` 503, taken from the
-    /// candidate pool rather than the model index.
+    /// The shed is a distinct 503, taken from the candidate pool rather than
+    /// the model index.
     #[test]
-    fn all_overloaded_sheds_with_no_available_workers_503() {
+    fn all_overloaded_sheds_with_distinct_503_code() {
         let a = worker("http://127.0.0.1:9801", "m");
         let b = worker("http://127.0.0.1:9802", "m");
         let pool = vec![Arc::clone(&a), Arc::clone(&b)];
@@ -146,7 +181,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
-            "no_available_workers"
+            "worker_overload_protection_shed"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .expect("gateway error code header"),
+            "worker_overload_protection_shed"
         );
     }
 
@@ -212,7 +254,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
-            "no_available_workers"
+            "worker_overload_protection_shed"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .expect("gateway error code header"),
+            "worker_overload_protection_shed"
         );
     }
 }

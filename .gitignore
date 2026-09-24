@@ -105,6 +105,8 @@ tl_out/
 # Plots
 *.png
 *.pdf
+# Lossless image fixtures for preprocessing parity tests
+!crates/multimodal/tests/fixtures/images/*.png
 
 # personnal
 work_dirs/

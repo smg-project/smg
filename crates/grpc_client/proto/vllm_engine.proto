@@ -17,6 +17,9 @@ service VllmEngine {
   // Health check
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
+  // Invalidate the local KV prefix cache without preempting requests.
+  rpc FlushCache(smg.grpc.common.FlushCacheRequest) returns (smg.grpc.common.FlushCacheResponse);
+
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 
@@ -99,7 +102,7 @@ message TokenizedInput {
 // transport; shape and dtype describe how the receiver interprets them.
 message TensorData {
   repeated uint32 shape = 2;   // Dimension sizes
-  string dtype = 3;            // "float32", "int64", "uint32"
+  string dtype = 3;            // "float32", "bfloat16", "float16", "int64", "uint32"
 
   oneof payload {
     // Current path: raw little-endian bytes carried in the gRPC message
@@ -156,6 +159,28 @@ message MultimodalInputs {
   // modality (`pixel_values_videos` / `video_grid_thw`) and expands the video
   // placeholder token instead of the image one. Unset (0) is treated as image.
   smg.grpc.common.Modality modality = 10;
+
+  // Wire key for the primary encoder tensor carried in `pixel_values`: the
+  // model's forward kwarg when it is not the HF-conventional `pixel_values`
+  // (DeepSeek-V4.1 takes `patches`). Absent = pixel_values. `batched_keys`
+  // and `flat_keys` name the tensor by this key.
+  optional string encoder_input_key = 11;
+}
+
+// One media item the worker fetches and processes itself. `url` is forwarded
+// verbatim from the API request: http(s)://, data:<mime>;base64,..., or
+// file://. The worker's MediaConnector applies --allowed-media-domains /
+// --allowed-local-media-path / VLLM_*_FETCH_TIMEOUT.
+message MediaRef {
+  smg.grpc.common.Modality modality = 1;  // IMAGE | VIDEO
+  string url = 2;
+}
+
+// Media references in prompt (media-part) order. `tokenized.input_ids` carries
+// exactly one UNEXPANDED placeholder anchor per item; the worker's processor
+// expands it.
+message MediaRefs {
+  repeated MediaRef items = 1;
 }
 
 // =====================
@@ -185,6 +210,11 @@ message GenerateRequest {
   // Optional multimodal data (images for vision models)
   MultimodalInputs mm_inputs = 7;
 
+  // Further preprocessed batches when one request carries several modalities
+  // (an image batch in mm_inputs and a video batch here, say). Each batch has
+  // its own modality, tensors, placeholders and hashes.
+  repeated MultimodalInputs extra_mm_inputs = 11;
+
   // Connector KV-transfer params as a JSON object, passed verbatim to the
   // engine (e.g. NIXL's do_remote_prefill/remote_block_ids/remote_host/...).
   // Preferred over the legacy typed kv_transfer_params field.
@@ -192,6 +222,10 @@ message GenerateRequest {
 
   // DP rank to pin this request to; unset lets the engine balance internally
   optional int32 data_parallel_rank = 9;
+
+  // Set only when the router skipped multimodal processing. Mutually
+  // exclusive with mm_inputs; requires `tokenized` input.
+  MediaRefs media_refs = 10;
 }
 
 // KV cache transfer parameters for Mooncake PD disaggregation
@@ -256,7 +290,7 @@ message GenerateStreamChunk {
 
 message GenerateComplete {
   repeated uint32 output_ids = 1;      // All output tokens
-  string finish_reason = 2;            // "stop", "length", "abort"
+  string finish_reason = 2;            // "stop", "length", "abort", "error"
   uint32 prompt_tokens = 3;
   uint32 completion_tokens = 4;
   uint32 cached_tokens = 5;
@@ -282,6 +316,23 @@ message GenerateComplete {
   // Connector KV-transfer params returned by the engine, as a JSON object
   // (e.g. NIXL's handoff for the decode worker). Forwarded verbatim by the router.
   optional string kv_transfer_params_json = 12;
+
+  uint32 spec_accepted_tokens = 13;
+  uint32 spec_draft_tokens = 14;
+
+  // Identity of worker-processed media, returned by the prefill leg so the
+  // decode leg can be served without pixels: the expanded prompt ids plus one
+  // pixel-less MultimodalInputs per modality (hashes, placeholders, grid
+  // tensors). Absent on non-PD requests and from older servicers.
+  MediaIdentity media_identity = 15;
+}
+
+// What the prefill worker learned about the media it processed, in the shape
+// the decode leg already accepts from a router-preprocessed request.
+message MediaIdentity {
+  repeated uint32 prompt_token_ids = 1;
+  MultimodalInputs mm_inputs = 2;
+  repeated MultimodalInputs extra_mm_inputs = 3;
 }
 
 // =====================
@@ -360,6 +411,34 @@ message GetServerInfoResponse {
   // the router can verify a shared /dev/shm before using the SHM tensor
   // transport under `auto`. Empty when it can't be determined.
   string shm_namespace_id = 10;
+
+  // PD pairing protocol: what a prefill and a decode must agree on for a KV
+  // handoff to work. These mirror the factors vLLM's NIXL compatibility hash
+  // is built from, so the router can keep incompatible legs apart before the
+  // engines reject each other at handshake.
+  string kv_cache_dtype = 11;     // cache_config.cache_dtype ("auto", "fp8", ...)
+  int32 block_size = 12;          // cache_config.block_size (0 until the engine resolves it)
+  string attention_backend = 13;  // attention_config.backend name, "" when auto-selected
+  string model_dtype = 14;        // model_config.dtype ("torch.bfloat16", ...)
+  // Operator-set PD pairing protocol, read from the SMG_PAIRING_PROTOCOL
+  // environment variable of the engine process; "" when unset. A prefill and
+  // a decode that both carry one can pair only when the values are equal.
+  string pairing_protocol = 15;
+
+  // Worker-side multimodal processing backend: "" (off, or not a multimodal
+  // model), "inprocess", or "redis". Non-empty iff this worker accepts
+  // `media_refs`. Flattened into the `mm_processor` worker label.
+  string mm_processor = 16;
+
+  // Comma-separated URL schemes the worker will fetch, e.g. "http,https,data"
+  // or "http,https,data,file" (file only with --allowed-local-media-path).
+  // Flattened into the `mm_media_ref_schemes` worker label.
+  string mm_media_ref_schemes = 17;
+
+  // Where the worker's mm_processor setting came from: "flag" (the launcher's
+  // --mm-processor), "env" (SMG_VLLM_MM_PROCESSOR) or "default"; "" when
+  // mm_processor is empty. Flattened into the `mm_processor_source` label.
+  string mm_processor_source = 18;
 }
 
 // =====================

@@ -8,6 +8,151 @@ use common::{create_test_tools, streaming_helpers};
 use serde_json::json;
 use tool_parser::{parsers::QwenXmlParser, traits::ToolParser};
 
+// Exercise the same terminal getters as the gRPC streaming caller. Fixtures are synthetic.
+#[expect(clippy::unwrap_used, reason = "assertions in a shared test helper")]
+async fn assert_streamed_arguments(
+    input: &str,
+    expected: &[(&str, serde_json::Value)],
+    complete: bool,
+) {
+    let tools = create_test_tools();
+    let mut feeds = vec![
+        vec![input.to_string()],
+        input.chars().map(|c| c.to_string()).collect(),
+    ];
+    // Also cover every possible two-chunk split, including coalesced calls.
+    for (split, _) in input.char_indices().skip(1) {
+        feeds.push(vec![input[..split].to_string(), input[split..].to_string()]);
+    }
+    for chunks in feeds {
+        let mut parser = QwenXmlParser::new();
+        let mut deltas = Vec::new();
+        for chunk in &chunks {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            assert!(result.normal_text.is_empty());
+            deltas.extend(result.calls);
+        }
+        assert!(parser.take_unstreamed_normal_text().is_empty());
+        let pending = parser.get_unstreamed_tool_args();
+        if complete {
+            assert!(pending.is_none(), "completed calls must already be closed");
+            assert!(parser
+                .parse_incremental("", &tools)
+                .await
+                .unwrap()
+                .calls
+                .is_empty());
+        }
+        deltas.extend(pending.unwrap_or_default());
+        let names: Vec<_> = deltas
+            .iter()
+            .filter_map(|d| d.name.as_deref().map(|name| (d.tool_index, name)))
+            .collect();
+        let expected_names: Vec<_> = expected
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| (index, *name))
+            .collect();
+        assert_eq!(names, expected_names, "chunks: {chunks:?}");
+        assert!(deltas.iter().all(|d| d.tool_index < expected.len()));
+        for (index, (_, expected_args)) in expected.iter().enumerate() {
+            let args: String = deltas
+                .iter()
+                .filter(|d| d.tool_index == index)
+                .map(|d| d.parameters.as_str())
+                .collect();
+            let parsed = serde_json::from_str::<serde_json::Value>(&args);
+            assert_eq!(
+                parsed.as_ref().ok(),
+                Some(expected_args),
+                "args: {args}; chunks: {chunks:?}"
+            );
+        }
+        parser.reset();
+        assert!(parser.get_unstreamed_tool_args().is_none());
+    }
+}
+
+#[tokio::test]
+async fn test_qwen_xml_streaming_braces_inside_string_do_not_close_object() {
+    let input = "<tool_call><function=get_weather><parameter=city>echo '}'</parameter></function></tool_call>";
+    assert_streamed_arguments(input, &[("get_weather", json!({"city": "echo '}'"}))], true).await;
+}
+
+#[tokio::test]
+async fn test_qwen_xml_eos_closes_only_complete_parameter_values() {
+    let input = "<tool_call><function=get_weather><parameter=city>Tokyo</parameter>";
+    for suffix in ["", "<parameter=units>cels"] {
+        assert_streamed_arguments(
+            &format!("{input}{suffix}"),
+            &[("get_weather", json!({"city": "Tokyo"}))],
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn test_qwen_xml_eos_does_not_invent_unfinished_parameter() {
+    assert_streamed_arguments(
+        "<tool_call><function=get_weather><parameter=city>Tok",
+        &[("get_weather", json!({}))],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_qwen_xml_eos_closes_last_of_multiple_calls() {
+    let input = concat!(
+        "<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>",
+        "<tool_call><function=get_weather><parameter=city>Tokyo</parameter>",
+    );
+    assert_streamed_arguments(
+        input,
+        &[
+            ("get_weather", json!({"city": "Paris"})),
+            ("get_weather", json!({"city": "Tokyo"})),
+        ],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_qwen_xml_coalesced_calls_do_not_share_parameters() {
+    let input = concat!(
+        "<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>",
+        "<tool_call><function=get_weather><parameter=city>Tokyo</parameter><parameter=units>celsius</parameter></function></tool_call>",
+    );
+    assert_streamed_arguments(
+        input,
+        &[
+            ("get_weather", json!({"city": "Paris"})),
+            ("get_weather", json!({"city": "Tokyo", "units": "celsius"})),
+        ],
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_qwen_xml_empty_calls_and_nested_values_are_closed_once() {
+    let input = concat!(
+        "<tool_call><function=get_time></function></tool_call>",
+        r#"<tool_call><function=process><parameter=data>{"x":"}"}</parameter></function></tool_call>"#,
+    );
+    assert_streamed_arguments(
+        input,
+        &[
+            ("get_time", json!({})),
+            ("process", json!({"data": {"x": "}"}})),
+        ],
+        true,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn test_qwen_xml_single_tool() {
     let parser = QwenXmlParser::new();

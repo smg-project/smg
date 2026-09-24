@@ -21,6 +21,7 @@ fn test_simple_chat_template() {
     let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
 
     let messages = [ChatMessage::User {
+        ext: Default::default(),
         content: MessageContent::Text("Test".to_string()),
         name: None,
     }];
@@ -55,6 +56,7 @@ fn test_chat_template_with_tokens() {
     let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
 
     let messages = [ChatMessage::User {
+        ext: Default::default(),
         content: MessageContent::Text("Test".to_string()),
         name: None,
     }];
@@ -118,8 +120,10 @@ fn test_llama_style_template() {
         ChatMessage::System {
             content: MessageContent::Text("You are a helpful assistant".to_string()),
             name: None,
+            ext: Default::default(),
         },
         ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("What is 2+2?".to_string()),
             name: None,
         },
@@ -171,16 +175,19 @@ fn test_chatml_template() {
 
     let messages = [
         ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("Hello".to_string()),
             name: None,
         },
         ChatMessage::Assistant {
+            ext: Default::default(),
             content: Some(MessageContent::Text("Hi there!".to_string())),
             name: None,
             tool_calls: None,
             reasoning_content: None,
         },
         ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("How are you?".to_string()),
             name: None,
         },
@@ -223,6 +230,7 @@ assistant:
     let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
 
     let messages = [ChatMessage::User {
+        ext: Default::default(),
         content: MessageContent::Text("Test".to_string()),
         name: None,
     }];
@@ -280,6 +288,7 @@ Tools: {{ message.tool_calls|tojson(ensure_ascii=False) }}
     let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
 
     let messages = [ChatMessage::User {
+        ext: Default::default(),
         content: MessageContent::Text("Test with Unicode: 日本語".to_string()),
         name: None,
     }];
@@ -451,6 +460,7 @@ fn test_template_with_multimodal_content() {
     let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
 
     let messages = [ChatMessage::User {
+        ext: Default::default(),
         content: MessageContent::Parts(vec![
             ContentPart::Text {
                 text: "Look at this:".to_string(),
@@ -459,6 +469,7 @@ fn test_template_with_multimodal_content() {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
                     detail: None,
+                    max_long_side_pixel: None,
                 },
             },
         ]),

@@ -74,6 +74,18 @@ impl proto::vllm_engine_server::VllmEngine for MockEngine {
         Ok(Response::new(proto::AbortResponse::default()))
     }
 
+    async fn flush_cache(
+        &self,
+        request: Request<smg_grpc_client::common_proto::FlushCacheRequest>,
+    ) -> Result<Response<smg_grpc_client::common_proto::FlushCacheResponse>, Status> {
+        Ok(Response::new(
+            smg_grpc_client::common_proto::FlushCacheResponse {
+                success: request.into_inner().timeout_s == 1.5,
+                message: "reset result".to_string(),
+            },
+        ))
+    }
+
     async fn embed(
         &self,
         _request: Request<proto::EmbedRequest>,
@@ -243,4 +255,14 @@ async fn mark_completed_suppresses_abort_in_deferred_mode() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(state.aborted_ids().is_empty());
+}
+
+#[tokio::test]
+async fn flush_cache_forwards_timeout_and_result() {
+    let (endpoint, _) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    let result = client.flush_cache(1.5).await.unwrap();
+    assert!(result.success);
+    assert_eq!(result.message, "reset result");
+    assert!(!client.flush_cache(0.0).await.unwrap().success);
 }

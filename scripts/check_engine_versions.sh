@@ -57,7 +57,7 @@ trtllm_latest=$("${CURL[@]}" https://pypi.nvidia.com/tensorrt-llm/ \
 require "tensorrt-llm latest" "$trtllm_latest"
 emit tensorrt-llm "$trtllm_current" "$trtllm_latest"
 
-tokenspeed_current=$(sed -n 's/.*TOKENSPEED_REF:-\([0-9a-f]*\)}.*/\1/p' scripts/ci_install_tokenspeed.sh | head -1)
+tokenspeed_current=$(tr -d '[:space:]' < .github/versions/tokenspeed.ref)
 require "tokenspeed pin" "$tokenspeed_current"
 tokenspeed_latest=$(gh api repos/lightseekorg/tokenspeed/commits/main --jq .sha)
 require "tokenspeed latest" "$tokenspeed_latest"

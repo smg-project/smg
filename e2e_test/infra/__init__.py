@@ -34,6 +34,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     Runtime,
     WorkerType,
     get_connection_mode_override,
+    get_mm_processing,
     get_runtime,
     get_zmq_engine_count,
     is_mlx,
@@ -44,6 +45,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
 from .gateway import Gateway, WorkerInfo, launch_cloud_gateway
 from .gpu_monitor import GPUMonitor
 from .gpu_monitor import should_monitor as should_monitor_gpu
+from .mm_processing import assert_mm_processing
 from .model_specs import (  # Default model paths; Model groups
     CHAT_MODELS,
     DEFAULT_EMBEDDING_MODEL_PATH,
@@ -114,6 +116,8 @@ __all__ = [
     # Runtime helpers
     "get_runtime",
     "get_connection_mode_override",
+    "get_mm_processing",
+    "assert_mm_processing",
     "get_zmq_engine_count",
     "is_vllm",
     "is_sglang",

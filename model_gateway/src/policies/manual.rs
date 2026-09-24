@@ -10,7 +10,9 @@
 //! Use this when you need stronger stickiness guarantees than consistent hashing,
 //! for example with stateful chat sessions where context is stored on the worker.
 //!
-//! ## Header
+//! ## Key sources
+//! - `SelectWorkerInfo::rid_key`: the session key derived from the request
+//!   body's `rid` (populated under `--routing-key-override`); outranks the header
 //! - `X-SMG-Routing-Key`: The routing key for sticky session routing
 
 use std::{sync::Arc, time::Instant};
@@ -286,7 +288,12 @@ impl ManualPolicy {
             return (None, ExecutionBranch::NoHealthyWorkers);
         }
 
-        if let Some(routing_id) = extract_routing_key(info.headers) {
+        // The rid-derived session key outranks the routing-key header. The
+        // registry populates it only under the routing-key override, already
+        // lineage-stripped, so a proxy that rotates the header per request
+        // cannot break a conversation's pin.
+        let routing_id = info.rid_key.or_else(|| extract_routing_key(info.headers));
+        if let Some(routing_id) = routing_id {
             // Single is the common leg; route on the bare key to skip the
             // per-request allocation. PD legs namespace so prefill and decode
             // stick independently.
@@ -444,6 +451,64 @@ mod tests {
         let (d1, _) = policy.select_worker_impl(&workers, &decode);
 
         // Same key under two legs -> two independent sticky entries.
+        assert_eq!(policy.routing_map.len(), 2);
+        for _ in 0..5 {
+            assert_eq!(policy.select_worker_impl(&workers, &prefill).0, p1);
+            assert_eq!(policy.select_worker_impl(&workers, &decode).0, d1);
+        }
+    }
+
+    #[test]
+    fn test_manual_rid_key_outranks_header_key() {
+        let policy = ManualPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        // One conversation (rid-derived key) whose per-request header key
+        // rotates: the pin must follow the rid, not the header.
+        let header_a = headers_with_routing_key("key_a");
+        let header_b = headers_with_routing_key("key_b");
+        let turn1 = SelectWorkerInfo {
+            headers: Some(&header_a),
+            rid_key: Some("conv"),
+            ..Default::default()
+        };
+        let turn2 = SelectWorkerInfo {
+            headers: Some(&header_b),
+            rid_key: Some("conv"),
+            ..Default::default()
+        };
+
+        let (first, branch) = policy.select_worker_impl(&workers, &turn1);
+        assert_eq!(branch, ExecutionBranch::Vacant);
+        let (second, branch) = policy.select_worker_impl(&workers, &turn2);
+        assert_eq!(second, first, "rid-derived key must outrank the header key");
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+
+        // The pin lives under the rid-derived key, not under either header.
+        assert_eq!(policy.routing_map.len(), 1);
+        assert!(policy.routing_map.contains_key(&RoutingId::new("conv")));
+    }
+
+    #[test]
+    fn test_manual_rid_key_namespaces_per_leg() {
+        let policy = ManualPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let prefill = SelectWorkerInfo {
+            rid_key: Some("conv"),
+            leg: WorkerLeg::Prefill,
+            ..Default::default()
+        };
+        let decode = SelectWorkerInfo {
+            rid_key: Some("conv"),
+            leg: WorkerLeg::Decode,
+            ..Default::default()
+        };
+
+        let (p1, _) = policy.select_worker_impl(&workers, &prefill);
+        let (d1, _) = policy.select_worker_impl(&workers, &decode);
+
+        // Same rid under two legs -> two independent sticky entries.
         assert_eq!(policy.routing_map.len(), 2);
         for _ in 0..5 {
             assert_eq!(policy.select_worker_impl(&workers, &prefill).0, p1);

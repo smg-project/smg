@@ -133,7 +133,6 @@ impl LoadState {
     }
 
     /// The current snapshot — one `Arc` clone, no lock held afterwards.
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Arc<LoadSnapshot> {
         self.tx.borrow().clone()
     }

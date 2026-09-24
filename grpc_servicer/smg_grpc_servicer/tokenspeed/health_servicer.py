@@ -52,6 +52,7 @@ class TokenSpeedHealthServicer(health_pb2_grpc.HealthServicer):
             self.OVERALL_SERVER: health_pb2.HealthCheckResponse.NOT_SERVING,
             self.TOKENSPEED_SERVICE: health_pb2.HealthCheckResponse.NOT_SERVING,
         }
+        self._stuck_reported = False
         logger.info("TokenSpeed gRPC health service initialized")
 
     def set_serving(self) -> None:
@@ -95,15 +96,24 @@ class TokenSpeedHealthServicer(health_pb2_grpc.HealthServicer):
             time_since_last_receive = time.time() - self.async_llm.last_receive_tstamp
             pending = len(self.async_llm.rid_to_state)
             if time_since_last_receive > STUCK_SCHEDULER_THRESHOLD_SEC and pending > 0:
-                logger.warning(
-                    "Scheduler appears stuck: %.1fs since last receive, %d pending requests",
-                    time_since_last_receive,
-                    pending,
-                )
+                # Probes keep arriving on their interval for as long as this
+                # holds, so say it when it starts and again only if it clears
+                # and comes back; repeating it every interval buries whatever
+                # else the scheduler is trying to report.
+                if not self._stuck_reported:
+                    self._stuck_reported = True
+                    logger.warning(
+                        "Scheduler appears stuck: %.1fs since last receive, %d pending requests",
+                        time_since_last_receive,
+                        pending,
+                    )
                 return health_pb2.HealthCheckResponse(
                     status=health_pb2.HealthCheckResponse.NOT_SERVING
                 )
 
+            if self._stuck_reported:
+                self._stuck_reported = False
+                logger.info("Scheduler is responsive again")
             return health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.SERVING)
 
         context.set_code(grpc.StatusCode.NOT_FOUND)

@@ -211,6 +211,10 @@ impl ReasoningParser for InklingParser {
         Ok(self.parse_buffer(false))
     }
 
+    fn flush(&mut self) -> Result<ParserResult, ParseError> {
+        Ok(self.parse_buffer(true))
+    }
+
     fn reset(&mut self) {
         self.block_kind = None;
         self.buffer.clear();

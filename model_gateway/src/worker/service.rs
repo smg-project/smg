@@ -17,6 +17,7 @@ use tracing::warn;
 
 use crate::{
     config::{validate_worker_url, RouterConfig},
+    routers::provider_support,
     worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
@@ -42,6 +43,14 @@ pub enum WorkerServiceError {
     BadRequest { message: String },
     /// Worker with this URL already exists (duplicate POST)
     Conflict { url: String, worker_id: WorkerId },
+    /// A create for this URL is still in flight (concurrent POST)
+    CreateInProgress { url: String, worker_id: WorkerId },
+    /// The spec targets a provider whose router this build does not carry
+    ProviderNotCompiled {
+        url: String,
+        family: &'static str,
+        feature: &'static str,
+    },
     /// Job queue not initialized
     QueueNotInitialized,
     /// Failed to submit job to queue
@@ -55,6 +64,8 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => "BAD_REQUEST",
             Self::BadRequest { .. } => "BAD_REQUEST",
             Self::Conflict { .. } => "WORKER_ALREADY_EXISTS",
+            Self::CreateInProgress { .. } => "WORKER_CREATE_IN_PROGRESS",
+            Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
         }
@@ -66,6 +77,8 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
+            Self::CreateInProgress { .. } => StatusCode::CONFLICT,
+            Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -91,6 +104,23 @@ impl std::fmt::Display for WorkerServiceError {
                     Use PUT /workers/{id} to replace or PATCH /workers/{id} to update."
                 )
             }
+            Self::CreateInProgress { url, worker_id } => {
+                let id = worker_id.as_str();
+                write!(
+                    f,
+                    "Worker creation already in progress for URL '{url}' with ID {id}. \
+                    Poll GET /workers/{id}."
+                )
+            }
+            Self::ProviderNotCompiled {
+                url,
+                family,
+                feature,
+            } => write!(
+                f,
+                "Worker '{url}' targets the {family} provider, but this build carries no \
+                 {family} router; rebuild with the `{feature}` Cargo feature to admit it."
+            ),
             Self::QueueNotInitialized => write!(f, "Job queue not initialized"),
             Self::QueueSubmitFailed { message } => write!(f, "{message}"),
         }
@@ -267,6 +297,7 @@ impl WorkerService {
         config: WorkerSpec,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
         validate_worker_url_request(&config.url)?;
+        Self::require_provider_router(&config)?;
 
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
@@ -278,6 +309,7 @@ impl WorkerService {
         }
 
         let worker_url = config.url.clone();
+        let queue = self.get_job_queue()?;
 
         // Reserve (or retrieve) a stable ID for the 202 response.
         // If this URL already has an active worker, reject with 409.
@@ -294,10 +326,21 @@ impl WorkerService {
             registration_mode: WorkerRegistrationMode::CreateOnly,
         };
 
-        self.get_job_queue()?
-            .submit(job)
-            .await
-            .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
+        // Exactly one create per URL is in flight at a time, so that attempt alone
+        // owns the reservation and a failed one can safely release it. A second
+        // create is told to poll the first rather than silently merged into it,
+        // since its spec may differ (#1533).
+        let submitted = queue.submit_if_idle(job).await.map_err(|e| {
+            // No 202 goes out, so nothing may keep this URL reserved (#1533).
+            self.worker_registry.release_reservation(&worker_url);
+            WorkerServiceError::QueueSubmitFailed { message: e }
+        })?;
+        if !submitted {
+            return Err(WorkerServiceError::CreateInProgress {
+                url: worker_url,
+                worker_id,
+            });
+        }
 
         let location = format!("/workers/{}", worker_id.as_str());
 
@@ -306,6 +349,21 @@ impl WorkerService {
             url: worker_url,
             location,
         })
+    }
+
+    /// A worker that targets a provider is reachable only through that
+    /// provider's router, which exists only in a build that compiled it in.
+    /// Admitting one otherwise would leave it routable by nothing, so refuse
+    /// here rather than after the 202, inside the background workflow.
+    fn require_provider_router(config: &WorkerSpec) -> Result<(), WorkerServiceError> {
+        match provider_support::missing_router(config) {
+            Some(missing) => Err(WorkerServiceError::ProviderNotCompiled {
+                url: config.url.clone(),
+                family: missing.label,
+                feature: missing.feature,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Replace a worker by ID (full replace, re-runs registration workflow)
@@ -323,6 +381,7 @@ impl WorkerService {
                     worker_id: worker_id_raw.to_string(),
                 })?;
         let url = existing.url().to_string();
+        Self::require_provider_router(&config)?;
 
         // A data-parallel router expands one spec into one worker per rank,
         // each registered under a rank-suffixed URL. Re-running registration
@@ -458,7 +517,7 @@ impl WorkerService {
 
         let job = Job::RemoveWorker {
             url: url.clone(),
-            expected_revision: None,
+            expected_revisions: None,
         };
 
         let job_queue = self.get_job_queue()?;
@@ -505,7 +564,10 @@ mod tests {
     use openai_protocol::model_card::ModelCard;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::{
+        worker::{BasicWorkerBuilder, WorkerType},
+        workflow::JobQueueConfig,
+    };
 
     fn make_service(registry: Arc<WorkerRegistry>) -> WorkerService {
         WorkerService::new(
@@ -623,5 +685,30 @@ mod tests {
             .expect_err("queue is uninitialized in the test harness");
 
         assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
+    }
+
+    #[tokio::test]
+    async fn create_worker_releases_reservation_when_submission_fails() {
+        let registry = Arc::new(WorkerRegistry::new());
+        // A queue whose AppContext is gone rejects every submission.
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        // Idempotent, so this is the id create_worker will hand out.
+        let reserved = registry.reserve_id_for_url("grpc://10.0.0.5:8000");
+
+        let err = service
+            .create_worker(worker_spec("grpc://10.0.0.5:8000"))
+            .await
+            .expect_err("submission must fail without an AppContext");
+        assert!(matches!(err, WorkerServiceError::QueueSubmitFailed { .. }));
+
+        // The 202 was never sent, so nothing may keep the URL reserved (#1533).
+        assert!(registry.get_url_by_id(&reserved).is_none());
     }
 }

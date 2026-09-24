@@ -944,6 +944,11 @@ pub fn resize_bicubic_pil_rgb(
             data.len()
         )));
     }
+    if out_w == 0 || out_h == 0 {
+        return Err(TransformError::ShapeError(format!(
+            "PIL bicubic RGB target {out_w}x{out_h} must be non-empty"
+        )));
+    }
     let output = resize_pil_bytes(
         data,
         width,
@@ -993,7 +998,13 @@ fn resize_pil_bytes(
     filter: PilResizeFilter,
 ) -> Vec<u8> {
     let (in_w, in_h, out_w, out_h) = (in_w as usize, in_h as usize, out_w as usize, out_h as usize);
-    if in_w == out_w && in_h == out_h {
+    if out_w == 0 || out_h == 0 {
+        // A zero-sized target has no pixels; the band resamplers would panic
+        // on a zero chunk size. The fallible entry points
+        // (`resize_bicubic_pil_rgb`, `pad_to_size_pil`) reject it up front;
+        // the infallible ones are only called with planned, non-zero sizes.
+        Vec::new()
+    } else if in_w == out_w && in_h == out_h {
         data.to_vec()
     } else if in_w == out_w {
         if joint_rgb {
@@ -1070,6 +1081,66 @@ pub fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicIma
             new_image
         }
     }
+}
+
+/// Pillow-exact `ImageOps.pad` with default centering (0.5, 0.5):
+/// aspect-preserving BICUBIC `contain` fit into `(out_w, out_h)`, then a
+/// centered paste onto a `color` canvas. Matches Pillow 12.x source: `contain`
+/// adjusts at most one dimension using Python `round()` (exact
+/// round-half-to-even, so `471.49999999999994` rounds to 471 like Python and
+/// not up like an epsilon tie test would) and `pad` pastes at
+/// `round((size - resized) * 0.5)` along the padded axis.
+///
+/// The image is treated as RGB (`to_rgb8`): an alpha channel is dropped, not
+/// premultiplied; callers that need Pillow's RGBA behaviour must flatten
+/// first. An aspect ratio so extreme that the contained dimension rounds to
+/// zero is an error, as it is in Pillow (`height and width must be > 0`).
+pub fn pad_to_size_pil(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    color: Rgb<u8>,
+) -> Result<DynamicImage> {
+    let (w, h) = image.dimensions();
+    let (mut target_w, mut target_h) = (out_w, out_h);
+
+    // ImageOps.contain: fit within (out_w, out_h) preserving aspect ratio.
+    let im_ratio = f64::from(w) / f64::from(h);
+    let dest_ratio = f64::from(out_w) / f64::from(out_h);
+    if im_ratio != dest_ratio {
+        if im_ratio > dest_ratio {
+            let new_h = (f64::from(h) / f64::from(w) * f64::from(out_w)).round_ties_even() as u32;
+            if new_h != out_h {
+                target_h = new_h;
+            }
+        } else {
+            let new_w = (f64::from(w) / f64::from(h) * f64::from(out_h)).round_ties_even() as u32;
+            if new_w != out_w {
+                target_w = new_w;
+            }
+        }
+    }
+    if target_w == 0 || target_h == 0 {
+        return Err(TransformError::ShapeError(format!(
+            "contain fit of {w}x{h} into {out_w}x{out_h} has a zero dimension ({target_w}x{target_h})"
+        )));
+    }
+
+    let resized = resize_bicubic_pil(image, target_w, target_h).to_rgb8();
+    if target_w == out_w && target_h == out_h {
+        return Ok(DynamicImage::ImageRgb8(resized));
+    }
+
+    let mut out = RgbImage::from_pixel(out_w, out_h, color);
+    let (resized_w, resized_h) = resized.dimensions();
+    if resized_w == out_w {
+        let y = (f64::from(out_h - resized_h) * 0.5).round_ties_even() as i64;
+        image::imageops::overlay(&mut out, &resized, 0, y);
+    } else {
+        let x = (f64::from(out_w - resized_w) * 0.5).round_ties_even() as i64;
+        image::imageops::overlay(&mut out, &resized, x, 0);
+    }
+    Ok(DynamicImage::ImageRgb8(out))
 }
 
 /// Stack multiple [C, H, W] tensors into [B, C, H, W].
@@ -1262,6 +1333,57 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn pad_to_size_pil_centres_on_one_axis_only() {
+        // 64x48 into 630x476: width-limited, so the contain fit is 630x472
+        // (472.5 rounds half to even) and a 2-row gray band goes on top.
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 48, Rgb([10, 200, 30])));
+        let out = pad_to_size_pil(&img, 630, 476, Rgb([127, 127, 127]))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(out.dimensions(), (630, 476));
+        assert_eq!(out.get_pixel(0, 0).0, [127, 127, 127]);
+        assert_eq!(out.get_pixel(0, 475).0, [127, 127, 127]);
+        assert_eq!(out.get_pixel(315, 238).0, [10, 200, 30]);
+        // Same aspect: no padding, a plain bicubic resize.
+        let same = pad_to_size_pil(&img, 128, 96, Rgb([0, 0, 0]))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(same.dimensions(), (128, 96));
+        assert_eq!(same.get_pixel(0, 0).0, [10, 200, 30]);
+    }
+
+    #[test]
+    fn pad_to_size_pil_rounds_the_contained_edge_like_python() {
+        // 41x56 into 476x644: 41/56*644 = 471.49999999999994, which Python's
+        // round() takes to 471 (an epsilon tie test would say 472) and then
+        // pastes at x = round(2.5) = 2.
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(41, 56, Rgb([200, 10, 30])));
+        let out = pad_to_size_pil(&img, 476, 644, Rgb([127, 127, 127]))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(out.dimensions(), (476, 644));
+        assert_eq!(out.get_pixel(1, 300).0, [127, 127, 127]);
+        assert_eq!(out.get_pixel(2, 300).0, [200, 10, 30]);
+        assert_eq!(out.get_pixel(472, 300).0, [200, 10, 30]);
+        assert_eq!(out.get_pixel(473, 300).0, [127, 127, 127]);
+    }
+
+    #[test]
+    fn pad_to_size_pil_rejects_a_zero_contained_dimension() {
+        // Pillow raises for these: the contained width/height rounds to 0.
+        let tall = DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 50_000, Rgb([0, 0, 0])));
+        assert!(matches!(
+            pad_to_size_pil(&tall, 42, 21_462, Rgb([127, 127, 127])),
+            Err(TransformError::ShapeError(_))
+        ));
+        let wide = DynamicImage::ImageRgb8(RgbImage::from_pixel(100_000, 1, Rgb([0, 0, 0])));
+        assert!(matches!(
+            pad_to_size_pil(&wide, 42_882, 42, Rgb([127, 127, 127])),
+            Err(TransformError::ShapeError(_))
+        ));
+    }
+
     fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))
     }
@@ -1331,6 +1453,17 @@ mod tests {
 
     /// `resize_bicubic_pil_rgb` rejects a buffer whose length doesn't match the
     /// declared dimensions rather than reading out of bounds.
+    #[test]
+    fn resize_bicubic_pil_rgb_rejects_an_empty_target() {
+        let data = vec![0u8; 2 * 2 * 3];
+        for (out_w, out_h) in [(0, 480), (480, 0)] {
+            assert!(matches!(
+                resize_bicubic_pil_rgb(&data, 2, 2, out_w, out_h),
+                Err(TransformError::ShapeError(_))
+            ));
+        }
+    }
+
     #[test]
     fn resize_bicubic_pil_rgb_rejects_wrong_length() {
         assert!(

@@ -123,10 +123,13 @@ impl ConsistentHashingPolicy {
         }
 
         let target_worker = extract_target_worker(info.headers);
-        // Both sides apply the hint caps: an over-cap or non-UTF-8 key must not
-        // influence placement on any path.
+        // The rid-derived session key (populated only under the routing-key
+        // override, already capped and lineage-stripped) outranks the header.
+        // Both header sides apply the hint caps: an over-cap or non-UTF-8 key
+        // must not influence placement on any path.
         let routing_key = info
-            .routing_key
+            .rid_key
+            .or(info.routing_key)
             .or_else(|| extract_routing_key_hint(info.headers));
 
         // Priority 1: X-SMG-Target-Worker - direct routing by worker index
@@ -656,6 +659,46 @@ mod tests {
         };
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(base_idx), "the validated hint must win");
+        assert_eq!(branch, Branch::RoutingKeyHit);
+    }
+
+    #[test]
+    fn test_rid_key_outranks_routing_key_hint() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let select_by_key = |key: &str| {
+            let info = SelectWorkerInfo {
+                routing_key: Some(key),
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            policy.select_worker_impl(&workers, &info).0.unwrap()
+        };
+
+        // Find a header key that lands on a different worker than the rid.
+        let rid_idx = select_by_key("conv");
+        let other_key = (0..64)
+            .map(|i| format!("key-{i}"))
+            .find(|key| select_by_key(key) != rid_idx)
+            .expect("some key must land on a different worker");
+
+        let headers = headers_with_routing_key(&other_key);
+        let info = SelectWorkerInfo {
+            rid_key: Some("conv"),
+            routing_key: Some(&other_key),
+            headers: Some(&headers),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(rid_idx), "the rid-derived key must win");
         assert_eq!(branch, Branch::RoutingKeyHit);
     }
 

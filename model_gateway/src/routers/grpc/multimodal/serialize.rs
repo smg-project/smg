@@ -14,11 +14,14 @@ use crate::routers::grpc::proto_wrapper::{
     write_tokenspeed_shm_with, TensorBytes, TokenSpeedTensor,
 };
 
-/// Serialize the primary encoder input ndarray to raw little-endian f32 bytes + shape.
+/// Serialize the primary encoder input ndarray to raw little-endian bytes in
+/// `dtype`, returning the shape and the dtype the bytes were actually written
+/// in, which is what the receiver must be told to read them at.
 pub(super) fn serialize_encoder_input(
     preprocessed: &PreprocessedEncoderInputs,
-) -> (Vec<u8>, Vec<u32>) {
-    serialize_array(&preprocessed.encoder_input.view())
+    dtype: &str,
+) -> (Vec<u8>, Vec<u32>, String) {
+    serialize_array_as_dtype(&preprocessed.encoder_input.view(), dtype)
 }
 
 fn serialize_array(encoder_input: &ArrayViewD<'_, f32>) -> (Vec<u8>, Vec<u32>) {
@@ -216,7 +219,7 @@ fn serialize_array_as_dtype(
         _ => {
             warn!(
                 dtype,
-                "Unsupported TokenSpeed encoder input dtype; falling back to float32"
+                "Unsupported encoder input dtype; falling back to float32"
             );
             let (data, shape) = serialize_array(encoder_input);
             (data, shape, "float32".to_string())
@@ -440,6 +443,29 @@ mod tests {
             let mut direct = vec![0; expected.len()];
             fill_array_as_dtype(&mut direct, &array.view(), dtype).unwrap();
             assert_eq!(direct, expected);
+        }
+    }
+
+    /// Both the vLLM and TokenSpeed paths now write their encoder input through
+    /// this one function, so the dtype it reports has to be the dtype it wrote:
+    /// the receiver has nothing else to read the bytes by.
+    #[test]
+    fn serialized_bytes_and_reported_dtype_agree() {
+        let array = ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap();
+
+        for (asked, expected_dtype, element_size) in [
+            ("float32", "float32", 4),
+            ("bfloat16", "bfloat16", 2),
+            ("float16", "float16", 2),
+            // Nothing sensible can be written for a name the receiver may not
+            // share, so the widest dtype is used and reported as such.
+            ("float64", "float32", 4),
+        ] {
+            let (data, shape, dtype) = serialize_array_as_dtype(&array.view(), asked);
+
+            assert_eq!(dtype, expected_dtype, "asked for {asked}");
+            assert_eq!(shape, vec![2, 2]);
+            assert_eq!(data.len(), 4 * element_size, "asked for {asked}");
         }
     }
 

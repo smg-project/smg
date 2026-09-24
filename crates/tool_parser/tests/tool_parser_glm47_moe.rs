@@ -2,7 +2,8 @@
 mod common;
 
 use common::create_test_tools;
-use tool_parser::{Glm4MoeParser, ParserFactory, ToolParser};
+use openai_protocol::common::{ToolChoice, ToolChoiceValue};
+use tool_parser::{Glm4MoeParser, ParserFactory, ToolConstraint, ToolParser};
 
 #[tokio::test]
 async fn test_glm47_complete_parsing() {
@@ -115,6 +116,157 @@ async fn test_glm5_routes_to_glm47_moe() {
         assert_eq!(tools.len(), 1, "{model} should extract one tool call");
         assert_eq!(tools[0].function.name, "get_weather", "{model}");
     }
+}
+
+/// GLM-4.7 follows the same contract as every other native tool format:
+/// `auto` and `none` send no constraint (an engine launched without a grammar
+/// backend, TokenSpeed's default, keeps serving tool calls), and `required`
+/// or a named function sends the structural tag with a forced call.
+#[test]
+fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("glm47_moe");
+    let tools = create_test_tools();
+    assert!(registry.has_structural_tag("glm47_moe"));
+
+    for choice in [
+        ToolChoice::Value(ToolChoiceValue::Auto),
+        ToolChoice::Value(ToolChoiceValue::None),
+    ] {
+        let constraint = registry
+            .generate_tool_constraint(parser, &tools, &choice, false)
+            .unwrap();
+        assert!(
+            constraint.is_none(),
+            "{choice:?} must not constrain: {constraint:?}"
+        );
+    }
+    assert!(registry
+        .generate_tool_constraint(
+            parser,
+            &[],
+            &ToolChoice::Value(ToolChoiceValue::Required),
+            false
+        )
+        .unwrap()
+        .is_none());
+
+    let structural_tag = |constraint: Option<ToolConstraint>| -> serde_json::Value {
+        let Some(ToolConstraint::StructuralTag(tag)) = constraint else {
+            panic!("expected the structural tag, got {constraint:?}");
+        };
+        serde_json::from_str(&tag).unwrap()
+    };
+
+    let required = structural_tag(
+        registry
+            .generate_tool_constraint(
+                parser,
+                &tools,
+                &ToolChoice::Value(ToolChoiceValue::Required),
+                false,
+            )
+            .unwrap(),
+    );
+    assert_eq!(required["format"]["type"], "triggered_tags");
+    assert_eq!(required["format"]["at_least_one"], true);
+    assert_eq!(
+        required["format"]["tags"].as_array().unwrap().len(),
+        tools.len()
+    );
+
+    // A named function used to fall back to a JSON schema (pure-JSON output);
+    // it is now the structural tag with a forced call. The gateway narrows
+    // `tools` to the named one before asking the registry, so the tag carries
+    // exactly that tool.
+    let named: ToolChoice = serde_json::from_value(serde_json::json!({
+        "type": "function",
+        "function": {"name": tools[0].function.name}
+    }))
+    .unwrap();
+    let named_tag = structural_tag(
+        registry
+            .generate_tool_constraint(parser, &tools[..1], &named, false)
+            .unwrap(),
+    );
+    assert_eq!(named_tag["format"]["at_least_one"], true);
+    let tags = named_tag["format"]["tags"].as_array().unwrap();
+    assert_eq!(tags.len(), 1);
+    assert_eq!(
+        tags[0]["begin"],
+        format!("<tool_call>{}", tools[0].function.name)
+    );
+
+    // Allowed tools: forced only in required mode; auto mode is unconstrained.
+    let allowed = |mode: &str| -> ToolChoice {
+        serde_json::from_value(serde_json::json!({
+            "type": "allowed_tools",
+            "mode": mode,
+            "tools": [{"type": "function", "name": tools[0].function.name}]
+        }))
+        .unwrap()
+    };
+    let allowed_required = structural_tag(
+        registry
+            .generate_tool_constraint(parser, &tools[..1], &allowed("required"), false)
+            .unwrap(),
+    );
+    assert_eq!(allowed_required["format"]["at_least_one"], true);
+    assert!(registry
+        .generate_tool_constraint(parser, &tools[..1], &allowed("auto"), false)
+        .unwrap()
+        .is_none());
+}
+
+/// On a thinking prompt (GLM-4.7 with `enable_thinking` on, GLM-5 always) the
+/// forced call must follow the model's reasoning, as xgrammar's built-in
+/// `glm_4_7` tag lays it out with `reasoning=True`:
+/// `sequence[<free text></think>, <calls>]`. Without a forced choice there is
+/// still no constraint, thinking or not.
+#[test]
+fn test_glm47_forced_choice_on_a_thinking_prompt_reasons_first() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("glm47_moe");
+    let tools = create_test_tools();
+    assert!(registry.has_reasoning_prefix(parser));
+    assert!(!registry.has_reasoning_prefix(Some("mistral")));
+    assert!(!registry.has_reasoning_prefix(None));
+
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    let tag = |reasoning: bool| -> serde_json::Value {
+        match registry
+            .generate_tool_constraint(parser, &tools, &required, reasoning)
+            .unwrap()
+        {
+            Some(ToolConstraint::StructuralTag(tag)) => serde_json::from_str(&tag).unwrap(),
+            other => panic!("expected the structural tag, got {other:?}"),
+        }
+    };
+    let plain = tag(false);
+    let thinking = tag(true);
+    assert_eq!(thinking["format"]["type"], "sequence");
+    let elements = thinking["format"]["elements"].as_array().unwrap();
+    assert_eq!(elements.len(), 2);
+    assert_eq!(elements[0]["type"], "tag");
+    assert_eq!(elements[0]["begin"], "");
+    assert_eq!(elements[0]["end"], "</think>");
+    assert_eq!(elements[0]["content"]["type"], "any_text");
+    assert_eq!(
+        elements[1], plain["format"],
+        "the calls part is the non-thinking tag"
+    );
+
+    assert!(registry
+        .generate_tool_constraint(
+            parser,
+            &tools,
+            &ToolChoice::Value(ToolChoiceValue::Auto),
+            true
+        )
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

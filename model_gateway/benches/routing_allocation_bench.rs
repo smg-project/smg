@@ -65,7 +65,9 @@ fn extract_text_for_routing_old(req: &ResponsesRequest) -> String {
                 ResponseInputOutputItem::FunctionToolCall { arguments, .. } => {
                     Some(arguments.clone())
                 }
-                ResponseInputOutputItem::FunctionCallOutput { output, .. } => Some(output.clone()),
+                ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
+                    output.to_text_only().ok()
+                }
                 ResponseInputOutputItem::McpApprovalRequest { .. } => None,
                 ResponseInputOutputItem::McpApprovalResponse { .. } => None,
                 ResponseInputOutputItem::ImageGenerationCall { .. } => None,

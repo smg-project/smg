@@ -13,7 +13,7 @@ use crate::routers::{
     grpc::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
-        multimodal, utils,
+        multimodal, utils, ProcessedMessages,
     },
 };
 
@@ -42,6 +42,32 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
+        let (token_ids, processed_messages, tool_constraints) =
+            prepare_chat_like(ctx, request).await?;
+        ctx.state.preparation = Some(PreparationOutput::Chat {
+            token_ids,
+            processed_messages,
+            tool_constraints,
+        });
+        Ok(())
+    }
+}
+
+/// The chat request → prepared inputs pipeline, shared by the chat endpoint
+/// and the transcription endpoint (whose backend request is chat-shaped).
+///
+/// Applies the model's chat template + multimodal expansion, tokenizes,
+/// derives `skip_special_tokens`, and builds the stop decoder — writing the
+/// intermediate/decoder/skip-special onto `ctx.state`. Returns the pieces the
+/// caller stores in its own `PreparationOutput` variant. Does NOT set
+/// `ctx.state.preparation`.
+pub(crate) async fn prepare_chat_like(
+    ctx: &mut RequestContext,
+    request: &ChatCompletionRequest,
+) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>), Response> {
+    utils::validate_chat_content_parts(&request.messages)
+        .map_err(|e| error::bad_request("unsupported_content_part", e))?;
+    {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
@@ -138,24 +164,26 @@ impl ChatPreparationStage {
         };
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages_with_placeholders(
-            &body_ref,
-            &*tokenizer,
-            placeholder_tokens.as_ref(),
-            media_order,
-        ) {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                return Err(error::bad_request("process_messages_failed", e));
-            }
-        };
+        let (processed_messages, prompt_encoding) =
+            match utils::process_chat_messages_with_placeholders(
+                &body_ref,
+                &*tokenizer,
+                placeholder_tokens.as_ref(),
+                media_order,
+            ) {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    return Err(error::bad_request("process_messages_failed", e));
+                }
+            };
 
-        // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
-        let encoding = match utils::encode_blocking(
+        // Step 3: Tokenize the prompt the way its renderer said to (a flat
+        // encode of the text, or the encode the renderer prepared)
+        let encoding = match utils::encode_prompt_blocking(
             tokenizer.clone(),
-            processed_messages.text.clone(),
-            false,
+            &processed_messages.text,
+            prompt_encoding,
         )
         .await
         {
@@ -190,51 +218,79 @@ impl ChatPreparationStage {
             })?;
         }
 
-        // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash)
+        // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash),
+        // or keep the media references for a worker that processes them itself.
         let mut multimodal_intermediate = None;
-        if let Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)) =
-            mm_context
+        let mut multimodal_refs = None;
+        if let (
+            Some(placeholders),
+            Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)),
+        ) = (placeholder_tokens.as_ref(), mm_context)
         {
-            match multimodal::process_multimodal_plan(
-                media_plan,
-                model_id,
-                &*tokenizer,
-                token_ids,
+            let processing = multimodal::resolve_mm_processing(
                 mm_components,
-                &tokenizer_id,
-                &tokenizer_source,
+                &ctx.components.worker_registry,
+                model_id,
+                &media_plan,
+                placeholders,
             )
-            .await
-            {
-                Ok(output) => {
-                    debug!(
-                        function = "ChatPreparationStage::execute",
-                        expanded_tokens = output.expanded_token_ids.len(),
-                        "Multimodal processing complete"
-                    );
-                    token_ids = output.expanded_token_ids;
-                    multimodal_intermediate = Some(output.intermediate);
-                }
-                Err(e) => {
-                    error!(
-                        function = "ChatPreparationStage::execute",
-                        error = %e,
-                        "Multimodal processing failed"
-                    );
-                    return Err(error::bad_request(
-                        "multimodal_processing_failed",
-                        format!("Multimodal processing failed: {e}"),
-                    ));
+            .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            if processing == multimodal::MmProcessing::Worker {
+                debug!(
+                    function = "ChatPreparationStage::execute",
+                    media_items = media_plan.parts().len(),
+                    "Forwarding media references for worker-side processing"
+                );
+                multimodal_refs = Some(media_plan);
+            } else {
+                match multimodal::process_multimodal_plan(
+                    media_plan,
+                    model_id,
+                    &*tokenizer,
+                    token_ids,
+                    mm_components,
+                    &tokenizer_id,
+                    &tokenizer_source,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        debug!(
+                            function = "ChatPreparationStage::execute",
+                            expanded_tokens = output.expanded_token_ids.len(),
+                            "Multimodal processing complete"
+                        );
+                        token_ids = output.expanded_token_ids;
+                        multimodal_intermediate = Some(output.intermediate);
+                    }
+                    Err(e) => {
+                        error!(
+                            function = "ChatPreparationStage::execute",
+                            error = %e,
+                            "Multimodal processing failed"
+                        );
+                        return Err(error::bad_request(
+                            "multimodal_processing_failed",
+                            format!("Multimodal processing failed: {e}"),
+                        ));
+                    }
                 }
             }
         }
 
         // Step 4: Build tool constraints if needed
         // The tool parser registry handles both structural tag (for native format
-        // parsers like Mistral, KimiK2) and generic JSON schema fallback.
-        let tool_call_constraint = if let (Some(tools), Some(tool_choice)) =
-            (body_ref.tools.as_ref(), request.tool_choice.as_ref())
+        // parsers like Mistral, KimiK2) and generic JSON schema fallback. When
+        // the prompt ends inside the model's thinking block, a parser with a
+        // reasoning prefix gets its tag wrapped so a forced call follows the
+        // reasoning instead of preempting it. The constraint covers every tool
+        // the choice lets the model call, dynamic tools declared on messages
+        // included (see `ChatCompletionRequest::callable_tools`).
+        let constraint_tools = request.callable_tools();
+        let tool_call_constraint = if let (false, Some(tool_choice)) =
+            (constraint_tools.is_empty(), request.tool_choice.as_ref())
         {
+            let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
             ctx.components
                 .tool_parser_factory
                 .registry()
@@ -243,8 +299,9 @@ impl ChatPreparationStage {
                         .parser_resolver
                         .tool_parser(&request.model)
                         .as_deref(),
-                    tools,
+                    &constraint_tools,
                     tool_choice,
+                    reasoning,
                 )
                 .map_err(|e| {
                     error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
@@ -298,20 +355,18 @@ impl ChatPreparationStage {
             request.ignore_eos,
         );
 
-        // Store results in context.
+        // Store the intermediate + decoder + derived skip_special_tokens on
+        // ctx (PreparationOutput is consumed by request_building before
+        // response_processing runs); hand the rest to the caller.
         ctx.state.multimodal_intermediate = multimodal_intermediate;
-        ctx.state.preparation = Some(PreparationOutput::Chat {
-            token_ids,
-            processed_messages,
-            tool_constraints: tool_call_constraint.map(|c| c.to_tuple()),
-        });
-
-        // Store stop decoder and derived skip_special_tokens for response processing.
-        // Stored on ResponseState because PreparationOutput is consumed by
-        // request_building before response_processing runs.
+        ctx.state.multimodal_refs = multimodal_refs;
         ctx.state.response.stop_decoder = Some(stop_decoder);
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
 
-        Ok(())
+        Ok((
+            token_ids,
+            processed_messages,
+            tool_call_constraint.map(|c| c.to_tuple()),
+        ))
     }
 }

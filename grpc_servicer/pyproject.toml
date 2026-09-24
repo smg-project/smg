@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-servicer"
-version = "0.9.1"
+version = "0.12.0"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
-    "smg-grpc-proto>=0.4.16",  # 0.4.16: first release with GenerateRequest.data_parallel_rank (field 12)
+    "smg-grpc-proto>=0.4.20",  # 0.4.20: first release with GenerateRequest.extra_mm_inputs (field 11)
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",
@@ -31,12 +31,16 @@ classifiers = [
 
 [project.optional-dependencies]
 vllm = ["vllm>=0.19.0", "pyzmq>=25.0.0", "msgspec>=0.18.0"]
-# 0.5.18 dropped the server_args parameter from
-# create_load_snapshot_reader(); the floor tracks that signature, which the
-# request manager calls unconditionally. (Earlier floors recorded the shmem
-# load snapshots that replaced the WatchLoadUpdateReq piggyback path in
-# 0.5.13, removed upstream in v0.5.14.)
-sglang = ["sglang>=0.5.18"]
+# Redis media-processing sidecar backend for vLLM (SMG_VLLM_MM_PROCESSOR=redis).
+vllm-redis = ["redis>=5.0", "msgspec>=0.18.0"]
+# 0.5.20 dropped the server_args parameter from start_disagg_service(), which
+# the gRPC server calls unconditionally when starting a prefill worker; it now
+# reads the per-process config instead. The floor tracks that signature, the
+# same way it tracked 0.5.18 dropping the same parameter from
+# create_load_snapshot_reader(). (Earlier floors recorded the shmem load
+# snapshots that replaced the WatchLoadUpdateReq piggyback path in 0.5.13,
+# removed upstream in v0.5.14.)
+sglang = ["sglang>=0.5.20"]
 # smg-grpc-proto>=0.4.7 is the first release that ships mlx_engine_pb2;
 # without this floor, installing [mlx] against an older proto build would
 # crash at import time when smg_grpc_servicer.mlx.server runs.

@@ -22,11 +22,21 @@ pub const BRANCH_ALL_OVERLOADED_SHED: &str = "all_overloaded_shed";
 /// here every other worker may well be idle.
 pub const BRANCH_OVERLOADED_AT_DISPATCH: &str = "overloaded_at_dispatch";
 
+/// Decision-log branch: the decode leg of a disaggregated pair was already
+/// running its full engine window and no slot freed inside the admission wait.
+/// The pair is not overloaded by the threshold predicate above — the gateway
+/// simply has nowhere to put another bootstrap room.
+pub const BRANCH_PD_ADMISSION_SHED: &str = "pd_admission_shed";
+
 /// Shed detected while assembling the candidate pool.
 pub const STAGE_SELECTION: &str = "selection";
 
 /// Shed detected by the dispatch-time re-check of the chosen worker.
 pub const STAGE_DISPATCH: &str = "dispatch";
+
+/// Shed detected by the PD admission gate, which runs between selection and
+/// the paired dispatch.
+pub const STAGE_PD_ADMISSION: &str = "pd_admission";
 
 /// Absolute thresholds above which a worker is vetoed from routing.
 ///

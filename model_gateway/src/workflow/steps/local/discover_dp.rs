@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerSpec;
+use reqwest::Client;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -21,8 +22,12 @@ pub struct DpInfo {
 }
 
 /// Get DP info for a worker URL.
-pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, String> {
-    let info = get_server_info(url, api_key).await?;
+pub async fn get_dp_info(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<DpInfo, String> {
+    let info = get_server_info(client, url, api_key).await?;
 
     let dp_size = info
         .dp_size
@@ -149,7 +154,8 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                     );
                     return Ok(StepResult::Success);
                 }
-                get_dp_info(&config.url, config.api_key.as_deref())
+                let client = context.data.http_client("discover_dp_info")?;
+                get_dp_info(&client, &config.url, config.api_key.as_deref())
                     .await
                     .map_err(|e| WorkflowError::StepFailed {
                         step_id: StepId::new("discover_dp_info"),

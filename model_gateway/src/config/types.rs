@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
-pub use openai_protocol::worker::TransportMode;
+pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use serde::{Deserialize, Serialize};
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
@@ -10,6 +10,7 @@ pub use smg_data_connector::{
 
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
+    routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{ConnectionMode, RuntimeType},
 };
@@ -42,6 +43,10 @@ pub struct RouterConfig {
     /// Per-request sticky-session routing (rid-lineage keys, header fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// How strictly PD placement pairs a prefill with a decode on their KV
+    /// transfer protocol; see [`PdPairingMode`].
+    #[serde(default)]
+    pub pd_pairing_mode: PdPairingMode,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -91,6 +96,14 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// How long a disaggregated (PD) dispatch waits for a slot in the decode
+    /// engine's running window before shedding. Must stay well under the
+    /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
+    /// out this budget and then dispatches still has the whole deadline ahead
+    /// of it. `0` sheds immediately instead of waiting. Ignored for engines
+    /// that report no running window.
+    #[serde(default = "default_pd_admission_wait_secs")]
+    pub pd_admission_wait_secs: u64,
     /// Restore the conditional load-monitor poll gate: only poll worker groups
     /// when a load-aware routing policy, `engine_metrics`, or overload
     /// protection needs the data. Default `false` — the monitor polls every
@@ -147,10 +160,43 @@ pub struct RouterConfig {
     /// to `SMG_MM_SHM_MIN_BYTES`, then 64 KiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_shm_min_bytes: Option<usize>,
+    /// Most bytes of preprocessed media the gateway holds in flight for engines
+    /// at once. A request that fits waits briefly for room, then gets 429; one
+    /// larger than the whole budget gets 413 straight away. A request waiting
+    /// for room still holds its media, and the queue is capped at one budget
+    /// as well, so size memory for about twice this value. Unset leaves it
+    /// unbounded; zero is refused rather than read as unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_max_inflight_bytes: Option<usize>,
     /// Per-request image-count limit applied to every model, replacing each
     /// spec's built-in limit; beats `SMG_IMAGE_MAX_COUNT`. Unset keeps spec limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_per_request_image_limit: Option<usize>,
+    /// Where media for vLLM gRPC workers is fetched and preprocessed (`auto` |
+    /// `router` | `worker`); when unset, falls back to `SMG_MM_PROCESSING`,
+    /// then `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_processing: Option<MmProcessingMode>,
+    /// Host-DRAM budget (MiB) for router-side preprocessed media; when unset,
+    /// falls back to `SMG_MM_PIXEL_CACHE_MB`, then 0 (no cache).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_pixel_cache_mb: Option<usize>,
+    /// Serve cached pixels over RDMA (the legacy switch; `multimodal_tensor_transport
+    /// = rdma` is the first-class one); when unset, falls back to `SMG_MM_PIXEL_RDMA`.
+    #[serde(default)]
+    pub mm_pixel_rdma: bool,
+    /// Listener IP for the RDMA metadata exchange; when unset, falls back to
+    /// `SMG_RDMA_LISTEN_IP`, and without either the lane stays on the inline path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma_listen_ip: Option<String>,
+    /// Full-TTL override (seconds) for leased RDMA pixel slots; when unset, falls
+    /// back to `SMG_RDMA_SLOT_TTL_S`, then the TTL derived from the worker's hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma_slot_ttl_s: Option<u64>,
+    /// Emit per-request multimodal timing at INFO; when unset, falls back to
+    /// `SMG_LOG_MM_TIMING`.
+    #[serde(default)]
+    pub log_mm_timing: bool,
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -216,6 +262,9 @@ pub struct RouterConfig {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub enable_igw: bool,
+    /// RL control plane (`/v1/rl/*`); inert unless `rl.enabled`.
+    #[serde(default)]
+    pub rl: smg_rl::RlConfig,
     /// Can be a HuggingFace model ID or local path
     pub model_path: Option<String>,
     /// Overrides model_path tokenizer if provided
@@ -264,8 +313,9 @@ pub struct RouterConfig {
     /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
     /// engine-directed connections — request dispatch and health/probe traffic
     /// alike — multiplexing every request to a worker over one connection
-    /// instead of one TCP connection per in-flight request. Requires every
-    /// HTTP worker to serve HTTP/2 without an upgrade handshake.
+    /// instead of one TCP connection per in-flight request. Negotiated per
+    /// worker at registration: a worker that does not answer HTTP/2 stays on
+    /// HTTP/1.1. `http_pool.http2` on a worker spec pins the version instead.
     #[serde(default)]
     pub upstream_http2: bool,
     /// Loaded from mcp_config_path during config creation
@@ -330,6 +380,10 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_pd_admission_wait_secs() -> u64 {
+    DEFAULT_PD_ADMISSION_WAIT_SECS
 }
 
 fn default_job_queue_capacity() -> usize {
@@ -510,6 +564,56 @@ pub enum ManualAssignmentMode {
     /// policy, then pin. With `--policy manual` (no underlying policy to
     /// delegate to) this falls back to min-load.
     Delegate,
+}
+
+/// How strictly PD placement pairs a prefill with a decode on their KV
+/// transfer protocol (#2483). A descriptor component an engine does not report
+/// is "unknown".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PdPairingMode {
+    /// Pair on nothing: placement behaves as if no descriptor existed.
+    Off,
+    /// A known difference in runtime, transport or KV layout refuses the
+    /// pair; unknown components and engine versions pair with anything.
+    #[default]
+    Lenient,
+    /// Runtime, transport and KV layout must be known on both sides and
+    /// agree, and reported engine versions must match.
+    Strict,
+}
+
+impl PdPairingMode {
+    /// Number of modes, for per-mode caches.
+    pub const COUNT: usize = 3;
+
+    /// A dense index for per-mode caches.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Lenient => 1,
+            Self::Strict => 2,
+        }
+    }
+
+    /// Parse the CLI spelling (`off` / `lenient` / `strict`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "lenient" => Some(Self::Lenient),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    /// The CLI spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lenient => "lenient",
+            Self::Strict => "strict",
+        }
+    }
 }
 
 /// Per-request sticky-routing override: when a sticky key is present, any
@@ -919,33 +1023,7 @@ impl Default for DiscoveryConfig {
     }
 }
 
-/// Retry configuration for request handling
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryConfig {
-    pub max_retries: u32,
-    pub initial_backoff_ms: u64,
-    pub max_backoff_ms: u64,
-    pub backoff_multiplier: f32,
-    /// D' = D * (1 + U[-j, +j]) where j is jitter factor
-    #[serde(default = "default_retry_jitter_factor")]
-    pub jitter_factor: f32,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 5,
-            initial_backoff_ms: 50,
-            max_backoff_ms: 30000,
-            backoff_multiplier: 1.5,
-            jitter_factor: 0.2,
-        }
-    }
-}
-
-fn default_retry_jitter_factor() -> f32 {
-    0.2
-}
+pub use smg_external_router::RetryConfig;
 
 /// Health check configuration for worker monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -956,8 +1034,9 @@ pub struct HealthCheckConfig {
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
-    /// Let workers recover after prolonged failure: removal re-enters them
-    /// through service discovery once their engine returns.
+    /// Recover failed workers by removal: they re-enter through service
+    /// discovery once their engine returns. Off, a Failed worker stays
+    /// registered and probed, and rejoins in place when it answers again.
     #[serde(default, alias = "worker_auto_recovery")]
     pub remove_unhealthy_workers: bool,
     /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
@@ -1074,6 +1153,7 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,
@@ -1089,6 +1169,7 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
             worker_overload_protection: false,
             worker_overload_waiting_requests: None,
@@ -1098,7 +1179,14 @@ impl Default for RouterConfig {
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
+            multimodal_max_inflight_bytes: None,
             mm_per_request_image_limit: None,
+            mm_processing: None,
+            mm_pixel_cache_mb: None,
+            mm_pixel_rdma: false,
+            rdma_listen_ip: None,
+            rdma_slot_ttl_s: None,
+            log_mm_timing: false,
             dp_aware: false,
             dp_minimum_tokens_scheduler: false,
             api_key: None,
@@ -1129,6 +1217,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            rl: smg_rl::RlConfig::default(),
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
             zmq_engine_count: None,
@@ -1334,6 +1423,54 @@ mod tests {
     }
 
     #[test]
+    fn test_multimodal_settings_serde_roundtrip_and_backward_compat() {
+        // Unset by default, and the optional ones stay out of serialized output.
+        let config = RouterConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        for key in [
+            "mm_processing",
+            "mm_pixel_cache_mb",
+            "rdma_listen_ip",
+            "rdma_slot_ttl_s",
+        ] {
+            assert!(!json.contains(key), "unset {key} must be omitted");
+        }
+
+        // Config files predating the fields deserialize to the defaults.
+        let mut without: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = without.as_object_mut().unwrap();
+        object.remove("mm_pixel_rdma").unwrap();
+        object.remove("log_mm_timing").unwrap();
+        let without: RouterConfig = serde_json::from_value(without).unwrap();
+        assert_eq!(without.mm_processing, None);
+        assert_eq!(without.mm_pixel_cache_mb, None);
+        assert!(!without.mm_pixel_rdma);
+        assert_eq!(without.rdma_listen_ip, None);
+        assert_eq!(without.rdma_slot_ttl_s, None);
+        assert!(!without.log_mm_timing);
+
+        // When set, every value round-trips, the mode as its lowercase name.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .mm_processing(Some(MmProcessingMode::Worker))
+            .mm_pixel_cache_mb(Some(512))
+            .mm_pixel_rdma(true)
+            .rdma_listen_ip(Some("10.0.0.7"))
+            .rdma_slot_ttl_s(Some(600))
+            .log_mm_timing(true)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""mm_processing":"worker""#));
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.mm_processing, Some(MmProcessingMode::Worker));
+        assert_eq!(with.mm_pixel_cache_mb, Some(512));
+        assert!(with.mm_pixel_rdma);
+        assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(with.rdma_slot_ttl_s, Some(600));
+        assert!(with.log_mm_timing);
+    }
+
+    #[test]
     fn test_max_buffered_request_bytes_serde_default_and_roundtrip() {
         // Config files predating the field deserialize to the 1MiB default.
         let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
@@ -1410,6 +1547,27 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.stream_body_stall_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_pd_admission_wait_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to the 30s default.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("pd_admission_wait_secs")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.pd_admission_wait_secs, 30);
+
+        // The shed-immediately zero round-trips instead of reverting.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .pd_admission_wait_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.pd_admission_wait_secs, 0);
     }
 
     #[test]

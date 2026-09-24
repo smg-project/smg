@@ -66,9 +66,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
             &config.resilience,
         );
 
+        // TLS negotiates the HTTP version via ALPN; only an explicit
+        // `http_pool.http2` pins it.
+        let http2 = config.http_pool.http2.unwrap_or(false);
         let http_client = app_context
             .worker_client_cache
-            .get(&config.http_pool)
+            .get(&config.http_pool, http2)
             .map_err(|e| WorkflowError::StepFailed {
                 step_id: StepId::new("create_external_workers"),
                 message: e,
@@ -107,6 +110,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
                 .runtime_type(RuntimeType::External)
                 .circuit_breaker_config(circuit_breaker_config.clone())
                 .http_client(http_client.clone())
+                .http2(http2)
                 .resilience(resolved_resilience.clone())
                 .health_config(health_config.clone())
                 .health_endpoint(&health_endpoint)
@@ -144,6 +148,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
                 .runtime_type(RuntimeType::External)
                 .circuit_breaker_config(circuit_breaker_config.clone())
                 .http_client(http_client.clone())
+                .http2(http2)
                 .resilience(resolved_resilience.clone())
                 .health_config(health_config.clone())
                 .health_endpoint(&health_endpoint)

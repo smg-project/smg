@@ -44,6 +44,7 @@ class SGLangHealthServicer(health_pb2_grpc.HealthServicer):
         self.request_manager = request_manager
         self.scheduler_info = scheduler_info
         self._serving_status = {}
+        self._stuck_reported = False
 
         # Initially set to NOT_SERVING until model is loaded
         self._serving_status[self.OVERALL_SERVER] = health_pb2.HealthCheckResponse.NOT_SERVING
@@ -118,15 +119,24 @@ class SGLangHealthServicer(health_pb2_grpc.HealthServicer):
             # Consider making this configurable via environment variable in the future
             # if different workloads need different responsiveness thresholds.
             if time_since_last_receive > 30 and len(self.request_manager.rid_to_state) > 0:
-                logger.warning(
-                    f"Service health check: Scheduler not responsive "
-                    f"({time_since_last_receive:.1f}s since last receive, "
-                    f"{len(self.request_manager.rid_to_state)} pending requests)"
-                )
+                # Probes keep arriving on their interval for as long as this
+                # holds, so say it when it starts and again only if it clears
+                # and comes back; repeating it every interval buries whatever
+                # else the scheduler is trying to report.
+                if not self._stuck_reported:
+                    self._stuck_reported = True
+                    logger.warning(
+                        f"Service health check: Scheduler not responsive "
+                        f"({time_since_last_receive:.1f}s since last receive, "
+                        f"{len(self.request_manager.rid_to_state)} pending requests)"
+                    )
                 return health_pb2.HealthCheckResponse(
                     status=health_pb2.HealthCheckResponse.NOT_SERVING
                 )
 
+            if self._stuck_reported:
+                self._stuck_reported = False
+                logger.info("Service health check: scheduler is responsive again")
             logger.debug("Service health check: SERVING")
             return health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.SERVING)
 

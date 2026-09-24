@@ -22,7 +22,7 @@ use crate::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
-    encoders::{deepseek_v32, deepseek_v4},
+    encoders::{deepseek_v32, deepseek_v4, deepseek_v41},
     traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait},
 };
 
@@ -31,6 +31,7 @@ enum Renderer {
     Jinja,
     DeepseekV32,
     DeepseekV4(deepseek_v4::EffortEncoding),
+    DeepseekV41,
 }
 
 /// HuggingFace tokenizer wrapper
@@ -261,11 +262,18 @@ impl HuggingFaceTokenizer {
             }
         }
 
-        // Load merged EOS token IDs from config.json + generation_config.json
-        let eos_token_ids = tokenizer_path
-            .parent()
-            .map(crate::eos::load_eos_token_ids)
-            .unwrap_or_default();
+        // Load merged EOS token IDs from config.json + generation_config.json,
+        // plus the tokenizer's own eos_token (structured-output grammars end on it).
+        let eos_token_ids = crate::eos::with_tokenizer_eos(
+            tokenizer_path
+                .parent()
+                .map(crate::eos::load_eos_token_ids)
+                .unwrap_or_default(),
+            special_tokens
+                .eos_token
+                .as_deref()
+                .and_then(|token| vocab.get(token).copied()),
+        );
 
         // Detect a custom Python-encoder model from config.json::architectures.
         let renderer = tokenizer_path
@@ -571,11 +579,25 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             }
             Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
             Renderer::DeepseekV4(encoding) => apply_deepseek_v4(messages, &params, encoding),
+            Renderer::DeepseekV41 => apply_deepseek_v41(messages, &params),
         }
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
-        self.chat_template.content_format()
+        match self.renderer {
+            // V4.1 wants message parts preserved (OpenAI wire format) so the
+            // gateway passes `image_url`/`image` parts through as a list
+            // instead of flattening to a string; the encoder turns each part
+            // into a placeholder at its position. Part *order* is still the
+            // gateway's media-part order (the V4.1 multimodal spec declares
+            // `Authored`; without a spec the gateway moves media first).
+            // V3.2/V4 have no native opinion here and fall back to whatever
+            // the (usually absent) Jinja template reports.
+            Renderer::DeepseekV41 => ChatTemplateContentFormat::OpenAI,
+            Renderer::Jinja | Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => {
+                self.chat_template.content_format()
+            }
+        }
     }
 
     fn thinking_toggle(&self) -> ThinkingToggle {
@@ -584,30 +606,54 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             // kwarg, default off. The Jinja processor has no knowledge of
             // the native encoder so we must report it directly.
             Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => ThinkingToggle::DefaultOff,
+            // V4.1 defaults thinking ON: `reasoning_effort: "none"` or an
+            // explicit `thinking: false` (or vLLM's `enable_thinking` alias,
+            // see `renderer_capabilities`) turns it off.
+            Renderer::DeepseekV41 => ThinkingToggle::DefaultOn,
             Renderer::Jinja => self.chat_template.thinking_toggle(),
         }
     }
 
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
         match self.renderer {
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => Some(ThinkingKeyName::Thinking),
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => {
+                Some(ThinkingKeyName::Thinking)
+            }
             Renderer::Jinja => self.chat_template.thinking_key_name(),
         }
     }
     fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
         match self.renderer {
             Renderer::DeepseekV4(encoding) => encoding.valid_native_values(),
+            Renderer::DeepseekV41 => deepseek_v41::NATIVE_EFFORT_VALUES,
             Renderer::DeepseekV32 | Renderer::Jinja => &[],
         }
     }
 
     fn think_in_prefill(&self) -> bool {
         match self.renderer {
-            // Both encoders emit `<｜Assistant｜><think>` at the end of the
-            // prompt when thinking mode is on; the completion therefore starts
-            // mid-reasoning and the parser must be told so.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => true,
+            // All three native encoders emit `<｜Assistant｜><think>` at the end
+            // of the prompt when thinking mode is on; the completion therefore
+            // starts mid-reasoning and the parser must be told so.
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => true,
             Renderer::Jinja => self.chat_template.think_in_prefill(),
+        }
+    }
+
+    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+        match self.renderer {
+            // The V4.1 shim honours vLLM's `enable_thinking` alias, renders a
+            // trailing assistant message itself when `add_generation_prompt`
+            // is false, and parses tool-call `arguments` strings with the
+            // reference's tolerance.
+            Renderer::DeepseekV41 => crate::traits::RendererCapabilities {
+                enable_thinking_alias: true,
+                native_assistant_continuation: true,
+                raw_tool_call_arguments: true,
+            },
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::Jinja => {
+                crate::traits::RendererCapabilities::default()
+            }
         }
     }
 
@@ -649,6 +695,13 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
     if arch_strs.contains(&"DeepseekV32ForCausalLM") {
         debug!(?path, "selected DeepseekV32 chat-template renderer");
         return Renderer::DeepseekV32;
+    }
+    // Checked before the V4 arm below: V4.1 ships its own architecture name,
+    // but some checkpoints identify themselves only via `model_type`.
+    let model_type = value.get("model_type").and_then(|v| v.as_str());
+    if arch_strs.contains(&"DeepseekV41ForCausalLM") || model_type == Some("deepseek_v41") {
+        debug!(?path, "selected DeepseekV41 chat-template renderer");
+        return Renderer::DeepseekV41;
     }
     if arch_strs.contains(&"DeepseekV4ForCausalLM") {
         let encoding = detect_dsv4_effort_encoding(dir);
@@ -782,6 +835,202 @@ fn apply_deepseek_v4(
     };
     deepseek_v4::encode_messages(msgs, thinking_mode, &encode_params)
         .map_err(|e| Error::msg(format!("DeepSeek V4 encode failed: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek V4.1 dispatch shim
+// ---------------------------------------------------------------------------
+/// Attach `tools` to the FIRST message whose role is `system`, wherever it
+/// appears in the conversation — vLLM's V4.1 rule. This differs from V3.2/V4's
+/// [`inject_tools_into_messages`], which only rewrites a *leading*
+/// system/developer message. Synthesizes an empty leading system message when
+/// none exists.
+fn inject_tools_into_first_system_message(
+    messages: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+) -> Option<Vec<serde_json::Value>> {
+    let tools = tools?;
+    if tools.is_empty() {
+        return None;
+    }
+    let mut owned: Vec<serde_json::Value> = messages.to_vec();
+    let system_index = owned
+        .iter()
+        .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
+    let index = system_index.unwrap_or_else(|| {
+        owned.insert(0, serde_json::json!({ "role": "system", "content": "" }));
+        0
+    });
+    if let Some(obj) = owned[index].as_object_mut() {
+        obj.insert("tools".into(), serde_json::Value::Array(tools.to_vec()));
+    }
+    Some(owned)
+}
+
+/// A V4.1 boolean template kwarg (`thinking`, `drop_thinking`): `None` when
+/// absent or JSON `null`; a present value that isn't a JSON boolean is an
+/// error naming the key and the value. Unlike V3.2/V4's [`explicit_thinking`],
+/// which silently ignores a wrongly typed value.
+fn boolean_kwarg_v41(params: &ChatTemplateParams, key: &str) -> Result<Option<bool>> {
+    match params.template_kwargs.and_then(|k| k.get(key)) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+        Some(other) => Err(Error::msg(format!(
+            "DeepSeek V4.1: template_kwargs[\"{key}\"] must be a boolean, got {other}"
+        ))),
+    }
+}
+
+/// V4.1's explicit thinking toggle: `template_kwargs["thinking"]` (the key
+/// this tokenizer reports through `thinking_key_name()`) or vLLM's
+/// `enable_thinking` alias, both read with the strict [`boolean_kwarg_v41`]
+/// rule. The gateway reads the same two keys when it arms the reasoning
+/// parser (`renderer_capabilities().enable_thinking_alias`), so the prompt
+/// and the parser never disagree; both present and different is an error.
+fn explicit_thinking_v41(params: &ChatTemplateParams) -> Result<Option<bool>> {
+    let thinking = boolean_kwarg_v41(params, "thinking")?;
+    let alias = boolean_kwarg_v41(params, "enable_thinking")?;
+    match (thinking, alias) {
+        (Some(a), Some(b)) if a != b => Err(Error::msg(format!(
+            "DeepSeek V4.1: template_kwargs[\"thinking\"] = {a} and \
+             template_kwargs[\"enable_thinking\"] = {b} disagree"
+        ))),
+        (Some(value), _) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The gateway deserialises a top-level JSON number (`"reasoning_effort": 42`)
+/// into the string `"42"` before forwarding it as a template kwarg. Restore
+/// the number so [`deepseek_v41::parse_reasoning_effort`] sees the integer
+/// budget the client sent. Only that exact form, a non-empty string of ASCII
+/// digits, is restored: a signed or padded `"+42"` / `" 42 "` passes through
+/// untouched and is rejected there as the string it is, and an out-of-range
+/// `"101"` is restored and rejected there with the message a JSON number gets.
+fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let digits = value.as_str()?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok().map(serde_json::Value::from)
+}
+
+/// DeepSeek V4.1 chat-template shim. Order: attach tools to the first system
+/// message (vLLM's rule) -> resolve `reasoning_effort` -> resolve the
+/// thinking mode -> `drop_thinking` -> stamp `wo_eos` on a trailing assistant
+/// message when `add_generation_prompt` is false -> encode.
+///
+/// `add_generation_prompt: false` with a trailing assistant message is the
+/// encoder's `wo_eos` route (no EOS, no generation header). The gateway sends
+/// it for `continue_final_message` with a trailing assistant turn because
+/// `renderer_capabilities().native_assistant_continuation` is declared, and
+/// does not arm the reasoning parser for that shape: the message is rendered
+/// past its `</think>`, so the completion starts in content mode.
+///
+/// The shim reads the merged template kwargs, so an explicit
+/// `chat_template_kwargs.reasoning_effort` wins over the projected top-level
+/// `reasoning_effort` (SMG's global contract; vLLM prefers the top-level
+/// field — a divergence only on contradictory requests).
+///
+/// The thinking mode mirrors the gateway's parser-arming precedence
+/// (`resolve_thinking_pref` in `model_gateway/src/routers/grpc/utils/parsers.rs`)
+/// so the rendered prompt and the arming decision agree on every request
+/// shape:
+/// 1. an explicit `template_kwargs["thinking"]` boolean decides;
+/// 2. else the `reasoning_effort` kwarg: `"none"`/`"minimal"` (the gateway's
+///    thinking switch, `thinking_from_reasoning_effort`) switch thinking off,
+///    a native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and
+///    an integer budget has no opinion;
+/// 3. else `params.thinking` (the gateway's projection of the typed
+///    `thinking.type` toggle, else `Some(false)` for a `none`/`minimal`
+///    effective `reasoning_effort`);
+/// 4. else on ([`ThinkingToggle::DefaultOn`]).
+///
+/// Deliberate divergence from vLLM's Python: there `reasoning_effort: "none"`
+/// forces chat mode even over an explicit `thinking: true`. Here the explicit
+/// toggle wins, because the gateway arms the reasoning parser from the
+/// explicit toggle first, and rendering chat mode for that contradictory input
+/// would have the armed parser swallow the whole answer as reasoning. Neither
+/// switch value reaches `parse_reasoning_effort` (which rejects both, as the
+/// reference does) and both leave the effort unset, so a thinking-mode prompt
+/// carries the default budget.
+fn apply_deepseek_v41(
+    messages: &[serde_json::Value],
+    params: &ChatTemplateParams,
+) -> Result<String> {
+    // `template_kwargs["response_format"]` is deliberately not attached to a
+    // message: vLLM Python never renders V4.1's `## Response Format:` block
+    // (structured output is enforced by the constraint), so the gateway's
+    // projected kwarg is ignored here too. The encoder still renders a
+    // per-message `response_format` for direct callers.
+    let owned = inject_tools_into_first_system_message(messages, params.tools);
+    let mut msgs: Vec<serde_json::Value> = owned.unwrap_or_else(|| messages.to_vec());
+
+    let effort_kwarg = params
+        .template_kwargs
+        .and_then(|k| k.get("reasoning_effort"));
+    let effort_name = effort_kwarg.and_then(serde_json::Value::as_str);
+    // `"none"`/`"minimal"` are the gateway's thinking switch (both project to
+    // thinking off everywhere else in SMG), not effort levels.
+    let effort_is_none = matches!(effort_name, Some("none") | Some("minimal"));
+    let reasoning_effort = if effort_is_none {
+        None
+    } else {
+        let restored = effort_kwarg.and_then(restore_integer_reasoning_effort);
+        restored
+            .as_ref()
+            .or(effort_kwarg)
+            .map(deepseek_v41::parse_reasoning_effort)
+            .transpose()
+            .map_err(|e| Error::msg(format!("DeepSeek V4.1 reasoning_effort invalid: {e}")))?
+            .flatten()
+    };
+    // The effort kwarg's opinion on the mode (step 2 above). Only the names
+    // advertised through `native_reasoning_effort_values()` switch thinking
+    // on: exactly the set the gateway treats as arming the parser.
+    let effort_mode = if effort_is_none {
+        Some(false)
+    } else {
+        effort_name
+            .is_some_and(|name| deepseek_v41::NATIVE_EFFORT_VALUES.contains(&name))
+            .then_some(true)
+    };
+    let thinking_on = explicit_thinking_v41(params)?
+        .or(effort_mode)
+        .or(params.thinking)
+        .unwrap_or(true);
+    let thinking_mode = if thinking_on {
+        deepseek_v32::ThinkingMode::Thinking
+    } else {
+        deepseek_v32::ThinkingMode::Chat
+    };
+
+    let drop_thinking = boolean_kwarg_v41(params, "drop_thinking")?.unwrap_or(true);
+
+    // `add_generation_prompt: false` with a trailing assistant message reaches
+    // the encoder as `wo_eos` on that message: no EOS, no generation header.
+    // That is the only shape wired: with any other trailing role the flag is
+    // ignored and the generation header is appended (V3.2/V4 ignore the flag
+    // entirely).
+    let continues_final_assistant_message = !params.add_generation_prompt
+        && msgs
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            == Some("assistant");
+    if continues_final_assistant_message {
+        if let Some(obj) = msgs.last_mut().and_then(serde_json::Value::as_object_mut) {
+            obj.insert("wo_eos".into(), serde_json::Value::Bool(true));
+        }
+    }
+
+    let encode_params = deepseek_v41::EncodeParams {
+        add_default_bos_token: true,
+        drop_thinking,
+        reasoning_effort,
+    };
+    deepseek_v41::encode_messages(&msgs, thinking_mode, &encode_params)
+        .map_err(|e| Error::msg(format!("DeepSeek V4.1 encode failed: {e}")))
 }
 
 #[cfg(test)]

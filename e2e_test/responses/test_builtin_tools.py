@@ -414,6 +414,7 @@ class TestBuiltinToolRouting:
 
 @pytest.mark.vendor("openai")
 @pytest.mark.gpu(0)
+@pytest.mark.external
 @pytest.mark.parametrize("setup_backend", ["openai"], indirect=True)
 class TestMcpWebSearchStreamingEvents:
     """Test MCP tool SSE streaming events (baseline behavior).

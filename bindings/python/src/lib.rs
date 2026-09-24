@@ -528,6 +528,19 @@ struct Router {
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
     mm_per_request_image_limit: Option<usize>,
+    pd_admission_wait_secs: u64,
+    /// New parameters MUST be appended here (not inserted mid-list) to avoid
+    /// breaking external Python callers that pass `_Router(...)` positionally.
+    enable_rl: bool,
+    rl_control_timeout_secs: u64,
+    rl_fanout_concurrency: usize,
+    multimodal_max_inflight_bytes: Option<usize>,
+    mm_processing: Option<String>,
+    mm_pixel_cache_mb: Option<usize>,
+    mm_pixel_rdma: bool,
+    rdma_listen_ip: Option<String>,
+    rdma_slot_ttl_s: Option<u64>,
+    log_mm_timing: bool,
 }
 
 impl Router {
@@ -610,6 +623,19 @@ impl Router {
                 })
             })
             .transpose()?;
+        let mm_processing = self
+            .mm_processing
+            .as_deref()
+            .map(|value| {
+                config::MmProcessingMode::parse(value).ok_or_else(|| {
+                    config::ConfigError::InvalidValue {
+                        field: "mm_processing".to_string(),
+                        value: value.to_string(),
+                        reason: "expected 'auto', 'router', or 'worker'".to_string(),
+                    }
+                })
+            })
+            .transpose()?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
@@ -662,11 +688,9 @@ impl Router {
             })
         };
 
-        let mode = if self.enable_igw {
-            RoutingMode::Regular {
-                worker_urls: vec![],
-            }
-        } else if matches!(self.backend, BackendType::Openai) {
+        // IGW does not override backend or disaggregated modes; IGW-only keeps
+        // the Python binding's existing empty startup-worker behavior.
+        let mode = if matches!(self.backend, BackendType::Openai) {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
             }
@@ -712,7 +736,11 @@ impl Router {
             }
         } else {
             RoutingMode::Regular {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: if self.enable_igw {
+                    vec![]
+                } else {
+                    self.worker_urls.clone()
+                },
             }
         };
 
@@ -846,6 +874,7 @@ impl Router {
             .worker_overload_protection(self.worker_overload_protection)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -919,7 +948,14 @@ impl Router {
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit)
+            .mm_processing(mm_processing)
+            .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
+            .mm_pixel_rdma(self.mm_pixel_rdma)
+            .rdma_listen_ip(self.rdma_listen_ip.clone())
+            .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
+            .log_mm_timing(self.log_mm_timing)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -931,6 +967,11 @@ impl Router {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
+            .rl(smg_rl::RlConfig {
+                enabled: self.enable_rl,
+                control_timeout_secs: self.rl_control_timeout_secs,
+                fanout_concurrency: self.rl_fanout_concurrency,
+            })
             .maybe_client_cert_and_key(
                 self.client_cert_path.as_ref(),
                 self.client_key_path.as_ref(),
@@ -1096,6 +1137,20 @@ impl Router {
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
         mm_per_request_image_limit = None,
+        pd_admission_wait_secs = 30,
+        // Appended last (not inserted mid-list) so every pre-existing
+        // positional argument keeps its index for callers that construct
+        // `_Router(...)` positionally. See the struct-field note above.
+        enable_rl = false,
+        rl_control_timeout_secs = 600,
+        rl_fanout_concurrency = 32,
+        multimodal_max_inflight_bytes = None,
+        mm_processing = None,
+        mm_pixel_cache_mb = None,
+        mm_pixel_rdma = false,
+        rdma_listen_ip = None,
+        rdma_slot_ttl_s = None,
+        log_mm_timing = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1249,6 +1304,19 @@ impl Router {
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
         mm_per_request_image_limit: Option<usize>,
+        pd_admission_wait_secs: u64,
+        // Appended last to match the `#[pyo3(signature)]` order above and
+        // preserve positional-argument compatibility.
+        enable_rl: bool,
+        rl_control_timeout_secs: u64,
+        rl_fanout_concurrency: usize,
+        multimodal_max_inflight_bytes: Option<usize>,
+        mm_processing: Option<String>,
+        mm_pixel_cache_mb: Option<usize>,
+        mm_pixel_rdma: bool,
+        rdma_listen_ip: Option<String>,
+        rdma_slot_ttl_s: Option<u64>,
+        log_mm_timing: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1416,6 +1484,17 @@ impl Router {
             kv_connector_annotation,
             kv_engine_id_annotation,
             mm_per_request_image_limit,
+            pd_admission_wait_secs,
+            enable_rl,
+            rl_control_timeout_secs,
+            rl_fanout_concurrency,
+            multimodal_max_inflight_bytes,
+            mm_processing,
+            mm_pixel_cache_mb,
+            mm_pixel_rdma,
+            rdma_listen_ip,
+            rdma_slot_ttl_s,
+            log_mm_timing,
         })
     }
 
@@ -1457,9 +1536,20 @@ impl Router {
                 worker_ports_annotation: self.worker_ports_annotation.clone(),
                 kv_connector_annotation: self.kv_connector_annotation.clone(),
                 kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                model_id_source,
+            })
+        } else {
+            None
+        };
+
+        // Mesh-router discovery now has its own task and lifetime, but stays
+        // gated on the legacy service-discovery flag until it gains its own
+        // config surface with the tagged provider configuration.
+        let mesh_discovery_config = if self.service_discovery && !self.router_selector.is_empty() {
+            Some(mesh_discovery::MeshDiscoveryConfig {
+                namespace: self.service_discovery_namespace.clone(),
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source,
             })
         } else {
             None
@@ -1491,6 +1581,7 @@ impl Router {
                 log_level: self.log_level.clone(),
                 log_json: self.log_json,
                 service_discovery_config,
+                mesh_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
@@ -1518,6 +1609,16 @@ impl Router {
                             })
                         })
                         .transpose()?;
+                    // Mirrors the CLI check in `main.rs`: port 0 parses as a
+                    // socket address but is undialable once gossiped to peers,
+                    // and reaches router discovery as the fallback mesh port
+                    // for Pods with no usable annotation.
+                    if self.mesh_port == 0 {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "Invalid value for mesh_port='0': mesh port cannot be 0; peers dial \
+                             the advertised port, so it must be a fixed, routable one",
+                        ));
+                    }
                     let bind_addr =
                         Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
                     let (advertise_host, advertise_field) =

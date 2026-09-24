@@ -103,6 +103,10 @@ class Gateway:
         self.policy: str = "round_robin"
         self.log_level: str = "warn"
         self.log_dir: str | None = None
+        # The leg workers a PD/EPD gateway was started with (tests kill and restart them).
+        self.encode_workers: list[Worker] = []
+        self.prefill_workers: list[Worker] = []
+        self.decode_workers: list[Worker] = []
         self.pd_mode: bool = False
         self.igw_mode: bool = False
         self.cloud_mode: bool = False
@@ -179,6 +183,9 @@ class Gateway:
             encodes = encode_workers or []
             prefills = prefill_workers or []
             decodes = decode_workers or []
+            self.encode_workers = list(encodes)
+            self.prefill_workers = list(prefills)
+            self.decode_workers = list(decodes)
             mode_args = build_epd_mode_args(encodes, prefills, decodes, encode_policy)
             self._launch(
                 mode_args=mode_args,
@@ -195,6 +202,8 @@ class Gateway:
             self.igw_mode = False
             prefills = prefill_workers or []
             decodes = decode_workers or []
+            self.prefill_workers = list(prefills)
+            self.decode_workers = list(decodes)
 
             mode_args = ["--pd-disaggregation"]
             for pf in prefills:
@@ -409,6 +418,7 @@ class Gateway:
                 "connection_mode": w.get("connection_mode"),
                 "priority": w.get("priority"),
                 "cost": w.get("cost"),
+                "pd_pairing": w.get("pd_pairing"),
             },
         )
 
@@ -440,15 +450,23 @@ class Gateway:
         wait_ready: bool = True,
         ready_timeout: float = 60.0,
         labels: dict[str, str] | None = None,
+        worker_type: str | None = None,
+        bootstrap_port: int | None = None,
     ) -> tuple[bool, str | None]:
         """Add a worker to the gateway. Returns (success, worker_id or error).
 
         ``labels`` are attached to the worker's ``WorkerSpec`` (e.g.
         ``{"realtime": "true"}`` to make it eligible for realtime routing).
+        ``worker_type`` (``"prefill"``/``"decode"``/``"encode"``) and the
+        prefill ``bootstrap_port`` register a disaggregated leg at runtime.
         """
         body: dict = {"url": worker_url}
         if labels:
             body["labels"] = labels
+        if worker_type:
+            body["worker_type"] = worker_type
+        if bootstrap_port is not None:
+            body["bootstrap_port"] = bootstrap_port
         try:
             resp = httpx.post(
                 f"{self.base_url}/workers",

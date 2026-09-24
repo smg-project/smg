@@ -50,6 +50,9 @@ pub enum MediaContentPart {
         detail: Option<ImageDetail>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
+        /// MiniMax-M3 extension: cap the image's long side before preprocessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_long_side_pixel: Option<u32>,
     },
     ImageData {
         data: Vec<u8>,
@@ -81,6 +84,12 @@ pub enum MediaContentPart {
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
+        /// MiniMax-M3 extension: frames per second to sample at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fps: Option<f64>,
+        /// MiniMax-M3 extension: cap each sampled frame's long side.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_long_side_pixel: Option<u32>,
     },
     VideoData {
         data: Vec<u8>,
@@ -142,6 +151,15 @@ pub struct AudioClip {
     pub hash: String,
 }
 
+/// How the decoded frames of a clip were sampled from the source stream.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoSamplingInfo {
+    /// Source stream frame rate, as decoded.
+    pub source_fps: f64,
+    /// Source frame index behind each decoded frame, in order; one entry per decoded frame.
+    pub frame_indices: Vec<usize>,
+}
+
 /// Decoded video payload captured by the media connector.
 #[derive(Debug, Clone)]
 pub struct VideoClip {
@@ -149,10 +167,15 @@ pub struct VideoClip {
     pub rgb_video: Option<DecodedRgbVideo>,
     /// Effective frame rate after connector-side sampling and frame-count clamps.
     pub sample_fps: f32,
+    /// Source fps and sampled frame indices; `None` when the decoder could not recover them.
+    pub sampling: Option<VideoSamplingInfo>,
     pub raw_bytes: bytes::Bytes,
     pub source: VideoSource,
     /// Blake3 hex-digest of raw_bytes, computed at decode time.
     pub hash: String,
+    /// The long-side cap the caller asked for (MiniMax `max_long_side_pixel`);
+    /// the frames were already scaled to it when set.
+    pub max_long_side_pixel: Option<u32>,
 }
 
 /// Borrowed RGB frame data for video preprocessors.
@@ -250,9 +273,11 @@ impl VideoClip {
             frames,
             rgb_video: None,
             sample_fps,
+            sampling: None,
             raw_bytes,
             source,
             hash,
+            max_long_side_pixel: None,
         }
     }
 
@@ -276,14 +301,31 @@ impl VideoClip {
             frames: Vec::new(),
             rgb_video: Some(rgb_video),
             sample_fps,
+            sampling: None,
             raw_bytes,
             source,
             hash,
+            max_long_side_pixel: None,
         }
+    }
+
+    pub fn with_sampling(mut self, sampling: Option<VideoSamplingInfo>) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
+    /// Record the long-side cap the frames were decoded under.
+    pub fn with_max_long_side_pixel(mut self, max_long_side_pixel: Option<u32>) -> Self {
+        self.max_long_side_pixel = max_long_side_pixel;
+        self
     }
 
     pub fn frames(&self) -> &[DynamicImage] {
         &self.frames
+    }
+
+    pub fn max_long_side_pixel(&self) -> Option<u32> {
+        self.max_long_side_pixel
     }
 
     pub fn rgb_video(&self) -> Option<&DecodedRgbVideo> {
@@ -292,6 +334,10 @@ impl VideoClip {
 
     pub fn sample_fps(&self) -> f32 {
         self.sample_fps
+    }
+
+    pub fn sampling(&self) -> Option<&VideoSamplingInfo> {
+        self.sampling.as_ref()
     }
 
     pub fn materialized_frames(&self) -> Result<Vec<DynamicImage>, String> {
@@ -568,6 +614,33 @@ mod tests {
                 length: 2
             }])
         );
+    }
+
+    #[test]
+    fn video_clip_sampling_defaults_to_none_and_follows_the_builder() {
+        let clip = VideoClip::new(
+            Vec::new(),
+            bytes::Bytes::new(),
+            VideoSource::InlineBytes,
+            "hash".to_string(),
+        );
+        assert!(clip.sampling().is_none());
+
+        let rgb = VideoClip::new_rgb(
+            DecodedRgbVideo::new(bytes::Bytes::new(), Vec::new()),
+            bytes::Bytes::new(),
+            VideoSource::InlineBytes,
+            "hash".to_string(),
+        );
+        assert!(rgb.sampling().is_none());
+
+        let sampling = VideoSamplingInfo {
+            source_fps: 30.0,
+            frame_indices: vec![0, 15, 30],
+        };
+        let clip = clip.with_sampling(Some(sampling.clone()));
+        assert_eq!(clip.sampling(), Some(&sampling));
+        assert!(clip.with_sampling(None).sampling().is_none());
     }
 
     #[test]

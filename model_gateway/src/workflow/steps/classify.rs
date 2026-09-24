@@ -12,10 +12,11 @@ use async_trait::async_trait;
 use openai_protocol::worker::ProviderType;
 use reqwest::Client;
 use tracing::debug;
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::util::{http_base_url, try_grpc_reachable, try_http_reachable};
 use crate::{
+    routers::provider_support,
     worker::worker::RuntimeType,
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
@@ -85,6 +86,20 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         context: &mut WorkflowContext<WorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let config = &context.data.config;
+
+        // A provider target needs the provider's router, which exists only in
+        // a build that compiled it in; a worker nothing could route to must
+        // not enter the registry.
+        if let Some(missing) = provider_support::missing_router(config) {
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("classify_worker_type"),
+                message: format!(
+                    "worker {} targets the {} provider, but this build carries no {} router; \
+                     rebuild with the `{}` Cargo feature to admit it",
+                    config.url, missing.label, missing.label, missing.feature
+                ),
+            });
+        }
 
         // 1. Any explicit runtime → classify immediately, no probing needed
         if config.runtime_type.is_specified() {

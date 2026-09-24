@@ -167,7 +167,7 @@ impl MessagePreparationStage {
         };
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match message_utils::process_messages(
+        let (processed_messages, prompt_encoding) = match message_utils::process_messages(
             request,
             &*tokenizer,
             tools_for_template,
@@ -181,11 +181,11 @@ impl MessagePreparationStage {
             }
         };
 
-        // Step 3: Tokenize the processed text
-        let encoding = match utils::encode_blocking(
+        // Step 3: Tokenize the prompt the way its renderer said to
+        let encoding = match utils::encode_prompt_blocking(
             tokenizer.clone(),
-            processed_messages.text.clone(),
-            false,
+            &processed_messages.text,
+            prompt_encoding,
         )
         .await
         {
@@ -220,49 +220,74 @@ impl MessagePreparationStage {
             })?;
         }
 
-        // Step 4: Multimodal processing (fetch + preprocess + expand tokens + hash)
+        // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash),
+        // or keep the media references for a worker that processes them itself.
         let mut multimodal_intermediate = None;
-        if let Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)) =
-            mm_context
+        let mut multimodal_refs = None;
+        if let (
+            Some(placeholders),
+            Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)),
+        ) = (placeholder_tokens.as_ref(), mm_context)
         {
-            match multimodal::process_multimodal_plan(
-                media_plan,
-                model_id,
-                &*tokenizer,
-                token_ids,
+            let processing = multimodal::resolve_mm_processing(
                 mm_components,
-                &tokenizer_id,
-                &tokenizer_source,
+                &ctx.components.worker_registry,
+                model_id,
+                &media_plan,
+                placeholders,
             )
-            .await
-            {
-                Ok(output) => {
-                    debug!(
-                        function = "MessagePreparationStage::execute",
-                        expanded_tokens = output.expanded_token_ids.len(),
-                        "Multimodal processing complete"
-                    );
-                    token_ids = output.expanded_token_ids;
-                    multimodal_intermediate = Some(output.intermediate);
-                }
-                Err(e) => {
-                    error!(
-                        function = "MessagePreparationStage::execute",
-                        error = %e,
-                        "Multimodal processing failed"
-                    );
-                    return Err(error::bad_request(
-                        "multimodal_processing_failed",
-                        format!("Multimodal processing failed: {e}"),
-                    ));
+            .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            if processing == multimodal::MmProcessing::Worker {
+                debug!(
+                    function = "MessagePreparationStage::execute",
+                    media_items = media_plan.parts().len(),
+                    "Forwarding media references for worker-side processing"
+                );
+                multimodal_refs = Some(media_plan);
+            } else {
+                match multimodal::process_multimodal_plan(
+                    media_plan,
+                    model_id,
+                    &*tokenizer,
+                    token_ids,
+                    mm_components,
+                    &tokenizer_id,
+                    &tokenizer_source,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        debug!(
+                            function = "MessagePreparationStage::execute",
+                            expanded_tokens = output.expanded_token_ids.len(),
+                            "Multimodal processing complete"
+                        );
+                        token_ids = output.expanded_token_ids;
+                        multimodal_intermediate = Some(output.intermediate);
+                    }
+                    Err(e) => {
+                        error!(
+                            function = "MessagePreparationStage::execute",
+                            error = %e,
+                            "Multimodal processing failed"
+                        );
+                        return Err(error::bad_request(
+                            "multimodal_processing_failed",
+                            format!("Multimodal processing failed: {e}"),
+                        ));
+                    }
                 }
             }
         }
 
-        // Step 4: Build tool constraints if tools present
+        // Step 4: Build tool constraints if tools present. On a thinking
+        // prompt a parser with a reasoning prefix gets its tag wrapped so a
+        // forced call follows the reasoning instead of preempting it.
         let tool_call_constraint = if let (false, Some(tool_choice)) =
             (filtered_tools.is_empty(), chat_tool_choice.as_ref())
         {
+            let reasoning =
+                utils::messages_reasoning_starts_in_prefill(request, tokenizer.as_ref());
             ctx.components
                 .tool_parser_factory
                 .registry()
@@ -273,6 +298,7 @@ impl MessagePreparationStage {
                         .as_deref(),
                     &filtered_tools,
                     tool_choice,
+                    reasoning,
                 )
                 .map_err(|e| {
                     error!(function = "MessagePreparationStage::execute", error = %e, "Invalid tool configuration");
@@ -332,6 +358,7 @@ impl MessagePreparationStage {
 
         // Store results in context.
         ctx.state.multimodal_intermediate = multimodal_intermediate;
+        ctx.state.multimodal_refs = multimodal_refs;
         ctx.state.preparation = Some(PreparationOutput::Messages {
             token_ids,
             processed_messages,

@@ -29,6 +29,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    future::Future,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -43,7 +44,10 @@ use rmcp::{
     RoleClient,
 };
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    time::{error::Elapsed, Timeout},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -794,7 +798,13 @@ impl McpOrchestrator {
 
         match entry {
             Some(entry) => match self
-                .execute_tool_entry_result(&entry, qualified, input.arguments, request_ctx)
+                .execute_tool_entry_result(
+                    &entry,
+                    qualified,
+                    &input.call_id,
+                    input.arguments,
+                    request_ctx,
+                )
                 .await
             {
                 ToolExecutionResult::Executed(mut output) => {
@@ -838,6 +848,7 @@ impl McpOrchestrator {
         &self,
         entry: &ToolEntry,
         qualified: QualifiedToolName,
+        call_id: &str,
         arguments: Value,
         request_ctx: &McpRequestContext<'_>,
     ) -> ToolExecutionResult {
@@ -849,7 +860,7 @@ impl McpOrchestrator {
         let call_start_time = Instant::now();
 
         let result = match self
-            .execute_tool_with_approval_raw_internal(entry, arguments, request_ctx)
+            .execute_tool_with_approval_raw_internal(entry, call_id, arguments, request_ctx)
             .await
         {
             Ok(ApprovalExecutionResult::Success(raw_result)) => {
@@ -905,13 +916,15 @@ impl McpOrchestrator {
     async fn execute_tool_with_approval_raw_internal(
         &self,
         entry: &ToolEntry,
+        call_id: &str,
         arguments: Value,
         request_ctx: &McpRequestContext<'_>,
     ) -> McpResult<ApprovalExecutionResult> {
+        let elicitation_id = Self::approval_elicitation_id(entry.tool_name(), call_id);
         let approval_params = ApprovalParams {
             request_id: &request_ctx.request_id,
             server_key: entry.server_key(),
-            elicitation_id: &format!("tool-{}", entry.tool_name()),
+            elicitation_id: &elicitation_id,
             tool_name: entry.tool_name(),
             hints: &entry.annotations,
             message: &format!("Allow execution of '{}'?", entry.tool_name()),
@@ -968,15 +981,32 @@ impl McpOrchestrator {
     ) -> McpResult<CallToolResult> {
         let server_name = entry.server_key();
 
+        // One deadline for the whole call: the first attempt and a replay
+        // after reconnection share the configured bound instead of each
+        // starting a fresh one. Reconnection itself runs under the
+        // reconnection manager's own bounded retry budget.
+        let deadline = self
+            .config
+            .call_timeout()
+            .map(|bound| Instant::now() + bound);
+
         // Capture the client instance we are about to use (to detect if it gets replaced)
         let initial_client = self
             .static_servers
             .get(server_name)
             .map(|e| Arc::clone(&e.client));
 
-        match self.execute_tool_impl(entry, arguments.clone()).await {
+        match self
+            .execute_tool_impl(entry, arguments.clone(), Self::remaining(deadline))
+            .await
+        {
             Ok(result) => Ok(result),
             Err(McpError::ServerDisconnected(name)) => {
+                // Decide replay eligibility before any recovery work: a tool
+                // with side effects gets an unknown outcome whether or not
+                // the connection comes back.
+                let replayable = Self::replayable(entry);
+
                 // Acquire/Create the mutex for this server to prevent concurrent reconnects
                 let lock = self
                     .reconnection_locks
@@ -987,47 +1017,144 @@ impl McpOrchestrator {
 
                 let _guard = lock.lock().await;
 
-                // A client differing from the one that failed means another task
-                // already reconnected it.
-                if let Some(current_entry) = self.static_servers.get(&name) {
-                    let already_reconnected = match &initial_client {
-                        Some(initial) => !Arc::ptr_eq(initial, &current_entry.client),
-                        None => true,
-                    };
+                // A client differing from the one that failed means another
+                // task already reconnected it. Read the verdict and drop the
+                // map guard before awaiting anything.
+                let already_reconnected =
+                    self.static_servers
+                        .get(&name)
+                        .map(|current| match &initial_client {
+                            Some(initial) => !Arc::ptr_eq(initial, &current.client),
+                            None => true,
+                        });
 
-                    if already_reconnected {
-                        debug!(
-                            "Server '{}' already reconnected by another task, retrying call",
-                            name
-                        );
-                        return self.execute_tool_impl(entry, arguments).await;
+                let recovery = match already_reconnected {
+                    Some(true) => {
+                        debug!("Server '{}' already reconnected by another task", name);
+                        Ok(())
                     }
-                }
+                    _ => self.recover_static_server(&name).await,
+                };
 
-                let server_config = self
-                    .config
-                    .servers
-                    .iter()
-                    .find(|s| s.name == name)
-                    .cloned()
-                    .ok_or_else(|| McpError::ServerNotFound(name.clone()))?;
-
-                warn!(
-                    "Server '{}' disconnected, initiating thread-safe recovery",
-                    name
-                );
-
-                ReconnectionManager::default()
-                    .reconnect(&name, || async {
-                        self.static_servers.remove(&name);
-                        self.connect_static_server(&server_config).await
-                    })
-                    .await?;
-
-                // Retry execution after successful reconnection
-                self.execute_tool_impl(entry, arguments).await
+                Self::after_recovery(replayable, recovery, &name, entry.tool_name())?;
+                self.execute_tool_impl(entry, arguments, Self::remaining(deadline))
+                    .await
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Rebuild a static server's connection. Runs under the caller's
+    /// reconnection lock.
+    async fn recover_static_server(&self, name: &str) -> McpResult<()> {
+        let server_config = self
+            .config
+            .servers
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()
+            .ok_or_else(|| McpError::ServerNotFound(name.to_string()))?;
+
+        warn!(
+            "Server '{}' disconnected, initiating thread-safe recovery",
+            name
+        );
+
+        ReconnectionManager::default()
+            .reconnect(name, || async {
+                self.static_servers.remove(name);
+                self.connect_static_server(&server_config).await
+            })
+            .await
+    }
+
+    /// Whether a call whose transport dropped may be re-issued: only a tool
+    /// that cannot double-execute, one declared idempotent or one that is
+    /// read-only. The MCP spec says the idempotency hint is only meaningful
+    /// for tools with side effects, so read-only tools rarely set it.
+    fn replayable(entry: &ToolEntry) -> bool {
+        entry.annotations.idempotent || entry.annotations.read_only
+    }
+
+    /// Time left under `deadline`, or `None` for an unbounded call. A deadline
+    /// already passed yields a zero budget, which the bounded call reports as
+    /// a timeout rather than running.
+    fn remaining(deadline: Option<Instant>) -> Option<Duration> {
+        deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// What a disconnected call becomes once recovery was attempted: `Ok(())`
+    /// means re-issue it. A call that must not be replayed is an unknown
+    /// outcome whether recovery succeeded or not; the recovery error then only
+    /// gets logged, since later calls are what it matters to.
+    fn after_recovery(
+        replayable: bool,
+        recovery: McpResult<()>,
+        server: &str,
+        tool: &str,
+    ) -> McpResult<()> {
+        if !replayable {
+            if let Err(err) = recovery {
+                warn!(
+                    "Server '{}' recovery failed after a non-replayable call to '{}': {}",
+                    server, tool, err
+                );
+            }
+            return Err(McpError::OutcomeUnknown {
+                server: server.to_string(),
+                tool: tool.to_string(),
+            });
+        }
+        recovery
+    }
+
+    /// Elicitation id for an interactive approval.
+    ///
+    /// Keyed by the model's call id so that two calls to the same tool in one
+    /// turn get two approvals instead of the second being rejected as a
+    /// duplicate. Falls back to the tool name when no call id is known.
+    fn approval_elicitation_id(tool_name: &str, call_id: &str) -> String {
+        if call_id.is_empty() {
+            format!("tool-{tool_name}")
+        } else {
+            format!("tool-{tool_name}-{call_id}")
+        }
+    }
+
+    /// Run a tool call under the configured bound, if any.
+    ///
+    /// A disabled bound becomes a deadline that never fires: tokio clamps an
+    /// unrepresentable deadline to "never", so `Duration::MAX` is safe. This
+    /// is a plain function so the call future is stored once in the caller's
+    /// state machine rather than duplicated through an async-fn argument slot.
+    fn bounded<F>(bound: Option<Duration>, call: F) -> Timeout<F>
+    where
+        F: Future<Output = Result<CallToolResult, ServiceError>>,
+    {
+        tokio::time::timeout(bound.unwrap_or(Duration::MAX), call)
+    }
+
+    /// Map a bounded tool call to the crate error. `configured_secs` is the
+    /// operator's bound, reported on expiry even when a replay ran on the
+    /// remainder of it.
+    fn map_call_result(
+        server_key: &str,
+        tool: &str,
+        configured_secs: u64,
+        result: Result<Result<CallToolResult, ServiceError>, Elapsed>,
+    ) -> McpResult<CallToolResult> {
+        match result {
+            Ok(Ok(result)) => Ok(result),
+            // Typed detection for transport-level failures
+            Ok(Err(ServiceError::TransportClosed | ServiceError::TransportSend(_))) => {
+                Err(McpError::ServerDisconnected(server_key.to_string()))
+            }
+            Ok(Err(e)) => Err(McpError::ToolExecution(format!("MCP call failed: {e}"))),
+            Err(_elapsed) => Err(McpError::CallTimeout {
+                server: server_key.to_string(),
+                tool: tool.to_string(),
+                secs: configured_secs,
+            }),
         }
     }
 
@@ -1036,6 +1163,7 @@ impl McpOrchestrator {
         &self,
         entry: &ToolEntry,
         mut arguments: Value,
+        bound: Option<Duration>,
     ) -> McpResult<CallToolResult> {
         // Resolve alias if needed
         let (target_server, target_tool) = if let Some(alias) = &entry.alias_target {
@@ -1069,7 +1197,7 @@ impl McpOrchestrator {
         }
 
         // Execute on server
-        self.execute_on_server(&target_server, request).await
+        self.execute_on_server(&target_server, request, bound).await
     }
 
     /// Coerce argument types based on tool schema.
@@ -1142,27 +1270,32 @@ impl McpOrchestrator {
         &self,
         server_key: &str,
         request: CallToolRequestParams,
+        bound: Option<Duration>,
     ) -> McpResult<CallToolResult> {
-        if let Some(entry) = self.static_servers.get(server_key) {
-            return entry.client.call_tool(request).await.map_err(|e| match e {
-                // Typed detection for transport-level failures
-                ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
-                    McpError::ServerDisconnected(server_key.to_string())
-                }
-                _ => McpError::ToolExecution(format!("MCP call failed: {e}")),
-            });
+        // Every call is bounded: a hung server must not hold a tool loop open
+        // forever, and a call that outlives the bound is reported as unknown
+        // rather than retried. `bound` is what is left of the configured
+        // budget; the message reports the configured value.
+        let configured_secs = self.config.pool.call_timeout;
+        let tool = request.name.to_string();
+
+        // Clone the client out of the map so no shard guard is held across
+        // the call: reconnection removes entries from the same map.
+        let static_client = self
+            .static_servers
+            .get(server_key)
+            .map(|entry| Arc::clone(&entry.client));
+        if let Some(client) = static_client {
+            let result = Self::bounded(bound, client.call_tool(request)).await;
+            return Self::map_call_result(server_key, &tool, configured_secs, result);
         }
 
         match self.connection_pool.get_unique_by_url(server_key) {
             UrlLookup::Found(client) => {
-                return client.call_tool(request).await.map_err(|e| match e {
-                    ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
-                        // Note: Pooled connections trigger Disconnected but
-                        // recovery logic is currently scoped to static servers.
-                        McpError::ServerDisconnected(server_key.to_string())
-                    }
-                    _ => McpError::ToolExecution(format!("MCP call failed: {e}")),
-                });
+                // Note: Pooled connections trigger Disconnected but
+                // recovery logic is currently scoped to static servers.
+                let result = Self::bounded(bound, client.call_tool(request)).await;
+                return Self::map_call_result(server_key, &tool, configured_secs, result);
             }
             UrlLookup::Ambiguous => {
                 // Multiple pooled connections share this URL under different
@@ -1733,6 +1866,85 @@ mod tests {
             Arc::new(serde_json::Map::new()),
         )
     }
+    #[test]
+    fn approval_elicitation_id_is_keyed_by_call_id() {
+        assert_eq!(
+            McpOrchestrator::approval_elicitation_id("order", "call_1"),
+            "tool-order-call_1"
+        );
+        assert_ne!(
+            McpOrchestrator::approval_elicitation_id("order", "call_1"),
+            McpOrchestrator::approval_elicitation_id("order", "call_2")
+        );
+        assert_eq!(
+            McpOrchestrator::approval_elicitation_id("order", ""),
+            "tool-order"
+        );
+    }
+
+    #[test]
+    fn only_side_effect_free_tools_are_replayed() {
+        let mut entry = ToolEntry::new(
+            QualifiedToolName::new("srv", "order"),
+            create_test_tool("order"),
+        );
+        assert!(!McpOrchestrator::replayable(&entry));
+
+        // Read-only tools rarely carry the idempotency hint; they cannot
+        // double-execute anything, so they are replayed.
+        entry.annotations.read_only = true;
+        assert!(McpOrchestrator::replayable(&entry));
+
+        entry.annotations.read_only = false;
+        entry.annotations.idempotent = true;
+        assert!(McpOrchestrator::replayable(&entry));
+    }
+
+    #[test]
+    fn a_non_replayable_call_is_unknown_whether_or_not_recovery_succeeds() {
+        let failed = || Err(McpError::ConnectionFailed("handshake".to_string()));
+
+        assert!(matches!(
+            McpOrchestrator::after_recovery(false, failed(), "srv", "order"),
+            Err(McpError::OutcomeUnknown { .. })
+        ));
+        assert!(matches!(
+            McpOrchestrator::after_recovery(false, Ok(()), "srv", "order"),
+            Err(McpError::OutcomeUnknown { .. })
+        ));
+
+        // A replayable call surfaces the recovery error itself, and proceeds
+        // to the replay once the connection is back.
+        assert!(matches!(
+            McpOrchestrator::after_recovery(true, failed(), "srv", "order"),
+            Err(McpError::ConnectionFailed(_))
+        ));
+        assert!(McpOrchestrator::after_recovery(true, Ok(()), "srv", "order").is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_expired_call_maps_to_the_timeout_error() {
+        let pending = std::future::pending::<Result<CallToolResult, ServiceError>>();
+        let result = McpOrchestrator::bounded(Some(Duration::from_millis(5)), pending).await;
+        assert!(result.is_err(), "the bound must fire");
+
+        let mapped = McpOrchestrator::map_call_result("srv", "order", 7, result);
+        assert!(matches!(mapped, Err(McpError::CallTimeout { secs: 7, .. })));
+    }
+
+    #[test]
+    fn a_passed_deadline_leaves_no_budget() {
+        assert_eq!(McpOrchestrator::remaining(None), None);
+        let passed = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            McpOrchestrator::remaining(Some(passed)),
+            Some(Duration::ZERO)
+        );
+        let ahead = Instant::now() + Duration::from_secs(60);
+        assert!(McpOrchestrator::remaining(Some(ahead))
+            .is_some_and(|left| left > Duration::from_secs(50)));
+    }
+
     #[tokio::test]
     async fn test_orchestrator_graceful_shutdown_flow() {
         let orchestrator = McpOrchestrator::new_test();

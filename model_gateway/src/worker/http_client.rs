@@ -16,21 +16,19 @@ use tracing::debug;
 use crate::config::RouterConfig;
 
 /// Default pool settings for worker-directed HTTP clients.
-const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 8;
-const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
+const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-/// HTTP/2 prior-knowledge tuning for `--upstream-http2`, shared by the
-/// dispatch client and the worker client cache.
+/// HTTP/2 tuning for `--upstream-http2`, applied to every worker client under
+/// the flag; only the prior-knowledge bucket forces h2 on cleartext.
 ///
 /// Multiplex everything to a worker over one HTTP/2 connection. The default
 /// 64KB flow-control windows would let concurrent token streams throttle each
 /// other, so start large and let the adaptive window take over; h2 PING
 /// keepalives replace idle-connection churn and detect dead peers under
 /// long-lived streams.
-pub(crate) fn apply_upstream_http2(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+fn tune_http2(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     builder
-        .http2_prior_knowledge()
         .http2_initial_stream_window_size(2 * 1024 * 1024)
         .http2_initial_connection_window_size(16 * 1024 * 1024)
         .http2_adaptive_window(true)
@@ -39,35 +37,21 @@ pub(crate) fn apply_upstream_http2(builder: reqwest::ClientBuilder) -> reqwest::
         .http2_keep_alive_while_idle(true)
 }
 
-/// The `HttpPoolConfig` settings reqwest only honors client-wide, with
-/// defaults applied.
+/// The `HttpPoolConfig` settings reqwest only honors client-wide, with router
+/// defaults applied, plus the HTTP version spoken to the worker.
 ///
-/// Client-level (buckets the cache): connect timeout, pool sizing, pool idle
-/// timeout. Router TLS identity/roots and the h2c mode are also client-level
-/// but process-constant, so they apply to every entry instead of keying it.
-/// Request-level (never buckets): total timeout — every worker-client call
-/// site sets `RequestBuilder::timeout`, which overrides the client default.
+/// Router TLS identity/roots and the h2 tuning are also client-level but
+/// process-constant, so they apply to every entry instead of keying it.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ClientKey {
     connect_timeout_secs: u64,
     pool_max_idle_per_host: usize,
+    /// `0` keeps idle connections indefinitely.
     pool_idle_timeout_secs: u64,
-}
-
-impl ClientKey {
-    fn from_pool_config(pool_config: &HttpPoolConfig) -> Self {
-        Self {
-            connect_timeout_secs: pool_config
-                .connect_timeout_secs
-                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
-            pool_max_idle_per_host: pool_config
-                .pool_max_idle_per_host
-                .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST),
-            pool_idle_timeout_secs: pool_config
-                .pool_idle_timeout_secs
-                .unwrap_or(DEFAULT_POOL_IDLE_TIMEOUT_SECS),
-        }
-    }
+    /// Client default; a call site's `RequestBuilder::timeout` overrides it.
+    timeout_secs: u64,
+    /// HTTP/2 prior knowledge (h2c on cleartext, ALPN pinned to h2 on TLS).
+    http2: bool,
 }
 
 /// Cache of worker-directed HTTP clients, keyed by effective client-level
@@ -80,6 +64,7 @@ pub struct WorkerHttpClientCache {
     ca_certificates: Vec<Vec<u8>>,
     upstream_http2: bool,
     request_timeout_secs: u64,
+    pool_idle_timeout_secs: u64,
     clients: Mutex<HashMap<ClientKey, Weak<reqwest::Client>>>,
 }
 
@@ -90,14 +75,19 @@ impl WorkerHttpClientCache {
             ca_certificates: router_config.ca_certificates.clone(),
             upstream_http2: router_config.upstream_http2,
             request_timeout_secs: router_config.request_timeout_secs,
+            pool_idle_timeout_secs: router_config.upstream_pool_idle_timeout_secs,
             clients: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The shared client for a worker's effective pool config, rebuilt when
-    /// no live worker holds it anymore.
-    pub fn get(&self, pool_config: &HttpPoolConfig) -> Result<Arc<reqwest::Client>, String> {
-        let key = ClientKey::from_pool_config(pool_config);
+    /// The shared client for a worker's effective pool config and HTTP
+    /// version, rebuilt when no live worker holds it anymore.
+    pub fn get(
+        &self,
+        pool_config: &HttpPoolConfig,
+        http2: bool,
+    ) -> Result<Arc<reqwest::Client>, String> {
+        let key = self.key(pool_config, http2);
         let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(client) = clients.get(&key).and_then(Weak::upgrade) {
             return Ok(client);
@@ -107,6 +97,24 @@ impl WorkerHttpClientCache {
         debug!(?key, "built shared worker HTTP client");
         clients.insert(key, Arc::downgrade(&client));
         Ok(client)
+    }
+
+    fn key(&self, pool_config: &HttpPoolConfig, http2: bool) -> ClientKey {
+        ClientKey {
+            connect_timeout_secs: pool_config
+                .connect_timeout_secs
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+            pool_max_idle_per_host: pool_config
+                .pool_max_idle_per_host
+                .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST),
+            pool_idle_timeout_secs: pool_config
+                .pool_idle_timeout_secs
+                .unwrap_or(self.pool_idle_timeout_secs),
+            timeout_secs: pool_config
+                .timeout_secs
+                .unwrap_or(self.request_timeout_secs),
+            http2,
+        }
     }
 
     /// Live + not-yet-pruned dead entries (test observation of bounds).
@@ -121,16 +129,26 @@ impl WorkerHttpClientCache {
     fn build(&self, key: &ClientKey) -> Result<reqwest::Client, String> {
         let has_tls = self.client_identity.is_some() || !self.ca_certificates.is_empty();
 
+        // Idle pooled connections must expire before the backend server's
+        // keep-alive closes them (vLLM/SGLang default: 5s), or checkout races
+        // the server's FIN and non-idempotent sends fail.
+        let pool_idle_timeout = match key.pool_idle_timeout_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
         let mut builder = reqwest::Client::builder()
             .pool_max_idle_per_host(key.pool_max_idle_per_host)
-            .pool_idle_timeout(Some(Duration::from_secs(key.pool_idle_timeout_secs)))
-            .timeout(Duration::from_secs(self.request_timeout_secs))
+            .pool_idle_timeout(pool_idle_timeout)
+            .timeout(Duration::from_secs(key.timeout_secs))
             .connect_timeout(Duration::from_secs(key.connect_timeout_secs))
             .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(30)));
 
         if self.upstream_http2 {
-            builder = apply_upstream_http2(builder);
+            builder = tune_http2(builder);
+        }
+        if key.http2 {
+            builder = builder.http2_prior_knowledge();
         }
 
         if has_tls {
@@ -163,6 +181,13 @@ mod tests {
         WorkerHttpClientCache::new(&config)
     }
 
+    fn http2_cache() -> WorkerHttpClientCache {
+        cache(RouterConfig {
+            upstream_http2: true,
+            ..RouterConfig::default()
+        })
+    }
+
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
     async fn spawn_echo_server() -> String {
@@ -192,13 +217,18 @@ mod tests {
     #[test]
     fn same_effective_config_shares_one_client() {
         let cache = cache(RouterConfig::default());
-        let a = cache.get(&HttpPoolConfig::default()).expect("client");
+        let a = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
         // Explicit values equal to the defaults are the same effective config.
         let b = cache
-            .get(&HttpPoolConfig {
-                connect_timeout_secs: Some(DEFAULT_CONNECT_TIMEOUT_SECS),
-                ..Default::default()
-            })
+            .get(
+                &HttpPoolConfig {
+                    connect_timeout_secs: Some(DEFAULT_CONNECT_TIMEOUT_SECS),
+                    ..Default::default()
+                },
+                false,
+            )
             .expect("client");
         assert!(Arc::ptr_eq(&a, &b));
     }
@@ -206,22 +236,76 @@ mod tests {
     #[test]
     fn client_level_override_gets_its_own_client() {
         let cache = cache(RouterConfig::default());
-        let default = cache.get(&HttpPoolConfig::default()).expect("client");
+        let default = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
         let overridden = cache
-            .get(&HttpPoolConfig {
-                connect_timeout_secs: Some(3),
-                ..Default::default()
-            })
+            .get(
+                &HttpPoolConfig {
+                    connect_timeout_secs: Some(3),
+                    ..Default::default()
+                },
+                false,
+            )
             .expect("client");
         assert!(!Arc::ptr_eq(&default, &overridden));
         // The override bucket is itself cached.
         let again = cache
-            .get(&HttpPoolConfig {
-                connect_timeout_secs: Some(3),
-                ..Default::default()
-            })
+            .get(
+                &HttpPoolConfig {
+                    connect_timeout_secs: Some(3),
+                    ..Default::default()
+                },
+                false,
+            )
             .expect("client");
         assert!(Arc::ptr_eq(&overridden, &again));
+    }
+
+    #[test]
+    fn pool_defaults_follow_router_upstream_settings() {
+        let cache = cache(RouterConfig {
+            upstream_pool_idle_timeout_secs: 7,
+            request_timeout_secs: 90,
+            ..RouterConfig::default()
+        });
+        let default = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
+        let explicit = cache
+            .get(
+                &HttpPoolConfig {
+                    pool_idle_timeout_secs: Some(7),
+                    timeout_secs: Some(90),
+                    pool_max_idle_per_host: Some(DEFAULT_POOL_MAX_IDLE_PER_HOST),
+                    ..Default::default()
+                },
+                false,
+            )
+            .expect("client");
+        assert!(Arc::ptr_eq(&default, &explicit));
+        let other_timeout = cache
+            .get(
+                &HttpPoolConfig {
+                    timeout_secs: Some(91),
+                    ..Default::default()
+                },
+                false,
+            )
+            .expect("client");
+        assert!(!Arc::ptr_eq(&default, &other_timeout));
+    }
+
+    #[test]
+    fn http_version_buckets_are_distinct_clients() {
+        let cache = http2_cache();
+        let h1 = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
+        let h2 = cache.get(&HttpPoolConfig::default(), true).expect("client");
+        assert!(!Arc::ptr_eq(&h1, &h2));
+        let h2_again = cache.get(&HttpPoolConfig::default(), true).expect("client");
+        assert!(Arc::ptr_eq(&h2, &h2_again));
     }
 
     #[test]
@@ -229,7 +313,9 @@ mod tests {
         use crate::worker::BasicWorkerBuilder;
 
         let cache = cache(RouterConfig::default());
-        let handle = cache.get(&HttpPoolConfig::default()).expect("client");
+        let handle = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
         let probe = Arc::downgrade(&handle);
         let worker_a = BasicWorkerBuilder::new("http://a:1")
             .http_client(handle.clone())
@@ -251,7 +337,9 @@ mod tests {
         );
 
         // The dead entry cannot be upgraded, so the next get rebuilds.
-        let rebuilt = cache.get(&HttpPoolConfig::default()).expect("client");
+        let rebuilt = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
         assert!(probe.upgrade().is_none());
         assert_eq!(cache.cached_len(), 1);
         drop(rebuilt);
@@ -260,29 +348,21 @@ mod tests {
     #[test]
     fn dead_entries_are_pruned_on_insert() {
         let cache = cache(RouterConfig::default());
-        let dropped = cache.get(&HttpPoolConfig::default()).expect("client");
+        let dropped = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
         drop(dropped);
 
         let _live = cache
-            .get(&HttpPoolConfig {
-                connect_timeout_secs: Some(3),
-                ..Default::default()
-            })
+            .get(
+                &HttpPoolConfig {
+                    connect_timeout_secs: Some(3),
+                    ..Default::default()
+                },
+                false,
+            )
             .expect("client");
         assert_eq!(cache.cached_len(), 1);
-    }
-
-    #[test]
-    fn request_level_timeout_override_never_buckets() {
-        let cache = cache(RouterConfig::default());
-        let a = cache.get(&HttpPoolConfig::default()).expect("client");
-        let b = cache
-            .get(&HttpPoolConfig {
-                timeout_secs: Some(600),
-                ..Default::default()
-            })
-            .expect("client");
-        assert!(Arc::ptr_eq(&a, &b));
     }
 
     #[tokio::test]
@@ -296,7 +376,7 @@ mod tests {
             request_timeout_secs: 0,
             ..RouterConfig::default()
         })
-        .get(&HttpPoolConfig::default())
+        .get(&HttpPoolConfig::default(), false)
         .expect("client");
         let err = client
             .get(&hang_url)
@@ -315,16 +395,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_http2_worker_client_speaks_h2c_prior_knowledge() {
+    async fn http2_bucket_speaks_h2c_prior_knowledge() {
         let url = spawn_echo_server().await;
-        let client = cache(RouterConfig {
-            upstream_http2: true,
-            ..RouterConfig::default()
-        })
-        .get(&HttpPoolConfig::default())
-        .expect("client");
+        let client = http2_cache()
+            .get(&HttpPoolConfig::default(), true)
+            .expect("client");
         let resp = client.get(&url).send().await.expect("h2c request");
         assert_eq!(resp.version(), http::Version::HTTP_2);
+        assert_eq!(resp.text().await.expect("body"), "ok");
+    }
+
+    #[tokio::test]
+    async fn http1_bucket_stays_http1_under_upstream_http2() {
+        let url = spawn_echo_server().await;
+        let client = http2_cache()
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
+        let resp = client.get(&url).send().await.expect("h1 request");
+        assert_eq!(resp.version(), http::Version::HTTP_11);
         assert_eq!(resp.text().await.expect("body"), "ok");
     }
 
@@ -332,7 +420,7 @@ mod tests {
     async fn default_worker_client_stays_http1() {
         let url = spawn_echo_server().await;
         let client = cache(RouterConfig::default())
-            .get(&HttpPoolConfig::default())
+            .get(&HttpPoolConfig::default(), false)
             .expect("client");
         let resp = client.get(&url).send().await.expect("h1 request");
         assert_eq!(resp.version(), http::Version::HTTP_11);

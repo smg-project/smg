@@ -26,6 +26,7 @@ use std::sync::{
 
 use dashmap::DashMap;
 
+use super::activity::L0;
 use crate::traits::Encoding;
 
 /// Number of entries to sample when looking for an eviction candidate.
@@ -100,6 +101,7 @@ impl L0Cache {
         match self.map_for(add_special_tokens).get(key) {
             Some(entry) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
+                L0.hit(key.len());
                 // Update last-accessed timestamp for LRU tracking.
                 // This is a single atomic store -- no contention on the map lock.
                 let ts = self.next_timestamp();
@@ -108,6 +110,7 @@ impl L0Cache {
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
+                L0.miss();
                 None
             }
         }
@@ -148,7 +151,9 @@ impl L0Cache {
             };
 
             if let Some(k) = key_to_remove {
-                victim_map.remove(&k);
+                if victim_map.remove(&k).is_some() {
+                    L0.evict();
+                }
             }
         }
     }

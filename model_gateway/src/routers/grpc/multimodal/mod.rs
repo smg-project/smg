@@ -12,11 +12,10 @@
 //! - [`serialize`]: tensor byte/dtype serialization used by assembly.
 //! - [`transport`]: SHM-vs-inline transport resolution and `/dev/shm`
 //!   namespace verification.
+//! - [`refs`]: router-vs-worker processing resolution and the media-reference
+//!   payload for workers that process media themselves.
 
-use std::{
-    collections::HashSet,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashSet, sync::Arc};
 
 use llm_multimodal::{
     AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
@@ -50,39 +49,45 @@ mod assemble;
 mod capability;
 mod config;
 mod detect;
+mod inflight;
 mod pixel_cache;
 mod plan;
 mod process;
+mod refs;
 mod serialize;
+mod settings;
 mod transport;
 
 pub(crate) use assemble::{
     assemble_multimodal_data, assemble_multimodal_data_after_encode,
     assemble_tokenspeed_for_encode, encode_routing_hashes,
 };
-pub(crate) use capability::ensure_backend_supports_modalities;
+pub(crate) use capability::{
+    ensure_backend_supports_modalities, worker_language_model_only, SUPPORTS_VISION_LABEL,
+};
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
+pub(crate) use inflight::{reserve_multimodal_inflight, InflightPermit};
 pub(crate) use plan::{
     prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
-    PlaceholderTokens,
+    MediaPlan, PlaceholderTokens,
 };
 pub(crate) use process::process_multimodal_plan;
+pub(crate) use refs::{
+    assemble_media_refs, ensure_selection_supports_media_refs, resolve_mm_processing,
+    worker_accepts_media_refs, MmProcessing, MmRefsError,
+};
+pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
 
-/// Whether verbose multimodal timing logs are enabled via `SMG_LOG_MM_TIMING`.
-/// Read from the environment once and cached; the flag is not expected to change
-/// at runtime, and this is called on every multimodal request.
-fn log_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
+/// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
+/// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal
+/// request.
+pub(crate) fn log_mm_timing_enabled() -> bool {
+    mm_settings().log_mm_timing.value
 }
 
 /// Output of the multimodal processing pipeline.
@@ -193,4 +198,8 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     pub field_layouts: EncoderFieldLayouts,
     /// Tensor keys that should remain on CPU (vLLM `keep_on_cpu` hint).
     pub keep_on_cpu_keys: Vec<String>,
+    /// Wire key for the primary encoder tensor when the model's forward does
+    /// not take `pixel_values` (DeepSeek-V4.1 takes `patches`); `None` keeps
+    /// the default name.
+    pub encoder_input_key: Option<String>,
 }

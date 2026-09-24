@@ -5,8 +5,20 @@
 use std::fmt::Write as _;
 
 use serde_json::{json, Value};
-use thiserror::Error;
 
+// `DsEncodingError` now lives in `deepseek_common` (shared with V4.1) but is
+// re-exported here unchanged: it was already part of this module's public
+// API (returned from `encode_messages`), and `pub(super)` items are only
+// reachable within `encoders` on their own — this `pub use` is what makes it
+// visible to callers outside `encoders` (e.g. `huggingface.rs`) again.
+pub use super::deepseek_common::DsEncodingError;
+// Message-shape preprocessing, drop-thinking and DSML argument rendering are
+// identical to the upcoming V4.1 renderer except for the tag strings; see
+// `deepseek_common` for the shared implementation and its own doc comments.
+use super::deepseek_common::{
+    at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml, find_last_user_index,
+    merge_tool_messages, sort_tool_results_by_call_order, DsmlTags,
+};
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
@@ -94,27 +106,6 @@ impl Default for EncodeParams {
     }
 }
 
-/// Errors raised when a message list is malformed.
-///
-/// V4-local error type. The variants overlap with V3.2 but are kept
-/// independent so each encoder file is a standalone translation of its
-/// Python source.
-#[derive(Debug, Error)]
-pub enum DsEncodingError {
-    #[error("Index {index} out of range for messages list of length {len}")]
-    IndexOutOfRange { index: usize, len: usize },
-    #[error("Invalid message for role `{role}`: {msg}")]
-    InvalidMessage { role: String, msg: String },
-    #[error("Unknown role: {0}")]
-    UnknownRole(String),
-    #[error("DeepSeek V4 merges tool messages into user; preprocess via merge_tool_messages first (got tool message at index {0})")]
-    UnmergedToolRole(usize),
-    #[error(
-        "Invalid task `{0}`. Valid tasks are: action, query, authority, domain, title, read_url"
-    )]
-    InvalidTask(String),
-}
-
 // ---------------------------------------------------------------------------
 // Special-token constants — copied verbatim from the Python source.
 // ---------------------------------------------------------------------------
@@ -127,6 +118,13 @@ const USER_SP_TOKEN: &str = "<｜User｜>";
 const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
 const LATEST_REMINDER_SP_TOKEN: &str = "<｜latest_reminder｜>";
 const TOOL_CALLS_BLOCK_NAME: &str = "tool_calls";
+/// V4's DSML tag strings: bare `invoke`/`parameter`, no leading space. The
+/// upcoming V4.1 renderer builds its own `DsmlTags` with a leading space on
+/// each and passes it to the same shared [`encode_arguments_to_dsml`].
+const DSML_TAGS: DsmlTags = DsmlTags {
+    invoke: "invoke",
+    parameter: "parameter",
+};
 // Quick-instruction "task" tokens (`<｜action｜>`, `<｜query｜>`, etc.)
 const TASK_ACTION: &str = "<｜action｜>";
 const TASK_QUERY: &str = "<｜query｜>";
@@ -218,57 +216,9 @@ fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// V4 differs from V3.2: when `arguments` fails to JSON-parse, the upstream
-/// wraps the raw string in `{"arguments": <raw>}` instead of erroring.
-///
-/// `arguments` may arrive as a JSON *string* (raw OpenAI tool_calls) or as an
-/// already-parsed object — `model_gateway`'s `process_tool_call_arguments`
-/// converts the string into a dict before the chat template runs. Reading only
-/// `as_str()` silently dropped object-form args, which erased every historical
-/// tool call's parameters in multi-turn prompts.
-fn encode_arguments_to_dsml(tool_call: &Value) -> String {
-    let arguments: Value = match tool_call.get("arguments") {
-        Some(Value::String(s)) => {
-            serde_json::from_str(s).unwrap_or_else(|_| json!({ "arguments": s }))
-        }
-        Some(v) if v.is_object() => v.clone(),
-        _ => json!({}),
-    };
-    let obj = match arguments.as_object() {
-        Some(obj) => obj,
-        None => return String::new(),
-    };
-    let mut parts = Vec::with_capacity(obj.len());
-    for (k, v) in obj {
-        let (is_str, value_str) = match v {
-            Value::String(s) => ("true", s.clone()),
-            other => ("false", to_json(other)),
-        };
-        parts.push(format!(
-            "<{DSML_TOKEN}parameter name=\"{k}\" string=\"{is_str}\">{value_str}</{DSML_TOKEN}parameter>",
-        ));
-    }
-    parts.join("\n")
-}
-
 fn render_tools(tools: &[Value]) -> String {
     let schemas: Vec<String> = tools.iter().map(to_json).collect();
     render_tools_template(&schemas.join("\n"))
-}
-fn find_last_user_index(messages: &[Value]) -> Option<usize> {
-    for idx in (0..messages.len()).rev() {
-        let role = messages[idx].get("role").and_then(|v| v.as_str());
-        if matches!(role, Some("user") | Some("developer")) {
-            return Some(idx);
-        }
-    }
-    None
-}
-fn at_or_after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
-    match last_user_idx {
-        Some(idx) => index >= idx,
-        None => true,
-    }
 }
 fn after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
     match last_user_idx {
@@ -438,9 +388,11 @@ fn render_message(
                 let mut tc_list = Vec::with_capacity(tcs.len());
                 for tc in tcs {
                     let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let args = encode_arguments_to_dsml(tc);
+                    let arguments = tc.get("arguments").unwrap_or(&Value::Null);
+                    let args = encode_arguments_to_dsml(arguments, &DSML_TAGS);
                     tc_list.push(format!(
-                        "<{DSML_TOKEN}invoke name=\"{name}\">\n{args}\n</{DSML_TOKEN}invoke>"
+                        "<{DSML_TOKEN}{invoke} name=\"{name}\">\n{args}\n</{DSML_TOKEN}{invoke}>",
+                        invoke = DSML_TAGS.invoke,
                     ));
                 }
                 let joined = tc_list.join("\n");
@@ -520,183 +472,13 @@ fn render_message(
 }
 
 // ---------------------------------------------------------------------------
-// Preprocessing: merge tool messages and sort tool results.
-// ---------------------------------------------------------------------------
-fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
-    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
-    for msg in messages {
-        let msg = msg.clone();
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if role == "tool" {
-            let tool_block = json!({
-                "type": "tool_result",
-                "tool_use_id": msg.get("tool_call_id").cloned().unwrap_or(Value::String(String::new())),
-                "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
-            });
-            // Append to a previous user message that already has content_blocks.
-            let appended = if let Some(prev) = merged.last_mut() {
-                let prev_role = prev.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                if prev_role == "user" && prev.get("content_blocks").is_some() {
-                    if let Some(blocks) = prev
-                        .get_mut("content_blocks")
-                        .and_then(|v| v.as_array_mut())
-                    {
-                        blocks.push(tool_block.clone());
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if !appended {
-                merged.push(json!({
-                    "role": "user",
-                    "content_blocks": [tool_block],
-                }));
-            }
-        } else if role == "user" {
-            let text_block = json!({
-                "type": "text",
-                "text": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
-            });
-            let merged_into_prev = if let Some(prev) = merged.last_mut() {
-                let prev_role = prev.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                let prev_has_blocks = prev.get("content_blocks").is_some();
-                let prev_task_none = prev.get("task").map(Value::is_null).unwrap_or(true);
-                if prev_role == "user" && prev_has_blocks && prev_task_none {
-                    if let Some(blocks) = prev
-                        .get_mut("content_blocks")
-                        .and_then(|v| v.as_array_mut())
-                    {
-                        blocks.push(text_block.clone());
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if !merged_into_prev {
-                let mut new_msg = json!({
-                    "role": "user",
-                    "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
-                    "content_blocks": [text_block],
-                });
-                // Preserve extra fields (task, wo_eos, mask, etc.).
-                if let Some(obj) = new_msg.as_object_mut() {
-                    for key in ["task", "wo_eos", "mask"] {
-                        if let Some(v) = msg.get(key) {
-                            obj.insert(key.to_string(), v.clone());
-                        }
-                    }
-                }
-                merged.push(new_msg);
-            }
-        } else {
-            merged.push(msg);
-        }
-    }
-    merged
-}
-
-/// Sort `tool_result` blocks within user messages by the tool-call order
-/// of the *preceding* assistant turn.
-fn sort_tool_results_by_call_order(messages: Vec<Value>) -> Vec<Value> {
-    let mut out = messages;
-    let mut last_tool_call_order: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for msg in &mut out {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if role == "assistant" {
-            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                last_tool_call_order.clear();
-                for (idx, tc) in tcs.iter().enumerate() {
-                    let tc_id = tc
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            tc.get("function")
-                                .and_then(|f| f.get("id"))
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string)
-                        });
-                    if let Some(id) = tc_id {
-                        last_tool_call_order.insert(id, idx);
-                    }
-                }
-            }
-        } else if role == "user" {
-            if let Some(blocks) = msg.get("content_blocks").and_then(|v| v.as_array()) {
-                let tool_blocks: Vec<&Value> = blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
-                    .collect();
-                if tool_blocks.len() > 1 && !last_tool_call_order.is_empty() {
-                    let mut sorted: Vec<Value> = tool_blocks.iter().map(|b| (*b).clone()).collect();
-                    sorted.sort_by_key(|b| {
-                        b.get("tool_use_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|id| last_tool_call_order.get(id).copied())
-                            .unwrap_or(0)
-                    });
-                    let mut sorted_idx = 0;
-                    let mut new_blocks: Vec<Value> = Vec::with_capacity(blocks.len());
-                    for block in blocks {
-                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                            new_blocks.push(sorted[sorted_idx].clone());
-                            sorted_idx += 1;
-                        } else {
-                            new_blocks.push(block.clone());
-                        }
-                    }
-                    if let Some(obj) = msg.as_object_mut() {
-                        obj.insert("content_blocks".to_string(), Value::Array(new_blocks));
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Drop reasoning_content from earlier assistant turns and remove non-essential
-/// developer messages before the last user.
-fn drop_thinking_messages(messages: &[Value]) -> Vec<Value> {
-    let last_user_idx = find_last_user_index(messages);
-    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
-    for (idx, msg) in messages.iter().enumerate() {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let always_keep = matches!(
-            role,
-            "user" | "system" | "tool" | "latest_reminder" | "direct_search_results"
-        ) || at_or_after_last_user(idx, last_user_idx);
-        if always_keep {
-            out.push(msg.clone());
-            continue;
-        }
-        if role == "assistant" {
-            let mut cloned = msg.clone();
-            if let Some(obj) = cloned.as_object_mut() {
-                obj.remove("reasoning_content");
-            }
-            out.push(cloned);
-        }
-        // developer + other roles before last_user_idx are dropped.
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
 // encode_messages — public entry point
 // ---------------------------------------------------------------------------
+// Preprocessing (merge tool messages, sort tool results, drop-thinking) now
+// lives in `deepseek_common`, shared with the upcoming V4.1 renderer; see
+// that module for `merge_tool_messages`, `sort_tool_results_by_call_order`
+// and `drop_thinking_messages`, all used unchanged below.
+
 /// Encode a list of OpenAI-style messages into a DeepSeek V4 prompt string.
 ///
 /// The signature mirrors the Python `encode_messages` function;
@@ -727,7 +509,8 @@ pub fn encode_messages(
         effective_drop_thinking = false;
     }
     if thinking_mode == ThinkingMode::Thinking && effective_drop_thinking {
-        full_messages = drop_thinking_messages(&full_messages);
+        let last_user_idx = find_last_user_index(&full_messages);
+        full_messages = drop_thinking_messages(&full_messages, last_user_idx);
     }
     for idx in 0..full_messages.len() {
         prompt.push_str(&render_message(

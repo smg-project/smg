@@ -10,13 +10,19 @@ pub struct MetricPack {
 type PrometheusExposition = MetricsExposition<PrometheusType, PrometheusValue>;
 type PrometheusFamily = MetricFamily<PrometheusType, PrometheusValue>;
 
-/// Aggregate Prometheus metrics scraped from multiple sources into a unified one
+/// Aggregate Prometheus metrics scraped from multiple sources into a unified one.
+///
+/// `openmetrics_parser`'s Prometheus grammar requires metric names to start with
+/// a lowercase letter followed by `[a-z0-9_]`, while the Prometheus text format
+/// allows colons, and engines prefix their metrics with one (`sglang:`, `vllm:`).
+/// Colons are swapped for an escape sequence before parsing and restored in the
+/// rendered output, so `/engine_metrics` exposes the exact metric names, HELP
+/// text, and label values the engines exported.
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
+    let colon_escape = unused_colon_escape(&metric_packs);
     let mut expositions = vec![];
     for metric_pack in metric_packs {
-        let metrics_text = &metric_pack.metrics_text;
-        // openmetrics_parser rejects colons in metric names.
-        let metrics_text = metrics_text.replace(":", "_");
+        let metrics_text = metric_pack.metrics_text.replace(':', &colon_escape);
 
         let exposition = match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {
             Ok(x) => x,
@@ -33,9 +39,32 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
     }
 
     let text = try_reduce(expositions, merge_exposition)?
-        .map(|x| format!("{x}"))
+        .map(|x| format!("{x}").replace(&colon_escape, ":"))
         .unwrap_or_default();
     Ok(text)
+}
+
+/// The escape that stands in for `:` while parsing: `xsmgcolon{n}z` for the
+/// first `n` that occurs nowhere in the input. A literal escape can itself
+/// occur in a valid metric name, HELP text, or label, and picking an unused
+/// one keeps restoring colons from rewriting it. Only the first character is
+/// `x`, so adjacent escapes cannot combine into a false match.
+fn unused_colon_escape(metric_packs: &[MetricPack]) -> String {
+    let mut n = 0u64;
+    loop {
+        let escape = format!("xsmgcolon{n}z");
+        let used = metric_packs.iter().any(|pack| {
+            pack.metrics_text.contains(&escape)
+                || pack
+                    .labels
+                    .iter()
+                    .any(|(key, value)| key.contains(&escape) || value.contains(&escape))
+        });
+        if !used {
+            return escape;
+        }
+        n += 1;
+    }
 }
 
 fn transform_metrics(

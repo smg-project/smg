@@ -7,8 +7,10 @@
 use std::{
     collections::HashMap,
     fs::{read_dir, remove_file, OpenOptions},
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
+    pin::Pin,
     process,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -17,6 +19,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use futures::future::select_all;
 use futures_util::StreamExt;
 use memmap2::MmapOptions;
 use rand::RngExt;
@@ -39,7 +42,10 @@ use smg_grpc_client::{
 };
 use smg_mm_rdma::RdmaExporter;
 
-use crate::routers::grpc::{multimodal::mm_rdma_exporter, zmq_client::ZmqGenerateStream};
+use crate::routers::grpc::{
+    multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+    zmq_client::ZmqGenerateStream,
+};
 
 /// How a streaming response's per-token payloads (token ids, sampled
 /// logprobs, token counts) relate across the responses of one stream.
@@ -96,12 +102,57 @@ pub enum MultimodalData {
     TokenSpeed(TokenSpeedMultimodalData),
 }
 
+impl MultimodalData {
+    /// Bytes of media the request body itself carries.
+    pub fn inline_bytes(&self) -> usize {
+        match self {
+            Self::Sglang(data) => {
+                data.image_data.iter().map(Vec::len).sum::<usize>()
+                    + data.pixel_values.len()
+                    + tensor_bytes(&data.model_specific_tensors)
+            }
+            Self::Vllm(data) => data.inline_bytes(),
+            Self::Trtllm(data) => data.image_data.iter().map(Vec::len).sum(),
+            Self::TokenSpeed(data) => data
+                .items
+                .iter()
+                .map(|item| {
+                    let encoder = match &item.encoder_input.storage {
+                        TokenSpeedTensorStorage::Inline(bytes) => bytes.len(),
+                        TokenSpeedTensorStorage::Shm(_) | TokenSpeedTensorStorage::Remote(_) => 0,
+                    };
+                    encoder + tensor_bytes(&item.model_specific_tensors)
+                })
+                .sum(),
+        }
+    }
+}
+
+fn tensor_bytes(tensors: &HashMap<String, TensorBytes>) -> usize {
+    tensors.values().map(|tensor| tensor.data.len()).sum()
+}
+
+impl VllmMultimodalData {
+    /// Bytes of this batch and of every batch travelling with it.
+    pub fn inline_bytes(&self) -> usize {
+        self.pixel_values.len()
+            + tensor_bytes(&self.model_specific_tensors)
+            + self
+                .extra_batches
+                .iter()
+                .map(Self::inline_bytes)
+                .sum::<usize>()
+    }
+}
+
 /// SGLang multimodal data: preprocessed tensors with patch-only placeholders.
 #[derive(Debug)]
 pub struct SglangMultimodalData {
     pub image_data: Vec<Vec<u8>>,
     pub pixel_values: Vec<u8>,
     pub pixel_values_shape: Vec<u32>,
+    /// The width `pixel_values` was written in, which the receiver reads it at.
+    pub pixel_values_dtype: String,
     pub model_specific_tensors: HashMap<String, TensorBytes>,
     pub im_token_id: Option<u32>,
     /// Patch-only placeholder offsets aligned 1:1 with vision encoder output.
@@ -113,6 +164,8 @@ pub struct SglangMultimodalData {
 pub struct VllmMultimodalData {
     pub pixel_values: Vec<u8>,
     pub pixel_values_shape: Vec<u32>,
+    /// The width `pixel_values` was written in, which the receiver reads it at.
+    pub pixel_values_dtype: String,
     pub model_specific_tensors: HashMap<String, TensorBytes>,
     pub im_token_id: Option<u32>,
     /// Full structural placeholder offsets (vLLM filters via is_embed mask).
@@ -122,6 +175,9 @@ pub struct VllmMultimodalData {
     pub flat_keys: HashMap<String, String>,
     /// Tensor keys that should remain on CPU (`keep_on_cpu=True` in vLLM).
     pub keep_on_cpu_keys: Vec<String>,
+    /// Wire key for the primary tensor when the model's forward does not take
+    /// `pixel_values` (`None` keeps the default name).
+    pub encoder_input_key: Option<String>,
     /// Input modality (image/video). Selects the video modality
     /// (`pixel_values_videos` / `video_grid_thw`) on the servicer side.
     pub modality: common::Modality,
@@ -134,6 +190,10 @@ pub struct VllmMultimodalData {
     /// Whether `pixel_values` may use the RDMA lane. Gated on the worker being able
     /// to pull, so SMG never emits a `remote` payload a worker would reject.
     pub rdma_enabled: bool,
+    /// The other modalities of a mixed request (a video batch next to an
+    /// image batch), each assembled the same way; they travel in the
+    /// request's `extra_mm_inputs`.
+    pub extra_batches: Vec<VllmMultimodalData>,
 }
 
 /// TRT-LLM multimodal data: raw image bytes only.
@@ -267,7 +327,7 @@ impl SglangMultimodalData {
             pixel_values: Some(sglang::TensorData {
                 data: self.pixel_values,
                 shape: self.pixel_values_shape,
-                dtype: "float32".to_string(),
+                dtype: self.pixel_values_dtype,
             }),
             model_specific_tensors,
             im_token_id: self.im_token_id,
@@ -277,8 +337,17 @@ impl SglangMultimodalData {
 }
 
 impl VllmMultimodalData {
-    /// Convert to vLLM proto MultimodalInputs.
-    pub fn into_proto(self) -> vllm::MultimodalInputs {
+    /// Convert to the request's `mm_inputs` and `extra_mm_inputs`.
+    pub fn into_protos(mut self) -> (vllm::MultimodalInputs, Vec<vllm::MultimodalInputs>) {
+        let extras = std::mem::take(&mut self.extra_batches)
+            .into_iter()
+            .map(Self::into_proto)
+            .collect();
+        (self.into_proto(), extras)
+    }
+
+    /// Convert one batch to a vLLM proto MultimodalInputs.
+    fn into_proto(self) -> vllm::MultimodalInputs {
         let shm_enabled = self.shm_enabled;
         let shm_min_bytes = self.shm_min_bytes;
         // RDMA only for pixel_values (see TokenSpeed item conversion).
@@ -318,7 +387,7 @@ impl VllmMultimodalData {
         vllm::MultimodalInputs {
             pixel_values: Some(vllm::TensorData {
                 shape: self.pixel_values_shape,
-                dtype: "float32".to_string(),
+                dtype: self.pixel_values_dtype,
                 payload: Some(vllm_tensor_payload(
                     self.pixel_values,
                     shm_enabled,
@@ -334,6 +403,7 @@ impl VllmMultimodalData {
             flat_keys: self.flat_keys,
             keep_on_cpu_keys: self.keep_on_cpu_keys,
             modality: self.modality as i32,
+            encoder_input_key: self.encoder_input_key,
         }
     }
 }
@@ -625,12 +695,7 @@ fn vllm_tensor_payload(
 }
 
 fn log_tokenspeed_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
+    log_mm_timing_enabled()
 }
 
 static TOKENSPEED_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -861,15 +926,23 @@ pub(crate) fn finish_tokenspeed_request(
 /// request is fully assembled (sampling/tool validation), so a build error must
 /// unlink them or the worker — which never receives the request — leaks them.
 pub(crate) fn finish_vllm_request(
-    vllm_mm: Option<vllm::MultimodalInputs>,
+    vllm_mm: Option<(vllm::MultimodalInputs, Vec<vllm::MultimodalInputs>)>,
     build: impl FnOnce(Option<vllm::MultimodalInputs>) -> Result<vllm::GenerateRequest, String>,
 ) -> Result<ProtoGenerateRequest, String> {
-    let shm_handles = vllm_mm
-        .as_ref()
-        .map(collect_vllm_multimodal_inputs_shm_handles)
-        .unwrap_or_default();
-    match build(vllm_mm) {
-        Ok(req) => Ok(ProtoGenerateRequest::Vllm(Box::new(req))),
+    let (primary, extra) = match vllm_mm {
+        Some((primary, extra)) => (Some(primary), extra),
+        None => (None, Vec::new()),
+    };
+    let shm_handles: Vec<_> = primary
+        .iter()
+        .chain(&extra)
+        .flat_map(collect_vllm_multimodal_inputs_shm_handles)
+        .collect();
+    match build(primary) {
+        Ok(mut req) => {
+            req.extra_mm_inputs = extra;
+            Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
+        }
         Err(error) => {
             cleanup_mm_shm_handles(&shm_handles);
             Err(error)
@@ -925,6 +998,83 @@ fn collect_tokenspeed_tensor_shm_handles(
     }
 }
 
+/// The identity of a multimodal batch without its pixels, for the PD decode
+/// leg: hashes, placeholders and the M-RoPE grid tensors (a few ints per item,
+/// inline payloads only, since an SHM segment is unreadable after the prefill
+/// send). A hash-less batch carries no identity worth keeping.
+fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInputs> {
+    if mm.mm_hashes.is_empty() {
+        return None;
+    }
+    let inline_tensor = |key: &str| {
+        mm.model_specific_tensors
+            .get(key)
+            .filter(|tensor| matches!(tensor.payload, Some(vllm::tensor_data::Payload::Inline(_))))
+            .cloned()
+    };
+    let mut grid_tensors: HashMap<String, vllm::TensorData> = VLLM_MROPE_GRID_KEYS
+        .iter()
+        .filter_map(|key| inline_tensor(key).map(|tensor| (key.to_string(), tensor)))
+        .collect();
+    // A flat-classified grid key needs its sizes tensor to keep per-item
+    // slicing on the decode leg.
+    let mut flat_keys = HashMap::new();
+    for (key, sizes_key) in &mm.flat_keys {
+        if !grid_tensors.contains_key(key) {
+            continue;
+        }
+        match inline_tensor(sizes_key) {
+            Some(sizes) => {
+                grid_tensors.insert(sizes_key.clone(), sizes);
+                flat_keys.insert(key.clone(), sizes_key.clone());
+            }
+            None => {
+                tracing::warn!(
+                    grid_key = %key,
+                    sizes_key = %sizes_key,
+                    "dropping grid tensor from the PD decode leg: its sizes tensor is not inline"
+                );
+                grid_tensors.remove(key);
+            }
+        }
+    }
+    let retained = |keys: &[String]| {
+        keys.iter()
+            .filter(|key| grid_tensors.contains_key(*key))
+            .cloned()
+            .collect()
+    };
+    Some(vllm::MultimodalInputs {
+        im_token_id: mm.im_token_id,
+        mm_placeholders: mm.mm_placeholders.clone(),
+        mm_hashes: mm.mm_hashes.clone(),
+        modality: mm.modality,
+        batched_keys: retained(&mm.batched_keys),
+        keep_on_cpu_keys: retained(&mm.keep_on_cpu_keys),
+        flat_keys,
+        model_specific_tensors: grid_tensors,
+        encoder_input_key: mm.encoder_input_key.clone(),
+        ..Default::default()
+    })
+}
+
+/// The content identity of a multimodal batch for a language-model-only PD
+/// decode leg: only the per-image hashes survive. The servicer folds them
+/// into the request's `cache_salt`, so two requests whose text and expanded
+/// placeholder-token runs match but whose images differ cannot alias in the
+/// decode-side prefix cache. A hash-less batch carries no identity worth
+/// keeping.
+fn vllm_mm_hash_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInputs> {
+    if mm.mm_hashes.is_empty() {
+        return None;
+    }
+    Some(vllm::MultimodalInputs {
+        mm_hashes: mm.mm_hashes.clone(),
+        modality: mm.modality,
+        ..Default::default()
+    })
+}
+
 pub fn collect_vllm_multimodal_inputs_shm_handles(
     inputs: &vllm::MultimodalInputs,
 ) -> Vec<common::ShmHandle> {
@@ -941,9 +1091,10 @@ pub fn collect_vllm_generate_request_shm_handles(
 ) -> Vec<common::ShmHandle> {
     request
         .mm_inputs
-        .as_ref()
-        .map(collect_vllm_multimodal_inputs_shm_handles)
-        .unwrap_or_default()
+        .iter()
+        .chain(&request.extra_mm_inputs)
+        .flat_map(collect_vllm_multimodal_inputs_shm_handles)
+        .collect()
 }
 
 fn collect_optional_vllm_tensor_shm_handles(
@@ -1123,8 +1274,16 @@ pub enum ProtoGenerateRequest {
 }
 
 /// Per-item grid metadata the engine reads to compute M-RoPE positions
-/// (`_get_mrope_input_positions` in vLLM); a few ints per item.
-const VLLM_MROPE_GRID_KEYS: [&str; 3] = ["image_grid_thw", "video_grid_thw", "second_per_grid_ts"];
+/// (`_get_mrope_input_positions` in vLLM); a few ints per item. The video
+/// timing has two spellings: `second_per_grid_ts` from the Qwen-VL
+/// processors, `video_second_per_grid` from the Qwen-Omni family and this
+/// gateway's own processors. The servicer's `GRID_KEYS` mirrors this list.
+const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
+    "image_grid_thw",
+    "video_grid_thw",
+    "second_per_grid_ts",
+    "video_second_per_grid",
+];
 
 impl ProtoGenerateRequest {
     /// Append stop token ids to the request's sampling params (TRT-LLM keeps
@@ -1337,77 +1496,14 @@ impl ProtoGenerateRequest {
             }
             Self::Vllm(req) => {
                 let mm = req.mm_inputs.take();
+                let extra = std::mem::take(&mut req.extra_mm_inputs);
                 let mut clone = Self::Vllm(req.clone());
-                // Rebuild the identity (no pixel tensors) on the clone; a
-                // hash-less payload carries no identity worth keeping.
-                if let (Self::Vllm(clone_req), Some(mm_ref)) = (&mut clone, mm.as_ref()) {
-                    if !mm_ref.mm_hashes.is_empty() {
-                        // M-RoPE models (Qwen-VL) need the grid tensors to
-                        // compute decode-side positions; they are a few ints
-                        // per item, so keep them (inline payloads only — an
-                        // SHM segment is unreadable after the prefill send).
-                        let inline_tensor = |key: &str| {
-                            mm_ref
-                                .model_specific_tensors
-                                .get(key)
-                                .filter(|tensor| {
-                                    matches!(
-                                        tensor.payload,
-                                        Some(vllm::tensor_data::Payload::Inline(_))
-                                    )
-                                })
-                                .cloned()
-                        };
-                        let mut grid_tensors: HashMap<String, vllm::TensorData> =
-                            VLLM_MROPE_GRID_KEYS
-                                .iter()
-                                .filter_map(|key| {
-                                    inline_tensor(key).map(|tensor| (key.to_string(), tensor))
-                                })
-                                .collect();
-                        // A flat-classified grid key needs its sizes tensor to
-                        // keep per-item slicing on the decode leg.
-                        let mut flat_keys = HashMap::new();
-                        for (key, sizes_key) in &mm_ref.flat_keys {
-                            if !grid_tensors.contains_key(key) {
-                                continue;
-                            }
-                            match inline_tensor(sizes_key) {
-                                Some(sizes) => {
-                                    grid_tensors.insert(sizes_key.clone(), sizes);
-                                    flat_keys.insert(key.clone(), sizes_key.clone());
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        grid_key = %key,
-                                        sizes_key = %sizes_key,
-                                        "dropping grid tensor from the PD decode leg: its \
-                                         sizes tensor is not inline"
-                                    );
-                                    grid_tensors.remove(key);
-                                }
-                            }
-                        }
-                        let retained = |keys: &[String]| {
-                            keys.iter()
-                                .filter(|key| grid_tensors.contains_key(*key))
-                                .cloned()
-                                .collect()
-                        };
-                        clone_req.mm_inputs = Some(vllm::MultimodalInputs {
-                            im_token_id: mm_ref.im_token_id,
-                            mm_placeholders: mm_ref.mm_placeholders.clone(),
-                            mm_hashes: mm_ref.mm_hashes.clone(),
-                            modality: mm_ref.modality,
-                            batched_keys: retained(&mm_ref.batched_keys),
-                            keep_on_cpu_keys: retained(&mm_ref.keep_on_cpu_keys),
-                            flat_keys,
-                            model_specific_tensors: grid_tensors,
-                            ..Default::default()
-                        });
-                    }
+                if let Self::Vllm(clone_req) = &mut clone {
+                    clone_req.mm_inputs = mm.as_ref().and_then(vllm_mm_identity);
+                    clone_req.extra_mm_inputs = extra.iter().filter_map(vllm_mm_identity).collect();
                 }
                 req.mm_inputs = mm;
+                req.extra_mm_inputs = extra;
                 clone
             }
             Self::TokenSpeed(req) => {
@@ -1434,6 +1530,52 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Clone for a PD decode leg on a language-model-only decode worker (no
+    /// vision encoder, encoder-cache budget 0 — the production vLLM P/D
+    /// shape). The prefill-expanded `input_ids` and the KV handoff stay, but
+    /// every multimodal payload beyond the content hashes goes: pixels,
+    /// placeholders, grid tensors and media references. The decode engine
+    /// then sees a pure-text TokensPrompt and never touches its (zero-budget)
+    /// encoder cache, mirroring the Dynamo P/D contract; the kept hashes ride
+    /// into `cache_salt` servicer-side so different images cannot alias in
+    /// the decode prefix cache. Non-vLLM backends have no language-model-only
+    /// mode, so they take the pixel-stripping clone.
+    pub fn clone_without_mm(&mut self) -> Self {
+        match self {
+            Self::Vllm(req) => {
+                let mm = req.mm_inputs.take();
+                let extra = std::mem::take(&mut req.extra_mm_inputs);
+                let refs = req.media_refs.take();
+                let mut clone = Self::Vllm(req.clone());
+                if let Self::Vllm(clone_req) = &mut clone {
+                    clone_req.mm_inputs = mm.as_ref().and_then(vllm_mm_hash_identity);
+                    clone_req.extra_mm_inputs =
+                        extra.iter().filter_map(vllm_mm_hash_identity).collect();
+                }
+                req.mm_inputs = mm;
+                req.extra_mm_inputs = extra;
+                req.media_refs = refs;
+                clone
+            }
+            _ => self.clone_without_mm_pixels(),
+        }
+    }
+
+    /// Whether any vLLM multimodal batch carries M-RoPE grid tensors. The
+    /// decode leg of a grid-dependent model (Qwen-VL family) derives its
+    /// positions from them, so they cannot be stripped for a
+    /// language-model-only decode worker.
+    pub fn has_vllm_mrope_grids(&self) -> bool {
+        match self {
+            Self::Vllm(req) => req.mm_inputs.iter().chain(&req.extra_mm_inputs).any(|mm| {
+                mm.model_specific_tensors
+                    .keys()
+                    .any(|key| VLLM_MROPE_GRID_KEYS.contains(&key.as_str()))
+            }),
+            _ => false,
+        }
+    }
+
     /// Drop raw multimodal encoder tensors while keeping item metadata.
     ///
     /// Used by the EPD prefill leg: multimodal embeddings arrive from encode workers,
@@ -1441,7 +1583,10 @@ impl ProtoGenerateRequest {
     pub fn clear_mm_pixel_values(&mut self) {
         match self {
             Self::Sglang(req) => req.mm_inputs = None,
-            Self::Vllm(req) => req.mm_inputs = None,
+            Self::Vllm(req) => {
+                req.mm_inputs = None;
+                req.extra_mm_inputs.clear();
+            }
             Self::TokenSpeed(req) => {
                 if let Some(mm) = req.mm_inputs.as_mut() {
                     for item in &mut mm.items {
@@ -1502,16 +1647,111 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Number of parallel samples requested (vLLM only; 1 when unset).
-    pub fn sampling_n(&self) -> u32 {
+    /// Attach media references for worker-side multimodal processing (vLLM only).
+    pub fn set_vllm_media_refs(&mut self, refs: vllm::MediaRefs) -> Result<(), String> {
         match self {
-            Self::Vllm(req) => req
-                .sampling_params
-                .as_ref()
-                .map(|p| p.n)
-                .filter(|&n| n > 0)
-                .unwrap_or(1),
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 1,
+            Self::Vllm(req) => {
+                req.media_refs = Some(refs);
+                Ok(())
+            }
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                Err("media refs require a vLLM gRPC worker".to_string())
+            }
+        }
+    }
+
+    /// Whether this vLLM request carries media references.
+    pub fn has_vllm_media_refs(&self) -> bool {
+        matches!(self, Self::Vllm(req) if req.media_refs.is_some())
+    }
+
+    /// Replace this vLLM request's media references with the identity the
+    /// prefill leg produced: the expanded prompt ids and the pixel-less
+    /// per-modality inputs, in the shape a router-preprocessed decode leg has.
+    /// Applied whole or not at all: an identity without ids, or a leg whose
+    /// input is not tokenized, leaves the leg as it is (`false`), so it
+    /// reprocesses the references rather than run an empty prompt.
+    pub fn apply_media_identity(&mut self, identity: &vllm::MediaIdentity) -> bool {
+        let Self::Vllm(req) = self else {
+            return false;
+        };
+        let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() else {
+            return false;
+        };
+        if identity.prompt_token_ids.is_empty() {
+            return false;
+        }
+        tokenized.input_ids.clone_from(&identity.prompt_token_ids);
+        req.mm_inputs.clone_from(&identity.mm_inputs);
+        req.extra_mm_inputs.clone_from(&identity.extra_mm_inputs);
+        req.media_refs = None;
+        true
+    }
+
+    /// Number of parallel samples requested (1 when unset). vLLM, SGLang
+    /// and TokenSpeed carry it in their sampling params; the others have no
+    /// per-request sample count.
+    pub fn sampling_n(&self) -> u32 {
+        let n = match self {
+            Self::Vllm(req) => req.sampling_params.as_ref().map(|p| p.n),
+            Self::Sglang(req) => req.sampling_params.as_ref().map(|p| p.n),
+            Self::TokenSpeed(req) => req.sampling_params.as_ref().map(|p| p.n),
+            Self::Trtllm(_) | Self::Mlx(_) => None,
+        };
+        n.filter(|&n| n > 0).unwrap_or(1)
+    }
+
+    /// Set the number of parallel samples (engines without the field ignore it).
+    pub fn set_sampling_n(&mut self, n: u32) {
+        match self {
+            Self::Vllm(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.n = n;
+                }
+            }
+            Self::Sglang(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.n = n;
+                }
+            }
+            Self::TokenSpeed(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.n = n;
+                }
+            }
+            Self::Trtllm(_) | Self::Mlx(_) => {}
+        }
+    }
+
+    /// Offset an explicit sampling seed so fanned-out samples stay distinct
+    /// yet deterministic; an unset seed stays unset (the engine then seeds
+    /// each request on its own). Engines without a seed field ignore it.
+    pub fn offset_sampling_seed(&mut self, offset: u32) {
+        match self {
+            Self::Vllm(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    let offset = i32::try_from(offset).unwrap_or(i32::MAX);
+                    params.seed = params.seed.map(|seed| seed.wrapping_add(offset));
+                }
+            }
+            Self::TokenSpeed(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.sampling_seed = params
+                        .sampling_seed
+                        .map(|seed| seed.wrapping_add(u64::from(offset)));
+                }
+            }
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
+        }
+    }
+
+    /// Whether the request carries multimodal inputs.
+    pub fn has_mm_inputs(&self) -> bool {
+        match self {
+            Self::Sglang(req) => req.mm_inputs.is_some(),
+            Self::Vllm(req) => req.mm_inputs.is_some() || !req.extra_mm_inputs.is_empty(),
+            Self::TokenSpeed(req) => req.mm_inputs.is_some(),
+            Self::Trtllm(_) | Self::Mlx(_) => false,
         }
     }
 
@@ -1523,6 +1763,17 @@ impl ProtoGenerateRequest {
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
                 tracing::warn!("set_kv_transfer_params_json called on non-vLLM request, ignoring");
             }
+        }
+    }
+
+    /// Whether the request carries a KV handoff from the prefill worker
+    /// (either the modern JSON params or the legacy typed host/port).
+    pub fn has_kv_transfer_params(&self) -> bool {
+        match self {
+            Self::Vllm(req) => {
+                req.kv_transfer_params_json.is_some() || req.kv_transfer_params.is_some()
+            }
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => false,
         }
     }
 
@@ -1595,6 +1846,79 @@ pub enum ProtoGenerateResponse {
 }
 
 impl ProtoGenerateResponse {
+    /// Stamp the choice index on a chunk or complete. A fanned-out n>1
+    /// sample reports index 0 from its own engine request; the fan-out
+    /// restamps it with the sample's position.
+    pub fn set_index(&mut self, index: u32) {
+        match self {
+            Self::Sglang(resp) => match resp.response.as_mut() {
+                Some(sglang::generate_response::Response::Chunk(chunk)) => chunk.index = index,
+                Some(sglang::generate_response::Response::Complete(complete)) => {
+                    complete.index = index;
+                }
+                None => {}
+            },
+            Self::Vllm(resp) => match resp.response.as_mut() {
+                Some(vllm::generate_response::Response::Chunk(chunk)) => chunk.index = index,
+                Some(vllm::generate_response::Response::Complete(complete)) => {
+                    complete.index = index;
+                }
+                None => {}
+            },
+            Self::Trtllm(resp) => match resp.response.as_mut() {
+                Some(trtllm::generate_response::Response::Chunk(chunk)) => {
+                    chunk.sequence_index = index;
+                }
+                Some(trtllm::generate_response::Response::Complete(complete)) => {
+                    complete.sequence_index = index;
+                }
+                None => {}
+            },
+            Self::Mlx(resp) => match resp.response.as_mut() {
+                Some(mlx::generate_response::Response::Chunk(chunk)) => chunk.index = index,
+                Some(mlx::generate_response::Response::Complete(complete)) => {
+                    complete.index = index;
+                }
+                None => {}
+            },
+            Self::TokenSpeed(resp) => match resp.response.as_mut() {
+                Some(tokenspeed::generate_response::Response::Chunk(chunk)) => {
+                    chunk.index = index;
+                }
+                Some(tokenspeed::generate_response::Response::Complete(complete)) => {
+                    complete.index = index;
+                }
+                None => {}
+            },
+        }
+    }
+
+    /// Whether this is a `Complete` the engine finished with reason `"error"`.
+    pub fn engine_error(&self) -> bool {
+        match self {
+            Self::Sglang(resp) => matches!(
+                &resp.response,
+                Some(sglang::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::Vllm(resp) => matches!(
+                &resp.response,
+                Some(vllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::Trtllm(resp) => matches!(
+                &resp.response,
+                Some(trtllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::Mlx(resp) => matches!(
+                &resp.response,
+                Some(mlx::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::TokenSpeed(resp) => matches!(
+                &resp.response,
+                Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+        }
+    }
+
     /// Get the response variant (chunk, complete, or error)
     ///
     /// Consumes self to avoid cloning large proto messages in hot streaming path
@@ -1614,7 +1938,7 @@ impl ProtoGenerateResponse {
                     ProtoResponseVariant::Chunk(ProtoGenerateStreamChunk::Vllm(chunk))
                 }
                 Some(vllm::generate_response::Response::Complete(complete)) => {
-                    ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(complete))
+                    ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(Box::new(complete)))
                 }
                 None => ProtoResponseVariant::None,
             },
@@ -1842,7 +2166,10 @@ impl ProtoGenerateStreamChunk {
 #[derive(Clone)]
 pub enum ProtoGenerateComplete {
     Sglang(sglang::GenerateComplete),
-    Vllm(vllm::GenerateComplete),
+    // Boxed: the media identity a PD prefill leg returns made this variant
+    // several times the size of the others, and completions move through
+    // the same channel as every streamed chunk.
+    Vllm(Box<vllm::GenerateComplete>),
     Trtllm(trtllm::GenerateComplete),
     Mlx(mlx::GenerateComplete),
     TokenSpeed(tokenspeed::GenerateComplete),
@@ -2057,6 +2384,28 @@ impl ProtoGenerateComplete {
         }
     }
 
+    /// Get accepted speculative draft tokens.
+    pub fn spec_accepted_tokens(&self) -> u32 {
+        match self {
+            Self::Sglang(c) => c.spec_accepted_tokens,
+            Self::Vllm(c) => c.spec_accepted_tokens,
+            Self::Trtllm(c) => c.spec_accepted_tokens,
+            Self::TokenSpeed(c) => c.spec_accepted_tokens,
+            Self::Mlx(_) => 0,
+        }
+    }
+
+    /// Get proposed speculative draft tokens.
+    pub fn spec_draft_tokens(&self) -> u32 {
+        match self {
+            Self::Sglang(c) => c.spec_draft_tokens,
+            Self::Vllm(c) => c.spec_draft_tokens,
+            Self::Trtllm(c) => c.spec_draft_tokens,
+            Self::TokenSpeed(c) => c.spec_draft_tokens,
+            Self::Mlx(_) => 0,
+        }
+    }
+
     /// Get input/prompt logprobs (SGLang, vLLM, and TensorRT-LLM)
     pub fn input_logprobs(&self) -> Option<ProtoInputLogProbs> {
         match self {
@@ -2132,6 +2481,15 @@ impl ProtoGenerateComplete {
         }
     }
 
+    /// The media identity a prefill leg returned for its processed
+    /// references (vLLM only; absent from older servicers).
+    pub fn media_identity(&self) -> Option<&vllm::MediaIdentity> {
+        match self {
+            Self::Vllm(c) => c.media_identity.as_ref(),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
+        }
+    }
+
     /// Get opaque connector KV-transfer params JSON returned by the engine (vLLM only).
     pub fn kv_transfer_params_json(&self) -> Option<&str> {
         match self {
@@ -2158,12 +2516,27 @@ pub enum ProtoStream {
     /// ZMQ backend: a custom stream yielding vLLM-proto responses built from
     /// EngineCore outputs. Auto-aborts on drop, so `mark_completed` is a no-op.
     Zmq(ZmqGenerateStream),
+    /// An n>1 fan-out over rendezvous-room PD pairs: one child per sample,
+    /// each response stamped with its sample's index (see [`FanoutStream`]).
+    Fanout(FanoutStream),
+}
+
+/// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
+fn reject_engine_error(
+    item: Result<ProtoGenerateResponse, tonic::Status>,
+) -> Result<ProtoGenerateResponse, tonic::Status> {
+    match item {
+        Ok(response) if response.engine_error() => Err(tonic::Status::internal(
+            "engine finished the request with an error (see engine logs)",
+        )),
+        item => item,
+    }
 }
 
 impl ProtoStream {
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        match self {
+        let item = match self {
             Self::Sglang(stream) => stream
                 .next()
                 .await
@@ -2196,7 +2569,9 @@ impl ProtoStream {
                 .next()
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
-        }
+            Self::Fanout(stream) => stream.next().await,
+        };
+        item.map(reject_engine_error)
     }
 
     /// Mark stream as completed (no abort needed)
@@ -2208,6 +2583,7 @@ impl ProtoStream {
             Self::Mlx(stream) => stream.mark_completed(),
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
+            Self::Fanout(stream) => stream.mark_completed(),
         }
     }
 
@@ -2228,6 +2604,133 @@ impl ProtoStream {
             Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
             Self::Zmq(stream) => Self::Zmq(stream),
+            Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+        }
+    }
+}
+
+impl FanoutChild for ProtoStream {
+    fn next_item(
+        &mut self,
+    ) -> impl Future<Output = Option<Result<ProtoGenerateResponse, tonic::Status>>> + Send {
+        self.next()
+    }
+
+    fn mark_completed(&mut self) {
+        Self::mark_completed(self);
+    }
+
+    fn defer_abort_until_first_item(self) -> Self {
+        Self::defer_abort_until_first_item(self)
+    }
+}
+
+/// What a fan-out needs from a child stream. Implemented by [`ProtoStream`];
+/// tests implement it on a scripted child.
+pub trait FanoutChild: Send {
+    /// The child's next response, or `None` once it has ended.
+    fn next_item(
+        &mut self,
+    ) -> impl Future<Output = Option<Result<ProtoGenerateResponse, tonic::Status>>> + Send;
+
+    /// Mark the child completed so dropping it sends no abort.
+    fn mark_completed(&mut self);
+
+    /// Defer the child's abort-on-drop until its first response.
+    #[must_use]
+    fn defer_abort_until_first_item(self) -> Self;
+}
+
+/// One child per sample of an n>1 fan-out over rendezvous-room PD pairs.
+///
+/// Each child is a single-sample dispatch whose responses report choice
+/// index 0; the fan-out restamps them with the child's position, so the
+/// pipeline demuxes the merged stream exactly like an engine-native n>1
+/// stream. Children are polled together, starting from a rotating cursor so
+/// a chatty child cannot starve its siblings, and are retired as they end;
+/// the fan-out ends with the last child. Dropping it drops every child, so
+/// each leg keeps its abort-on-drop, and `mark_completed` reaches every
+/// child.
+pub struct FanoutStream<C = ProtoStream> {
+    children: Vec<Option<C>>,
+    cursor: usize,
+}
+
+type FanoutItem = Option<Result<ProtoGenerateResponse, tonic::Status>>;
+/// One child's pending `next_item`, tagged with the child's position.
+type FanoutPoll<'a> = Pin<Box<dyn Future<Output = (usize, FanoutItem)> + Send + 'a>>;
+
+impl<C: FanoutChild> FanoutStream<C> {
+    pub fn new(children: Vec<C>) -> Self {
+        Self {
+            children: children.into_iter().map(Some).collect(),
+            cursor: 0,
+        }
+    }
+
+    /// Children that have not ended yet.
+    pub fn open_children(&self) -> usize {
+        self.children.iter().flatten().count()
+    }
+
+    /// Next response from any open child, stamped with that child's index.
+    pub async fn next(&mut self) -> FanoutItem {
+        loop {
+            let len = self.children.len();
+            if len == 0 {
+                return None;
+            }
+            let start = self.cursor % len;
+            self.cursor = (start + 1) % len;
+            // Open children before the cursor go to the back of the poll
+            // order, so the cursor rotates which child gets the first look.
+            let skip = self.children[..start].iter().flatten().count();
+            let mut polls: Vec<FanoutPoll<'_>> = self
+                .children
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(position, child)| {
+                    child.as_mut().map(|child| {
+                        let poll: FanoutPoll<'_> =
+                            Box::pin(async move { (position, child.next_item().await) });
+                        poll
+                    })
+                })
+                .collect();
+            if polls.is_empty() {
+                return None;
+            }
+            let rotate = skip % polls.len();
+            polls.rotate_left(rotate);
+            let ((position, item), _, _) = select_all(polls).await;
+            match item {
+                Some(Ok(mut response)) => {
+                    response.set_index(u32::try_from(position).unwrap_or(u32::MAX));
+                    return Some(Ok(response));
+                }
+                Some(Err(status)) => return Some(Err(status)),
+                None => self.children[position] = None,
+            }
+        }
+    }
+
+    /// Mark every open child completed.
+    pub fn mark_completed(&mut self) {
+        for child in self.children.iter_mut().flatten() {
+            child.mark_completed();
+        }
+    }
+
+    /// Defer every open child's abort-on-drop until its first response.
+    #[must_use]
+    pub fn defer_abort_until_first_item(self) -> Self {
+        Self {
+            children: self
+                .children
+                .into_iter()
+                .map(|child| child.map(FanoutChild::defer_abort_until_first_item))
+                .collect(),
+            cursor: self.cursor,
         }
     }
 }
@@ -2336,8 +2839,313 @@ impl ProtoEmbedComplete {
 }
 
 #[cfg(test)]
+mod fanout_tests {
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+
+    use super::*;
+
+    /// A child that yields a script, then ends.
+    struct Scripted {
+        items: VecDeque<Result<ProtoGenerateResponse, tonic::Status>>,
+        completed: Arc<AtomicBool>,
+    }
+
+    impl FanoutChild for Scripted {
+        fn next_item(
+            &mut self,
+        ) -> impl Future<Output = Option<Result<ProtoGenerateResponse, tonic::Status>>> + Send
+        {
+            let item = self.items.pop_front();
+            async move { item }
+        }
+
+        fn mark_completed(&mut self) {
+            self.completed.store(true, Ordering::SeqCst);
+        }
+
+        fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+    }
+
+    fn chunk(text: &str) -> ProtoGenerateResponse {
+        ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Chunk(
+                sglang::GenerateStreamChunk {
+                    token_ids: vec![text.len() as u32],
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }))
+    }
+
+    fn complete() -> ProtoGenerateResponse {
+        ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Complete(
+                sglang::GenerateComplete::default(),
+            )),
+            ..Default::default()
+        }))
+    }
+
+    fn child(items: Vec<ProtoGenerateResponse>) -> (Scripted, Arc<AtomicBool>) {
+        let completed = Arc::new(AtomicBool::new(false));
+        let child = Scripted {
+            items: items.into_iter().map(Ok).collect(),
+            completed: Arc::clone(&completed),
+        };
+        (child, completed)
+    }
+
+    fn index_of(response: ProtoGenerateResponse) -> u32 {
+        match response.into_response() {
+            ProtoResponseVariant::Chunk(chunk) => chunk.index(),
+            ProtoResponseVariant::Complete(complete) => complete.index(),
+            ProtoResponseVariant::None => u32::MAX,
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_stamps_each_childs_position_and_ends_with_the_last_child() {
+        let (first, first_done) = child(vec![chunk("a"), chunk("aa"), complete()]);
+        let (second, second_done) = child(vec![chunk("b"), complete()]);
+        let mut fanout = FanoutStream::new(vec![first, second]);
+
+        let mut indices = Vec::new();
+        while let Some(item) = fanout.next().await {
+            indices.push(index_of(item.unwrap()));
+        }
+        assert_eq!(indices.len(), 5);
+        assert_eq!(indices.iter().filter(|&&i| i == 0).count(), 3);
+        assert_eq!(indices.iter().filter(|&&i| i == 1).count(), 2);
+        // The rotating cursor lets the second child in before the first drains.
+        assert_ne!(indices[0], indices[1]);
+        assert_eq!(fanout.open_children(), 0);
+        assert!(fanout.next().await.is_none());
+
+        assert!(!first_done.load(Ordering::SeqCst));
+        fanout.mark_completed();
+        // Ended children were retired; only open children get marked.
+        assert!(!first_done.load(Ordering::SeqCst));
+        assert!(!second_done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fanout_mark_completed_reaches_every_open_child() {
+        let (first, first_done) = child(vec![chunk("a")]);
+        let (second, second_done) = child(vec![chunk("b")]);
+        let mut fanout = FanoutStream::new(vec![first, second]);
+        assert_eq!(fanout.open_children(), 2);
+        fanout.mark_completed();
+        assert!(first_done.load(Ordering::SeqCst));
+        assert!(second_done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fanout_passes_a_child_error_through() {
+        let (first, _) = child(vec![chunk("a")]);
+        let second = Scripted {
+            items: VecDeque::from([Err(tonic::Status::internal("leg died"))]),
+            completed: Arc::new(AtomicBool::new(false)),
+        };
+        let mut fanout = FanoutStream::new(vec![second, first]);
+        let first_item = fanout.next().await.unwrap();
+        assert!(matches!(first_item, Err(status) if status.message() == "leg died"));
+    }
+
+    #[test]
+    fn set_index_restamps_chunks_and_completes() {
+        let mut response = chunk("x");
+        response.set_index(3);
+        assert_eq!(index_of(response), 3);
+        let mut response = complete();
+        response.set_index(2);
+        assert_eq!(index_of(response), 2);
+    }
+
+    #[test]
+    fn sampling_n_reads_and_writes_the_room_based_engines() {
+        let mut sglang_req = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            sampling_params: Some(sglang::SamplingParams {
+                n: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(sglang_req.sampling_n(), 4);
+        sglang_req.set_sampling_n(1);
+        assert_eq!(sglang_req.sampling_n(), 1);
+        assert!(!sglang_req.has_mm_inputs());
+
+        let mut tokenspeed_req =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed::GenerateRequest {
+                sampling_params: Some(tokenspeed::SamplingParams {
+                    n: 0,
+                    sampling_seed: Some(5),
+                    ..Default::default()
+                }),
+                mm_inputs: Some(tokenspeed::MultimodalInputs::default()),
+                ..Default::default()
+            }));
+        assert_eq!(tokenspeed_req.sampling_n(), 1, "0 means unset");
+        assert!(tokenspeed_req.has_mm_inputs());
+        tokenspeed_req.offset_sampling_seed(2);
+        let ProtoGenerateRequest::TokenSpeed(req) = &tokenspeed_req else {
+            panic!("runtime changed");
+        };
+        assert_eq!(req.sampling_params.as_ref().unwrap().sampling_seed, Some(7));
+    }
+}
+
+#[cfg(test)]
+mod engine_error_tests {
+    use super::*;
+
+    /// One `Complete` per backend finishing with `reason`.
+    fn completes(reason: &str) -> Vec<ProtoGenerateResponse> {
+        let reason = reason.to_string();
+        vec![
+            ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+                response: Some(sglang::generate_response::Response::Complete(
+                    sglang::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+            ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+                response: Some(vllm::generate_response::Response::Complete(
+                    vllm::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+            })),
+            ProtoGenerateResponse::Trtllm(Box::new(trtllm::GenerateResponse {
+                response: Some(trtllm::generate_response::Response::Complete(
+                    trtllm::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+            ProtoGenerateResponse::Mlx(Box::new(mlx::GenerateResponse {
+                response: Some(mlx::generate_response::Response::Complete(
+                    mlx::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+            })),
+            ProtoGenerateResponse::TokenSpeed(Box::new(tokenspeed::GenerateResponse {
+                response: Some(tokenspeed::generate_response::Response::Complete(
+                    tokenspeed::GenerateComplete {
+                        finish_reason: reason,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+        ]
+    }
+
+    #[test]
+    fn engine_error_is_true_only_for_complete_with_error_finish_reason() {
+        assert!(completes("error")
+            .iter()
+            .all(ProtoGenerateResponse::engine_error));
+        for reason in ["stop", "length", "abort", ""] {
+            assert!(!completes(reason)
+                .iter()
+                .any(ProtoGenerateResponse::engine_error));
+        }
+        let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk::default(),
+            )),
+        }));
+        assert!(!chunk.engine_error());
+        let empty = ProtoGenerateResponse::Vllm(Box::default());
+        assert!(!empty.engine_error());
+    }
+
+    #[test]
+    fn reject_engine_error_turns_error_complete_into_internal_status() {
+        for response in completes("error") {
+            let Err(status) = reject_engine_error(Ok(response)) else {
+                panic!("engine error must not pass through as a completion");
+            };
+            assert_eq!(status.code(), tonic::Code::Internal);
+            assert_eq!(
+                status.message(),
+                "engine finished the request with an error (see engine logs)"
+            );
+        }
+        for response in completes("stop") {
+            assert!(reject_engine_error(Ok(response)).is_ok());
+        }
+        let passed = reject_engine_error(Err(tonic::Status::unavailable("leg died")));
+        assert!(matches!(passed, Err(status) if status.code() == tonic::Code::Unavailable));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use prost::Message;
+
+    #[test]
+    fn inline_bytes_counts_every_inline_tensor_and_raw_image() {
+        let trtllm = MultimodalData::Trtllm(TrtllmMultimodalData {
+            image_data: vec![vec![0; 3], vec![0; 5]],
+        });
+        assert_eq!(trtllm.inline_bytes(), 8);
+
+        let sglang = MultimodalData::Sglang(SglangMultimodalData {
+            image_data: vec![vec![0; 2]],
+            pixel_values: vec![0; 16],
+            pixel_values_shape: vec![4, 4],
+            pixel_values_dtype: "float32".to_string(),
+            model_specific_tensors: HashMap::from([(
+                "grid".to_string(),
+                TensorBytes {
+                    data: vec![0; 24],
+                    shape: vec![1, 3],
+                    dtype: "int64".to_string(),
+                },
+            )]),
+            im_token_id: None,
+            mm_placeholders: vec![(0, 4)],
+        });
+        assert_eq!(sglang.inline_bytes(), 42);
+    }
+
+    #[test]
+    fn inline_bytes_counts_every_batch_of_a_mixed_request() {
+        let alone = MultimodalData::Vllm(vllm_mm_data(common::Modality::Image));
+        assert_eq!(alone.inline_bytes(), 16);
+
+        let mut video = vllm_mm_data(common::Modality::Video);
+        video.model_specific_tensors.insert(
+            "video_grid_thw".to_string(),
+            TensorBytes {
+                data: vec![0; 24],
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+            },
+        );
+        let mut image = vllm_mm_data(common::Modality::Image);
+        image.extra_batches = vec![video];
+        assert_eq!(MultimodalData::Vllm(image).inline_bytes(), 56);
+    }
 
     use super::*;
 
@@ -2579,6 +3387,7 @@ mod tests {
         VllmMultimodalData {
             pixel_values: vec![0u8; 16],
             pixel_values_shape: vec![1, 4],
+            pixel_values_dtype: "float32".to_string(),
             model_specific_tensors: HashMap::new(),
             im_token_id: Some(if is_video { 151656 } else { 151655 }),
             mm_placeholders: vec![(3, 4)],
@@ -2586,10 +3395,12 @@ mod tests {
             batched_keys: vec![],
             flat_keys: HashMap::new(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
             modality,
             shm_enabled: false,
             shm_min_bytes: 0,
             rdma_enabled: false,
+            extra_batches: Vec::new(),
         }
     }
 
@@ -2641,11 +3452,9 @@ mod tests {
                 .chunk_semantics()
                 .is_delta()
         );
-        assert!(
-            ProtoGenerateComplete::Vllm(vllm::GenerateComplete::default())
-                .chunk_semantics()
-                .is_delta()
-        );
+        assert!(ProtoGenerateComplete::Vllm(Box::default())
+            .chunk_semantics()
+            .is_delta());
 
         // Every other shape reports running totals.
         for chunk in [

@@ -282,6 +282,11 @@ impl Deref for Qwen3VLProcessor {
 }
 
 impl VisionPreProcessor for Qwen3VLProcessor {
+    fn supports_per_image_preprocessing(&self) -> bool {
+        // The shared Qwen image pipeline plans and writes each image independently.
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }

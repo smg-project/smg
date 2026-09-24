@@ -6,7 +6,6 @@ for orchestration without tokenization.
 """
 
 import asyncio
-import dataclasses
 import hashlib
 import json
 import logging
@@ -18,11 +17,7 @@ from pathlib import Path
 
 import grpc
 import msgspec
-import numpy as np
 import sglang
-import torch
-import zmq
-import zmq.asyncio
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -33,7 +28,6 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     KVEventBatch,
     KVEventsConfig,
-    ZmqEventPublisher,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.io_struct import (
@@ -43,7 +37,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -58,9 +51,14 @@ from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
+from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
+from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+
+from ..pd_pairing import pairing_protocol_from_env
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -95,81 +93,6 @@ def _filtered_sampling_defaults(params: dict | None) -> dict:
         for key in SAMPLING_DEFAULT_KEYS
         if key in params and params[key] is not None
     }
-
-
-def _convert_loads_to_protobuf(
-    result: LoadSnapshot,
-) -> sglang_scheduler_pb2.SchedulerLoad:
-    """Convert a LoadSnapshot to a protobuf SchedulerLoad message."""
-    scheduler_load = sglang_scheduler_pb2.SchedulerLoad(
-        dp_rank=result.dp_rank,
-        num_running_reqs=result.num_running_reqs,
-        num_waiting_reqs=result.num_waiting_reqs,
-        num_total_reqs=result.num_running_reqs + result.num_waiting_reqs,
-        num_used_tokens=result.num_used_tokens,
-        max_total_num_tokens=result.max_total_num_tokens,
-        token_usage=result.token_usage,
-        gen_throughput=result.gen_throughput,
-        cache_hit_rate=result.cache_hit_rate,
-        utilization=result.utilization,
-        max_running_requests=result.max_running_requests,
-        # Queued token-work: waiting-queue tokens not served from cache.
-        num_waiting_uncached_tokens=result.num_waiting_uncached_tokens,
-    )
-
-    # Add optional sections using CopyFrom for proper protobuf assignment
-    if result.memory:
-        scheduler_load.memory.CopyFrom(
-            sglang_scheduler_pb2.MemoryMetrics(
-                weight_gb=result.memory.weight_gb,
-                kv_cache_gb=result.memory.kv_cache_gb,
-                graph_gb=result.memory.graph_gb,
-                token_capacity=result.memory.token_capacity,
-            )
-        )
-
-    if result.speculative:
-        scheduler_load.speculative.CopyFrom(
-            sglang_scheduler_pb2.SpeculativeMetrics(
-                accept_length=result.speculative.accept_length,
-                accept_rate=result.speculative.accept_rate,
-            )
-        )
-
-    if result.lora:
-        scheduler_load.lora.CopyFrom(
-            sglang_scheduler_pb2.LoRAMetrics(
-                slots_used=result.lora.slots_used,
-                slots_total=result.lora.slots_total,
-                utilization=result.lora.utilization,
-            )
-        )
-
-    if result.disaggregation:
-        scheduler_load.disaggregation.CopyFrom(
-            sglang_scheduler_pb2.DisaggregationMetrics(
-                mode=result.disaggregation.mode,
-                prefill_prealloc_queue_reqs=result.disaggregation.prefill_prealloc_queue_reqs,
-                prefill_inflight_queue_reqs=result.disaggregation.prefill_inflight_queue_reqs,
-                decode_prealloc_queue_reqs=result.disaggregation.decode_prealloc_queue_reqs,
-                decode_transfer_queue_reqs=result.disaggregation.decode_transfer_queue_reqs,
-                decode_retracted_queue_reqs=result.disaggregation.decode_retracted_queue_reqs,
-                kv_transfer_speed_gb_s=result.disaggregation.kv_transfer_speed_gb_s,
-                kv_transfer_latency_ms=result.disaggregation.kv_transfer_latency_ms,
-            )
-        )
-
-    if result.queues:
-        scheduler_load.queues.CopyFrom(
-            sglang_scheduler_pb2.QueueMetrics(
-                waiting=result.queues.waiting,
-                grammar=result.queues.grammar,
-                paused=result.queues.paused,
-                retracted=result.queues.retracted,
-            )
-        )
-
-    return scheduler_load
 
 
 def _compute_aggregate_protobuf(
@@ -552,7 +475,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Get server information."""
         logger.debug("Receive server info request")
 
-        server_args_dict = dataclasses.asdict(self.server_args)
+        # 0.5.20 turned ServerArgs from a dataclass into a msgspec Struct, so
+        # dataclasses.asdict() raises. A Struct keeps its declared fields OUT
+        # of __dict__ (upstream carries `dict=True` only so the underscore
+        # extras have somewhere to live), which is why vars() returns those
+        # extras and none of the fields the gateway reads. msgspec's own
+        # asdict is the conversion upstream uses on this type.
+        server_args_dict = msgspec.structs.asdict(self.server_args)
         server_args_struct = Struct()
 
         def make_serializable(obj):
@@ -568,6 +497,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return str(obj)
 
         serializable_args = make_serializable(server_args_dict)
+        # The operator's PD pairing protocol rides with the server args, so
+        # the gateway reads it as the worker's `pairing_protocol` label.
+        pairing_protocol = pairing_protocol_from_env()
+        if pairing_protocol:
+            serializable_args["pairing_protocol"] = pairing_protocol
         server_args_struct.update(serializable_args)
 
         # Convert scheduler_info to Struct
@@ -630,7 +564,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             context.set_details(f"Failed to get load metrics: {e}")
             return sglang_scheduler_pb2.GetLoadsResponse()
 
-        loads = [_convert_loads_to_protobuf(r) for r in results]
+        loads = [convert_loads_to_protobuf(r) for r in results]
 
         return sglang_scheduler_pb2.GetLoadsResponse(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -813,60 +747,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
             return
 
-        config = self._kv_events_config
-
-        # Resolve the PUB endpoint to a connectable address.
-        # The publisher binds to e.g. "tcp://*:5557"; we connect to localhost.
-        pub_endpoint = config.endpoint.replace("*", "127.0.0.1")
-
-        # For DP attention, each rank publishes on port + rank with
-        # independent sequence counters. Subscribing to multiple ranks
-        # on one socket interleaves independent counters, breaking gap
-        # detection. For now, subscribe to rank 0 only.
-        # TODO(phase2): per-rank virtual workers or merged renumbering.
-        pub_endpoint = ZmqEventPublisher.offset_endpoint_port(pub_endpoint, 0)
-
-        zmq_ctx = zmq.asyncio.Context.instance()
-        sub_socket = zmq_ctx.socket(zmq.SUB)
-        sub_socket.subscribe(config.topic.encode("utf-8"))
-        sub_socket.connect(pub_endpoint)
-
-        logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
-
-        # Send response headers immediately so the tonic client's
-        # subscribe_kv_events().await resolves without waiting for the first
-        # yielded event (grpc.aio defers headers until first yield otherwise).
-        await context.send_initial_metadata(())
-
         decoder = msgspec.msgpack.Decoder(KVEventBatch)
-
-        # Stream live events using the ZMQ publisher's native seq numbers.
-        try:
-            while not context.cancelled():
-                try:
-                    frames = await asyncio.wait_for(sub_socket.recv_multipart(), timeout=1.0)
-                except TimeoutError:
-                    continue
-
-                # ZMQ multipart: [topic, seq_bytes, payload]
-                if len(frames) < 3:
-                    continue
-
-                zmq_seq = int.from_bytes(frames[1], "big")
-                payload = frames[2]
-
-                try:
-                    raw_batch = decoder.decode(payload)
-                except Exception as e:
-                    logger.warning("Failed to decode KV event batch: %s", e)
-                    continue
-
-                yield self._convert_kv_event_batch(raw_batch, zmq_seq)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            sub_socket.close(linger=0)
-            logger.info("SubscribeKvEvents: stream closed")
+        async for batch in subscribe_kv_events(
+            self._kv_events_config,
+            request.start_sequence_number,
+            context,
+            decoder.decode,
+            self._convert_kv_event_batch,
+        ):
+            yield batch
 
     def _convert_kv_event_batch(
         self, raw_batch: KVEventBatch, seq_num: int
@@ -1016,11 +905,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     @staticmethod
     def _decode_tensor_data(tensor_data):
         """Decode a proto TensorData message into a torch.Tensor."""
-        dtype_map = {"float32": np.float32, "int64": np.int64}
-        np_dtype = dtype_map.get(tensor_data.dtype, np.float32)
-        shape = list(tensor_data.shape)
-        arr = np.frombuffer(tensor_data.data, dtype=np_dtype).reshape(shape)
-        return torch.from_numpy(arr)
+        return tensor_from_parts(tensor_data.data, tensor_data.shape, tensor_data.dtype)
 
     def _parse_mm_inputs(self, mm_proto) -> MultimodalProcessorOutput:
         """Parse proto MultimodalInputs into a MultimodalProcessorOutput for the scheduler."""
@@ -1295,6 +1180,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 ),
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 reasoning_tokens=meta_info.get("reasoning_tokens", 0),
+                spec_accepted_tokens=meta_info.get("spec_num_correct_drafts", 0),
+                spec_draft_tokens=meta_info.get("spec_num_proposed_drafts", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
                 index=output.get("index", 0),

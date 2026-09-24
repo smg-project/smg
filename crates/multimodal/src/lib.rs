@@ -16,17 +16,22 @@ pub use audio::AudioPreProcessor;
 pub use encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
 pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, TransformError};
 pub use media::{
-    ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
+    init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,
+    MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
-pub use registry::{MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer};
+pub use registry::{
+    MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,
+    DEEPSEEK_V41_IMAGE_PLACEHOLDER,
+};
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
     ImageSource, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, PlaceholderRange,
-    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, VideoClip, VideoSource,
+    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, VideoClip, VideoSamplingInfo,
+    VideoSource,
 };
 // Re-export vision processing components
 pub use vision::{
-    LlavaNextProcessor, LlavaProcessor, PreProcessorConfig, VisionPreProcessor,
-    VisionProcessorRegistry,
+    DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
+    VisionPreProcessor, VisionProcessorRegistry,
 };

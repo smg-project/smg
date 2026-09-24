@@ -14,12 +14,14 @@
 //! let encoding = cached.encode("Hello world")?;
 //! ```
 
+mod activity;
 mod fingerprint;
 mod l0;
 mod l1;
 
 use std::sync::Arc;
 
+pub use activity::{cache_activity_stats, CacheActivityStats};
 use anyhow::Result;
 pub use fingerprint::TokenizerFingerprint;
 pub use l0::{CacheStats, L0Cache};
@@ -31,7 +33,9 @@ use crate::{
     chat_template::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
     },
-    traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer},
+    traits::{
+        ChatTemplateOutput, Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer,
+    },
 };
 
 /// Configuration for the tokenizer cache
@@ -286,6 +290,22 @@ impl Tokenizer for CachedTokenizer {
         self.inner.apply_chat_template(messages, params)
     }
 
+    fn apply_chat_template_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        // Forward rather than inherit the default: the default would render
+        // through the inner tokenizer's flat template and report `FromText`,
+        // silently dropping a deferred encode. A flat rendering still reaches
+        // the L0/L1 caches because the caller encodes its text through
+        // `self.encode`; a deferred encode never does, since two renderings
+        // can share one text with different ids.
+        self.inner
+            .apply_chat_template_with_encoding(messages, params, assistant_prefix)
+    }
+
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         self.inner.chat_template_content_format()
     }
@@ -304,6 +324,10 @@ impl Tokenizer for CachedTokenizer {
 
     fn think_in_prefill(&self) -> bool {
         self.inner.think_in_prefill()
+    }
+
+    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+        self.inner.renderer_capabilities()
     }
 
     fn eos_token_ids(&self) -> &[TokenIdType] {
@@ -674,5 +698,65 @@ mod tests {
         assert_eq!(cached.vocab_size(), tokenizer.vocab_size());
         assert!(cached.token_to_id("Hello").is_some());
         assert!(cached.id_to_token(1).is_some());
+    }
+
+    #[test]
+    fn forwards_deferred_chat_encodes_from_the_inner_tokenizer() {
+        use crate::{
+            chat_template::ChatTemplateParams,
+            mock::MockTokenizer,
+            traits::{PromptEncoding, Tokenizer as _},
+        };
+
+        let inner = MockTokenizer::new()
+            .with_deferred_chat_ids(vec![7, 8, 9])
+            .with_unbilled_prompt_tokens(3);
+        let cached = CachedTokenizer::new(
+            Arc::new(inner),
+            CacheConfig {
+                enable_l0: true,
+                ..Default::default()
+            },
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hello"})];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+
+        let rendered = cached
+            .apply_chat_template_with_encoding(&messages, params, Some("Sure"))
+            .unwrap();
+        assert!(
+            rendered.text.ends_with("assistant: Sure"),
+            "{}",
+            rendered.text
+        );
+        assert_eq!(rendered.unbilled_prompt_tokens, 3);
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("the wrapper must hand the inner tokenizer's deferred encode through");
+        };
+        assert_eq!(job.run().unwrap().token_ids(), &[7, 8, 9]);
+
+        // A flat inner tokenizer reports `FromText`, and the caller's
+        // `encode(text)` still goes through the wrapper's caches.
+        let flat = CachedTokenizer::new(
+            Arc::new(MockTokenizer::new()),
+            CacheConfig {
+                enable_l0: true,
+                ..Default::default()
+            },
+        );
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+        let rendered = flat
+            .apply_chat_template_with_encoding(&messages, params, None)
+            .unwrap();
+        assert!(matches!(rendered.encoding, PromptEncoding::FromText));
+        let _ = flat.encode(&rendered.text, false).unwrap();
+        let _ = flat.encode(&rendered.text, false).unwrap();
+        assert_eq!(flat.cache_stats().map(|s| s.hits), Some(1));
     }
 }

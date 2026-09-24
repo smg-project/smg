@@ -2,10 +2,13 @@
 //!
 //! Defines configuration structures for MCP servers, transports, proxies, and inventory.
 
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, time::Duration};
 
 pub use rmcp::model::{Prompt, RawResource, Tool};
 use serde::{Deserialize, Serialize};
+
+/// Default upper bound for a single tool call (seconds).
+pub const DEFAULT_CALL_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct McpConfig {
@@ -499,6 +502,14 @@ pub struct McpPoolConfig {
     /// Idle timeout before closing connection (seconds)
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout: u64,
+
+    /// Upper bound for a single tool call (seconds).
+    ///
+    /// A call that exceeds it fails with an unknown outcome and is never
+    /// retried, because the server may still have executed it. `0` disables
+    /// the bound.
+    #[serde(default = "default_call_timeout")]
+    pub call_timeout: u64,
 }
 
 /// Tool inventory refresh configuration
@@ -540,6 +551,10 @@ fn default_max_connections() -> usize {
     100
 }
 
+fn default_call_timeout() -> u64 {
+    DEFAULT_CALL_TIMEOUT_SECS
+}
+
 fn default_idle_timeout() -> u64 {
     300 // 5 minutes
 }
@@ -562,6 +577,7 @@ impl Default for McpPoolConfig {
         Self {
             max_connections: default_max_connections(),
             idle_timeout: default_idle_timeout(),
+            call_timeout: default_call_timeout(),
         }
     }
 }
@@ -607,6 +623,11 @@ impl McpProxyConfig {
 }
 
 impl McpConfig {
+    /// Upper bound for a single tool call, or `None` when disabled.
+    pub fn call_timeout(&self) -> Option<Duration> {
+        (self.pool.call_timeout > 0).then(|| Duration::from_secs(self.pool.call_timeout))
+    }
+
     /// Load configuration from a YAML file
     pub async fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = tokio::fs::read_to_string(path).await?;
@@ -663,6 +684,27 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    #[test]
+    fn test_call_timeout_default_override_and_disable() {
+        let config: McpConfig = serde_yaml::from_str("servers: []").unwrap();
+        assert_eq!(
+            config.call_timeout(),
+            Some(Duration::from_secs(DEFAULT_CALL_TIMEOUT_SECS))
+        );
+
+        let yaml = "servers: []
+pool:
+  call_timeout: 5";
+        let config: McpConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.call_timeout(), Some(Duration::from_secs(5)));
+
+        let yaml = "servers: []
+pool:
+  call_timeout: 0";
+        let config: McpConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.call_timeout(), None);
+    }
 
     #[test]
     fn test_default_pool_config() {

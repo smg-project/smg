@@ -21,14 +21,25 @@ from .constants import (
     ENV_SHOW_WORKER_LOGS,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
+    MM_PROCESSING_WORKER,
     ConnectionMode,
     WorkerType,
+    get_mm_processing,
     get_runtime,
     get_zmq_engine_count,
+    sglang_transfer_backend,
     vllm_kv_backend,
 )
 from .model_specs import get_model_spec
-from .process_utils import detect_ib_device, get_open_port, wait_for_health
+from .process_utils import (
+    detect_ib_device,
+    detect_rdma_fabric_devices,
+    get_open_port,
+    gpu_memory_used_mib,
+    wait_for_gpu_memory_release,
+    wait_for_health,
+    wait_for_process_group_exit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +61,20 @@ class Worker:
     dist_init_port: int | None = None
     log_dir: str | None = None
     extra_engine_args: list[str] | None = None
+    # Overrides the model spec's tp, so a PD pair can run asymmetric legs.
+    tp: int | None = None
+    # KV transfer backend for this PD worker ("nixl" or "mooncake"); None
+    # takes the lane's default, so one fleet can mix transports.
+    kv_backend: str | None = None
+    # Environment for the engine process on top of the infra's own settings
+    # (a deployment-injected SMG_PAIRING_PROTOCOL, for instance).
+    extra_env: dict[str, str] | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
+    # Where the engine's output lands when it is not shown on the terminal.
+    log_path: str | None = field(default=None, repr=False)
     _log_file: IO[Any] | None = field(default=None, repr=False)
+    # Used memory per GPU just before launch; ``stop`` waits for it to come back.
+    _gpu_mem_baseline: dict[int, int] | None = field(default=None, repr=False)
 
     @property
     def base_url(self) -> str:
@@ -102,6 +125,7 @@ class Worker:
         )
         logger.debug("Command: %s", " ".join(cmd))
 
+        self._gpu_mem_baseline = gpu_memory_used_mib(self.gpu_ids)
         self.process = self._spawn_process(cmd, env)
 
         if not wait_ready:
@@ -113,7 +137,16 @@ class Worker:
             )
             return
 
-        # Wait for health check
+        self.wait_ready(timeout)
+
+    def wait_ready(self, timeout: int = DEFAULT_STARTUP_TIMEOUT) -> None:
+        """Block until the spawned worker passes its health check.
+
+        ``start(wait_ready=False)`` followed by this call lets a caller spawn
+        several workers and wait for all of them afterwards.
+        """
+        if self.process is None:
+            raise RuntimeError(f"Worker {self.model_id} has not been started")
         if self.mode == ConnectionMode.ZMQ:
             # SMG (the router) binds the ZMQ sockets and this engine dials in;
             # there is no worker port to probe. The gateway's readiness gate
@@ -149,18 +182,28 @@ class Worker:
         pid = self.process.pid
         logger.info("Stopping worker %s (PID %d)", self.model_id, pid)
 
-        # Kill entire process group (workers run in their own session)
+        # Workers run in their own session, so the launcher and every engine
+        # child process share one group.
+        pgid: int | None
         try:
             pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGTERM)
         except (ProcessLookupError, OSError):
+            pgid = None
+
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                self.process.terminate()
+        else:
             self.process.terminate()
 
         try:
             self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             try:
-                pgid = os.getpgid(pid)
+                if pgid is None:
+                    raise ProcessLookupError
                 os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 self.process.kill()
@@ -168,6 +211,31 @@ class Worker:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 logger.error("Worker PID %d did not die after SIGKILL", pid)
+
+        # ``process.wait`` only reaps the launcher. The engine's children
+        # (vLLM's EngineCore, SGLang's scheduler) outlive it while they tear
+        # down their CUDA contexts, and a replacement started on the same GPUs
+        # inside that window fails its startup memory check against the old
+        # allocation. Wait for the group to empty, then for the memory.
+        if pgid is not None:
+            stragglers = wait_for_process_group_exit(pgid, timeout=40.0, kill_after=20.0)
+            if stragglers:
+                logger.error("Worker %s: PIDs %s survived SIGKILL", self.model_id, stragglers)
+        if self._gpu_mem_baseline is not None:
+            # A region another process still maps (a decode holding a dead
+            # prefill's KV) never frees, so the wait is a bounded courtesy.
+            waited = time.monotonic()
+            held = wait_for_gpu_memory_release(self.gpu_ids, self._gpu_mem_baseline, timeout=30.0)
+            if held:
+                # The wait gives up once the figure stops moving, usually well
+                # inside the 30 s cap; report what was actually waited.
+                logger.warning(
+                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, baseline %s MiB",
+                    self.model_id,
+                    time.monotonic() - waited,
+                    held,
+                    self._gpu_mem_baseline,
+                )
 
         # Clean up log file
         if self._log_file is not None:
@@ -194,11 +262,23 @@ class Worker:
         """Check if the worker process is still running."""
         return self.process is not None and self.process.poll() is None
 
+    def effective_kv_backend(self) -> str:
+        """This worker's KV transfer backend: its own override, else the lane's."""
+        if self.kv_backend:
+            return self.kv_backend.lower()
+        if self.engine == "sglang":
+            return sglang_transfer_backend()
+        if self.engine == "tokenspeed":
+            # TokenSpeed moves KV over Mooncake only; the lane-wide setting
+            # exists for the engines that have a choice.
+            return "mooncake"
+        return vllm_kv_backend()
+
     def _build_cmd(self) -> list[str]:
         """Build engine-specific launch command using model specs."""
         spec = get_model_spec(self.model_id)
         model_path = spec["model"]
-        tp_size = spec.get("tp", 1)
+        tp_size = self.tp or spec.get("tp", 1)
         features = spec.get("features", [])
 
         if self.engine == "sglang":
@@ -260,12 +340,14 @@ class Worker:
         # PD disaggregation arguments
         if self.worker_type == WorkerType.PREFILL:
             cmd.extend(["--disaggregation-mode", "prefill"])
+            cmd.extend(["--disaggregation-transfer-backend", self.effective_kv_backend()])
             if self.bootstrap_port:
                 cmd.extend(["--disaggregation-bootstrap-port", str(self.bootstrap_port)])
             if self.ib_device:
                 cmd.extend(["--disaggregation-ib-device", self.ib_device])
         elif self.worker_type == WorkerType.DECODE:
             cmd.extend(["--disaggregation-mode", "decode"])
+            cmd.extend(["--disaggregation-transfer-backend", self.effective_kv_backend()])
             cmd.extend(["--base-gpu-id", "0"])
             if self.ib_device:
                 cmd.extend(["--disaggregation-ib-device", self.ib_device])
@@ -329,7 +411,7 @@ class Worker:
         # PD disaggregation: KV transfer roles (backend via E2E_VLLM_KV_BACKEND)
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
             kv_role = "kv_producer" if self.worker_type == WorkerType.PREFILL else "kv_consumer"
-            if vllm_kv_backend() == "mooncake":
+            if self.effective_kv_backend() == "mooncake":
                 config = {"kv_connector": "MooncakeConnector", "kv_role": kv_role}
             else:
                 config = {"kv_connector": "NixlConnector", "kv_role": kv_role}
@@ -413,14 +495,13 @@ class Worker:
             cmd.extend(["--disaggregation-mode", self.worker_type.value])
             if self.bootstrap_port is not None:
                 cmd.extend(["--disaggregation-bootstrap-port", str(self.bootstrap_port)])
-            cmd.extend(["--disaggregation-transfer-backend", "mooncake"])
+            cmd.extend(["--disaggregation-transfer-backend", self.effective_kv_backend()])
             if self.dist_init_addr:
                 cmd.extend(["--dist-init-addr", self.dist_init_addr])
             if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
                 cmd.append("--enable-prefix-caching")
             if self.worker_type == WorkerType.PREFILL:
                 cmd.append("--enforce-eager")
-            cmd.append("--skip-server-warmup")
 
         extra = spec.get("tokenspeed_args", [])
         if extra:
@@ -467,6 +548,15 @@ class Worker:
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
 
+        if (
+            self.engine == "vllm"
+            and self.mode == ConnectionMode.GRPC
+            and get_mm_processing() == MM_PROCESSING_WORKER
+        ):
+            # The worker advertises mm_processor and the gateway, left in auto
+            # mode, forwards media references instead of preprocessed tensors.
+            env["SMG_VLLM_MM_PROCESSOR"] = "inprocess"
+
         if self.engine == "tokenspeed" and self.worker_type in (
             WorkerType.ENCODE,
             WorkerType.PREFILL,
@@ -477,9 +567,34 @@ class Worker:
             env.setdefault("NO_PROXY", "*")
             env.setdefault("no_proxy", "*")
 
+        if (
+            self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE)
+            and self.effective_kv_backend() == "nixl"
+        ):
+            # NIXL moves KV over UCX, which binds to the mlx5 device closest to
+            # the GPU. A host also exposes mlx5 devices for ordinary VM
+            # networking, and picking one of those breaks the worker: it either
+            # fails to open the device, when that NIC carries no RoCE GIDs, or
+            # opens it and dies on the first transfer, when it has GIDs but
+            # cannot route RDMA. Only the workers whose GPUs sit nearest such a
+            # NIC are affected, so a lane fails or passes by topology. Pin UCX
+            # to the fabric devices to take that choice away.
+            fabric_devices = detect_rdma_fabric_devices()
+            if fabric_devices:
+                env.setdefault("UCX_NET_DEVICES", ",".join(fabric_devices))
+
+        if (
+            self.engine == "sglang"
+            and self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE)
+            and self.effective_kv_backend() == "nixl"
+        ):
+            # SGLang's NIXL transfer engine rides on UCX too; see the vLLM
+            # branch below for why the CUDA IPC cache is off.
+            env.setdefault("UCX_CUDA_IPC_CACHE", "n")
+
         # vLLM PD workers need per-worker side-channel ports for their KV backend
         if self.engine == "vllm" and self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
-            if vllm_kv_backend() == "mooncake":
+            if self.effective_kv_backend() == "mooncake":
                 # The producer's bootstrap server must listen on the port the
                 # gateway advertises in remote_bootstrap_addr
                 if self.bootstrap_port is not None:
@@ -487,6 +602,13 @@ class Worker:
             else:
                 self.nixl_port = get_open_port()
                 env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(self.nixl_port)
+                # Single-host NIXL moves KV over CUDA IPC, and UCX caches the
+                # imported handles on the reader. A decode worker then keeps a
+                # dead prefill's whole KV region mapped (54 GiB stayed
+                # allocated 60 s after every prefill process had exited), and
+                # the prefill restarted on that GPU fails its free-memory
+                # check. Drop the cache so a mapping ends with its transfer.
+                env.setdefault("UCX_CUDA_IPC_CACHE", "n")
 
         if self.engine == "trtllm":
             # TRT-LLM bootstraps workers over Open MPI even at TP=1. On CI pods the
@@ -504,7 +626,16 @@ class Worker:
                 env["NCCL_SHM_DISABLE"] = "1"
                 env["TLLM_DISABLE_ALLREDUCE_AUTOTUNE"] = "1"
 
+        if self.extra_env:
+            env.update(self.extra_env)
         return env
+
+    def read_log(self) -> str:
+        """The engine's captured output so far; empty when it goes to the terminal."""
+        if self.log_path is None:
+            return ""
+        with open(self.log_path, encoding="utf-8", errors="replace") as log:
+            return log.read()
 
     def _spawn_process(self, cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
         """Spawn the worker subprocess with output routing."""
@@ -523,6 +654,7 @@ class Worker:
             else:
                 log_path = os.path.join(tempfile.gettempdir(), f"smg-worker-{safe_name}.log")
             self._log_file = open(log_path, "w", encoding="utf-8")
+            self.log_path = log_path
             stdout_target = self._log_file
             stderr_target = subprocess.STDOUT
 
@@ -597,6 +729,9 @@ def start_workers(
     wait_ready: bool = True,
     gpus: int | None = None,
     extra_engine_args: list[str] | None = None,
+    tp: int | None = None,
+    kv_backend: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> list[Worker]:
     """Start N workers for a model. GPU IDs assigned sequentially.
 
@@ -614,6 +749,10 @@ def start_workers(
             If False, spawn processes and return immediately.
         gpus: GPUs per worker; defaults to the model spec's tp (e.g. DP needs dp*tp).
         extra_engine_args: Extra CLI args appended to the engine launch command.
+        tp: Tensor-parallel size for these workers; defaults to the model
+            spec's tp. Also sizes the GPU slice unless ``gpus`` says otherwise.
+        kv_backend: KV transfer backend for PD workers ("nixl" or
+            "mooncake"); defaults to the lane's setting.
 
     Returns:
         List of started Worker instances.
@@ -625,7 +764,7 @@ def start_workers(
         engine = get_runtime()
 
     spec = get_model_spec(model_id)
-    gpus_per_worker = gpus or spec.get("tp", 1)
+    gpus_per_worker = gpus or tp or spec.get("tp", 1)
     if gpus is None and mode == ConnectionMode.ZMQ:
         # A grouped ZMQ worker launches get_zmq_engine_count() engines, each
         # tp-wide, in one process — size its GPU slice accordingly. vLLM and
@@ -676,6 +815,9 @@ def start_workers(
                 dist_init_port=dist_init_port,
                 log_dir=log_dir,
                 extra_engine_args=extra_engine_args,
+                tp=tp,
+                kv_backend=kv_backend,
+                extra_env=extra_env,
             )
 
             # Stagger launches to avoid resource contention

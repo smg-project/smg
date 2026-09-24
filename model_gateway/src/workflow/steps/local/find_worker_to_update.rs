@@ -9,8 +9,8 @@ use crate::workflow::data::WorkerUpdateWorkflowData;
 
 /// Step to find workers to update based on URL.
 ///
-/// For DP-aware workers, finds all workers with matching URL prefix.
-/// For regular workers, finds the single worker with exact URL match.
+/// A DP rank URL selects that rank. Other updates use an exact registered
+/// URL lookup.
 pub struct FindWorkerToUpdateStep;
 
 #[async_trait]
@@ -31,14 +31,9 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
             find_workers_by_url(&app_context.worker_registry, worker_url, dp_aware);
 
         if workers_to_update.is_empty() {
-            let error_msg = if dp_aware {
-                format!("No workers found with prefix {worker_url}@")
-            } else {
-                format!("Worker {worker_url} not found")
-            };
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("find_worker_to_update"),
-                message: error_msg,
+                message: format!("Worker {worker_url} not found"),
             });
         }
 

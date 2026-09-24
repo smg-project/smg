@@ -18,6 +18,272 @@ use tower::ServiceExt;
 use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 
 #[cfg(test)]
+mod dp_removal_tests {
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, WorkerStatus, WorkerType};
+    use smg::{
+        app_context::AppContext,
+        config::RouterConfig,
+        routers::http::router::Router as HttpRouter,
+        worker::{BasicWorkerBuilder, Worker},
+        workflow::create_worker_removal_workflow_data,
+    };
+    use wfaas::WorkflowId;
+
+    use super::*;
+    use crate::common::{create_test_context, test_app::create_test_app_with_context};
+
+    fn register(
+        context: &AppContext,
+        url: &str,
+        worker_type: WorkerType,
+        rank: Option<usize>,
+    ) -> Arc<dyn Worker> {
+        let builder = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .connection_mode(if url.starts_with("grpc://") {
+                ConnectionMode::Grpc
+            } else {
+                ConnectionMode::Http
+            })
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                drain_settle_secs: 0,
+                ..Default::default()
+            });
+        let builder = match rank {
+            Some(rank) => builder.dp_config(rank, 2),
+            None => builder,
+        };
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
+        context
+            .worker_registry
+            .register(Arc::clone(&worker))
+            .unwrap();
+        worker
+    }
+
+    async fn delete_via_api(app: &axum::Router, context: &AppContext, url: &str) {
+        let id = context.worker_registry.get_id_by_url(url).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/workers/{}", id.as_str()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        // 202 only acknowledges submission. Wait for actual registry removal.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while context.worker_registry.get(&id).is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("accepted DELETE did not remove the worker");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/workers/{}", id.as_str()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_removes_plain_worker_and_individual_rank_in_mixed_pd_fleet() {
+        for (plain_type, dp_type) in [
+            (WorkerType::Prefill, WorkerType::Decode),
+            (WorkerType::Decode, WorkerType::Prefill),
+        ] {
+            let context = create_test_context(RouterConfig {
+                dp_aware: true,
+                disable_load_monitoring: true,
+                ..Default::default()
+            })
+            .await;
+            let plain = register(&context, "http://plain:30000", plain_type, None);
+            plain.set_status(WorkerStatus::Failed);
+            let rank0 = register(&context, "http://expanded:30000", dp_type, Some(0));
+            let rank1 = register(&context, "http://expanded:30000", dp_type, Some(1));
+            let router = Arc::new(HttpRouter::new(&context).await.unwrap());
+            let app = create_test_app_with_context(router, Arc::clone(&context));
+
+            delete_via_api(&app, &context, plain.url()).await;
+            assert!(context.worker_registry.get_by_url(rank0.url()).is_some());
+            assert!(context.worker_registry.get_by_url(rank1.url()).is_some());
+
+            delete_via_api(&app, &context, rank0.url()).await;
+            assert!(context.worker_registry.get_by_url(rank1.url()).is_some());
+            assert_eq!(context.worker_registry.len(), 1);
+        }
+    }
+
+    /// Snapshot `(worker id, revision)` for each worker, as discovery does.
+    fn guards(context: &AppContext, workers: &[&Arc<dyn Worker>]) -> HashMap<String, u64> {
+        workers
+            .iter()
+            .map(|worker| {
+                let id = context
+                    .worker_registry
+                    .get_id_by_url(worker.url())
+                    .expect("worker is registered");
+                (id.as_str().to_string(), worker.revision())
+            })
+            .collect()
+    }
+
+    async fn run_removal(
+        context: &Arc<AppContext>,
+        url: &str,
+        expected_revisions: Option<HashMap<String, u64>>,
+    ) -> Result<String, String> {
+        let engine = &context.workflow_engines.get().unwrap().worker_removal;
+        let data = create_worker_removal_workflow_data(
+            url.to_string(),
+            expected_revisions,
+            Arc::clone(context),
+        );
+        let instance = engine
+            .start_workflow(WorkflowId::new("worker_removal"), data)
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(instance, url, Duration::from_secs(10))
+            .await
+    }
+
+    /// A DP group collapses to one removal job but holds independent
+    /// revisions per rank. Guarding it with a single revision retained only
+    /// the ranks that happened to share that value and silently left the
+    /// others registered against a Pod that was already gone. Per-rank
+    /// guards drain the ranks still at their observed revision and skip only
+    /// the one that moved.
+    #[tokio::test]
+    async fn dp_group_removal_skips_only_the_rank_whose_revision_moved() {
+        let context = create_test_context(RouterConfig {
+            dp_aware: true,
+            disable_load_monitoring: true,
+            ..Default::default()
+        })
+        .await;
+        let base = "http://worker:30000".to_string();
+        let rank0 = register(&context, &base, WorkerType::Decode, Some(0));
+        let rank1 = register(&context, &base, WorkerType::Decode, Some(1));
+
+        // Both ranks sit at the same revision, which is exactly the case a
+        // scalar guard could not distinguish. Claim rank1 moved on since the
+        // snapshot; rank0 is still current.
+        let mut expected = guards(&context, &[&rank0]);
+        let rank1_id = context
+            .worker_registry
+            .get_id_by_url(rank1.url())
+            .expect("rank1 is registered");
+        expected.insert(rank1_id.as_str().to_string(), rank1.revision() + 1);
+
+        run_removal(&context, "worker:30000", Some(expected))
+            .await
+            .unwrap();
+
+        assert!(
+            context.worker_registry.get_by_url(rank0.url()).is_none(),
+            "the rank still at its observed revision must drain"
+        );
+        assert!(
+            context.worker_registry.get_by_url(rank1.url()).is_some(),
+            "the rank whose revision moved must be skipped, not dropped"
+        );
+    }
+
+    /// A rank registered after the snapshot has no guard entry at all, so it
+    /// is a different incarnation and must be left for the next pass.
+    #[tokio::test]
+    async fn dp_group_removal_leaves_ranks_absent_from_the_snapshot() {
+        let context = create_test_context(RouterConfig {
+            dp_aware: true,
+            disable_load_monitoring: true,
+            ..Default::default()
+        })
+        .await;
+        let base = "http://worker:30000".to_string();
+        let rank0 = register(&context, &base, WorkerType::Decode, Some(0));
+        let rank1 = register(&context, &base, WorkerType::Decode, Some(1));
+
+        // Snapshot rank0 only, as if rank1 appeared afterwards.
+        run_removal(&context, "worker:30000", Some(guards(&context, &[&rank0])))
+            .await
+            .unwrap();
+
+        assert!(context.worker_registry.get_by_url(rank0.url()).is_none());
+        assert!(
+            context.worker_registry.get_by_url(rank1.url()).is_some(),
+            "an unguarded rank is a later incarnation and must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_removal_resolves_plain_and_dp_groups_without_global_dp_setting() {
+        for dp_aware in [false, true] {
+            for scheme in ["http", "grpc"] {
+                let context = create_test_context(RouterConfig {
+                    dp_aware,
+                    disable_load_monitoring: true,
+                    ..Default::default()
+                })
+                .await;
+                let base = format!("{scheme}://worker:30000");
+                let plain = register(&context, &base, WorkerType::Prefill, None);
+                let rank0 = register(&context, &base, WorkerType::Decode, Some(0));
+                let rank1 = register(&context, &base, WorkerType::Decode, Some(1));
+                let other = register(
+                    &context,
+                    &format!("{scheme}://worker:30001"),
+                    WorkerType::Prefill,
+                    None,
+                );
+
+                // A mismatched revision must preserve every current registration.
+                let stale: HashMap<String, u64> = guards(&context, &[&plain, &rank0, &rank1])
+                    .into_iter()
+                    .map(|(id, revision)| (id, revision + 1))
+                    .collect();
+                run_removal(&context, "worker:30000", Some(stale))
+                    .await
+                    .unwrap();
+                assert_eq!(context.worker_registry.len(), 4);
+
+                let current = guards(&context, &[&plain, &rank0, &rank1]);
+                run_removal(&context, "worker:30000", Some(current))
+                    .await
+                    .unwrap();
+                for removed in [plain, rank0, rank1] {
+                    assert!(context.worker_registry.get_by_url(removed.url()).is_none());
+                }
+                assert!(context.worker_registry.get_by_url(other.url()).is_some());
+                assert_eq!(context.worker_registry.len(), 1);
+
+                // Discovery removal is idempotent; an explicit missing target errors.
+                run_removal(&context, "worker:30000", Some(HashMap::new()))
+                    .await
+                    .unwrap();
+                assert!(run_removal(&context, "worker:30000", None).await.is_err());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod worker_management_tests {
     use super::*;
 

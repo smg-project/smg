@@ -85,13 +85,8 @@ pub const PROFILE_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_
 /// exactly when streams are mass-dropped (clients time out and disconnect).
 pub const ABORT_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Shared admin-op implementations (`flush_cache`, `start_profile`,
-/// `stop_profile`) for engine clients whose protos expose the common
-/// admin RPCs (request/response messages live in `common.proto`).
-///
-/// Every call enforces a local deadline so an unresponsive backend cannot
-/// hang the gateway, and injects trace context for distributed tracing.
-macro_rules! impl_admin_ops {
+/// Shared cache-flush RPC with tracing and a bounded local deadline.
+macro_rules! impl_flush_cache {
     () => {
         /// Flush the KV cache on the backend scheduler.
         ///
@@ -120,6 +115,14 @@ macro_rules! impl_admin_ops {
                 })??;
             Ok(response.into_inner())
         }
+    };
+}
+pub(crate) use impl_flush_cache;
+
+/// Shared admin RPCs for engines supporting both cache flush and profiling.
+macro_rules! impl_admin_ops {
+    () => {
+        $crate::impl_flush_cache!();
 
         /// Start the profiler on the backend scheduler.
         pub async fn start_profile(

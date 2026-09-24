@@ -1,9 +1,19 @@
 name: 'Setup TokenSpeed Backend'
-description: 'Create Python venv and install TokenSpeed (engine + kernel + scheduler) from source.'
+description: 'Create Python venv and install TokenSpeed (engine + kernel + scheduler), from the prebuilt CI image when available, from source otherwise.'
 
 runs:
   using: 'composite'
   steps:
+    # Extracts the baked venv + checkout onto the bare runner and exports
+    # SMG_BAKED_VENV for the venv step below. Tolerant: any failure logs and
+    # leaves the source-build path to run instead.
+    - name: Fetch prebuilt TokenSpeed
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_ACTOR: ${{ github.actor }}
+      run: bash scripts/ci_fetch_tokenspeed_prebuilt.sh
+
     - name: Setup Python venv
       shell: bash
       run: bash scripts/ci_setup_python_venv.sh

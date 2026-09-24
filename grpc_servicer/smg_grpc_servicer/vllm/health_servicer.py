@@ -44,6 +44,7 @@ class VllmHealthServicer(health_pb2_grpc.HealthServicer):
         """
         self.async_llm = async_llm
         self._shutting_down = False
+        self._failure_logged = False
         logger.info("Standard gRPC health service initialized")
 
     def set_not_serving(self):
@@ -67,24 +68,20 @@ class VllmHealthServicer(health_pb2_grpc.HealthServicer):
             HealthCheckResponse with SERVING/NOT_SERVING/SERVICE_UNKNOWN status
         """
         service_name = request.service
-        logger.debug(f"Health check request for service: '{service_name}'")
 
         if self._shutting_down:
-            logger.debug("Health check: Server is shutting down")
             return health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.NOT_SERVING)
 
         if service_name in (self.OVERALL_SERVER, self.VLLM_SERVICE):
             try:
                 await self.async_llm.check_health()
-                logger.debug(f"Health check for '{service_name}': SERVING")
                 return health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.SERVING)
             except Exception:
-                logger.exception("Health check failed for service '%s'", service_name)
+                self._log_failure_once(service_name)
                 return health_pb2.HealthCheckResponse(
                     status=health_pb2.HealthCheckResponse.NOT_SERVING
                 )
 
-        logger.debug(f"Health check for unknown service: '{service_name}'")
         context.set_code(grpc.StatusCode.NOT_FOUND)
         context.set_details(f"Unknown service: {service_name}")
         return health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.SERVICE_UNKNOWN)
@@ -108,7 +105,6 @@ class VllmHealthServicer(health_pb2_grpc.HealthServicer):
             HealthCheckResponse messages
         """
         service_name = request.service
-        logger.debug(f"Health watch request for service: '{service_name}'")
 
         # Inline status computation to avoid Check()'s context.set_code()
         # side effect, which would incorrectly set the RPC status on the
@@ -121,11 +117,19 @@ class VllmHealthServicer(health_pb2_grpc.HealthServicer):
                 await self.async_llm.check_health()
                 status = health_pb2.HealthCheckResponse.SERVING
             except Exception:
-                logger.debug(
-                    "Health watch check failed for service '%s'",
-                    service_name,
-                    exc_info=True,
-                )
+                self._log_failure_once(service_name)
                 status = health_pb2.HealthCheckResponse.NOT_SERVING
 
         yield health_pb2.HealthCheckResponse(status=status)
+
+    def _log_failure_once(self, service_name: str) -> None:
+        """Record the first refused probe and stay quiet about the rest.
+
+        Probes arrive on a fixed interval for as long as the pod lives, and an
+        engine that fails this check does not recover, so every later probe
+        would repeat the same traceback and bury the one that explains it.
+        """
+        if self._failure_logged:
+            return
+        self._failure_logged = True
+        logger.exception("Health check is now failing for service '%s'", service_name)

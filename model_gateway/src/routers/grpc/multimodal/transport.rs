@@ -20,6 +20,7 @@ use openai_protocol::worker::TransportMode;
 use smg_mm_rdma::{RdmaConfig, RdmaExporter};
 use tracing::{error, info, warn};
 
+use super::settings::mm_settings;
 use crate::routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable};
 
 const DEFAULT_SHM_MIN_BYTES: usize = 64 * 1024;
@@ -179,7 +180,8 @@ const MAX_RDMA_ARENA_BYTES: usize = 8 * 1024 * 1024 * 1024;
 /// A const rather than an env knob: it only ever widens the lost-notif leak window
 /// (a capacity nit, never correctness -- the crate's per-lease gen framing makes a
 /// recycled-under-read slot detectable independent of the TTL), and 30s dwarfs any
-/// Encode-RPC delivery jitter. `SMG_RDMA_SLOT_TTL_S` remains the full-TTL override.
+/// Encode-RPC delivery jitter. `--rdma-slot-ttl-s` / `SMG_RDMA_SLOT_TTL_S` remains
+/// the full-TTL override.
 const RDMA_SLOT_TTL_SLACK: Duration = Duration::from_secs(30);
 
 /// Process-wide RDMA pixel exporter, built lazily on first use from env-derived
@@ -198,7 +200,7 @@ pub(crate) fn mm_rdma_exporter() -> Option<&'static RdmaExporter> {
                 // exchange, so every export would fall back to inline anyway. Skip
                 // building the NIXL agent + (2 GiB default) arena for nothing.
                 warn!(
-                    "EPD RDMA: lane enabled but SMG_RDMA_LISTEN_IP is unset; staying on the inline path"
+                    "EPD RDMA: lane enabled but no listener IP (--rdma-listen-ip / SMG_RDMA_LISTEN_IP); staying on the inline path"
                 );
                 return None;
             }
@@ -215,13 +217,9 @@ pub(crate) fn mm_rdma_exporter() -> Option<&'static RdmaExporter> {
 
 /// Whether the RDMA pixel lane is active: the first-class `TransportMode::Rdma`
 /// (`--multimodal-tensor-transport rdma` / `SMG_MM_TENSOR_TRANSPORT=rdma`), with
-/// the legacy `SMG_MM_PIXEL_RDMA` env as a backward-compatible fallback.
+/// the legacy `--mm-pixel-rdma` / `SMG_MM_PIXEL_RDMA` switch as a fallback.
 fn rdma_lane_enabled() -> bool {
-    mm_transport_defaults().mode == TransportMode::Rdma
-        || matches!(
-            std::env::var("SMG_MM_PIXEL_RDMA").as_deref(),
-            Ok("1") | Ok("true")
-        )
+    mm_transport_defaults().mode == TransportMode::Rdma || mm_settings().pixel_rdma.value
 }
 
 /// Build the exporter config from the `SMG_RDMA_*` env knobs. All RDMA policy lives
@@ -239,7 +237,11 @@ fn build_rdma_config_from_env() -> RdmaConfig {
         // Empty listener IP => the exporter cannot do the cross-node metadata
         // exchange, so the caller stays on the inline path (checked before we build
         // the exporter in `mm_rdma_exporter`).
-        listen_ip: std::env::var("SMG_RDMA_LISTEN_IP").unwrap_or_default(),
+        listen_ip: mm_settings()
+            .rdma_listen_ip
+            .value
+            .clone()
+            .unwrap_or_default(),
         listen_port: rdma_env_parse("SMG_RDMA_LISTEN_PORT", 18515),
         agent_name: RDMA_GATEWAY_AGENT_NAME.to_string(),
         pool_slots,
@@ -282,16 +284,15 @@ fn worker_max_hold() -> Duration {
 /// force-reclaims it. MUST exceed [`worker_max_hold`] or the TTL races a still-valid
 /// READ: the reaper frees the slot, the next image re-leases the SAME address, and
 /// the late READ silently returns the WRONG image's pixels. Derived by default
-/// (= `worker_max_hold` + [`RDMA_SLOT_TTL_SLACK`]); `SMG_RDMA_SLOT_TTL_S` overrides,
-/// but an override that does not exceed the hold is rejected (see [`resolve_slot_ttl`]).
+/// (= `worker_max_hold` + [`RDMA_SLOT_TTL_SLACK`]); `--rdma-slot-ttl-s` /
+/// `SMG_RDMA_SLOT_TTL_S` overrides, but an override that does not exceed the hold is
+/// rejected (see [`resolve_slot_ttl`]).
 fn derive_rdma_slot_ttl() -> Duration {
-    let override_secs = std::env::var("SMG_RDMA_SLOT_TTL_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
-    resolve_slot_ttl(override_secs, worker_max_hold())
+    resolve_slot_ttl(mm_settings().rdma_slot_ttl_s.value, worker_max_hold())
 }
 
-/// Apply the TTL invariant to an optional `SMG_RDMA_SLOT_TTL_S` override: honor it
+/// Apply the TTL invariant to an optional `--rdma-slot-ttl-s` / `SMG_RDMA_SLOT_TTL_S`
+/// override: honor it
 /// only if it strictly exceeds `hold` (otherwise the reaper could reclaim a slot the
 /// worker is still READing and cross-wire images). A too-small override is ignored
 /// with a warning in favor of the derived `hold + RDMA_SLOT_TTL_SLACK`. Pure (takes
@@ -305,7 +306,7 @@ fn resolve_slot_ttl(override_secs: Option<u64>, hold: Duration) -> Duration {
         warn!(
             ttl_s = secs,
             hold_s = hold.as_secs(),
-            "SMG_RDMA_SLOT_TTL_S must exceed the worker's max hold; ignoring override"
+            "--rdma-slot-ttl-s / SMG_RDMA_SLOT_TTL_S must exceed the worker's max hold; ignoring override"
         );
     }
     hold + RDMA_SLOT_TTL_SLACK
@@ -359,6 +360,33 @@ fn primary_worker(workers: Option<&WorkerSelection>) -> Option<&Arc<dyn crate::w
             .map(|assignment| &assignment.worker)
             .or(Some(prefill)),
     }
+}
+
+/// The wire dtype for the vLLM encoder input.
+///
+/// Defaults to float32 rather than to the narrower width the TokenSpeed path
+/// prefers: a worker only reads the bytes at the width it already knows, so the
+/// router keeps sending the widest one until it is told the other end reads
+/// something else.
+pub(super) fn mm_vllm_encoder_input_dtype(workers: Option<&WorkerSelection>) -> String {
+    resolve_mm_vllm_encoder_input_dtype(
+        mm_vllm_encoder_input_dtype_from_env(),
+        mm_encoder_input_dtype_from_worker(workers),
+    )
+}
+
+fn resolve_mm_vllm_encoder_input_dtype(
+    override_dtype: Option<String>,
+    worker_dtype: Option<String>,
+) -> String {
+    override_dtype
+        .or(worker_dtype)
+        .unwrap_or_else(|| "float32".to_string())
+}
+
+fn mm_vllm_encoder_input_dtype_from_env() -> Option<String> {
+    static DTYPE: OnceLock<Option<String>> = OnceLock::new();
+    cached_env_dtype(&DTYPE, "SMG_VLLM_ENCODER_INPUT_DTYPE")
 }
 
 pub(super) fn mm_encoder_input_dtype(
@@ -559,6 +587,26 @@ mod tests {
             "bfloat16"
         );
         assert_eq!(resolve_mm_encoder_input_dtype(None, None, None), "bfloat16");
+    }
+
+    /// The vLLM wire starts from the widest dtype and narrows only when asked,
+    /// the opposite of the TokenSpeed default above. A worker reads the bytes at
+    /// whatever width it knows, so guessing a narrower one turns every media
+    /// request against an older worker into a failure or worse.
+    #[test]
+    fn vllm_dtype_stays_float32_until_something_asks_for_narrower() {
+        assert_eq!(resolve_mm_vllm_encoder_input_dtype(None, None), "float32");
+        assert_eq!(
+            resolve_mm_vllm_encoder_input_dtype(None, Some("bfloat16".to_string())),
+            "bfloat16"
+        );
+        assert_eq!(
+            resolve_mm_vllm_encoder_input_dtype(
+                Some("float16".to_string()),
+                Some("bfloat16".to_string()),
+            ),
+            "float16"
+        );
     }
 
     /// The derived slot TTL must strictly exceed the worker's max hold, so the

@@ -22,7 +22,7 @@ from infra import (
     get_zmq_engine_count,
 )
 
-from .markers import resolve_class_marker
+from .markers import model_id_for_engine, resolve_class_marker
 
 # Local wires a plain (non-PD/EPD) test case can be authored with; these are the
 # only backends a ZMQ lane reuses (mapped onto ZMQ by the ``setup_backend``
@@ -131,7 +131,7 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     # H100), so gpt-oss dies at model load on CI's H100 runners.
     if current_runtime == "tokenspeed":
         model_marker = resolve_class_marker(item, "model")
-        if model_marker and model_marker.args and "gpt-oss" in str(model_marker.args[0]):
+        if "gpt-oss" in str(model_id_for_engine(model_marker, current_runtime, default="")):
             pytest.skip("tokenspeed cannot load gpt-oss on H100 (tokenspeed#1036)")
 
 
@@ -225,7 +225,7 @@ def _filter_tokenspeed_dp_items(
     deselected: list[pytest.Item] = []
     for item in items:
         marker = resolve_class_marker(item, "model")
-        model = str(marker.args[0]) if marker is not None and marker.args else ""
+        model = str(model_id_for_engine(marker, "tokenspeed", default=""))
         (deselected if model in _TOKENSPEED_DP_BROKEN_MODELS else kept).append(item)
     return kept, deselected
 
@@ -424,9 +424,7 @@ def _pool_sort_key(item: pytest.Item) -> tuple:
         backend = str(params.get("setup_backend", params.get("backend_router", "")))
 
     model_marker = resolve_class_marker(item, "model")
-    model = ""
-    if model_marker is not None and model_marker.args:
-        model = str(model_marker.args[0])
+    model = str(model_id_for_engine(model_marker, get_runtime(), default=""))
 
     return (backend, model, item.nodeid)
 

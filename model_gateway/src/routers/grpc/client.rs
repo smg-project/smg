@@ -306,7 +306,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client.flush_cache(timeout_s).await,
             Self::TokenSpeed(client) => client.flush_cache(timeout_s).await,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+            Self::Vllm(client) => client.flush_cache(timeout_s).await,
+            Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "FlushCache RPC not supported for this backend",
             )),
         }
@@ -361,7 +362,7 @@ impl GrpcClient {
             Self::Sglang(client) => Ok(ServerInfo::Sglang(Box::new(
                 client.get_server_info().await?,
             ))),
-            Self::Vllm(client) => Ok(ServerInfo::Vllm(client.get_server_info().await?)),
+            Self::Vllm(client) => Ok(ServerInfo::Vllm(Box::new(client.get_server_info().await?))),
             Self::Trtllm(client) => Ok(ServerInfo::Trtllm(client.get_server_info().await?)),
             Self::Mlx(client) => Ok(ServerInfo::Mlx(client.get_server_info().await?)),
             Self::TokenSpeed(client) => Ok(ServerInfo::TokenSpeed(Box::new(
@@ -501,7 +502,7 @@ impl GrpcClient {
             }
             Self::Vllm(_) => {
                 let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Vllm(data) => data.into_proto(),
+                    MultimodalData::Vllm(data) => data.into_protos(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_vllm_request(vllm_mm, |mm| {
@@ -593,7 +594,7 @@ impl GrpcClient {
             }
             Self::Vllm(_) => {
                 let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Vllm(data) => data.into_proto(),
+                    MultimodalData::Vllm(data) => data.into_protos(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_vllm_request(vllm_mm, |mm| {
@@ -779,7 +780,7 @@ pub enum ModelInfo {
 
 pub enum ServerInfo {
     Sglang(Box<smg_grpc_client::sglang_proto::GetServerInfoResponse>),
-    Vllm(smg_grpc_client::vllm_proto::GetServerInfoResponse),
+    Vllm(Box<smg_grpc_client::vllm_proto::GetServerInfoResponse>),
     Trtllm(smg_grpc_client::trtllm_proto::GetServerInfoResponse),
     Mlx(smg_grpc_client::mlx_proto::GetServerInfoResponse),
     TokenSpeed(Box<smg_grpc_client::tokenspeed_proto::GetServerInfoResponse>),
@@ -852,24 +853,51 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     "is_embedding",
     "vocab_size",
     "weight_version",
+    // PD pairing protocol: the transport and KV layout a prefill and a decode
+    // must share for a handoff to work (the engines validate TP themselves).
+    "disaggregation_transfer_backend",
+    "disaggregation_bootstrap_port",
+    "kv_cache_dtype",
+    "page_size",
+    "attention_backend",
+    // The operator's explicit protocol, which the servicer reads from the
+    // engine's SMG_PAIRING_PROTOCOL environment.
+    "pairing_protocol",
 ];
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
 /// names, not `_path` variants — TokenSpeed dropped the legacy suffixes).
+/// TokenSpeed spells its parallelism `attn_tp_size` / `pipeline_parallel_size`
+/// / `data_parallel_size`; `normalize_grpc_keys` folds those into the
+/// canonical `tp_size` / `pp_size` / `dp_size`.
 const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "model",
     "served_model_name",
     "tokenizer",
     "tp_size",
+    "attn_tp_size",
     "dp_size",
+    "data_parallel_size",
     "pp_size",
+    "pipeline_parallel_size",
     "context_length",
     "max_total_tokens",
+    // TokenSpeed's spelling of the scheduler's running window; the fleet
+    // capacity accounting and the PD admission gate read either name.
+    "max_num_seqs",
     "max_running_requests",
     "load_balance_method",
     "is_embedding",
     "vocab_size",
     "weight_version",
+    // PD pairing protocol (see SGLANG_GRPC_KEYS). TokenSpeed has no page
+    // size: its KV layout is the cache contract exchanged at rendezvous.
+    "disaggregation_mode",
+    "disaggregation_transfer_backend",
+    "disaggregation_bootstrap_port",
+    "kv_cache_dtype",
+    "attention_backend",
+    "pairing_protocol",
 ];
 
 // ---------------------------------------------------------------------------
@@ -982,6 +1010,18 @@ mod tests {
                     ("tokenizer".to_string(), string_value("Qwen/Qwen3-8B")),
                     ("tp_size".to_string(), number_value(2.0)),
                     ("max_total_tokens".to_string(), number_value(8192.0)),
+                    ("disaggregation_mode".to_string(), string_value("prefill")),
+                    (
+                        "disaggregation_transfer_backend".to_string(),
+                        string_value("mooncake"),
+                    ),
+                    (
+                        "disaggregation_bootstrap_port".to_string(),
+                        number_value(8998.0),
+                    ),
+                    ("kv_cache_dtype".to_string(), string_value("auto")),
+                    ("attention_backend".to_string(), string_value("flashinfer")),
+                    ("pipeline_parallel_size".to_string(), number_value(2.0)),
                     // Not in TOKENSPEED_GRPC_KEYS — must not become a label.
                     ("host".to_string(), string_value("127.0.0.1")),
                 ]),
@@ -1014,6 +1054,36 @@ mod tests {
         );
         assert_eq!(labels.get("version").map(String::as_str), Some("0.1.0"));
         assert!(!labels.contains_key("host"));
+        // The pairing-protocol facts survive, under the engine's own names;
+        // the discovery step canonicalises the parallelism spellings.
+        assert_eq!(
+            labels.get("disaggregation_mode").map(String::as_str),
+            Some("prefill")
+        );
+        assert_eq!(
+            labels
+                .get("disaggregation_transfer_backend")
+                .map(String::as_str),
+            Some("mooncake")
+        );
+        assert_eq!(
+            labels
+                .get("disaggregation_bootstrap_port")
+                .map(String::as_str),
+            Some("8998")
+        );
+        assert_eq!(
+            labels.get("kv_cache_dtype").map(String::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            labels.get("attention_backend").map(String::as_str),
+            Some("flashinfer")
+        );
+        assert_eq!(
+            labels.get("pipeline_parallel_size").map(String::as_str),
+            Some("2")
+        );
         // scheduler_info and transient runtime state never become labels.
         assert!(!labels.contains_key("status"));
         assert!(!labels.contains_key("active_requests"));
@@ -1033,6 +1103,18 @@ mod tests {
                             kind: Some(prost_types::value::Kind::BoolValue(false)),
                         },
                     ),
+                    (
+                        "disaggregation_transfer_backend".to_string(),
+                        string_value("nixl"),
+                    ),
+                    (
+                        "disaggregation_bootstrap_port".to_string(),
+                        number_value(8998.0),
+                    ),
+                    ("kv_cache_dtype".to_string(), string_value("fp8_e5m2")),
+                    ("page_size".to_string(), number_value(64.0)),
+                    ("attention_backend".to_string(), string_value("fa3")),
+                    ("pairing_protocol".to_string(), string_value("kv-v1")),
                     // Not in SGLANG_GRPC_KEYS — must not become a label.
                     ("api_key".to_string(), string_value("secret")),
                 ]),
@@ -1055,6 +1137,33 @@ mod tests {
         );
         assert_eq!(labels.get("version").map(String::as_str), Some("0.4.0"));
         assert!(!labels.contains_key("api_key"));
+        // The pairing-protocol facts survive: transport, bootstrap port, KV layout.
+        assert_eq!(
+            labels
+                .get("disaggregation_transfer_backend")
+                .map(String::as_str),
+            Some("nixl")
+        );
+        assert_eq!(
+            labels
+                .get("disaggregation_bootstrap_port")
+                .map(String::as_str),
+            Some("8998")
+        );
+        assert_eq!(
+            labels.get("kv_cache_dtype").map(String::as_str),
+            Some("fp8_e5m2")
+        );
+        assert_eq!(labels.get("page_size").map(String::as_str), Some("64"));
+        assert_eq!(
+            labels.get("attention_backend").map(String::as_str),
+            Some("fa3")
+        );
+        // The explicit protocol the servicer read from the engine's environment.
+        assert_eq!(
+            labels.get("pairing_protocol").map(String::as_str),
+            Some("kv-v1")
+        );
     }
 
     /// `GetModelInfoResponse` is flat for every backend, so it serializes via

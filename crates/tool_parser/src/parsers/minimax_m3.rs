@@ -135,6 +135,30 @@ impl MinimaxM3Parser {
             .max()
     }
 
+    /// Whether a buffered tool-call wrapper can still become a valid invoke.
+    ///
+    /// Whitespace is allowed between the wrapper and the invoke marker. Once
+    /// the first non-whitespace bytes diverge from that marker, later input
+    /// cannot turn the candidate into a tool call.
+    fn could_start_invoke(buffer: &str) -> bool {
+        let Some(after_wrapper) = buffer.strip_prefix(TOOL_CALL_START) else {
+            return false;
+        };
+        let candidate = after_wrapper.trim_start();
+        if candidate.is_empty() || INVOKE_START.starts_with(candidate) {
+            return true;
+        }
+
+        let Some(after_invoke) = candidate.strip_prefix(INVOKE_START) else {
+            return false;
+        };
+        after_invoke.is_empty()
+            || after_invoke
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace() || c == '>')
+    }
+
     /// Decode common XML entities.
     fn decode_xml_entities(text: &str) -> String {
         text.replace("&lt;", "<")
@@ -172,8 +196,14 @@ impl MinimaxM3Parser {
 
     /// Parse the body of one element (recursively), returning its value and the
     /// number of bytes consumed up to and including the matching close tag.
-    /// `name` is the element name whose close tag terminates this body.
-    fn parse_element_body(input: &str, name: &str) -> Option<(ParamValue, usize)> {
+    /// An empty schema-declared container may omit its close immediately before
+    /// its parent closes; in that case the parent marker remains unconsumed.
+    fn parse_element_body(
+        input: &str,
+        name: &str,
+        schema: Option<&Value>,
+        parent_name: Option<&str>,
+    ) -> Option<(ParamValue, usize)> {
         let close_tag = format!("{ELEMENT_END_START}{name}>");
         let mut pos = 0;
         let mut text = String::new();
@@ -192,9 +222,21 @@ impl MinimaxM3Parser {
                 pos += close_tag.len();
                 break;
             }
+            if text.trim().is_empty()
+                && children.is_empty()
+                && matches!(Self::schema_type(schema), Some("array" | "object"))
+                && parent_name.is_some_and(|parent| {
+                    rest.starts_with(&format!("{ELEMENT_END_START}{parent}>"))
+                })
+            {
+                // The parent consumes its own close; the empty child's close
+                // was omitted by the model.
+                break;
+            }
             if rest.starts_with(ELEMENT_START) {
                 // Child element.
-                let (child_name, child_value, consumed) = Self::parse_element(rest)?;
+                let (child_name, child_value, consumed) =
+                    Self::parse_element(rest, schema, Some(name))?;
                 children.push((child_name, child_value));
                 pos += consumed;
                 continue;
@@ -217,7 +259,11 @@ impl MinimaxM3Parser {
 
     /// Parse a complete element starting at `input` (which must begin with
     /// `]<]minimax[>[<name>`). Returns `(name, value, consumed_bytes)`.
-    fn parse_element(input: &str) -> Option<(String, ParamValue, usize)> {
+    fn parse_element(
+        input: &str,
+        parent_schema: Option<&Value>,
+        parent_name: Option<&str>,
+    ) -> Option<(String, ParamValue, usize)> {
         let after_start = input.strip_prefix(ELEMENT_START)?;
         let gt = after_start.find('>')?;
         let name = after_start[..gt].trim().to_string();
@@ -225,7 +271,15 @@ impl MinimaxM3Parser {
             return None;
         }
         let body_start = ELEMENT_START.len() + gt + 1;
-        let (value, body_consumed) = Self::parse_element_body(&input[body_start..], &name)?;
+        let parent_schema = Self::container_schema(parent_schema).or(parent_schema);
+        let schema = if Self::schema_type(parent_schema) == Some("array") {
+            parent_schema.and_then(|schema| schema.get("items"))
+        } else {
+            Self::property_schema(parent_schema, &name)
+        };
+        let schema = Self::container_schema(schema).or(schema);
+        let (value, body_consumed) =
+            Self::parse_element_body(&input[body_start..], &name, schema, parent_name)?;
         Some((name, value, body_start + body_consumed))
     }
 
@@ -244,10 +298,86 @@ impl MinimaxM3Parser {
         schema?.get("type")?.as_str()
     }
 
+    /// Resolve a direct container or a transparent composition wrapper.
+    /// Nullable unions must have exactly one container branch; scalar/unknown
+    /// alternatives are ambiguous. Only singleton allOf wrappers are unwrapped:
+    /// choosing one of several conjuncts would discard the others' constraints.
+    fn container_schema(schema: Option<&Value>) -> Option<&Value> {
+        let schema = schema?;
+        if schema.get("type").is_some() {
+            return matches!(Self::schema_type(Some(schema)), Some("array" | "object"))
+                .then_some(schema);
+        }
+
+        let mut compositions = ["oneOf", "anyOf", "allOf"]
+            .into_iter()
+            .filter_map(|key| schema.get(key).map(|branches| (key, branches)));
+        let (keyword, branches) = compositions.next()?;
+        if compositions.next().is_some() {
+            return None;
+        }
+        // Unwrapping must not drop sibling validation or structural keywords.
+        if schema.as_object()?.keys().any(|key| {
+            key != keyword
+                && !matches!(
+                    key.as_str(),
+                    "title"
+                        | "description"
+                        | "default"
+                        | "examples"
+                        | "deprecated"
+                        | "readOnly"
+                        | "writeOnly"
+                        | "$comment"
+                )
+        }) {
+            return None;
+        }
+        let branches = branches.as_array()?;
+        if keyword == "allOf" && branches.len() != 1 {
+            return None;
+        }
+        let mut container = None;
+        for branch in branches {
+            if keyword != "allOf" && Self::schema_type(Some(branch)) == Some("null") {
+                continue;
+            }
+            let resolved = Self::container_schema(Some(branch))?;
+            if container.replace(resolved).is_some() {
+                return None;
+            }
+        }
+        container
+    }
+
+    /// Find a named property in this schema or a nested composition branch.
+    fn property_schema<'a>(schema: Option<&'a Value>, name: &str) -> Option<&'a Value> {
+        let schema = schema?;
+        if let Some(property) = schema.get("properties").and_then(|value| value.get(name)) {
+            return Some(property);
+        }
+
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            for branch in schema
+                .get(keyword)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(property) = Self::property_schema(Some(branch), name) {
+                    return Some(property);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Convert a parsed parameter value into a JSON value, coercing leaves by
     /// the schema node they sit under: array elements descend into `items`,
     /// object members into their `properties` entry.
     fn value_to_json(value: ParamValue, schema: Option<&Value>) -> Value {
+        let schema = Self::container_schema(schema).or(schema);
         match value {
             ParamValue::Text(text) => {
                 let decoded = Self::decode_xml_entities(&text);
@@ -265,12 +395,9 @@ impl MinimaxM3Parser {
                     return Value::Array(items);
                 }
 
-                let properties = schema
-                    .and_then(|s| s.get("properties"))
-                    .and_then(Value::as_object);
                 let mut map: Map<String, Value> = Map::new();
                 for (name, child) in children {
-                    let child_schema = properties.and_then(|p| p.get(&name));
+                    let child_schema = Self::property_schema(schema, &name);
                     let child_json = Self::value_to_json(child, child_schema);
                     match map.get_mut(&name) {
                         Some(Value::Array(arr)) => arr.push(child_json),
@@ -294,9 +421,6 @@ impl MinimaxM3Parser {
     /// arguments collected so far would run the tool with silently missing
     /// parameters.
     fn parse_invoke_params(body: &str, params_schema: Option<&Value>) -> Option<Value> {
-        let properties = params_schema
-            .and_then(|s| s.get("properties"))
-            .and_then(Value::as_object);
         let mut map: Map<String, Value> = Map::new();
         let mut pos = 0;
 
@@ -312,9 +436,9 @@ impl MinimaxM3Parser {
                 break;
             }
             pos += trim_len;
-            let (name, value, consumed) = Self::parse_element(&body[pos..])?;
+            let (name, value, consumed) = Self::parse_element(&body[pos..], params_schema, None)?;
             pos += consumed;
-            let json = Self::value_to_json(value, properties.and_then(|p| p.get(&name)));
+            let json = Self::value_to_json(value, Self::property_schema(params_schema, &name));
             match map.get_mut(&name) {
                 Some(Value::Array(arr)) => arr.push(json),
                 Some(existing) => {
@@ -467,6 +591,15 @@ impl ToolParser for MinimaxM3Parser {
 
             // Inside a tool call: wait for the complete end token before emitting.
             let Some(end_rel) = self.buffer.find(TOOL_CALL_END) else {
+                if !Self::could_start_invoke(&self.buffer) {
+                    // Release the false wrapper, then resume the normal-text
+                    // scan so a later marker (including a partial one) is still
+                    // recognized rather than flushed as ordinary content.
+                    normal_text.push_str(TOOL_CALL_START);
+                    self.buffer.drain(..TOOL_CALL_START.len());
+                    self.in_tool_call = false;
+                    continue;
+                }
                 break;
             };
             let block_end = end_rel + TOOL_CALL_END.len();
@@ -530,6 +663,14 @@ impl ToolParser for MinimaxM3Parser {
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn take_unstreamed_normal_text(&mut self) -> String {
+        // Completed blocks are removed from `buffer`, so anything left here is
+        // an independent, incomplete candidate and must be returned verbatim.
+        // Leave the parser ready to process ordinary text if it is reused.
+        self.in_tool_call = false;
+        std::mem::take(&mut self.buffer)
     }
 
     fn reset(&mut self) {

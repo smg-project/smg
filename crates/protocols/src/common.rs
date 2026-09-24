@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{
     de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
@@ -10,6 +10,19 @@ use validator;
 // ============================================================================
 // Default value helpers
 // ============================================================================
+
+/// A typed request as a `Value` whose `f32` fields print as the shortest
+/// decimal that round-trips the parsed value. `serde_json::to_value` stores
+/// an `f32` widened to `f64`, so a client's `"top_p": 0.95` would go
+/// upstream as `0.949999988079071`; the writer prints the `f32` itself, so
+/// encode with it and parse that back. This restores what the parsed `f32`
+/// holds, not the client's original token: precision the parse discarded
+/// (`0.950000001` is the same `f32` as `0.95`) is gone, and numbers kept
+/// as `Value` (an `other` map, nested values) were normalized at parse time
+/// (`1e2` is `100.0`, `-0` is `-0.0`).
+pub fn to_value_exact<T: Serialize>(value: &T) -> serde_json::Result<Value> {
+    serde_json::from_slice(&serde_json::to_vec(value)?)
+}
 
 /// Default model for endpoints where model is optional (e.g., /generate).
 /// Uses UNKNOWN_MODEL_ID so routers treat it as "any available worker."
@@ -55,6 +68,31 @@ where
 // GenerationRequest Trait
 // ============================================================================
 
+/// The request fields that partition a backend's prefix cache.
+///
+/// Engines namespace their prefix (KV) caches by client-supplied values: a
+/// cache salt, an extra classification key, and the LoRA adapter. Two
+/// requests that share a prompt but differ in any of these can never share
+/// cached blocks on the engine, so routing derives its cache namespace from
+/// this projection. All fields absent means the request is unpartitioned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CachePartition<'a> {
+    pub cache_salt: Option<&'a str>,
+    pub extra_key: Option<&'a str>,
+    pub lora_path: Option<&'a str>,
+}
+
+impl CachePartition<'_> {
+    /// True when no partitioning field is set. An empty string is "unset":
+    /// engines treat an empty salt or adapter as absent, so it must not
+    /// split the request off from the shared unpartitioned cache.
+    pub fn is_empty(&self) -> bool {
+        [self.cache_salt, self.extra_key, self.lora_path]
+            .iter()
+            .all(|field| field.is_none_or(str::is_empty))
+    }
+}
+
 /// Trait for unified access to generation request properties
 /// Implemented by ChatCompletionRequest, CompletionRequest, GenerateRequest,
 /// EmbeddingRequest, RerankRequest, and ResponsesRequest
@@ -79,6 +117,12 @@ pub trait GenerationRequest: Send + Sync {
     /// derive a session-affinity key from it; a batch reports its first id.
     fn rid(&self) -> Option<&str> {
         None
+    }
+
+    /// The fields that partition the backend's prefix cache for this request.
+    /// Protocols without such fields are unpartitioned.
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition::default()
     }
 }
 
@@ -231,6 +275,10 @@ pub enum ContentPart {
     InputAudio { input_audio: InputAudio },
     #[serde(rename = "video_url")]
     VideoUrl { video_url: VideoUrl },
+    /// Pass through unknown content objects to HTTP backends.
+    /// Also matches malformed known types; gRPC backends reject this variant.
+    #[serde(untagged)]
+    Unknown(Map<String, Value>),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -238,6 +286,12 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
+    /// MiniMax-M3 extension: cap the image's long side before preprocessing.
+    ///
+    /// Must be a positive multiple of the vision patch factor (28); larger
+    /// values keep more of the image and therefore cost more prompt tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_long_side_pixel: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -256,6 +310,16 @@ pub struct InputAudio {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct VideoUrl {
     pub url: String,
+    /// MiniMax-M3 extension: frames per second to sample the clip at.
+    ///
+    /// Valid range is 0.2 to 5.0 inclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    /// MiniMax-M3 extension: cap each sampled frame's long side.
+    ///
+    /// Must be a multiple of the vision patch factor (28) within 150..=3584.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_long_side_pixel: Option<u32>,
 }
 
 // ============================================================================
@@ -279,6 +343,26 @@ pub struct JsonSchemaFormat {
     pub schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+}
+
+/// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
+pub fn validate_json_schema_shape(
+    name: &str,
+    schema: &Value,
+) -> Result<(), validator::ValidationError> {
+    let (code, message) = if name.is_empty() {
+        ("json_schema_name_empty", "JSON schema name cannot be empty")
+    } else if !schema.is_object() {
+        (
+            "json_schema_schema_not_object",
+            "JSON schema 'schema' must be a JSON object",
+        )
+    } else {
+        return Ok(());
+    };
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    Err(e)
 }
 
 // ============================================================================
@@ -371,6 +455,36 @@ impl ToolChoice {
             .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
             .unwrap_or_else(|| "auto".to_string())
     }
+
+    /// The subset of `tools` this choice lets the model call, in the original
+    /// order: the named function for the function form, the listed functions
+    /// for `allowed_tools`. `None` when the choice does not narrow the list
+    /// (`auto`, `none`, `required`).
+    pub fn narrow_tools(&self, tools: &[Tool]) -> Option<Vec<Tool>> {
+        match self {
+            ToolChoice::AllowedTools { tools: allowed, .. } => {
+                let allowed: HashSet<&str> = allowed
+                    .iter()
+                    .filter_map(ToolReference::function_name)
+                    .collect();
+                Some(
+                    tools
+                        .iter()
+                        .filter(|tool| allowed.contains(tool.function.name.as_str()))
+                        .cloned()
+                        .collect(),
+                )
+            }
+            ToolChoice::Function { function, .. } => Some(
+                tools
+                    .iter()
+                    .filter(|tool| tool.function.name == function.name)
+                    .cloned()
+                    .collect(),
+            ),
+            ToolChoice::Value(_) => None,
+        }
+    }
 }
 
 /// Function choice specification for ToolChoice::Function
@@ -449,7 +563,7 @@ impl ToolReference {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Tool {
     #[serde(rename = "type")]
     pub tool_type: String, // "function"
@@ -462,12 +576,28 @@ fn empty_parameters_schema() -> Value {
     Value::Object(Map::new())
 }
 
+/// An explicit `"parameters": null` means the same as omitting the field
+/// (vLLM reads it as "no schema" too), and `null` is not a JSON Schema, so it
+/// is normalised to the empty schema once here rather than in every consumer:
+/// the structural-tag builders, the JSON-schema constraint and the renderers.
+fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(if value.is_null() {
+        empty_parameters_schema()
+    } else {
+        value
+    })
+}
+
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Function {
     pub name: String,
     pub description: Option<String>,
-    #[serde(default = "empty_parameters_schema")]
+    #[serde(
+        default = "empty_parameters_schema",
+        deserialize_with = "deserialize_parameters"
+    )]
     pub parameters: Value, // JSON Schema
     /// Whether to enable strict schema adherence (OpenAI structured outputs)
     pub strict: Option<bool>,
@@ -599,18 +729,36 @@ impl Usage {
     /// Add reasoning token details to this Usage
     pub fn with_reasoning_tokens(mut self, reasoning_tokens: u32) -> Self {
         if reasoning_tokens > 0 {
-            self.completion_tokens_details = Some(CompletionTokensDetails {
-                reasoning_tokens: Some(reasoning_tokens),
-                accepted_prediction_tokens: None,
-                rejected_prediction_tokens: None,
-            });
+            self.completion_tokens_details
+                .get_or_insert_default()
+                .reasoning_tokens = Some(reasoning_tokens);
+        }
+        self
+    }
+
+    /// Add speculative decoding details to this Usage.
+    pub fn with_speculative_tokens(mut self, accepted: u32, drafted: u32) -> Self {
+        if drafted > 0 {
+            let details = self.completion_tokens_details.get_or_insert_default();
+            details.accepted_prediction_tokens = Some(accepted);
+            details.rejected_prediction_tokens = Some(drafted.saturating_sub(accepted));
+        }
+        self
+    }
+
+    /// Drop prompt tokens the provider does not bill (the rendered generation stub).
+    pub fn with_unbilled_prompt_tokens(mut self, unbilled: u32) -> Self {
+        self.prompt_tokens = self.prompt_tokens.saturating_sub(unbilled);
+        self.total_tokens = self.prompt_tokens + self.completion_tokens;
+        if let Some(details) = &mut self.prompt_tokens_details {
+            details.cached_tokens = details.cached_tokens.min(self.prompt_tokens);
         }
         self
     }
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionTokensDetails {
     pub reasoning_tokens: Option<u32>,
     pub accepted_prediction_tokens: Option<u32>,
@@ -944,6 +1092,26 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn to_value_exact_keeps_f32_fields_as_the_client_wrote_them() {
+        let request: crate::chat::ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 0.95,
+            "temperature": 0.7
+        }))
+        .unwrap();
+        // The widening this guards against: 0.95f32 is 0.949999988079071 as f64.
+        assert_ne!(
+            serde_json::to_value(&request).unwrap()["top_p"],
+            json!(0.95)
+        );
+        let exact = to_value_exact(&request).unwrap();
+        assert_eq!(exact["top_p"], json!(0.95));
+        assert_eq!(exact["temperature"], json!(0.7));
+        assert_eq!(exact["model"], json!("glm-5.3-flash"));
+    }
+
     #[derive(Deserialize)]
     struct NullableBoolTest {
         #[serde(default, deserialize_with = "deserialize_null_as_false")]
@@ -1009,6 +1177,36 @@ mod tests {
     }
 
     #[test]
+    fn unbilled_prompt_tokens_come_off_the_prompt_and_total() {
+        let usage = Usage::from_counts(10, 4)
+            .with_cached_tokens(10)
+            .with_unbilled_prompt_tokens(3);
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (7, 4, 11)
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(7),
+            "cached tokens are clamped to the billed prompt"
+        );
+
+        let saturated = Usage::from_counts(2, 4).with_unbilled_prompt_tokens(3);
+        assert_eq!((saturated.prompt_tokens, saturated.total_tokens), (0, 4));
+        assert!(saturated.prompt_tokens_details.is_none());
+
+        let unchanged = Usage::from_counts(10, 4).with_unbilled_prompt_tokens(0);
+        assert_eq!((unchanged.prompt_tokens, unchanged.total_tokens), (10, 14));
+    }
+
+    #[test]
     fn content_part_deserializes_audio_url() {
         let value = json!({
             "type": "audio_url",
@@ -1025,6 +1223,49 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn content_part_round_trips_unknown_type() {
+        let value = json!({
+            "type": "vendor_special",
+            "payload": {"items": [1, "two", null], "enabled": true},
+            "vendor_option": "keep"
+        });
+        let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+
+        assert!(
+            matches!(&part, ContentPart::Unknown(fields) if fields["type"] == "vendor_special")
+        );
+        assert_eq!(serde_json::to_value(&part).unwrap(), value);
+    }
+
+    #[test]
+    fn content_part_rejects_non_objects() {
+        for value in [
+            json!(null),
+            json!(true),
+            json!(42),
+            json!("text"),
+            json!([]),
+        ] {
+            assert!(serde_json::from_value::<ContentPart>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn content_part_known_types_take_precedence_over_fallback() {
+        for value in [
+            json!({"type": "text", "text": "hello"}),
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}),
+            json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}),
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
+        ] {
+            let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+            assert!(!matches!(&part, ContentPart::Unknown(_)));
+            assert_eq!(serde_json::to_value(&part).unwrap(), value);
+        }
     }
 
     #[test]
@@ -1129,5 +1370,77 @@ mod tests {
         let value = json!({"name": "web_search", "description": ""});
         let function: Function = serde_json::from_value(value).expect("parameterless function");
         assert_eq!(function.parameters, json!({}));
+
+        // An explicit null is the same thing; `serde(default)` alone would
+        // keep `Value::Null`, which is not a JSON Schema and would reach the
+        // constraint builders as one.
+        let value = json!({"name": "web_search", "parameters": null});
+        let function: Function = serde_json::from_value(value).expect("null parameters");
+        assert_eq!(function.parameters, json!({}));
+
+        // A real schema passes through untouched.
+        let schema = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+        let value = json!({"name": "web_search", "parameters": schema});
+        let function: Function = serde_json::from_value(value).expect("schema");
+        assert_eq!(function.parameters, schema);
+    }
+
+    #[test]
+    fn reasoning_tokens_do_not_clear_speculative_tokens() {
+        let details = Usage::from_counts(10, 20)
+            .with_speculative_tokens(12, 16)
+            .with_reasoning_tokens(5)
+            .completion_tokens_details
+            .expect("details");
+        assert_eq!(details.reasoning_tokens, Some(5));
+        assert_eq!(details.accepted_prediction_tokens, Some(12));
+        assert_eq!(details.rejected_prediction_tokens, Some(4));
+    }
+
+    #[test]
+    fn speculative_tokens_do_not_clear_reasoning_tokens() {
+        let details = Usage::from_counts(10, 20)
+            .with_reasoning_tokens(5)
+            .with_speculative_tokens(12, 16)
+            .completion_tokens_details
+            .expect("details");
+        assert_eq!(details.reasoning_tokens, Some(5));
+        assert_eq!(details.accepted_prediction_tokens, Some(12));
+        assert_eq!(details.rejected_prediction_tokens, Some(4));
+    }
+
+    #[test]
+    fn zero_speculative_counts_leave_usage_untouched() {
+        let usage = Usage::from_counts(10, 20).with_speculative_tokens(0, 0);
+        assert!(usage.completion_tokens_details.is_none());
+    }
+
+    #[test]
+    fn json_schema_shape_requires_name_and_object_schema() {
+        let cases = [
+            ("", json!({}), Some("json_schema_name_empty")),
+            ("", json!("x"), Some("json_schema_name_empty")),
+            ("w", json!("x"), Some("json_schema_schema_not_object")),
+            ("w", json!(1), Some("json_schema_schema_not_object")),
+            ("w", json!([]), Some("json_schema_schema_not_object")),
+            ("w", json!(null), Some("json_schema_schema_not_object")),
+            ("w", json!(true), Some("json_schema_schema_not_object")),
+            ("w", json!({}), None),
+            (
+                "w",
+                json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                None,
+            ),
+        ];
+        for (name, schema, expected) in cases {
+            let result = validate_json_schema_shape(name, &schema);
+            match expected {
+                Some(code) => {
+                    let err = result.expect_err(&format!("{name:?}/{schema} should fail"));
+                    assert_eq!(err.code, code, "{name:?}/{schema}");
+                }
+                None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
+            }
+        }
     }
 }

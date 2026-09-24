@@ -14,6 +14,7 @@ use crate::{
 
 mod bucket;
 mod cache_aware;
+mod cache_namespace;
 mod consistent_hashing;
 mod dp_min_token;
 mod factory;
@@ -29,6 +30,7 @@ pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
+pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
@@ -297,6 +299,10 @@ pub struct SelectWorkerInfo<'a> {
     /// consistent_hashing and prefix_hash prefer it over their other keying
     /// input.
     pub routing_key: Option<&'a str>,
+    /// The request's cache partition (cache salt / extra key / LoRA), when
+    /// set. Cache-aware routing keys its affinity under it so requests the
+    /// engine cannot serve from the same cache never match each other.
+    pub cache_namespace: Option<CacheNamespace>,
     /// Session key derived from the request body's `rid` (routers with typed
     /// body access populate it); consumed by the routing-key override when
     /// its key source includes rid.

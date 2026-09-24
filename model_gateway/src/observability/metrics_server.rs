@@ -19,6 +19,7 @@ struct MetricsState {
 }
 
 async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoResponse {
+    super::metrics::record_tokenizer_cache_activity();
     (
         [(
             http::header::CONTENT_TYPE,

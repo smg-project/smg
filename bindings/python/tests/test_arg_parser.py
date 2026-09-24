@@ -46,6 +46,30 @@ class TestRouterArgs:
         assert args.disable_circuit_breaker is False
         assert args.mesh_advertise_host is None
 
+        # RL control plane defaults
+        assert args.enable_rl is False
+        assert args.rl_control_timeout_secs == 600
+        assert args.rl_fanout_concurrency == 32
+
+    def test_rl_flags_parse(self):
+        """RL control-plane flags land on the dataclass."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        args = RouterArgs.from_cli_args(
+            parser.parse_args(
+                [
+                    "--enable-rl",
+                    "--rl-control-timeout-secs",
+                    "1200",
+                    "--rl-fanout-concurrency",
+                    "8",
+                ]
+            )
+        )
+        assert args.enable_rl is True
+        assert args.rl_control_timeout_secs == 1200
+        assert args.rl_fanout_concurrency == 8
+
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
         # Test single key-value pair
@@ -546,6 +570,46 @@ class TestParseRouterArgs:
 
         defaults = parse_router_args([])
         assert defaults.mm_per_request_image_limit is None
+
+    def test_parse_mm_settings_flags(self):
+        """Media placement and engine-side media knobs; unset leaves each to its env fallback."""
+        router_args = parse_router_args(
+            [
+                "--mm-processing",
+                "worker",
+                "--mm-pixel-cache-mb",
+                "256",
+                "--mm-pixel-rdma",
+                "--rdma-listen-ip",
+                "10.0.0.7",
+                "--rdma-slot-ttl-s",
+                "600",
+                "--log-mm-timing",
+            ]
+        )
+        assert router_args.mm_processing == "worker"
+        assert router_args.mm_pixel_cache_mb == 256
+        assert router_args.mm_pixel_rdma is True
+        assert router_args.rdma_listen_ip == "10.0.0.7"
+        assert router_args.rdma_slot_ttl_s == 600
+        assert router_args.log_mm_timing is True
+
+        defaults = parse_router_args([])
+        assert defaults.mm_processing is None
+        assert defaults.mm_pixel_cache_mb is None
+        assert defaults.mm_pixel_rdma is False
+        assert defaults.rdma_listen_ip is None
+        assert defaults.rdma_slot_ttl_s is None
+        assert defaults.log_mm_timing is False
+
+        with pytest.raises(SystemExit):
+            parse_router_args(["--mm-processing", "routers"])
+        # Same spelling rules as the Rust CLI: case-insensitive, sign-checked.
+        assert parse_router_args(["--mm-processing", "Router"]).mm_processing == "router"
+        for flag in ("--mm-pixel-cache-mb", "--rdma-slot-ttl-s"):
+            with pytest.raises(SystemExit):
+                parse_router_args([flag, "-1"])
+        assert parse_router_args(["--mm-pixel-cache-mb", "0"]).mm_pixel_cache_mb == 0
 
     def test_parse_routing_key_headers(self):
         """Ordered list flag; unset keeps the x-smg-routing-key default."""
@@ -1440,6 +1504,17 @@ class TestRouterArgsFieldOrder:
         "kv_connector_annotation",
         "kv_engine_id_annotation",
         "mm_per_request_image_limit",
+        "pd_admission_wait_secs",
+        "enable_rl",
+        "rl_control_timeout_secs",
+        "rl_fanout_concurrency",
+        "multimodal_max_inflight_bytes",
+        "mm_processing",
+        "mm_pixel_cache_mb",
+        "mm_pixel_rdma",
+        "rdma_listen_ip",
+        "rdma_slot_ttl_s",
+        "log_mm_timing",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1474,6 +1549,10 @@ class TestRouterArgsFieldOrder:
             "max_buffered_request_bytes",
             "kv_connector_annotation",
             "kv_engine_id_annotation",
+            "mm_per_request_image_limit",
+            "enable_rl",
+            "rl_control_timeout_secs",
+            "rl_fanout_concurrency",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

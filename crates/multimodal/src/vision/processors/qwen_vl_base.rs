@@ -300,12 +300,26 @@ fn resize_dynamic_frame_to_raw(
 #[derive(Debug, Clone)]
 pub struct QwenVLProcessorBase {
     config: QwenVLConfig,
+    allow_video_dimensions_below_factor: bool,
 }
 
 impl QwenVLProcessorBase {
     /// Create a new processor with the given configuration.
     pub fn new(config: QwenVLConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            allow_video_dimensions_below_factor: false,
+        }
+    }
+
+    /// Allow non-zero video dimensions below the patch-alignment factor.
+    ///
+    /// Some model families upscale these inputs to the minimum aligned size,
+    /// while Qwen processors reject them. This opt-in preserves the Qwen
+    /// default and lets wrappers select the model-specific behavior.
+    pub fn allow_video_dimensions_below_factor(mut self) -> Self {
+        self.allow_video_dimensions_below_factor = true;
+        self
     }
 
     /// Get the patch size.
@@ -432,10 +446,6 @@ impl QwenVLProcessorBase {
             ModelSpecificValue::int_1d(vec![plan.num_patches as i64]),
         )
         .with_extra(
-            "patches_per_image",
-            ModelSpecificValue::int_1d(vec![plan.num_patches as i64]),
-        )
-        .with_extra(
             "video_second_per_grid",
             ModelSpecificValue::Tensor {
                 data: vec![plan.second_per_grid],
@@ -543,7 +553,14 @@ impl QwenVLProcessorBase {
             });
         }
 
-        if height < factor || width < factor {
+        if height == 0 || width == 0 {
+            return Err(TransformError::InvalidShape {
+                expected: "non-zero dimensions".to_string(),
+                actual: vec![height, width],
+            });
+        }
+
+        if !self.allow_video_dimensions_below_factor && (height < factor || width < factor) {
             return Err(TransformError::InvalidShape {
                 expected: format!("height and width >= factor ({factor})"),
                 actual: vec![height, width],
@@ -1124,49 +1141,67 @@ impl VisionPreProcessor for QwenVLProcessorBase {
             });
         }
 
-        let mut all_patches: Vec<f32> = Vec::with_capacity(total_patch_values);
         let mut patches_per_image: Vec<i64> = Vec::with_capacity(images.len());
         let mut grid_thw_data = Vec::with_capacity(images.len() * 3);
         let mut feature_token_counts = Vec::with_capacity(images.len());
-
-        for (image, plan) in images.iter().zip(image_plans) {
-            // Resize to the image's own target size (skip if dimensions match)
-            let resized;
-            let img_ref = if plan.needs_resize {
-                // BICUBIC (Qwen default) uses the PIL-compatible path; other
-                // filters keep the SIMD path.
-                resized = if filter == FilterType::CatmullRom {
-                    resize_bicubic_pil(image, plan.target_width, plan.target_height)
-                } else {
-                    resize(image, plan.target_width, plan.target_height, filter)
-                };
-                &resized
-            } else {
-                image
-            };
-
-            grid_thw_data.push(plan.grid_t as i64);
-            grid_thw_data.push(plan.grid_h as i64);
-            grid_thw_data.push(plan.grid_w as i64);
-
+        for plan in &image_plans {
+            grid_thw_data.extend([plan.grid_t as i64, plan.grid_h as i64, plan.grid_w as i64]);
             feature_token_counts.push(plan.tokens);
-
-            // Patchify directly from RGB bytes to avoid the intermediate
-            // [C,H,W] tensor allocation. This matches the tensor path's
-            // channel/temporal/spatial order.
-            let base_idx = all_patches.len();
-            all_patches.resize(base_idx + plan.patch_values, 0.0);
-            let mut out_idx = base_idx;
-            self.patchify_image_rgb_into(
-                img_ref,
-                plan.grid_h,
-                plan.grid_w,
-                &mut all_patches,
-                &mut out_idx,
-                &lut,
-            )?;
-            debug_assert_eq!(out_idx, all_patches.len());
             patches_per_image.push(plan.num_patches as i64);
+        }
+
+        // Each image owns a disjoint band of the patch buffer, so the images
+        // resize and patchify in parallel.
+        let mut all_patches: Vec<f32> = vec![0.0; total_patch_values];
+        let mut bands = Vec::with_capacity(images.len());
+        let mut remaining = all_patches.as_mut_slice();
+        for plan in &image_plans {
+            let (band, rest) = remaining.split_at_mut(plan.patch_values);
+            bands.push(band);
+            remaining = rest;
+        }
+        let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
+        parallel_scope(|scope| {
+            for (((image, plan), band), error_slot) in images
+                .iter()
+                .zip(&image_plans)
+                .zip(bands)
+                .zip(errors.iter_mut())
+            {
+                let lut = &lut;
+                scope.spawn(move |_| {
+                    // BICUBIC (Qwen default) uses the PIL-compatible path; other
+                    // filters keep the SIMD path.
+                    let resized;
+                    let img_ref = if plan.needs_resize {
+                        resized = if filter == FilterType::CatmullRom {
+                            resize_bicubic_pil(image, plan.target_width, plan.target_height)
+                        } else {
+                            resize(image, plan.target_width, plan.target_height, filter)
+                        };
+                        &resized
+                    } else {
+                        image
+                    };
+                    // Patchify directly from RGB bytes to avoid the intermediate
+                    // [C,H,W] tensor allocation. This matches the tensor path's
+                    // channel/temporal/spatial order.
+                    let mut out_idx = 0;
+                    let outcome = self.patchify_image_rgb_into(
+                        img_ref,
+                        plan.grid_h,
+                        plan.grid_w,
+                        band,
+                        &mut out_idx,
+                        lut,
+                    );
+                    debug_assert!(outcome.is_err() || out_idx == band.len());
+                    *error_slot = outcome.err();
+                });
+            }
+        });
+        if let Some(error) = errors.into_iter().flatten().next() {
+            return Err(error);
         }
 
         let encoder_input =
@@ -1367,6 +1402,80 @@ mod tests {
 
     use super::*;
     use crate::vision::transforms::to_tensor_and_normalize;
+
+    /// The opted-in Qwen processors must produce bit-identical pixels and
+    /// metadata when individual images are concatenated instead of batched.
+    #[test]
+    fn test_preprocess_per_image_concat_matches_batch() {
+        use crate::{
+            types::FieldLayout,
+            vision::processors::{Qwen2VLProcessor, Qwen3VLProcessor},
+        };
+
+        let processors: [&dyn VisionPreProcessor; 2] =
+            [&Qwen2VLProcessor::new(), &Qwen3VLProcessor::new()];
+        for processor in processors {
+            assert!(processor.supports_per_image_preprocessing());
+            let config = PreProcessorConfig {
+                image_mean: Some(processor.default_mean().to_vec()),
+                image_std: Some(processor.default_std().to_vec()),
+                min_pixels: Some(56 * 56),
+                max_pixels: Some(112 * 112),
+                ..Default::default()
+            };
+            let images = vec![
+                create_sized_pattern_frame(7, 9, 3),
+                create_sized_pattern_frame(12, 6, 42),
+                create_sized_pattern_frame(8, 8, 250),
+            ];
+
+            let batched = processor.preprocess(&images, &config).unwrap();
+
+            let layouts = std::collections::HashMap::from([
+                ("image_grid_thw".to_string(), FieldLayout::Batched),
+                ("patches_per_image".to_string(), FieldLayout::Batched),
+            ]);
+            let parts = images
+                .iter()
+                .map(|image| {
+                    processor
+                        .preprocess(std::slice::from_ref(image), &config)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let merged = PreprocessedEncoderInputs::concat(parts, &layouts).unwrap();
+
+            assert_eq!(merged.encoder_input_shape(), batched.encoder_input_shape());
+            assert_eq!(merged.feature_token_counts, batched.feature_token_counts);
+            assert_eq!(merged.item_sizes, batched.item_sizes);
+            let merged_values = merged.encoder_input.as_slice_memory_order().unwrap();
+            let batched_values = batched.encoder_input.as_slice_memory_order().unwrap();
+            for (idx, (&got, &want)) in merged_values.iter().zip(batched_values.iter()).enumerate()
+            {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "merged patch value differs at index {idx}: got {got}, want {want}"
+                );
+            }
+            for key in ["image_grid_thw", "patches_per_image"] {
+                let (merged_extra, batched_extra) = (
+                    merged.model_specific.get(key).unwrap(),
+                    batched.model_specific.get(key).unwrap(),
+                );
+                assert!(
+                    matches!(
+                        (merged_extra, batched_extra),
+                        (
+                            ModelSpecificValue::IntTensor { data: got, shape: got_shape },
+                            ModelSpecificValue::IntTensor { data: want, shape: want_shape },
+                        ) if got == want && got_shape == want_shape
+                    ),
+                    "model-specific value {key:?} differs between merged and batched outputs"
+                );
+            }
+        }
+    }
 
     fn create_test_config() -> QwenVLConfig {
         QwenVLConfig {
@@ -1696,6 +1805,33 @@ mod tests {
     fn test_qwen_vl_base_factor() {
         let processor = QwenVLProcessorBase::new(create_test_config());
         assert_eq!(processor.get_factor(), 28); // 14 * 2
+    }
+
+    #[test]
+    fn test_video_dimension_guards() {
+        let qwen = QwenVLProcessorBase::new(create_test_config());
+        let permissive = qwen.clone().allow_video_dimensions_below_factor();
+        for (height, width) in [(20, 100), (100, 20), (1, 1), (27, 28), (28, 27)] {
+            assert!(matches!(
+                qwen.smart_resize_video(2, height, width),
+                Err(TransformError::InvalidShape { .. })
+            ));
+            assert!(permissive.smart_resize_video(2, height, width).is_ok());
+        }
+        for processor in [&qwen, &permissive] {
+            for (height, width) in [(0, 100), (100, 0), (0, 0)] {
+                assert!(matches!(
+                    processor.smart_resize_video(2, height, width),
+                    Err(TransformError::InvalidShape { .. })
+                ));
+            }
+        }
+        for (height, width) in [(28, 28), (100, 100), (720, 1280)] {
+            assert_eq!(
+                qwen.smart_resize_video(2, height, width).unwrap(),
+                permissive.smart_resize_video(2, height, width).unwrap()
+            );
+        }
     }
 
     #[test]

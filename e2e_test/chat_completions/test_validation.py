@@ -402,11 +402,9 @@ class TestEosTokenStripping:
 class TestUnknownModelRejected:
     """An unknown model must be rejected with 404 before the pipeline runs.
 
-    The gRPC pipeline tokenizes locally, so its preparation stage runs ahead
-    of worker selection. Without an up-front check, an unknown model reaches
-    tokenizer resolution and surfaces as a 500 ``tokenizer_not_found`` — a
-    client error reported as a server fault. The responses endpoint already
-    fails fast with 404 ``model_not_found``; every gRPC entry point should.
+    Unknown models must consistently return ``model_not_found``, whether
+    rejected by the entry-point guard or during tokenizer resolution.
+    Registered models whose tokenizers are still loading remain server errors.
     """
 
     UNKNOWN = "nonexistent-model-xyz"

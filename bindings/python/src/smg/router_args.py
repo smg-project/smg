@@ -31,6 +31,15 @@ def _parse_int_csv(value: str) -> list[int]:
     return [int(item) for item in value.split(",") if item]
 
 
+def _non_negative_int(value: str) -> int:
+    """argparse type for the unsigned Rust settings; rejects a minus sign here
+    rather than in the binding's conversion after parsing."""
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return number
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
@@ -251,6 +260,29 @@ class RouterArgs:
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
     # Per-request image-count limit replacing model spec limits; None keeps spec limits
     mm_per_request_image_limit: int | None = None
+    # Seconds a PD dispatch waits for a slot in the decode engine's running
+    # window before shedding; 0 sheds immediately
+    pd_admission_wait_secs: int = 30
+    enable_rl: bool = False  # Mount the RL control plane under /v1/rl
+    rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
+    rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
+    # Appended last so callers that build RouterArgs positionally keep
+    # their existing field order.
+    multimodal_max_inflight_bytes: int | None = None
+    # Where media for vLLM gRPC workers is fetched and preprocessed:
+    # auto | router | worker; None falls back to SMG_MM_PROCESSING, then auto
+    mm_processing: str | None = None
+    # Pixel cache budget (MiB) for router-side preprocessed media; None falls
+    # back to SMG_MM_PIXEL_CACHE_MB, then 0 (off)
+    mm_pixel_cache_mb: int | None = None
+    # Legacy switch for the RDMA pixel lane; False falls back to SMG_MM_PIXEL_RDMA
+    mm_pixel_rdma: bool = False
+    # Listener IP for the RDMA metadata exchange; None falls back to SMG_RDMA_LISTEN_IP
+    rdma_listen_ip: str | None = None
+    # Full-TTL override (seconds) for leased RDMA slots; None falls back to SMG_RDMA_SLOT_TTL_S
+    rdma_slot_ttl_s: int | None = None
+    # Per-request multimodal timing at INFO; False falls back to SMG_LOG_MM_TIMING
+    log_mm_timing: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -330,6 +362,9 @@ class RouterArgs:
         auth_group = parser.add_argument_group(
             "Control Plane Authentication", "API key and JWT/OIDC authentication"
         )
+        rl_group = parser.add_argument_group(
+            "RL Control Plane", "Worker discovery and engine-route passthrough for RL training"
+        )
 
         if use_router_prefix:
             parser.add_argument(
@@ -377,8 +412,8 @@ class RouterArgs:
             help=(
                 "Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),"
                 " multiplexing every request to a worker over one connection."
-                " Requires every HTTP worker to serve HTTP/2 without an upgrade"
-                " handshake."
+                " Negotiated per worker at registration: a worker that does not"
+                " answer HTTP/2 stays on HTTP/1.1."
             ),
         )
         worker_group.add_argument(
@@ -729,6 +764,18 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}pd-admission-wait-secs",
+            type=int,
+            default=RouterArgs.pd_admission_wait_secs,
+            help=(
+                "Seconds a prefill/decode dispatch waits for a free slot in"
+                " the decode engine's running window before shedding with 503"
+                " worker_overload_protection_shed. Keep it well under the"
+                " engine's bootstrap deadline. 0 sheds immediately; engines"
+                " that report no running window are never gated"
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}stream-body-stall-timeout-secs",
             type=int,
             default=RouterArgs.stream_body_stall_timeout_secs,
@@ -774,6 +821,23 @@ class RouterArgs:
             f"--{prefix}enable-igw",
             action="store_true",
             help="Enable IGW (Inference-Gateway) mode for multi-model support",
+        )
+        rl_group.add_argument(
+            f"--{prefix}enable-rl",
+            action="store_true",
+            help="Mount the RL control plane under /v1/rl (discovery, passthrough, fan-out)",
+        )
+        rl_group.add_argument(
+            f"--{prefix}rl-control-timeout-secs",
+            type=int,
+            default=RouterArgs.rl_control_timeout_secs,
+            help="Total timeout for one proxied engine control call (default: 600)",
+        )
+        rl_group.add_argument(
+            f"--{prefix}rl-fanout-concurrency",
+            type=int,
+            default=RouterArgs.rl_fanout_concurrency,
+            help="Maximum concurrent engine calls in one fan-out (default: 32)",
         )
 
         # PD/EPD-specific arguments
@@ -882,6 +946,18 @@ class RouterArgs:
             help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
         )
         parser.add_argument(
+            f"--{prefix}multimodal-max-inflight-bytes",
+            type=int,
+            default=RouterArgs.multimodal_max_inflight_bytes,
+            help=(
+                "Most bytes of preprocessed media held in flight for engines at"
+                " once; a request that fits waits briefly for room, then gets"
+                " 429, and one larger than the whole budget gets 413 straight"
+                " away. A waiting request still holds its media, so size memory"
+                " for about twice this value. Zero is refused, not read as unset"
+            ),
+        )
+        parser.add_argument(
             f"--{prefix}mm-per-request-image-limit",
             type=int,
             default=RouterArgs.mm_per_request_image_limit,
@@ -890,6 +966,63 @@ class RouterArgs:
                 " model spec's built-in limit (e.g. to match the engine's"
                 " --limit-mm-per-prompt). Must be >= 1; unset keeps spec limits."
             ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-processing",
+            type=str.lower,
+            choices=["auto", "router", "worker"],
+            default=RouterArgs.mm_processing,
+            help=(
+                "Where media for vLLM gRPC workers is fetched and preprocessed: auto"
+                " (worker when the model spec and the worker both allow it, else"
+                " router), router (always the gateway), worker (always the engine;"
+                " models without worker expansion are rejected). Falls back to"
+                " SMG_MM_PROCESSING, then auto"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-pixel-cache-mb",
+            type=_non_negative_int,
+            default=RouterArgs.mm_pixel_cache_mb,
+            help=(
+                "Pixel cache budget in MiB for router-side preprocessed media; 0 keeps"
+                " the cache off. Falls back to SMG_MM_PIXEL_CACHE_MB"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-pixel-rdma",
+            action="store_true",
+            default=RouterArgs.mm_pixel_rdma,
+            help=(
+                "Serve cached pixels over RDMA instead of inline bytes (the legacy"
+                " switch; --multimodal-tensor-transport rdma is the first-class one)."
+                " Falls back to SMG_MM_PIXEL_RDMA"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}rdma-listen-ip",
+            type=str,
+            default=RouterArgs.rdma_listen_ip,
+            help=(
+                "Listener IP for the RDMA pixel lane's metadata exchange; without one"
+                " the lane stays on the inline path. Falls back to SMG_RDMA_LISTEN_IP"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}rdma-slot-ttl-s",
+            type=_non_negative_int,
+            default=RouterArgs.rdma_slot_ttl_s,
+            help=(
+                "Seconds a leased RDMA pixel slot lives without a free notification;"
+                " must exceed the worker's hold or it is ignored. Falls back to"
+                " SMG_RDMA_SLOT_TTL_S"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}log-mm-timing",
+            action="store_true",
+            default=RouterArgs.log_mm_timing,
+            help="Emit per-request multimodal timing at INFO. Falls back to SMG_LOG_MM_TIMING",
         )
 
         # Logging configuration

@@ -54,6 +54,7 @@ pub trait ProcessStage: Send + Sync {
 }
 
 mod client_acquisition;
+mod context_length;
 mod dispatch_metadata;
 pub(crate) mod encode;
 pub(crate) mod helpers;
@@ -64,6 +65,7 @@ mod worker_selection;
 
 // Export stage implementations
 pub(crate) use client_acquisition::acquire_clients;
+pub(crate) use context_length::{enforce_context_length, enforce_output_budget};
 pub(crate) use dispatch_metadata::prepare_dispatch_metadata;
 pub(crate) use encode::EncodeStage;
 pub(crate) use rate_limit::{RateLimitCell, RateLimitOutcome, RateLimitReserveStage};

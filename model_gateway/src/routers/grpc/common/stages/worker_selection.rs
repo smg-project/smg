@@ -12,12 +12,12 @@ use tracing::{error, warn};
 use super::PipelineStage;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    policies::{
-        policy_filters_unavailable_workers, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo,
-        WorkerLeg,
-    },
+    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
-        common::overload,
+        common::{
+            placement::{self, PairFailure, PlacementFailure, PlacementInputs},
+            retry::mark_non_retryable,
+        },
         error,
         grpc::{
             context::{
@@ -28,7 +28,7 @@ use crate::{
         },
     },
     worker::{
-        ConnectionModeExt, HashRing, ModelWorkerSnapshot, RoutingPool, RuntimeType, Worker,
+        ConnectionModeExt, HashRing, ModelWorkerSnapshot, PdWire, RoutingPool, RuntimeType, Worker,
         WorkerRegistry, WorkerType,
     },
 };
@@ -90,6 +90,8 @@ impl PipelineStage for WorkerSelectionStage {
         })?;
 
         let intermediate = ctx.state.multimodal_intermediate.as_ref();
+        // Media references only go to workers that advertise worker-side processing.
+        let media_refs = ctx.state.multimodal_refs.is_some();
 
         let text = prep.routing_text();
 
@@ -113,41 +115,73 @@ impl PipelineStage for WorkerSelectionStage {
         // would actually read it (tokens win otherwise).
         let keep_text =
             tokens.is_none() || self.policy_registry.any_policy_needs_request_text(headers);
+        // The typed engine wires (gRPC servicers, direct ZMQ) do not carry the
+        // request's cache-partition fields yet, so the engine's prefix cache
+        // is unpartitioned on this path and the router must not split
+        // affinity for it: a namespace here would cost cache hits for every
+        // request that sets a salt today. The snapshot carries the field so
+        // the forwarding change can derive it (as the HTTP proxy path does via
+        // `GenerationRequest::cache_partition`) without touching selection.
+        let cache_namespace: Option<CacheNamespace> = None;
         ctx.state.routing_snapshot = Some(RoutingSnapshot {
             routing_text: keep_text.then(|| text.map(str::to_string)).flatten(),
             token_ids: ids.to_vec(),
             rid_key: rid_key.clone(),
+            cache_namespace,
         });
         let rid_key = rid_key.as_deref();
 
         let model_id = ctx.input.model_id.as_str();
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers, rid_key, None) {
+                match self.select_single_worker(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    cache_namespace,
+                    None,
+                    media_refs,
+                ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
-                        return Err(self.selection_failure(model_id, &[WorkerType::Regular], None))
+                        return Err(self.selection_failure(
+                            model_id,
+                            &[WorkerType::Regular],
+                            None,
+                            media_refs,
+                        ))
                     }
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(model_id, text, tokens, headers, rid_key, None) {
-                    Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
+                match self.select_pd_pair(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    cache_namespace,
+                    None,
+                    media_refs,
+                ) {
+                    Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
                         decode,
                         runtime_type,
                     },
-                    None => {
-                        return Err(self.selection_failure(
-                            model_id,
-                            &[WorkerType::Prefill, WorkerType::Decode],
-                            None,
-                        ))
-                    }
+                    Err(response) => return Err(response),
                 }
             }
             WorkerSelectionMode::EncodePrefillDecode => {
+                // Encode workers never process references: refuse strict
+                // worker mode here rather than silently bypass the encode fleet.
+                if media_refs {
+                    let err = multimodal::MmRefsError::EncodeNotSupported;
+                    return Err(error::bad_request(err.code(), err.to_string()));
+                }
                 let encode_item_hashes = match encode_item_hashes(intermediate) {
                     Ok(hashes) => hashes,
                     Err(err) => {
@@ -168,6 +202,7 @@ impl PipelineStage for WorkerSelectionStage {
                     tokens,
                     headers,
                     rid_key,
+                    cache_namespace,
                     &encode_item_hashes,
                 ) {
                     Some((encode_assignments, prefill, decode, runtime_type)) => {
@@ -191,15 +226,15 @@ impl PipelineStage for WorkerSelectionStage {
                         } else {
                             &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode]
                         };
-                        return Err(self.selection_failure(model_id, legs, None));
+                        return Err(self.selection_failure(model_id, legs, None, media_refs));
                     }
                 }
             }
         };
 
         // Reject an unsupported (backend, modality) combination now that the
-        // runtime is known, before request building fetches/preprocesses media
-        // only to fail deep in assembly. The prefill leg builds the request in
+        // runtime is known, before request building assembles the payload only
+        // to fail deep in assembly. The prefill leg builds the request in
         // disaggregated mode, so its runtime is the one that must support the
         // request's modalities.
         if let Some(intermediate) = intermediate {
@@ -211,6 +246,12 @@ impl PipelineStage for WorkerSelectionStage {
                     "multimodal_not_supported",
                     format!("{err}"),
                 ));
+            }
+        }
+
+        if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
+            if let Err(err) = multimodal::ensure_selection_supports_media_refs(&workers, plan) {
+                return Err(error::bad_request(err.code(), err.to_string()));
             }
         }
 
@@ -243,34 +284,53 @@ impl WorkerSelectionStage {
             Some(ctx.routing.token_ids.as_slice())
         };
         let rid_key = ctx.routing.rid_key.as_deref();
+        let cache_namespace = ctx.routing.cache_namespace;
         let headers = ctx.headers.as_ref();
         let model_id = ctx.model_id.as_str();
+        // The retained wire carries the media-refs pin; the helpers derive it.
         let wire = Some(ctx.wire);
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers, rid_key, wire) {
+                match self.select_single_worker(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    cache_namespace,
+                    wire,
+                    false,
+                ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
-                        return Err(self.selection_failure(model_id, &[WorkerType::Regular], wire))
+                        return Err(self.selection_failure(
+                            model_id,
+                            &[WorkerType::Regular],
+                            wire,
+                            false,
+                        ))
                     }
                 }
             }
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
-                match self.select_pd_pair(model_id, text, tokens, headers, rid_key, wire) {
-                    Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
+                match self.select_pd_pair(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    cache_namespace,
+                    wire,
+                    false,
+                ) {
+                    Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
                         decode,
                         runtime_type,
                     },
-                    None => {
-                        return Err(self.selection_failure(
-                            model_id,
-                            &[WorkerType::Prefill, WorkerType::Decode],
-                            wire,
-                        ))
-                    }
+                    Err(response) => return Err(response),
                 }
             }
         };
@@ -278,6 +338,11 @@ impl WorkerSelectionStage {
         ctx.workers = Some(workers);
         Ok(())
     }
+}
+
+/// Candidate predicate for requests carrying media references.
+fn accepts_media_refs(worker: &dyn Worker) -> bool {
+    multimodal::worker_accepts_media_refs(worker)
 }
 
 /// Runtime of the leg that builds the generate request: the sole worker in
@@ -306,59 +371,215 @@ impl WorkerSelectionStage {
         model_id: &str,
         legs: &[WorkerType],
         wire: Option<WireConstraint>,
+        media_refs: bool,
     ) -> Response {
+        let media_refs = media_refs || wire.is_some_and(|w| w.requires_media_refs);
+        if media_refs {
+            return self.media_refs_failure(model_id, legs, wire);
+        }
+        let mut unavailable = false;
         for leg in legs {
-            let candidates = self.leg_candidates(model_id, *leg, wire);
-            if let Some(shed) = overload::shed_if_all_overloaded(&candidates, model_id) {
-                return shed;
+            let verdict = match leg {
+                // The regular leg is judged from exactly the pool the shared
+                // placement drew from.
+                WorkerType::Regular => placement::single_failure(
+                    &self.worker_registry,
+                    model_id,
+                    RoutingPool::GrpcPipelineRegular,
+                    wire,
+                ),
+                WorkerType::Prefill => {
+                    self.disaggregated_leg_verdict(model_id, RoutingPool::GrpcPrefill, wire)
+                }
+                WorkerType::Decode => {
+                    self.disaggregated_leg_verdict(model_id, RoutingPool::GrpcDecode, wire)
+                }
+                WorkerType::Encode => {
+                    self.disaggregated_leg_verdict(model_id, RoutingPool::GrpcEncode, wire)
+                }
+            };
+            match verdict {
+                PlacementFailure::AllOverloaded(shed) => return shed,
+                PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. } => {
+                    unavailable = true;
+                }
+                PlacementFailure::NoCandidates => {}
             }
         }
+        if unavailable {
+            return self.workers_unavailable(model_id);
+        }
+        error!(
+            function = "WorkerSelectionStage::execute",
+            mode = ?self.mode,
+            model_id = %model_id,
+            "No worker serves model"
+        );
+        error::model_not_found(model_id)
+    }
+
+    /// Selection failure for a request carrying media references, judged
+    /// from the capability-filtered pool: an absent model stays 404, an
+    /// overloaded capable pool keeps its shed, and only a leg with candidates
+    /// but no capable one is the capability shed.
+    fn media_refs_failure(
+        &self,
+        model_id: &str,
+        legs: &[WorkerType],
+        wire: Option<WireConstraint>,
+    ) -> Response {
+        let mut unavailable = false;
+        for leg in legs {
+            let pool = match leg {
+                WorkerType::Regular => RoutingPool::GrpcPipelineRegular,
+                WorkerType::Prefill => RoutingPool::GrpcPrefill,
+                WorkerType::Decode => RoutingPool::GrpcDecode,
+                WorkerType::Encode => RoutingPool::GrpcEncode,
+            };
+            let candidates = placement::candidates(&self.worker_registry, model_id, pool, wire);
+            let candidates = candidates.as_slice();
+            if candidates.is_empty() {
+                continue;
+            }
+            let capable: Vec<Arc<dyn Worker>> = candidates
+                .iter()
+                .filter(|w| accepts_media_refs(w.as_ref()))
+                .cloned()
+                .collect();
+            if capable.is_empty() {
+                return self.media_refs_shed(model_id);
+            }
+            match placement::failure_from(&capable, model_id) {
+                PlacementFailure::AllOverloaded(shed) => return shed,
+                PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. } => unavailable = true,
+                PlacementFailure::NoCandidates => {}
+            }
+        }
+        if unavailable {
+            return self.workers_unavailable(model_id);
+        }
+        error!(
+            function = "WorkerSelectionStage::execute",
+            mode = ?self.mode,
+            model_id = %model_id,
+            "No worker serves model"
+        );
+        error::model_not_found(model_id)
+    }
+
+    /// Workers serve the model but none advertises worker-side multimodal
+    /// processing. Terminal: capability cannot change within a retry window.
+    fn media_refs_shed(&self, model_id: &str) -> Response {
+        error!(
+            function = "WorkerSelectionStage::execute",
+            mode = ?self.mode,
+            model_id = %model_id,
+            "No worker advertising worker-side multimodal processing"
+        );
+        let mut response = error::service_unavailable(
+            "no_media_ref_capable_worker",
+            format!(
+                "model {model_id} has vLLM gRPC workers but none advertises mm_processor; set \
+                 SMG_VLLM_MM_PROCESSOR on the workers or SMG_MM_PROCESSING=router on the router"
+            ),
+        );
+        mark_non_retryable(&mut response);
+        response
+    }
+
+    /// Workers serve the model but none can take the request right now
+    /// (unhealthy, circuit breaker open, or the policy declined). A 503 with
+    /// the same code the HTTP router uses: the model exists, the client should
+    /// retry, and nothing about its request is wrong. Answering 404 here told
+    /// clients the model was gone while its workers restarted.
+    fn workers_unavailable(&self, model_id: &str) -> Response {
         error!(
             function = "WorkerSelectionStage::execute",
             mode = ?self.mode,
             model_id = %model_id,
             "No available workers for model"
         );
-        error::model_not_found(model_id)
+        error::service_unavailable(
+            "no_available_workers",
+            format!("All workers for model '{model_id}' are unavailable (unhealthy or circuit breaker open)"),
+        )
     }
 
-    /// The pool one leg selected over, *before* the `is_available()` filter,
-    /// under the same worker-type and transport rules selection applied.
+    /// The response for a failed pair placement. The verdict was judged from
+    /// the leg's own candidates inside the placement, so a shed is answered
+    /// as it was built and counted once; a leg nobody serves is a 404, and a
+    /// leg whose workers are all unavailable is the 503 the HTTP router gives.
+    fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
+        match failure.verdict {
+            PlacementFailure::AllOverloaded(shed) => shed,
+            PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
+                self.workers_unavailable(model_id)
+            }
+            PlacementFailure::NoCompatiblePair {
+                prefill,
+                decode,
+                mismatches,
+            } => {
+                error!(
+                    function = "WorkerSelectionStage::execute",
+                    mode = ?self.mode,
+                    model_id = %model_id,
+                    ?mismatches,
+                    ?prefill,
+                    ?decode,
+                    "No prefill/decode pair shares a KV transfer protocol"
+                );
+                error::service_unavailable(
+                    "no_compatible_pd_pair",
+                    format!(
+                        "No prefill/decode pair for model '{model_id}' shares a KV transfer \
+                         protocol (mismatch on {mismatches:?}; prefill: {prefill:?}, decode: \
+                         {decode:?})"
+                    ),
+                )
+            }
+            PlacementFailure::NoCandidates => {
+                error!(
+                    function = "WorkerSelectionStage::execute",
+                    mode = ?self.mode,
+                    model_id = %model_id,
+                    leg = ?failure.leg,
+                    "No worker serves model"
+                );
+                error::model_not_found(model_id)
+            }
+        }
+    }
+
+    /// The verdict for one disaggregated leg, judged from the pool it
+    /// selected over *before* the `is_available()` filter. The legs are
+    /// gRPC-only (no KV rendezvous on ZMQ), so a retry pins the runtime alone;
+    /// the regular leg is judged by [`placement::single_failure`] instead.
     /// Failure path only.
-    fn leg_candidates(
+    fn disaggregated_leg_verdict(
         &self,
         model_id: &str,
-        worker_type: WorkerType,
+        pool: RoutingPool,
         wire: Option<WireConstraint>,
-    ) -> Vec<Arc<dyn Worker>> {
-        // One definition shared with selection: the same routing-pool
-        // projection, before the `is_available()` filter. Regular selection
-        // takes either gRPC-pipeline transport; the disaggregated legs are
-        // gRPC-only (no KV rendezvous on ZMQ). The wildcard model maps to
-        // the global snapshot — not the `unknown` model-index entry.
-        let pool = match worker_type {
-            WorkerType::Regular => RoutingPool::GrpcPipelineRegular,
-            WorkerType::Prefill => RoutingPool::GrpcPrefill,
-            WorkerType::Decode => RoutingPool::GrpcDecode,
-            WorkerType::Encode => RoutingPool::GrpcEncode,
-        };
-        self.worker_registry
+    ) -> PlacementFailure {
+        let candidates: Vec<Arc<dyn Worker>> = self
+            .worker_registry
             .get_routing_pool(model_id, pool)
             .iter()
-            .filter(|w| {
-                wire.is_none_or(|c| {
-                    w.metadata().spec.runtime_type == c.runtime
-                        && match worker_type {
-                            WorkerType::Regular => *w.connection_mode() == c.connection,
-                            // Disaggregated legs are gRPC-only regardless of pin.
-                            _ => true,
-                        }
-                })
-            })
+            .filter(|w| wire.is_none_or(|c| w.metadata().spec.runtime_type == c.runtime))
             .cloned()
-            .collect()
+            .collect();
+        placement::failure_from(&candidates, model_id)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes"
+    )]
     fn select_single_worker(
         &self,
         model_id: &str,
@@ -366,77 +587,28 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
+        media_refs: bool,
     ) -> Option<Arc<dyn Worker>> {
-        // Get workers for the specified model. The gRPC router serves both gRPC
-        // and direct-ZMQ workers, so accept either transport (not HTTP).
-        let pool = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::GrpcPipelineRegular);
-        // A retry pins the retained plan's runtime/transport.
-        let wire_pinned;
-        let candidates: &[Arc<dyn Worker>] = match wire {
-            None => &pool,
-            Some(c) => {
-                wire_pinned = pool
-                    .iter()
-                    .filter(|w| {
-                        w.metadata().spec.runtime_type == c.runtime
-                            && *w.connection_mode() == c.connection
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                &wire_pinned
-            }
-        };
-
-        // Get the appropriate policy for this model
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-
-        let filtered;
-        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
-            candidates
-        } else {
-            filtered = candidates
-                .iter()
-                .filter(|worker| worker.is_available())
-                .cloned()
-                .collect::<Vec<_>>();
-            &filtered
-        };
-        if available.is_empty() {
-            return None;
-        }
-
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-
-        // Select worker via the registry (applies the routing-key sticky override
-        // when enabled; otherwise delegates to the configured policy).
-        let idx = self.policy_registry.select_worker(
-            &policy,
-            available,
-            &SelectWorkerInfo {
-                request_text: text,
+        let media_refs = media_refs || wire.is_some_and(|w| w.requires_media_refs);
+        // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
+        // accepts either transport (not HTTP). A retry pins the retained wire.
+        placement::select_single(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            RoutingPool::GrpcPipelineRegular,
+            wire,
+            PlacementInputs {
+                text,
                 tokens,
                 headers,
-                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key,
-                hash_ring,
-                leg: WorkerLeg::Single,
+                cache_namespace,
+                candidate_filter: media_refs.then_some(accepts_media_refs),
             },
-        )?;
-        let selected = available[idx].clone();
-
-        // Record worker selection metric
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            selected.connection_mode().as_metric_label(),
-            model_id,
-            policy.name(),
-        );
-
-        Some(selected)
+        )
     }
 
     /// Workers from one leg pool of `snapshot` that also pass the live
@@ -453,6 +625,10 @@ impl WorkerSelectionStage {
             .collect()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes"
+    )]
     fn select_pd_pair(
         &self,
         model_id: &str,
@@ -460,133 +636,54 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
-    ) -> Option<PdWorkerPair> {
+        media_refs: bool,
+    ) -> Result<PdWorkerPair, Response> {
+        let media_refs = media_refs || wire.is_some_and(|w| w.requires_media_refs);
         // Both legs derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
         // that never coexisted. The pools are strictly gRPC (a ZMQ leg would
         // silently drop the PD bootstrap info, see `RoutingPool::GrpcPrefill`;
-        // the wildcard model maps to the global snapshot), and availability
-        // stays a live per-request check.
+        // the wildcard model maps to the global snapshot). The legs must
+        // share a runtime, the rendezvous being runtime-specific, and a retry
+        // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let all_prefill = Self::available_workers(&snapshot, RoutingPool::GrpcPrefill);
-        let all_decode = Self::available_workers(&snapshot, RoutingPool::GrpcDecode);
-
-        // Retry re-selection pins both legs to the retained plan's runtime.
-        let (all_prefill, all_decode) = match wire {
-            Some(constraint) => (
-                all_prefill
-                    .into_iter()
-                    .filter(|w| w.metadata().spec.runtime_type == constraint.runtime)
-                    .collect::<Vec<_>>(),
-                all_decode
-                    .into_iter()
-                    .filter(|w| w.metadata().spec.runtime_type == constraint.runtime)
-                    .collect::<Vec<_>>(),
-            ),
-            None => (all_prefill, all_decode),
-        };
-
-        if all_prefill.is_empty() {
-            warn!("No available prefill workers");
-            return None;
-        }
-
-        if all_decode.is_empty() {
-            warn!("No available decode workers");
-            return None;
-        }
-
-        // Determine the runtime type from prefill workers.
-        // All workers in a PD pair must use the same runtime.
-        let first_runtime = all_prefill.first()?.metadata().spec.runtime_type;
-
-        // Check for mixed runtimes in both prefill and decode pools
-        let prefill_mixed = all_prefill
-            .iter()
-            .skip(1)
-            .any(|w| w.metadata().spec.runtime_type != first_runtime);
-        let decode_mixed = all_decode
-            .iter()
-            .any(|w| w.metadata().spec.runtime_type != first_runtime);
-
-        if prefill_mixed || decode_mixed {
-            warn!(
-                "Mixed runtime types in PD workers (prefill_mixed={}, decode_mixed={}). Using {:?}.",
-                prefill_mixed,
-                decode_mixed,
-                first_runtime
-            );
-        }
-
-        let target_runtime = first_runtime;
-
-        // Filter both pools to the target runtime
-        let available_prefill: Vec<_> = all_prefill
-            .into_iter()
-            .filter(|w| w.metadata().spec.runtime_type == target_runtime)
-            .collect();
-        let available_decode: Vec<_> = all_decode
-            .into_iter()
-            .filter(|w| w.metadata().spec.runtime_type == target_runtime)
-            .collect();
-
-        if available_prefill.is_empty() || available_decode.is_empty() {
-            warn!("No available PD pair for runtime {:?}", target_runtime);
-            return None;
-        }
-
-        // Independent P/D policies so stateful ones (e.g. round_robin) don't share a counter.
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-
-        // Prefill and decode are separate pools; tag each leg so the routing-key
-        // override keys its sticky map per leg (a key sticks independently).
-        let mut info = SelectWorkerInfo {
-            request_text: text,
-            tokens,
-            headers,
-            routing_key: self.policy_registry.resolve_routing_key(headers),
-            rid_key,
-            hash_ring,
-            leg: WorkerLeg::Prefill,
-        };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
-        info.leg = WorkerLeg::Decode;
-        let decode_idx =
-            self.policy_registry
-                .select_worker(&decode_policy, &available_decode, &info)?;
-
-        let model = model_id;
-
-        // Record worker selection metrics for both prefill and decode
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            available_prefill[prefill_idx]
-                .connection_mode()
-                .as_metric_label(),
-            model,
-            prefill_policy.name(),
-        );
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            available_decode[decode_idx]
-                .connection_mode()
-                .as_metric_label(),
-            model,
-            decode_policy.name(),
-        );
-
-        Some((
-            available_prefill[prefill_idx].clone(),
-            available_decode[decode_idx].clone(),
-            target_runtime,
-        ))
+        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        let pair = placement::select_pair(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &pairs,
+            wire,
+            true,
+            PlacementInputs {
+                text,
+                tokens,
+                headers,
+                rid_key,
+                cache_namespace,
+                candidate_filter: media_refs.then_some(accepts_media_refs),
+            },
+        )
+        .map_err(|failure| {
+            // Both legs must advertise worker-side processing: a populated
+            // failing leg with no capable worker is the capability shed; an
+            // empty leg or anything else keeps its own verdict.
+            let leg_pool = match failure.leg {
+                WorkerLeg::Prefill => &pairs.prefill_pool,
+                _ => &pairs.decode_pool,
+            };
+            if media_refs
+                && !leg_pool.is_empty()
+                && !leg_pool.iter().any(|w| accepts_media_refs(w.as_ref()))
+            {
+                self.media_refs_shed(model_id)
+            } else {
+                self.pair_failure(model_id, *failure)
+            }
+        })?;
+        Ok((pair.prefill, pair.decode, pair.runtime))
     }
 
     /// Select per-item encode workers + a prefill/decode pair for EPD routing.
@@ -595,6 +692,10 @@ impl WorkerSelectionStage {
     /// encode worker. prefill+decode are selected as a normal PD pair. All pools
     /// are filtered to a runtime shared by the selected encode/prefill/decode
     /// legs.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes"
+    )]
     fn select_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -602,6 +703,7 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
         encode_item_hashes: &[Vec<u8>],
     ) -> Option<EncodePrefillDecodeWorkerSelection> {
         // All three legs derive from ONE membership snapshot (see
@@ -709,16 +811,23 @@ impl WorkerSelectionStage {
             headers,
             routing_key: self.policy_registry.resolve_routing_key(headers),
             rid_key,
+            cache_namespace,
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
+        let prefill_idx = self.policy_registry.select_worker_for_model(
+            &prefill_policy,
+            model_id,
+            &available_prefill,
+            &info,
+        )?;
         info.leg = WorkerLeg::Decode;
-        let decode_idx =
-            self.policy_registry
-                .select_worker(&decode_policy, &available_decode, &info)?;
+        let decode_idx = self.policy_registry.select_worker_for_model(
+            &decode_policy,
+            model_id,
+            &available_decode,
+            &info,
+        )?;
 
         let encode_assignments = assign_encode_workers(
             &available_encode,
@@ -790,6 +899,7 @@ fn assign_encode_workers(
                 // Encode items key by media-content hash; a conversation key
                 // here would defeat per-item encode reuse.
                 rid_key: None,
+                cache_namespace: None,
                 hash_ring: hash_ring.clone(),
                 leg: WorkerLeg::Single,
             };
@@ -925,7 +1035,7 @@ mod tests {
         let mut decode_hits = HashMap::new();
         for _ in 0..iterations {
             let (prefill, decode, _) = stage
-                .select_pd_pair(model_id, None, None, None, None, None)
+                .select_pd_pair(model_id, None, None, None, None, None, None, false)
                 .expect("select_pd_pair should return a pair");
             *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
@@ -951,8 +1061,8 @@ mod tests {
             WorkerSelectionMode::PrefillDecode,
         );
         assert!(stage
-            .select_pd_pair(model_id, None, None, None, None, None)
-            .is_some());
+            .select_pd_pair(model_id, None, None, None, None, None, None, false)
+            .is_ok());
 
         for url in &prefill_urls {
             let worker = worker_registry.get_by_url(url).expect("registered");
@@ -961,16 +1071,20 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None)
-                .is_none(),
+                .select_pd_pair(model_id, None, None, None, None, None, None, false)
+                .is_err(),
             "the veto empties the prefill pool"
         );
-        let response =
-            stage.selection_failure(model_id, &[WorkerType::Prefill, WorkerType::Decode], None);
+        let response = stage.selection_failure(
+            model_id,
+            &[WorkerType::Prefill, WorkerType::Decode],
+            None,
+            false,
+        );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error::extract_error_code_from_response(&response),
-            "no_available_workers"
+            "worker_overload_protection_shed"
         );
         assert!(
             !is_retryable_response(&response),
@@ -1004,8 +1118,12 @@ mod tests {
 
         // No prefill/decode workers registered: with encode undemanded this is
         // model absence (404), not pressure.
-        let text_only =
-            stage.selection_failure(model_id, &[WorkerType::Prefill, WorkerType::Decode], None);
+        let text_only = stage.selection_failure(
+            model_id,
+            &[WorkerType::Prefill, WorkerType::Decode],
+            None,
+            false,
+        );
         assert_eq!(text_only.status(), StatusCode::NOT_FOUND);
 
         // With encode demanded, the saturated encode pool is a shed.
@@ -1013,6 +1131,7 @@ mod tests {
             model_id,
             &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode],
             None,
+            false,
         );
         assert_eq!(with_encode.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1028,18 +1147,23 @@ mod tests {
         );
         assert_eq!(
             stage
-                .selection_failure("nobody", &[WorkerType::Prefill, WorkerType::Decode], None)
+                .selection_failure(
+                    "nobody",
+                    &[WorkerType::Prefill, WorkerType::Decode],
+                    None,
+                    false
+                )
                 .status(),
             StatusCode::NOT_FOUND
         );
     }
 
     #[test]
-    #[should_panic(expected = "even PD round-robin coverage")]
-    fn select_pd_pair_shared_round_robin_fails_even_coverage() {
+    fn select_pd_pair_shared_round_robin_keeps_each_leg_even() {
         // Same correctness bar as the independent test. One shared RoundRobin
-        // Arc for P/D advances the counter twice per request, so even coverage
-        // must fail (this test is expected to panic on that assertion).
+        // Arc for P/D used to advance a single counter twice per request and
+        // pin each leg to half its workers; the rotation is per candidate
+        // set now, so even a shared instance covers both legs evenly.
         let model_id = "test-model-shared";
         let worker_registry = Arc::new(WorkerRegistry::new());
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
@@ -1131,15 +1255,15 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None)
-                .is_none(),
+                .select_pd_pair(model_id, None, None, None, None, None, None, false)
+                .is_err(),
             "ZMQ-only PD pools must not yield a pair"
         );
 
         // Adding gRPC legs makes selection succeed, and it never picks the ZMQ ones.
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
         let (prefill, decode, _) = stage
-            .select_pd_pair(model_id, None, None, None, None, None)
+            .select_pd_pair(model_id, None, None, None, None, None, None, false)
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));
@@ -1186,7 +1310,16 @@ mod tests {
         let mut poison = HeaderMap::new();
         poison.insert("x-smg-routing-key", "req-unique-1".parse().unwrap());
         let first = stage
-            .select_single_worker(model_id, None, None, Some(&poison), rid_key, None)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                Some(&poison),
+                rid_key,
+                None,
+                None,
+                false,
+            )
             .unwrap();
         for (i, rid) in ["conv7_t2", "conv7_t2_r1", "conv7_t3"].iter().enumerate() {
             let mut rotated = HeaderMap::new();
@@ -1202,14 +1335,16 @@ mod tests {
                     Some(&rotated),
                     policy_registry.derive_rid_key(Some(rid)),
                     None,
+                    None,
+                    false,
                 )
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by rid key");
         }
     }
 
-    /// The gRPC transport must shed an all-overloaded model with the same 503
-    /// `no_available_workers` the HTTP router uses. Its usual empty-pool answer
+    /// The gRPC transport must shed an all-overloaded model with the same
+    /// distinct overload 503 the HTTP router uses. Its usual empty-pool answer
     /// is a 404, which would both misreport pressure as model absence and skip
     /// the retry path (404 is not retryable).
     #[test]
@@ -1239,13 +1374,13 @@ mod tests {
         );
 
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, None, None, false)
             .is_some());
 
         worker_registry.set_worker_overloaded(&workers[0], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None)
+                .select_single_worker(model_id, None, None, None, None, None, None, false)
                 .is_some(),
             "one eligible worker left still serves"
         );
@@ -1253,30 +1388,129 @@ mod tests {
         worker_registry.set_worker_overloaded(&workers[1], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None)
+                .select_single_worker(model_id, None, None, None, None, None, None, false)
                 .is_none(),
             "the veto empties the candidate pool"
         );
 
-        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None);
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, false);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
-            "no_available_workers"
+            "worker_overload_protection_shed"
         );
 
         // Recovery re-admits, and the failure response goes back to 404 for a
         // genuinely absent model.
         worker_registry.set_worker_overloaded(&workers[0], false);
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, None, None, false)
             .is_some());
         assert_eq!(
             stage
-                .selection_failure("no-such-model", &[WorkerType::Regular], None)
+                .selection_failure("no-such-model", &[WorkerType::Regular], None, false)
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// Workers serve the model but none is available: a 503 with the HTTP
+    /// router's code, not the 404 that told clients the model was gone while
+    /// its workers restarted.
+    #[test]
+    fn an_unavailable_regular_worker_answers_503_not_404() {
+        use openai_protocol::worker::WorkerStatus;
+
+        use crate::routers::error::extract_error_code_from_response;
+        let model_id = "test-model-unavailable";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8470")
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        worker_registry.register(Arc::clone(&worker)).unwrap();
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+        );
+        // Any status but Ready is unavailable to routing.
+        worker.set_status(WorkerStatus::NotReady);
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None, None, None, false)
+            .is_none());
+
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, false);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        // A model nobody serves stays a 404.
+        assert_eq!(
+            stage
+                .selection_failure("no-such-model", &[WorkerType::Regular], None, false)
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// A disaggregated leg whose only worker is down is the same 503, both
+    /// through the per-leg fallback and through the pair verdict.
+    #[test]
+    fn an_unavailable_decode_leg_answers_503_not_404() {
+        use openai_protocol::worker::WorkerStatus;
+
+        use crate::{policies::WorkerLeg, routers::error::extract_error_code_from_response};
+        let model_id = "test-model-decode-down";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_pd_workers(&worker_registry, model_id, 1);
+        let decode = worker_registry
+            .get_routing_pool(model_id, RoutingPool::GrpcDecode)
+            .first()
+            .cloned()
+            .expect("one decode worker registered");
+        decode.set_status(WorkerStatus::NotReady);
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::PrefillDecode,
+        );
+
+        let fallback = stage.selection_failure(
+            model_id,
+            &[WorkerType::Prefill, WorkerType::Decode],
+            None,
+            false,
+        );
+        let pair = stage.pair_failure(
+            model_id,
+            PairFailure {
+                leg: WorkerLeg::Decode,
+                verdict: PlacementFailure::Unavailable,
+            },
+        );
+
+        for response in [fallback, pair] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "no_available_workers"
+            );
+        }
+        let absent = stage.pair_failure(
+            model_id,
+            PairFailure {
+                leg: WorkerLeg::Decode,
+                verdict: PlacementFailure::NoCandidates,
+            },
+        );
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
     }
 
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
@@ -1290,6 +1524,7 @@ mod tests {
                 routing_text: None,
                 token_ids: vec![1, 2, 3],
                 rid_key: None,
+                cache_namespace: None,
             },
             wire,
             tokenizer: None,
@@ -1299,6 +1534,7 @@ mod tests {
             encode_outputs: None,
             dispatch: None,
             load_guards: None,
+            multimodal_inflight: None,
             response: Default::default(),
         }
     }
@@ -1350,6 +1586,7 @@ mod tests {
             WireConstraint {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
             },
         );
         for _ in 0..8 {
@@ -1416,6 +1653,7 @@ mod tests {
             WireConstraint {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
             },
         );
         for _ in 0..8 {
@@ -1474,6 +1712,7 @@ mod tests {
             WireConstraint {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
             },
         );
 
@@ -1485,5 +1724,365 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "verdict must reflect the pinned pool, not every runtime"
         );
+    }
+
+    /// The namespace lives on the routing snapshot so a retry re-selects in
+    /// the same cache partition: the retained snapshot, not a re-derivation
+    /// from a request that may already be released, decides the key.
+    #[test]
+    fn reselect_keys_affinity_under_the_retained_cache_namespace() {
+        use openai_protocol::common::CachePartition;
+
+        let model_id = "namespace-retry-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let workers: Vec<Arc<dyn Worker>> = ["grpc://127.0.0.1:9401", "grpc://127.0.0.1:9402"]
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        for worker in &workers {
+            worker_registry.register(Arc::clone(worker)).unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 4096,
+                block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
+            })),
+            WorkerSelectionMode::Regular,
+        );
+        let wire = WireConstraint {
+            runtime: RuntimeType::Vllm,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+        };
+        let namespace = |salt: &str| {
+            CacheNamespace::derive(&CachePartition {
+                cache_salt: Some(salt),
+                extra_key: None,
+                lora_path: None,
+            })
+        };
+        let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
+            WorkerSelection::Single { worker } => worker.url().to_string(),
+            WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
+        };
+        let prompt: Vec<u32> = (1..33).collect();
+
+        // Worker 1 is busier, so tenant A's first selection lands on worker 2.
+        workers[0].increment_load();
+        let mut ctx = dispatch_ctx(model_id, wire);
+        ctx.routing.token_ids = prompt.clone();
+        ctx.routing.cache_namespace = namespace("tenant-a");
+        stage.reselect(&mut ctx).unwrap();
+        assert_eq!(selected(&ctx), "grpc://127.0.0.1:9402");
+
+        // A retry from the retained snapshot stays in tenant A's partition
+        // even once worker 2 is the busier one...
+        workers[1].increment_load();
+        workers[1].increment_load();
+        stage.reselect(&mut ctx).unwrap();
+        assert_eq!(selected(&ctx), "grpc://127.0.0.1:9402");
+
+        // ...while a retained snapshot for tenant B misses and takes the
+        // least-loaded worker 1.
+        let mut other = dispatch_ctx(model_id, wire);
+        other.routing.token_ids = prompt;
+        other.routing.cache_namespace = namespace("tenant-b");
+        stage.reselect(&mut other).unwrap();
+        assert_eq!(selected(&other), "grpc://127.0.0.1:9401");
+    }
+
+    fn vllm_grpc_worker(
+        url: &str,
+        model_id: &str,
+        worker_type: WorkerType,
+        advertise_refs: bool,
+    ) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .model(ModelCard::new(model_id))
+            .worker_type(worker_type)
+            .runtime_type(RuntimeType::Vllm)
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check());
+        if advertise_refs {
+            builder = builder
+                .label("mm_processor", "inprocess")
+                .label("mm_media_ref_schemes", "http,https,data");
+        }
+        Arc::new(builder.build())
+    }
+
+    /// Media references only reach workers advertising worker-side processing,
+    /// on first selection and on the wire-pinned retry path alike.
+    #[test]
+    fn media_refs_selection_filters_to_advertising_workers() {
+        let model_id = "test-model-media-refs";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let plain_url = "grpc://127.0.0.1:8700";
+        let capable_url = "grpc://127.0.0.1:8701";
+        for (url, advertise) in [(plain_url, false), (capable_url, true)] {
+            worker_registry
+                .register(vllm_grpc_worker(
+                    url,
+                    model_id,
+                    WorkerType::Regular,
+                    advertise,
+                ))
+                .unwrap();
+        }
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::Regular,
+        );
+
+        for _ in 0..4 {
+            let worker = stage
+                .select_single_worker(model_id, None, None, None, None, None, None, true)
+                .expect("advertising worker is selectable");
+            assert_eq!(worker.url(), capable_url);
+        }
+
+        let wire = WireConstraint {
+            runtime: RuntimeType::Vllm,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: true,
+        };
+        let worker = stage
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(wire),
+                wire.requires_media_refs,
+            )
+            .expect("retry re-selection stays on advertising workers");
+        assert_eq!(worker.url(), capable_url);
+
+        let mut seen = HashMap::new();
+        for _ in 0..4 {
+            let worker = stage
+                .select_single_worker(model_id, None, None, None, None, None, None, false)
+                .expect("any worker without refs");
+            *seen.entry(worker.url().to_string()).or_insert(0) += 1;
+        }
+        assert_eq!(seen.len(), 2, "without refs both workers are eligible");
+    }
+
+    #[test]
+    fn media_refs_selection_sheds_when_no_worker_advertises() {
+        let model_id = "test-model-media-refs-none";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry
+            .register(vllm_grpc_worker(
+                "grpc://127.0.0.1:8710",
+                model_id,
+                WorkerType::Regular,
+                false,
+            ))
+            .unwrap();
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::Regular,
+        );
+
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None, None, None, true)
+            .is_none());
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, true);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "capability cannot change inside a retry window"
+        );
+        // The wire pin alone carries the media-refs fact on retries.
+        let wire = WireConstraint {
+            runtime: RuntimeType::Vllm,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: true,
+        };
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None, None, Some(wire), false)
+            .is_none());
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], Some(wire), false);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker"
+        );
+
+        // An absent model stays a 404 even in worker mode.
+        let response = stage.selection_failure("no-such-model", &[WorkerType::Regular], None, true);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Capable but overloaded workers keep the overload shed: its code,
+    /// Retry-After and non-retryable marking survive worker mode.
+    #[test]
+    fn media_refs_overloaded_capable_workers_keep_the_overload_shed() {
+        let model_id = "test-model-media-refs-overload";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let mut workers = Vec::new();
+        for i in 0..2 {
+            let worker = vllm_grpc_worker(
+                &format!("grpc://127.0.0.1:{}", 8740 + i),
+                model_id,
+                WorkerType::Regular,
+                true,
+            );
+            worker_registry.register(Arc::clone(&worker)).unwrap();
+            workers.push(worker);
+        }
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::Regular,
+        );
+        for worker in &workers {
+            worker_registry.set_worker_overloaded(worker, true);
+        }
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None, None, None, true)
+            .is_none());
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, true);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker"
+        );
+        assert!(response.headers().contains_key("retry-after"));
+        assert!(!is_retryable_response(&response));
+    }
+
+    /// Both PD legs process the references, so both must advertise.
+    /// A leg with no members is "no worker serves the model", not a capability
+    /// shed: the PD path judges emptiness before capability, like the single path.
+    #[test]
+    fn media_refs_pd_selection_empty_leg_keeps_its_own_verdict() {
+        let model_id = "test-model-media-refs-pd-empty-leg";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry
+            .register(vllm_grpc_worker(
+                "grpc://127.0.0.1:8740",
+                model_id,
+                WorkerType::Decode,
+                true,
+            ))
+            .unwrap();
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::PrefillDecode,
+        );
+
+        let response = stage
+            .select_pd_pair(model_id, None, None, None, None, None, None, true)
+            .expect_err("no prefill worker at all");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker"
+        );
+    }
+
+    #[test]
+    fn media_refs_pd_selection_requires_both_legs() {
+        let model_id = "test-model-media-refs-pd";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry
+            .register(vllm_grpc_worker(
+                "grpc://127.0.0.1:8720",
+                model_id,
+                WorkerType::Prefill,
+                false,
+            ))
+            .unwrap();
+        worker_registry
+            .register(vllm_grpc_worker(
+                "grpc://127.0.0.1:8721",
+                model_id,
+                WorkerType::Prefill,
+                true,
+            ))
+            .unwrap();
+        worker_registry
+            .register(vllm_grpc_worker(
+                "grpc://127.0.0.1:8730",
+                model_id,
+                WorkerType::Decode,
+                false,
+            ))
+            .unwrap();
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::PrefillDecode,
+        );
+
+        let response = stage
+            .select_pd_pair(model_id, None, None, None, None, None, None, true)
+            .expect_err("no advertising decode worker yet");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker"
+        );
+
+        worker_registry
+            .register(vllm_grpc_worker(
+                "grpc://127.0.0.1:8731",
+                model_id,
+                WorkerType::Decode,
+                true,
+            ))
+            .unwrap();
+        for _ in 0..3 {
+            let (prefill, decode, _) = stage
+                .select_pd_pair(model_id, None, None, None, None, None, None, true)
+                .expect("advertising pair");
+            assert_eq!(prefill.url(), "grpc://127.0.0.1:8721");
+            assert_eq!(decode.url(), "grpc://127.0.0.1:8731");
+        }
     }
 }

@@ -120,6 +120,7 @@ cmd_create_postgres_db() {
     local postgres_host="${1:-postgres-db}"
     local admin_url="postgresql://postgres:postgres@${postgres_host}:5432/postgres"
 
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
     sudo apt-get update -qq
     sudo apt-get install -y -qq postgresql-client
 
@@ -148,6 +149,7 @@ cmd_cleanup_postgres_db() {
 
 cmd_setup_oracle_client() {
     set -e
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
     sudo apt-get update
     sudo apt-get install -y unzip wget
     sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1

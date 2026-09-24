@@ -66,6 +66,9 @@ ENV_CONNECTION_MODE = (
 ENV_ZMQ_ENGINE_COUNT = (
     "E2E_ZMQ_ENGINE_COUNT"  # DP engines per ZMQ worker (grouped vLLM launch; empty = 1)
 )
+ENV_MM_PROCESSING = (
+    "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
+)
 ENV_STARTUP_TIMEOUT = "E2E_STARTUP_TIMEOUT"
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
@@ -157,6 +160,30 @@ def get_connection_mode_override() -> "ConnectionMode | None":
         ) from None
 
 
+MM_PROCESSING_WORKER = "worker"
+
+
+def get_mm_processing() -> str | None:
+    """Per-lane multimodal processing location for local vLLM gRPC workers.
+
+    Set ``E2E_MM_PROCESSING=worker`` to launch every vLLM gRPC worker with
+    ``SMG_VLLM_MM_PROCESSOR=inprocess``: the worker advertises worker-side media
+    processing and the gateway (left in its default ``auto`` mode) forwards
+    media references instead of preprocessed tensors for models that opt in.
+    Returns ``None`` when the var is unset or blank (the router path); a
+    set-but-unrecognized value is a misconfiguration and raises.
+    """
+    value = os.environ.get(ENV_MM_PROCESSING, "").strip().lower()
+    if not value:
+        return None
+    if value != MM_PROCESSING_WORKER:
+        raise ValueError(
+            f"{ENV_MM_PROCESSING}={value!r} is not a valid processing location; "
+            f"use {MM_PROCESSING_WORKER!r} or leave it unset"
+        )
+    return value
+
+
 def get_zmq_engine_count() -> int:
     """DP engines per ZMQ worker (grouped vLLM/TokenSpeed launch).
 
@@ -174,11 +201,22 @@ def get_zmq_engine_count() -> int:
 
 
 ENV_VLLM_KV_BACKEND = "E2E_VLLM_KV_BACKEND"
+# One KV transfer backend for every PD worker in the lane, whatever the
+# engine; the per-engine variables below are the fallbacks.
+ENV_KV_BACKEND = "E2E_KV_BACKEND"
+ENV_SGLANG_TRANSFER_BACKEND = "E2E_SGLANG_TRANSFER_BACKEND"
 
 
 def vllm_kv_backend() -> str:
     """KV transfer backend for vLLM PD workers: "nixl" (default) or "mooncake"."""
-    return os.environ.get(ENV_VLLM_KV_BACKEND, "nixl").lower()
+    lane = os.environ.get(ENV_KV_BACKEND, "").strip().lower()
+    return lane or os.environ.get(ENV_VLLM_KV_BACKEND, "nixl").lower()
+
+
+def sglang_transfer_backend() -> str:
+    """Disaggregation transfer backend for SGLang PD workers: "mooncake" (default) or "nixl"."""
+    lane = os.environ.get(ENV_KV_BACKEND, "").strip().lower()
+    return lane or os.environ.get(ENV_SGLANG_TRANSFER_BACKEND, "mooncake").lower()
 
 
 # Runtime display labels

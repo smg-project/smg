@@ -174,13 +174,20 @@ impl QwenXmlParser {
 
     /// Parse and stream complete parameters from buffer
     /// Returns tool call items to emit (similar to Python's _parse_and_stream_parameters)
-    fn parse_and_stream_parameters(&mut self, tools: &[Tool]) -> Vec<ToolCallItem> {
+    fn parse_and_stream_parameters(
+        &mut self,
+        tools: &[Tool],
+        parameter_end: usize,
+    ) -> Vec<ToolCallItem> {
         let mut calls: Vec<ToolCallItem> = vec![];
         let param_types = helpers::param_types_for_function(tools, &self.current_function_name);
 
-        // Find all complete parameter patterns in buffer
+        // Leave parameters from subsequent coalesced calls for their own iteration.
         let mut new_params = serde_json::Map::new();
-        for cap in self.xml_param_pattern.captures_iter(&self.buffer) {
+        for cap in self
+            .xml_param_pattern
+            .captures_iter(&self.buffer[..parameter_end])
+        {
             if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                 let key = key_match.as_str().trim().to_string();
                 let value = value_match.as_str();
@@ -422,26 +429,23 @@ impl ToolParser for QwenXmlParser {
 
             // Parse parameters (only complete ones)
             if self.current_tool_name_sent {
-                let param_calls = self.parse_and_stream_parameters(tools);
+                let end_pos = self.buffer.find(self.tool_call_end_token);
+                let parameter_end = end_pos.unwrap_or(self.buffer.len());
+                let param_calls = self.parse_and_stream_parameters(tools, parameter_end);
                 calls.extend(param_calls);
 
                 // Check if tool call is complete
-                if let Some(end_pos) = self.buffer.find(self.tool_call_end_token) {
-                    // Close JSON object if we have parameters
-                    let current_args = &self.streamed_args_for_tool[self.current_tool_id as usize];
-                    if !current_args.is_empty() {
-                        // Count braces to check if JSON is complete
-                        let open_braces = current_args.matches('{').count();
-                        let close_braces = current_args.matches('}').count();
-                        if open_braces > close_braces {
-                            calls.push(ToolCallItem {
-                                tool_index: self.current_tool_id as usize,
-                                name: None,
-                                parameters: "}".to_string(),
-                            });
-                            self.streamed_args_for_tool[self.current_tool_id as usize].push('}');
-                        }
-                    }
+                if let Some(end_pos) = end_pos {
+                    // Parameter fragments leave the root open; braces in values are data.
+                    let current_args =
+                        &mut self.streamed_args_for_tool[self.current_tool_id as usize];
+                    let closing = if current_args.is_empty() { "{}" } else { "}" };
+                    calls.push(ToolCallItem {
+                        tool_index: self.current_tool_id as usize,
+                        name: None,
+                        parameters: closing.to_string(),
+                    });
+                    current_args.push_str(closing);
 
                     // Complete the tool call
                     self.buffer =
@@ -466,6 +470,23 @@ impl ToolParser for QwenXmlParser {
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        let tool_index = self.prev_tool_call_arr.len().checked_sub(1)?;
+        let actual = self.streamed_args_for_tool.get(tool_index)?;
+        let expected = self.prev_tool_call_arr[tool_index].get("arguments")?;
+        // XML parameters use spaced JSON, unlike the generic compact-prefix recovery.
+        // Append only the root brace, and only for exactly the already parsed values.
+        if !actual.is_empty()
+            && serde_json::from_str::<Value>(&format!("{actual}}}"))
+                .ok()
+                .as_ref()
+                == Some(expected)
+        {
+            return Some(vec![ToolCallItem {
+                tool_index,
+                name: None,
+                parameters: "}".to_string(),
+            }]);
+        }
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 

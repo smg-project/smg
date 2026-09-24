@@ -247,7 +247,6 @@ mod pd_routing_unit_tests {
                 let worker_monitor = Some(Arc::new(WorkerMonitor::new(
                     worker_registry.clone(),
                     policy_registry.clone(),
-                    client.clone(),
                     config.load_monitor_interval_secs,
                     config.engine_metrics,
                     config.disable_load_monitoring,

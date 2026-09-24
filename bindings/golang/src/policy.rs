@@ -32,7 +32,7 @@ use smg::{
         circuit_breaker::{CircuitBreaker, CircuitState},
         resilience::ResolvedResilience,
         worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
-        ConnectionMode, OverloadThresholds, Worker, WorkerResult, WorkerType,
+        ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
 use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
@@ -71,10 +71,12 @@ impl GrpcWorker {
         spec.runtime_type = RuntimeType::Sglang;
 
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
+            http2: false,
         };
         Self {
             client,
@@ -608,7 +610,9 @@ pub unsafe extern "C" fn sgl_multi_client_chat_completion_stream(
         chat_request.tools.as_ref(),
         chat_request.tool_choice.as_ref(),
     ) {
-        match registry.generate_tool_constraint(None, tools, tool_choice) {
+        // No parser is configured here, so the registry falls back to a JSON
+        // schema, which carries no reasoning prefix.
+        match registry.generate_tool_constraint(None, tools, tool_choice, false) {
             Ok(Some(c)) => Some(c.to_tuple()),
             Ok(None) => None,
             Err(e) => {

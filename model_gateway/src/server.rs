@@ -21,7 +21,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     multipart::AudioTranscriptionMultipart,
     parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
     realtime_session::{
@@ -47,7 +47,9 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
+    endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
+    mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
         logging::{self, LoggingConfig},
@@ -56,11 +58,9 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
-        conversations,
+        gateway::Gateway,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
-        parse, responses as response_handlers,
-        router_manager::RouterManager,
-        tokenize, RouterTrait,
+        RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
@@ -78,7 +78,7 @@ pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
     pub admission_queue: Option<Arc<AdmissionQueue>>,
-    pub router_manager: Option<Arc<RouterManager>>,
+    pub gateway: Option<Arc<Gateway>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
     /// Cached O(1) readiness state shared with the optional dedicated
@@ -127,7 +127,7 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
-    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client)
+    WorkerManager::get_engine_metrics(&state.context.worker_registry)
         .await
         .into_response()
 }
@@ -137,7 +137,7 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    state.router.get_models(req).await
+    models::list_models(&state.context, req.headers()).await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -295,6 +295,23 @@ async fn v1_messages(
             state
                 .router
                 .route_messages(Some(&headers), &tenant_meta, body, &model),
+        )
+        .await
+}
+
+async fn v1_messages_count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    Json(body): Json<CountMessageTokensRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_messages_count_tokens(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -564,17 +581,21 @@ async fn stop_profile(
         .into_response()
 }
 
-async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::get_all_worker_loads(
+async fn get_loads(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListWorkersQuery>,
+) -> Response {
+    let snapshot = state
+        .context
+        .worker_monitor
+        .as_ref()
+        .map(|monitor| monitor.load_snapshot())
+        .unwrap_or_default();
+    Json(WorkerManager::fleet_loads(
         &state.context.worker_registry,
-        &state.context.client,
-        state
-            .context
-            .worker_monitor
-            .as_ref()
-            .map(|monitor| monitor.native_loads_absent()),
-    )
-    .await
+        &snapshot,
+        query.model.as_deref(),
+    ))
     .into_response()
 }
 
@@ -592,11 +613,17 @@ async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
 ) -> Response {
-    state
+    let mut result = state
         .context
         .worker_service
-        .list_workers(query.model.as_deref())
-        .into_response()
+        .list_workers(query.model.as_deref());
+    if let Some(monitor) = state.context.worker_monitor.as_ref() {
+        let snapshot = monitor.load_snapshot();
+        for info in &mut result.workers {
+            info.engine_load = snapshot.get(&info.spec.url).cloned();
+        }
+    }
+    result.into_response()
 }
 
 async fn get_worker(
@@ -604,7 +631,13 @@ async fn get_worker(
     Path(worker_id_raw): Path<String>,
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
-        Ok(result) => result.into_response(),
+        Ok(mut result) => {
+            if let Some(monitor) = state.context.worker_monitor.as_ref() {
+                let snapshot = monitor.load_snapshot();
+                result.0.engine_load = snapshot.get(&result.0.spec.url).cloned();
+            }
+            result.into_response()
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -722,6 +755,9 @@ pub struct ServerConfig {
     pub log_level: Option<String>,
     pub log_json: bool,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    /// Kubernetes discovery of SMG mesh router peers. Independent of the
+    /// worker discovery provider: either may run without the other.
+    pub mesh_discovery_config: Option<MeshDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
@@ -839,6 +875,7 @@ pub fn build_app(
             .route("/v1/rerank", post(v1_rerank))
             .route("/v1/embeddings", post(v1_embeddings))
             .route("/v1/messages", post(v1_messages))
+            .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
             .route("/v1/interactions", post(v1_interactions))
             .route("/v1/classify", post(v1_classify))
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
@@ -920,6 +957,7 @@ pub fn build_app(
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
+        .route("/loads", get(get_loads))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
@@ -929,6 +967,7 @@ pub fn build_app(
         .route("/flush_cache", post(flush_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
+        // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
@@ -984,19 +1023,30 @@ pub fn build_app(
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
+    // RL control plane: mounted only when the flag built an `RlState`, so
+    // with `--enable-rl` off nothing under /v1/rl exists and the sink 404s.
+    let rl_routes = app_state.context.rl.as_ref().map(|rl| {
+        apply_control_plane_auth(Router::new().nest("/v1/rl", smg_rl::router(Arc::clone(rl))))
+    });
+
     // `/ha/*` management routes (routers/mesh handlers) are removed
     // in this PR — they all read/write through the v1
     // `MeshSyncManager` and don't map cleanly onto the v2 adapters.
     // A v2-aware admin surface will return in a follow-up PR once
     // adapters are production-wired.
 
-    Ok(Router::new()
+    let mut app = Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
         .merge(multipart_upload_routes)
         .merge(public_routes)
         .merge(admin_routes)
-        .merge(worker_routes)
+        .merge(worker_routes);
+    if let Some(rl_routes) = rl_routes {
+        app = app.merge(rl_routes);
+    }
+
+    Ok(app
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -1009,6 +1059,45 @@ pub fn build_app(
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
         .with_state(app_state))
+}
+
+/// Discovery tasks owned by `startup`, aborted when this guard drops.
+///
+/// Discovery starts before `build_app`, address parsing, and TLS setup, so an
+/// error on any of those paths returns from `startup` early. Dropping a bare
+/// `AbortHandle` does not stop its task, so the guard makes cancellation
+/// unconditional rather than relying on reaching the cleanup block.
+#[derive(Default)]
+struct DiscoveryTasks(Vec<tokio::task::AbortHandle>);
+
+impl Drop for DiscoveryTasks {
+    fn drop(&mut self) {
+        for task in self.0.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+/// Keep a discovery task's abort handle for shutdown while a supervisor logs if
+/// the task ever stops on its own. A watcher that panics or whose stream ends
+/// permanently disables that discovery, so it must not fail silently.
+fn supervise_discovery(
+    name: &'static str,
+    handle: tokio::task::JoinHandle<()>,
+) -> tokio::task::AbortHandle {
+    let abort = handle.abort_handle();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "supervisor outlives the task it watches; it ends when that task ends"
+    )]
+    spawn(async move {
+        match handle.await {
+            Ok(()) => error!("{name} task exited; it no longer receives updates"),
+            Err(e) if e.is_cancelled() => debug!("{name} task cancelled at shutdown"),
+            Err(e) => error!("{name} task panicked and is no longer running: {e}"),
+        }
+    });
+    abort
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1059,11 +1148,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Seed the process-wide multimodal tensor transport defaults from the
     // resolved router config; per-worker specs still override at request time.
-    use crate::routers::grpc::multimodal::init_mm_transport_defaults;
+    use crate::routers::grpc::multimodal::{
+        init_mm_settings, init_mm_transport_defaults, MultimodalSettings,
+    };
     init_mm_transport_defaults(
         config.router_config.multimodal_tensor_transport,
         config.router_config.multimodal_shm_min_bytes,
     );
+    // Flag > env > default, resolved once; an unreadable env value stops
+    // startup here rather than at router creation.
+    let mm_settings = MultimodalSettings::resolve(&config.router_config)
+        .map_err(|error| format!("multimodal settings: {error:#}"))?;
+    llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
+    init_mm_settings(mm_settings);
 
     // Start the metrics server. It binds the port eagerly so we fail fast on
     // port conflicts or bad addresses.
@@ -1263,8 +1360,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         worker_stats.total_workers, worker_stats.healthy_workers
     );
 
-    let router_manager = RouterManager::from_config(&config, &app_context).await?;
-    let router: Arc<dyn RouterTrait> = router_manager.clone();
+    let gateway = Gateway::from_config(&config, &app_context).await?;
+    let router: Arc<dyn RouterTrait> = gateway.clone();
 
     // WorkerManager owns the background health check loop. Its handle must
     // outlive the server to keep the task alive — bind it here so its Drop
@@ -1287,7 +1384,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // WorkerMonitor subscribes to registry events. Starting its event
     // loop here (after the synchronous worker population in
-    // RouterManager::from_config above) means the bootstrap reconcile
+    // Gateway::from_config above) means the bootstrap reconcile
     // captures every worker that exists at this point and the event
     // task picks up everything registered afterwards.
     if let Some(ref worker_monitor) = app_context.worker_monitor {
@@ -1352,40 +1449,59 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router,
         context: app_context.clone(),
         admission_queue,
-        router_manager: Some(router_manager),
+        gateway: Some(gateway),
         mesh_handler,
         mesh_adapters,
         probe_state,
     });
+    // Worker discovery and mesh-router discovery are independent lifetimes:
+    // either may run without the other. Each is supervised for unexpected exit
+    // and its abort handle held so shutdown cancels it.
+    let mut discovery_tasks = DiscoveryTasks::default();
+
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
             let app_context_arc = Arc::clone(&app_state.context);
-
-            match start_service_discovery(
-                service_discovery_config,
-                app_context_arc,
-                mesh_cluster_state,
-                mesh_port,
-            )
-            .await
-            {
+            match start_service_discovery(service_discovery_config, app_context_arc).await {
                 Ok(handle) => {
                     info!("Service discovery started");
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "service discovery runs for the lifetime of the server"
-                    )]
-                    spawn(async move {
-                        if let Err(e) = handle.await {
-                            error!("Service discovery task failed: {:?}", e);
-                        }
-                    });
+                    discovery_tasks
+                        .0
+                        .push(supervise_discovery("Worker discovery", handle));
                 }
                 Err(e) => {
                     error!("Failed to start service discovery: {e}");
                     warn!("Continuing without service discovery");
                 }
             }
+        }
+    }
+
+    if let Some(mesh_discovery_config) = config.mesh_discovery_config {
+        match (
+            mesh_discovery_config.is_enabled(),
+            mesh_cluster_state,
+            mesh_port,
+        ) {
+            (true, Some(cluster_state), Some(port)) => {
+                match start_mesh_discovery(mesh_discovery_config, cluster_state, port).await {
+                    Ok(handle) => {
+                        info!("Mesh router discovery started");
+                        discovery_tasks
+                            .0
+                            .push(supervise_discovery("Mesh router discovery", handle));
+                    }
+                    Err(e) => {
+                        error!("Failed to start mesh router discovery: {e}");
+                        warn!("Continuing without mesh router discovery");
+                    }
+                }
+            }
+            (true, _, _) => warn!(
+                "Router selector configured but mesh is not enabled (mesh cluster state or \
+                 mesh port not provided). Skipping router discovery."
+            ),
+            (false, _, _) => {}
         }
     }
 
@@ -1409,10 +1525,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // keys when falling back to simple API-key auth (no control-plane auth
     // configured) — a tenant credential must not be able to reach
     // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
-    let serving_auth_config = AuthConfig::with_tenant_keys(
-        config.router_config.api_key.clone(),
-        &config.router_config.tenant_api_keys,
-    );
+    let serving_auth_config = app_context.gateway_auth.clone();
     let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
     // Initialize control plane authentication if configured
@@ -1511,7 +1624,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
-        axum_server::bind(addr)
+        bind_http_server(addr)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -1520,6 +1633,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Graceful Shutdown
 
     info!("HTTP server stopped. Starting component cleanup...");
+
+    drop(discovery_tasks);
 
     // This triggers background task cancellation, waits for tools, and denies approvals
     if let Some(orchestrator) = app_context.mcp_orchestrator.get() {
@@ -1530,6 +1645,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Return original server error if any, otherwise Ok
     server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// Disable Nagle buffering on accepted plain-HTTP sockets so small streaming
+/// writes need not wait for outstanding data to be acknowledged. This changes
+/// neither HTTP payloads nor the separately configured TLS listener.
+fn bind_http_server(
+    addr: std::net::SocketAddr,
+) -> axum_server::Server<std::net::SocketAddr, axum_server::accept::NoDelayAcceptor> {
+    axum_server::bind(addr).acceptor(axum_server::accept::NoDelayAcceptor::new())
 }
 
 #[expect(
@@ -1588,7 +1712,12 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
                 http::Method::DELETE,
                 http::Method::OPTIONS,
             ])
-            .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
+            .allow_headers([
+                http::header::CONTENT_TYPE,
+                http::header::AUTHORIZATION,
+                http::header::HeaderName::from_static("anthropic-version"),
+                http::header::HeaderName::from_static("anthropic-beta"),
+            ])
             .expose_headers([http::header::HeaderName::from_static("x-request-id")])
     };
 
@@ -1597,8 +1726,136 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
+    use axum::response::sse::{Event, Sse};
+    use axum_server::accept::Accept;
+    use tokio::net::{TcpListener, TcpStream};
+
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    #[tokio::test]
+    async fn configured_cors_allows_anthropic_headers() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/v1/messages/count_tokens",
+                post(|| async { StatusCode::OK }),
+            )
+            .layer(create_cors_layer(vec!["https://client.example".into()]));
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/messages/count_tokens")
+                    .header("origin", "https://client.example")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "content-type,authorization,anthropic-version,anthropic-beta",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://client.example"
+        );
+        let allowed = response.headers()["access-control-allow-headers"]
+            .to_str()
+            .unwrap();
+        for header in [
+            "content-type",
+            "authorization",
+            "anthropic-version",
+            "anthropic-beta",
+        ] {
+            assert!(
+                allowed.split(',').any(|value| value.trim() == header),
+                "missing {header}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_http_acceptor_enables_nodelay() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            let _client = client.unwrap();
+            let (socket, _) = accepted.unwrap();
+            socket.set_nodelay(false).unwrap();
+            assert!(!socket.nodelay().unwrap());
+            let service = Arc::new(());
+            let server = bind_http_server(addr);
+            let (socket, returned_service) = server
+                .get_ref()
+                .accept(socket, service.clone())
+                .await
+                .unwrap();
+            assert!(socket.nodelay().unwrap());
+            assert!(Arc::ptr_eq(&service, &returned_service));
+        })
+        .await
+        .expect("plain HTTP acceptor test timed out");
+    }
+
+    #[tokio::test]
+    async fn plain_http_acceptor_preserves_response_bytes() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let handle = axum_server::Handle::new();
+            let app = Router::new()
+                .route(
+                    "/plain",
+                    get(|| async { Json(serde_json::json!({"ok": true})) }),
+                )
+                .route(
+                    "/stream",
+                    get(|| async {
+                        Sse::new(futures::stream::iter([
+                            Ok::<_, Infallible>(Event::default().data("first")),
+                            Ok::<_, Infallible>(Event::default().data("second")),
+                        ]))
+                    }),
+                );
+            let serving = bind_http_server("127.0.0.1:0".parse().unwrap())
+                .handle(handle.clone())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
+            let checking = async {
+                let addr = handle.listening().await.expect("HTTP server did not bind");
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                for (path, content_type, expected) in [
+                    ("plain", "application/json", "{\"ok\":true}"),
+                    (
+                        "stream",
+                        "text/event-stream",
+                        "data: first\n\ndata: second\n\n",
+                    ),
+                ] {
+                    let response = client
+                        .get(format!("http://{addr}/{path}"))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()["content-type"], content_type);
+                    assert_eq!(response.text().await.unwrap(), expected);
+                }
+                handle.shutdown();
+            };
+            let (result, ()) = tokio::join!(serving, checking);
+            result.unwrap();
+        })
+        .await
+        .expect("plain HTTP response test timed out");
+    }
 
     fn minimal_server_config(router_config: RouterConfig) -> ServerConfig {
         ServerConfig {
@@ -1612,6 +1869,7 @@ mod tests {
             log_level: None,
             log_json: false,
             service_discovery_config: None,
+            mesh_discovery_config: None,
             prometheus_config: None,
             request_timeout_secs: 60,
             request_id_headers: None,

@@ -30,6 +30,7 @@ use std::{
 use blake3;
 use dashmap::DashMap;
 
+use super::activity::L1;
 use crate::traits::{Encoder, Encoding, TokenIdType};
 
 /// Hash type for cache keys
@@ -201,6 +202,7 @@ impl L1Cache {
 
         if seeds.is_empty() {
             self.misses.fetch_add(1, Ordering::Relaxed);
+            L1.miss();
             return PrefixLookup::Miss(seeds);
         }
 
@@ -214,12 +216,14 @@ impl L1Cache {
                 entry.last_accessed.store(timestamp, Ordering::Relaxed);
 
                 self.hits.fetch_add(1, Ordering::Relaxed);
+                L1.hit(boundary_pos);
                 // Share the cached allocation instead of copying it on every hit.
                 return PrefixLookup::Hit(Arc::clone(&entry.tokens), boundary_pos);
             }
         }
 
         self.misses.fetch_add(1, Ordering::Relaxed);
+        L1.miss();
         PrefixLookup::Miss(seeds)
     }
 
@@ -414,6 +418,7 @@ impl L1Cache {
             {
                 // Remove it
                 if let Some((_, removed)) = self.shards[shard_idx].remove(&hash) {
+                    L1.evict();
                     freed += removed.size_bytes;
                     self.current_memory
                         .fetch_sub(removed.size_bytes as u64, Ordering::Relaxed);

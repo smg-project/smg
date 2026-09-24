@@ -421,6 +421,112 @@ async fn test_m3_streaming_no_markers_passthrough() {
 }
 
 #[tokio::test]
+async fn test_m3_streaming_wrapper_and_invoke_across_every_chunk_boundary() {
+    let tools = create_test_tools();
+    let full = tool_block(&[("get_weather", element("city", "Seattle"))]);
+    let invoke_header = "name=\"get_weather\">";
+    let prefix_end = full.find(invoke_header).unwrap() + invoke_header.len();
+
+    for split in 1..prefix_end {
+        let mut parser = MinimaxM3Parser::new();
+
+        let first = parser
+            .parse_incremental(&full[..split], &tools)
+            .await
+            .unwrap();
+        assert!(first.normal_text.is_empty(), "split {split}");
+        assert!(first.calls.is_empty(), "split {split}");
+
+        let second = parser
+            .parse_incremental(&full[split..], &tools)
+            .await
+            .unwrap();
+        assert!(second.normal_text.is_empty(), "split {split}");
+        assert_eq!(
+            second.calls.iter().find_map(|call| call.name.as_deref()),
+            Some("get_weather"),
+            "split {split}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_m3_streaming_false_invoke_prefix_recovers_at_every_divergence() {
+    let tools = create_test_tools();
+    let wrapper = format!("{NS}<tool_call>");
+    let possible_invoke = format!("\n\t{NS}<invoke");
+
+    // Every prefix through the complete marker remains viable, including
+    // whitespace after the wrapper. The first divergent byte must release the
+    // entire candidate, including when it follows a complete invoke marker.
+    for split in 0..=possible_invoke.len() {
+        let mut parser = MinimaxM3Parser::new();
+        let held = format!("{wrapper}{}", &possible_invoke[..split]);
+
+        let first = parser.parse_incremental(&held, &tools).await.unwrap();
+        assert!(first.normal_text.is_empty(), "split {split}");
+        assert!(first.calls.is_empty(), "split {split}");
+
+        let recovered = parser.parse_incremental("X", &tools).await.unwrap();
+        assert_eq!(recovered.normal_text, format!("{held}X"), "split {split}");
+        assert!(recovered.calls.is_empty(), "split {split}");
+
+        let tail = parser
+            .parse_incremental(" ordinary tail", &tools)
+            .await
+            .unwrap();
+        assert_eq!(tail.normal_text, " ordinary tail", "split {split}");
+        assert!(tail.calls.is_empty(), "split {split}");
+    }
+}
+
+#[tokio::test]
+async fn test_m3_streaming_eof_returns_incomplete_candidates_and_resets_state() {
+    let tools = create_test_tools();
+    let wrapper = format!("{NS}<tool_call>");
+    let candidates = [
+        wrapper[..wrapper.len() - 1].to_string(),
+        format!("{wrapper}\n  {NS}<invoke name=\"get_weather\">"),
+    ];
+
+    for candidate in candidates {
+        let mut parser = MinimaxM3Parser::new();
+        let result = parser.parse_incremental(&candidate, &tools).await.unwrap();
+        assert!(result.normal_text.is_empty(), "candidate {candidate:?}");
+        assert!(result.calls.is_empty(), "candidate {candidate:?}");
+
+        assert_eq!(parser.take_unstreamed_normal_text(), candidate);
+        assert_eq!(parser.take_unstreamed_normal_text(), "");
+
+        let next = parser
+            .parse_incremental("ordinary text", &tools)
+            .await
+            .unwrap();
+        assert_eq!(next.normal_text, "ordinary text");
+        assert!(next.calls.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_m3_streaming_eof_returns_new_candidate_after_completed_call() {
+    let tools = create_test_tools();
+    let mut parser = MinimaxM3Parser::new();
+    let call = tool_block(&[("get_weather", element("city", "Seattle"))]);
+
+    let complete = parser.parse_incremental(&call, &tools).await.unwrap();
+    assert_eq!(
+        complete.calls.iter().find_map(|item| item.name.as_deref()),
+        Some("get_weather")
+    );
+
+    let incomplete = format!("{NS}<tool_call>\n{NS}<invoke name=\"search\">");
+    let pending = parser.parse_incremental(&incomplete, &tools).await.unwrap();
+    assert!(pending.normal_text.is_empty());
+    assert!(pending.calls.is_empty());
+    assert_eq!(parser.take_unstreamed_normal_text(), incomplete);
+}
+
+#[tokio::test]
 async fn test_m3_reset_between_requests() {
     let mut parser = MinimaxM3Parser::new();
     let tools = create_test_tools();
@@ -913,6 +1019,137 @@ async fn test_empty_leaf_without_schema_is_unchanged() {
     assert_eq!(args["avoid_aisles"], json!(""));
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper; allow-unwrap-in-tests only covers #[test] fns"
+)]
+fn composite_schema_tools(combinator: &str) -> Vec<Tool> {
+    let branches = json!([
+        {
+            "type": "object",
+            "properties": {
+                "string_list": {"type": "array", "items": {"type": "string"}}
+            }
+        },
+        {
+            "type": "object",
+            "properties": {
+                "number_list": {"type": "array", "items": {"type": "number"}}
+            }
+        }
+    ]);
+    let mut nested = json!({"type": "object"});
+    nested
+        .as_object_mut()
+        .unwrap()
+        .insert(combinator.to_string(), branches.clone());
+    let mut parameters = json!({
+        "type": "object",
+        "properties": {
+            "plain": {"type": "string"},
+            "nested": nested
+        }
+    });
+    parameters
+        .as_object_mut()
+        .unwrap()
+        .insert(combinator.to_string(), branches);
+
+    vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "composite_schema".to_string(),
+            description: None,
+            parameters,
+            strict: None,
+        },
+    }]
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper; allow-unwrap-in-tests only covers #[test] fns"
+)]
+async fn assert_composite_property_schemas(combinator: &str) {
+    let parser = MinimaxM3Parser::new();
+    let tools = composite_schema_tools(combinator);
+    let string_items = format!("{}{}", element("item", "12"), element("item", "34"));
+    let number_items = format!("{}{}", element("item", "12"), element("item", "34"));
+    let input = tool_block(&[
+        ("composite_schema", element("plain", "007")),
+        ("composite_schema", element("string_list", &string_items)),
+        ("composite_schema", element("number_list", &number_items)),
+    ]);
+
+    let (_, calls) = parser
+        .parse_complete_with_tools(&input, &tools)
+        .await
+        .unwrap();
+    let arguments = calls
+        .iter()
+        .map(|call| serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(arguments[0], json!({"plain": "007"}));
+    assert_eq!(arguments[1], json!({"string_list": ["12", "34"]}));
+    assert_eq!(arguments[2], json!({"number_list": [12, 34]}));
+}
+
+#[tokio::test]
+async fn test_m3_resolves_property_schemas_in_top_level_one_of() {
+    assert_composite_property_schemas("oneOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_property_schemas_in_top_level_any_of() {
+    assert_composite_property_schemas("anyOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_property_schemas_in_top_level_all_of() {
+    assert_composite_property_schemas("allOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_nested_composite_property_schemas() {
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        let parser = MinimaxM3Parser::new();
+        let tools = composite_schema_tools(combinator);
+        let string_items = format!("{}{}", element("item", "12"), element("item", "34"));
+        let number_items = format!("{}{}", element("item", "12"), element("item", "34"));
+        let input = tool_block(&[
+            (
+                "composite_schema",
+                element("nested", &element("string_list", &string_items)),
+            ),
+            (
+                "composite_schema",
+                element("nested", &element("number_list", &number_items)),
+            ),
+        ]);
+
+        let (_, calls) = parser
+            .parse_complete_with_tools(&input, &tools)
+            .await
+            .unwrap();
+        let string_args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let number_args: serde_json::Value =
+            serde_json::from_str(&calls[1].function.arguments).unwrap();
+
+        assert_eq!(
+            string_args,
+            json!({"nested": {"string_list": ["12", "34"]}}),
+            "{combinator} must preserve nested string array items"
+        );
+        assert_eq!(
+            number_args,
+            json!({"nested": {"number_list": [12, 34]}}),
+            "{combinator} must coerce nested number array items"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_populated_array_still_parses_after_empty_container_fix() {
     let parser = MinimaxM3Parser::new();
@@ -927,4 +1164,333 @@ async fn test_populated_array_still_parses_after_empty_container_fix() {
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
 
     assert_eq!(args["avoid_aisles"], json!(["dairy", "frozen"]));
+}
+
+/// Reduced from M3 output where Sunday's empty time_blocks omitted its close
+/// before </item>. Keep nested array schema traversal and later parameters.
+#[tokio::test]
+async fn test_m3_missing_empty_container_close_in_nested_array() {
+    let tools = vec![Tool {
+        tool_type: "function".into(),
+        function: Function {
+            name: "plan".into(),
+            description: None,
+            parameters: json!({"type": "object", "properties": {
+                "days": {"type": "array", "items": {
+                    "type": "object", "properties": {
+                        "name": {"type": "string"},
+                        "time_blocks": {"type": "array", "items": {"type": "string"}}
+                    }
+                }},
+                "timezone": {"type": "string"}
+            }}),
+            strict: None,
+        },
+    }];
+    let days = format!(
+        "{}{}{}",
+        element(
+            "item",
+            &format!(
+                "{}{}",
+                element("name", "Saturday"),
+                element("time_blocks", &element("item", "10:00–13:00"))
+            )
+        ),
+        element(
+            "item",
+            &format!("{}{NS}<time_blocks>", element("name", "Sunday"))
+        ),
+        element(
+            "item",
+            &format!(
+                "{}{}",
+                element("name", "Monday"),
+                element("time_blocks", &element("item", "18:30–21:00"))
+            )
+        )
+    );
+    let text = tool_block(&[(
+        "plan",
+        format!(
+            "{}{}",
+            element("days", &days),
+            element("timezone", "Asia/Shanghai")
+        ),
+    )]);
+    let expected = json!({
+        "days": [
+            {"name": "Saturday", "time_blocks": ["10:00–13:00"]},
+            {"name": "Sunday", "time_blocks": []},
+            {"name": "Monday", "time_blocks": ["18:30–21:00"]}
+        ],
+        "timezone": "Asia/Shanghai"
+    });
+    let (normal, calls) = MinimaxM3Parser::new()
+        .parse_complete_with_tools(&text, &tools)
+        .await
+        .unwrap();
+    assert!(normal.is_empty());
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "plan");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(args, expected);
+
+    let chars: Vec<char> = text.chars().collect();
+    for size in [1, 2, 7, 29, chars.len()] {
+        let mut parser = MinimaxM3Parser::new();
+        let mut arguments = String::new();
+        let mut names = Vec::new();
+        for chunk in chars.chunks(size) {
+            let result = parser
+                .parse_incremental(&chunk.iter().collect::<String>(), &tools)
+                .await
+                .unwrap();
+            assert!(result.normal_text.is_empty(), "chunk size {size}");
+            for call in result.calls {
+                assert_eq!(call.tool_index, 0);
+                if let Some(name) = call.name {
+                    names.push(name);
+                }
+                arguments.push_str(&call.parameters);
+            }
+        }
+        assert!(parser.take_unstreamed_normal_text().is_empty());
+        assert_eq!(names, ["plan"]);
+        let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(args, expected, "chunk size {size}");
+    }
+}
+
+#[tokio::test]
+async fn test_m3_empty_container_recovery_requires_schema_and_parent_close() {
+    for (kind, content, close, recover) in [
+        ("array", "", "parent", true),
+        ("object", " \n", "parent", true),
+        ("string", "", "parent", false),
+        ("array", "lost value", "parent", false),
+        ("array", "", "wrong", false),
+        ("array", &element("item", "value"), "parent", false),
+    ] {
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: Function {
+                name: "test".into(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {
+                    "parent": {"type": "object", "properties": {
+                        "empty": {"type": kind}
+                    }}
+                }}),
+                strict: None,
+            },
+        }];
+        let text = tool_block(&[(
+            "test",
+            format!("{NS}<parent>{NS}<empty>{content}{NS}</{close}>"),
+        )]);
+        let (_, calls) = MinimaxM3Parser::new()
+            .parse_complete_with_tools(&text, &tools)
+            .await
+            .unwrap();
+        assert_eq!(calls.len(), usize::from(recover));
+        if recover {
+            let args: serde_json::Value =
+                serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(
+                args["parent"]["empty"],
+                if kind == "array" {
+                    json!([])
+                } else {
+                    json!({})
+                }
+            );
+        }
+        let (_, no_schema_calls) = MinimaxM3Parser::new().parse_complete(&text).await.unwrap();
+        assert!(no_schema_calls.is_empty());
+
+        for supplied_tools in [&tools[..], &[][..]] {
+            let mut parser = MinimaxM3Parser::new();
+            let mut arguments = String::new();
+            let mut normal = String::new();
+            for ch in text.chars() {
+                let result = parser
+                    .parse_incremental(&ch.to_string(), supplied_tools)
+                    .await
+                    .unwrap();
+                normal.push_str(&result.normal_text);
+                for call in result.calls {
+                    arguments.push_str(&call.parameters);
+                }
+            }
+            normal.push_str(&parser.take_unstreamed_normal_text());
+            assert_eq!(
+                normal,
+                if recover && !supplied_tools.is_empty() {
+                    ""
+                } else {
+                    &text
+                }
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&arguments).is_ok(),
+                recover && !supplied_tools.is_empty()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_m3_composed_container_recovery() {
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        let wrap = |schema: serde_json::Value| {
+            let branches = if keyword == "allOf" {
+                vec![schema]
+            } else {
+                vec![json!({"type": "null"}), schema]
+            };
+            json!({keyword: branches})
+        };
+        let item_schema = wrap(json!({"type": "object", "properties": {
+            "values": wrap(json!({"type": "array", "items": {"type": "string"}})),
+            "options": wrap(json!({"type": "object"}))
+        }}));
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: Function {
+                name: "test".into(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {
+                    "rows": wrap(json!({"type": "array", "items": item_schema}))
+                }}),
+                strict: None,
+            },
+        }];
+        let rows = format!(
+            "{}{}{}",
+            element("item", &format!("{NS}<values>")),
+            element("item", &format!("{NS}<options> \n")),
+            element("item", &element("values", &element("item", "001")))
+        );
+        let text = tool_block(&[("test", element("rows", &rows))]);
+        let expected = json!({"rows": [
+            {"values": []}, {"options": {}}, {"values": ["001"]}
+        ]});
+        let (normal, calls) = MinimaxM3Parser::new()
+            .parse_complete_with_tools(&text, &tools)
+            .await
+            .unwrap();
+        assert!(normal.is_empty(), "{keyword}");
+        assert_eq!(calls.len(), 1, "{keyword}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap(),
+            expected,
+            "{keyword}"
+        );
+
+        let mut parser = MinimaxM3Parser::new();
+        let mut arguments = String::new();
+        for ch in text.chars() {
+            let result = parser
+                .parse_incremental(&ch.to_string(), &tools)
+                .await
+                .unwrap();
+            assert!(result.normal_text.is_empty(), "{keyword}");
+            for call in result.calls {
+                arguments.push_str(&call.parameters);
+            }
+        }
+        assert!(parser.take_unstreamed_normal_text().is_empty());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_m3_composed_container_recovery_rejects_ambiguous_schemas() {
+    for schema in [
+        json!({"anyOf": [{"type": "array"}, {"type": "object"}]}),
+        json!({"oneOf": [{"type": "array"}, {"type": "array", "items": {"type": "string"}}]}),
+        json!({"anyOf": [{"type": "array"}, {"type": "string"}]}),
+        json!({"anyOf": [{"type": "array"}, {}]}),
+        json!({"allOf": [{"type": "array"}, {"type": "null"}]}),
+        json!({"allOf": [{"type": "array"}, {"items": {"type": "string"}}]}),
+        json!({"anyOf": [{"type": "array"}, {"$ref": "#/$defs/other"}]}),
+        json!({"anyOf": [{"type": "array"}], "not": {"type": "array"}}),
+    ] {
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: Function {
+                name: "test".into(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {
+                    "parent": {"type": "object", "properties": {"empty": schema}}
+                }}),
+                strict: None,
+            },
+        }];
+        let text = tool_block(&[("test", format!("{NS}<parent>{NS}<empty>{NS}</parent>"))]);
+        let (normal, calls) = MinimaxM3Parser::new()
+            .parse_complete_with_tools(&text, &tools)
+            .await
+            .unwrap();
+        assert_eq!(normal, text, "{schema}");
+        assert!(calls.is_empty(), "{schema}");
+        let mut parser = MinimaxM3Parser::new();
+        let mut normal = String::new();
+        for ch in text.chars() {
+            let result = parser
+                .parse_incremental(&ch.to_string(), &tools)
+                .await
+                .unwrap();
+            assert!(result.calls.is_empty(), "{schema}");
+            normal.push_str(&result.normal_text);
+        }
+        normal.push_str(&parser.take_unstreamed_normal_text());
+        assert_eq!(normal, text, "{schema}");
+    }
+}
+
+/// A call to a tool the request never declared (the conversation established
+/// it) still parses, complete and streaming, with no schema to coerce by.
+#[tokio::test]
+async fn test_m3_undeclared_tool_parses_without_a_tool_inventory() {
+    let text = tool_block(&[("list_skills", String::new())]);
+    let (normal, calls) = MinimaxM3Parser::new()
+        .parse_complete_with_tools(&text, &[])
+        .await
+        .unwrap();
+    assert_eq!(normal, "");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "list_skills");
+    assert_eq!(calls[0].function.arguments, "{}");
+
+    let mut parser = MinimaxM3Parser::new();
+    let mut streamed = Vec::new();
+    let mut normal = String::new();
+    for ch in text.chars() {
+        let result = parser
+            .parse_incremental(&ch.to_string(), &[])
+            .await
+            .unwrap();
+        streamed.extend(result.calls);
+        normal.push_str(&result.normal_text);
+    }
+    normal.push_str(&parser.take_unstreamed_normal_text());
+    assert_eq!(normal, "");
+    let names: Vec<&str> = streamed
+        .iter()
+        .filter_map(|call| call.name.as_deref())
+        .collect();
+    assert_eq!(names, ["list_skills"]);
+    // The name arrives on its own and the arguments follow, so the pieces have
+    // to add back up to what the one-shot parse returned. Checking the name
+    // alone would also pass on a call that streamed no arguments at all.
+    let arguments: String = streamed
+        .iter()
+        .map(|call| call.parameters.as_str())
+        .collect();
+    assert_eq!(arguments, "{}");
 }

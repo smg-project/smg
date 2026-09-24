@@ -7,13 +7,15 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
-use futures::future::try_join_all;
+use futures::{future::try_join_all, StreamExt, TryStreamExt};
 use llm_multimodal::{
-    AsyncMultiModalTracker, AudioClip, EncoderFieldLayouts, ImageFrame, Modality, ModelMetadata,
-    ModelProcessorSpec, PlaceholderRange, PreProcessorConfig, PreprocessedEncoderInputs,
-    PromptReplacement, TrackedMedia, TrackerOutput, VideoClip, VisionProcessorRegistry,
+    AsyncMultiModalTracker, AudioClip, EncoderFieldLayouts, ImageFrame, MediaItemInfo, Modality,
+    ModelMetadata, ModelProcessorSpec, PlaceholderRange, PreProcessorConfig,
+    PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput, VideoClip,
+    VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
+use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
 use super::{
@@ -33,6 +35,7 @@ struct PreparedMultimodalPart {
     placeholder_token_id: Option<u32>,
     field_layouts: EncoderFieldLayouts,
     keep_on_cpu_keys: Vec<String>,
+    encoder_input_key: Option<String>,
 }
 
 /// Process a protocol-independent, ordered media plan.
@@ -47,8 +50,33 @@ pub(crate) async fn process_multimodal_plan(
 ) -> Result<MultimodalOutput> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
+
+    // Step 1: Resolve the model spec; it decides how media is fetched.
+    let config_started = Instant::now();
+    let model_config = components
+        .config_registry
+        .get_or_load(tokenizer_id, tokenizer_source)
+        .await?;
+    let model_type = model_config
+        .config
+        .get("model_type")
+        .and_then(|v| v.as_str());
+    let registry_tokenizer = RegistryTokenizer(tokenizer);
+    let metadata = ModelMetadata {
+        model_id,
+        tokenizer: &registry_tokenizer,
+        config: &model_config.config,
+    };
+    let spec = components
+        .model_registry
+        .lookup(&metadata)
+        .ok_or_else(|| anyhow::anyhow!("Multimodal not supported for model: {model_id}"))?;
+    let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
+
     let media_started = Instant::now();
-    let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone());
+    let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone())
+        .with_default_video_sample_fps(spec.default_video_sample_fps())
+        .with_video_frame_sampling(spec.video_frame_sampling());
 
     for part in plan.into_parts() {
         tracker
@@ -161,28 +189,7 @@ pub(crate) async fn process_multimodal_plan(
         }
     }
 
-    // Step 2: Resolve model spec and preprocess media.
-    let config_started = Instant::now();
-    let model_config = components
-        .config_registry
-        .get_or_load(tokenizer_id, tokenizer_source)
-        .await?;
-    let model_type = model_config
-        .config
-        .get("model_type")
-        .and_then(|v| v.as_str());
-    let registry_tokenizer = RegistryTokenizer(tokenizer);
-    let metadata = ModelMetadata {
-        model_id,
-        tokenizer: &registry_tokenizer,
-        config: &model_config.config,
-    };
-    let spec = components
-        .model_registry
-        .lookup(&metadata)
-        .ok_or_else(|| anyhow::anyhow!("Multimodal not supported for model: {model_id}"))?;
-    let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
-
+    // Step 2: Preprocess media.
     let preprocess_started = Instant::now();
     let mut prepared_parts = Vec::with_capacity(media_batches.len());
     // Every modality batch is independent until prompt expansion. Poll all
@@ -211,8 +218,15 @@ pub(crate) async fn process_multimodal_plan(
             "Multimodal preprocessing complete"
         );
 
+        let media_info = media_item_infos(&media);
         let prompt_replacements = spec
-            .prompt_replacements_for(&metadata, &preprocessed, modality)
+            .prompt_replacements_with_media(
+                &metadata,
+                &preprocessed,
+                modality,
+                &media_info,
+                preprocessor_config_for(&model_config, modality),
+            )
             .map_err(|e| anyhow::anyhow!("Failed to compute prompt replacements: {e}"))?;
 
         let media_count = media.len();
@@ -262,6 +276,7 @@ pub(crate) async fn process_multimodal_plan(
             placeholder_token_id,
             field_layouts: spec.encoder_field_layouts_for(modality),
             keep_on_cpu_keys: spec.keep_on_cpu_keys_for(modality),
+            encoder_input_key: spec.encoder_input_key_for(modality),
         });
     }
     let preprocess_elapsed_ms = preprocess_started.elapsed().as_secs_f64() * 1000.0;
@@ -302,6 +317,7 @@ pub(crate) async fn process_multimodal_plan(
             placeholder_token_id: part.placeholder_token_id,
             field_layouts: part.field_layouts,
             keep_on_cpu_keys: part.keep_on_cpu_keys,
+            encoder_input_key: part.encoder_input_key,
         })
         .collect::<Vec<_>>();
     let intermediate = MultimodalIntermediate::try_new(batches)?;
@@ -343,26 +359,92 @@ async fn preprocess_modality(
     // block the tokio async runtime under concurrent load.
     // TODO: consider making the thread pool size configurable.
     let modality = media.modality();
-    let pp_config = match modality {
-        Modality::Video => model_config
-            .video_preprocessor_config
-            .clone()
-            .unwrap_or_else(|| model_config.preprocessor_config.clone()),
-        _ => model_config.preprocessor_config.clone(),
-    };
+    let pp_config = preprocessor_config_for(model_config, modality).clone();
 
     if let MediaBatch::Images(images) = media {
-        if let (Some(cache), [image]) = (components.pixel_cache.clone(), images.as_slice()) {
-            return preprocess_image_cached(
-                cache,
-                image,
-                components.vision_processor_registry.clone(),
-                model_id.to_string(),
-                model_type.map(String::from),
-                pp_config,
-                config_fingerprint(tokenizer_id, &model_config.config),
-            )
-            .await;
+        if let Some(cache) = &components.pixel_cache {
+            let processor = components
+                .vision_processor_registry
+                .find(model_id, model_type);
+            // Retaining individual tensors plus their concatenation is costly
+            // for large requests. Keep their whole-batch allocation path.
+            if images.len() == 1
+                || (images.len() < 32
+                    && processor.is_some_and(|p| p.supports_per_image_preprocessing()))
+            {
+                let mut config = serde_json::json!({
+                    "model_id": model_id,
+                    "model_type": model_type,
+                    "model_config": model_config.config,
+                    "preprocessor_config": pp_config,
+                });
+                config.sort_all_objects();
+                let fingerprint = config_fingerprint(tokenizer_id, &config);
+                // Deduplicate within the request even if the result cannot fit
+                // in the cache. Record every position before scheduling work.
+                let mut unique = HashMap::new();
+                let mut positions: Vec<Vec<usize>> = Vec::new();
+                let tasks = images
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, image)| {
+                        let next = unique.len();
+                        let index = *unique
+                            .entry(PixelCacheKey {
+                                image_hash: image.hash.clone(),
+                                config_fingerprint: fingerprint,
+                            })
+                            .or_insert(next);
+                        if index == next {
+                            positions.push(vec![position]);
+                            Some(image)
+                        } else {
+                            positions[index].push(position);
+                            None
+                        }
+                    })
+                    .map(|image| {
+                        preprocess_image_cached(
+                            cache.clone(),
+                            image.clone(),
+                            components.vision_processor_registry.clone(),
+                            model_id.to_string(),
+                            model_type.map(String::from),
+                            pp_config.clone(),
+                            fingerprint,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let parts = futures::stream::iter(tasks)
+                    // Keep unique results aligned with their recorded positions.
+                    .buffered(4)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                let layouts = spec
+                    .encoder_field_layouts_for(Modality::Image)
+                    .model_specific;
+                let image_count = images.len();
+                return tokio::task::spawn_blocking(move || -> Result<_> {
+                    let mut ordered = vec![None; image_count];
+                    for (part, positions) in parts.into_iter().zip(positions) {
+                        let (&last, repeats) = positions
+                            .split_last()
+                            .context("Unique image has no position")?;
+                        for &position in repeats {
+                            ordered[position] = Some(part.clone());
+                        }
+                        ordered[last] = Some(part);
+                    }
+                    let parts = ordered
+                        .into_iter()
+                        .collect::<Option<Vec<_>>>()
+                        .context("Missing image output position")?;
+                    PreprocessedEncoderInputs::concat(parts, &layouts)
+                })
+                .await
+                .context("Image batch assembly task panicked")?
+                .context("Image batch assembly failed");
+            }
         }
     }
 
@@ -370,6 +452,9 @@ async fn preprocess_modality(
     let model_id_owned = model_id.to_string();
     let model_type_owned = model_type.map(String::from);
     let media_for_preprocess = media.clone(); // cheap Arc refcount bumps
+    let video_layouts = spec
+        .encoder_field_layouts_for(Modality::Video)
+        .model_specific;
     let audio_processor = if modality == Modality::Audio {
         Some(
             spec.audio_processor(&model_config.config, &model_config.preprocessor_config)
@@ -400,57 +485,61 @@ async fn preprocess_modality(
                 .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
         }
         MediaBatch::Videos(videos) => {
-            // VisionPreProcessor currently models one decoded clip per call.
-            // Video-capable model specs therefore declare a per-request limit
-            // of one; a future batched-video processor can lift this without
-            // adding any modality-combination policy here.
-            let [video] = videos.as_slice() else {
-                anyhow::bail!(
-                    "Video preprocessing currently requires exactly one clip per modality batch; got {}",
-                    videos.len()
-                );
-            };
             let processor = registry
                 .find(&model_id_owned, model_type_owned.as_deref())
                 .ok_or_else(|| {
                     anyhow::anyhow!("No vision processor found for model: {model_id_owned}")
                 })?;
-            let video_pp_config = with_video_sample_fps(pp_config.clone(), video);
+            // The processor takes one decoded clip at a time; the clips are
+            // joined into one batch afterwards, laid out as if processed together.
+            let preprocess_clip = |video: &VideoClip| -> Result<PreprocessedEncoderInputs> {
+                let video_pp_config = video_request_config(pp_config.clone(), video);
 
-            if !video.frames().is_empty() {
-                return processor
-                    .preprocess_video(video.frames(), &video_pp_config)
-                    .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"));
-            }
+                if !video.frames().is_empty() {
+                    return processor
+                        .preprocess_video(video.frames(), &video_pp_config)
+                        .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"));
+                }
 
-            if let Some(rgb_video) = video.rgb_video() {
-                match rgb_video.frame_refs() {
-                    Ok(frame_refs) => match processor
-                        .preprocess_video_rgb(&frame_refs, &video_pp_config)
-                    {
-                        Ok(preprocessed) => return Ok(preprocessed),
+                if let Some(rgb_video) = video.rgb_video() {
+                    match rgb_video.frame_refs() {
+                        Ok(frame_refs) => match processor
+                            .preprocess_video_rgb(&frame_refs, &video_pp_config)
+                        {
+                            Ok(preprocessed) => return Ok(preprocessed),
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "RGB video preprocessing fast path failed; falling back to materialized frames"
+                                );
+                            }
+                        },
                         Err(error) => {
                             warn!(
                                 error = %error,
-                                "RGB video preprocessing fast path failed; falling back to materialized frames"
+                                "RGB video frame refs are invalid; falling back to materialized frames"
                             );
                         }
-                    },
-                    Err(error) => {
-                        warn!(
-                            error = %error,
-                            "RGB video frame refs are invalid; falling back to materialized frames"
-                        );
                     }
                 }
-            }
 
-            let frames = video
-                .materialized_frames()
-                .map_err(|e| anyhow::anyhow!("Video frame materialization failed: {e}"))?;
-            processor
-                .preprocess_video(&frames, &video_pp_config)
-                .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"))
+                let frames = video
+                    .materialized_frames()
+                    .map_err(|e| anyhow::anyhow!("Video frame materialization failed: {e}"))?;
+                processor
+                    .preprocess_video(&frames, &video_pp_config)
+                    .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"))
+            };
+
+            // Clips are independent until the concat below, and each one is
+            // frames' worth of work, so they go wide the way the image batch
+            // does. `collect` keeps request order, which the concat relies on.
+            let parts = videos
+                .par_iter()
+                .map(|video| preprocess_clip(video))
+                .collect::<Result<Vec<_>>>()?;
+            PreprocessedEncoderInputs::concat(parts, &video_layouts)
+                .map_err(|e| anyhow::anyhow!("Video batch assembly failed: {e}"))
         }
         MediaBatch::Audios(audios) => {
             let processor = audio_processor.ok_or_else(|| {
@@ -465,17 +554,54 @@ async fn preprocess_modality(
     .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
 }
 
-fn with_video_sample_fps(mut config: PreProcessorConfig, video: &VideoClip) -> PreProcessorConfig {
+/// The preprocessor config for one clip: its sampled frame rate and, when the
+/// caller named a `max_long_side_pixel` tier, that tier, so the processor can
+/// size the frames the way the caller asked.
+fn video_request_config(mut config: PreProcessorConfig, video: &VideoClip) -> PreProcessorConfig {
     config
         .extra
         .insert("fps".to_string(), serde_json::json!(video.sample_fps()));
+    if let Some(tier) = video.max_long_side_pixel() {
+        config
+            .extra
+            .insert("max_long_side_pixel".to_string(), serde_json::json!(tier));
+    }
     config
 }
 
-/// Pixel-cache image preprocessing for single-image requests.
+/// The config a modality is preprocessed with: video's own when the checkpoint ships one.
+fn preprocessor_config_for(
+    model_config: &MultimodalModelConfig,
+    modality: Modality,
+) -> &PreProcessorConfig {
+    match modality {
+        Modality::Video => model_config
+            .video_preprocessor_config
+            .as_ref()
+            .unwrap_or(&model_config.preprocessor_config),
+        _ => &model_config.preprocessor_config,
+    }
+}
+
+/// One descriptor per media item, in batch order; only decoded clips carry sampling.
+fn media_item_infos(media: &MediaBatch) -> Vec<MediaItemInfo> {
+    match media {
+        MediaBatch::Videos(videos) => videos
+            .iter()
+            .map(|clip| MediaItemInfo {
+                video_sampling: clip.sampling().cloned(),
+            })
+            .collect(),
+        MediaBatch::Images(_) | MediaBatch::Audios(_) => {
+            vec![MediaItemInfo::default(); media.len()]
+        }
+    }
+}
+
+/// Pixel-cache lookup and preprocessing for one image.
 async fn preprocess_image_cached(
     cache: Arc<PixelCache>,
-    image: &Arc<ImageFrame>,
+    image: Arc<ImageFrame>,
     registry: Arc<VisionProcessorRegistry>,
     model_id: String,
     model_type: Option<String>,
@@ -495,7 +621,7 @@ async fn preprocess_image_cached(
         model_id,
         model_type,
         pp_config,
-        std::slice::from_ref(image),
+        std::slice::from_ref(&image),
     )
     .await?;
     cache.insert(
@@ -514,8 +640,9 @@ async fn preprocess_image_batch(
     pp_config: PreProcessorConfig,
     images: &[Arc<ImageFrame>],
 ) -> Result<PreprocessedEncoderInputs> {
-    let raw_images: Vec<image::DynamicImage> = images.iter().map(|f| f.image.clone()).collect();
+    let images = images.to_vec();
     tokio::task::spawn_blocking(move || {
+        let raw_images: Vec<image::DynamicImage> = images.iter().map(|f| f.image.clone()).collect();
         let processor = registry
             .find(&model_id, model_type.as_deref())
             .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;
@@ -731,7 +858,7 @@ fn explicit_feature_ranges(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use llm_multimodal::VideoSource;
+    use llm_multimodal::{ImageDetail, ImageSource, VideoSamplingInfo, VideoSource};
 
     use super::*;
 
@@ -745,9 +872,160 @@ mod tests {
             0.8,
         );
 
-        let config = with_video_sample_fps(PreProcessorConfig::default(), &video);
+        let config = video_request_config(PreProcessorConfig::default(), &video);
 
         assert!((config.get_extra::<f32>("fps").unwrap() - 0.8).abs() < 1e-6);
+        assert!(config.get_extra::<u32>("max_long_side_pixel").is_none());
+    }
+
+    #[test]
+    fn decoded_video_tier_reaches_the_processor_config() {
+        let video = VideoClip::new_with_sample_fps(
+            Vec::new(),
+            Bytes::new(),
+            VideoSource::InlineBytes,
+            "video-hash".to_string(),
+            2.0,
+        )
+        .with_max_long_side_pixel(Some(1008));
+
+        let config = video_request_config(PreProcessorConfig::default(), &video);
+
+        assert_eq!(config.get_extra::<u32>("max_long_side_pixel"), Some(1008));
+    }
+
+    #[test]
+    fn media_item_infos_carry_video_sampling_per_clip() {
+        let sampling = VideoSamplingInfo {
+            source_fps: 30.0,
+            frame_indices: vec![0, 15, 30],
+        };
+        let sampled = VideoClip::new(
+            Vec::new(),
+            Bytes::new(),
+            VideoSource::InlineBytes,
+            "sampled".to_string(),
+        )
+        .with_sampling(Some(sampling.clone()));
+        let unsampled = VideoClip::new(
+            Vec::new(),
+            Bytes::new(),
+            VideoSource::InlineBytes,
+            "unsampled".to_string(),
+        );
+
+        let infos = media_item_infos(&MediaBatch::Videos(vec![
+            Arc::new(sampled),
+            Arc::new(unsampled),
+        ]));
+
+        assert_eq!(
+            infos,
+            vec![
+                MediaItemInfo {
+                    video_sampling: Some(sampling)
+                },
+                MediaItemInfo::default()
+            ]
+        );
+    }
+
+    #[test]
+    fn media_item_infos_default_for_every_image() {
+        let image = || {
+            Arc::new(ImageFrame::new(
+                image::DynamicImage::new_rgb8(1, 1),
+                Bytes::new(),
+                ImageDetail::Auto,
+                ImageSource::InlineBytes,
+                "hash".to_string(),
+            ))
+        };
+
+        let infos = media_item_infos(&MediaBatch::Images(vec![image(), image(), image()]));
+
+        assert_eq!(infos, vec![MediaItemInfo::default(); 3]);
+    }
+
+    #[test]
+    fn preprocessor_config_for_video_is_the_video_config_when_shipped() {
+        let image_config = PreProcessorConfig {
+            temporal_patch_size: Some(2),
+            ..Default::default()
+        };
+        let video_config = PreProcessorConfig {
+            temporal_patch_size: Some(4),
+            ..Default::default()
+        };
+        let with_video = MultimodalModelConfig {
+            config: serde_json::json!({}),
+            preprocessor_config: image_config.clone(),
+            video_preprocessor_config: Some(video_config),
+        };
+        let without_video = MultimodalModelConfig {
+            config: serde_json::json!({}),
+            preprocessor_config: image_config,
+            video_preprocessor_config: None,
+        };
+
+        let temporal = |config: &MultimodalModelConfig, modality| {
+            preprocessor_config_for(config, modality).temporal_patch_size
+        };
+        assert_eq!(temporal(&with_video, Modality::Video), Some(4));
+        assert_eq!(temporal(&with_video, Modality::Image), Some(2));
+        assert_eq!(temporal(&with_video, Modality::Audio), Some(2));
+        assert_eq!(temporal(&without_video, Modality::Video), Some(2));
+    }
+
+    #[test]
+    fn test_explicit_feature_ranges_keep_non_uniform_strides() {
+        let replacements =
+            vec![
+                PromptReplacement::sequence(Modality::Video, "<video>", vec![7; 48])
+                    .with_feature_ranges(vec![
+                        PlaceholderRange {
+                            offset: 5,
+                            length: 4,
+                        },
+                        PlaceholderRange {
+                            offset: 19,
+                            length: 4,
+                        },
+                        PlaceholderRange {
+                            offset: 40,
+                            length: 4,
+                        },
+                    ]),
+            ];
+        let expansion = ModalityExpansion {
+            modality: Modality::Video,
+            search_token_id: Some(100),
+            placeholder_token_id: Some(7),
+            replacements: &replacements,
+        };
+
+        let result = expand_tokens_for_modalities(&[1, 2, 100, 3], &[expansion]).unwrap();
+
+        assert_eq!(result.token_ids.len(), 3 + 48);
+        assert_eq!(result.bindings[0][0].structural.offset, 2);
+        assert_eq!(result.bindings[0][0].structural.length, 48);
+        assert_eq!(
+            result.bindings[0][0].patches,
+            vec![
+                PlaceholderRange {
+                    offset: 7,
+                    length: 4,
+                },
+                PlaceholderRange {
+                    offset: 21,
+                    length: 4,
+                },
+                PlaceholderRange {
+                    offset: 42,
+                    length: 4,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1233,3 +1511,7 @@ mod tests {
         assert!(error.to_string().contains("Invalid negative token ID"));
     }
 }
+
+#[cfg(test)]
+#[path = "image_cache_tests.rs"]
+mod image_cache_tests;

@@ -92,7 +92,7 @@ mod tests {
 
     use hyper_util::rt::TokioIo;
     use tokio::io::DuplexStream;
-    use tonic::codegen::http::Uri;
+    use tonic::{codegen::http::Uri, transport::Endpoint};
     use tower::Service;
 
     use super::{configured_endpoint, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT};
@@ -226,6 +226,185 @@ mod tests {
         assert_eq!(
             normalize_grpc_endpoint("GRPC://worker:8080"),
             "GRPC://worker:8080"
+        );
+    }
+
+    // --- HTTP/2 window on the wire ------------------------------------------
+    //
+    // tonic applies `http2_adaptive_window` after the window setters and hyper
+    // resets both windows to 65535 when it is enabled, so what reaches the
+    // peer can only be checked on the wire. h2 also sizes its budget for
+    // sub-256-byte DATA frames from that window (`max(window / 2, 25_600)`),
+    // which is what turns a backlog of streamed token frames into
+    // `GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`.
+
+    const STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+
+    /// Read `SETTINGS_INITIAL_WINDOW_SIZE` from the client's first frame.
+    /// `None` means the client omitted it, which h2 does at the 65535 default.
+    async fn advertised_initial_stream_window<F>(build: F) -> Option<u32>
+    where
+        F: FnOnce(String) -> Endpoint,
+    {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let endpoint = build(format!("http://{addr}"));
+
+        let read_settings = async {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut preface = [0u8; 24];
+            sock.read_exact(&mut preface).await.expect("read preface");
+            assert_eq!(&preface[..16], b"PRI * HTTP/2.0\r\n");
+            let mut header = [0u8; 9];
+            sock.read_exact(&mut header)
+                .await
+                .expect("read frame header");
+            assert_eq!(header[3], 0x4, "first frame must be SETTINGS");
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let mut payload = vec![0u8; len];
+            sock.read_exact(&mut payload).await.expect("read SETTINGS");
+            payload
+        };
+        // `connect` resolves once the preface is flushed, so join rather
+        // than race the two.
+        let (payload, _connected) = tokio::join!(read_settings, endpoint.connect());
+
+        let (entries, _) = payload.as_chunks::<6>();
+        entries
+            .iter()
+            .find(|e| u16::from_be_bytes([e[0], e[1]]) == 0x4)
+            .map(|e| u32::from_be_bytes([e[2], e[3], e[4], e[5]]))
+    }
+
+    #[tokio::test]
+    async fn configured_endpoint_advertises_its_stream_window() {
+        let advertised = advertised_initial_stream_window(|uri| {
+            configured_endpoint(&uri, DEFAULT_CONNECT_TIMEOUT).expect("endpoint")
+        })
+        .await;
+        assert_eq!(advertised, Some(STREAM_WINDOW));
+    }
+
+    #[derive(Debug)]
+    enum BlastOutcome {
+        ClientGoAway(h2::Reason),
+        StillOpen,
+    }
+
+    /// Have an in-process h2 server push `frames` one-byte DATA frames onto a
+    /// stream whose body the client never polls, and report whether the client
+    /// tore the connection down.
+    async fn blast_unread_data_frames<F>(build: F, frames: usize) -> BlastOutcome
+    where
+        F: FnOnce(String) -> Endpoint,
+    {
+        use tonic::codegen::{http, Bytes};
+
+        // Keep the HTTP/2 exchange in memory: closing TCP with unread DATA
+        // can surface as a connection reset on macOS instead of the GOAWAY.
+        // Buffer the entire blast (including frame headers) so the peer can
+        // finish writing before reading the client's GOAWAY.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let endpoint = build("http://unused.invalid".to_owned());
+
+        #[expect(clippy::disallowed_methods, reason = "test-only h2 peer, joined below")]
+        let server = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io)
+                .await
+                .expect("h2 handshake");
+            let (_request, mut respond) = conn
+                .accept()
+                .await
+                .expect("client opened a stream")
+                .expect("valid request");
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc")
+                .body(())
+                .expect("response");
+            let mut send = respond
+                .send_response(response, false)
+                .expect("send headers");
+            send.reserve_capacity(frames);
+            for sent in 0..frames {
+                // Every frame must be queued; a short blast would let
+                // `StillOpen` below pass vacuously.
+                send.send_data(Bytes::from_static(b"x"), false)
+                    .unwrap_or_else(|err| panic!("send_data failed after {sent} frames: {err}"));
+            }
+            match tokio::time::timeout(Duration::from_secs(5), conn.accept()).await {
+                Ok(Some(Err(err))) if err.is_go_away() && err.is_remote() => {
+                    BlastOutcome::ClientGoAway(err.reason().expect("go_away reason"))
+                }
+                Ok(Some(Err(err))) => panic!("unexpected h2 error: {err}"),
+                Ok(Some(Ok(_))) => panic!("client opened a second stream"),
+                Ok(None) => panic!("client closed mid-blast"),
+                Err(_elapsed) => BlastOutcome::StillOpen,
+            }
+        });
+
+        let mut client_io = Some(client_io);
+        let mut channel = endpoint
+            .connect_with_connector(tower::service_fn(move |_uri: Uri| {
+                let io = client_io.take().map(TokioIo::new).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "test connection already used")
+                });
+                std::future::ready(io)
+            }))
+            .await
+            .expect("connect");
+        std::future::poll_fn(|cx| channel.poll_ready(cx))
+            .await
+            .expect("channel ready");
+        let request = http::Request::post("/smg.test.Blast/Stream")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(tonic::body::Body::empty())
+            .expect("request");
+        let response = channel.call(request).await.expect("response headers");
+        let _unread_body = response.into_body();
+
+        server.await.expect("server task")
+    }
+
+    /// With adaptive windows the budget is 32_767, so ~130 unread token
+    /// frames make the client GOAWAY and kill every stream on the connection.
+    #[tokio::test]
+    async fn adaptive_window_goaways_on_unread_token_frames() {
+        let outcome = blast_unread_data_frames(
+            |uri| {
+                Endpoint::from_shared(uri)
+                    .expect("uri")
+                    .http2_adaptive_window(true)
+                    .initial_stream_window_size(Some(STREAM_WINDOW))
+                    .initial_connection_window_size(Some(2 * STREAM_WINDOW))
+            },
+            2_000,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                BlastOutcome::ClientGoAway(h2::Reason::ENHANCE_YOUR_CALM)
+            ),
+            "expected GOAWAY ENHANCE_YOUR_CALM, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_endpoint_survives_unread_token_frames() {
+        let outcome = blast_unread_data_frames(
+            |uri| configured_endpoint(&uri, DEFAULT_CONNECT_TIMEOUT).expect("endpoint"),
+            2_000,
+        )
+        .await;
+        assert!(
+            matches!(outcome, BlastOutcome::StillOpen),
+            "expected the connection to survive, got {outcome:?}"
         );
     }
 }

@@ -99,6 +99,7 @@ impl ConfigValidator {
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_model_aliases(config)?;
+        Self::validate_rl(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -836,6 +837,20 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
+        config
+            .rl
+            .validate()
+            .map_err(|reason| ConfigError::InvalidValue {
+                field: "rl".to_string(),
+                value: format!(
+                    "control_timeout_secs={} fanout_concurrency={}",
+                    config.rl.control_timeout_secs, config.rl.fanout_concurrency
+                ),
+                reason,
+            })
+    }
+
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
         if !discovery.enabled {
             return Ok(());
@@ -1096,22 +1111,32 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
+        let invalid_decode_policy = match &config.mode {
+            RoutingMode::PrefillDecode { decode_policy, .. } if !config.enable_igw => {
+                !has_service_discovery && matches!(decode_policy, Some(PolicyConfig::Bucket { .. }))
+            }
+            RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. } => {
+                matches!(
+                    config.mode.get_decode_policy(&config.policy),
+                    PolicyConfig::Bucket { .. }
+                )
+            }
+            _ => false,
+        };
+        if invalid_decode_policy {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Decode policy should not be allowed to be bucket".to_string(),
+            });
+        }
+
+        // IGW may receive workers dynamically, so worker-count validation cannot
+        // reason about its eventual topology. Mode-level compatibility still applies.
         if config.enable_igw {
             return Ok(());
         }
 
         Self::validate_mtls(config)?;
-
-        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
-
-        if let RoutingMode::EncodePrefillDecode { decode_policy, .. } = &config.mode {
-            let effective_decode_policy = decode_policy.as_ref().unwrap_or(&config.policy);
-            if matches!(effective_decode_policy, PolicyConfig::Bucket { .. }) {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "Decode policy should not be allowed to be bucket".to_string(),
-                });
-            }
-        }
 
         if !has_service_discovery {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
@@ -1146,13 +1171,6 @@ impl ConfigValidator {
                                     .to_string(),
                         });
                     }
-                }
-
-                // Check bucket for decode
-                if let Some(PolicyConfig::Bucket { .. }) = decode_policy {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason: "Decode policy should not be allowed to be bucket".to_string(),
-                    });
                 }
             }
 
@@ -1203,6 +1221,49 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::worker::ConnectionMode;
+
+    #[test]
+    fn igw_disaggregated_modes_reject_bucket_decode_policy() {
+        let bucket = || PolicyConfig::Bucket {
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            bucket_adjust_interval_secs: 5,
+        };
+        let mut config = RouterConfig {
+            discovery: Some(DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: Some(bucket()),
+            },
+            ..Default::default()
+        };
+
+        assert!(ConfigValidator::validate_compatibility(&config).is_ok());
+        config.enable_igw = true;
+        assert!(ConfigValidator::validate_compatibility(&config).is_err());
+
+        if let RoutingMode::PrefillDecode { decode_policy, .. } = &mut config.mode {
+            *decode_policy = None;
+        }
+        config.policy = bucket();
+        assert!(ConfigValidator::validate_compatibility(&config).is_err());
+
+        config.policy = PolicyConfig::Random;
+        config.mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: Some(bucket()),
+        };
+        assert!(ConfigValidator::validate_compatibility(&config).is_err());
+    }
 
     #[test]
     fn prefix_hash_policy_cache_boundaries_are_validated() {
@@ -2211,5 +2272,39 @@ mod tests {
         }
         config.worker_overload_token_usage = Some(1.0);
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn rl_config_defaults_to_disabled_and_validates_when_enabled() {
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .build_unchecked();
+        assert!(!config.rl.enabled);
+        assert_eq!(config.rl.control_timeout_secs, 600);
+        assert_eq!(config.rl.fanout_concurrency, 32);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        let bad = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .rl(smg_rl::RlConfig {
+                enabled: true,
+                control_timeout_secs: 0,
+                fanout_concurrency: 32,
+            })
+            .build_unchecked();
+        let err = ConfigValidator::validate(&bad).unwrap_err().to_string();
+        assert!(err.contains("control_timeout_secs"), "{err}");
+
+        let ok = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .rl(smg_rl::RlConfig {
+                enabled: true,
+                ..smg_rl::RlConfig::default()
+            })
+            .build_unchecked();
+        assert!(ConfigValidator::validate(&ok).is_ok());
     }
 }

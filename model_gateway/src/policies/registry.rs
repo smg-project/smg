@@ -17,11 +17,11 @@ use tracing::{debug, info, warn};
 use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
+    normalize_model_key, BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
+    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
 };
 use crate::{
-    config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
+    config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     observability::metrics::Metrics,
     policies::cache_aware::LoadReceiver,
@@ -77,13 +77,15 @@ pub struct PolicyRegistry {
 
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
-    /// requests via [`PolicyRegistry::select_worker`].
+    /// requests via [`PolicyRegistry::select_worker_for_model`].
     routing_key_sticky: Option<Arc<ManualPolicy>>,
 
     /// Ordered routing-key header names, parsed once from
     /// `routing_key_override.headers`; the first header present with a valid
     /// value wins.
     routing_key_headers: Arc<Vec<HeaderName>>,
+    /// How strictly PD placement pairs prefill and decode descriptors.
+    pd_pairing_mode: PdPairingMode,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -121,7 +123,7 @@ impl PolicyRegistry {
     }
 
     /// Create a PolicyRegistry. When `routing_key_override.enabled`, builds a shared
-    /// sticky selector consulted for keyed requests in [`Self::select_worker`].
+    /// sticky selector consulted for keyed requests in [`Self::select_worker_for_model`].
     pub fn with_override(
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
@@ -161,7 +163,20 @@ impl PolicyRegistry {
             dp_rank_policy: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
+            pd_pairing_mode: PdPairingMode::default(),
         }
+    }
+
+    /// Set how strictly PD placement pairs prefill and decode descriptors.
+    #[must_use]
+    pub fn with_pd_pairing_mode(mut self, mode: PdPairingMode) -> Self {
+        self.pd_pairing_mode = mode;
+        self
+    }
+
+    /// How strictly PD placement pairs prefill and decode descriptors.
+    pub fn pd_pairing_mode(&self) -> PdPairingMode {
+        self.pd_pairing_mode
     }
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and
@@ -235,22 +250,40 @@ impl PolicyRegistry {
     /// Select a worker, applying the sticky routing-key override when it is
     /// enabled, the request carries a key from the configured source, and the
     /// configured policy does not already honor the key (`manual` /
-    /// `consistent_hashing`). Otherwise delegates to `policy`. `policy.name()`
-    /// stays the real policy (for metrics).
-    pub fn select_worker(
+    /// `consistent_hashing`, which read `rid_key` and the header themselves
+    /// with the same rid-first precedence). Otherwise delegates to `policy`.
+    /// `policy.name()` stays the real policy (for metrics).
+    pub fn select_worker_for_model(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         if let Some(sticky) = self.routing_key_sticky.as_ref() {
             if Self::routing_key_override_applies(policy.name()) {
                 if let Some((key, source)) = self.effective_sticky_key(info) {
-                    return Self::select_sticky(sticky, policy, workers, info, key, source);
+                    return Self::select_sticky(
+                        sticky, policy, model_id, workers, info, key, source,
+                    );
                 }
             }
         }
         policy.select_worker(workers, info)
+    }
+
+    #[cfg(test)]
+    fn select_worker(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let model_id = workers
+            .first()
+            .map(|worker| worker.model_id())
+            .unwrap_or(crate::worker::UNKNOWN_MODEL_ID);
+        self.select_worker_for_model(policy, model_id, workers, info)
     }
 
     /// Keyed selection: honor an existing pin under the in-flight cap;
@@ -259,6 +292,7 @@ impl PolicyRegistry {
     fn select_sticky(
         sticky: &Arc<ManualPolicy>,
         policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         key: &str,
@@ -266,17 +300,20 @@ impl PolicyRegistry {
     ) -> Option<usize> {
         Metrics::record_routing_key_source(source);
 
-        // Keyed-load guards track the un-namespaced key on each worker.
+        // WorkerLoadGuard records the raw session key, so the cap must query
+        // that same key. Model/leg-scoped cap accounting is a separate contract.
         let load_key = key;
 
-        // PD legs namespace so prefill and decode stick independently.
-        let namespaced;
-        let key = if info.leg == WorkerLeg::Single {
-            key
-        } else {
-            namespaced = format!("{}{}", info.leg.routing_id_prefix(), key);
-            &namespaced
+        // Models and PD legs stick independently while sharing one bounded map.
+        // Length-prefix the model so delimiters in model IDs cannot cross fields.
+        let model = normalize_model_key(model_id);
+        let leg = match info.leg {
+            WorkerLeg::Single => 's',
+            WorkerLeg::Prefill => 'p',
+            WorkerLeg::Decode => 'd',
         };
+        let namespaced = format!("{}:{model}:{leg}:{key}", model.len());
+        let key = namespaced.as_str();
 
         let over_cap =
             |idx: usize| workers[idx].routing_key_inflight(load_key) >= STICKY_INFLIGHT_CAP;
@@ -340,7 +377,8 @@ impl PolicyRegistry {
         finish(Some(idx), branch)
     }
 
-    /// Policies that already honor the routing key keep their own handling; all
+    /// Policies that already honor the routing key keep their own handling
+    /// (they consult `rid_key` before the header, like the override does); all
     /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
     fn routing_key_override_applies(name: &str) -> bool {
         !matches!(name, "manual" | "consistent_hashing")
@@ -970,7 +1008,7 @@ mod tests {
     use super::*;
     use crate::{
         policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
-        worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType},
+        worker::{BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard, WorkerType},
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -1038,6 +1076,111 @@ mod tests {
         let first = reg.select_worker(&policy, &workers, &info).unwrap();
         for _ in 0..5 {
             assert_eq!(reg.select_worker(&policy, &workers, &info), Some(first));
+        }
+    }
+
+    #[test]
+    fn routing_key_override_keeps_model_pins_independent() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                assignment_mode: ManualAssignmentMode::Delegate,
+                ..Default::default()
+            },
+        );
+        let policy = reg.get_default_policy();
+        let pools = [
+            vec![
+                worker("http://a1", WorkerType::Regular),
+                worker("http://a2", WorkerType::Regular),
+            ],
+            vec![worker("http://b1", WorkerType::Regular)],
+            vec![worker("http://c1", WorkerType::Regular)],
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("session-42"),
+            ..Default::default()
+        };
+
+        let first_a = reg
+            .select_worker_for_model(&policy, "model-a", &pools[0], &info)
+            .unwrap();
+        reg.select_worker_for_model(&policy, "model-b", &pools[1], &info)
+            .unwrap();
+        reg.select_worker_for_model(&policy, "model-c", &pools[2], &info)
+            .unwrap();
+
+        assert_eq!(
+            reg.select_worker_for_model(&policy, "model-a", &pools[0], &info),
+            Some(first_a),
+            "other models must not consume this model's bounded failover slots"
+        );
+    }
+
+    /// `--routing-key-override` means the same thing under every policy:
+    /// the body rid outranks the routing-key header. Key-native policies
+    /// skip the sticky override, so they must honor `rid_key` themselves.
+    #[test]
+    fn rid_key_outranks_header_under_key_native_policies() {
+        for config in [
+            PolicyConfig::Manual {
+                eviction_interval_secs: 60,
+                max_idle_secs: 3600,
+                assignment_mode: ManualAssignmentMode::Random,
+            },
+            PolicyConfig::ConsistentHashing,
+        ] {
+            let reg = PolicyRegistry::with_override(
+                config,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            let policy = reg.get_default_policy();
+            let name = policy.name();
+            assert!(!PolicyRegistry::routing_key_override_applies(name));
+            let workers = vec![
+                worker("http://w1", WorkerType::Regular),
+                worker("http://w2", WorkerType::Regular),
+                worker("http://w3", WorkerType::Regular),
+                worker("http://w4", WorkerType::Regular),
+            ];
+            let hash_ring = Some(Arc::new(HashRing::new(workers.iter().map(|w| w.url()))));
+
+            let rid_key = reg.derive_rid_key(Some("conv_t1"));
+            assert_eq!(rid_key, Some("conv"));
+            let pinned = reg
+                .select_worker(
+                    &policy,
+                    &workers,
+                    &SelectWorkerInfo {
+                        rid_key,
+                        hash_ring: hash_ring.clone(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            // Later turns of the conversation with rotating header keys stay
+            // on the rid's worker, whatever the header would have picked.
+            for (turn, key) in (2..).zip(["key_a", "key_b", "key_c", "key_d"]) {
+                let headers = headers_with_key(key);
+                let rid = format!("conv_t{turn}");
+                let info = SelectWorkerInfo {
+                    headers: Some(&headers),
+                    routing_key: reg.resolve_routing_key(Some(&headers)),
+                    rid_key: reg.derive_rid_key(Some(&rid)),
+                    hash_ring: hash_ring.clone(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    reg.select_worker(&policy, &workers, &info),
+                    Some(pinned),
+                    "{name}: body rid must outrank header {key}"
+                );
+            }
         }
     }
 

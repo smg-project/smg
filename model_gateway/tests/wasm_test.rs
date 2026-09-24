@@ -67,7 +67,6 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let worker_monitor = Some(Arc::new(WorkerMonitor::new(
         worker_registry.clone(),
         policy_registry.clone(),
-        client.clone(),
         config.load_monitor_interval_secs,
         config.engine_metrics,
         config.disable_load_monitoring,
@@ -195,7 +194,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         probe_state: ProbeState::new(app_context.inflight_tracker.clone()),
         context: app_context.clone(),
         admission_queue: None,
-        router_manager: None,
+        gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
     });

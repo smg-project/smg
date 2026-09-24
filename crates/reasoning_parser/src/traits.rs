@@ -62,6 +62,12 @@ pub trait ReasoningParser: Send + Sync {
         text: &str,
     ) -> Result<ParserResult, ParseError>;
 
+    /// Emit text held at the end of a stream. Repeated calls return no text.
+    /// Call `reset` before the next stream.
+    fn flush(&mut self) -> Result<ParserResult, ParseError> {
+        Ok(ParserResult::default())
+    }
+
     /// Reset the parser state for reuse.
     ///
     /// This should clear any buffers and reset flags to initial state.

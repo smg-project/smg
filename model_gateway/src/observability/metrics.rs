@@ -3,9 +3,15 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
+use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::Lazy;
+use smg_external_router::metrics::Metrics as RouterMetrics;
+pub use smg_external_router::metrics::{
+    bool_to_static_str, intern_model_label, intern_tool_label, metrics_labels, STREAMING_FALSE,
+    STREAMING_TRUE,
+};
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -38,69 +44,9 @@ pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
 }
 
-/// Sentinel substituted once a bounded interner reaches its cap, so a flood of
-/// client-controlled label values (model IDs, MCP tool names) cannot mint an
-/// unbounded number of interner entries or Prometheus series.
-const BOUNDED_LABEL_SENTINEL: &str = "other";
-
-/// Max distinct client-supplied model labels retained before collapsing to the
-/// sentinel. A gateway fronts far fewer real models than this; the cap only bites
-/// on adversarial or unvalidated input.
-const MAX_MODEL_LABELS: usize = 1024;
-
-/// Max distinct client/model-controlled MCP tool-name labels.
-const MAX_TOOL_LABELS: usize = 1024;
-
-static MODEL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
-static TOOL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
-static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUNDED_LABEL_SENTINEL));
-
-/// Intern a client-controlled label with a hard cardinality cap.
-///
-/// Distinct values beyond `cap` collapse to a shared sentinel, so untrusted input
-/// (client-supplied model names, model-generated tool names) cannot grow the
-/// interner — or the metric's Prometheus series set — without bound. Unlike an LRU,
-/// admitted values are never evicted and re-admitted, which would keep minting new
-/// series in the recorder even as the map churned.
-fn intern_bounded_label(map: &DashMap<String, Arc<str>>, cap: usize, s: &str) -> Arc<str> {
-    if let Some(entry) = map.get(s) {
-        return Arc::clone(entry.value());
-    }
-    // Best-effort cap; a small concurrent overshoot is harmless.
-    if map.len() >= cap {
-        return Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
-    }
-    map.entry(s.to_string())
-        .or_insert_with(|| Arc::from(s))
-        .clone()
-}
-
-/// Intern a client-supplied model label, bounded by [`MAX_MODEL_LABELS`].
-fn intern_model_label(model_id: &str) -> Arc<str> {
-    intern_bounded_label(&MODEL_LABELS, MAX_MODEL_LABELS, model_id)
-}
-
-/// Intern a client/model-controlled MCP tool-name label, bounded by
-/// [`MAX_TOOL_LABELS`].
-fn intern_tool_label(tool_name: &str) -> Arc<str> {
-    intern_bounded_label(&TOOL_LABELS, MAX_TOOL_LABELS, tool_name)
-}
-
 // =============================================================================
 // STATIC STRING CONSTANTS
 // =============================================================================
-
-/// Static string constants for boolean labels to avoid allocations.
-pub const STREAMING_TRUE: &str = "true";
-pub const STREAMING_FALSE: &str = "false";
-
-pub const fn bool_to_static_str(b: bool) -> &'static str {
-    if b {
-        STREAMING_TRUE
-    } else {
-        STREAMING_FALSE
-    }
-}
 
 /// Static lookup table for common HTTP status codes to avoid allocations.
 /// Returns a static string for known codes, or None for unknown codes.
@@ -182,6 +128,12 @@ impl Default for PrometheusConfig {
 /// `PrometheusBuilder::upkeep_timeout()` in `start_prometheus`.
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
+/// Histogram buckets for `smg_cache_aware_match_ratio`. The ratio is
+/// dimensionless (matched/input, 0..1), so it takes deciles instead of the
+/// duration buckets; `le="0"` isolates requests with no cached prefix at all.
+pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
+    &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
 /// Call this before [`start_prometheus`] only from a binary or extension that
@@ -199,6 +151,13 @@ pub fn register_jemalloc_as_global_allocator() {
 }
 
 pub(crate) fn init_metrics() {
+    describe_counter!("smg_tokenizer_cache_lookups_total", "Tokenizer cache lookups by layer and result; L1 includes inputs without cacheable boundaries and excludes L0 hits");
+    describe_counter!(
+        "smg_tokenizer_cache_evictions_total",
+        "Tokenizer cache entries removed for capacity; excludes clear, drop and replacement"
+    );
+    describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
+
     #[cfg(all(
         feature = "jemalloc-stats",
         not(target_env = "msvc"),
@@ -336,6 +295,10 @@ pub(crate) fn init_metrics() {
         "smg_worker_health",
         "Worker health status (1=healthy, 0=unhealthy)"
     );
+    describe_gauge!(
+        "smg_worker_http2",
+        "Whether the router speaks HTTP/2 to the worker (1=HTTP/2, 0=HTTP/1.1)"
+    );
     describe_counter!(
         "smg_worker_health_checks_total",
         "Health check results by worker_type and result"
@@ -381,6 +344,15 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_cache_placement_entries",
         "Cache-aware hash-index placement entries by model (keys with a live holder)"
+    );
+    describe_counter!(
+        "smg_cache_aware_policy_branch_total",
+        "Cache-aware tree-mode selection branch (tree_match, spill, expected_wait_fallback, \
+         first_healthy_fallback)"
+    );
+    describe_histogram!(
+        "smg_cache_aware_match_ratio",
+        "Cache-aware tree-mode best prefix match ratio per request (matched/input, 0..1)"
     );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
@@ -518,6 +490,10 @@ pub(crate) fn init_metrics() {
         "smg_mm_shm_write_failures_total",
         "SHM tensor write attempts that failed and fell back to inline, by runtime"
     );
+    describe_counter!(
+        "smg_mm_processing_total",
+        "Multimodal requests by processing location (router/worker) and resolution reason"
+    );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
@@ -525,10 +501,31 @@ pub(crate) fn init_metrics() {
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();
 
+    // RL control plane metrics (emit only when the plane is enabled).
+    smg_rl::init_rl_metrics();
+
     // Priority scheduler metrics (no-op at scrape time unless the scheduler
     // is enabled and recording).
     use crate::middleware::scheduler::metrics as scheduler_metrics;
     scheduler_metrics::describe();
+}
+
+/// Publish process-lifetime totals without scanning or retaining tokenizer instances.
+pub(super) fn record_tokenizer_cache_activity() {
+    for stats in cache_activity_stats() {
+        record_tokenizer_cache_activity_snapshot(stats);
+    }
+}
+
+fn record_tokenizer_cache_activity_snapshot(stats: CacheActivityStats) {
+    counter!("smg_tokenizer_cache_lookups_total", "layer" => stats.layer, "result" => "hit")
+        .absolute(stats.hits);
+    counter!("smg_tokenizer_cache_lookups_total", "layer" => stats.layer, "result" => "miss")
+        .absolute(stats.misses);
+    counter!("smg_tokenizer_cache_evictions_total", "layer" => stats.layer)
+        .absolute(stats.evictions);
+    counter!("smg_tokenizer_cache_reused_bytes_total", "layer" => stats.layer)
+        .absolute(stats.reused_bytes);
 }
 
 #[expect(
@@ -561,6 +558,11 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
     let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
 
+    // The cache-aware match ratio is a dimensionless 0..1 value: no `_seconds`
+    // matcher applies, so it also needs its own buckets or it renders as a
+    // summary.
+    let match_ratio_matcher = Matcher::Full(String::from("smg_cache_aware_match_ratio"));
+
     PrometheusBuilder::new()
         .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
@@ -574,6 +576,8 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
             super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
         )
         .expect("failed to set event loop delay buckets")
+        .set_buckets_for_metric(match_ratio_matcher, CACHE_AWARE_MATCH_RATIO_BUCKETS)
+        .expect("failed to set cache-aware match ratio buckets")
         .install_recorder()
         .inspect(|_| {
             #[cfg(all(
@@ -677,113 +681,6 @@ pub(crate) mod allocator_stats {
     }
 }
 
-/// Label constants for consistent metric labeling
-pub mod metrics_labels {
-    // Router types
-    pub const ROUTER_OPENAI: &str = "openai";
-    pub const ROUTER_HTTP: &str = "http";
-    pub const ROUTER_GRPC: &str = "grpc";
-
-    // Backend types
-    pub const BACKEND_REGULAR: &str = "regular";
-    pub const BACKEND_PD: &str = "pd";
-    pub const BACKEND_EXTERNAL: &str = "external";
-    pub const BACKEND_HARMONY: &str = "harmony";
-
-    // Connection modes
-    pub const CONNECTION_HTTP: &str = "http";
-    pub const CONNECTION_GRPC: &str = "grpc";
-    pub const CONNECTION_ZMQ: &str = "zmq";
-
-    // Endpoints
-    pub const ENDPOINT_CHAT: &str = "chat";
-    pub const ENDPOINT_GENERATE: &str = "generate";
-    pub const ENDPOINT_RESPONSES: &str = "responses";
-    pub const ENDPOINT_COMPLETIONS: &str = "completions";
-    pub const ENDPOINT_RERANK: &str = "rerank";
-    pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
-    pub const ENDPOINT_CLASSIFY: &str = "classify";
-    pub const ENDPOINT_MESSAGES: &str = "messages";
-    pub const ENDPOINT_REALTIME: &str = "realtime";
-    pub const ENDPOINT_REALTIME_SESSIONS: &str = "realtime_sessions";
-    pub const ENDPOINT_REALTIME_CLIENT_SECRETS: &str = "realtime_client_secrets";
-    pub const ENDPOINT_REALTIME_TRANSCRIPTION: &str = "realtime_transcription";
-    pub const ENDPOINT_AUDIO_TRANSCRIPTIONS: &str = "audio_transcriptions";
-
-    // Connection modes
-    pub const CONNECTION_WEBSOCKET: &str = "websocket";
-    pub const CONNECTION_WEBRTC: &str = "webrtc";
-
-    // Worker types
-    pub const WORKER_REGULAR: &str = "regular";
-    pub const WORKER_PREFILL: &str = "prefill";
-    pub const WORKER_DECODE: &str = "decode";
-    pub const WORKER_ENCODE: &str = "encode";
-    pub const WORKER_HTTP: &str = "http";
-    pub const WORKER_GRPC: &str = "grpc";
-
-    // Token types
-    pub const TOKEN_INPUT: &str = "input";
-    pub const TOKEN_OUTPUT: &str = "output";
-
-    // PD KV connector modes (smg_pd_kv_connector_mode_total)
-    pub const KV_CONNECTOR_MOONCAKE: &str = "mooncake";
-    pub const KV_CONNECTOR_NIXL: &str = "nixl";
-    pub const KV_CONNECTOR_PASSTHROUGH: &str = "passthrough";
-
-    // Storage types
-    pub const STORAGE_RESPONSE: &str = "response";
-    pub const STORAGE_CONVERSATION: &str = "conversation";
-    pub const STORAGE_CONVERSATION_ITEM: &str = "conversation_item";
-
-    // Database operations
-    pub const DB_OP_GET: &str = "get";
-    pub const DB_OP_PUT: &str = "put";
-    pub const DB_OP_DELETE: &str = "delete";
-    pub const DB_OP_LIST: &str = "list";
-
-    // Result types
-    pub const RESULT_SUCCESS: &str = "success";
-    pub const RESULT_ERROR: &str = "error";
-    pub const RESULT_TIMEOUT: &str = "timeout";
-    pub const RESULT_NOT_FOUND: &str = "not_found";
-
-    // Discovery sources
-    pub const DISCOVERY_STATIC: &str = "static";
-    pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
-    pub const DISCOVERY_CONSUL: &str = "consul";
-    pub const DISCOVERY_MANUAL: &str = "manual";
-
-    // Discovery registration results
-    pub const REGISTRATION_SUCCESS: &str = "success";
-    pub const REGISTRATION_FAILED: &str = "failed";
-    pub const DEREGISTRATION_RECONCILED: &str = "reconciled";
-
-    // Rate limit results
-    pub const RATE_LIMIT_ALLOWED: &str = "allowed";
-    pub const RATE_LIMIT_REJECTED: &str = "rejected";
-
-    // Admission rejection reasons
-    pub const ADMISSION_REJECTED_FULL: &str = "full";
-    pub const ADMISSION_REJECTED_TIMEOUT: &str = "timeout";
-
-    // Circuit breaker states
-    pub const CB_CLOSED: &str = "closed";
-    pub const CB_OPEN: &str = "open";
-    pub const CB_HALF_OPEN: &str = "half_open";
-
-    // Circuit breaker outcomes
-    pub const CB_SUCCESS: &str = "success";
-    pub const CB_FAILURE: &str = "failure";
-
-    // Router error types
-    pub const ERROR_NO_WORKERS: &str = "no_workers";
-    pub const ERROR_TIMEOUT: &str = "timeout";
-    pub const ERROR_BACKEND: &str = "backend_error";
-    pub const ERROR_VALIDATION: &str = "validation_error";
-    pub const ERROR_INTERNAL: &str = "internal_error";
-}
-
 /// SMG Metrics helper struct for the new layered metrics architecture.
 ///
 /// Design principles for low overhead:
@@ -812,6 +709,92 @@ pub struct StreamingMetricsParams<'a> {
 }
 
 impl Metrics {
+    pub fn record_router_request(
+        router_type: &'static str,
+        backend_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        streaming: &'static str,
+    ) {
+        RouterMetrics::record_router_request(
+            router_type,
+            backend_type,
+            connection_mode,
+            model_id,
+            endpoint,
+            streaming,
+        );
+    }
+    pub fn record_router_duration(
+        router_type: &'static str,
+        backend_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        duration: Duration,
+    ) {
+        RouterMetrics::record_router_duration(
+            router_type,
+            backend_type,
+            connection_mode,
+            model_id,
+            endpoint,
+            duration,
+        );
+    }
+    pub fn record_router_error(
+        router_type: &'static str,
+        backend_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        error_type: &'static str,
+    ) {
+        RouterMetrics::record_router_error(
+            router_type,
+            backend_type,
+            connection_mode,
+            model_id,
+            endpoint,
+            error_type,
+        );
+    }
+    pub fn record_router_tokens(
+        router_type: &'static str,
+        backend_type: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        token_type: &'static str,
+        count: u64,
+    ) {
+        RouterMetrics::record_router_tokens(
+            router_type,
+            backend_type,
+            model_id,
+            endpoint,
+            token_type,
+            count,
+        );
+    }
+    pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {
+        RouterMetrics::record_worker_retry(worker_type, endpoint);
+    }
+    pub fn record_worker_retries_exhausted(worker_type: &'static str, endpoint: &'static str) {
+        RouterMetrics::record_worker_retries_exhausted(worker_type, endpoint);
+    }
+    pub fn record_worker_retry_backoff(attempt: u32, duration: Duration) {
+        RouterMetrics::record_worker_retry_backoff(attempt, duration);
+    }
+    pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
+        RouterMetrics::record_mcp_tool_call(model_id, tool_name, result);
+    }
+    pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
+        RouterMetrics::record_mcp_tool_duration(model_id, tool_name, duration);
+    }
+    pub fn record_mcp_tool_iteration(model_id: &str) {
+        RouterMetrics::record_mcp_tool_iteration(model_id);
+    }
     /// Record an HTTP request.
     /// Here we want a metric to directly reflect user's experience ("I am sending a request")
     /// when viewing the router as a blackbox, and is bumped immediately when the request arrives.
@@ -906,81 +889,21 @@ impl Metrics {
         counter!("smg_mm_shm_write_failures_total", "runtime" => runtime).increment(1);
     }
 
+    /// Record where a multimodal request's media is processed and why.
+    pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
+        let model = intern_model_label(model_id);
+        counter!(
+            "smg_mm_processing_total",
+            "model" => model,
+            "mode" => mode,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
     // ========================================================================
     // Layer 2: Router metrics
     // ========================================================================
-
-    /// Record a routed request.
-    ///
-    /// Uses string interning for model_id to avoid repeated allocations.
-    ///
-    /// # Arguments
-    /// * `streaming` - Use `bool_to_static_str(request.stream)` or the constants
-    pub fn record_router_request(
-        router_type: &'static str,
-        backend_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        streaming: &'static str,
-    ) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_router_requests_total",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "endpoint" => endpoint,
-            "streaming" => streaming
-        )
-        .increment(1);
-    }
-
-    /// Record router request duration.
-    /// Uses string interning for model_id.
-    pub fn record_router_duration(
-        router_type: &'static str,
-        backend_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        duration: Duration,
-    ) {
-        let model = intern_model_label(model_id);
-        histogram!(
-            "smg_router_request_duration_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "endpoint" => endpoint
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Record a router error.
-    /// Uses string interning for model_id.
-    pub fn record_router_error(
-        router_type: &'static str,
-        backend_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        error_type: &'static str,
-    ) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_router_request_errors_total",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "endpoint" => endpoint,
-            "error_type" => error_type
-        )
-        .increment(1);
-    }
 
     /// Record pipeline stage duration (gRPC only).
     /// All labels are static, so this is very fast.
@@ -1081,27 +1004,6 @@ impl Metrics {
             "endpoint" => endpoint
         )
         .record(duration.as_secs_f64());
-    }
-
-    /// Record tokens processed
-    pub fn record_router_tokens(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        token_type: &'static str,
-        count: u64,
-    ) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_router_tokens_total",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => model,
-            "endpoint" => endpoint,
-            "token_type" => token_type
-        )
-        .increment(count);
     }
 
     /// Record total generation duration.
@@ -1291,6 +1193,16 @@ impl Metrics {
         counter!("smg_pd_kv_transfer_failures_total").increment(1);
     }
 
+    /// Record a PD dispatch that had to wait for a decode admission slot.
+    pub fn record_pd_admission_wait() {
+        counter!("smg_pd_admission_waits_total").increment(1);
+    }
+
+    /// Record a PD dispatch shed because no decode slot freed in time.
+    pub fn record_pd_admission_shed() {
+        counter!("smg_pd_admission_sheds_total").increment(1);
+    }
+
     // ========================================================================
     // Layer 3: Worker metrics
     // ========================================================================
@@ -1433,6 +1345,21 @@ impl Metrics {
         gauge!("smg_cache_placement_entries", "model" => model).set(count as f64);
     }
 
+    /// Record cache-aware policy execution branch for tree-mode routing decisions
+    pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_cache_aware_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the best prefix match ratio (matched/input, 0..1) of a cache-aware
+    /// tree-mode routing decision
+    pub fn record_cache_aware_match_ratio(ratio: f64) {
+        histogram!("smg_cache_aware_match_ratio").record(ratio);
+    }
+
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
         counter!(
@@ -1479,6 +1406,15 @@ impl Metrics {
             "worker" => worker_interned
         )
         .set(if healthy { 1.0 } else { 0.0 });
+    }
+
+    pub fn set_worker_http2(worker_url: &str, http2: bool) {
+        let worker_interned = intern_string(worker_url);
+        gauge!(
+            "smg_worker_http2",
+            "worker" => worker_interned
+        )
+        .set(if http2 { 1.0 } else { 0.0 });
     }
 
     /// Record a KV event subscription task failure (panic, join error, or
@@ -1554,43 +1490,6 @@ impl Metrics {
     // Layer 3: Worker resilience metrics (retry)
     // ========================================================================
 
-    /// Record retry attempt
-    pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {
-        counter!(
-            "smg_worker_retries_total",
-            "worker_type" => worker_type,
-            "endpoint" => endpoint
-        )
-        .increment(1);
-    }
-
-    /// Record retries exhausted
-    pub fn record_worker_retries_exhausted(worker_type: &'static str, endpoint: &'static str) {
-        counter!(
-            "smg_worker_retries_exhausted_total",
-            "worker_type" => worker_type,
-            "endpoint" => endpoint
-        )
-        .increment(1);
-    }
-
-    /// Record retry backoff duration.
-    pub fn record_worker_retry_backoff(attempt: u32, duration: Duration) {
-        let attempt_str: Cow<'static, str> = match attempt {
-            1 => Cow::Borrowed("1"),
-            2 => Cow::Borrowed("2"),
-            3 => Cow::Borrowed("3"),
-            4 => Cow::Borrowed("4"),
-            5 => Cow::Borrowed("5"),
-            _ => Cow::Owned(attempt.to_string()),
-        };
-        histogram!(
-            "smg_worker_retry_backoff_seconds",
-            "attempt" => attempt_str
-        )
-        .record(duration.as_secs_f64());
-    }
-
     // ========================================================================
     // Layer 4: Discovery metrics
     // ========================================================================
@@ -1637,44 +1536,9 @@ impl Metrics {
     // Layer 5: MCP metrics
     // ========================================================================
 
-    /// Record MCP tool call
-    pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
-        let model = intern_model_label(model_id);
-        let tool = intern_tool_label(tool_name);
-        counter!(
-            "smg_mcp_tool_calls_total",
-            "model" => model,
-            "tool_name" => tool,
-            "result" => result
-        )
-        .increment(1);
-    }
-
-    /// Record MCP tool execution duration
-    pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
-        let model = intern_model_label(model_id);
-        let tool = intern_tool_label(tool_name);
-        histogram!(
-            "smg_mcp_tool_duration_seconds",
-            "model" => model,
-            "tool_name" => tool
-        )
-        .record(duration.as_secs_f64());
-    }
-
     /// Set active MCP servers count
     pub fn set_mcp_servers_active(count: usize) {
         gauge!("smg_mcp_servers_active").set(count as f64);
-    }
-
-    /// Record MCP tool loop iteration
-    pub fn record_mcp_tool_iteration(model_id: &str) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_mcp_tool_iterations_total",
-            "model" => model
-        )
-        .increment(1);
     }
 
     // ========================================================================
@@ -1909,31 +1773,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn intern_bounded_label_caps_cardinality_with_sentinel() {
-        let map: DashMap<String, Arc<str>> = DashMap::new();
-
-        let a = intern_bounded_label(&map, 2, "m1");
-        let b = intern_bounded_label(&map, 2, "m2");
-        assert_eq!(map.len(), 2);
-
-        // Repeats return the same interned Arc without growing the map.
-        let a2 = intern_bounded_label(&map, 2, "m1");
-        assert!(Arc::ptr_eq(&a, &a2));
-        assert_eq!(map.len(), 2);
-
-        // A distinct value past the cap collapses to the sentinel and does not
-        // grow the map, so no new Prometheus series is minted for it.
-        let c = intern_bounded_label(&map, 2, "m3");
-        assert_eq!(&*c, BOUNDED_LABEL_SENTINEL);
-        assert_eq!(map.len(), 2);
-
-        // Already-admitted values still resolve normally after the cap is hit.
-        let b2 = intern_bounded_label(&map, 2, "m2");
-        assert!(Arc::ptr_eq(&b, &b2));
-        assert_ne!(&*a, BOUNDED_LABEL_SENTINEL);
-    }
-
     /// Run `f` under a thread-local Prometheus recorder and return the
     /// rendered `/metrics` text — the same scrape output the :29000 endpoint
     /// serves in production.
@@ -1942,6 +1781,75 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, f);
         handle.render()
+    }
+
+    #[test]
+    fn tokenizer_activity_registers_both_layers_on_scrape() {
+        let rendered = render_with_recorder(|| {
+            init_metrics();
+            record_tokenizer_cache_activity();
+        });
+        for layer in ["l0", "l1"] {
+            for name in [
+                "smg_tokenizer_cache_lookups_total",
+                "smg_tokenizer_cache_evictions_total",
+                "smg_tokenizer_cache_reused_bytes_total",
+            ] {
+                assert!(rendered
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}{{"))
+                        && line.contains(&format!("layer=\"{layer}\""))));
+            }
+        }
+    }
+
+    #[test]
+    fn tokenizer_activity_exports_monotonic_totals_without_double_counting() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            init_metrics();
+            for layer in ["l0", "l1"] {
+                for (hits, misses, evictions, reused_bytes) in [(7, 3, 2, 1024), (9, 4, 3, 2048)] {
+                    let snapshot = CacheActivityStats {
+                        layer,
+                        hits,
+                        misses,
+                        evictions,
+                        reused_bytes,
+                    };
+                    record_tokenizer_cache_activity_snapshot(snapshot);
+                    record_tokenizer_cache_activity_snapshot(snapshot);
+                    // An older concurrent scrape must not decrease counters either.
+                    record_tokenizer_cache_activity_snapshot(CacheActivityStats {
+                        hits: 0,
+                        misses: 0,
+                        evictions: 0,
+                        reused_bytes: 0,
+                        ..snapshot
+                    });
+                    let rendered = handle.render();
+                    for (name, result, value) in [
+                        ("smg_tokenizer_cache_lookups_total", Some("hit"), hits),
+                        ("smg_tokenizer_cache_lookups_total", Some("miss"), misses),
+                        ("smg_tokenizer_cache_evictions_total", None, evictions),
+                        ("smg_tokenizer_cache_reused_bytes_total", None, reused_bytes),
+                    ] {
+                        assert!(rendered.contains(&format!("# TYPE {name} counter")));
+                        assert!(
+                            rendered.lines().any(|line| {
+                                line.starts_with(&format!("{name}{{"))
+                                    && line.contains(&format!("layer=\"{layer}\""))
+                                    && result
+                                        .is_none_or(|r| line.contains(&format!("result=\"{r}\"")))
+                                    && line.ends_with(&format!(" {value}"))
+                            }),
+                            "missing {name} for {layer}: {rendered}"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Core engine gauges share these labels for the snapshot fixtures.
@@ -2064,6 +1972,61 @@ mod tests {
                 "smg_cache_tree_tenants {tree} series missing; rendered:\n{rendered}"
             );
         }
+    }
+
+    /// The match ratio must render as a real histogram (`_bucket{le=...}`
+    /// lines) once its buckets are registered the way `start_prometheus` does;
+    /// without them the recorder falls back to a summary.
+    #[test]
+    fn cache_aware_decision_metrics_render_counter_and_bucketed_histogram() {
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full(String::from("smg_cache_aware_match_ratio")),
+                CACHE_AWARE_MATCH_RATIO_BUCKETS,
+            )
+            .expect("bucket override")
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::record_worker_cache_aware_policy_branch("tree_match");
+            Metrics::record_worker_cache_aware_policy_branch("tree_match");
+            Metrics::record_worker_cache_aware_policy_branch("spill");
+            Metrics::record_cache_aware_match_ratio(0.0);
+            Metrics::record_cache_aware_match_ratio(0.75);
+        });
+        let rendered = handle.render();
+
+        for (branch, value) in [("tree_match", "2"), ("spill", "1")] {
+            let series =
+                format!("smg_cache_aware_policy_branch_total{{branch=\"{branch}\"}} {value}");
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "{series} missing; rendered:\n{rendered}"
+            );
+        }
+        for (le, count) in [
+            ("0", "1"),
+            ("0.7", "1"),
+            ("0.8", "2"),
+            ("1", "2"),
+            ("+Inf", "2"),
+        ] {
+            let series = format!("smg_cache_aware_match_ratio_bucket{{le=\"{le}\"}} {count}");
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "{series} missing; rendered:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l == "smg_cache_aware_match_ratio_count 2"),
+            "histogram count missing; rendered:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_cache_aware_match_ratio{quantile="),
+            "match ratio rendered as a summary; rendered:\n{rendered}"
+        );
     }
 
     #[test]

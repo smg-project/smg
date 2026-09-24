@@ -6,7 +6,10 @@ use thiserror::Error;
 use crate::{
     audio::AudioPreProcessor,
     encoder_inputs::PreprocessedEncoderInputs,
-    types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
+    media::FrameSampling,
+    types::{
+        EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId, VideoSamplingInfo,
+    },
     vision::PreProcessorConfig,
 };
 
@@ -165,6 +168,13 @@ impl<'a> ModelMetadata<'a> {
     }
 }
 
+/// Decoder-side facts about one media item that prompt replacements may need.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MediaItemInfo {
+    /// Sampling behind a decoded clip; `None` for images/audio or when the decoder could not report it.
+    pub video_sampling: Option<VideoSamplingInfo>,
+}
+
 pub trait ModelProcessorSpec: Send + Sync {
     fn name(&self) -> &'static str;
     fn matches(&self, metadata: &ModelMetadata) -> bool;
@@ -174,6 +184,12 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// parts positionally override to `Authored`.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::MediaFirst
+    }
+
+    /// Whether the anchor rendered for `modality` is exactly the single token
+    /// vLLM's prompt updates target, so a worker can expand it itself.
+    fn worker_expandable(&self, _modality: Modality) -> bool {
+        false
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
@@ -283,6 +299,18 @@ pub trait ModelProcessorSpec: Send + Sync {
         }
     }
 
+    /// Prompt replacements given one [`MediaItemInfo`] per media item in batch order and the config the modality was preprocessed with; the default ignores both.
+    fn prompt_replacements_with_media(
+        &self,
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+        modality: Modality,
+        _media: &[MediaItemInfo],
+        _preprocessor_config: &PreProcessorConfig,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        self.prompt_replacements_for(metadata, preprocessed, modality)
+    }
+
     /// Declare how each tensor's first dimension maps to media items.
     ///
     /// Keys not listed are treated as shared (replicated across all media items).
@@ -318,6 +346,28 @@ pub trait ModelProcessorSpec: Send + Sync {
     fn keep_on_cpu_keys_for(&self, _modality: Modality) -> Vec<String> {
         self.keep_on_cpu_keys()
     }
+
+    /// The engine-side name of the primary encoder input for one modality,
+    /// when it is not the HF-conventional `pixel_values` / `audio_features`
+    /// (DeepSeek-V4.1's forward pops `patches`). `None` keeps the default
+    /// name; adapters that build the engine request consult this before
+    /// naming the tensor.
+    fn encoder_input_key_for(&self, _modality: Modality) -> Option<String> {
+        None
+    }
+
+    /// Frame rate to sample a video at when the request names no `fps`: the
+    /// model's reference processor default, so token counts match it. `None`
+    /// keeps the media connector's default.
+    fn default_video_sample_fps(&self) -> Option<f32> {
+        None
+    }
+
+    /// Where a video's sampled frames sit: evenly spread, or one per interval
+    /// from the start with the last frame kept, as the model's reference does.
+    fn video_frame_sampling(&self) -> FrameSampling {
+        FrameSampling::Even
+    }
 }
 
 #[cfg(test)]
@@ -325,7 +375,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::registry::test_helpers::TestTokenizer;
+    use crate::{
+        registry::test_helpers::{test_preprocessed_with_tokens, TestTokenizer},
+        types::ImageSize,
+    };
 
     struct TestSpec;
 
@@ -360,9 +413,15 @@ mod tests {
         fn prompt_replacements(
             &self,
             _metadata: &ModelMetadata,
-            _preprocessed: &PreprocessedEncoderInputs,
+            preprocessed: &PreprocessedEncoderInputs,
         ) -> RegistryResult<Vec<PromptReplacement>> {
-            Ok(vec![])
+            Ok(preprocessed
+                .feature_token_counts
+                .iter()
+                .map(|&count| {
+                    PromptReplacement::sequence(Modality::Image, "<image>", vec![1; count])
+                })
+                .collect())
         }
     }
 
@@ -378,6 +437,73 @@ mod tests {
             config: &config,
         };
         spec.validate_media_request(&metadata, requested)
+    }
+
+    #[test]
+    fn media_aware_replacements_default_to_the_modality_hook() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({});
+        let metadata = ModelMetadata {
+            model_id: "test-model",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let preprocessed =
+            test_preprocessed_with_tokens(&[ImageSize::new(4, 4), ImageSize::new(4, 4)], &[3, 5]);
+        let media = vec![
+            MediaItemInfo::default(),
+            MediaItemInfo {
+                video_sampling: Some(VideoSamplingInfo {
+                    source_fps: 30.0,
+                    frame_indices: vec![0, 15],
+                }),
+            },
+        ];
+
+        let preprocessor_config = PreProcessorConfig::default();
+        let with_media = TestSpec
+            .prompt_replacements_with_media(
+                &metadata,
+                &preprocessed,
+                Modality::Image,
+                &media,
+                &preprocessor_config,
+            )
+            .unwrap();
+        let without_media = TestSpec
+            .prompt_replacements_for(&metadata, &preprocessed, Modality::Image)
+            .unwrap();
+
+        let tokens = |replacements: &[PromptReplacement]| {
+            replacements
+                .iter()
+                .map(|replacement| replacement.tokens.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tokens(&with_media), vec![vec![1; 3], vec![1; 5]]);
+        assert_eq!(tokens(&with_media), tokens(&without_media));
+        let unsupported = TestSpec
+            .prompt_replacements_with_media(
+                &metadata,
+                &preprocessed,
+                Modality::Video,
+                &media,
+                &preprocessor_config,
+            )
+            .unwrap_err();
+        assert_eq!(
+            unsupported,
+            ModelRegistryError::UnsupportedModality {
+                spec: "test",
+                modality: Modality::Video,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_expandable_defaults_to_false() {
+        assert!(!TestSpec.worker_expandable(Modality::Image));
+        assert!(!TestSpec.worker_expandable(Modality::Video));
     }
 
     #[test]

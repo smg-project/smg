@@ -6,15 +6,57 @@
 use std::collections::HashMap;
 
 use image::imageops::FilterType;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::transforms;
 
 /// Struct to represent patch_size as dict {"height": x, "width": y}
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PatchSize {
     pub height: Option<u32>,
     pub width: Option<u32>,
+}
+
+/// Custom deserializer for `size`, which HuggingFace checkpoints write either
+/// as a mapping or as a bare `[height, width]` pair.
+///
+/// The mapping forms (`{"height": H, "width": W}`, `{"shortest_edge": S}`, and
+/// any other scalar keys such as `longest_edge`) pass through untouched. A
+/// two-element sequence — as MiniMax-M3 writes it, `"size": [672, 672]` — is
+/// normalized to `{"height": H, "width": W}` so every existing accessor keeps
+/// working. Without this the whole config fails to deserialize with
+/// "invalid type: sequence, expected a map".
+fn deserialize_size<'de, D>(deserializer: D) -> Result<Option<HashMap<String, u32>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SizeSpec {
+        Map(HashMap<String, u32>),
+        Pair(Vec<u32>),
+    }
+
+    let Some(spec) = Option::<SizeSpec>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+
+    match spec {
+        SizeSpec::Map(map) => Ok(Some(map)),
+        SizeSpec::Pair(dims) => match dims.as_slice() {
+            [height, width] => Ok(Some(HashMap::from([
+                ("height".to_string(), *height),
+                ("width".to_string(), *width),
+            ]))),
+            // A single value is the shortest-edge spelling; anything else is
+            // not a size we can interpret.
+            [edge] => Ok(Some(HashMap::from([("shortest_edge".to_string(), *edge)]))),
+            other => Err(serde::de::Error::invalid_length(
+                other.len(),
+                &"a [height, width] pair or a single shortest-edge value",
+            )),
+        },
+    }
 }
 
 /// Custom deserializer for patch_size that handles both integer and dict formats.
@@ -101,7 +143,7 @@ where
 ///
 /// This struct captures the common fields across different vision model processors.
 /// Model-specific fields are accessed via the flexible `extra` field.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PreProcessorConfig {
     /// Processor class name (e.g., "CLIPImageProcessor", "Qwen2VLImageProcessor")
     #[serde(default)]
@@ -148,8 +190,8 @@ pub struct PreProcessorConfig {
     pub resampling: Option<usize>,
 
     /// Target size for resizing
-    /// Can be {"height": H, "width": W} or {"shortest_edge": S}
-    #[serde(default)]
+    /// Can be {"height": H, "width": W}, {"shortest_edge": S}, or [H, W]
+    #[serde(default, deserialize_with = "deserialize_size")]
     pub size: Option<HashMap<String, u32>>,
 
     /// Target size for center cropping

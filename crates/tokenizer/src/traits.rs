@@ -12,6 +12,70 @@ use crate::chat_template::{
 /// Type alias for token IDs
 pub type TokenIdType = u32;
 
+/// An encode a renderer prepared while applying the chat template but left
+/// for the caller to run. Built only inside this crate.
+///
+/// Run it exactly where `encode(&text, false)` would otherwise run: the caller
+/// picks the thread, so the work goes through the same offload as a flat
+/// encode. A flat encode of the prompt text does not reproduce these ids.
+/// Wrappers that implement `Tokenizer` over another tokenizer must forward
+/// `apply_chat_template_with_encoding` so the job survives.
+#[must_use = "run it where you would encode the prompt text; a flat encode yields different ids"]
+pub struct EncodeJob(Box<dyn FnOnce() -> Result<Encoding> + Send + 'static>);
+
+impl EncodeJob {
+    pub(crate) fn new(f: impl FnOnce() -> Result<Encoding> + Send + 'static) -> Self {
+        Self(Box::new(f))
+    }
+
+    /// Perform the encode.
+    pub fn run(self) -> Result<Encoding> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for EncodeJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EncodeJob")
+    }
+}
+
+/// Renderer behaviours the gateway mirrors when it prepares a request, so
+/// the rendered prompt and the request handling never disagree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RendererCapabilities {
+    /// The renderer reads `enable_thinking` as an alias of its thinking key.
+    pub enable_thinking_alias: bool,
+    /// With `add_generation_prompt` false the renderer continues a trailing
+    /// assistant message itself (no EOS, no generation header); the gateway
+    /// must keep the message instead of popping it into a text prefix.
+    pub native_assistant_continuation: bool,
+    /// The renderer parses tool-call `arguments` strings itself with the
+    /// reference's tolerance (non-object and double-encoded values); the
+    /// gateway must forward them as written instead of pre-parsing them.
+    pub raw_tool_call_arguments: bool,
+}
+
+/// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
+#[derive(Debug)]
+pub enum PromptEncoding {
+    /// `encode(&text, false)` is the prompt's encoding (every flat renderer).
+    FromText,
+    /// The renderer prepared the encode itself: run the job instead of
+    /// encoding `text` (renderers whose ids are not a function of the text).
+    Deferred(EncodeJob),
+}
+
+/// The applied chat template: the flat prompt string plus how to encode it.
+#[derive(Debug)]
+pub struct ChatTemplateOutput {
+    /// The flat prompt, for logs, routing, and `original_text`.
+    pub text: String,
+    pub encoding: PromptEncoding,
+    /// Prompt tokens the provider does not bill (K3's response-channel stub); 0 for flat renderers.
+    pub unbilled_prompt_tokens: u32,
+}
+
 /// Core encoding trait - separate from decoding for modularity
 pub trait Encoder: Send + Sync {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding>;
@@ -94,6 +158,28 @@ pub trait Tokenizer: Encoder + Decoder {
         ))
     }
 
+    /// `apply_chat_template` plus how to encode the result, with the optional
+    /// `continue_final_message` prefill applied. The default appends the
+    /// prefill to the flat rendering and reports [`PromptEncoding::FromText`];
+    /// renderers whose ids are not a function of the text override it and
+    /// hand back a deferred encode instead.
+    fn apply_chat_template_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        let mut text = self.apply_chat_template(messages, params)?;
+        if let Some(prefix) = assistant_prefix {
+            text.push_str(prefix);
+        }
+        Ok(ChatTemplateOutput {
+            text,
+            encoding: PromptEncoding::FromText,
+            unbilled_prompt_tokens: 0,
+        })
+    }
+
     /// Get the content format expected by the chat template.
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         ChatTemplateContentFormat::default()
@@ -119,6 +205,11 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Whether the template injects `<think>` in the generation prompt.
     fn think_in_prefill(&self) -> bool {
         false
+    }
+
+    /// Renderer behaviours the gateway mirrors when it prepares a request.
+    fn renderer_capabilities(&self) -> RendererCapabilities {
+        RendererCapabilities::default()
     }
 
     /// Set or override the chat template.

@@ -54,6 +54,16 @@ on:
         type: string
         default: "nixl"
         description: "KV transfer backend for vLLM PD workers: nixl or mooncake"
+      kv_backend:
+        required: false
+        type: string
+        default: ""
+        description: "KV transfer backend for every PD worker, whatever the engine (nixl or mooncake); empty keeps each engine's default"
+      vllm_extra_kv_backends:
+        required: false
+        type: string
+        default: ""
+        description: "Additional vLLM KV transfer backends to install beside the lane's own (e.g. mooncake), for fleets that mix transports"
       connection_mode:
         required: false
         type: string
@@ -64,11 +74,26 @@ on:
         type: string
         default: ""
         description: "DP engines per ZMQ worker (grouped vLLM launch; empty = 1)"
+      mm_processing:
+        required: false
+        type: string
+        default: ""
+        description: "Multimodal processing location for vLLM gRPC workers: worker launches them with SMG_VLLM_MM_PROCESSOR=inprocess so the gateway forwards media references; empty keeps router-side preprocessing"
       min_selected:
         required: false
         type: number
         default: 0
         description: "Minimum effective (selected) test count; exported as E2E_MIN_SELECTED for the pytest harness floor check (0 = disabled)"
+      tokenspeed_prebuilt_image:
+        required: false
+        type: string
+        default: ""
+        description: "Prebuilt TokenSpeed carrier image to extract onto the runner (resolved by detect-changes); empty = build from source"
+      servicer_unit_tests:
+        required: false
+        type: boolean
+        default: false
+        description: "Also run grpc_servicer/tests here, where the importorskip('vllm') cases meet a real vLLM; set on one vLLM lane"
 
 jobs:
   run:
@@ -82,12 +107,28 @@ jobs:
       E2E_RUNTIME: ${{ inputs.engine }}
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
+      E2E_KV_BACKEND: ${{ inputs.kv_backend }}
+      E2E_VLLM_EXTRA_KV_BACKENDS: ${{ inputs.vllm_extra_kv_backends }}
       E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
       E2E_ZMQ_ENGINE_COUNT: ${{ inputs.zmq_engine_count }}
+      E2E_MM_PROCESSING: ${{ inputs.mm_processing }}
+      TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      # The cluster runners share one NAT egress IP and GitHub intermittently
+      # 401s anonymous git from it, even for public repos — the TokenSpeed
+      # source fetch dies on "could not read Username". Carry the workflow
+      # token on every github.com git operation instead.
+      - name: Authenticate git for github.com
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
 
       # Engine-specific setup
       - name: Setup SGLang backend
@@ -138,6 +179,15 @@ jobs:
           pip install wheel/*.whl
           bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
 
+      # The servicer's vLLM-gated unit tests (importorskip("vllm")) only meet a
+      # real vLLM here; the CPU unit-test job skips them. One lane opts in.
+      - name: Run vLLM-gated servicer unit tests
+        if: inputs.servicer_unit_tests
+        run: |
+          python3 -c "import vllm, msgspec"  # the gates these tests importorskip on
+          pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
+          pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
         run: |
@@ -182,7 +232,9 @@ jobs:
           LABEL=$(echo '${{ inputs.test_dirs }}' | tr '/' '-')
           # vLLM legs can differ only by KV backend; disambiguate the artifact
           SUFFIX=""
-          if [ "${{ inputs.engine }}" = "vllm" ]; then
+          if [ -n "${{ inputs.kv_backend }}" ]; then
+            SUFFIX="-${{ inputs.kv_backend }}"
+          elif [ "${{ inputs.engine }}" = "vllm" ]; then
             SUFFIX="-${{ inputs.vllm_kv_backend }}"
           fi
           # gRPC and ZMQ chat legs share engine/GPU/test-dir and differ only by
@@ -190,6 +242,11 @@ jobs:
           MODE="${{ inputs.connection_mode }}"
           if [ -n "$MODE" ]; then
             SUFFIX="${SUFFIX}-${MODE}"
+          fi
+          # The worker-side media lane reuses the multimodal test files.
+          MM="${{ inputs.mm_processing }}"
+          if [ -n "$MM" ]; then
+            SUFFIX="${SUFFIX}-mm-${MM}"
           fi
           ARTIFACT="e2e-worker-logs-${{ inputs.engine }}-gpu${{ inputs.gpu_tier }}-${LABEL}${SUFFIX}"
           bash scripts/ci_dump_worker_logs.sh e2e-logs "$ARTIFACT"
@@ -204,6 +261,14 @@ jobs:
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: ignore
+
+      # The prebuilt TokenSpeed payload is a per-job copy on the node's shared
+      # NVMe cache (scripts/ci_fetch_tokenspeed_prebuilt.sh); drop it so the
+      # cache does not keep one copy per lane. A hard-killed runner never
+      # reaches this step; those copies are swept by the next fetch on the node.
+      - name: Remove per-job TokenSpeed payload copy
+        if: always() && env.TOKENSPEED_PREBUILT_JOB_DIR != ''
+        run: rm -rf "$TOKENSPEED_PREBUILT_JOB_DIR"
 
       - name: Cleanup Oracle test users
         if: always() && inputs.setup_agentic_deps

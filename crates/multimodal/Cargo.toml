@@ -66,5 +66,9 @@ pkg-config = "0.3"
 name = "image_preprocess"
 harness = false
 
+[[bench]]
+name = "minimax_m3_preprocess"
+harness = false
+
 [lints]
 workspace = true

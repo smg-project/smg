@@ -25,6 +25,19 @@ pub enum TransformError {
 
 #[derive(Debug, Error)]
 pub enum MediaConnectorError {
+    #[error("max_long_side_pixel must be a positive multiple of {factor}, got {value}")]
+    InvalidMaxLongSidePixel { value: u32, factor: u32 },
+    #[error("fps must be between {min} and {max}, got {value}")]
+    InvalidSampleFps { value: f64, min: f64, max: f64 },
+    #[error(
+        "video max_long_side_pixel must be a multiple of {factor} within {min}..={max}, got {value}"
+    )]
+    InvalidVideoLongSideCap {
+        value: u32,
+        factor: u32,
+        min: u32,
+        max: u32,
+    },
     #[error("unsupported media scheme: {0}")]
     UnsupportedScheme(String),
     #[error("invalid media URL: {0}")]

@@ -9,10 +9,10 @@
 use axum::{http, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{Tool, ToolChoice, ToolChoiceValue},
+    common::{Tool, ToolChoice, ToolChoiceValue, Usage},
     responses::{
-        self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-        ResponsesRequest,
+        self, InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponseOutputItem, ResponseUsage, ResponsesRequest,
     },
 };
 use smg_data_connector::{
@@ -24,9 +24,12 @@ use tracing::{debug, warn};
 use crate::{
     middleware::TenantRequestMeta,
     routers::{
-        common::{openai_bridge, persistence_utils::split_stored_message_content},
+        common::{
+            mcp_utils::DEFAULT_MAX_ITERATIONS, openai_bridge,
+            persistence_utils::split_stored_message_content,
+        },
         error,
-        grpc::common::responses::ResponsesContext,
+        grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
     },
 };
 
@@ -36,8 +39,10 @@ use crate::{
 
 /// State for tracking multi-turn tool calling loop
 pub(super) struct ToolLoopState {
+    tools: Option<Vec<responses::ResponseTool>>,
     pub iteration: usize,
     pub total_calls: usize,
+    pub usage: Option<ResponseUsage>,
     pub conversation_history: Vec<ResponseInputOutputItem>,
     pub original_input: ResponseInput,
     pub mcp_call_items: Vec<ResponseOutputItem>,
@@ -53,13 +58,52 @@ pub(super) struct ResponsesCallContext {
 }
 
 impl ToolLoopState {
-    pub fn new(original_input: ResponseInput) -> Self {
+    pub fn new(request: &ResponsesRequest) -> Self {
         Self {
+            tools: request.tools.clone(),
             iteration: 0,
             total_calls: 0,
+            usage: None,
             conversation_history: Vec::new(),
-            original_input,
+            original_input: request.input.clone(),
             mcp_call_items: Vec::new(),
+        }
+    }
+
+    /// Usage is per model request; missing reports must not erase prior totals.
+    pub fn record_usage(&mut self, usage: Option<&Usage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let total = self.usage.get_or_insert(ResponseUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        });
+        total.input_tokens = total.input_tokens.saturating_add(usage.prompt_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(usage.completion_tokens);
+        total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+        if let Some(details) = &usage.prompt_tokens_details {
+            let accumulated = total
+                .input_tokens_details
+                .get_or_insert(InputTokensDetails { cached_tokens: 0 });
+            accumulated.cached_tokens = accumulated
+                .cached_tokens
+                .saturating_add(details.cached_tokens);
+        }
+        if let Some(tokens) = usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+        {
+            let accumulated = total
+                .output_tokens_details
+                .get_or_insert(OutputTokensDetails {
+                    reasoning_tokens: 0,
+                });
+            accumulated.reasoning_tokens = accumulated.reasoning_tokens.saturating_add(tokens);
         }
     }
 
@@ -74,11 +118,13 @@ impl ToolLoopState {
     ) {
         // Add function_tool_call item with both arguments and output
         let id = call_id.clone();
+        let (name, namespace) = resolve_function_identity(self.tools.as_deref(), &tool_name);
         self.conversation_history
             .push(ResponseInputOutputItem::FunctionToolCall {
                 id: Some(id),
                 call_id,
-                name: tool_name,
+                name,
+                namespace,
                 arguments: args_json_str,
                 output: Some(output_str),
                 status: Some("completed".to_string()),
@@ -123,6 +169,49 @@ pub(super) struct ExtractedToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: String,
+}
+
+/// Why a generated MCP batch must stop after its permitted calls execute.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum McpToolCallLimit {
+    User,
+    Safety,
+}
+
+/// Keep the prefix of MCP calls that fits the remaining request budget.
+///
+/// A batch that fits may continue to a final model answer. An overflowing
+/// batch executes its permitted prefix, then stops normally for a user cap
+/// or fails for the internal safety cap. A user cap wins when both are equal.
+pub(super) fn apply_mcp_tool_call_limit(
+    calls: &mut Vec<ExtractedToolCall>,
+    total_calls: usize,
+    max_tool_calls: Option<usize>,
+) -> Option<McpToolCallLimit> {
+    let effective_limit = max_tool_calls
+        .unwrap_or(DEFAULT_MAX_ITERATIONS)
+        .min(DEFAULT_MAX_ITERATIONS);
+    let remaining = effective_limit.saturating_sub(total_calls);
+    if calls.len() <= remaining {
+        return None;
+    }
+
+    if max_tool_calls.is_none_or(|limit| limit > DEFAULT_MAX_ITERATIONS) {
+        warn!(
+            total_calls,
+            batch_size = calls.len(),
+            effective_limit,
+            "Internal MCP tool call safety limit reached"
+        );
+    }
+    calls.truncate(remaining);
+    Some(
+        if max_tool_calls.is_some_and(|limit| limit <= DEFAULT_MAX_ITERATIONS) {
+            McpToolCallLimit::User
+        } else {
+            McpToolCallLimit::Safety
+        },
+    )
 }
 
 /// Extract all tool calls from chat response (for parallel tool call support)
@@ -424,5 +513,69 @@ pub(super) fn build_next_request(
         top_k: current_request.top_k,
         min_p: current_request.min_p,
         repetition_penalty: current_request.repetition_penalty,
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    #[test]
+    fn namespace_replay_preserves_structured_identity() {
+        let request: ResponsesRequest = namespace_test_request();
+        let mut state = ToolLoopState::new(&request);
+        state.record_call(
+            "call_test".into(),
+            "weather.lookup".into(),
+            "{}".into(),
+            "sunny".into(),
+            ResponseOutputItem::new_function_tool_call(
+                "fc_test".into(),
+                "call_test".into(),
+                "weather.lookup".into(),
+                "{}".into(),
+                None,
+                "completed".into(),
+            ),
+            true,
+        );
+        let wire = serde_json::to_value(&state.conversation_history[0]).unwrap();
+
+        assert_eq!(wire["name"], "lookup");
+        assert_eq!(wire["namespace"], "weather");
+        assert_eq!(wire["call_id"], "call_test");
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn mcp_usage_accumulates_reasoning_and_cache_and_survives_missing_usage() {
+        let mut state = ToolLoopState::new(&ResponsesRequest::default());
+        state.record_usage(None);
+        assert!(state.usage.is_none());
+        state.record_usage(Some(
+            &Usage::from_counts(12, 7)
+                .with_cached_tokens(3)
+                .with_reasoning_tokens(2),
+        ));
+        state.record_usage(Some(
+            &Usage::from_counts(5, 4)
+                .with_cached_tokens(0)
+                .with_reasoning_tokens(1),
+        ));
+        state.record_usage(None);
+        assert_eq!(
+            serde_json::to_value(state.usage).unwrap(),
+            json!({
+                "input_tokens":17, "output_tokens":11, "total_tokens":28,
+                "input_tokens_details":{"cached_tokens":3},
+                "output_tokens_details":{"reasoning_tokens":3},
+            })
+        );
     }
 }

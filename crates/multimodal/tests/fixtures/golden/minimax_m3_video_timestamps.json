@@ -1,0 +1,153 @@
+{
+  "reference": "processing_minimax.py",
+  "reference_sha256": "0706ae8b93b3489a3b3bc7f48a5f29fb34b1449ebebb37586250e4d5fa8f5e35",
+  "generated_by": "huggingface.co/MiniMaxAI/MiniMax-M3 processing_minimax.py lines 221-245, with metadata.frames_indices = frame_indices, metadata.fps = source_fps and self.video_processor.temporal_patch_size = temporal_patch_size: timestamps = [f\"]<]{frame_indices[min(frame_idx * temporal_patch_size, len(frame_indices) - 1)] / source_fps:.1f} seconds[>[\" for frame_idx in range(grid_t)]",
+  "cases": [
+    {
+      "name": "thirty_fps_pairs",
+      "source_fps": 30.0,
+      "frame_indices": [0, 15, 30, 45, 60],
+      "temporal_patch_size": 2,
+      "grid_t": 3,
+      "timestamps": [
+        "]<]0.0 seconds[>[",
+        "]<]1.0 seconds[>[",
+        "]<]2.0 seconds[>["
+      ]
+    },
+    {
+      "name": "half_second_boundaries",
+      "source_fps": 30.0,
+      "frame_indices": [0, 45, 90, 135],
+      "temporal_patch_size": 1,
+      "grid_t": 4,
+      "timestamps": [
+        "]<]0.0 seconds[>[",
+        "]<]1.5 seconds[>[",
+        "]<]3.0 seconds[>[",
+        "]<]4.5 seconds[>["
+      ]
+    },
+    {
+      "name": "ntsc_29_97",
+      "source_fps": 29.97002997002997,
+      "frame_indices": [0, 15, 30, 45, 60, 75, 1349, 1350],
+      "temporal_patch_size": 2,
+      "grid_t": 4,
+      "timestamps": [
+        "]<]0.0 seconds[>[",
+        "]<]1.0 seconds[>[",
+        "]<]2.0 seconds[>[",
+        "]<]45.0 seconds[>["
+      ]
+    },
+    {
+      "name": "ntsc_23_976",
+      "source_fps": 23.976023976023978,
+      "frame_indices": [0, 24, 48, 240],
+      "temporal_patch_size": 1,
+      "grid_t": 4,
+      "timestamps": [
+        "]<]0.0 seconds[>[",
+        "]<]1.0 seconds[>[",
+        "]<]2.0 seconds[>[",
+        "]<]10.0 seconds[>["
+      ]
+    },
+    {
+      "name": "quarter_second_ties",
+      "source_fps": 4.0,
+      "frame_indices": [1, 3, 5, 7, 10, 11],
+      "temporal_patch_size": 1,
+      "grid_t": 6,
+      "timestamps": [
+        "]<]0.2 seconds[>[",
+        "]<]0.8 seconds[>[",
+        "]<]1.2 seconds[>[",
+        "]<]1.8 seconds[>[",
+        "]<]2.5 seconds[>[",
+        "]<]2.8 seconds[>["
+      ]
+    },
+    {
+      "name": "eighth_second_ties",
+      "source_fps": 8.0,
+      "frame_indices": [1, 3, 5, 7],
+      "temporal_patch_size": 1,
+      "grid_t": 4,
+      "timestamps": [
+        "]<]0.1 seconds[>[",
+        "]<]0.4 seconds[>[",
+        "]<]0.6 seconds[>[",
+        "]<]0.9 seconds[>["
+      ]
+    },
+    {
+      "name": "thirds",
+      "source_fps": 3.0,
+      "frame_indices": [2, 100],
+      "temporal_patch_size": 1,
+      "grid_t": 2,
+      "timestamps": [
+        "]<]0.7 seconds[>[",
+        "]<]33.3 seconds[>["
+      ]
+    },
+    {
+      "name": "large_offsets",
+      "source_fps": 30.0,
+      "frame_indices": [3000, 3001, 30000, 30001, 359999],
+      "temporal_patch_size": 2,
+      "grid_t": 3,
+      "timestamps": [
+        "]<]100.0 seconds[>[",
+        "]<]1000.0 seconds[>[",
+        "]<]12000.0 seconds[>["
+      ]
+    },
+    {
+      "name": "odd_frame_count_padded",
+      "source_fps": 30.0,
+      "frame_indices": [0, 15, 30],
+      "temporal_patch_size": 2,
+      "grid_t": 2,
+      "timestamps": [
+        "]<]0.0 seconds[>[",
+        "]<]1.0 seconds[>["
+      ]
+    },
+    {
+      "name": "short_index_list_clamps",
+      "source_fps": 30.0,
+      "frame_indices": [0, 30],
+      "temporal_patch_size": 2,
+      "grid_t": 3,
+      "timestamps": [
+        "]<]0.0 seconds[>[",
+        "]<]1.0 seconds[>[",
+        "]<]1.0 seconds[>["
+      ]
+    },
+    {
+      "name": "single_frame",
+      "source_fps": 25.0,
+      "frame_indices": [7],
+      "temporal_patch_size": 2,
+      "grid_t": 1,
+      "timestamps": [
+        "]<]0.3 seconds[>["
+      ]
+    },
+    {
+      "name": "temporal_patch_size_four",
+      "source_fps": 30.0,
+      "frame_indices": [0, 15, 30, 45, 60, 75, 90, 105],
+      "temporal_patch_size": 4,
+      "grid_t": 2,
+      "timestamps": [
+        "]<]0.0 seconds[>[",
+        "]<]2.0 seconds[>["
+      ]
+    }
+  ]
+}

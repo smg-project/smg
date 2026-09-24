@@ -389,7 +389,8 @@ fn build_zmq_request<B>(
     match dialect {
         ZmqDialect::Vllm => {
             let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
-            finish_vllm_request(vllm_mm, |mm| {
+            // The ZMQ wire carries one modality batch (see `zmq_vllm_mm`).
+            finish_vllm_request(vllm_mm.map(|mm| (mm, Vec::new())), |mm| {
                 vllm(
                     request_id,
                     body,
@@ -446,7 +447,17 @@ fn zmq_vllm_mm(
 ) -> Result<Option<vllm_proto::MultimodalInputs>, String> {
     inputs
         .map(|mm| match mm {
-            MultimodalData::Vllm(data) => Ok(data.into_proto()),
+            MultimodalData::Vllm(data) => {
+                let (primary, extra) = data.into_protos();
+                if !extra.is_empty() {
+                    return Err(
+                        "the vLLM ZMQ backend takes one modality per request; mixed image and \
+                         video requests need the gRPC backend"
+                            .to_string(),
+                    );
+                }
+                Ok(primary)
+            }
             other => Err(mm_variant_mismatch("vLLM", &other)),
         })
         .transpose()
@@ -459,7 +470,9 @@ fn zmq_tokenspeed_mm(
 ) -> Result<Option<tokenspeed_proto::MultimodalInputs>, String> {
     inputs
         .map(|mm| match mm {
-            MultimodalData::TokenSpeed(data) => Ok(data.into_proto(true)),
+            // No RDMA staging: the ZMQ engine reads tensors inline off the wire
+            // and has no puller for `remote` payloads.
+            MultimodalData::TokenSpeed(data) => Ok(data.into_proto(false)),
             other => Err(mm_variant_mismatch("TokenSpeed", &other)),
         })
         .transpose()

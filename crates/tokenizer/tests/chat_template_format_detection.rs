@@ -176,8 +176,10 @@ assistant:
         ChatMessage::System {
             content: MessageContent::Text("You are helpful".to_string()),
             name: None,
+            ext: Default::default(),
         },
         ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("Hello".to_string()),
             name: None,
         },
@@ -214,6 +216,7 @@ fn test_chat_template_with_tokens_unit_test() {
     let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
 
     let messages = [ChatMessage::User {
+        ext: Default::default(),
         content: MessageContent::Text("Test".to_string()),
         name: None,
     }];

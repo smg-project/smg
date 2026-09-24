@@ -5,10 +5,12 @@ set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 if command -v sudo >/dev/null 2>&1; then
     sudo dpkg --configure -a --force-confnew 2>/dev/null || true
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
     sudo apt-get update
     sudo apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
 else
     dpkg --configure -a --force-confnew 2>/dev/null || true
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
     apt-get update
     apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
 fi

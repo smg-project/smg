@@ -270,6 +270,9 @@ message GenerateComplete {
   }
 
   uint32 index = 9;
+
+  uint32 spec_accepted_tokens = 10;
+  uint32 spec_draft_tokens = 11;
 }
 
 message OutputLogProbs {

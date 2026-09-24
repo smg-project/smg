@@ -780,6 +780,10 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
                 },
             );
         Self {
+            // Set only by a gateway reporting a fleet; an engine reports
+            // ranks, not which worker they came from.
+            worker: None,
+            worker_type: None,
             dp_rank: load.dp_rank,
             num_running_reqs: load.num_running_reqs,
             num_waiting_reqs: load.num_waiting_reqs,

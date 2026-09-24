@@ -1,5 +1,6 @@
 //! Host-DRAM LRU cache of preprocessed per-image encoder inputs for the gateway
-//! multimodal path. Disabled by default (`SMG_MM_PIXEL_CACHE_MB` unset / 0).
+//! multimodal path. Disabled by default (`--mm-pixel-cache-mb` /
+//! `SMG_MM_PIXEL_CACHE_MB` unset or 0).
 
 use std::{
     mem::size_of,
@@ -132,14 +133,12 @@ impl PixelCache {
     }
 }
 
-pub(crate) fn pixel_cache_from_env() -> Option<Arc<PixelCache>> {
+/// The process-wide pixel cache with a budget of `mb` MiB; 0 keeps it off.
+/// Built once: the first budget wins, later routers share it.
+pub(crate) fn pixel_cache_with_budget(mb: usize) -> Option<Arc<PixelCache>> {
     static CACHE: OnceLock<Option<Arc<PixelCache>>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let mb = std::env::var("SMG_MM_PIXEL_CACHE_MB")
-                .ok()
-                .and_then(|raw| raw.trim().parse::<usize>().ok())
-                .unwrap_or(0);
             if mb == 0 {
                 return None;
             }

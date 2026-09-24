@@ -117,14 +117,7 @@ impl ResponseProcessor {
             ) {
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
-                if utils::should_mark_reasoning_started(
-                    utils::resolve_user_thinking(
-                        original_request.chat_template_kwargs.as_ref(),
-                        original_request.reasoning_effort.as_deref(),
-                        tokenizer.as_ref(),
-                    ),
-                    tokenizer.as_ref(),
-                ) {
+                if original_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
                     parser.mark_reasoning_started();
                 }
 
@@ -195,8 +188,10 @@ impl ResponseProcessor {
             complete.finish_reason()
         };
 
-        // Override finish reason if we have tool calls
-        let final_finish_reason_str = if tool_calls.is_some() {
+        // Parsed calls do not override an engine truncation or failure.
+        let final_finish_reason_str = if tool_calls.is_some()
+            && !matches!(finish_reason_str, "length" | "failed" | "error")
+        {
             "tool_calls"
         } else {
             finish_reason_str
@@ -316,7 +311,8 @@ impl ResponseProcessor {
         }
 
         // Build usage from gRPC response counters.
-        let usage = response_formatting::build_usage(&all_responses);
+        let usage = response_formatting::build_usage(&all_responses)
+            .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens);
 
         // Build final ChatCompletionResponse
         Ok(
@@ -826,6 +822,8 @@ impl ResponseProcessor {
 
         let mut total_prompt = 0u32;
         let mut total_completion = 0u32;
+        let mut total_spec_accepted = 0u32;
+        let mut total_spec_drafted = 0u32;
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
@@ -876,6 +874,8 @@ impl ResponseProcessor {
 
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
                 total_completion += complete.completion_tokens();
+                total_spec_accepted += complete.spec_accepted_tokens();
+                total_spec_drafted += complete.spec_draft_tokens();
 
                 // A local stop-decoder match takes precedence over the engine's
                 // reason (which is "length" when stop strings are enforced
@@ -940,7 +940,10 @@ impl ResponseProcessor {
             created: dispatch.created,
             model: dispatch.model.clone(),
             choices,
-            usage: Some(Usage::from_counts(total_prompt, total_completion)),
+            usage: Some(
+                Usage::from_counts(total_prompt, total_completion)
+                    .with_speculative_tokens(total_spec_accepted, total_spec_drafted),
+            ),
             system_fingerprint: dispatch.weight_version.clone(),
         })
     }
@@ -1001,5 +1004,70 @@ mod messages_usage_wire_tests {
         assert_eq!(v["output_tokens"], 150);
         assert_eq!(v["cache_creation_input_tokens"], 0);
         assert_eq!(v["cache_read_input_tokens"], 0);
+    }
+}
+
+#[cfg(test)]
+mod responses_finish_reason_tests {
+    use openai_protocol::chat::ChatCompletionRequest;
+    use smg_grpc_client::tokenspeed_proto::GenerateComplete;
+
+    use super::*;
+
+    #[expect(
+        dead_code,
+        reason = "this shared fixture also supports multi-turn MCP tests"
+    )]
+    mod scripted_tokenizer {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/scripted_tokenizer.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parsed_tool_call_preserves_engine_length_finish() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
+            "<tool_call>\n{\"name\":\"user_tool\",\"arguments\":{}}\n</tool_call>",
+        ));
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test-model","messages":[{"role":"user","content":"call the tool"}],
+            "tools":[{"type":"function","function":{"name":"user_tool","parameters":{"type":"object","properties":{}}}}]
+        })).unwrap();
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for (finish, expected) in [("stop", "tool_calls"), ("length", "length")] {
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: finish.into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let choice = processor
+                .process_single_choice(
+                    &complete,
+                    0,
+                    &ChatResponseSpec::from(&request),
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    false,
+                    true,
+                    None,
+                    Some("qwen"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(choice.finish_reason.as_deref(), Some(expected));
+            assert_eq!(choice.message.tool_calls.as_ref().unwrap().len(), 1);
+        }
     }
 }

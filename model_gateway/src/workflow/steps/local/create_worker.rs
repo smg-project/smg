@@ -13,7 +13,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_dp::DpInfo;
 use crate::{
-    routers::grpc::zmq_client::zmq_handshake_address,
+    routers::grpc::{multimodal::SUPPORTS_VISION_LABEL, zmq_client::zmq_handshake_address},
     worker::{
         circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
         resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
@@ -207,13 +207,8 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &config.resilience,
         );
 
-        let http_client = app_context
-            .worker_client_cache
-            .get(&config.http_pool)
-            .map_err(|e| WorkflowError::StepFailed {
-                step_id: StepId::new("create_worker"),
-                message: e,
-            })?;
+        let http_client = context.data.http_client("create_worker")?;
+        let http2 = context.data.http2.unwrap_or(false);
 
         let overload_defaults = OverloadThresholds::from_gateway_config(&app_context.router_config);
 
@@ -238,6 +233,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .runtime_type(runtime_type)
                     .circuit_breaker_config(circuit_breaker.clone())
                     .http_client(http_client.clone())
+                    .http2(http2)
                     .resilience(resolved_resilience.clone())
                     .health_config(health_config.clone())
                     .health_endpoint(health_endpoint)
@@ -492,7 +488,7 @@ fn build_model_card(
 
     // Infer model_type capabilities from discovered signals
     let has_vision = labels
-        .get("supports_vision")
+        .get(SUPPORTS_VISION_LABEL)
         .or_else(|| labels.get("has_image_understanding"))
         .map(|s| s == "true")
         .unwrap_or(false);

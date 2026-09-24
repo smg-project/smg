@@ -33,6 +33,7 @@ use rustls::crypto::ring;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
+    mesh_discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
     service_discovery::{
         start_service_discovery_with_client, ServiceDiscoveryConfig, POD_UID_LABEL,
     },
@@ -312,8 +313,6 @@ async fn multi_port_pod_registers_and_removes_all_workers() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
 
     wait_for(
@@ -357,8 +356,6 @@ async fn terminating_pod_drains_before_final_deletion() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -411,8 +408,6 @@ async fn zombie_worker_removed_and_manual_worker_kept() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
 
     wait_for(
@@ -444,8 +439,6 @@ async fn watch_interruption_relists_and_converges() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -489,8 +482,6 @@ async fn drain_window_is_honored_despite_reconcile_passes() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -633,8 +624,6 @@ async fn failed_registration_retries_until_engine_appears() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
 
     // Many reconcile passes with the engine down: registration keeps failing
@@ -677,8 +666,6 @@ async fn pod_added_after_start_registers_only_once_ready() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
 
     fake.apply_pod(worker_pod("flip-0", "uid-flip-0", &port.to_string(), false));
@@ -713,8 +700,6 @@ async fn ready_pod_becoming_unready_removes_all_workers_and_recovers() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for_ready_pod_uid(
         &app_context,
@@ -794,8 +779,6 @@ async fn same_url_pod_replacement_reregisters_with_new_uid() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for_pod_uid(
         &app_context,
@@ -858,8 +841,6 @@ async fn annotation_port_change_reconciles_worker_set() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -912,8 +893,6 @@ async fn severed_watch_reconnects_and_converges_without_relist() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -940,16 +919,18 @@ async fn severed_watch_reconnects_and_converges_without_relist() {
 }
 
 #[tokio::test]
-async fn router_discovery_updates_mesh_cluster_state() {
+async fn mesh_router_discovery_runs_without_worker_discovery() {
     use smg_mesh::gossip::NodeStatus;
 
     let fake = FakeK8s::start().await;
     let app_context = test_context().await;
 
-    let mut config = discovery_config();
-    config
-        .router_selector
-        .insert("role".to_string(), "router".to_string());
+    // Mesh router discovery runs on its own lifecycle: no worker discovery
+    // is started here, and none of these router pods may become workers.
+    let config = MeshDiscoveryConfig {
+        router_selector: [("role".to_string(), "router".to_string())].into(),
+        ..Default::default()
+    };
     let cluster_state: smg_mesh::ClusterState = Arc::default();
 
     let mut router = worker_pod("r-0", "uid-r-0", "1", true);
@@ -961,13 +942,8 @@ async fn router_discovery_updates_mesh_cluster_state() {
     );
     fake.apply_pod(router.clone());
 
-    let handle = start_service_discovery_with_client(
-        fake.client(),
-        config,
-        Arc::clone(&app_context),
-        Some(cluster_state.clone()),
-        Some(7000),
-    );
+    let handle =
+        start_mesh_discovery_with_client(fake.client(), config, cluster_state.clone(), 7000);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -988,6 +964,11 @@ async fn router_discovery_updates_mesh_cluster_state() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    assert!(
+        app_context.worker_registry.get_all().is_empty(),
+        "mesh router discovery must not register workers"
+    );
 
     fake.delete_pod("r-0");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);

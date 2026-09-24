@@ -11,6 +11,115 @@ use serde_json::json;
 use validator::Validate;
 
 #[test]
+fn stateless_function_replay_preserves_namespace_and_content_part_output() {
+    let call = json!({
+        "type":"function_call", "call_id":"call_test", "name":"lookup",
+        "namespace":"weather", "arguments":"{}", "status":"completed"
+    });
+    let input: ResponseInputOutputItem = serde_json::from_value(call.clone()).unwrap();
+    let output: ResponseOutputItem = serde_json::from_value(call.clone()).unwrap();
+    assert_eq!(serde_json::to_value(input).unwrap(), call);
+    assert_eq!(serde_json::to_value(output).unwrap(), call);
+    for result in [
+        json!("sunny"),
+        json!([{"type":"input_text", "text":"sunny"}]),
+        json!(""),
+        json!([]),
+    ] {
+        let value = json!({"type":"function_call_output", "call_id":"call_test", "output":result});
+        let item: ResponseInputOutputItem = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(item).unwrap(), value);
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"test-model", "input":[{"role":"user", "content":"weather"}, call.clone(), value], "store":false
+        }))
+        .unwrap();
+        request.validate().unwrap();
+    }
+}
+
+#[test]
+fn text_only_function_output_projection_preserves_order_and_rejects_media() {
+    let output: StringOrContentParts = serde_json::from_value(json!([
+        {"type":"input_text", "text":"first"}, {"type":"input_text", "text":"second"}
+    ]))
+    .unwrap();
+    assert_eq!(output.to_text_only().unwrap(), "firstsecond");
+    let value = json!([{"type":"input_image", "image_url":"data:image/png;base64,AA=="}]);
+    let output: StringOrContentParts = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&output).unwrap(), value);
+    assert!(output.to_text_only().is_err());
+}
+
+#[test]
+fn namespaced_function_choice_preserves_identity_and_validates_membership() {
+    let tools = json!([
+        {"type":"namespace", "name":"weather", "description":"Weather tools", "tools":[
+            {"type":"function", "name":"lookup", "description":"Look up weather", "parameters":{"type":"object"}}
+        ]},
+        {"type":"function", "name":"lookup", "description":"Top-level lookup", "parameters":{"type":"object"}}
+    ]);
+    for selection in [
+        json!({"type":"function", "name":"lookup", "namespace":"weather"}),
+        json!({"type":"function", "function":{"name":"lookup"}, "namespace":"weather"}),
+    ] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"test-model", "input":"weather", "tools":tools,
+            "tool_choice":selection, "store":false
+        }))
+        .unwrap();
+        request.validate().unwrap();
+        let choice = request.tool_choice.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(choice).unwrap(),
+            json!({
+                "type":"function", "name":"lookup", "namespace":"weather"
+            })
+        );
+        match choice.to_chat_tool_choice() {
+            ChatToolChoice::Function { function, .. } => {
+                assert_eq!(function.name, "weather.lookup");
+            }
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+    for (namespace, name) in [("missing", "lookup"), ("weather", "missing")] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"test-model", "input":"weather", "tools":tools,
+            "tool_choice":{"type":"function", "name":name, "namespace":namespace}
+        }))
+        .unwrap();
+        assert!(request.validate().is_err());
+    }
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model":"test-model", "input":"weather", "tools":[tools[0].clone()],
+        "tool_choice":{"type":"function", "name":"lookup"}
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_err(),
+        "a namespace member must not match an unqualified selection"
+    );
+}
+
+#[test]
+fn web_search_external_access_round_trips_explicit_false() {
+    for enabled in [true, false] {
+        let value = json!({"type":"web_search", "external_web_access":enabled});
+        let tool: ResponseTool = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(tool).unwrap(), value);
+    }
+    let tool: ResponseTool = serde_json::from_value(json!({"type":"web_search"})).unwrap();
+    assert_eq!(
+        serde_json::to_value(tool).unwrap(),
+        json!({"type":"web_search"})
+    );
+    assert!(serde_json::from_value::<ResponseTool>(
+        json!({"type":"web_search", "external_web_access":"false"})
+    )
+    .is_err());
+}
+
+#[test]
 fn summary_text_content_round_trips_spec_shape() {
     // Spec: `summary: array of SummaryTextContent { text, type: "summary_text" }`.
     let item: ResponseOutputItem = serde_json::from_value(json!({
@@ -1102,6 +1211,7 @@ fn responses_tool_choice_to_chat_projection() {
     let fn_choice = ResponsesToolChoice::Function(ResponsesFunctionToolChoice {
         tool_type: FunctionToolChoiceTag::Function,
         name: "get_weather".to_string(),
+        namespace: None,
     });
     match fn_choice.to_chat_tool_choice() {
         ChatToolChoice::Function {
@@ -1135,7 +1245,7 @@ fn responses_tool_choice_to_chat_projection() {
     }
 
     // Responses-only variants collapse onto Chat's `auto` — there is no
-    // spec-valid Chat projection for hosted / mcp / custom / apply_patch / shell.
+    // spec-valid Chat projection for hosted / mcp / apply_patch / shell.
     for variant in [
         ResponsesToolChoice::Types {
             tool_type: BuiltInToolChoiceType::FileSearch,
@@ -1144,10 +1254,6 @@ fn responses_tool_choice_to_chat_projection() {
             tool_type: McpToolChoiceTag::Mcp,
             server_label: "s".into(),
             name: None,
-        },
-        ResponsesToolChoice::Custom {
-            tool_type: CustomToolChoiceTag::Custom,
-            name: "c".into(),
         },
         ResponsesToolChoice::ApplyPatch {
             tool_type: ApplyPatchToolChoiceTag::ApplyPatch,
@@ -1161,6 +1267,17 @@ fn responses_tool_choice_to_chat_projection() {
             ChatToolChoice::Value(ChatToolChoiceValue::Auto)
         ));
     }
+
+    // The regular router downgrades custom tools to function tools, so the
+    // chat projection pins the choice by name to keep the forcing semantics.
+    assert!(matches!(
+        ResponsesToolChoice::Custom {
+            tool_type: CustomToolChoiceTag::Custom,
+            name: "c".into(),
+        }
+        .to_chat_tool_choice(),
+        ChatToolChoice::Function { function, .. } if function.name == "c"
+    ));
 }
 
 /// The Default impl is `Options(Auto)`.

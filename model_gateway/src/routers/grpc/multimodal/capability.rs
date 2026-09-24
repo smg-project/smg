@@ -4,15 +4,37 @@
 //! Previously this was implicit and duplicated across assembly (per-backend
 //! `into_single_image_batch` / `into_single_vision_batch` / ad-hoc `bail!`s with
 //! divergent messages). Centralizing it here lets the pipeline reject an
-//! unsupported (engine, modality) request early -- at worker selection, before
-//! any media is fetched or preprocessed -- with one consistent message, and lets
-//! assembly assert against the same matrix as defense in depth.
+//! unsupported (engine, modality) request at worker selection -- once the
+//! runtime is known, before request building assembles the payload -- with one
+//! consistent message, and lets assembly assert against the same matrix as
+//! defense in depth.
 
 use anyhow::Result;
 use llm_multimodal::Modality;
 
 use super::MultimodalIntermediate;
-use crate::worker::RuntimeType;
+use crate::worker::{RuntimeType, Worker};
+
+/// Worker label carrying the engine's vision-input capability (the vLLM
+/// gRPC servicer's `GetModelInfoResponse.supports_vision`). `"false"` on a
+/// multimodal architecture means the engine runs `--language-model-only`:
+/// no vision encoder, encoder-cache budget 0, so no multimodal payload may
+/// reach it. A multimodal model reports `"true"`; a text-only model also
+/// reports `"false"`, which is harmless — its requests carry no mm payload
+/// to strip in the first place.
+pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
+
+/// Whether the worker's engine accepts no multimodal inputs at all (a vLLM
+/// `--language-model-only` worker). Absent label (non-vLLM runtimes, older
+/// servicers) reads as multimodal-capable so behavior stays as today.
+pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
+    worker
+        .metadata()
+        .spec
+        .labels
+        .get(SUPPORTS_VISION_LABEL)
+        .is_some_and(|value| value == "false")
+}
 
 /// Whether `runtime` accepts multimodal inputs of `modality`.
 ///
@@ -41,8 +63,8 @@ pub(crate) fn runtime_supports_modality(runtime: RuntimeType, modality: Modality
 
 /// Reject early if the selected backend does not support every modality present
 /// in the request. Runs at worker selection, once the runtime is known but
-/// before media is fetched/preprocessed, so an unsupported combination fails
-/// fast with one clear message instead of dying deep in assembly.
+/// before request building assembles the payload, so an unsupported combination
+/// fails fast with one clear message instead of dying deep in assembly.
 pub(crate) fn ensure_backend_supports_modalities(
     runtime: RuntimeType,
     intermediate: &MultimodalIntermediate,
@@ -150,6 +172,7 @@ mod tests {
             placeholder_token_id: Some(10),
             field_layouts: EncoderFieldLayouts::default(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         }])
         .unwrap()
     }

@@ -16,7 +16,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
@@ -28,19 +28,14 @@ use openai_protocol::{
 
 use crate::middleware::TenantRequestMeta;
 
-pub mod anthropic;
 pub mod common;
-pub mod conversations;
-pub mod error;
+pub use smg_external_router::error;
+pub mod external;
 pub mod factory;
-pub mod gemini;
+pub mod gateway;
 pub mod grpc;
 pub mod http;
-pub mod openai;
-pub mod parse;
-pub mod responses;
-pub mod router_manager;
-pub mod tokenize;
+pub(crate) mod provider_support;
 
 pub use common::body_policy::BodyPolicy;
 pub use factory::RouterFactory;
@@ -74,11 +69,6 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Get server information
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Server info not implemented").into_response()
-    }
-
-    /// Get available models
-    async fn get_models(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Get models not implemented").into_response()
     }
 
     /// Get model information
@@ -228,6 +218,21 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Messages API not yet implemented for this router",
+        )
+            .into_response()
+    }
+
+    /// Route Anthropic Messages token counting (/v1/messages/count_tokens)
+    async fn route_messages_count_tokens(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: CountMessageTokensRequest,
+        _model_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Messages token counting not implemented for this router",
         )
             .into_response()
     }
