@@ -538,13 +538,6 @@ def _marker(body: str | None) -> dict | None:
     return marker if isinstance(marker, dict) else None
 
 
-def issue_key(issue: dict) -> str | None:
-    """The check key of a monitor issue, open or closed; None for other issues."""
-    marker = _marker(issue.get("body"))
-    key = marker.get("key") if marker else None
-    return key if isinstance(key, str) else None
-
-
 def parse_issue(issue: dict) -> IssueState | None:
     """Rebuild the state of an open monitor issue from its marker."""
     marker = _marker(issue.get("body"))
@@ -653,17 +646,17 @@ def plan_ops(
 
     for key, findings in active.items():
         check = CHECKS[key]
+        if check.event:
+            closed = recently_closed.get(key, {})
+            findings = [
+                f
+                for f in findings
+                if f.scope not in closed or now - closed[f.scope] >= EVENT_REOPEN_GRACE
+            ]
+            if not findings:
+                continue
         state = by_key.get(key)
         if state is None:
-            if check.event:
-                closed = recently_closed.get(key, {})
-                findings = [
-                    f
-                    for f in findings
-                    if f.scope not in closed or now - closed[f.scope] >= EVENT_REOPEN_GRACE
-                ]
-                if not findings:
-                    continue
             nodes = {scope: now for scope in _scopes(findings)}
             fresh = IssueState(0, key, now, now, now if check.event else None, nodes)
             ops.append(
@@ -779,11 +772,12 @@ def issue_states(gh: GitHub) -> tuple[list[IssueState], dict[str, dict[str, date
     for issue in closed:
         marker = _marker(issue.get("body"))
         key = marker.get("key") if marker else None
-        if not isinstance(key, str) or not issue.get("closed_at"):
+        nodes = marker.get("nodes", {}) if marker else {}
+        if not isinstance(key, str) or not isinstance(nodes, dict) or not issue.get("closed_at"):
             continue
         closed_at = parse_ts(issue["closed_at"])
         per_scope = recently_closed.setdefault(key, {})
-        for scope in marker.get("nodes", {}):
+        for scope in nodes:
             if scope not in per_scope or closed_at > per_scope[scope]:
                 per_scope[scope] = closed_at
     return open_states, recently_closed

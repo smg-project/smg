@@ -539,6 +539,57 @@ def test_render_body_links_docs_when_given(mod):
     assert "docs/superpowers" not in body
 
 
+@pytest.mark.parametrize("closed_minutes", [20, 60])
+def test_plan_ops_preserves_event_acknowledgement_on_update(mod, closed_minutes):
+    """An open issue must respect the same per-node grace window as creation."""
+    first = NOW - timedelta(days=2)
+    state = mod.parse_issue(
+        _issue(mod, 7, "gpu_xid", first, first, last_comment=first, nodes=["10.0.1.2"])
+    )
+    active = mod.group_by_check(
+        [_finding(mod, "gpu_xid", "10.0.1.1"), _finding(mod, "gpu_xid", "10.0.1.2")]
+    )
+    closed = {"gpu_xid": {"10.0.1.1": NOW - timedelta(minutes=closed_minutes)}}
+    ops = mod.plan_ops([state], active, NOW, "https://run/10", recently_closed=closed)
+    assert [o.kind for o in ops] == ["update", "comment"]
+    parsed = mod.parse_issue({"number": 7, "body": ops[0].body})
+    assert parsed.nodes["10.0.1.2"] == first
+    for text in (ops[0].title, ops[0].body, ops[1].body):
+        assert ("10.0.1.1" in text) == (closed_minutes == 60)
+    assert ("10.0.1.1" in parsed.nodes) == (closed_minutes == 60)
+
+
+def test_plan_ops_skips_update_when_all_event_scopes_are_suppressed(mod):
+    """Acknowledged findings must not refresh or comment on an open event issue."""
+    first = NOW - timedelta(days=2)
+    state = mod.parse_issue(
+        _issue(mod, 7, "gpu_xid", first, first, last_comment=first, nodes=["10.0.1.2"])
+    )
+    active = mod.group_by_check([_finding(mod, "gpu_xid", "10.0.1.1")])
+    closed = {"gpu_xid": {"10.0.1.1": NOW - timedelta(minutes=20)}}
+    assert mod.plan_ops([state], active, NOW, "https://run/11", recently_closed=closed) == []
+    assert state.last_seen == first
+    assert state.last_comment == first
+    assert state.nodes == {"10.0.1.2": first}
+
+
+@pytest.mark.parametrize("nodes", [None, 42, "10.0.1.1", ["10.0.1.1"]])
+def test_issue_states_ignores_closed_markers_with_invalid_nodes(mod, nodes):
+    """Malformed closed markers must not crash or contribute suppression scopes."""
+    marker = json.dumps({"key": "gpu_xid", "nodes": nodes})
+    malformed = {
+        "number": 2,
+        "closed_at": _ts(NOW),
+        "body": f"{mod.MARKER_PREFIX}{marker}{mod.MARKER_SUFFIX}",
+    }
+    valid = _issue(mod, 3, "gpu_xid", NOW, NOW, nodes=["10.0.1.2"])
+    valid["closed_at"] = _ts(NOW - timedelta(minutes=30))
+    gh = FakeGitHub({"issues?state=open": [], "issues?state=closed": [malformed, valid]})
+    states, recently_closed = mod.issue_states(gh)
+    assert states == []
+    assert recently_closed == {"gpu_xid": {"10.0.1.2": NOW - timedelta(minutes=30)}}
+
+
 def test_issue_states_reads_open_state_and_latest_close_per_key(mod):
     open_issue = _issue(mod, 1, "node_cordoned", NOW - timedelta(hours=3), NOW - timedelta(hours=1))
     closed_new = dict(
