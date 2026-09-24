@@ -882,4 +882,64 @@ mod tests {
             ChatTemplateContentFormat::String
         );
     }
+
+    #[test]
+    fn deepseek_profile_thinking_matches_both_native_renderers() {
+        use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
+        for (model, architecture) in [
+            ("deepseek-v4-pro", "DeepseekV4ForCausalLM"),
+            ("deepseek-ai/DeepSeek-V4.1-Flash", "DeepseekV41ForCausalLM"),
+        ] {
+            let (_tmp, path) = write_dir(Some(&[architecture]));
+            let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
+            for (extra, enabled) in [
+                (json!({}), true),
+                (json!({"reasoning_effort":"minimal"}), true),
+                (json!({"reasoning_effort":"none"}), false),
+                (
+                    json!({"thinking":{"type":"disabled"},"reasoning_effort":"high"}),
+                    false,
+                ),
+                (
+                    json!({"thinking":{"type":"enabled"},"reasoning_effort":"none"}),
+                    true,
+                ),
+                (
+                    json!({"chat_template_kwargs":{"enable_thinking":false},"reasoning_effort":"high"}),
+                    false,
+                ),
+            ] {
+                let mut body =
+                    json!({"model":model,"messages":[{"role":"user","content":"hello"}]});
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let mut req: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+                req.normalize();
+                // Match the gateway's merge: typed effort, then explicit kwargs.
+                let mut kwargs = HashMap::new();
+                if let Some(effort) = req.effective_reasoning_effort() {
+                    kwargs.insert("reasoning_effort".to_string(), json!(effort));
+                }
+                if let Some(explicit) = &req.chat_template_kwargs {
+                    kwargs.extend(explicit.clone());
+                }
+                let rendered = tokenizer
+                    .apply_chat_template(
+                        &[json!({"role":"user","content":"hello"})],
+                        ChatTemplateParams {
+                            add_generation_prompt: true,
+                            thinking: req.thinking_toggle(),
+                            template_kwargs: Some(&kwargs),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    rendered.ends_with(if enabled { "<think>" } else { "</think>" }),
+                    "{body}: {rendered}"
+                );
+            }
+        }
+    }
 }

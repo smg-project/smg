@@ -14,6 +14,7 @@
 //! parts, such as MiniMax's `max_long_side_pixel` and `fps`, are not covered
 //! by that pass and are forwarded as sent.
 
+mod deepseek;
 mod kimi;
 mod minimax;
 mod zai;
@@ -35,6 +36,8 @@ pub enum ProviderProfile {
     Minimax,
     /// z.ai / GLM contract (providers-verifier `golden/zai`).
     Zai,
+    /// DeepSeek V4 / V4.1 Chat contract (deepseek-provider-verifier).
+    DeepSeek,
 }
 
 impl ProviderProfile {
@@ -48,9 +51,10 @@ impl ProviderProfile {
     ) -> Box<dyn Iterator<Item = &'a Tool> + 'a> {
         match self {
             ProviderProfile::Kimi => Box::new(kimi::dynamic_tools(req)),
-            ProviderProfile::Minimax | ProviderProfile::Zai | ProviderProfile::OpenAi => {
-                Box::new(std::iter::empty())
-            }
+            ProviderProfile::DeepSeek
+            | ProviderProfile::Minimax
+            | ProviderProfile::Zai
+            | ProviderProfile::OpenAi => Box::new(std::iter::empty()),
         }
     }
 
@@ -74,8 +78,14 @@ impl ProviderProfile {
     /// aliased vendor model falls back to the OpenAI baseline, any extension
     /// it carried is dropped with a warning, and a `root` message is rejected
     /// outright, so that role needs a canonical MiniMax model id.
+    /// DeepSeek is narrower: only the calibrated V4 / V4.1 model segments
+    /// and `deepseek-flash` alias select its profile; older versions and
+    /// unrecognized suffixes keep the baseline.
     pub fn for_model(model: &str) -> Self {
         for segment in model.split('/') {
+            if deepseek::matches_model(segment) {
+                return ProviderProfile::DeepSeek;
+            }
             if starts_with_ignore_ascii_case(segment, "kimi")
                 || starts_with_ignore_ascii_case(segment, "moonshot")
             {
@@ -110,7 +120,10 @@ impl ProviderProfile {
     pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
         match self {
             ProviderProfile::Minimax => minimax::normalize_chat(req),
-            ProviderProfile::Kimi | ProviderProfile::Zai | ProviderProfile::OpenAi => {}
+            ProviderProfile::DeepSeek
+            | ProviderProfile::Kimi
+            | ProviderProfile::Zai
+            | ProviderProfile::OpenAi => {}
         }
         let mut dropped: Vec<&'static str> = Vec::new();
         for message in &mut req.messages {
@@ -142,6 +155,7 @@ impl ProviderProfile {
             );
         }
         match self {
+            ProviderProfile::DeepSeek => deepseek::normalize_chat(req),
             ProviderProfile::Kimi => kimi::normalize_chat(req),
             ProviderProfile::Zai => zai::normalize_chat(req),
             ProviderProfile::OpenAi | ProviderProfile::Minimax => {}
@@ -162,6 +176,10 @@ impl ProviderProfile {
             ProviderProfile::Zai => {
                 reject_root(req)?;
                 zai::validate_chat(req)
+            }
+            ProviderProfile::DeepSeek => {
+                reject_root(req)?;
+                deepseek::validate_chat(req)
             }
             ProviderProfile::OpenAi => reject_root(req),
         }

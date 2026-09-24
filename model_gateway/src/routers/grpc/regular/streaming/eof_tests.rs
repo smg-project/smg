@@ -463,3 +463,118 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
         );
     }
 }
+
+#[tokio::test]
+async fn deepseek_usage_rides_on_the_last_finish_chunk() {
+    for options in [
+        serde_json::json!(null),
+        serde_json::json!({"include_usage": false}),
+        serde_json::json!({"include_usage": true}),
+        serde_json::json!({"include_usage": true, "continuous_usage_stats": true}),
+    ] {
+        for (choices, unbilled) in [(1, 0), (2, 3)] {
+            let mut frames = Vec::new();
+            for index in 0..choices {
+                frames.push(chunk(index, "<think>reason</think>answer<thi"));
+                let mut final_frame = complete_with_prompt(index, "length", 10);
+                if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
+                    complete.cached_tokens = 8;
+                    complete.completion_tokens = 31;
+                }
+                frames.push(final_frame);
+            }
+            let (stream, server) = scripted_stream(frames, "0").await;
+            let (tx, rx) = sse_channel();
+            let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "deepseek-flash", "messages": [], "stream": true, "n": choices,
+                "stream_options": options, "separate_reasoning": true
+            }))
+            .unwrap();
+            let mut spec = ChatResponseSpec::from(&req);
+            spec.unbilled_prompt_tokens = unbilled;
+            let result = processor(false)
+                .process_streaming_chunks(
+                    stream,
+                    dispatch(),
+                    Arc::new(CharacterTokenizer::default()),
+                    (None, None, false, false, false),
+                    spec,
+                    &tx,
+                    None,
+                )
+                .await;
+            drop(tx);
+            let events = collect_events(rx).await;
+            server.abort();
+            assert!(result.is_ok(), "{result:?}");
+            assert!(events.len() > 2, "{events:?}");
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["choices"].as_array().unwrap().len() == 1),
+                "no usage-only chunk: {events:?}"
+            );
+            let last = events.last().unwrap();
+            assert_eq!(last["choices"][0]["finish_reason"], "length");
+            assert!(last["choices"][0]["delta"]["content"].is_null());
+            assert_eq!(last["usage"]["prompt_tokens"], 10 - unbilled);
+            assert_eq!(last["usage"]["completion_tokens"], 31 * choices);
+            assert_eq!(last["usage"]["total_tokens"], 10 - unbilled + 31 * choices);
+            assert_eq!(
+                last["usage"]["prompt_tokens_details"]["cached_tokens"],
+                8.min(10 - unbilled)
+            );
+            assert!(last["usage"]["completion_tokens_details"]["reasoning_tokens"].is_null());
+            for event in &events[..events.len() - 1] {
+                if options["include_usage"] == true {
+                    assert_eq!(event.get("usage"), Some(&Value::Null), "{event}");
+                } else {
+                    assert!(event.get("usage").is_none(), "{event}");
+                }
+            }
+            for index in 0..choices {
+                assert_eq!(chat_text(&events, index, "content"), "answer<thi");
+                assert_eq!(chat_text(&events, index, "reasoning_content"), "reason");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn deepseek_does_not_emit_aggregate_usage_without_complete_frames() {
+    for (status, partial) in [("0", false), ("13", false), ("0", true)] {
+        let mut frames = vec![chunk(0, "hello")];
+        if partial {
+            frames.extend([complete(0, "stop"), chunk(1, "unfinished")]);
+        }
+        let (stream, server) = scripted_stream(frames, status).await;
+        let (tx, rx) = sse_channel();
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "deepseek-flash", "messages": [], "stream": true, "n": if partial {2} else {1},
+            "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                ChatResponseSpec::from(&req),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert_eq!(result.is_ok(), status == "0");
+        assert!(!events.is_empty());
+        assert!(
+            events
+                .iter()
+                .all(|event| event.get("usage") == Some(&Value::Null)),
+            "{events:?}"
+        );
+    }
+}

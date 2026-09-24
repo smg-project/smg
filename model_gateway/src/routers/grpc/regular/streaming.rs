@@ -29,6 +29,7 @@ use openai_protocol::{
     profile::ProviderProfile,
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
@@ -363,10 +364,19 @@ impl StreamingProcessor {
         let tools = &original_request.tools;
         let history_tool_calls_count = original_request.history_tool_calls_count;
         let stream_options = &original_request.stream_options;
+        // DeepSeek always reports aggregate usage on the final finish chunk.
+        // include_usage controls null placeholders on earlier chunks only.
+        let deepseek_usage = original_request.provider == ProviderProfile::DeepSeek;
+        let include_usage = stream_options
+            .as_ref()
+            .is_some_and(|opts| opts.include_usage.unwrap_or(false));
+        let emit_usage_null = deepseek_usage && include_usage;
         let mut continuous_usage = stream_options
             .as_ref()
             .filter(|opts| {
-                opts.include_usage.unwrap_or(false) && opts.continuous_usage_stats.unwrap_or(false)
+                !deepseek_usage
+                    && opts.include_usage.unwrap_or(false)
+                    && opts.continuous_usage_stats.unwrap_or(false)
             })
             .map(|_| ChatStreamUsage::default());
 
@@ -634,7 +644,7 @@ impl StreamingProcessor {
                     .maybe_system_fingerprint(system_fingerprint)
                     .maybe_usage(usage.clone())
                     .build();
-                Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+                Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk, emit_usage_null);
                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
                     .await
                     .map_err(|_| "Failed to send first chunk".to_string())?;
@@ -663,7 +673,7 @@ impl StreamingProcessor {
                     .await;
                 if let Some(mut chunk) = reasoning_chunk {
                     chunk.usage = usage.clone();
-                    Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                    Self::format_sse_chunk_into(&mut sse_buffer, &chunk, emit_usage_null);
                     tx.send(Ok(Bytes::from(sse_buffer.clone())))
                         .await
                         .map_err(|_| "Failed to send reasoning chunk".to_string())?;
@@ -721,7 +731,7 @@ impl StreamingProcessor {
 
                     for mut chunk in tool_chunks {
                         chunk.usage = usage.clone();
-                        Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                        Self::format_sse_chunk_into(&mut sse_buffer, &chunk, emit_usage_null);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .await
                             .map_err(|_| "Failed to send tool call chunk".to_string())?;
@@ -741,7 +751,7 @@ impl StreamingProcessor {
                     .maybe_system_fingerprint(system_fingerprint)
                     .maybe_usage(usage.clone())
                     .build();
-                Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+                Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk, emit_usage_null);
                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
                     .await
                     .map_err(|_| "Failed to send content chunk".to_string())?;
@@ -771,7 +781,7 @@ impl StreamingProcessor {
                     .build();
 
                 let sse_chunk = sse_encoder
-                    .encode_data(&content_chunk)
+                    .encode_data(&ChatChunkWithUsage::new(&content_chunk, emit_usage_null))
                     .map_err(|e| format!("Failed to serialize content chunk: {e}"))?;
                 tx.send(Ok(sse_chunk))
                     .await
@@ -802,7 +812,7 @@ impl StreamingProcessor {
                         .build();
 
                     let sse_chunk = sse_encoder
-                        .encode_data(&tool_chunk)
+                        .encode_data(&ChatChunkWithUsage::new(&tool_chunk, emit_usage_null))
                         .map_err(|e| format!("Failed to serialize tool chunk: {e}"))?;
                     tx.send(Ok(sse_chunk))
                         .await
@@ -811,8 +821,23 @@ impl StreamingProcessor {
             }
         }
 
-        // Phase 4: Finish reason chunks
-        for (index, finish_reason) in &finish_reasons {
+        // Every choice shares one prompt, so prompt/cache counts take max;
+        // completion and reasoning counts sum across choices.
+        let final_usage = (deepseek_usage || include_usage).then(|| {
+            Usage::from_counts(
+                prompt_tokens.values().copied().max().unwrap_or(0),
+                completion_tokens.total(),
+            )
+            .with_cached_tokens(cached_tokens.values().copied().max().unwrap_or(0))
+            .with_reasoning_tokens(reasoning_tokens.values().sum())
+            .with_speculative_tokens(spec_accepted.values().sum(), spec_drafted.values().sum())
+            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+        });
+
+        // Phase 4: Finish reason chunks. Do not advertise partial counters as
+        // a final aggregate if the backend omitted a choice's Complete frame.
+        let complete_usage = prompt_tokens.len() as u32 >= original_request.expected_choices;
+        for (position, (index, finish_reason)) in finish_reasons.iter().enumerate() {
             let final_finish_reason =
                 if has_tool_calls.get(index).copied().unwrap_or(false) && finish_reason == "stop" {
                     "tool_calls".to_string()
@@ -822,48 +847,35 @@ impl StreamingProcessor {
 
             let matched_stop_value = matched_stops.get(index).and_then(|v| v.clone());
 
+            let finish_usage =
+                if deepseek_usage && complete_usage && position + 1 == finish_reasons.len() {
+                    final_usage.clone()
+                } else {
+                    usage.clone()
+                };
             let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                 .created(created)
                 .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
                 .maybe_system_fingerprint(system_fingerprint)
-                .maybe_usage(usage.clone())
+                .maybe_usage(finish_usage)
                 .build();
 
             let sse_chunk = sse_encoder
-                .encode_data(&finish_chunk)
+                .encode_data(&ChatChunkWithUsage::new(&finish_chunk, emit_usage_null))
                 .map_err(|e| format!("Failed to serialize finish chunk: {e}"))?;
             tx.send(Ok(sse_chunk))
                 .await
                 .map_err(|_| "Failed to send finish chunk".to_string())?;
         }
 
-        // Phase 5: Usage chunk
-        if let Some(stream_opts) = stream_options {
-            if stream_opts.include_usage.unwrap_or(false) {
-                // Every `n>1` choice shares one prompt; each Complete reports
-                // that same full length, so max (not sum) is the actual
-                // prompt cost -- summing would multiply it by `n`. cached_tokens
-                // is a property of that same shared prompt, not of the
-                // individual completion, so it takes the same treatment.
-                let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
-                let total_completion: u32 = completion_tokens.total();
-                let total_cached: u32 = cached_tokens.values().copied().max().unwrap_or(0);
-                let total_reasoning: u32 = reasoning_tokens.values().sum();
-                let total_spec_accepted: u32 = spec_accepted.values().sum();
-                let total_spec_drafted: u32 = spec_drafted.values().sum();
-
+        // Phase 5: The OpenAI dialect keeps its opt-in, usage-only chunk.
+        if !deepseek_usage {
+            if let Some(final_usage) = final_usage {
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
-                    .usage(
-                        Usage::from_counts(total_prompt, total_completion)
-                            .with_cached_tokens(total_cached)
-                            .with_reasoning_tokens(total_reasoning)
-                            .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
-                            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens),
-                    )
+                    .usage(final_usage)
                     .maybe_system_fingerprint(system_fingerprint)
                     .build();
-
                 let sse_chunk = sse_encoder
                     .encode_data(&usage_chunk)
                     .map_err(|e| format!("Failed to serialize usage chunk: {e}"))?;
@@ -1748,10 +1760,17 @@ impl StreamingProcessor {
     /// Format a response as SSE chunk into a reusable buffer
     /// This avoids allocations by reusing the same buffer across multiple chunks
     #[inline]
-    fn format_sse_chunk_into(buffer: &mut Vec<u8>, chunk: &ChatCompletionStreamResponse) {
+    fn format_sse_chunk_into(
+        buffer: &mut Vec<u8>,
+        chunk: &ChatCompletionStreamResponse,
+        emit_usage_null: bool,
+    ) {
         buffer.clear();
         buffer.extend_from_slice(b"data: ");
-        if let Err(e) = serde_json::to_writer(&mut *buffer, chunk) {
+        if let Err(e) = serde_json::to_writer(
+            &mut *buffer,
+            &ChatChunkWithUsage::new(chunk, emit_usage_null),
+        ) {
             error!("Failed to serialize SSE chunk: {}", e);
             buffer.clear();
             buffer.extend_from_slice(b"data: ");
@@ -3424,6 +3443,26 @@ impl StreamingProcessor {
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
             server_tool_use: None,
+        }
+    }
+}
+
+/// Add the provider's null placeholder without allocating a JSON value per
+/// token or changing the shared Chat response type. A populated usage field
+/// is serialized only by `chunk`, so there is never a duplicate JSON key.
+#[derive(Serialize)]
+struct ChatChunkWithUsage<'a> {
+    #[serde(flatten)]
+    chunk: &'a ChatCompletionStreamResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<()>,
+}
+
+impl<'a> ChatChunkWithUsage<'a> {
+    fn new(chunk: &'a ChatCompletionStreamResponse, emit_usage_null: bool) -> Self {
+        Self {
+            chunk,
+            usage: (emit_usage_null && chunk.usage.is_none()).then_some(()),
         }
     }
 }
