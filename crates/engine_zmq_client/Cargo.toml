@@ -1,6 +1,6 @@
 [package]
 name = "engine-zmq-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Engine-agnostic ZMQ transport + per-engine protocol modules for same-host SMG backend connections"
 license = "Apache-2.0"
