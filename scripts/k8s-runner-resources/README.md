@@ -4,8 +4,10 @@ This directory configures the `smg-project/smg` runner scale sets. The shared AR
 controller and listener pods run in `org-actions-runner`; runner scale-set objects,
 credentials, and runner pods run in `actions-runner-system`.
 
-The controller and runner scale-set charts are pinned to `0.14.2` so their CRDs and
-controller behavior stay compatible.
+The controller and runner scale-set charts are pinned to `0.14.2`. The runner
+image is `fra.ocir.io/idqj093njucb/action-runner:2.337.0` for both the runner and
+the `init-dind-externals` container in every active values file. Chart versions
+and the runner software version are independent.
 
 ## Prerequisites
 
@@ -59,6 +61,10 @@ for schema/reference purposes.
 
 ## 3. Install or upgrade the shared controller
 
+For an existing installation, review GitHub's [ARC upgrade procedure](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets#upgrading-arc)
+before changing chart versions. [Helm does not upgrade existing CRDs](https://helm.sh/docs/chart_best_practices/custom_resource_definitions/#some-caveats-and-explanations),
+so matching chart versions alone do not ensure that the installed schema is current.
+
 ```bash
 helm upgrade --install arc \
   --namespace org-actions-runner \
@@ -73,6 +79,37 @@ Verify the controller:
 kubectl get pods \
   --namespace org-actions-runner \
   -l app.kubernetes.io/part-of=gha-rs-controller
+```
+
+### Check the EphemeralRunnerSet schema
+
+ARC `0.14.x` needs `EphemeralRunnerSet.status.phase` to track outdated runner sets.
+An older CRD can discard this field even when the controller upgrade succeeded,
+producing `unknown field "status.phase"` warnings and preventing outdated sets from
+retiring normally. Check that the field type is `string`:
+
+```bash
+kubectl get crd ephemeralrunnersets.actions.github.com \
+  -o jsonpath='{.spec.versions[?(@.name=="v1alpha1")].schema.openAPIV3Schema.properties.status.properties.phase.type}{"\n"}'
+```
+
+If the field is missing on an existing `0.14.1` or `0.14.2` installation, the
+following additive repair restores the field from the upstream schema without
+deleting runner resources. It is a repair for this specific schema drift, not a
+replacement for the full CRD upgrade procedure when changing ARC versions.
+
+```bash
+kubectl get crd ephemeralrunnersets.actions.github.com -o yaml \
+  > /tmp/ephemeralrunnersets-crd-before.yaml
+
+kubectl patch crd ephemeralrunnersets.actions.github.com \
+  --type=json --dry-run=server \
+  --patch-file scripts/k8s-runner-resources/ephemeralrunnersets-phase.patch.json
+
+# Apply only after the dry run succeeds, then repeat the field check above.
+kubectl patch crd ephemeralrunnersets.actions.github.com \
+  --type=json \
+  --patch-file scripts/k8s-runner-resources/ephemeralrunnersets-phase.patch.json
 ```
 
 ## 4. Install or upgrade runner scale sets
@@ -125,6 +162,49 @@ kubectl get pods \
 Each scale set should have a listener pod in `Running` state. Runner pods are created
 on demand when a workflow uses the corresponding `runnerScaleSetName` as its
 `runs-on` label.
+
+## Maintaining the runner image
+
+The [Dockerfile](Dockerfile) updates the runner runtime and bundled Node runtimes
+on top of the existing `v0.0.3` image, pinned by digest. It preserves the custom
+startup scripts, container hooks, Docker client, and other installed tools, and
+verifies the runner archive's SHA-256 before extracting it.
+
+The published `2.337.0` image digest is
+`sha256:df427c441ea192d3129d9f2e206ade6bb5e03f41b44c7d745f7a02351e5164fd`.
+To build and validate an image from the repository root with OCIR access:
+
+```bash
+docker build --platform linux/amd64 \
+  -f scripts/k8s-runner-resources/Dockerfile \
+  -t fra.ocir.io/idqj093njucb/action-runner:2.337.0 \
+  scripts/k8s-runner-resources
+
+docker run --rm --network none \
+  --entrypoint /home/runner/bin/Runner.Listener \
+  fra.ocir.io/idqj093njucb/action-runner:2.337.0 --version
+```
+
+For a future runner release, update `RUNNER_VERSION` and `RUNNER_SHA256` in the
+Dockerfile using the matching Linux x64 archive from the [official runner release](https://github.com/actions/runner/releases),
+and use that version as the image tag. After validation, push that new tag to OCIR
+and update **both** image references in all four active `runner-values-*.yaml`
+files. Keep published tags immutable; use a revision suffix if rebuilding the
+same runner version with different image contents.
+
+If runners report `Runner version ... is deprecated and cannot receive messages`,
+refresh the image and redeploy the scale sets. If GPU pods remain pending despite
+free GPUs, also inspect Volcano PodGroups and outdated EphemeralRunners:
+
+```bash
+kubectl get podgroups.scheduling.volcano.sh,ephemeralrunners,pods \
+  --namespace actions-runner-system
+```
+
+PodGroups left by outdated runners can reserve queue capacity after their pods
+are gone. Repair the schema and update the image first. Any remaining cleanup
+must be limited to the affected scale sets and to outdated owners with no pods;
+retain reservations for active jobs and other workloads.
 
 ## Uninstalling
 
