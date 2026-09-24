@@ -48,7 +48,9 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{CacheNamespace, PolicyRegistry},
+    policies::{
+        remote_index::IndexPrediction, CacheNamespace, PolicyRegistry, RemoteLookup, RemoteOverlap,
+    },
     routers::{
         common::{
             attach_sized_body,
@@ -249,6 +251,10 @@ impl Router {
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes, plus the remote-overlap prefetch"
+    )]
     fn select_worker_for_model(
         &self,
         model_id: &str,
@@ -257,6 +263,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
+        remote: RemoteLookup<'_>,
     ) -> Option<Arc<dyn Worker>> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -273,6 +280,7 @@ impl Router {
                 rid_key,
                 cache_namespace,
                 candidate_filter: None,
+                remote,
             },
         )
     }
@@ -389,6 +397,46 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
+        // Remote-index prefetch (--kv-indexer-url): resolve the shared-index
+        // overlap once, here, instead of inside the per-attempt dispatch. The
+        // prompt is identical on every attempt, so the index's answer is too;
+        // querying per attempt would multiply index QPS by the attempt count
+        // and charge each retry the query deadline for an answer already in
+        // hand. gRPC settled this the same way — its selection stage runs
+        // once, ahead of the retry loop. Running before the lease takes
+        // ownership also lets the query borrow the routing derivatives
+        // directly, so a prompt that reaches hundreds of KB on agentic
+        // traffic is never copied to cross the await. The prediction rides
+        // along for the post-dispatch placement publish.
+        let prefetch = if self.policy_registry.remote_index_enabled() {
+            // Prefer the token tree (stronger, token-prefix affinity); fall
+            // back to string mode (raw-byte prefix) only when the request
+            // carries text but no tokens.
+            if routing_tokens.is_some() {
+                self.policy_registry
+                    .resolve_remote_overlap(
+                        model_id,
+                        routing_tokens.as_deref(),
+                        cache_namespace,
+                        headers,
+                        rid_key.as_deref(),
+                    )
+                    .await
+            } else {
+                self.policy_registry
+                    .resolve_remote_overlap_bytes(
+                        model_id,
+                        text.as_deref(),
+                        cache_namespace,
+                        headers,
+                        rid_key.as_deref(),
+                    )
+                    .await
+            }
+        } else {
+            None
+        };
+
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
@@ -413,6 +461,7 @@ impl Router {
                     model_id,
                     canonical_model.as_deref(),
                     is_stream,
+                    prefetch.as_ref(),
                 )
                 .await;
             Metrics::record_router_upstream_response(
@@ -441,6 +490,7 @@ impl Router {
                             model_id,
                             canonical_model.as_deref(),
                             is_stream,
+                            prefetch.as_ref(),
                         )
                         .await;
 
@@ -496,6 +546,13 @@ impl Router {
         response
     }
 
+    /// One dispatch attempt. `prefetch` is the shared-index answer resolved
+    /// once by the caller, before the retry loop: selection steers on its
+    /// overlap and a successful dispatch publishes its prediction.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attempt threads the lease, route, model and the hoisted index prefetch"
+    )]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -504,6 +561,7 @@ impl Router {
         model_id: &str,
         canonical_model: Option<&str>,
         is_stream: bool,
+        prefetch: Option<&(RemoteOverlap, IndexPrediction)>,
     ) -> Response {
         let worker = match lease.with_view(|view| {
             self.select_worker_for_model(
@@ -513,6 +571,7 @@ impl Router {
                 headers,
                 view.rid_key,
                 view.cache_namespace,
+                RemoteLookup::from_resolved(prefetch.map(|(overlap, _)| overlap)),
             )
         }) {
             Some(w) => w,
@@ -605,6 +664,18 @@ impl Router {
 
         let status = response.status();
         worker.record_outcome(status.as_u16());
+
+        // Publish the routing-time prompt chain as a placement for the
+        // dispatched worker on success only (never on error/retry, which
+        // must not advertise a phantom holder). HTTP does not surface the
+        // generated output tokens, so there is no prompt (+) output refine —
+        // the prompt-only placement is final.
+        if status.is_success() {
+            if let Some((_, prediction)) = prefetch {
+                self.policy_registry
+                    .publish_placement(prediction, worker.url(), None);
+            }
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -838,6 +909,9 @@ impl Router {
                 rid_key: None,
                 cache_namespace: None,
                 candidate_filter: None,
+                // Transcription never queries the shared index (audio has
+                // no prompt prefix to share); it places as without one.
+                remote: RemoteLookup::NotAttempted,
             },
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
@@ -1735,6 +1809,14 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
+        // The streamed pass-through selects under `UNKNOWN_MODEL_ID` (the
+        // body, and thus the real model, is never read here). The shared
+        // index is keyed by model, so participating from this path would
+        // publish into a different keyspace than the buffered path's real
+        // model — fragmenting the index for mixed buffered/streamed
+        // traffic. It does not ask the index (`NotAttempted`: placement
+        // exactly as without one) until the streamed path can resolve the
+        // model without buffering.
         let Some(worker) = self.select_worker_for_model(
             model_id,
             None,
@@ -1742,6 +1824,7 @@ impl Router {
             Some(req.headers()),
             None,
             None,
+            RemoteLookup::NotAttempted,
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
@@ -2419,6 +2502,7 @@ mod tests {
                 None,
                 None,
                 None,
+                RemoteLookup::NotAttempted,
             )
             .unwrap();
         assert!(selected.is_available());
@@ -2433,7 +2517,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                RemoteLookup::NotAttempted
             )
             .is_none());
     }

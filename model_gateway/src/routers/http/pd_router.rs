@@ -1491,6 +1491,10 @@ impl PDRouter {
                 rid_key,
                 cache_namespace,
                 candidate_filter: None,
+                // HTTP PD does not query the shared index yet (its prefill
+                // pool would also have to publish; own PR): places as
+                // without one.
+                remote: crate::policies::RemoteLookup::NotAttempted,
             },
         )
         .map_err(|failure| Box::new(Self::pair_failure(*failure)))?;
@@ -2158,6 +2162,9 @@ impl RouterTrait for PDRouter {
                 rid_key: None,
                 cache_namespace: None,
                 candidate_filter: None,
+                // count_tokens picks one prefill worker without a decode leg
+                // and never consults the shared index.
+                remote: crate::policies::RemoteLookup::NotAttempted,
             },
         ) else {
             return error::service_unavailable(

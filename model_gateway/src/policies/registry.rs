@@ -8,6 +8,10 @@ use http::{header::HeaderName, HeaderMap};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
+use super::remote_index::{
+    outcome_label, IndexPrediction, RemoteIndexHandle, APPROX_BYTES_PER_TOKEN, BYTE_BLOCK,
+    QUERY_DEADLINE, TOO_SHORT_TO_HASH, UNSCORABLE,
+};
 /// Policy Registry for managing model-to-policy mappings
 ///
 /// This registry manages the dynamic assignment of load balancing policies to models.
@@ -17,8 +21,9 @@ use tracing::{debug, info, warn};
 use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
-    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
+    normalize_model_key, BucketPolicy, CacheAwarePolicy, CacheNamespace, DPRankLoadPolicy,
+    LoadBalancingPolicy, ManualConfig, ManualPolicy, PolicyFactory, RemoteLookup, RemoteOverlap,
+    SelectWorkerInfo, WorkerLeg,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -60,6 +65,10 @@ pub struct PolicyRegistry {
     /// Optional KV event monitor for event-driven cache-aware routing.
     /// When set, new CacheAwarePolicy instances are injected with this monitor.
     kv_event_monitor: Arc<RwLock<Option<Arc<KvEventMonitor>>>>,
+    /// The shared remote radix index (`--kv-indexer-url`); `None` = flag
+    /// off. Owning it here is what lets EVERY router get cache-aware
+    /// remote routing through one call, instead of per-router wiring.
+    remote_index: Arc<RwLock<Option<Arc<RemoteIndexHandle>>>>,
 
     /// Optional backend load-snapshot receiver from the `WorkerMonitor`. When
     /// set, new CacheAwarePolicy instances are injected with it for the KV-usage
@@ -158,6 +167,7 @@ impl PolicyRegistry {
             decode_policy: Arc::new(OnceLock::new()),
             encode_policy: Arc::new(OnceLock::new()),
             kv_event_monitor: Arc::new(RwLock::new(None)),
+            remote_index: Arc::new(RwLock::new(None)),
             load_rx: Arc::new(RwLock::new(None)),
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
@@ -260,16 +270,7 @@ impl PolicyRegistry {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        if let Some(sticky) = self.routing_key_sticky.as_ref() {
-            if Self::routing_key_override_applies(policy.name()) {
-                if let Some((key, source)) = self.effective_sticky_key(info) {
-                    return Self::select_sticky(
-                        sticky, policy, model_id, workers, info, key, source,
-                    );
-                }
-            }
-        }
-        policy.select_worker(workers, info)
+        self.select_worker_with_remote(policy, model_id, workers, info, RemoteLookup::NotAttempted)
     }
 
     #[cfg(test)]
@@ -284,6 +285,331 @@ impl PolicyRegistry {
             .map(|worker| worker.model_id())
             .unwrap_or(crate::worker::UNKNOWN_MODEL_ID);
         self.select_worker_for_model(policy, model_id, workers, info)
+    }
+
+    /// Set the shared remote-index handle (from `AppContext` after the
+    /// client connects). `None` clears it. Mirrors `set_kv_event_monitor`.
+    pub fn set_remote_index(&self, handle: Option<Arc<RemoteIndexHandle>>) {
+        *self.remote_index.write() = handle;
+    }
+
+    /// Whether the shared remote index is configured. A cheap gate for
+    /// callers that would otherwise pay to hoist owned routing inputs
+    /// (e.g. the HTTP router copying tokens out of its request view)
+    /// before the async `resolve_remote_overlap`; with the flag off this
+    /// returns `false` and that work is skipped entirely.
+    pub(crate) fn remote_index_enabled(&self) -> bool {
+        self.remote_index.read().is_some()
+    }
+
+    /// Routing-time remote-index query — the piece that used to live in
+    /// the gRPC selection stage, now here so every router shares it.
+    /// Computes the request's content-hash chain, queries the index
+    /// under the 2ms deadline, and returns the per-worker overlap for
+    /// the policy blend plus the prediction the router publishes/echoes.
+    ///
+    /// `namespace` is the request's cache partition, and it is hashed
+    /// into the chain exactly as the local trees key it. Without it the
+    /// index is partition-blind, which in a *shared* index is worse
+    /// than in a per-gateway tree: one tenant's placement would steer
+    /// another tenant's identical prompt fleet-wide, to a worker whose
+    /// engine cannot serve the hit.
+    ///
+    /// `None` — no index work, plain select — when the flag is off, no
+    /// policy that consumes the overlap is cache_aware, or a sticky
+    /// override key wins anyway. A participating request with nothing
+    /// to hash is NOT a skip: it returns empty scores, so the caller
+    /// sees a miss and takes the load-only pick instead of populating a
+    /// local tree the index is meant to have replaced.
+    pub(crate) async fn resolve_remote_overlap(
+        &self,
+        model_id: &str,
+        tokens: Option<&[u32]>,
+        namespace: Option<CacheNamespace>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+    ) -> Option<(RemoteOverlap, IndexPrediction)> {
+        let handle = self.remote_index.read().clone()?;
+        if !self.consumes_remote_overlap(model_id) {
+            return None;
+        }
+        let sticky_wins = self.routing_key_override_enabled()
+            && (rid_key.is_some() || self.resolve_routing_key(headers).is_some());
+        if sticky_wins {
+            return None;
+        }
+        let tokens = tokens.unwrap_or(&[]);
+        let block = handle.block_size();
+        // The marker fills whole keyspace blocks, so a partitioned
+        // request keeps the prompt's own block grid and only its head
+        // differs. `fold_answers` takes the marker blocks back off the
+        // scores, keeping the echoed prediction in prompt units.
+        let marker_units = namespace
+            .map(|_| (CacheNamespace::token_marker_len(block) / block.max(1)) as u32)
+            .unwrap_or(0);
+        // Borrow the prompt on the common unpartitioned path; only a
+        // partition prepends a marker and has to own a copy.
+        let keyed: std::borrow::Cow<[u32]> = match namespace {
+            Some(ns) => ns.prefixed_tokens(tokens, block).into(),
+            None => CacheNamespace::unpartitioned_tokens(tokens).into(),
+        };
+        let mut hashes: Vec<u64> = kv_index::compute_request_content_hashes(&keyed, block)
+            .iter()
+            .map(|h| h.0)
+            .collect();
+        let started = std::time::Instant::now();
+        let (label, scores) = if super::remote_index::too_short_to_score(
+            hashes.len(),
+            keyed.len(),
+            block,
+            marker_units,
+        ) {
+            // Nothing the index could credit: shorter than one keyspace
+            // block, or (partitioned) a chain that is marker only, or a
+            // prompt whose last-token bound cannot clear the marker.
+            // Counted as an empty answer rather than skipped: the request
+            // did participate, and the caller must see a miss so it takes
+            // the load-only pick. The chain is dropped too, so a success
+            // path never publishes a marker-only placement nothing can
+            // score.
+            hashes.clear();
+            (TOO_SHORT_TO_HASH, Vec::new())
+        } else {
+            let outcome = handle
+                .client()
+                .query(model_id, block as u32, hashes.clone(), QUERY_DEADLINE)
+                .await;
+            let label = outcome_label(&outcome);
+            match outcome {
+                radix_index::client::QueryOutcome::Scores(answers) => {
+                    let scores = super::remote_index::fold_answers(
+                        answers,
+                        keyed.len(),
+                        block,
+                        marker_units,
+                    );
+                    // An answer that folds to nothing routes on load
+                    // alone, so counting it as a hit would let a fleet
+                    // the index cannot steer report a perfect hit rate.
+                    let label = if scores.is_empty() { UNSCORABLE } else { label };
+                    (label, scores)
+                }
+                _ => (label, Vec::new()),
+            }
+        };
+        Metrics::record_remote_index_query(label, started.elapsed());
+        let overlap = RemoteOverlap {
+            scores: scores.clone(),
+            request_blocks: hashes.len().saturating_sub(marker_units as usize),
+            block_size: block,
+        };
+        let prediction = IndexPrediction {
+            source: label,
+            scores,
+            block_size: block,
+            content_hashes: hashes,
+            model: model_id.to_string(),
+            bytes: false,
+            namespace,
+        };
+        Some((overlap, prediction))
+    }
+
+    /// String-mode ([`SymbolKind::Bytes`]) analogue of
+    /// [`Self::resolve_remote_overlap`]: for HTTP requests that carry
+    /// text but no tokens, hash the raw request bytes into
+    /// [`BYTE_BLOCK`]-sized blocks and query the `Bytes` keyspace. Same
+    /// skip cases; a distinct, coarser affinity than the token tree
+    /// (a shared byte prefix, not a shared token prefix).
+    pub(crate) async fn resolve_remote_overlap_bytes(
+        &self,
+        model_id: &str,
+        text: Option<&str>,
+        namespace: Option<CacheNamespace>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+    ) -> Option<(RemoteOverlap, IndexPrediction)> {
+        let handle = self.remote_index.read().clone()?;
+        if !self.consumes_remote_overlap(model_id) {
+            return None;
+        }
+        let sticky_wins = self.routing_key_override_enabled()
+            && (rid_key.is_some() || self.resolve_routing_key(headers).is_some());
+        if sticky_wins {
+            return None;
+        }
+        let text = text.unwrap_or("");
+        // The text marker is far shorter than a byte block, so it sits
+        // inside the first block rather than filling one: two
+        // namespaces diverge at block 0 and can never match, and no
+        // whole marker block has to come back off the score.
+        let keyed = match namespace {
+            Some(ns) => ns.prefixed_text(text),
+            None => CacheNamespace::unpartitioned_text(text).to_string(),
+        };
+        let hashes: Vec<u64> =
+            kv_index::compute_request_byte_content_hashes(keyed.as_bytes(), BYTE_BLOCK)
+                .iter()
+                .map(|h| h.0)
+                .collect();
+        let started = std::time::Instant::now();
+        let (label, scores) = if hashes.is_empty() {
+            (TOO_SHORT_TO_HASH, Vec::new())
+        } else {
+            let outcome = handle
+                .client()
+                .query_bytes(model_id, BYTE_BLOCK as u32, hashes.clone(), QUERY_DEADLINE)
+                .await;
+            let label = outcome_label(&outcome);
+            match outcome {
+                radix_index::client::QueryOutcome::Scores(answers) => {
+                    let scores =
+                        super::remote_index::fold_answers(answers, keyed.len(), BYTE_BLOCK, 0);
+                    let label = if scores.is_empty() { UNSCORABLE } else { label };
+                    (label, scores)
+                }
+                _ => (label, Vec::new()),
+            }
+        };
+        Metrics::record_remote_index_query(label, started.elapsed());
+        // The overlap-decay math divides a TOKEN backlog by `block_size`
+        // and compares it with `request_blocks`; in string mode both are
+        // byte-blocks, so the block size must be expressed in tokens
+        // (one 256-byte block is roughly 64 tokens) or the anti-hotspot
+        // decay runs in the wrong unit. The prediction keeps the real
+        // byte block size: that is what the placement is published at.
+        let overlap = RemoteOverlap {
+            scores: scores.clone(),
+            request_blocks: hashes.len(),
+            block_size: (BYTE_BLOCK / APPROX_BYTES_PER_TOKEN).max(1),
+        };
+        let prediction = IndexPrediction {
+            source: label,
+            scores,
+            block_size: BYTE_BLOCK,
+            content_hashes: hashes,
+            model: model_id.to_string(),
+            bytes: true,
+            namespace,
+        };
+        Some((overlap, prediction))
+    }
+
+    /// Publish a placement for the worker a request was dispatched to —
+    /// the router calls this at its post-dispatch SUCCESS point (never
+    /// at select time: that would advertise phantom holders on shed/
+    /// retry). `refine_tokens = Some(prompt ⊕ output)` re-hashes and
+    /// publishes that fuller chain; `None` publishes the prompt-only
+    /// chain the query already computed. No-op when the flag is off.
+    pub(crate) fn publish_placement(
+        &self,
+        prediction: &IndexPrediction,
+        worker_url: &str,
+        refine_tokens: Option<&[u32]>,
+    ) {
+        let Some(handle) = self.remote_index.read().clone() else {
+            return;
+        };
+        // String-mode publishes go to the `Bytes` keyspace and never
+        // refine (HTTP has no output tokens to append); the token path
+        // may re-hash prompt (+) output.
+        // A prompt too short to hash has nothing to publish; counting the
+        // client's silent early return as a publish would put the counter
+        // ahead of what the index receives by the short-prompt share.
+        if prediction.bytes && prediction.content_hashes.is_empty() {
+            return;
+        }
+        if !prediction.bytes && prediction.content_hashes.is_empty() && refine_tokens.is_none() {
+            return;
+        }
+        if prediction.bytes {
+            handle.client().publish_placement_bytes(
+                &prediction.model,
+                prediction.block_size as u32,
+                worker_url,
+                &prediction.content_hashes,
+            );
+            Metrics::record_remote_index_publish();
+            return;
+        }
+        let hashes: Vec<u64> = match refine_tokens {
+            // The refined chain has to be keyed exactly as the query
+            // was, cache partition included: publishing the fuller
+            // chain unpartitioned would advertise the placement in a
+            // keyspace no query of this request's tenant ever reaches.
+            Some(tokens) => {
+                let keyed: std::borrow::Cow<[u32]> = match prediction.namespace {
+                    Some(ns) => ns.prefixed_tokens(tokens, prediction.block_size).into(),
+                    None => CacheNamespace::unpartitioned_tokens(tokens).into(),
+                };
+                kv_index::compute_request_content_hashes(&keyed, prediction.block_size)
+                    .iter()
+                    .map(|h| h.0)
+                    .collect()
+            }
+            None => prediction.content_hashes.clone(),
+        };
+        if hashes.is_empty() {
+            return;
+        }
+        handle.client().publish_placement(
+            &prediction.model,
+            prediction.block_size as u32,
+            worker_url,
+            &hashes,
+        );
+        Metrics::record_remote_index_publish();
+    }
+
+    /// [`Self::select_worker_for_model`] with the shared index's answer for
+    /// this request: the sticky override still wins identically; the answer
+    /// only reaches the policy on the delegated path (and only
+    /// cache_aware consumes it). A path that never asked
+    /// (`NotAttempted`) gets exactly the plain selection — the index being
+    /// wired changes nothing for it; a path that asked and missed gets
+    /// the load-only pick so no local tree fills with remote misses.
+    pub fn select_worker_with_remote(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        remote: RemoteLookup<'_>,
+    ) -> Option<usize> {
+        if let Some(sticky) = self.routing_key_sticky.as_ref() {
+            if Self::routing_key_override_applies(policy.name()) {
+                if let Some((key, source)) = self.effective_sticky_key(info) {
+                    return Self::select_sticky(
+                        sticky, policy, model_id, workers, info, key, source,
+                    );
+                }
+            }
+        }
+        match remote {
+            RemoteLookup::Hit(remote) => policy.select_worker_with_remote(workers, info, remote),
+            RemoteLookup::Missed => policy.select_worker_remote_only(workers, info),
+            RemoteLookup::NotAttempted => policy.select_worker(workers, info),
+        }
+    }
+
+    /// Whether a policy that actually RECEIVES the overlap for
+    /// `model_id` is cache_aware.
+    ///
+    /// Exactly two legs are handed the scores: the single-worker leg
+    /// (the per-model policy, or the default when there is none) and
+    /// the prefill leg of a PD/EPD pair. Decode and encode get plain
+    /// `select_worker`, so including them — or including a default
+    /// policy a per-model policy already shadows — would hash the whole
+    /// prompt and pay the query deadline on the critical path for
+    /// scores nothing ever reads.
+    fn consumes_remote_overlap(&self, model_id: &str) -> bool {
+        let single = self.get_policy_or_default(model_id);
+        if single.name() == "cache_aware" {
+            return true;
+        }
+        self.prefill_policy
+            .get()
+            .is_some_and(|policy| policy.name() == "cache_aware")
     }
 
     /// Keyed selection: honor an existing pin under the in-flight cap;
@@ -2186,5 +2512,277 @@ mod tests {
 
         registry.remove_worker_from_pd_cache_aware("http://prefill-1:8000");
         registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
+    }
+
+    /// A policy that records which selection entry point the registry
+    /// called. The three-way dispatch is the whole contract of the index
+    /// seam — a path that never queried must place exactly as it did
+    /// before the index existed — and without this it is held only by
+    /// literal arguments at the call sites, which a refactor can flip
+    /// with nothing going red.
+    #[derive(Debug, Default)]
+    struct RecordingPolicy {
+        calls: parking_lot::Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingPolicy {
+        fn taken(&self) -> Vec<&'static str> {
+            std::mem::take(&mut *self.calls.lock())
+        }
+    }
+
+    impl LoadBalancingPolicy for RecordingPolicy {
+        fn select_worker(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            self.calls.lock().push("plain");
+            Some(0)
+        }
+
+        fn select_worker_with_remote(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+            _remote: &RemoteOverlap,
+        ) -> Option<usize> {
+            self.calls.lock().push("with_remote");
+            Some(0)
+        }
+
+        fn select_worker_remote_only(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            self.calls.lock().push("remote_only");
+            Some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "cache_aware"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn a_skip_and_an_empty_answer_are_different_states() {
+        assert!(matches!(
+            RemoteLookup::from_resolved(None),
+            RemoteLookup::NotAttempted
+        ));
+        // An answer with no scores is a MISS, not a skip: the request
+        // took part, so it must get the load-only pick rather than a
+        // local tree that would then hold only remote misses.
+        let empty = RemoteOverlap::default();
+        assert!(matches!(
+            RemoteLookup::from_resolved(Some(&empty)),
+            RemoteLookup::Missed
+        ));
+        let answered = RemoteOverlap {
+            scores: vec![("http://w2".to_string(), 3)],
+            request_blocks: 4,
+            block_size: 16,
+        };
+        assert!(matches!(
+            RemoteLookup::from_resolved(Some(&answered)),
+            RemoteLookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn each_remote_state_reaches_its_own_selection_entry_point() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let recorder = Arc::new(RecordingPolicy::default());
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::clone(&recorder) as _;
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo::default();
+        let overlap = RemoteOverlap {
+            scores: vec![("http://w2".to_string(), 3)],
+            request_blocks: 4,
+            block_size: 16,
+        };
+
+        for state in [
+            RemoteLookup::Hit(&overlap),
+            RemoteLookup::Missed,
+            RemoteLookup::NotAttempted,
+        ] {
+            assert!(reg
+                .select_worker_with_remote(&policy, "m", &workers, &info, state)
+                .is_some());
+        }
+        assert_eq!(
+            recorder.taken(),
+            vec!["with_remote", "remote_only", "plain"]
+        );
+    }
+
+    #[test]
+    fn a_sticky_key_still_wins_over_every_remote_state() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let recorder = Arc::new(RecordingPolicy::default());
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::clone(&recorder) as _;
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let headers = headers_with_key("session-A");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let overlap = RemoteOverlap {
+            scores: vec![("http://w2".to_string(), 3)],
+            request_blocks: 4,
+            block_size: 16,
+        };
+
+        let picks: Vec<Option<usize>> = [
+            RemoteLookup::Hit(&overlap),
+            RemoteLookup::Missed,
+            RemoteLookup::NotAttempted,
+        ]
+        .into_iter()
+        .map(|state| reg.select_worker_with_remote(&policy, "m", &workers, &info, state))
+        .collect();
+
+        // One key, one worker, whatever the index said.
+        assert!(picks.iter().all(|p| p.is_some()));
+        assert!(picks.windows(2).all(|w| w[0] == w[1]));
+        // Sticky assignment delegates through `select_worker`, so the
+        // two index-aware entry points are never reached.
+        assert!(!recorder.taken().iter().any(|call| *call != "plain"));
+    }
+
+    #[tokio::test]
+    async fn only_a_leg_that_consumes_the_overlap_pays_for_the_query() {
+        // Unroutable on purpose: every assertion below returns before
+        // the client is ever dialed, and `connect` is lazy.
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.set_remote_index(Some(RemoteIndexHandle::connect("http://127.0.0.1:1", 16)));
+        let tokens: Vec<u32> = (0..64).collect();
+
+        // No cache_aware anywhere: nothing would read the scores.
+        assert!(reg
+            .resolve_remote_overlap("m", Some(&tokens), None, None, None)
+            .await
+            .is_none());
+
+        // A cache_aware DECODE leg still does not read them — the
+        // overlap only ever reaches the single and prefill legs — so
+        // paying the query deadline for it would be pure latency.
+        reg.set_decode_policy(cache_aware_policy());
+        assert!(reg
+            .resolve_remote_overlap("m", Some(&tokens), None, None, None)
+            .await
+            .is_none());
+
+        // The prefill leg does read them.
+        reg.set_prefill_policy(cache_aware_policy());
+        assert!(reg
+            .resolve_remote_overlap("m", Some(&tokens), None, None, None)
+            .await
+            .is_some());
+
+        // A sticky override decides the worker by itself, so the query
+        // would be discarded.
+        let sticky = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        sticky.set_prefill_policy(cache_aware_policy());
+        sticky.set_remote_index(Some(RemoteIndexHandle::connect("http://127.0.0.1:1", 16)));
+        assert!(sticky
+            .resolve_remote_overlap("m", Some(&tokens), None, None, Some("session-A"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_prompt_too_short_to_hash_is_a_miss_not_a_skip() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.set_prefill_policy(cache_aware_policy());
+        reg.set_remote_index(Some(RemoteIndexHandle::connect("http://127.0.0.1:1", 128)));
+
+        // Under one 128-token block, so `compute_request_content_hashes`
+        // yields nothing and no query goes out. Returning `None` here
+        // would hand the request to plain cache_aware selection, which
+        // populates the per-gateway tree the shared index replaced —
+        // and sub-block prompts are a large share of chat traffic, not
+        // a corner case.
+        let tokens: Vec<u32> = (0..100).collect();
+        let (overlap, prediction) = reg
+            .resolve_remote_overlap("m", Some(&tokens), None, None, None)
+            .await
+            .expect("a participating path resolves even with nothing to hash");
+        assert!(overlap.scores.is_empty());
+        assert!(matches!(
+            RemoteLookup::from_resolved(Some(&overlap)),
+            RemoteLookup::Missed
+        ));
+        assert_eq!(prediction.source(), TOO_SHORT_TO_HASH);
+    }
+
+    #[tokio::test]
+    async fn a_partitioned_request_hashes_a_different_chain() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.set_prefill_policy(cache_aware_policy());
+        reg.set_remote_index(Some(RemoteIndexHandle::connect("http://127.0.0.1:1", 16)));
+        let tokens: Vec<u32> = (0..64).collect();
+        let namespace = CacheNamespace::derive(&openai_protocol::common::CachePartition {
+            cache_salt: Some("tenant-a"),
+            ..Default::default()
+        });
+        assert!(namespace.is_some(), "a salt must produce a namespace");
+
+        let plain = reg
+            .resolve_remote_overlap("m", Some(&tokens), None, None, None)
+            .await
+            .expect("resolved");
+        let partitioned = reg
+            .resolve_remote_overlap("m", Some(&tokens), namespace, None, None)
+            .await
+            .expect("resolved");
+
+        // Same prompt, different partition: the chains must differ at
+        // block 0. Overlap is scored as a prefix from block 0, so a
+        // divergent head is what stops one partition's placement from
+        // steering another partition's identical prompt. The block
+        // hashes themselves are position-independent, so the prompt's
+        // own blocks DO recur further along the partitioned chain;
+        // that is harmless, because a holder whose coverage starts past
+        // block 0 scores a depth of zero and is dropped.
+        assert!(!partitioned.1.content_hashes.is_empty());
+        assert_ne!(partitioned.1.content_hashes[0], plain.1.content_hashes[0]);
+        // The marker fills whole blocks, so the partitioned chain is
+        // exactly one block longer and the prompt's own grid is intact:
+        // every plain block reappears, shifted by the marker.
+        assert_eq!(
+            partitioned.1.content_hashes.len(),
+            plain.1.content_hashes.len() + 1
+        );
+        assert_eq!(
+            &partitioned.1.content_hashes[1..],
+            &plain.1.content_hashes[..]
+        );
+        // …and the extra block is not counted as reusable prompt.
+        assert_eq!(partitioned.0.request_blocks, plain.0.request_blocks);
     }
 }
