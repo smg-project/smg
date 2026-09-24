@@ -664,30 +664,26 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create and initialize MCP orchestrator with empty config
+    /// Create and initialize the MCP orchestrator from the operator's MCP
+    /// config (`--mcp-config-path`), minus its server list.
     ///
-    /// This initializes the MCP orchestrator with an empty config and default settings.
-    /// MCP servers will be registered later via the InitializeMcpServers job.
-    async fn with_mcp_orchestrator(
-        mut self,
-        _router_config: &RouterConfig,
-    ) -> Result<Self, String> {
+    /// The servers are registered later via the InitializeMcpServers job, so
+    /// startup never waits on one. The pool limits, the global proxy, the
+    /// inventory settings and the approval policy have to be in place before
+    /// that: the orchestrator resolves each server's proxy against its global
+    /// proxy and builds its policy engine once, at construction.
+    async fn with_mcp_orchestrator(mut self, router_config: &RouterConfig) -> Result<Self, String> {
         // Create OnceLock container
         let mcp_orchestrator_lock = Arc::new(OnceLock::new());
 
-        // Always create with empty config and defaults
-        debug!("Initializing MCP orchestrator with empty config and default settings (5 min TTL, 100 max connections)");
+        let config = mcp_bootstrap_config(router_config.mcp_config.as_ref());
+        debug!(
+            max_connections = config.pool.max_connections,
+            proxy = config.proxy.is_some(),
+            "Initializing MCP orchestrator; config-file servers register through the job queue"
+        );
 
-        let empty_config = smg_mcp::McpConfig {
-            servers: Vec::new(),
-            pool: Default::default(),
-            proxy: None,
-            warmup: Vec::new(),
-            inventory: Default::default(),
-            policy: Default::default(),
-        };
-
-        let orchestrator = McpOrchestrator::new(empty_config)
+        let orchestrator = McpOrchestrator::new(config)
             .await
             .map_err(|e| format!("Failed to initialize MCP orchestrator: {e}"))?;
 
@@ -775,6 +771,17 @@ impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The orchestrator's startup configuration: the operator's MCP file with
+/// its server list removed (the `InitializeMcpServers` job registers those
+/// once the gateway is up), and the global proxy taken from the environment
+/// (`MCP_HTTP_PROXY`, `MCP_HTTPS_PROXY`, `MCP_NO_PROXY`, or their unprefixed
+/// forms) when the file sets none.
+fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig {
+    let mut config = file.cloned().unwrap_or_default();
+    config.servers.clear();
+    config.with_env_proxy()
 }
 
 #[cfg(test)]
@@ -1055,5 +1062,59 @@ mod tests {
         let result = AppContextBuilder::new().maybe_rate_limit_manager(&config);
         assert!(result.is_ok());
         assert!(result.unwrap().rate_limit_manager.is_some());
+    }
+
+    #[test]
+    fn mcp_bootstrap_keeps_everything_but_the_server_list() {
+        let file: smg_mcp::McpConfig = serde_yaml::from_str(
+            r#"
+servers:
+  - name: "docs"
+    protocol: sse
+    url: "https://mcp.example.com/sse"
+pool:
+  max_connections: 7
+proxy:
+  https: "http://proxy.example:3128"
+policy:
+  default: deny
+"#,
+        )
+        .unwrap();
+        assert_eq!(file.servers.len(), 1);
+
+        let config = mcp_bootstrap_config(Some(&file));
+        assert!(
+            config.servers.is_empty(),
+            "servers register through the job queue"
+        );
+        assert_eq!(config.pool.max_connections, 7);
+        assert_eq!(
+            config
+                .proxy
+                .as_ref()
+                .and_then(|proxy| proxy.https.as_deref()),
+            Some("http://proxy.example:3128")
+        );
+        assert!(matches!(
+            config.policy.default,
+            smg_mcp::PolicyDecisionConfig::Deny
+        ));
+
+        assert!(mcp_bootstrap_config(None).servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_bootstrap_reads_the_proxy_from_the_environment_when_the_file_has_none() {
+        std::env::set_var("MCP_HTTPS_PROXY", "http://env-proxy.example:3128");
+        let config = mcp_bootstrap_config(None);
+        std::env::remove_var("MCP_HTTPS_PROXY");
+        assert_eq!(
+            config
+                .proxy
+                .as_ref()
+                .and_then(|proxy| proxy.https.as_deref()),
+            Some("http://env-proxy.example:3128")
+        );
     }
 }
