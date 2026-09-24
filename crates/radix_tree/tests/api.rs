@@ -645,3 +645,304 @@ fn evict_oldest_keeps_chain_slots_bounded_under_placement_churn() {
     assert_eq!(t.live_chain_count(), (capacity / chain_len) as usize);
     t.audit().expect("audit");
 }
+
+/// Cost of one capacity cut on a placement-shaped forest (ignored; run
+/// with `--release -- --ignored --nocapture`): 120 holders sharing a
+/// 16-block system prefix, each holding private session chains of
+/// 30..100 blocks up to 2x a 4,688-block capacity, plus a hot set of
+/// 256 chains shared by 8 holders each. Times `evict_oldest` and
+/// `truncate_tail` on identically built trees.
+#[test]
+#[ignore]
+fn bench_capacity_cut_on_a_placement_shaped_forest() {
+    fn build(shared_hot: bool) -> (RadixTree, Vec<HolderId>) {
+        let mut t = chain_tree();
+        let mut rng = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let holders: Vec<HolderId> = (0..120)
+            .map(|i| t.create_holder(&format!("w{i}")))
+            .collect();
+        let system: Vec<(u64, u64)> = (1..=16).map(|i| (i, i)).collect();
+        let hot: Vec<Vec<(u64, u64)>> = (0..256)
+            .map(|c| {
+                (0..64)
+                    .map(|p| (10_000_000 + c * 1000 + p, 10_000_000 + c * 1000 + p))
+                    .collect()
+            })
+            .collect();
+        let mut key = 1_000_000u64;
+        for (hi, &h) in holders.iter().enumerate() {
+            t.store(h, None, &system).expect("system prefix");
+            let mut n = 16u64;
+            while n < 9_376 {
+                if shared_hot && next() % 10 < 3 {
+                    let c = &hot[(next() as usize) % hot.len()];
+                    let out = t.store(h, Some(16), c).expect("hot chain");
+                    n += u64::from(out.applied);
+                } else {
+                    let len = 30 + next() % 71;
+                    let chain: Vec<(u64, u64)> = (0..len)
+                        .map(|p| (key + p, key + p + (hi as u64) * 7))
+                        .collect();
+                    key += len;
+                    t.store(h, Some(16), &chain).expect("session chain");
+                    n += len;
+                }
+            }
+        }
+        (t, holders)
+    }
+    for shared_hot in [false, true] {
+        for method in ["evict_oldest", "truncate_tail"] {
+            let (mut t, holders) = build(shared_hot);
+            let before = t.stats();
+            let mut worst = std::time::Duration::ZERO;
+            let started = std::time::Instant::now();
+            let mut dropped = 0u64;
+            for &h in &holders {
+                let one = std::time::Instant::now();
+                dropped += if method == "evict_oldest" {
+                    t.evict_oldest(h, 4_688)
+                } else {
+                    t.truncate_tail(h, 4_688)
+                };
+                worst = worst.max(one.elapsed());
+            }
+            let total = started.elapsed();
+            let after = t.stats();
+            eprintln!(
+                "{method:13} shared_hot={shared_hot}: 120 cuts in {total:?} (mean {:?}, worst {worst:?}); dropped {dropped}; blocks {} -> {}; live chains {} -> {}",
+                total / 120,
+                before.holder_blocks,
+                after.holder_blocks,
+                before.distinct_entries,
+                after.distinct_entries,
+            );
+            t.audit().expect("audit");
+        }
+    }
+}
+
+// ---- coverage: per-holder runs along the query path (chain core) ----
+
+fn runs_of(t: &RadixTree, h: HolderId, query: &[u64]) -> Vec<(u32, u32)> {
+    let mut sc = OverlapScratch::default();
+    let mut out = Vec::new();
+    t.coverage(query, &mut sc, &mut out);
+    out.iter()
+        .filter(|r| r.holder == h)
+        .map(|r| (r.start, r.end))
+        .collect()
+}
+
+#[test]
+fn coverage_reports_holes_and_mid_path_runs_that_overlap_cannot() {
+    let mut t = chain_tree();
+    let full = t.create_holder("w#full");
+    let window = t.create_holder("w#window");
+    let mamba = t.create_holder("w#mamba");
+    let chain: Vec<(u64, u64)> = (1..=12).map(|i| (i, 100 + i)).collect();
+    let query: Vec<u64> = chain.iter().map(|&(_, c)| c).collect();
+    // Full attention holds everything; the window lane evicted its
+    // first four blocks; the mamba lane keeps checkpoints at 4 and 8.
+    t.store(full, None, &chain).expect("full");
+    t.store(window, None, &chain).expect("window");
+    assert_eq!(t.remove(window, &[1, 2, 3, 4]), 4);
+    t.store(mamba, None, &chain).expect("mamba");
+    assert_eq!(t.remove(mamba, &[1, 2, 3, 5, 6, 7, 9, 10, 11, 12]), 10);
+
+    assert_eq!(runs_of(&t, full, &query), vec![(0, 12)]);
+    assert_eq!(runs_of(&t, window, &query), vec![(4, 12)]);
+    assert_eq!(runs_of(&t, mamba, &query), vec![(3, 4), (7, 8)]);
+    // The depth answer sees only the full lane.
+    let mut sc = OverlapScratch::default();
+    let mut out = Vec::new();
+    t.overlap(&query, &mut sc, &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!((out[0].holder, out[0].depth), (full, 12));
+    // Runs stop where the query diverges from the stored chain.
+    let mut diverged = query.clone();
+    diverged[6] = 999;
+    assert_eq!(runs_of(&t, full, &diverged), vec![(0, 6)]);
+    assert_eq!(runs_of(&t, window, &diverged), vec![(4, 6)]);
+    assert_eq!(runs_of(&t, mamba, &diverged), vec![(3, 4)]);
+    // A query that matches nothing yields no runs; an empty query too.
+    assert!(runs_of(&t, full, &[42, 43]).is_empty());
+    assert!(runs_of(&t, full, &[]).is_empty());
+    t.audit().expect("audit");
+}
+
+#[test]
+fn coverage_is_sorted_per_holder_and_reuses_its_scratch_across_queries() {
+    let mut t = chain_tree();
+    let a = t.create_holder("a");
+    let b = t.create_holder("b");
+    let long: Vec<(u64, u64)> = (1..=8).map(|i| (i, 100 + i)).collect();
+    let short: Vec<(u64, u64)> = (11..=13).map(|i| (i, 200 + i)).collect();
+    t.store(a, None, &long).expect("a long");
+    t.store(b, None, &long).expect("b long");
+    t.store(b, None, &short).expect("b short");
+    t.remove(b, &[3, 4]);
+    let mut sc = OverlapScratch::default();
+    let mut out = Vec::new();
+    let q_long: Vec<u64> = long.iter().map(|&(_, c)| c).collect();
+    let q_short: Vec<u64> = short.iter().map(|&(_, c)| c).collect();
+    for _ in 0..3 {
+        t.coverage(&q_long, &mut sc, &mut out);
+        let got: Vec<(HolderId, u32, u32)> =
+            out.iter().map(|r| (r.holder, r.start, r.end)).collect();
+        assert_eq!(got, vec![(a, 0, 8), (b, 0, 2), (b, 4, 8)]);
+        assert!(out
+            .iter()
+            .all(|r| r.total_blocks == if r.holder == a { 8 } else { 9 }));
+        t.coverage(&q_short, &mut sc, &mut out);
+        let got: Vec<(HolderId, u32, u32)> =
+            out.iter().map(|r| (r.holder, r.start, r.end)).collect();
+        assert_eq!(
+            got,
+            vec![(b, 0, 3)],
+            "stale runs must not leak between queries"
+        );
+    }
+    t.retire_holder(a);
+    t.coverage(&q_long, &mut sc, &mut out);
+    assert!(
+        out.iter().all(|r| r.holder == b),
+        "retired holders are not reported"
+    );
+}
+
+/// Randomized: colliding prefixes across holders, random leaf removes,
+/// then every stored sequence is queried and each holder's runs must
+/// equal the positions where that holder still holds the query's key.
+#[test]
+fn coverage_matches_the_per_position_key_map_under_churn() {
+    fn key_of(prefix: &[u64]) -> u64 {
+        prefix.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| {
+            (h ^ c).wrapping_mul(0x0100_0000_01b3)
+        }) | 1
+    }
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut t = chain_tree();
+    let holders: Vec<HolderId> = (0..6).map(|i| t.create_holder(&format!("h{i}"))).collect();
+    let mut sequences: Vec<Vec<(u64, u64)>> = Vec::new();
+    for round in 0..600 {
+        let len = 2 + (next() % 10) as usize;
+        let mut contents = Vec::with_capacity(len);
+        let mut seq = Vec::with_capacity(len);
+        for pos in 0..len {
+            contents.push(1 + (pos as u64) * 8 + next() % 3);
+            seq.push((key_of(&contents), contents[pos]));
+        }
+        let h = holders[(next() as usize) % holders.len()];
+        t.store(h, None, &seq).expect("store");
+        sequences.push(seq);
+        if round % 4 == 3 {
+            // Remove a random key from a random holder: holes anywhere.
+            let s = &sequences[(next() as usize) % sequences.len()];
+            let (k, _) = s[(next() as usize) % s.len()];
+            let h = holders[(next() as usize) % holders.len()];
+            t.remove(h, &[k]);
+        }
+        if round % 25 == 24 {
+            t.audit().unwrap_or_else(|e| panic!("audit: {e}"));
+            let mut sc = OverlapScratch::default();
+            let mut out = Vec::new();
+            for s in &sequences {
+                let query: Vec<u64> = s.iter().map(|&(_, c)| c).collect();
+                t.coverage(&query, &mut sc, &mut out);
+                for &h in &holders {
+                    // Expected runs from the key map: position p is held
+                    // iff the holder has the key of query[..=p] at p.
+                    let mut expected = Vec::new();
+                    for (p, (k, _)) in s.iter().enumerate() {
+                        if t.position_of(h, *k) == Some(p as u32) {
+                            match expected.last_mut() {
+                                Some((_, end)) if *end == p as u32 => *end += 1,
+                                _ => expected.push((p as u32, p as u32 + 1)),
+                            }
+                        }
+                    }
+                    let got: Vec<(u32, u32)> = out
+                        .iter()
+                        .filter(|r| r.holder == h)
+                        .map(|r| (r.start, r.end))
+                        .collect();
+                    assert_eq!(got, expected, "round {round}: holder {h:?} on {query:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn path_contents_walks_forks_back_to_the_root_for_held_and_holed_coverage() {
+    let mut t = chain_tree();
+    let h = t.create_holder("h");
+    // Root [c1..c4], fork at position 1 with contents [c5, c6], and a
+    // hole: the holder drops keys 1 and 5 afterwards.
+    t.store(h, None, &[(1, 101), (2, 102), (3, 103), (4, 104)])
+        .expect("root");
+    t.store(h, Some(2), &[(5, 105), (6, 106)]).expect("fork");
+    assert_eq!(t.path_contents(h, 4), Some(vec![101, 102, 103, 104]));
+    assert_eq!(t.path_contents(h, 6), Some(vec![101, 102, 105, 106]));
+    t.remove(h, &[1, 5]);
+    // Holes do not hide the path: the chain keeps its contents.
+    assert_eq!(t.path_contents(h, 6), Some(vec![101, 102, 105, 106]));
+    assert_eq!(t.path_contents(h, 3), Some(vec![101, 102, 103]));
+    assert_eq!(t.path_contents(h, 5), None, "a removed key has no position");
+    t.retire_holder(h);
+    assert_eq!(t.path_contents(h, 6), None, "stale id");
+}
+
+#[test]
+fn runs_split_by_lineage_and_carry_the_uncovered_head_of_the_path() {
+    let mut t = chain_tree();
+    let h = t.create_holder("h");
+    let other = t.create_holder("o");
+    t.store(h, None, &[(1, 101), (2, 102), (3, 103), (4, 104), (5, 105)])
+        .expect("root");
+    t.store(h, Some(2), &[(6, 106), (7, 107), (8, 108)])
+        .expect("fork at 1");
+    // Another holder shares the root but that must not change h's runs.
+    t.store(other, None, &[(1, 101), (2, 102), (3, 103)])
+        .expect("other");
+    // Holes: drop position 0 on the root path and position 3 on the fork.
+    t.remove(h, &[1, 7]);
+    let runs = t.runs(h);
+    let view: Vec<(u32, u32, Vec<u64>, Vec<u64>)> = runs
+        .iter()
+        .map(|r| (r.start, r.end, r.keys.clone(), r.path.clone()))
+        .collect();
+    assert_eq!(view.len(), runs.len());
+    // Every run's keys sit at its positions with the path's contents.
+    for r in &runs {
+        assert_eq!(r.path.len(), r.end as usize);
+        for (i, k) in r.keys.iter().enumerate() {
+            assert_eq!(t.position_of(h, *k), Some(r.start + i as u32));
+        }
+    }
+    // The union of held positions is exactly the key map: 6 keys.
+    let held: usize = runs.iter().map(|r| r.keys.len()).sum();
+    assert_eq!(held, 6);
+    // Both lineages are present: one path ends in 105, one in 108.
+    let ends: std::collections::BTreeSet<u64> =
+        runs.iter().map(|r| *r.path.last().unwrap()).collect();
+    assert!(ends.contains(&105) && ends.contains(&108), "{runs:?}");
+    // A run that starts past 0 carries its uncovered head.
+    assert!(runs.iter().any(|r| r.start > 0 && r.path[0] == 101));
+    assert!(t.runs(other).iter().all(|r| r.start == 0));
+    t.retire_holder(h);
+    assert!(t.runs(h).is_empty());
+}

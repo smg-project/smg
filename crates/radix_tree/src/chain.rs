@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    lineage_root, lineage_step, BlockKey, Config, ContentHash, HolderId, Overlap, OverlapScratch,
-    SetInterner, SetRef, Stats, StoreError, StoreOutcome,
+    lineage_root, lineage_step, BlockKey, Config, ContentHash, CoverageRun, HolderId, HolderRun,
+    Overlap, OverlapScratch, SetInterner, SetRef, Stats, StoreError, StoreOutcome,
 };
 
 /// One trie chain: contiguous contents/keys stored ONCE, shared by
@@ -562,6 +562,39 @@ impl RadixTree {
         self.state_of(holder).keys.get(&key).map(|&(_, pos)| pos)
     }
 
+    /// Count a confirmation of `key` as a publish for recency: the
+    /// chain the holder holds it on takes a fresh tick, exactly as a
+    /// `store` landing there would. Touching the TIP of a path is
+    /// enough — `evict_oldest` propagates a chain's tick to its
+    /// covered ancestors. Returns whether the holder holds the key.
+    ///
+    /// A caller that CONFIRMS residency through [`Self::position_of`]
+    /// instead of storing must call this, for the same reason
+    /// [`Self::dup_prefix_touch`] exists: a hot chain re-confirmed
+    /// every round applies nothing, so its tick would stay frozen at
+    /// its last full publish and `evict_oldest` (ascending tick) would
+    /// retire it ahead of colder chains that happened to be sent whole
+    /// — inverting the recency order for exactly the chains the
+    /// confirm path makes cheap. Observable state (keys, spans,
+    /// answers) is untouched.
+    pub fn touch_chain_at(&self, id: HolderId, key: BlockKey) -> bool {
+        if self.live(id).is_none() {
+            return false;
+        }
+        let holder = id.parts().0;
+        let Some(&(chain, _)) = self.state_of(holder).keys.get(&key) else {
+            return false;
+        };
+        let tick = self.store_tick.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(t) = self.state_of(holder).chains.get(&chain) {
+            // Max, not store: concurrent touching walks take increasing
+            // ticks but land in any order, and a later tick must not be
+            // overwritten by an earlier one.
+            t.fetch_max(tick, Ordering::Relaxed);
+        }
+        true
+    }
+
     pub fn remove(&mut self, id: HolderId, keys: &[BlockKey]) -> u32 {
         if self.live(id).is_none() {
             return 0;
@@ -808,13 +841,11 @@ impl RadixTree {
 
     // ---- reads ----
 
-    pub fn overlap(
-        &self,
-        chain_query: &[ContentHash],
-        scratch: &mut OverlapScratch,
-        out: &mut Vec<Overlap>,
-    ) {
-        out.clear();
+    /// The trie descent shared by `overlap` and `coverage`: the query's
+    /// matched path as (chain, from, to) segments, empty when nothing
+    /// matches from position 0.
+    fn match_path(&self, chain_query: &[ContentHash], segments: &mut Vec<(u32, u32, u32)>) {
+        segments.clear();
         if chain_query.is_empty() {
             return;
         }
@@ -829,7 +860,6 @@ impl RadixTree {
         // Walk the trie along the query, collecting the matched path
         // as (chain, from, to) segments into the caller-owned scratch
         // (no per-query heap once warm — the alloc gate holds this).
-        let segments = &mut scratch.segments;
         segments.clear();
         let mut chain = root;
         let mut pos = 0u32;
@@ -874,9 +904,20 @@ impl RadixTree {
                 None => break,
             }
         }
-        if segments.is_empty() {
+    }
+
+    pub fn overlap(
+        &self,
+        chain_query: &[ContentHash],
+        scratch: &mut OverlapScratch,
+        out: &mut Vec<Overlap>,
+    ) {
+        out.clear();
+        self.match_path(chain_query, &mut scratch.segments);
+        if scratch.segments.is_empty() {
             return;
         }
+        let segments = &scratch.segments;
         // Merge holder runs along the matched path (same active-set
         // logic as the flat walk, but over spans — few per segment).
         let active = &mut scratch.active;
@@ -960,6 +1001,149 @@ impl RadixTree {
         }
         for &h in active.iter() {
             push_answer3(&self.slots, h, depth, out);
+        }
+    }
+
+    /// A holder's coverage as maximal runs per chain lineage, each with
+    /// its keys in position order and the full content path from
+    /// position 0 through the run's end (held or not). This is what a
+    /// snapshot needs to rebuild the holder on another tree at the
+    /// same positions: a run that starts past 0 is placed by its path,
+    /// not by a parent key the holder may no longer hold. Two runs at
+    /// the same positions on different lineages are two runs. Cost is
+    /// linear in the holder's blocks plus its chains times their depth;
+    /// a cold path. Runs come sorted by start, end and first key, for
+    /// deterministic output.
+    pub fn runs(&self, id: HolderId) -> Vec<HolderRun> {
+        let Some(state) = self.live(id) else {
+            return Vec::new();
+        };
+        let holder = id.parts().0;
+        let mut pos_key: FxHashMap<(u32, u32), BlockKey> = FxHashMap::default();
+        pos_key.reserve(state.keys.len());
+        for (&k, &(c, p)) in &state.keys {
+            pos_key.insert((c, p), k);
+        }
+        let mut prefix_cache: FxHashMap<u32, Vec<ContentHash>> = FxHashMap::default();
+        let mut out = Vec::new();
+        for &c in state.chains.keys() {
+            let cd = &self.chains[c as usize];
+            // Contents [0, base_pos) along this chain's ancestry.
+            let prefix = prefix_cache.entry(c).or_insert_with(|| {
+                let mut prefix = Vec::with_capacity(cd.base_pos as usize);
+                let mut cur = cd.parent;
+                while let Some((pc, fork_pos)) = cur {
+                    let pd = &self.chains[pc as usize];
+                    for p in (pd.base_pos..=fork_pos).rev() {
+                        prefix.push(pd.content_at(p));
+                    }
+                    cur = pd.parent;
+                }
+                prefix.reverse();
+                prefix
+            });
+            let mut run: Option<(u32, u32)> = None;
+            let flush = |run: &mut Option<(u32, u32)>, out: &mut Vec<HolderRun>| {
+                if let Some((start, end)) = run.take() {
+                    // The spans say the holder covers every position of
+                    // this run and `audit()` enforces that the key map
+                    // names each one ("span coverage ... has no key map
+                    // entry") — but INDEXING on that turns a skew
+                    // between the two structures into a panic here, and
+                    // `runs` is the snapshot producer: unwinding out of
+                    // it with the keyspace lock held poisons the lock,
+                    // so a bootstrap bug takes the serving replica's
+                    // queries down too. Every other read in this file
+                    // degrades instead (`live` returns None, `coverage`
+                    // skips the holder), so this one does as well. Cut
+                    // at the first unnamed position rather than skipping
+                    // it: the snapshot zips `keys` against the run's
+                    // contents positionally, so a compacted list would
+                    // ship every later block under the wrong key — a
+                    // silent divergence, where a short run only costs
+                    // the puller blocks its feed puts back.
+                    let keys: Vec<BlockKey> = (start..end)
+                        .map_while(|p| pos_key.get(&(c, p)).copied())
+                        .collect();
+                    if keys.is_empty() {
+                        return;
+                    }
+                    let end = start + keys.len() as u32;
+                    let mut path = prefix.clone();
+                    path.extend((cd.base_pos..end).map(|p| cd.content_at(p)));
+                    out.push(HolderRun {
+                        start,
+                        end,
+                        keys,
+                        path,
+                    });
+                }
+            };
+            for s in &cd.spans {
+                if s.holders.binary_search(&holder).is_err() {
+                    flush(&mut run, &mut out);
+                    continue;
+                }
+                match run {
+                    Some((_, end)) if end == s.start => {
+                        run = Some((run.expect("some").0, s.start + s.len))
+                    }
+                    _ => {
+                        flush(&mut run, &mut out);
+                        run = Some((s.start, s.start + s.len));
+                    }
+                }
+            }
+            flush(&mut run, &mut out);
+        }
+        out.sort_by(|a, b| (a.start, a.end, a.keys.first()).cmp(&(b.start, b.end, b.keys.first())));
+        out
+    }
+
+    /// The content path from position 0 through the position at which
+    /// `holder` holds `key` — every position's content along that
+    /// chain lineage, held or not. A snapshot of a holder whose coverage
+    /// has holes needs the uncovered head of each run to place the run
+    /// at the same positions on another tree; the holder's own keys
+    /// cannot supply it (a hole has no key). O(depth); cold path.
+    pub fn path_contents(&self, id: HolderId, key: BlockKey) -> Option<Vec<ContentHash>> {
+        let state = self.live(id)?;
+        let &(chain, pos) = state.keys.get(&key)?;
+        let mut out = Vec::with_capacity(pos as usize + 1);
+        let mut cur = Some((chain, pos));
+        while let Some((c, upto)) = cur {
+            let cd = &self.chains[c as usize];
+            // This chain's contents from its base through `upto`,
+            // pushed in reverse; the whole path is reversed at the end.
+            for p in (cd.base_pos..=upto).rev() {
+                out.push(cd.content_at(p));
+            }
+            cur = cd.parent;
+        }
+        out.reverse();
+        debug_assert_eq!(out.len(), pos as usize + 1);
+        Some(out)
+    }
+
+    /// Every block the holder holds, as `(pos, key, content)` in NO
+    /// defined order and with no allocation: the key map's iteration
+    /// order, which changes with its contents.
+    ///
+    /// [`Self::enumerate`] sorts because `snapshot_holder`'s chunks are
+    /// parent-linked and only reconstruct in position order. A
+    /// COMMUTATIVE consumer — the anti-entropy digest is an xor plus a
+    /// wrapping sum — buys that order and throws it away, paying an
+    /// O(blocks) `Vec` and an O(n log n) sort PER HOLDER on every
+    /// anti-entropy round, on both replicas, while the read path it
+    /// shares a process with is answering against a low-millisecond
+    /// routing deadline. Take this walk whenever the result cannot
+    /// depend on order; take `enumerate` when it can.
+    pub fn for_each_block(&self, id: HolderId, mut visit: impl FnMut(u32, BlockKey, ContentHash)) {
+        let Some(state) = self.live(id) else {
+            return;
+        };
+        for (&key, &(chain, pos)) in &state.keys {
+            visit(pos, key, self.chains[chain as usize].content_at(pos));
         }
     }
 
@@ -1621,6 +1805,79 @@ enum Placed {
     Duplicate,
 }
 
+impl RadixTree {
+    /// §6b coverage: every holder's covered runs along the query path,
+    /// not just the consecutive depth from position 0. A holder whose
+    /// coverage has holes (an engine that evicts a window's tail, or
+    /// keeps only checkpoint positions) is reported as several runs;
+    /// `overlap` would report it as depth 0 or the first run only. The
+    /// walk is the same trie descent as `overlap`; the merge is per
+    /// span × holder instead of the active-set intersection, so the
+    /// cost is O(covered positions' span count × holders per span).
+    /// `out` is cleared and left sorted by (holder, start).
+    pub fn coverage(
+        &self,
+        chain_query: &[ContentHash],
+        scratch: &mut OverlapScratch,
+        out: &mut Vec<CoverageRun>,
+    ) {
+        out.clear();
+        self.match_path(chain_query, &mut scratch.segments);
+        if scratch.segments.is_empty() {
+            return;
+        }
+        let last_run = &mut scratch.last_run;
+        let touched = &mut scratch.touched;
+        if last_run.len() < self.slots.len() {
+            last_run.resize(self.slots.len(), 0);
+        }
+        for &(c, from, to) in &scratch.segments {
+            let cd = &self.chains[c as usize];
+            let mut p = from;
+            while p < to {
+                let Some(i) = cd.span_index(p) else {
+                    // Uncovered position: skip to the next span start.
+                    let next = cd.spans.partition_point(|s| s.start <= p);
+                    match cd.spans.get(next) {
+                        Some(s) if s.start < to => p = s.start,
+                        _ => break,
+                    }
+                    continue;
+                };
+                let s = &cd.spans[i];
+                let run_end = (s.start + s.len).min(to);
+                for &h in s.holders.iter() {
+                    let slot = h as usize;
+                    let open = last_run[slot];
+                    if open != 0 && out[(open - 1) as usize].end == p {
+                        out[(open - 1) as usize].end = run_end;
+                    } else {
+                        let Some(state) = self.slots[slot].state.as_ref() else {
+                            continue;
+                        };
+                        if open == 0 {
+                            touched.push(h);
+                        }
+                        out.push(CoverageRun {
+                            holder: HolderId::assemble(h, self.slots[slot].generation),
+                            start: p,
+                            end: run_end,
+                            total_blocks: state.keys.len() as u64,
+                        });
+                        last_run[slot] = out.len() as u32;
+                    }
+                }
+                p = run_end;
+            }
+        }
+        for &h in touched.iter() {
+            last_run[h as usize] = 0;
+        }
+        touched.clear();
+        out.sort_unstable_by_key(|r| (r.holder.index, r.start));
+    }
+}
+
 fn push_answer3(slots: &[Slot3], holder: u32, depth: u32, out: &mut Vec<Overlap>) {
     if depth == 0 {
         return;
@@ -1701,5 +1958,89 @@ mod audit_tests {
         assert_eq!(t.evict_oldest(h, 1), 5, "eviction reaches the ceiling");
         assert_eq!(t.state_of(holder).keys.len(), 1);
         t.audit().expect("recovery erases the disagreement");
+    }
+
+    /// `runs` feeds the snapshot producer while the caller holds its
+    /// keyspace lock, so the same skew must degrade to a short run
+    /// rather than unwind: a panic there poisons that lock and takes
+    /// the serving replica's queries down with the bootstrap.
+    #[test]
+    fn runs_cuts_short_when_the_key_map_loses_a_covered_position() {
+        let mut t = RadixTree::new(Config::default());
+        let h = t.create_holder("w1");
+        t.store(h, None, &[(100, 1), (101, 2), (102, 3)])
+            .expect("store");
+        assert_eq!(t.runs(h).len(), 1, "one contiguous run to start");
+
+        // Drop the middle key but leave its span membership standing.
+        let holder = h.parts().0;
+        t.state_of_mut(holder).keys.remove(&101);
+        assert!(t.audit().is_err(), "the skew is an audit violation");
+
+        let runs = t.runs(h);
+        assert_eq!(runs.len(), 1, "the run is cut, not dropped or split");
+        assert_eq!((runs[0].start, runs[0].end), (0, 1));
+        assert_eq!(runs[0].keys, vec![100]);
+        assert_eq!(
+            runs[0].path.len(),
+            1,
+            "the content path stays in step with the keys"
+        );
+    }
+
+    /// The unsorted digest walk and the sorted snapshot walk must see
+    /// exactly the same triples: anti-entropy compares one replica's
+    /// fold against the other's, so a set that differs by even one
+    /// block makes the two disagree forever — a Pull storm that no
+    /// amount of pulling settles.
+    #[test]
+    fn for_each_block_visits_the_same_set_as_enumerate() {
+        let mut t = RadixTree::new(Config::default());
+        let h = t.create_holder("w1");
+        t.store(h, None, &[(100, 1), (101, 2), (102, 3)])
+            .expect("store");
+        // A fork off position 1 and a second root: more than one chain,
+        // so the walk cannot pass by visiting a single contents array.
+        t.store(h, Some(101), &[(200, 7)]).expect("fork");
+        t.store(h, None, &[(300, 9)]).expect("second root");
+
+        let mut unsorted: Vec<(u32, BlockKey, ContentHash)> = Vec::new();
+        t.for_each_block(h, |pos, key, content| unsorted.push((pos, key, content)));
+        let sorted: Vec<(u32, BlockKey, ContentHash)> = t.enumerate(h).collect();
+        assert_eq!(unsorted.len(), 5);
+        unsorted.sort_unstable();
+        assert_eq!(unsorted, sorted, "same triples, order aside");
+        let mut still_ordered = sorted.clone();
+        still_ordered.sort_unstable();
+        assert_eq!(
+            sorted, still_ordered,
+            "`enumerate` still hands back position order for the snapshot"
+        );
+
+        t.clear(h);
+        let mut visited = 0u32;
+        t.for_each_block(h, |_, _, _| visited += 1);
+        assert_eq!(visited, 0, "a cleared holder folds to nothing");
+    }
+
+    /// A residency confirm that applies nothing must still count as a
+    /// publish, or the chains a caller keeps confirming — the cheapest
+    /// ones it has — are evicted before the chains it had to send whole.
+    #[test]
+    fn touch_chain_at_makes_a_confirmed_chain_the_most_recent() {
+        let mut t = RadixTree::new(Config::default());
+        let h = t.create_holder("w1");
+        t.store(h, None, &[(100, 1), (101, 2)]).expect("store");
+        t.store(h, None, &[(200, 11), (201, 12)]).expect("store");
+        assert!(t.touch_chain_at(h, 101), "the holder holds the tip");
+        assert!(!t.touch_chain_at(h, 999), "an unheld key touches nothing");
+
+        // Room for one chain: the confirmed one outlives the chain that
+        // was stored after it.
+        assert_eq!(t.evict_oldest(h, 2), 2);
+        assert_eq!(t.position_of(h, 100), Some(0));
+        assert_eq!(t.position_of(h, 101), Some(1));
+        assert_eq!(t.position_of(h, 200), None, "untouched chain went first");
+        t.audit().expect("audit");
     }
 }

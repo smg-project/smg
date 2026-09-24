@@ -1,0 +1,3618 @@
+//! The index engine: one `radix_tree::RadixTree` per keyspace, with
+//! epoch-scoped holder state, per-feed eviction semantics, and
+//! overlap queries. Pure and synchronous apart from one cooperative
+//! yield point for runtime callers (`holder_digests_yielding`) — the
+//! gRPC surface, relay, and bootstrap live in `server.rs`.
+//!
+//! Correctness model (see `.claude/kv-index-service/01-design.md`):
+//! - Event feed: one worker-sequenced stream per (holder, epoch); apply
+//!   in order, dedup on `seq <= last_seq`, batch-shaped (one seq may mix
+//!   Stored and Removed).
+//! - Placement feed: unsequenced (`seq == 0`), idempotent by content —
+//!   publishers synthesize identical chains for identical prefixes, so
+//!   cross-publisher ordering never matters.
+//! - Epochs: a higher epoch clears all lower-epoch state for the holder;
+//!   lower-epoch updates are dropped. Restarts and cursor loss are both
+//!   epoch bumps, which is what makes relaying `Cleared` safe.
+//! - Feed authority: a holder becomes event-fed on its first observed
+//!   removal (or an explicit `Added { event_fed: true }`); inferred
+//!   Stored updates for an event-fed holder are dropped.
+//! - Freshness is holder-granular: idle inferred holders are cleared
+//!   by TTL, idle dropped holders are RETIRED entirely. Capacity is
+//!   runaway protection only (truncate past 2x declared, tail-first
+//!   and prefix-closed) — the placement feed has no removal signal,
+//!   so index-side eviction must never race the worker's own.
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use radix_tree::{
+    Config as TreeConfig, CoverageRun, HolderId, OverlapScratch, RadixTree, StoreError,
+};
+
+use crate::{server::LatencyHistogram, ContentHash, SequenceHash};
+
+/// One block on the wire: position-chained identity + content identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireBlock {
+    pub seq_hash: SequenceHash,
+    pub content_hash: ContentHash,
+}
+
+/// A cache transition within one update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireEvent {
+    Stored {
+        parent: Option<SequenceHash>,
+        blocks: Vec<WireBlock>,
+    },
+    Removed {
+        seq_hashes: Vec<SequenceHash>,
+    },
+    Cleared,
+    /// Duplicate-placement digest (see proto `StoredDigest`): confirm a
+    /// chain is already held without its blocks, or miss and force a
+    /// full resend.
+    StoredDigest {
+        parent: Option<SequenceHash>,
+        tip: SequenceHash,
+        len: u32,
+    },
+}
+
+/// Key of a snapshot placeholder block: the uncovered head of a run is
+/// shipped under keys no publisher can emit (a mix of the content, its
+/// position and a private tag) and removed again in the same snapshot.
+fn snapshot_placeholder_key(content: ContentHash, pos: u32) -> SequenceHash {
+    let mixed = (content.0 ^ 0x5A5A_F00D_C0FF_EE11)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(17)
+        ^ u64::from(pos).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    SequenceHash(mixed | 1)
+}
+
+/// Separator between a worker name and one of its lanes in a holder
+/// name (`worker#lane`): a lane is one independently evicted position
+/// set of a worker, published as its own holder. Lifecycle control for
+/// the worker applies to its lanes too.
+pub const LANE_SEPARATOR: char = '#';
+
+/// Membership / capacity control payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AddedControl {
+    pub capacity_blocks: u64,
+    pub event_fed: bool,
+    /// Opaque publisher metadata, kept on the holder and echoed on every
+    /// answer (`HolderScore::lane_meta`). Empty means "no claim": a bare
+    /// lifecycle re-announce never clears standing metadata. The index
+    /// never interprets it; a publisher that splits one worker into
+    /// several independently evicted holders (`worker#lane`) uses it to
+    /// tell the consumer what each lane is.
+    pub metadata: Vec<u8>,
+}
+
+/// One `Publish` message, decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateMsg {
+    pub keyspace: KeyspaceKey,
+    pub holder: String,
+    pub epoch: u64,
+    /// 0 = unsequenced (placement / control), else the holder's batch seq.
+    pub seq: u64,
+    pub events: Vec<WireEvent>,
+    pub added: Option<AddedControl>,
+    pub dropped: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    /// Dropped as a duplicate / stale seq or stale epoch.
+    Deduped,
+    /// Inferred Stored dropped because the holder is event-fed.
+    FeedRejected,
+    /// Keyspace block_size conflict — publisher misconfigured.
+    KeyspaceMismatch,
+    /// A `StoredDigest` the index could not confirm; the publisher must
+    /// resend the chain in full (never a silent under-match).
+    DigestMiss,
+    /// The tree refused a `Stored` (chain past `max_chain_len`, or a
+    /// holder that vanished between the lookup and the store). Not
+    /// reachable with today's limits, but never silently `Applied`:
+    /// the blocks did NOT land, and an ack claiming otherwise would be
+    /// exactly the silent under-match the digest path forbids.
+    StoreRejected,
+}
+
+/// What one applied update resolved to — the fields a publisher ack
+/// carries. Named (not a tuple): `last_seq` and `epoch` are both `u64`
+/// and positional confusion between them is exactly how a wrong ack
+/// would silently break the bridge's restart adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    pub outcome: ApplyOutcome,
+    /// The holder's event-feed watermark AFTER this apply.
+    pub last_seq: u64,
+    /// The holder's STORED epoch after this apply — deliberately not the
+    /// update's own epoch. Acks echo this so a restarted publisher (local
+    /// epoch back at 1) learns the surviving index's real epoch and
+    /// adopts past it, instead of feeding dead-on-arrival updates.
+    pub epoch: u64,
+    /// Whether state changed (the relay gate: echoes die in one hop).
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolKind {
+    Tokens,
+    Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeyspaceKey {
+    pub model: String,
+    pub symbol_kind: SymbolKind,
+    pub block_size: u32,
+}
+
+/// Per-holder score in a query answer.
+///
+/// CONTRACT, and it is not the one the depth-only answer had: a holder
+/// is scored for ANY overlap with the query path, so `matched_blocks
+/// == 0` alongside a non-empty `intervals` is a normal answer — a
+/// holder that evicted its prefix and kept a mid-chain block reaches
+/// the consumer exactly like a position-set lane would. A consumer
+/// that means "has a usable prefix" must therefore test
+/// `matched_blocks > 0` (or the run at position 0) and NEVER the
+/// emptiness of the answer list: a query that nothing has a prefix for
+/// comes back as a non-empty list of zero-depth holders, and a gateway
+/// reading that as "cache-hit candidates exist, take the head" routes
+/// to a worker with no prefix at all instead of falling through to
+/// load-based placement. The ordering keeps such holders last (depth
+/// descending), but only the field says whether one is usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderScore {
+    pub holder: String,
+    /// Consecutive covered blocks from position 0; 0 when the holder's
+    /// coverage of the query starts past position 0.
+    pub matched_blocks: u32,
+    pub total_blocks: u64,
+    pub event_fed: bool,
+    /// Every covered `[start, end)` run along the query path, in path
+    /// order; `matched_blocks` is the first run's end when it starts at 0.
+    pub intervals: Vec<(u32, u32)>,
+    /// The holder's `AddedControl::metadata`, verbatim.
+    pub lane_meta: Vec<u8>,
+}
+
+pub struct EngineConfig {
+    /// Idle TTL for INFERRED holder state; an inferred holder with no
+    /// publish inside the window is cleared entirely (coarse but
+    /// prefix-closed). Event-fed holders' BLOCK eviction is observed,
+    /// never TTL'd; their liveness backstop is `event_ttl`.
+    pub inferred_ttl: Duration,
+    /// Liveness BACKSTOP for event-fed holders whose fleet-departure
+    /// signal was lost (the primary signal is the gateway's removal
+    /// workflow publishing `dropped`; a gateway crash mid-workflow
+    /// loses it, and before this backstop such a holder persisted
+    /// FOREVER — liveness review finding). An event-fed holder silent
+    /// for this window is soft-retired (`dropped`), which stops its
+    /// scoring and starts the retire clock; a next observed event
+    /// batch self-heals it. Keep an order of magnitude above
+    /// `inferred_ttl`; zero disables the backstop.
+    pub event_ttl: Duration,
+    /// Default capacity (blocks) for inferred holders that never sent
+    /// `Added`.
+    pub default_capacity_blocks: u64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            inferred_ttl: Duration::from_secs(180),
+            event_ttl: Duration::from_secs(1800),
+            default_capacity_blocks: u64::MAX,
+        }
+    }
+}
+
+struct HolderState {
+    id: HolderId,
+    epoch: u64,
+    last_seq: u64,
+    event_fed: bool,
+    capacity_blocks: u64,
+    /// Opaque publisher metadata (`AddedControl::metadata`), echoed on
+    /// answers and carried by snapshots.
+    metadata: Vec<u8>,
+    dropped: bool,
+    /// `dropped` was set by the `event_ttl` silence backstop rather than
+    /// by a real departure signal. Such a holder keeps its entry AND its
+    /// blocks until `INFERRED_RETIRE_MULTIPLIER` × `event_ttl` of
+    /// silence: the event feed carries only deltas, so a worker whose
+    /// cache is still resident but quiet must find its state intact when
+    /// its next batch heals the soft-retire — retiring it one sweep later
+    /// would permanently under-match everything it cached before.
+    soft_retired: bool,
+    /// Nanoseconds since `Engine::start` — atomic so the shared-lock
+    /// duplicate fast path can refresh freshness WITHOUT the keyspace
+    /// write lock (a holder fed only by duplicate placements must not
+    /// TTL out).
+    last_publish_ns: std::sync::atomic::AtomicU64,
+}
+
+struct KeyspaceState {
+    tree: RadixTree,
+    holders: HashMap<String, HolderState>,
+}
+
+/// An inferred (placement-fed) holder silent for this many
+/// `inferred_ttl` windows is retired outright (its entry removed), not
+/// merely cleared, so its keyspace can be garbage-collected once empty.
+const INFERRED_RETIRE_MULTIPLIER: u32 = 2;
+
+/// Poisoned-lock policy: a panic mid-mutation leaves state that must
+/// never be served; crash so the replica re-bootstraps clean from a
+/// sibling.
+const LOCK_MSG: &str = "engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling";
+
+/// The engine: all keyspaces, locked at TWO levels. The outer RwLock
+/// guards only the keyspace map (creation/removal — rare); every
+/// keyspace lives behind its own RwLock. Queries take the SHARED side
+/// with caller-owned scratch, and so does the duplicate fast path —
+/// the >=90%-duplicate multi-gateway placement stream and all
+/// routing-time queries proceed concurrently, while only genuinely
+/// state-changing applies take the exclusive side (the multi-writer
+/// baseline measured 50-390x query-p99 degradation when every
+/// duplicate held an exclusive lock for its full chain walk).
+/// Convergence arguments are unaffected: all wire-visible ordering
+/// (epoch, seq, feed authority) is per HOLDER, and a holder lives in
+/// exactly one keyspace.
+pub struct Engine {
+    cfg: EngineConfig,
+    /// Basis for the per-holder atomic freshness stamps.
+    start: Instant,
+    keyspaces: std::sync::RwLock<HashMap<KeyspaceKey, Arc<std::sync::RwLock<KeyspaceState>>>>,
+    /// Capacity cuts run under the keyspace write lock, so this is the
+    /// write-lock hold time queries stall behind — and it is a
+    /// HISTOGRAM, not a count plus a since-boot maximum. A `fetch_max`
+    /// gauge only ever rises, so the one pathological cut of a
+    /// bootstrap flood pins it for the life of the process and every
+    /// windowed query an operator would write ("did a cut hold the
+    /// lock past the query deadline recently?") reads the all-time
+    /// worst instead: a fleet that has recovered stays
+    /// indistinguishable from one still cutting badly. The buckets
+    /// give the recent tail back, and `_sum`/`_count` still carry the
+    /// total and the count the gauge pair used to.
+    cut_latency: LatencyHistogram,
+}
+
+impl Engine {
+    pub fn new(cfg: EngineConfig) -> Self {
+        Self {
+            cfg,
+            start: Instant::now(),
+            keyspaces: std::sync::RwLock::new(HashMap::new()),
+            cut_latency: LatencyHistogram::default(),
+        }
+    }
+
+    /// Capacity-cut durations, ready to render as
+    /// `radix_index_capacity_cut_duration_seconds`. Bucket-for-bucket
+    /// comparable with the apply histogram, which already contains this
+    /// time: `enforce_capacity` runs inside the timed apply.
+    pub fn cut_latency(&self) -> &LatencyHistogram {
+        &self.cut_latency
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
+    }
+
+    fn space(&self, key: &KeyspaceKey) -> Option<Arc<std::sync::RwLock<KeyspaceState>>> {
+        self.keyspaces.read().expect(LOCK_MSG).get(key).cloned()
+    }
+
+    fn space_or_create(&self, key: &KeyspaceKey) -> Arc<std::sync::RwLock<KeyspaceState>> {
+        if let Some(space) = self.space(key) {
+            return space;
+        }
+        self.keyspaces
+            .write()
+            .expect(LOCK_MSG)
+            .entry(key.clone())
+            .or_insert_with(|| {
+                Arc::new(std::sync::RwLock::new(KeyspaceState {
+                    tree: RadixTree::new(TreeConfig::default()),
+                    holders: HashMap::new(),
+                }))
+            })
+            .clone()
+    }
+
+    /// Stable iteration set for the cross-keyspace paths: each entry is
+    /// then locked INDIVIDUALLY, so the walk never freezes the engine.
+    fn all_spaces(&self) -> Vec<(KeyspaceKey, Arc<std::sync::RwLock<KeyspaceState>>)> {
+        self.keyspaces
+            .read()
+            .expect(LOCK_MSG)
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Apply one update. Returns what happened, the holder's applied
+    /// watermark for the publisher's ack, and whether OBSERVABLE STATE
+    /// CHANGED — the relay forwards only changing applies, so a
+    /// symmetric-peer echo dies in one hop instead of ping-ponging
+    /// forever (the metrics timeline caught ~190x apply amplification
+    /// from exactly that loop).
+    pub fn apply(&self, update: &UpdateMsg) -> Applied {
+        // A keyspace is created on first contact; a later publisher whose
+        // key differs only in block_size is a DIFFERENT keyspace by key
+        // construction, so mismatch cannot silently merge. Reject only
+        // the degenerate block size.
+        if update.keyspace.block_size == 0 {
+            return Applied {
+                outcome: ApplyOutcome::KeyspaceMismatch,
+                last_seq: 0,
+                epoch: 0,
+                changed: false,
+            };
+        }
+        if update.events.is_empty() && (update.added.is_some() || update.dropped) {
+            return self.apply_lifecycle(update);
+        }
+        let space = self.space_or_create(&update.keyspace);
+
+        // SHARED-lock duplicate fast path: the multi-gateway steady
+        // state is every gateway re-publishing hot placement chains.
+        // A placement whose chain the holder fully holds changes
+        // NOTHING — resolve it under the read lock (concurrent with
+        // queries and with each other) and never touch the write side.
+        // Conditions are exactly the shapes whose slow-path outcome is
+        // Applied with changed=false: plain same-epoch placement Stored
+        // for a known non-event-fed holder. One deliberate divergence:
+        // the slow path's runaway-capacity truncate is skipped — a
+        // fully-covered duplicate adds zero blocks, so the bound cannot
+        // be NEWLY exceeded here; a bound already exceeded (possible
+        // only via a later capacity shrink) is enforced on the next
+        // non-duplicate store.
+        if update.seq == 0 && update.added.is_none() && !update.dropped {
+            if let [WireEvent::Stored { parent, blocks }] = update.events.as_slice() {
+                let pairs: Vec<(u64, u64)> = blocks
+                    .iter()
+                    .map(|b| (b.seq_hash.0, b.content_hash.0))
+                    .collect();
+                // The read-side walk answers both placement questions
+                // and counts as a publish for the capacity cut's
+                // recency order (a hot prefix republished every round
+                // must not age out):
+                // fully covered => return without any exclusive work;
+                // covered PREFIX => the exclusive section applies only
+                // the suffix, re-anchored at the last plain-duplicate
+                // key (a fresh 32-block tail on a hot 256-block prefix
+                // holds the write lock for the 32, not the 288 — the
+                // full-batch hold is what starved queries in the
+                // multi-writer baseline).
+                let mut split: Option<(u64, usize)> = None;
+                {
+                    let shared = space.read().expect(LOCK_MSG);
+                    if let Some(holder) = shared.holders.get(&update.holder) {
+                        if !holder.event_fed && !holder.dropped && update.epoch == holder.epoch {
+                            let (run, all) = shared.tree.dup_prefix_touch(
+                                holder.id,
+                                parent.map(|p| p.0),
+                                &pairs,
+                            );
+                            if all {
+                                holder
+                                    .last_publish_ns
+                                    .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
+                                return Applied {
+                                    outcome: ApplyOutcome::Applied,
+                                    last_seq: holder.last_seq,
+                                    epoch: holder.epoch,
+                                    changed: false,
+                                };
+                            }
+                            if run > 0 {
+                                split = Some((pairs[run as usize - 1].0, run as usize));
+                            }
+                        }
+                    }
+                }
+                if let Some((anchor, run)) = split {
+                    if let Some(result) = self.apply_placement_suffix(
+                        &space,
+                        update,
+                        parent.map(|p| p.0),
+                        &pairs,
+                        anchor,
+                        run,
+                    ) {
+                        return result;
+                    }
+                    // Posture changed between the locks (epoch bump,
+                    // feed flip, retire): the general path re-resolves.
+                }
+            }
+
+            // Digest fast path: a duplicate placement that carries NO
+            // blocks, only {parent, tip, len}. Confirmed with one
+            // read-lock key lookup (prefix-closed => tip at the
+            // expected position proves full coverage); a miss returns
+            // DigestMiss so the publisher resends the chain in full.
+            if let [WireEvent::StoredDigest { parent, tip, len }] = update.events.as_slice() {
+                let shared = space.read().expect(LOCK_MSG);
+                if let Some(holder) = shared.holders.get(&update.holder) {
+                    if holder.event_fed || holder.dropped || update.epoch != holder.epoch {
+                        return Applied {
+                            outcome: ApplyOutcome::DigestMiss,
+                            last_seq: holder.last_seq,
+                            epoch: holder.epoch,
+                            changed: false,
+                        };
+                    }
+                    let start_pos = match parent {
+                        None => Some(0u32),
+                        Some(p) => shared.tree.position_of(holder.id, p.0).map(|pp| pp + 1),
+                    };
+                    // `len` is wire-controlled: the tip-position compare
+                    // uses checked arithmetic so an absurd length can
+                    // never wrap into a false confirmation (a wrap in a
+                    // release build would be the exact silent under-match
+                    // digests are forbidden to produce); overflow => miss.
+                    let confirmed = *len > 0
+                        && start_pos.is_some_and(|start| {
+                            start.checked_add(*len - 1).is_some_and(|tip_pos| {
+                                shared.tree.position_of(holder.id, tip.0) == Some(tip_pos)
+                            })
+                        });
+                    if confirmed {
+                        // A confirm is a publish for the CHAIN, not just
+                        // for the holder: nothing is applied here, so
+                        // without the touch the chain keeps the recency
+                        // tick of its last FULL send while every cold
+                        // chain sent in full gets a fresh one, and
+                        // `evict_oldest` (ascending tick) then retires
+                        // the hot chain first — its next digest misses,
+                        // the publisher resends it whole, the worker
+                        // re-prefills, and the cycle repeats. The
+                        // holder-level `last_publish_ns` below is the
+                        // silence backstop and says nothing about which
+                        // chain is hot. Touching the tip's chain is
+                        // enough: the cut propagates a chain's tick to
+                        // its covered ancestors.
+                        shared.tree.touch_chain_at(holder.id, tip.0);
+                        holder
+                            .last_publish_ns
+                            .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
+                        return Applied {
+                            outcome: ApplyOutcome::Applied,
+                            last_seq: holder.last_seq,
+                            epoch: holder.epoch,
+                            changed: false,
+                        };
+                    }
+                }
+                // Unknown holder or unconfirmed: force a full resend.
+                let (last_seq, epoch) = shared
+                    .holders
+                    .get(&update.holder)
+                    .map_or((0, 0), |h| (h.last_seq, h.epoch));
+                return Applied {
+                    outcome: ApplyOutcome::DigestMiss,
+                    last_seq,
+                    epoch,
+                    changed: false,
+                };
+            }
+        }
+
+        let mut space = space.write().expect(LOCK_MSG);
+        self.apply_locked(&mut space, update)
+    }
+
+    /// Lifecycle-only updates (`added` / `dropped`, no events) are
+    /// fleet-membership signals about a WORKER, not about one keyspace:
+    /// a removed worker holds nothing in any keyspace, and a rejoining
+    /// one must heal a soft-retire wherever it stands. So the signal is
+    /// applied to every keyspace of the update's model in which the
+    /// holder exists — any symbol kind, any block size. A bare
+    /// re-announce or a `dropped` never creates a keyspace or holder (a
+    /// string-mode-only fleet would otherwise mint a phantom `Tokens`
+    /// keyspace per removal, and a `Bytes` holder could never be
+    /// retired by the gateway's signal); a SUBSTANTIVE `Added` (a
+    /// declared capacity or feed authority) is a worker announcing
+    /// itself and does create the holder in the named keyspace when it
+    /// exists nowhere yet. The ack carries the named keyspace's
+    /// watermark when the holder lives there, else the first keyspace
+    /// it was found in.
+    fn apply_lifecycle(&self, update: &UpdateMsg) -> Applied {
+        let mut result = Applied {
+            outcome: ApplyOutcome::Applied,
+            last_seq: 0,
+            epoch: 0,
+            changed: false,
+        };
+        let mut named_seen = false;
+        let mut found_any = false;
+        for (key, space_arc) in self.all_spaces() {
+            if key.model != update.keyspace.model {
+                continue;
+            }
+            let mut space = space_arc.write().expect(LOCK_MSG);
+            // A lifecycle signal names the WORKER; a publisher that split
+            // the worker into lanes (`worker#lane`) never sees the
+            // gateway's add/drop, so the signal fans out to every lane
+            // as a bare membership control (no capacity or metadata
+            // claim: those are the lane publisher's).
+            let lanes: Vec<String> = if update.holder.contains(LANE_SEPARATOR) {
+                Vec::new()
+            } else {
+                let prefix = format!("{}{LANE_SEPARATOR}", update.holder);
+                space
+                    .holders
+                    .keys()
+                    .filter(|name| name.starts_with(&prefix))
+                    .cloned()
+                    .collect()
+            };
+            for lane in lanes {
+                let control = UpdateMsg {
+                    holder: lane,
+                    added: update.added.as_ref().map(|_| AddedControl::default()),
+                    ..update.clone()
+                };
+                result.changed |= self.apply_locked(&mut space, &control).changed;
+                found_any = true;
+            }
+            if !space.holders.contains_key(&update.holder) {
+                continue;
+            }
+            let applied = self.apply_locked(&mut space, update);
+            result.changed |= applied.changed;
+            found_any = true;
+            if key == update.keyspace || !named_seen {
+                result.last_seq = applied.last_seq;
+                result.epoch = applied.epoch;
+                named_seen |= key == update.keyspace;
+            }
+        }
+        let substantive = update
+            .added
+            .as_ref()
+            .is_some_and(|a| a.capacity_blocks != 0 || a.event_fed);
+        if !found_any && substantive {
+            let space = self.space_or_create(&update.keyspace);
+            let mut space = space.write().expect(LOCK_MSG);
+            return self.apply_locked(&mut space, update);
+        }
+        result
+    }
+
+    /// Apply a run of updates, taking each keyspace's write lock ONCE
+    /// for its whole same-keyspace run instead of once per update.
+    /// Under a heavy event stream this cuts write-lock acquisitions
+    /// ~batch-fold, so the shared-lock queries get real gaps between
+    /// write bursts instead of ping-ponging against a per-event
+    /// writer. The result is IDENTICAL to applying each update
+    /// individually in order (only the lock granularity changes, never
+    /// the semantics — asserted by `apply_batch_equals_sequential`).
+    ///
+    /// This path is for the SEQUENCED event feed; it deliberately does
+    /// not run the read-lock placement/digest fast paths (those updates
+    /// go through `apply`), so a digest reaching here is a miss.
+    pub fn apply_batch(&self, updates: &[UpdateMsg]) -> Vec<Applied> {
+        let mut out = Vec::with_capacity(updates.len());
+        let mut i = 0;
+        while i < updates.len() {
+            if updates[i].keyspace.block_size == 0 {
+                out.push(Applied {
+                    outcome: ApplyOutcome::KeyspaceMismatch,
+                    last_seq: 0,
+                    epoch: 0,
+                    changed: false,
+                });
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < updates.len() && updates[j].keyspace == updates[i].keyspace {
+                j += 1;
+            }
+            let space = self.space_or_create(&updates[i].keyspace);
+            // Apply the same-keyspace run in bounded sub-batches, RELEASING
+            // and re-acquiring the write lock between them, so shared-lock
+            // queries get a window every SUB_BATCH applies instead of
+            // waiting behind the whole run. Caps the query-latency tail
+            // under a heavy write burst without a per-update lock grab.
+            const SUB_BATCH: usize = 16;
+            let mut k = i;
+            while k < j {
+                let end = (k + SUB_BATCH).min(j);
+                {
+                    let mut guard = space.write().expect(LOCK_MSG);
+                    for u in &updates[k..end] {
+                        out.push(self.apply_locked(&mut guard, u));
+                    }
+                }
+                k = end;
+            }
+            i = j;
+        }
+        out
+    }
+
+    /// The exclusive-lock write path: apply one update to an
+    /// already-write-locked keyspace.
+    fn apply_locked(&self, space: &mut KeyspaceState, update: &UpdateMsg) -> Applied {
+        if !space.holders.contains_key(&update.holder) {
+            let id = space.tree.create_holder(&update.holder);
+            space.holders.insert(
+                update.holder.clone(),
+                HolderState {
+                    metadata: Vec::new(),
+                    id,
+                    epoch: update.epoch,
+                    last_seq: 0,
+                    event_fed: false,
+                    capacity_blocks: self.cfg.default_capacity_blocks,
+                    dropped: false,
+                    soft_retired: false,
+                    last_publish_ns: std::sync::atomic::AtomicU64::new(self.now_ns()),
+                },
+            );
+        }
+        let tree = &mut space.tree;
+        let holder = space
+            .holders
+            .get_mut(&update.holder)
+            .expect("holder inserted above");
+
+        let mut changed = false;
+
+        // Control payloads (membership lifecycle) apply BEFORE the
+        // epoch gate: the gateway's removal workflow publishes
+        // `dropped` at whatever epoch it last saw, while the bridge
+        // may have bumped the holder past it — a lifecycle signal
+        // silently discarded on epoch mismatch is a holder leak (the
+        // liveness review caught exactly this: `dropped` at epoch 1
+        // vs a bridge on epoch 2 was Deduped).
+        //
+        // `changed` is gated on ACTUAL transitions, never on the
+        // payload's presence: the relay forwards changing applies to
+        // peers, and a peer re-applying an already-standing added/
+        // dropped must be a no-op or symmetric replicas ping-pong the
+        // lifecycle echo forever (the same loop the ~190x Stored echo
+        // amplification came from).
+        if let Some(added) = &update.added {
+            // Zero means "no capacity claim" — leave the standing
+            // value: a bare lifecycle re-announce must not clobber a
+            // worker-declared capacity back to the default.
+            if added.capacity_blocks != 0 && holder.capacity_blocks != added.capacity_blocks {
+                holder.capacity_blocks = added.capacity_blocks;
+                changed = true;
+            }
+            if added.event_fed && !holder.event_fed {
+                holder.event_fed = true;
+                changed = true;
+            }
+            if !added.metadata.is_empty() && holder.metadata != added.metadata {
+                holder.metadata.clone_from(&added.metadata);
+                changed = true;
+            }
+            if holder.dropped {
+                holder.dropped = false;
+                holder.soft_retired = false;
+                changed = true;
+            }
+        }
+        if update.dropped {
+            // The silence backstop sets BOTH flags, so an explicit drop
+            // arriving afterwards has no `dropped` transition to ride:
+            // without the downgrade it is a no-op and the holder sits
+            // out `INFERRED_RETIRE_MULTIPLIER` x `event_ttl` of silence
+            // instead of retiring one `inferred_ttl` after the departure
+            // signal, which is the ordering the sweep promises.
+            //
+            // The downgrade is a transition in its own right, so it
+            // RELAYS. A peer that soft-retired the same holder on its
+            // own clock would otherwise keep the corpse for the whole
+            // backstop window and hand it back the moment our
+            // retirement tombstone expired — the drop undone
+            // fleet-wide. The echo still terminates, one hop later than
+            // the rest: the peer's own downgrade leaves both flags
+            // settled here, so the return trip reports no change.
+            if holder.soft_retired {
+                holder.soft_retired = false; // a real departure signal
+                changed = true;
+            }
+            if !holder.dropped {
+                holder.dropped = true;
+                changed = true;
+            }
+        }
+
+        // Epoch gate: higher epoch supersedes (implicit clear), lower is
+        // dropped, equal proceeds. A bump is proof of life — a new feed
+        // generation exists, so a standing soft-retire is healed.
+        if update.epoch > holder.epoch {
+            tree.clear(holder.id);
+            holder.epoch = update.epoch;
+            holder.last_seq = 0;
+            if !update.dropped {
+                holder.dropped = false;
+                holder.soft_retired = false;
+            }
+            changed = true;
+        } else if update.epoch < holder.epoch {
+            return Applied {
+                outcome: ApplyOutcome::Deduped,
+                last_seq: holder.last_seq,
+                epoch: holder.epoch,
+                changed,
+            };
+        }
+        holder
+            .last_publish_ns
+            .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
+
+        // Sequenced = event feed; unsequenced = placement/control.
+        let sequenced = update.seq != 0;
+        if sequenced {
+            if update.seq <= holder.last_seq {
+                return Applied {
+                    outcome: ApplyOutcome::Deduped,
+                    last_seq: holder.last_seq,
+                    epoch: holder.epoch,
+                    changed,
+                };
+            }
+            holder.last_seq = update.seq;
+            if holder.dropped && !update.dropped {
+                // Observed engine events are proof of life: heal a
+                // stale (or wrongly relayed) soft-retire.
+                holder.dropped = false;
+                holder.soft_retired = false;
+                changed = true;
+            }
+        }
+
+        let mut outcome = ApplyOutcome::Applied;
+        for event in &update.events {
+            match event {
+                WireEvent::Stored { parent, blocks } => {
+                    if !sequenced && holder.event_fed {
+                        // D4: placements never pollute observed holders.
+                        outcome = ApplyOutcome::FeedRejected;
+                        continue;
+                    }
+                    if sequenced && !holder.event_fed {
+                        // First sequenced traffic pins feed authority too:
+                        // a holder with a real event stream is observed.
+                        holder.event_fed = true;
+                    }
+                    let pairs: Vec<(u64, u64)> = blocks
+                        .iter()
+                        .map(|b| (b.seq_hash.0, b.content_hash.0))
+                        .collect();
+                    let stored = tree
+                        .store(holder.id, parent.map(|p| p.0), &pairs)
+                        .or_else(|e| match e {
+                            // Unresolvable parent re-anchors at position 0,
+                            // mirroring the gateway monitor's recovery.
+                            StoreError::ParentNotFound => tree.store(holder.id, None, &pairs),
+                            other => Err(other),
+                        });
+                    // `changed` comes from the OUTCOME, never a
+                    // length delta: a MOVE (the re-anchor path above
+                    // produces them) changes query answers while
+                    // netting zero blocks, and a length-delta
+                    // heuristic would suppress its relay — replica
+                    // divergence (audit finding).
+                    match &stored {
+                        Ok(stored) => changed |= stored.applied > 0,
+                        Err(error) => {
+                            tracing::warn!(
+                                holder = %update.holder,
+                                ?error,
+                                blocks = pairs.len(),
+                                "Stored rejected by the tree; blocks did not land"
+                            );
+                            outcome = ApplyOutcome::StoreRejected;
+                        }
+                    }
+                    if stored.is_ok() && !holder.event_fed {
+                        self.enforce_capacity(tree, holder);
+                    }
+                }
+                WireEvent::Removed { seq_hashes } => {
+                    if !holder.event_fed {
+                        holder.event_fed = true;
+                    }
+                    let keys: Vec<u64> = seq_hashes.iter().map(|h| h.0).collect();
+                    changed |= tree.remove(holder.id, &keys) > 0;
+                }
+                WireEvent::Cleared => {
+                    // Gated like every other arm: clearing an already
+                    // empty holder is no transition. An unsequenced
+                    // Cleared (a worker batch numbered 0 reaches the
+                    // engine as seq 0 only if the bridge's wire offset
+                    // is bypassed) would otherwise relay between
+                    // symmetric peers forever.
+                    changed |= tree.holder_blocks(holder.id) > 0;
+                    tree.clear(holder.id);
+                }
+                WireEvent::StoredDigest { .. } => {
+                    // Digests are handled by the read-lock fast path and
+                    // are only ever sent alone. Reaching the general
+                    // loop (a mixed batch) means we cannot confirm it
+                    // here without its blocks: force a full resend
+                    // rather than silently drop it.
+                    outcome = ApplyOutcome::DigestMiss;
+                }
+            }
+        }
+        Applied {
+            outcome,
+            last_seq: holder.last_seq,
+            epoch: holder.epoch,
+            changed,
+        }
+    }
+
+    /// Runaway protection for placement-fed holders, NOT an eviction
+    /// mirror: the placement feed carries no removal signal, so
+    /// index-side eviction order can never match the worker's real
+    /// order — truncating AT the worker's size races it and
+    /// under-matches (measured: p95 prediction error 0 -> 9216 tokens
+    /// when the forest-correct accounting made an at-capacity bound
+    /// bind). The bound is 2x the declared capacity; TTL remains the
+    /// freshness bound.
+    ///
+    /// Hysteresis is load-bearing: past the bound the holder is cut
+    /// back to 1x, not to the bound. Cutting to the bound on every
+    /// apply meant the next placement re-crossed it immediately, so
+    /// each apply paid an O(holder blocks) depth-ordered truncation
+    /// AND, because the just-added (deepest) chain was what got cut,
+    /// every relayed placement re-applied as "changed" on the peer and
+    /// was relayed straight back — a permanent apply storm between
+    /// replicas (~2.3k applies/s per replica at 100% CPU with zero
+    /// external traffic, measured 30 s after a replica relaunch under
+    /// 120-worker load, starving routing queries into their 2 ms
+    /// deadline). With the cut to 1x the holder has headroom for
+    /// ~capacity blocks of new placements before the next truncation,
+    /// a re-applied echo lands and stays (unchanged on its return
+    /// trip), and truncation is a rare event whose cost is amortized.
+    ///
+    /// That echo argument is bounded by the chain length: a SINGLE
+    /// chain longer than 2x capacity cannot fit under the bound at
+    /// all, so every apply of it re-crosses, re-cuts, and relays, and
+    /// the storm survives for that holder. Nothing enforces the
+    /// premise that keeps it out of reach — a worker's declared
+    /// capacity comes from its own KV size, so it cannot hold a prompt
+    /// twice that cache, and the default (`u64::MAX`) makes the bound
+    /// unreachable — but an operator who sets a capacity below half
+    /// the longest prompt's block count gets the storm back. Both
+    /// sides are pinned by
+    /// `capacity_cut_leaves_headroom_so_echoes_die`.
+    ///
+    /// The cut is recency-ordered (`evict_oldest`): the holder's
+    /// least-recently-published chains go first, whole, and a chain
+    /// whose descendants are still being published is as young as
+    /// they are. Depth-ordered truncation was the first version and
+    /// failed two ways under a placement feed held above capacity: it
+    /// dropped the freshest long-prompt tails (the ones about to be
+    /// queried) and never removed a chain head, so every chain the
+    /// holder ever touched kept its slot — chain count 1k -> 14k at a
+    /// flat block count, replica RSS 120 -> 460 MiB over a 30-minute
+    /// soak. Whole-chain eviction frees the slot when the holder was
+    /// its last member.
+    fn enforce_capacity(&self, tree: &mut RadixTree, holder: &HolderState) {
+        let capacity = holder.capacity_blocks;
+        let bound = capacity.saturating_mul(2);
+        if tree.holder_blocks(holder.id) > bound {
+            let started = Instant::now();
+            tree.evict_oldest(holder.id, capacity);
+            self.cut_latency.observe(started.elapsed());
+        }
+    }
+
+    /// Split placement apply: exclusive work for ONLY the uncovered
+    /// suffix, anchored at the last plain-duplicate key found by the
+    /// shared-lock walk. Returns None when holder posture changed
+    /// between the locks (the caller falls through to the general
+    /// path). A concurrent clear/truncate can invalidate the anchor —
+    /// then the FULL batch is stored instead (with the general path's
+    /// dangling-parent re-anchor), which is exactly what a full-batch
+    /// apply serialized after that clear would have produced: the
+    /// split is linearizable, never lossy.
+    fn apply_placement_suffix(
+        &self,
+        space: &Arc<std::sync::RwLock<KeyspaceState>>,
+        update: &UpdateMsg,
+        original_parent: Option<u64>,
+        pairs: &[(u64, u64)],
+        anchor: u64,
+        run: usize,
+    ) -> Option<Applied> {
+        let mut space = space.write().expect(LOCK_MSG);
+        let space = &mut *space;
+        let holder = space.holders.get_mut(&update.holder)?;
+        if holder.event_fed || holder.dropped || update.epoch != holder.epoch {
+            return None;
+        }
+        holder
+            .last_publish_ns
+            .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
+        let tree = &mut space.tree;
+        let stored = tree
+            .store(holder.id, Some(anchor), &pairs[run..])
+            .or_else(|e| match e {
+                StoreError::ParentNotFound => tree
+                    .store(holder.id, original_parent, pairs)
+                    .or_else(|e| match e {
+                        StoreError::ParentNotFound => tree.store(holder.id, None, pairs),
+                        other => Err(other),
+                    }),
+                other => Err(other),
+            });
+        let mut changed = false;
+        let mut outcome = ApplyOutcome::Applied;
+        match &stored {
+            Ok(stored) => changed |= stored.applied > 0,
+            Err(error) => {
+                tracing::warn!(
+                    holder = %update.holder,
+                    ?error,
+                    blocks = pairs.len() - run,
+                    "placement suffix rejected by the tree; blocks did not land"
+                );
+                outcome = ApplyOutcome::StoreRejected;
+            }
+        }
+        if stored.is_ok() {
+            self.enforce_capacity(tree, holder);
+        }
+        Some(Applied {
+            outcome,
+            last_seq: holder.last_seq,
+            epoch: holder.epoch,
+            changed,
+        })
+    }
+
+    /// TTL sweep: clear inferred holders idle beyond the window, RETIRE
+    /// them entirely past [`INFERRED_RETIRE_MULTIPLIER`] windows (so a
+    /// placement-only keyspace can be garbage-collected — a holder
+    /// entry per worker URL a mis-configured gateway ever named would
+    /// otherwise live for the process lifetime), and RETIRE dropped
+    /// holders (including event-fed ones — the lifecycle leak the old
+    /// engine carried). Cheap per-holder timestamps; run from a timer.
+    pub fn sweep_idle(&self) {
+        let ttl = self.cfg.inferred_ttl;
+        let event_ttl = self.cfg.event_ttl;
+        let now = self.now_ns();
+        let since = |stamp: &std::sync::atomic::AtomicU64| {
+            Duration::from_nanos(
+                now.saturating_sub(stamp.load(std::sync::atomic::Ordering::Relaxed)),
+            )
+        };
+        for (key, space_arc) in self.all_spaces() {
+            let now_empty = {
+                let mut space = space_arc.write().expect(LOCK_MSG);
+                let space = &mut *space;
+                let mut retire: Vec<String> = Vec::new();
+                for (name, holder) in space.holders.iter_mut() {
+                    let silence = since(&holder.last_publish_ns);
+                    let idle = silence > ttl;
+                    // A backstop soft-retire is NOT a departure: keep the
+                    // entry and blocks for a further retire window so the
+                    // next observed batch can heal it with its cached
+                    // state intact (see `HolderState::soft_retired`). A
+                    // real `dropped` signal retires after the idle TTL.
+                    let backstop_expired = !holder.soft_retired
+                        || silence > event_ttl.saturating_mul(INFERRED_RETIRE_MULTIPLIER);
+                    if holder.dropped && idle && backstop_expired {
+                        retire.push(name.clone());
+                    } else if !holder.event_fed && idle {
+                        // An inferred holder's state is fully rebuilt by
+                        // its next placement (same observable state as
+                        // a cleared one), so past the retire window the
+                        // entry itself goes.
+                        if silence > ttl.saturating_mul(INFERRED_RETIRE_MULTIPLIER) {
+                            retire.push(name.clone());
+                        } else {
+                            space.tree.clear(holder.id);
+                        }
+                    } else if holder.event_fed
+                        && !holder.dropped
+                        && !event_ttl.is_zero()
+                        && since(&holder.last_publish_ns) > event_ttl
+                    {
+                        // Liveness backstop: silence far beyond the
+                        // event feed's cadence means the departure
+                        // signal was lost. Soft-retire; a next event
+                        // batch self-heals. Replicas converge on this
+                        // independently — each observes the same
+                        // silence on its own clock.
+                        holder.dropped = true;
+                        holder.soft_retired = true;
+                    }
+                }
+                for name in retire {
+                    if let Some(holder) = space.holders.remove(&name) {
+                        space.tree.retire_holder(holder.id);
+                    }
+                }
+                space.holders.is_empty()
+            };
+            // Keyspace GC (audit finding: any publisher can mint
+            // keyspaces and they were never removed). A keyspace whose
+            // last holder retired is unlinked — but only when nothing
+            // else holds its Arc: a concurrent apply that already
+            // cloned it would otherwise mutate an orphan and lose the
+            // update. New clones need the map lock we hold, so the
+            // count check cannot race; a skipped removal is retried
+            // next sweep.
+            if now_empty {
+                let mut map = self.keyspaces.write().expect(LOCK_MSG);
+                if let Some(arc) = map.get(&key) {
+                    let unshared = Arc::strong_count(arc) == 2; // map + our iteration clone
+                    if unshared && arc.read().expect(LOCK_MSG).holders.is_empty() {
+                        map.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Overlap query: every holder covering ANY position of the query
+    /// path, dropped holders excluded, ordered by contiguous depth from
+    /// position 0. An empty Vec means no holder overlaps anywhere — it
+    /// does NOT mean "no holder has a usable prefix", which is
+    /// `matched_blocks == 0` on every answer instead (see
+    /// [`HolderScore`]). Missing keyspace = empty answer (advisory
+    /// semantics).
+    pub fn find_matches(&self, keyspace: &KeyspaceKey, hashes: &[ContentHash]) -> Vec<HolderScore> {
+        let Some(space) = self.space(keyspace) else {
+            return Vec::new();
+        };
+        // SHARED lock with THREAD-LOCAL scratch: queries run
+        // concurrently with each other and with the duplicate fast
+        // path; only state-changing applies exclude them. The scratch
+        // (three Vecs + the answer buffer) is reused per worker thread
+        // so the routing hot path does not pay a fresh allocation set
+        // on every query.
+        thread_local! {
+            static QUERY_SCRATCH: std::cell::RefCell<(OverlapScratch, Vec<CoverageRun>, Vec<u64>)> =
+                std::cell::RefCell::new((OverlapScratch::default(), Vec::new(), Vec::new()));
+        }
+        let space = space.read().expect(LOCK_MSG);
+        let KeyspaceState { tree, holders } = &*space;
+        QUERY_SCRATCH.with(|cell| {
+            let (scratch, runs, chain) = &mut *cell.borrow_mut();
+            chain.clear();
+            chain.extend(hashes.iter().map(|h| h.0));
+            // One walk answers both shapes: the contiguous depth from 0
+            // for a contiguous cache, and every covered run for a
+            // holder whose cache is several independently evicted sets
+            // (runs come sorted by holder, so one holder's runs are
+            // adjacent).
+            tree.coverage(chain, scratch, runs);
+            let mut scores: Vec<HolderScore> = Vec::new();
+            let mut i = 0;
+            while i < runs.len() {
+                let first = runs[i];
+                let mut j = i;
+                while j < runs.len() && runs[j].holder == first.holder {
+                    j += 1;
+                }
+                let group = &runs[i..j];
+                i = j;
+                let Some(name) = tree.holder_name(first.holder) else {
+                    continue;
+                };
+                let Some(holder) = holders.get(name) else {
+                    continue;
+                };
+                if holder.dropped {
+                    continue;
+                }
+                let matched_blocks = if first.start == 0 { first.end } else { 0 };
+                scores.push(HolderScore {
+                    holder: name.to_string(),
+                    matched_blocks,
+                    total_blocks: first.total_blocks,
+                    event_fed: holder.event_fed,
+                    intervals: group.iter().map(|r| (r.start, r.end)).collect(),
+                    lane_meta: holder.metadata.clone(),
+                });
+            }
+            // Holder name as the tie key: equal depths sort identically
+            // on every replica, so converged replicas answer the same
+            // query with the same Vec (a stable sort alone leaves the
+            // tie order at the mercy of per-replica insertion order).
+            scores.sort_by(|a, b| {
+                b.matched_blocks
+                    .cmp(&a.matched_blocks)
+                    .then_with(|| a.holder.cmp(&b.holder))
+            });
+            scores
+        })
+    }
+
+    /// Reconstruct holder state from a snapshot/Pull `Update`, bypassing
+    /// the live feed's seq-dedup and placement/feed-authority rules.
+    /// Snapshot chunks all carry the holder's TRUE `last_seq` (a holder
+    /// larger than `SNAPSHOT_CHUNK` spans several), so applying them
+    /// through `apply` would seq-dedup every chunk after the first and
+    /// silently truncate the holder on the bootstrapping replica. This is
+    /// authoritative state, not a feed: chunks arrive in order and
+    /// parent-linked, and the posture (added/dropped/capacity/event_fed)
+    /// rides the first chunk.
+    pub fn apply_snapshot(&self, update: &UpdateMsg) {
+        if update.keyspace.block_size == 0 {
+            return;
+        }
+        let space = self.space_or_create(&update.keyspace);
+        let mut space = space.write().expect(LOCK_MSG);
+        let space = &mut *space;
+        if !space.holders.contains_key(&update.holder) {
+            let id = space.tree.create_holder(&update.holder);
+            space.holders.insert(
+                update.holder.clone(),
+                HolderState {
+                    metadata: Vec::new(),
+                    id,
+                    epoch: update.epoch,
+                    last_seq: 0,
+                    event_fed: false,
+                    capacity_blocks: self.cfg.default_capacity_blocks,
+                    dropped: false,
+                    soft_retired: false,
+                    last_publish_ns: std::sync::atomic::AtomicU64::new(self.now_ns()),
+                },
+            );
+        }
+        let tree = &mut space.tree;
+        let holder = space
+            .holders
+            .get_mut(&update.holder)
+            .expect("holder inserted above");
+        // Posture rides the first chunk (later chunks carry no control).
+        if let Some(added) = &update.added {
+            if added.capacity_blocks != 0 {
+                holder.capacity_blocks = added.capacity_blocks;
+            }
+            if added.event_fed {
+                holder.event_fed = true;
+            }
+            if !added.metadata.is_empty() {
+                holder.metadata.clone_from(&added.metadata);
+            }
+        }
+        holder.dropped = update.dropped;
+        // `soft_retired` has no wire representation, so a snapshot of a
+        // backstop-soft-retired holder is indistinguishable from one of
+        // a genuinely departed one: take the protective reading and
+        // keep its blocks for the healing batch exactly as the serving
+        // replica does. Resetting to false instead discarded the state
+        // the source deliberately retained — the puller's own sweep
+        // then retired the holder one `inferred_ttl` into the silence,
+        // and when the worker's next delta batch healed it the puller
+        // had no parent to anchor on and held only the delta,
+        // permanently under-matching that worker against the replica it
+        // bootstrapped from. Mis-assuming the other way costs one
+        // retire window on a holder that really did depart.
+        holder.soft_retired = update.dropped;
+        holder.epoch = update.epoch;
+        holder.last_seq = update.seq;
+        holder
+            .last_publish_ns
+            .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
+        // Store every chunk's blocks, parent-linked, with no feed
+        // rejection or capacity truncation — reconstructed ground truth.
+        for event in &update.events {
+            match event {
+                WireEvent::Stored { parent, blocks } => {
+                    let pairs: Vec<(u64, u64)> = blocks
+                        .iter()
+                        .map(|b| (b.seq_hash.0, b.content_hash.0))
+                        .collect();
+                    // Snapshot chunks are path-prefixed (`snapshot_holder`),
+                    // so a missing parent is a truncated stream, not a run
+                    // that starts past 0; the fallback keeps the blocks
+                    // rather than dropping them, and says so.
+                    let stored = tree
+                        .store(holder.id, parent.map(|p| p.0), &pairs)
+                        .or_else(|e| match e {
+                            StoreError::ParentNotFound => {
+                                tracing::warn!(
+                                    holder = %update.holder,
+                                    "snapshot chunk parent missing; placing at the root"
+                                );
+                                tree.store(holder.id, None, &pairs)
+                            }
+                            other => Err(other),
+                        });
+                    if let Err(error) = stored {
+                        tracing::warn!(
+                            holder = %update.holder,
+                            ?error,
+                            blocks = pairs.len(),
+                            "snapshot chunk rejected by the tree; replica under-matches until refed"
+                        );
+                    }
+                }
+                WireEvent::Removed { seq_hashes } => {
+                    let keys: Vec<u64> = seq_hashes.iter().map(|k| k.0).collect();
+                    tree.remove(holder.id, &keys);
+                }
+                WireEvent::Cleared | WireEvent::StoredDigest { .. } => {}
+            }
+        }
+    }
+
+    /// Per-holder (epoch, seq, block count, set digest) across every
+    /// keyspace — what anti-entropy compares between replicas. The digest
+    /// is a commutative fold over content hashes (xor and a multiplied
+    /// sum), so it compares block SETS regardless of storage order. One
+    /// read lock per holder, like `snapshot_holder`, never a long hold.
+    ///
+    /// Uninterrupted: right for a test or a one-shot tool, but a caller
+    /// on an async runtime wants [`Self::holder_digests_yielding`].
+    pub fn holder_digests(&self) -> Vec<HolderDigest> {
+        let mut out = Vec::new();
+        for key in self.snapshot_keys() {
+            for holder_key in self.snapshot_holders(&key) {
+                out.extend(self.holder_digest(&key, holder_key));
+            }
+        }
+        out
+    }
+
+    /// [`Self::holder_digests`] with a cooperative yield between
+    /// holders.
+    ///
+    /// The fold is the WHOLE index and it runs once an anti-entropy
+    /// period on both replicas, so run straight through it holds a
+    /// runtime worker for the length of a full-index walk — and the
+    /// queries sharing that runtime are answering against a
+    /// low-millisecond routing deadline, so the tail it adds is paid by
+    /// the read path, not by anti-entropy. The unit of work is already
+    /// one holder under one read lock, so a yield between holders
+    /// bounds the stall at a single holder's fold and costs nothing
+    /// when the runtime has no other work. NOT `spawn_blocking`: that
+    /// would move the read locks onto a blocking thread, where a
+    /// waiting writer queues behind a walk the runtime can no longer
+    /// interleave.
+    pub async fn holder_digests_yielding(&self) -> Vec<HolderDigest> {
+        let mut out = Vec::new();
+        for key in self.snapshot_keys() {
+            for holder_key in self.snapshot_holders(&key) {
+                out.extend(self.holder_digest(&key, holder_key));
+                tokio::task::yield_now().await;
+            }
+        }
+        out
+    }
+
+    /// One holder's digest under one read lock. None when the keyspace
+    /// or the holder went away between the listing and the fold — a
+    /// retire racing the walk, which is expected, not an error.
+    fn holder_digest(&self, key: &KeyspaceKey, holder_key: String) -> Option<HolderDigest> {
+        let space = self.space(key)?;
+        let space = space.read().expect(LOCK_MSG);
+        let holder = space.holders.get(&holder_key)?;
+        let (mut blocks, mut xor, mut sum) = (0u64, 0u64, 0u64);
+        // Position-bound: the same block set at different positions (a
+        // mis-placed run) must not digest equal. Unsorted on purpose:
+        // xor and the wrapping sum are commutative, so `enumerate`'s
+        // Vec and its sort would be bought and thrown away once per
+        // holder per round — see `RadixTree::for_each_block`.
+        space.tree.for_each_block(holder.id, |pos, _key, content| {
+            let entry = content ^ u64::from(pos).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+            blocks += 1;
+            xor ^= entry;
+            sum = sum.wrapping_add(entry.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        });
+        Some(HolderDigest {
+            keyspace: key.clone(),
+            holder: holder_key,
+            epoch: holder.epoch,
+            last_seq: holder.last_seq,
+            event_fed: holder.event_fed,
+            blocks,
+            digest_xor: xor,
+            digest_sum: sum,
+        })
+    }
+
+    /// Drop every block of one holder ahead of a snapshot replacement
+    /// (anti-entropy): `apply_snapshot` ADDS the peer's blocks; without
+    /// this, blocks the peer removed while we were partitioned would stay
+    /// resident forever. The holder entry itself stays (the snapshot's
+    /// first chunk resets its posture).
+    pub fn clear_holder(&self, key: &KeyspaceKey, holder_key: &str) -> bool {
+        let Some(space) = self.space(key) else {
+            return false;
+        };
+        let mut space = space.write().expect(LOCK_MSG);
+        let space = &mut *space;
+        let Some(holder) = space.holders.get(holder_key) else {
+            return false;
+        };
+        let had = space.tree.holder_blocks(holder.id) > 0;
+        space.tree.clear(holder.id);
+        had
+    }
+
+    /// Drop the whole index: every keyspace, every holder, every block.
+    ///
+    /// For a bootstrap pull that died mid-stream, where the only other
+    /// option is to serve the prefix that landed. Anti-entropy pulls an
+    /// ABSENT holder back through its "we have never held this" arm,
+    /// while a truncated one already carries the peer's watermark and so
+    /// is never re-planned — empty is strictly the safer of the two.
+    ///
+    /// Same lock order as the sweeper's keyspace GC, without its
+    /// liveness check: an apply holding an already-cloned keyspace Arc
+    /// would write into an orphan and be lost. Only sound before the
+    /// serving surface is up.
+    pub fn clear_all(&self) {
+        self.keyspaces.write().expect(LOCK_MSG).clear();
+    }
+
+    /// The keyspaces a `Pull` walks (a stable set; each is then
+    /// snapshotted holder by holder).
+    pub fn snapshot_keys(&self) -> Vec<KeyspaceKey> {
+        self.all_spaces().into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// The holders of one keyspace, for a holder-at-a-time `Pull`.
+    pub fn snapshot_holders(&self, key: &KeyspaceKey) -> Vec<String> {
+        let Some(space) = self.space(key) else {
+            return Vec::new();
+        };
+        let space = space.read().expect(LOCK_MSG);
+        let mut names: Vec<String> = space.holders.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// One holder's state as parent-linked snapshot chunks (empty when
+    /// the holder or keyspace is gone). This is the unit `Pull` streams:
+    /// the serving replica materializes ONE holder at a time, so a
+    /// sibling's bootstrap costs it a holder's worth of transient memory,
+    /// never a second copy of the whole index (the healthy replica must
+    /// not be the one at OOM risk when a sibling restarts).
+    ///
+    /// One Stored per chunk carrying the holder's blocks in position
+    /// order, under the holder's current epoch, unsequenced-for-inferred
+    /// / watermark-seq-for-observed so the puller lands with the same
+    /// dedup posture. (Gap positions collapse to a contiguous chain:
+    /// bootstrap equivalence is scoped to gap-free holders; gapped ones
+    /// converge through the feeds.) Consistency: the cut is per HOLDER —
+    /// sufficient because every UpdateMsg (and all dedup posture: epoch,
+    /// seq, feed authority) is scoped to one holder in one keyspace, so
+    /// a puller lands each holder exactly as some real moment saw it.
+    pub fn snapshot_holder(&self, key: &KeyspaceKey, holder_key: &str) -> Vec<UpdateMsg> {
+        let Some(space) = self.space(key) else {
+            return Vec::new();
+        };
+        let space = space.read().expect(LOCK_MSG);
+        let Some(holder) = space.holders.get(holder_key) else {
+            return Vec::new();
+        };
+        // CHUNKED: one giant Stored per holder blows through gRPC
+        // message limits at production block counts (audit finding:
+        // >4MiB past ~210k blocks). Chunks are parent-linked so the
+        // puller reassembles the exact chain; the control payload rides
+        // only the first chunk.
+        //
+        // PER RUN: a holder's coverage is reported per chain lineage as
+        // maximal runs with the content path from position 0. A run
+        // that starts past 0 (an event-fed holder after mid-chain
+        // removals, or a lane whose engine keeps only a window or
+        // checkpoints) is shipped as placeholder blocks for its
+        // uncovered head followed by its real blocks, then a Removed
+        // for the placeholders: the puller lands the run at the same
+        // positions on the same lineage and ends with the same holes.
+        // Shipping such a run as a bare parent-less Stored placed it at
+        // position 0 on a new lineage — a silent positional divergence
+        // the content-only digest could not see.
+        const SNAPSHOT_CHUNK: usize = 16_384;
+        let control = AddedControl {
+            capacity_blocks: holder.capacity_blocks,
+            event_fed: holder.event_fed,
+            metadata: holder.metadata.clone(),
+        };
+        let seq = if holder.event_fed { holder.last_seq } else { 0 };
+        let runs = space.tree.runs(holder.id);
+        let mut out = Vec::new();
+        let mut first_chunk = true;
+        let mut push = |events: Vec<WireEvent>, out: &mut Vec<UpdateMsg>| {
+            out.push(UpdateMsg {
+                keyspace: key.clone(),
+                holder: holder_key.to_string(),
+                epoch: holder.epoch,
+                seq,
+                events,
+                added: std::mem::take(&mut first_chunk).then(|| control.clone()),
+                dropped: holder.dropped,
+            });
+        };
+        if runs.is_empty() {
+            push(Vec::new(), &mut out);
+            return out;
+        }
+        for run in runs {
+            let head = run.start as usize;
+            let placeholders: Vec<SequenceHash> = run.path[..head]
+                .iter()
+                .enumerate()
+                .map(|(pos, content)| snapshot_placeholder_key(ContentHash(*content), pos as u32))
+                .collect();
+            let blocks: Vec<WireBlock> = placeholders
+                .iter()
+                .zip(&run.path[..head])
+                .map(|(k, c)| WireBlock {
+                    seq_hash: *k,
+                    content_hash: ContentHash(*c),
+                })
+                .chain(
+                    run.keys
+                        .iter()
+                        .zip(&run.path[head..])
+                        .map(|(k, c)| WireBlock {
+                            seq_hash: SequenceHash(*k),
+                            content_hash: ContentHash(*c),
+                        }),
+                )
+                .collect();
+            let mut parent: Option<SequenceHash> = None;
+            for chunk in blocks.chunks(SNAPSHOT_CHUNK) {
+                push(
+                    vec![WireEvent::Stored {
+                        parent,
+                        blocks: chunk.to_vec(),
+                    }],
+                    &mut out,
+                );
+                parent = chunk.last().map(|b| b.seq_hash);
+            }
+            if !placeholders.is_empty() {
+                push(
+                    vec![WireEvent::Removed {
+                        seq_hashes: placeholders,
+                    }],
+                    &mut out,
+                );
+            }
+        }
+        out
+    }
+
+    /// The whole index as snapshot chunks (tests and tooling; `Pull`
+    /// streams holder by holder via the three methods above).
+    pub fn snapshot(&self) -> Vec<UpdateMsg> {
+        let mut out = Vec::new();
+        for key in self.snapshot_keys() {
+            for holder in self.snapshot_holders(&key) {
+                out.extend(self.snapshot_holder(&key, &holder));
+            }
+        }
+        out
+    }
+
+    /// Total indexed blocks across keyspaces (stats/tests).
+    pub fn entry_count(&self) -> usize {
+        self.all_spaces()
+            .iter()
+            .map(|(_, s)| s.read().expect(LOCK_MSG).tree.stats().distinct_entries as usize)
+            .sum()
+    }
+
+    /// Point-in-time gauges for the metrics endpoint. One keyspace
+    /// locked at a time; cheap relative to apply/query traffic.
+    pub fn stats(&self) -> EngineStats {
+        let spaces = self.all_spaces();
+        let mut stats = EngineStats {
+            keyspaces: spaces.len(),
+            ..EngineStats::default()
+        };
+        for (_, space_arc) in &spaces {
+            let space = space_arc.read().expect(LOCK_MSG);
+            stats.blocks += space.tree.stats().distinct_entries as usize;
+            for holder in space.holders.values() {
+                stats.holders += 1;
+                if holder.event_fed {
+                    stats.event_fed_holders += 1;
+                }
+                if holder.dropped {
+                    stats.dropped_holders += 1;
+                }
+            }
+        }
+        stats
+    }
+}
+
+/// One holder's anti-entropy summary; see [`Engine::holder_digests`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HolderDigest {
+    pub keyspace: KeyspaceKey,
+    pub holder: String,
+    pub epoch: u64,
+    pub last_seq: u64,
+    pub event_fed: bool,
+    pub blocks: u64,
+    pub digest_xor: u64,
+    pub digest_sum: u64,
+}
+
+/// Point-in-time engine gauges (see [`Engine::stats`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EngineStats {
+    pub keyspaces: usize,
+    pub holders: usize,
+    pub event_fed_holders: usize,
+    pub dropped_holders: usize,
+    pub blocks: usize,
+}
+
+/// Deterministic placement chain: content hashes -> position-chained
+/// wire blocks, using the indexer's own rolling prefix hash so every
+/// publisher synthesizes byte-identical chains for identical prefixes.
+pub fn placement_chain(content_hashes: &[ContentHash]) -> Vec<WireBlock> {
+    crate::wire_hash::placement_chain(content_hashes)
+        .into_iter()
+        .map(|(seq_hash, content_hash)| WireBlock {
+            seq_hash,
+            content_hash,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn move_only_apply_reports_changed_for_relay() {
+        // A re-anchor MOVE changes query answers while netting zero
+        // blocks; the relay gate must still forward it (audit
+        // finding: a length-delta heuristic suppressed it and let
+        // replicas diverge).
+        let engine = Engine::new(EngineConfig::default());
+        let changed = engine.apply(&placement("w1", 21, 4)).changed;
+        assert!(changed);
+        // Same blocks re-anchored under a DIFFERENT prefix: every
+        // key moves, block count unchanged.
+        let chain = placement_chain(&prefix_hashes(21, 4));
+        let other_parent = placement_chain(&prefix_hashes(22, 2));
+        let mut setup = UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::Stored {
+                parent: None,
+                blocks: other_parent.clone(),
+            }],
+            added: None,
+            dropped: false,
+        };
+        engine.apply(&setup);
+        setup.events = vec![WireEvent::Stored {
+            parent: Some(other_parent[1].seq_hash),
+            blocks: chain.clone(),
+        }];
+        let before = engine.entry_count();
+        let changed = engine.apply(&setup).changed;
+        assert!(changed, "move-only apply must relay");
+        // Re-applying the identical update is a true no-op and must
+        // NOT relay (echo suppression).
+        let changed = engine.apply(&setup).changed;
+        assert!(!changed, "idempotent echo must not relay");
+        let _ = before;
+    }
+
+    use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
+
+    use super::*;
+    use crate::wire_hash::content_hash as compute_content_hash;
+
+    fn keyspace() -> KeyspaceKey {
+        KeyspaceKey {
+            model: "m".into(),
+            symbol_kind: SymbolKind::Tokens,
+            block_size: 4,
+        }
+    }
+
+    /// Content hashes for a synthetic prefix: block i hashes tokens
+    /// [seed, i] so shared prefixes share leading hashes.
+    fn prefix_hashes(seed: u32, blocks: usize) -> Vec<ContentHash> {
+        (0..blocks as u32)
+            .map(|i| compute_content_hash(&[seed, i]))
+            .collect()
+    }
+
+    fn placement(holder: &str, seed: u32, blocks: usize) -> UpdateMsg {
+        UpdateMsg {
+            keyspace: keyspace(),
+            holder: holder.into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(seed, blocks)),
+            }],
+            added: None,
+            dropped: false,
+        }
+    }
+
+    fn event_batch(holder: &str, seq: u64, events: Vec<WireEvent>) -> UpdateMsg {
+        UpdateMsg {
+            keyspace: keyspace(),
+            holder: holder.into(),
+            epoch: 1,
+            seq,
+            events,
+            added: None,
+            dropped: false,
+        }
+    }
+
+    fn digest(holder: &str, seed: u32, blocks: usize) -> UpdateMsg {
+        let chain = placement_chain(&prefix_hashes(seed, blocks));
+        UpdateMsg {
+            keyspace: keyspace(),
+            holder: holder.into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::StoredDigest {
+                parent: None,
+                tip: chain.last().expect("non-empty").seq_hash,
+                len: blocks as u32,
+            }],
+            added: None,
+            dropped: false,
+        }
+    }
+
+    #[test]
+    fn digest_confirms_held_chain_and_misses_otherwise() {
+        // TTL >> refresh cadence: the freshness loop below refreshes
+        // every 40ms against a 400ms TTL, so a CI-box stall of a few
+        // hundred ms cannot spuriously sweep the holder.
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::from_millis(400),
+            ..EngineConfig::default()
+        });
+        // Digest for a chain the index has never seen -> MISS (resend).
+        let (o, changed) = {
+            let r = engine.apply(&digest("w1", 71, 6));
+            (r.outcome, r.changed)
+        };
+        assert_eq!(o, ApplyOutcome::DigestMiss);
+        assert!(!changed);
+
+        // Establish it with a full placement, then the identical digest
+        // is confirmed as a no-op (Applied, no relay) — same observable
+        // outcome as a full duplicate placement.
+        engine.apply(&placement("w1", 71, 6));
+        let (o, changed) = {
+            let r = engine.apply(&digest("w1", 71, 6));
+            (r.outcome, r.changed)
+        };
+        assert_eq!(o, ApplyOutcome::Applied);
+        assert!(!changed, "confirmed digest must not relay");
+        assert_eq!(scores(&engine, 71, 6).len(), 1);
+
+        // Wrong length (chain only 6 deep) -> MISS.
+        let o = engine.apply(&digest("w1", 71, 8)).outcome;
+        assert_eq!(o, ApplyOutcome::DigestMiss);
+
+        // A confirmed digest refreshes freshness under the TTL: a
+        // digest-only-fed holder must not be swept.
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(40));
+            assert_eq!(
+                engine.apply(&digest("w1", 71, 6)).outcome,
+                ApplyOutcome::Applied
+            );
+            engine.sweep_idle();
+        }
+        assert_eq!(
+            scores(&engine, 71, 6).len(),
+            1,
+            "digest must keep holder fresh"
+        );
+
+        // Event-fed holders never accept placement digests.
+        engine.apply(&event_batch(
+            "w2",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(72, 4)),
+            }],
+        ));
+        let o = engine.apply(&digest("w2", 72, 4)).outcome;
+        assert_eq!(
+            o,
+            ApplyOutcome::DigestMiss,
+            "event-fed holder rejects digest"
+        );
+    }
+
+    fn scores(engine: &Engine, seed: u32, blocks: usize) -> Vec<(String, u32)> {
+        engine
+            .find_matches(&keyspace(), &prefix_hashes(seed, blocks))
+            .into_iter()
+            .map(|s| (s.holder, s.matched_blocks))
+            .collect()
+    }
+
+    /// `(_count, _sum seconds)` of the capacity-cut histogram. Read
+    /// through the rendered text because `LatencyHistogram`'s counters
+    /// are private — which also pins what `/metrics` actually serves,
+    /// the only place these numbers are ever consumed.
+    fn cut_histogram(engine: &Engine) -> (u64, f64) {
+        let text = engine.cut_latency().render("cut");
+        let value = |prefix: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` line in:\n{text}"))
+                .to_owned()
+        };
+        let count = value("cut_count ").parse().expect("_count is an integer");
+        let sum = value("cut_sum ").parse().expect("_sum is seconds");
+        (count, sum)
+    }
+
+    #[test]
+    fn placement_chain_is_deterministic_and_positions_match() {
+        let hashes = prefix_hashes(7, 6);
+        assert_eq!(placement_chain(&hashes), placement_chain(&hashes));
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 7, 6));
+        assert_eq!(scores(&engine, 7, 6), vec![("w1".into(), 6)]);
+        // A shorter shared prefix matches its depth only.
+        assert_eq!(scores(&engine, 7, 3), vec![("w1".into(), 3)]);
+    }
+
+    #[test]
+    fn placements_are_idempotent_across_publishers() {
+        let a = Engine::new(EngineConfig::default());
+        let b = Engine::new(EngineConfig::default());
+        // "Gateways" 1..4 place the same prefix repeatedly and extensions
+        // of it, in different orders per replica.
+        let mut updates = Vec::new();
+        for _publisher in 0..4 {
+            updates.push(placement("w1", 9, 4));
+            updates.push(placement("w1", 9, 8)); // extension
+            updates.push(placement("w2", 9, 2)); // shorter copy elsewhere
+        }
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut for_a = updates.clone();
+        let mut for_b = updates.clone();
+        for_a.shuffle(&mut rng);
+        for_b.shuffle(&mut rng);
+        for u in &for_a {
+            a.apply(u);
+        }
+        for u in &for_b {
+            b.apply(u);
+        }
+        assert_eq!(scores(&a, 9, 8), scores(&b, 9, 8));
+        assert_eq!(a.entry_count(), b.entry_count());
+        // And identical to the once-only application.
+        let once = Engine::new(EngineConfig::default());
+        once.apply(&placement("w1", 9, 8));
+        once.apply(&placement("w2", 9, 2));
+        assert_eq!(scores(&once, 9, 8), scores(&a, 9, 8));
+    }
+
+    #[test]
+    fn replicas_converge_under_interleaving_and_duplication() {
+        // Event holders: per-holder order preserved (the stream contract);
+        // cross-holder interleaving and duplicates are free game.
+        // Placement holders: any order, any duplication.
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut per_holder: Vec<Vec<UpdateMsg>> = Vec::new();
+        for h in 0..4u32 {
+            let holder = format!("ev{h}");
+            let mut seqs = Vec::new();
+            let mut chain = placement_chain(&prefix_hashes(100 + h, 12));
+            for (i, window) in chain.chunks(3).enumerate() {
+                let parent = if i == 0 {
+                    None
+                } else {
+                    Some(chain[i * 3 - 1].seq_hash)
+                };
+                let mut events = vec![WireEvent::Stored {
+                    parent,
+                    blocks: window.to_vec(),
+                }];
+                // Mixed batch: occasionally remove an old tail block in the
+                // same seq as a store.
+                if i == 3 {
+                    events.push(WireEvent::Removed {
+                        seq_hashes: vec![chain[11].seq_hash],
+                    });
+                }
+                seqs.push(event_batch(&holder, (i + 1) as u64, events));
+            }
+            chain.clear();
+            per_holder.push(seqs);
+        }
+        let placements: Vec<UpdateMsg> = (0..6u32)
+            .map(|p| placement(&format!("pl{}", p % 2), 200 + (p % 3), 4 + (p % 5) as usize))
+            .collect();
+
+        let deliver = |engine: &Engine, rng: &mut StdRng| {
+            // Merge per-holder event queues preserving each holder's order.
+            let mut cursors = vec![0usize; per_holder.len()];
+            let mut pending_placements = placements.clone();
+            loop {
+                let live: Vec<usize> = cursors
+                    .iter()
+                    .enumerate()
+                    .filter(|(h, &c)| c < per_holder[*h].len())
+                    .map(|(h, _)| h)
+                    .collect();
+                if live.is_empty() && pending_placements.is_empty() {
+                    break;
+                }
+                if !pending_placements.is_empty() && (live.is_empty() || rng.random_bool(0.4)) {
+                    let i = rng.random_range(0..pending_placements.len());
+                    let u = pending_placements.swap_remove(i);
+                    engine.apply(&u);
+                    if rng.random_bool(0.3) {
+                        engine.apply(&u); // duplicate
+                    }
+                } else {
+                    let h = live[rng.random_range(0..live.len())];
+                    let u = &per_holder[h][cursors[h]];
+                    engine.apply(u);
+                    if rng.random_bool(0.3) {
+                        engine.apply(u); // duplicate (deduped by seq)
+                    }
+                    cursors[h] += 1;
+                }
+            }
+        };
+
+        let a = Engine::new(EngineConfig::default());
+        let b = Engine::new(EngineConfig::default());
+        deliver(&a, &mut rng);
+        deliver(&b, &mut rng);
+        for h in 0..4u32 {
+            assert_eq!(
+                scores(&a, 100 + h, 12),
+                scores(&b, 100 + h, 12),
+                "event holder {h} diverged"
+            );
+        }
+        for p in 0..3u32 {
+            assert_eq!(scores(&a, 200 + p, 8), scores(&b, 200 + p, 8));
+        }
+        assert_eq!(a.entry_count(), b.entry_count());
+    }
+
+    #[test]
+    fn higher_epoch_clears_lower_and_stale_epochs_drop() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 5, 6));
+        assert_eq!(scores(&engine, 5, 6), vec![("w1".into(), 6)]);
+
+        // Restarted holder announces epoch 2 with a fresh (shorter) cache.
+        let mut restarted = placement("w1", 5, 2);
+        restarted.epoch = 2;
+        let outcome = engine.apply(&restarted).outcome;
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(scores(&engine, 5, 6), vec![("w1".into(), 2)]);
+
+        // A late epoch-1 update (relay stragglers) is dropped.
+        let outcome = engine.apply(&placement("w1", 5, 6)).outcome;
+        assert_eq!(outcome, ApplyOutcome::Deduped);
+        assert_eq!(scores(&engine, 5, 6), vec![("w1".into(), 2)]);
+    }
+
+    /// Anti-entropy replaces a holder wholesale: clearing first means a
+    /// block the peer removed while we were apart does not survive the
+    /// snapshot that follows, and the snapshot lands as authoritative state.
+    #[test]
+    fn clear_then_snapshot_replaces_a_holder_wholesale() {
+        let engine = Engine::new(EngineConfig::default());
+        let stale = placement_chain(&prefix_hashes(61, 6));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: stale.clone(),
+            }],
+        ));
+        assert_eq!(scores(&engine, 61, 6), vec![("w1".into(), 6)]);
+        // The peer's view: a different chain, watermark ahead.
+        let fresh = placement_chain(&prefix_hashes(62, 4));
+        let snapshot = UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 3,
+            events: vec![WireEvent::Stored {
+                parent: None,
+                blocks: fresh,
+            }],
+            added: Some(AddedControl {
+                metadata: Vec::new(),
+                capacity_blocks: 0,
+                event_fed: true,
+            }),
+            dropped: false,
+        };
+        assert!(
+            engine.clear_holder(&keyspace(), "w1"),
+            "had blocks to clear"
+        );
+        engine.apply_snapshot(&snapshot);
+        assert!(scores(&engine, 61, 6).is_empty(), "stale blocks are gone");
+        assert_eq!(scores(&engine, 62, 4), vec![("w1".into(), 4)]);
+        let d = engine.holder_digests();
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].blocks, d[0].last_seq, d[0].event_fed), (4, 3, true));
+        assert!(!engine.clear_holder(&keyspace(), "missing"));
+    }
+
+    /// Memory probe for the placement feed at capacity: a holder that is
+    /// cut back over and over must not accumulate tree state beyond
+    /// what its resident blocks need — the 30-minute soak saw the
+    /// service's RSS climb 120 → 460 MiB at a flat block count because
+    /// depth-ordered truncation never freed a chain slot. Every round:
+    /// distinct entries equal the resident blocks (single holder, so
+    /// nothing is shared) and live chain slots are bounded by the
+    /// chains those blocks can span.
+    #[test]
+    fn repeated_capacity_cuts_do_not_accumulate_state() {
+        let engine = Engine::new(EngineConfig {
+            default_capacity_blocks: 64,
+            ..EngineConfig::default()
+        });
+        let rounds = 40u64;
+        let per_round = 24u64;
+        let mut seed = 1000u32;
+        for round in 0..rounds {
+            // ~3 capacities of fresh chains per round, 8 blocks each.
+            for _ in 0..per_round {
+                seed += 1;
+                engine.apply(&placement("w1", seed, 8));
+            }
+            let blocks = engine.stats().blocks as u64;
+            let spaces = engine.all_spaces();
+            let space = spaces[0].1.read().expect("space");
+            let tree_stats = space.tree.stats();
+            let chains = space.tree.live_chain_count();
+            assert!(
+                blocks <= 128,
+                "round {round}: {blocks} blocks above the 2x bound"
+            );
+            assert_eq!(
+                tree_stats.distinct_entries, blocks,
+                "round {round}: orphaned entries"
+            );
+            // Whole chains of 8 plus at most one trimmed chain.
+            assert!(
+                chains as u64 <= blocks / 8 + 1,
+                "round {round}: {chains} live chains for {blocks} blocks (slots leaked)"
+            );
+            space.tree.audit().expect("audit");
+        }
+        // Amortization, which only the counter can show: each cut takes
+        // the holder from the 2x bound back to 1x, so it cannot fire
+        // again until a full capacity (8 chains here) of fresh blocks
+        // has landed. A cut per apply is the storm this hysteresis
+        // exists to prevent, and it leaves every assertion above green.
+        let applies = rounds * per_round;
+        let (cuts, _) = cut_histogram(&engine);
+        assert!(
+            cuts <= applies / 8,
+            "{cuts} cuts for {applies} applies: the cut stopped leaving headroom"
+        );
+    }
+
+    /// Soak-shaped memory probe (ignored; run with --nocapture): 64
+    /// holders, 52-block chains, a hot set republished at 90% and fresh
+    /// chains otherwise, capacity 4688 so the cut recurs for the whole
+    /// run. Prints the tree's internal footprint next to process RSS so a
+    /// growth that the byte estimate does not see still shows up.
+    #[test]
+    #[ignore]
+    fn soak_probe_placement_feed_at_capacity() {
+        fn rss_kib() -> u64 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0)
+        }
+        let engine = Engine::new(EngineConfig {
+            default_capacity_blocks: 4688,
+            ..EngineConfig::default()
+        });
+        let rounds: usize = std::env::var("SOAK_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+        let mut seed = 10_000u32;
+        let mut rng = 0x9E37_79B9u64;
+        let mut chain_counts = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            for _ in 0..5_000 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let holder = format!("w{}", rng % 64);
+                let hot = rng % 100 < 90;
+                let s = if hot {
+                    1 + (rng >> 8) as u32 % 512
+                } else {
+                    seed += 1;
+                    seed
+                };
+                engine.apply(&placement(&holder, s, 52));
+            }
+            let spaces = engine.all_spaces();
+            let space = spaces[0].1.read().expect("space");
+            let st = space.tree.stats();
+            eprintln!(
+                "round {round}: applies {} holder-blocks {} entries {} bytes~{}MiB rss {}MiB | {}",
+                (round + 1) * 5_000,
+                st.holder_blocks,
+                st.distinct_entries,
+                st.bytes_estimate / (1024 * 1024),
+                rss_kib() / 1024,
+                space.tree.debug_footprint()
+            );
+            chain_counts.push(space.tree.live_chain_count());
+        }
+        // Steady state: live chain slots must not trend up once every
+        // holder has been cut at least once (round 10 onward).
+        let early = chain_counts[rounds.min(10) - 1];
+        let late = *chain_counts.last().expect("rounds > 0");
+        assert!(
+            late <= early * 13 / 10,
+            "live chains grew {early} -> {late}"
+        );
+    }
+
+    /// Lanes (§6b): a holder whose coverage has holes is answered as
+    /// its covered runs, with the contiguous depth from 0 kept for the
+    /// contiguous-cache consumer, and its lane metadata echoed verbatim.
+    #[test]
+    fn answers_carry_intervals_and_lane_metadata() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(21, 8));
+        let keys: Vec<_> = chain.iter().map(|b| b.seq_hash).collect();
+        // Three lanes of one worker: full attention holds all eight
+        // blocks; the window lane evicted the first three; the mamba
+        // lane keeps checkpoints at blocks 4 and 8 only.
+        for (lane, meta) in [
+            ("w1#0", "kind=full;block=1"),
+            ("w1#1", "kind=swa;block=1;window=3"),
+            ("w1#2", "kind=mamba;block=4"),
+        ] {
+            engine.apply(&UpdateMsg {
+                added: Some(AddedControl {
+                    capacity_blocks: 0,
+                    event_fed: true,
+                    metadata: meta.as_bytes().to_vec(),
+                }),
+                ..event_batch(
+                    lane,
+                    1,
+                    vec![WireEvent::Stored {
+                        parent: None,
+                        blocks: chain.clone(),
+                    }],
+                )
+            });
+        }
+        engine.apply(&event_batch(
+            "w1#1",
+            2,
+            vec![WireEvent::Removed {
+                seq_hashes: keys[..3].to_vec(),
+            }],
+        ));
+        engine.apply(&event_batch(
+            "w1#2",
+            2,
+            vec![WireEvent::Removed {
+                seq_hashes: [&keys[..3], &keys[4..7]].concat(),
+            }],
+        ));
+        let mut answers = engine.find_matches(&keyspace(), &prefix_hashes(21, 8));
+        answers.sort_by(|a, b| a.holder.cmp(&b.holder));
+        type View<'a> = (&'a str, u32, &'a [(u32, u32)], &'a str);
+        let view: Vec<View<'_>> = answers
+            .iter()
+            .map(|a| {
+                (
+                    a.holder.as_str(),
+                    a.matched_blocks,
+                    a.intervals.as_slice(),
+                    std::str::from_utf8(&a.lane_meta).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            view,
+            vec![
+                ("w1#0", 8, &[(0, 8)][..], "kind=full;block=1"),
+                ("w1#1", 0, &[(3, 8)][..], "kind=swa;block=1;window=3"),
+                ("w1#2", 0, &[(3, 4), (7, 8)][..], "kind=mamba;block=4"),
+            ]
+        );
+        // A bare lifecycle re-announce (empty metadata) keeps the
+        // standing metadata; a new claim replaces it.
+        engine.apply(&UpdateMsg {
+            added: Some(AddedControl::default()),
+            ..event_batch("w1#1", 0, Vec::new())
+        });
+        engine.apply(&UpdateMsg {
+            added: Some(AddedControl {
+                metadata: b"kind=swa;block=1;window=5".to_vec(),
+                ..AddedControl::default()
+            }),
+            ..event_batch("w1#2", 0, Vec::new())
+        });
+        let metas: Vec<(String, Vec<u8>)> = engine
+            .find_matches(&keyspace(), &prefix_hashes(21, 8))
+            .into_iter()
+            .map(|a| (a.holder, a.lane_meta))
+            .collect();
+        assert!(metas.contains(&("w1#1".to_string(), b"kind=swa;block=1;window=3".to_vec())));
+        assert!(metas.contains(&("w1#2".to_string(), b"kind=swa;block=1;window=5".to_vec())));
+        // Snapshots carry the metadata and the holes; a bootstrapped
+        // replica answers identically.
+        let replica = Engine::new(EngineConfig::default());
+        for key in engine.snapshot_keys() {
+            for holder in engine.snapshot_holders(&key) {
+                for chunk in engine.snapshot_holder(&key, &holder) {
+                    replica.apply_snapshot(&chunk);
+                }
+            }
+        }
+        let mut a = engine.find_matches(&keyspace(), &prefix_hashes(21, 8));
+        let mut b = replica.find_matches(&keyspace(), &prefix_hashes(21, 8));
+        a.sort_by(|x, y| x.holder.cmp(&y.holder));
+        b.sort_by(|x, y| x.holder.cmp(&y.holder));
+        assert_eq!(a, b);
+    }
+
+    /// The query contract the runs answer changed, pinned: scoring any
+    /// overlap is not lane-only behaviour — an ordinary event-fed
+    /// worker that evicted its own prefix answers with depth 0 too. A
+    /// non-empty answer list therefore does not mean "cache-hit
+    /// candidates exist"; only `matched_blocks > 0` does, and a
+    /// consumer that routes on the former sends the request to a worker
+    /// holding no prefix at all (see [`HolderScore`]).
+    #[test]
+    fn a_holder_with_only_mid_chain_coverage_answers_at_depth_zero() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(61, 4));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain.clone(),
+            }],
+        ));
+        engine.apply(&event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Removed {
+                seq_hashes: chain[..2].iter().map(|b| b.seq_hash).collect(),
+            }],
+        ));
+        let answers = engine.find_matches(&keyspace(), &prefix_hashes(61, 4));
+        assert_eq!(answers.len(), 1, "the overlap is still answered");
+        assert_eq!(answers[0].matched_blocks, 0, "no prefix from position 0");
+        assert_eq!(answers[0].intervals, vec![(2, 4)]);
+        assert!(
+            answers[0].lane_meta.is_empty(),
+            "no lane published this holder"
+        );
+    }
+
+    /// Lifecycle control names the worker; its lanes follow. A lane can
+    /// also be dropped on its own.
+    #[test]
+    fn lifecycle_control_for_a_worker_fans_out_to_its_lanes() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(31, 4));
+        for holder in ["w1", "w1#0", "w1#1", "w10#0"] {
+            engine.apply(&UpdateMsg {
+                added: Some(AddedControl {
+                    event_fed: true,
+                    ..AddedControl::default()
+                }),
+                ..event_batch(
+                    holder,
+                    1,
+                    vec![WireEvent::Stored {
+                        parent: None,
+                        blocks: chain.clone(),
+                    }],
+                )
+            });
+        }
+        let answering = |engine: &Engine| -> Vec<String> {
+            let mut v: Vec<String> = engine
+                .find_matches(&keyspace(), &prefix_hashes(31, 4))
+                .into_iter()
+                .map(|a| a.holder)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(answering(&engine), vec!["w1", "w1#0", "w1#1", "w10#0"]);
+        // Drop the worker: its lanes go with it, the other worker's lane
+        // (a name that merely shares the prefix) stays.
+        let dropped = engine.apply(&UpdateMsg {
+            dropped: true,
+            ..event_batch("w1", 0, Vec::new())
+        });
+        assert!(dropped.changed);
+        assert_eq!(answering(&engine), vec!["w10#0"]);
+        // Re-add the worker: lanes come back, with their own metadata
+        // and capacity untouched (the fan-out is a bare membership
+        // control).
+        engine.apply(&UpdateMsg {
+            added: Some(AddedControl {
+                capacity_blocks: 77,
+                ..AddedControl::default()
+            }),
+            ..event_batch("w1", 0, Vec::new())
+        });
+        assert_eq!(answering(&engine), vec!["w1", "w1#0", "w1#1", "w10#0"]);
+        // A single lane dropped on its own leaves the worker and its
+        // sibling lane answering.
+        engine.apply(&UpdateMsg {
+            dropped: true,
+            ..event_batch("w1#1", 0, Vec::new())
+        });
+        assert_eq!(answering(&engine), vec!["w1", "w1#0", "w10#0"]);
+    }
+
+    #[test]
+    fn tail_eviction_keeps_prefixes_closed() {
+        let engine = Engine::new(EngineConfig {
+            default_capacity_blocks: 4,
+            ..EngineConfig::default()
+        });
+        // Capacity is runaway protection: truncation fires only past
+        // 2x the declared value (racing the worker's own unobservable
+        // eviction was measured to under-match), so 8 blocks at
+        // capacity 4 stay put...
+        engine.apply(&placement("w1", 3, 8));
+        assert_eq!(scores(&engine, 3, 8), vec![("w1".into(), 8)]);
+        // ...and 12 blocks cross the 2x bound and cut back to 1x
+        // (hysteresis), prefix-closed: the HEAD survives (depth 4 from
+        // position 0), never a mid-chain hole.
+        engine.apply(&placement("w1", 3, 12));
+        assert_eq!(scores(&engine, 3, 12), vec![("w1".into(), 4)]);
+        assert_eq!(scores(&engine, 3, 4), vec![("w1".into(), 4)]);
+        assert_eq!(engine.entry_count(), 4);
+    }
+
+    /// The capacity cut must leave headroom, or a holder pinned at the
+    /// bound pays a full depth-ordered truncation on EVERY apply and,
+    /// worse, each fresh chain is added-then-cut, so its relay re-applies
+    /// as "changed" on the peer and echoes back forever (the measured
+    /// post-relaunch apply storm). After one cut the next placements
+    /// land without truncation, and a relayed echo of a resident chain
+    /// is a no-op.
+    #[test]
+    fn capacity_cut_leaves_headroom_so_echoes_die() {
+        let engine = Engine::new(EngineConfig {
+            default_capacity_blocks: 4,
+            ..EngineConfig::default()
+        });
+        let long = placement("w1", 3, 9);
+        engine.apply(&long); // crosses 8 -> cut to 4
+        assert_eq!(engine.entry_count(), 4);
+        // The histogram's `_count`, not the block count, is what tells
+        // "cut once" apart from "cut twice to the same size":
+        // `cuts ~= applies` is the storm, and it is invisible in
+        // `entry_count` alone.
+        let (cuts, seconds) = cut_histogram(&engine);
+        assert_eq!(cuts, 1, "one cut");
+        assert!(
+            seconds > 0.0,
+            "the cut's duration is what queries stall behind: keep it measured"
+        );
+        // Fresh chains now accumulate up to the bound without cuts.
+        let fresh = placement("w1", 7, 3);
+        assert!(engine.apply(&fresh).changed);
+        assert_eq!(engine.entry_count(), 7, "no truncation below the bound");
+        // A relay echo of a chain the holder already has is unchanged:
+        // the loop terminates in one hop.
+        assert!(!engine.apply(&fresh).changed);
+        assert_eq!(engine.entry_count(), 7);
+        assert_eq!(cut_histogram(&engine).0, 1, "no cut below the bound");
+        // The residual the docstring scopes: a chain longer than 2x
+        // capacity cannot fit under the bound, so its echo re-crosses
+        // and re-cuts forever. Pinned so the claim is not quietly
+        // widened — closing it needs a bound that knows the longest
+        // chain, not a wider promise here.
+        assert!(
+            engine.apply(&long).changed,
+            "a chain past 2x capacity re-applies as changed (known residual)"
+        );
+        assert!(cut_histogram(&engine).0 > 1);
+    }
+
+    /// The cut keeps what was published most recently, not what is
+    /// shallowest: a holder that publishes fresh long prompts while
+    /// sitting above capacity must still answer for the prompt it just
+    /// placed, and the chain it retired must stop answering entirely.
+    #[test]
+    fn capacity_cut_evicts_least_recent_chains_and_keeps_the_fresh_deep_one() {
+        let engine = Engine::new(EngineConfig {
+            default_capacity_blocks: 8,
+            ..EngineConfig::default()
+        });
+        engine.apply(&placement("w1", 1, 6)); // oldest
+        engine.apply(&placement("w1", 2, 6));
+        engine.apply(&placement("w1", 3, 6)); // crosses 16 -> cut to 8
+        assert_eq!(engine.entry_count(), 8);
+        assert!(
+            scores(&engine, 1, 6).is_empty(),
+            "least recent chain gone whole"
+        );
+        assert_eq!(
+            scores(&engine, 3, 6),
+            vec![("w1".into(), 6)],
+            "freshest chain intact"
+        );
+        // The middle chain is the final victim, trimmed deepest-first.
+        assert_eq!(scores(&engine, 2, 6), vec![("w1".into(), 2)]);
+        // Republishing a resident chain refreshes it: chain 2 (a
+        // duplicate store, nothing applied) now outlives chain 3 and
+        // chain 4, both published before the touch, on the next cut.
+        engine.apply(&placement("w1", 4, 5)); // 13, below the bound
+        assert!(!engine.apply(&placement("w1", 2, 2)).changed);
+        engine.apply(&placement("w1", 5, 4)); // 17 > 16 -> cut to 8
+        assert_eq!(engine.entry_count(), 8);
+        assert!(
+            scores(&engine, 3, 6).is_empty(),
+            "least recent after the touch"
+        );
+        assert_eq!(
+            scores(&engine, 4, 5),
+            vec![("w1".into(), 2)],
+            "final victim, trimmed"
+        );
+        assert_eq!(
+            scores(&engine, 2, 2),
+            vec![("w1".into(), 2)],
+            "touched chain survives"
+        );
+        assert_eq!(
+            scores(&engine, 5, 4),
+            vec![("w1".into(), 4)],
+            "freshest intact"
+        );
+    }
+
+    /// A confirmed digest is a publish for the cut's recency order too.
+    /// It applies nothing, so without a touch the chain keeps the tick
+    /// of its last FULL send while colder chains sent in full get fresh
+    /// ones — the cut then evicts precisely the chain the publisher
+    /// keeps confirming, whose next digest misses and costs a full
+    /// resend plus a re-prefill on the worker.
+    #[test]
+    fn confirmed_digest_refreshes_the_chain_for_the_capacity_cut() {
+        let engine = Engine::new(EngineConfig {
+            default_capacity_blocks: 8,
+            ..EngineConfig::default()
+        });
+        engine.apply(&placement("w1", 81, 4)); // the hot chain, sent first
+        engine.apply(&placement("w1", 82, 10));
+        assert_eq!(
+            engine.apply(&digest("w1", 81, 4)).outcome,
+            ApplyOutcome::Applied,
+            "the chain is resident, so the digest confirms"
+        );
+        engine.apply(&placement("w1", 83, 3)); // 17 > 16 -> cut to 8
+        assert_eq!(engine.entry_count(), 8);
+        assert_eq!(
+            scores(&engine, 81, 4),
+            vec![("w1".into(), 4)],
+            "the digest-confirmed chain survives the cut whole"
+        );
+        assert_eq!(
+            scores(&engine, 83, 3),
+            vec![("w1".into(), 3)],
+            "the freshest chain is intact"
+        );
+        // The chain nobody republished is the victim, trimmed
+        // deepest-first to what the ceiling leaves.
+        assert_eq!(scores(&engine, 82, 10), vec![("w1".into(), 1)]);
+    }
+
+    #[test]
+    fn event_fed_holders_reject_placements_and_split_batches_do_not_lose_events() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(11, 6));
+        // One seq carrying Stored + Removed together (engine batch shape).
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![
+                WireEvent::Stored {
+                    parent: None,
+                    blocks: chain.clone(),
+                },
+                WireEvent::Removed {
+                    seq_hashes: vec![chain[5].seq_hash],
+                },
+            ],
+        ));
+        assert_eq!(scores(&engine, 11, 6), vec![("w1".into(), 5)]);
+
+        // A placement for the now event-fed holder is rejected.
+        let outcome = engine.apply(&placement("w1", 12, 3)).outcome;
+        assert_eq!(outcome, ApplyOutcome::FeedRejected);
+        assert!(scores(&engine, 12, 3).is_empty());
+
+        // Duplicate seq is deduped even with different content.
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Removed {
+                seq_hashes: vec![chain[4].seq_hash],
+            }],
+        ));
+        assert_eq!(scores(&engine, 11, 6), vec![("w1".into(), 5)]);
+    }
+
+    #[test]
+    fn snapshot_bootstrap_reproduces_answers() {
+        let a = Engine::new(EngineConfig::default());
+        a.apply(&placement("w1", 21, 5));
+        let chain = placement_chain(&prefix_hashes(22, 4));
+        a.apply(&event_batch(
+            "w2",
+            3,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain,
+            }],
+        ));
+
+        let b = Engine::new(EngineConfig::default());
+        for update in a.snapshot() {
+            b.apply_snapshot(&update);
+        }
+        assert_eq!(scores(&a, 21, 5), scores(&b, 21, 5));
+        assert_eq!(scores(&a, 22, 4), scores(&b, 22, 4));
+        assert_eq!(a.entry_count(), b.entry_count());
+
+        // The bootstrapped replica keeps the event holder's dedup posture:
+        // the watermark seq travels, so a replayed old batch is dropped.
+        let outcome = b
+            .apply(&event_batch("w2", 2, vec![WireEvent::Cleared]))
+            .outcome;
+        assert_eq!(outcome, ApplyOutcome::Deduped);
+    }
+
+    #[test]
+    fn lifecycle_controls_apply_across_the_epoch_gate() {
+        let engine = Engine::new(EngineConfig::default());
+        // Bridge feeds the holder at epoch 3.
+        let mut feed = event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(51, 4)),
+            }],
+        );
+        feed.epoch = 3;
+        engine.apply(&feed);
+        assert_eq!(scores(&engine, 51, 4).len(), 1);
+
+        // The gateway's removal workflow publishes `dropped` at the
+        // stale epoch it last saw. It must apply anyway (a lifecycle
+        // signal silently discarded on epoch mismatch is a holder
+        // leak) — and it must RELAY (changed=true) so replicas learn.
+        let drop_msg = UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: Vec::new(),
+            added: None,
+            dropped: true,
+        };
+        let changed = engine.apply(&drop_msg).changed;
+        assert!(changed, "stale-epoch drop must still relay");
+        assert!(scores(&engine, 51, 4).is_empty(), "dropped holder scored");
+
+        // Observed event traffic is proof of life: the next sequenced
+        // batch heals the soft-retire.
+        let mut alive = event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(52, 2)),
+            }],
+        );
+        alive.epoch = 3;
+        engine.apply(&alive);
+        assert_eq!(
+            scores(&engine, 52, 2).len(),
+            1,
+            "event batch must heal drop"
+        );
+    }
+
+    /// The backstop's soft-retire must survive the sweeps that follow it:
+    /// the event feed carries only deltas, so a quiet worker whose cache
+    /// is still resident must find its blocks intact when its next batch
+    /// heals the descore. (Before the `soft_retired` flag, the next sweep
+    /// retired the entry — `dropped && idle` — and the holder permanently
+    /// under-matched everything it cached before the silence.)
+    #[test]
+    fn backstop_soft_retire_keeps_state_for_the_healing_batch() {
+        // Margins are wide on purpose: the retire window is 2 x event_ttl
+        // of silence, and `thread::sleep` overshoots on a loaded CI box;
+        // with a 20 ms window the three "still retained" sweeps below
+        // drifted past it and retired the holder (a real flake).
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::from_millis(1),
+            event_ttl: Duration::from_millis(200),
+            ..EngineConfig::default()
+        });
+        let chain = placement_chain(&prefix_hashes(54, 6));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain.clone(),
+            }],
+        ));
+        std::thread::sleep(Duration::from_millis(250));
+        engine.sweep_idle();
+        assert!(scores(&engine, 54, 6).is_empty(), "backstop descored w1");
+        // Several more sweeps well past inferred_ttl: still descored, but
+        // the entry and its blocks are retained.
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(2));
+            engine.sweep_idle();
+        }
+        assert_eq!(
+            engine.stats().holders,
+            1,
+            "soft-retired holder keeps its entry"
+        );
+        assert_eq!(
+            engine.entry_count(),
+            6,
+            "soft-retired holder keeps its blocks"
+        );
+        // A delta batch heals it: the OLD blocks score again, not just
+        // the new one.
+        engine.apply(&event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Stored {
+                parent: Some(chain[5].seq_hash),
+                blocks: placement_chain(&prefix_hashes(54, 7))[6..].to_vec(),
+            }],
+        ));
+        assert_eq!(scores(&engine, 54, 6), vec![("w1".into(), 6)]);
+        // Silence past the second window (2 x event_ttl) finally retires.
+        std::thread::sleep(Duration::from_millis(250));
+        engine.sweep_idle(); // backstop soft-retires again
+        std::thread::sleep(Duration::from_millis(250));
+        engine.sweep_idle(); // > 2 x event_ttl of silence: retired
+        assert_eq!(
+            engine.stats().holders,
+            0,
+            "silence past the retire window retires"
+        );
+    }
+
+    #[test]
+    fn silent_event_holders_are_soft_retired_by_the_backstop() {
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::ZERO,
+            event_ttl: Duration::from_nanos(1),
+            ..EngineConfig::default()
+        });
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(53, 4)),
+            }],
+        ));
+        assert_eq!(scores(&engine, 53, 4).len(), 1);
+        std::thread::sleep(Duration::from_millis(2));
+        // First sweep: silence past event_ttl soft-retires (stops
+        // scoring); second sweep: dropped + idle retires entirely and
+        // the emptied keyspace unlinks.
+        engine.sweep_idle();
+        assert!(
+            scores(&engine, 53, 4).is_empty(),
+            "backstop must stop scoring"
+        );
+        engine.sweep_idle();
+        assert_eq!(engine.stats().holders, 0, "dropped idle holder must retire");
+        assert_eq!(engine.stats().keyspaces, 0);
+    }
+
+    /// The backstop sets `dropped` AND `soft_retired`, so a real
+    /// departure signal arriving afterwards has no `dropped` transition
+    /// to ride: unless it downgrades the soft-retire, an operator's
+    /// explicit drop is a no-op and the holder sits out the whole
+    /// backstop window instead of retiring one idle TTL later.
+    #[test]
+    fn a_real_drop_downgrades_a_backstop_soft_retire() {
+        // Margins mirror the healing-batch test: the backstop window is
+        // 2 x event_ttl and `sleep` overshoots on a loaded box.
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::from_millis(1),
+            event_ttl: Duration::from_millis(200),
+            ..EngineConfig::default()
+        });
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(55, 4)),
+            }],
+        ));
+        std::thread::sleep(Duration::from_millis(250));
+        engine.sweep_idle(); // soft-retired: entry and blocks retained
+        assert_eq!(engine.stats().holders, 1);
+        assert_eq!(engine.entry_count(), 4);
+
+        // The fleet's removal workflow publishes the drop late.
+        engine.apply(&UpdateMsg {
+            dropped: true,
+            ..event_batch("w1", 0, Vec::new())
+        });
+        std::thread::sleep(Duration::from_millis(2));
+        engine.sweep_idle();
+        assert_eq!(
+            engine.stats().holders,
+            0,
+            "a real drop retires after the idle TTL, not the backstop window"
+        );
+    }
+
+    /// That downgrade must RELAY. A peer that soft-retired the same
+    /// holder on its own clock keeps the corpse for the whole backstop
+    /// window otherwise, and hands it back the moment the retiring
+    /// replica's anti-entropy tombstone expires — the drop undone
+    /// fleet-wide. Relaying is safe because the echo terminates: the
+    /// peer's own downgrade leaves both flags settled here, so the
+    /// return trip reports no change.
+    #[test]
+    fn an_explicit_drop_relays_the_soft_retire_downgrade_without_looping() {
+        // Margins mirror the tests above: the backstop window is
+        // 2 x event_ttl and `sleep` overshoots on a loaded box.
+        let cfg = || EngineConfig {
+            inferred_ttl: Duration::from_millis(1),
+            event_ttl: Duration::from_millis(200),
+            ..EngineConfig::default()
+        };
+        let local = Engine::new(cfg());
+        let peer = Engine::new(cfg());
+        for engine in [&local, &peer] {
+            engine.apply(&event_batch(
+                "w1",
+                1,
+                vec![WireEvent::Stored {
+                    parent: None,
+                    blocks: placement_chain(&prefix_hashes(57, 4)),
+                }],
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        // Each replica reaches the silence backstop on its own clock.
+        local.sweep_idle();
+        peer.sweep_idle();
+
+        let departure = UpdateMsg {
+            dropped: true,
+            ..event_batch("w1", 0, Vec::new())
+        };
+        assert!(
+            local.apply(&departure).changed,
+            "the downgrade must reach the peer"
+        );
+        assert!(
+            peer.apply(&departure).changed,
+            "the peer downgrades and relays back"
+        );
+        assert!(
+            !local.apply(&departure).changed,
+            "the echo must die on the return trip"
+        );
+        assert!(!peer.apply(&departure).changed, "and stay dead");
+
+        // Both sides now retire one idle TTL after the departure, so
+        // neither outlives the other's retirement tombstone.
+        std::thread::sleep(Duration::from_millis(2));
+        local.sweep_idle();
+        peer.sweep_idle();
+        assert_eq!(local.stats().holders, 0);
+        assert_eq!(peer.stats().holders, 0, "the peer must not keep the corpse");
+    }
+
+    /// A failed bootstrap discards what it applied rather than serving a
+    /// truncated snapshot (see `Engine::clear_all`).
+    #[test]
+    fn clearing_the_index_drops_every_keyspace_and_holder() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 58, 4));
+        engine.apply(&placement("w2", 59, 4));
+        assert_eq!(engine.stats().holders, 2);
+        engine.clear_all();
+        let stats = engine.stats();
+        assert_eq!((stats.keyspaces, stats.holders, stats.blocks), (0, 0, 0));
+        assert!(engine.holder_digests().is_empty());
+        assert_eq!(engine.entry_count(), 0);
+    }
+
+    /// `soft_retired` has no wire representation, so a Pull of a
+    /// soft-retired holder must land as a soft-retire too. A puller
+    /// that reset the flag retired the holder one idle TTL into the
+    /// same silence and threw away exactly the state the source is
+    /// holding for the healing batch: the worker's next delta then had
+    /// no parent to anchor on there, so that replica under-matched the
+    /// worker permanently against the one it bootstrapped from.
+    #[test]
+    fn a_pulled_soft_retire_keeps_its_state_for_the_healing_batch() {
+        let cfg = || EngineConfig {
+            inferred_ttl: Duration::from_millis(1),
+            event_ttl: Duration::from_millis(200),
+            ..EngineConfig::default()
+        };
+        let engine = Engine::new(cfg());
+        let chain = placement_chain(&prefix_hashes(56, 5));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain.clone(),
+            }],
+        ));
+        std::thread::sleep(Duration::from_millis(250));
+        engine.sweep_idle(); // soft-retired, blocks retained
+
+        let replica = Engine::new(cfg());
+        for key in engine.snapshot_keys() {
+            for holder in engine.snapshot_holders(&key) {
+                for chunk in engine.snapshot_holder(&key, &holder) {
+                    replica.apply_snapshot(&chunk);
+                }
+            }
+        }
+        assert_eq!(replica.entry_count(), 5, "the puller lands the blocks");
+        // Past the idle TTL, inside the backstop window: the source
+        // holds, so the puller must hold.
+        std::thread::sleep(Duration::from_millis(2));
+        replica.sweep_idle();
+        assert_eq!(
+            replica.stats().holders,
+            1,
+            "a pulled soft-retire keeps its entry"
+        );
+        assert_eq!(replica.entry_count(), 5, "...and its blocks");
+        // The healing batch resolves its parent, so the OLD blocks
+        // score again — the same outcome the source replica gives.
+        replica.apply(&event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Stored {
+                parent: Some(chain[4].seq_hash),
+                blocks: placement_chain(&prefix_hashes(56, 6))[5..].to_vec(),
+            }],
+        ));
+        assert_eq!(scores(&replica, 56, 6), vec![("w1".into(), 6)]);
+    }
+
+    /// The two drivers must fold the same thing: anti-entropy compares
+    /// the local digest against a peer's, so a driver that skipped or
+    /// double-counted a holder would plan pulls forever against a
+    /// replica that is already converged.
+    #[tokio::test]
+    async fn the_yielding_digest_walk_matches_the_synchronous_one() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 91, 6));
+        engine.apply(&placement("w2", 92, 3));
+        // Mid-chain removal: the fold is position-bound, so this is
+        // where an order-dependent walk would show up as a difference.
+        engine.apply(&event_batch(
+            "w2",
+            1,
+            vec![WireEvent::Removed {
+                seq_hashes: vec![placement_chain(&prefix_hashes(92, 3))[1].seq_hash],
+            }],
+        ));
+        let sync = engine.holder_digests();
+        assert_eq!(sync.len(), 2, "both holders are folded");
+        assert!(sync.iter().all(|d| d.blocks > 0));
+        assert_eq!(engine.holder_digests_yielding().await, sync);
+    }
+
+    #[test]
+    fn apply_batch_equals_sequential() {
+        // A varied stream of sequenced event batches + placements across
+        // several holders (no digests — those deliberately route through
+        // `apply`). apply_batch over the whole stream must produce the
+        // identical outcome vector AND identical final query answers as
+        // applying each update one at a time.
+        let mut stream: Vec<UpdateMsg> = Vec::new();
+        for h in 0..6u32 {
+            let name = format!("w{h}");
+            // event chain, sequenced
+            for seq in 1..=4u64 {
+                stream.push(event_batch(
+                    &name,
+                    seq,
+                    vec![WireEvent::Stored {
+                        parent: None,
+                        blocks: placement_chain(&prefix_hashes(100 + h, (seq * 2) as usize)),
+                    }],
+                ));
+            }
+            // a remove and a re-store
+            let chain = placement_chain(&prefix_hashes(100 + h, 6));
+            stream.push(event_batch(
+                &name,
+                5,
+                vec![WireEvent::Removed {
+                    seq_hashes: vec![chain[chain.len() - 1].seq_hash],
+                }],
+            ));
+            // a placement for a different (inferred) holder
+            stream.push(placement(&format!("p{h}"), 200 + h, 5));
+        }
+        // interleave holders so runs mix
+        let seq_engine = Engine::new(EngineConfig::default());
+        let mut seq_out = Vec::new();
+        for u in &stream {
+            seq_out.push(seq_engine.apply(u));
+        }
+        let batch_engine = Engine::new(EngineConfig::default());
+        let batch_out = batch_engine.apply_batch(&stream);
+
+        assert_eq!(seq_out, batch_out, "batch outcome vector diverged");
+        for h in 0..6u32 {
+            for depth in [4usize, 6, 8] {
+                assert_eq!(
+                    scores(&seq_engine, 100 + h, depth),
+                    scores(&batch_engine, 100 + h, depth),
+                    "event-holder query diverged at h{h} depth{depth}"
+                );
+            }
+            assert_eq!(
+                scores(&seq_engine, 200 + h, 5),
+                scores(&batch_engine, 200 + h, 5),
+                "placement-holder query diverged at h{h}"
+            );
+        }
+        assert_eq!(seq_engine.entry_count(), batch_engine.entry_count());
+    }
+
+    #[test]
+    fn duplicate_fast_path_matches_slow_path_and_keeps_holders_fresh() {
+        // TTL >> refresh cadence (see digest_confirms_...): stall-proof
+        // margins for a loaded CI box.
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::from_millis(400),
+            ..EngineConfig::default()
+        });
+        let first = engine.apply(&placement("w1", 61, 6));
+        assert_eq!(first.outcome, ApplyOutcome::Applied);
+        assert!(first.changed, "fresh placement must relay");
+        // Re-publish (another gateway routed the same prefix): covered
+        // by the shared-lock fast path — same outcome shape, no relay.
+        let dup = engine.apply(&placement("w1", 61, 6));
+        assert_eq!(dup.outcome, ApplyOutcome::Applied);
+        assert!(!dup.changed, "duplicate placement must not relay");
+        assert_eq!(scores(&engine, 61, 6).len(), 1);
+
+        // Duplicate-only traffic is still proof of freshness: the fast
+        // path must refresh the TTL stamp without the write lock, or a
+        // hot-but-duplicate-fed holder would be swept.
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(40));
+            engine.apply(&placement("w1", 61, 6));
+            engine.sweep_idle();
+        }
+        assert_eq!(
+            scores(&engine, 61, 6).len(),
+            1,
+            "duplicate-fed holder must never TTL out"
+        );
+
+        // Event-fed holders still reject placements (the fast path
+        // must not swallow the FeedRejected outcome).
+        engine.apply(&event_batch(
+            "w2",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(62, 4)),
+            }],
+        ));
+        let mut evt_placement = placement("w2", 62, 4);
+        evt_placement.epoch = 1;
+        let outcome = engine.apply(&evt_placement).outcome;
+        assert_eq!(outcome, ApplyOutcome::FeedRejected);
+    }
+
+    #[test]
+    fn keyspace_gc_removes_emptied_keyspaces_only() {
+        // Small real TTL (not ZERO: with ZERO the idle predicate is
+        // elapsed_ns > 0, which can round to the same nanosecond as
+        // creation under parallel test load and flake).
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::from_millis(20),
+            ..EngineConfig::default()
+        });
+        engine.apply(&placement("w1", 31, 4));
+        let mut other = placement("w2", 32, 4);
+        other.keyspace.model = "other-model".into();
+        engine.apply(&other);
+        assert_eq!(engine.stats().keyspaces, 2);
+
+        // Dropping w1 and sweeping past the TTL retires the holder AND
+        // unlinks its now-empty keyspace; the live keyspace stays. w2
+        // stays a holder for now (its blocks are cleared as
+        // idle-inferred, but within the retire window the holder — hence
+        // its keyspace — remains).
+        let mut drop_w1 = placement("w1", 31, 0);
+        drop_w1.events.clear();
+        drop_w1.dropped = true;
+        engine.apply(&drop_w1);
+        std::thread::sleep(Duration::from_millis(25));
+        engine.sweep_idle();
+        let stats = engine.stats();
+        assert_eq!(stats.keyspaces, 1);
+        assert_eq!(stats.holders, 1);
+        assert!(
+            scores(&engine, 32, 4).is_empty(),
+            "idle inferred blocks cleared"
+        );
+        // Recreation after GC is a fresh first contact, not a resurrection.
+        engine.apply(&placement("w1", 31, 4));
+        assert_eq!(engine.stats().keyspaces, 2);
+        assert!(!scores(&engine, 31, 4).is_empty());
+
+        // An inferred holder silent past INFERRED_RETIRE_MULTIPLIER x TTL
+        // is retired outright, so a placement-only keyspace can be
+        // garbage-collected (it never receives a `dropped`: a typo'd
+        // --model on one gateway must not mint a keyspace for the life
+        // of the process).
+        std::thread::sleep(Duration::from_millis(45));
+        engine.sweep_idle();
+        let stats = engine.stats();
+        assert_eq!(stats.holders, 0, "idle inferred holders retire");
+        assert_eq!(stats.keyspaces, 0, "emptied placement keyspaces unlink");
+    }
+
+    /// Lifecycle signals are about a WORKER: a `dropped` named under the
+    /// Tokens keyspace must soft-retire the same worker's `Bytes` (string
+    /// mode) holder, and must NOT mint a phantom Tokens keyspace or
+    /// holder in a Bytes-only fleet; a bare re-announce heals the Bytes
+    /// holder the same way.
+    #[test]
+    fn lifecycle_signals_reach_every_keyspace_of_the_model_without_minting() {
+        let engine = Engine::new(EngineConfig::default());
+        let mut bytes_placement = placement("w1", 81, 4);
+        bytes_placement.keyspace.symbol_kind = SymbolKind::Bytes;
+        bytes_placement.keyspace.block_size = 256;
+        engine.apply(&bytes_placement);
+        let bytes_key = bytes_placement.keyspace.clone();
+        assert_eq!(
+            engine.find_matches(&bytes_key, &prefix_hashes(81, 4)).len(),
+            1
+        );
+
+        // The gateway's signal names the Tokens keyspace (its default).
+        let signal = |dropped: bool| UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: Vec::new(),
+            added: (!dropped).then_some(AddedControl {
+                metadata: Vec::new(),
+                capacity_blocks: 0,
+                event_fed: false,
+            }),
+            dropped,
+        };
+        assert!(engine.apply(&signal(true)).changed, "drop reaches Bytes");
+        assert!(
+            engine
+                .find_matches(&bytes_key, &prefix_hashes(81, 4))
+                .is_empty(),
+            "Bytes holder soft-retired by a Tokens-named signal"
+        );
+        let stats = engine.stats();
+        assert_eq!(stats.keyspaces, 1, "no phantom Tokens keyspace");
+        assert_eq!(stats.holders, 1, "no phantom Tokens holder");
+
+        assert!(engine.apply(&signal(false)).changed, "re-announce heals");
+        assert_eq!(
+            engine.find_matches(&bytes_key, &prefix_hashes(81, 4)).len(),
+            1
+        );
+        assert_eq!(engine.stats().keyspaces, 1);
+
+        // A bare signal for a holder that exists nowhere mints nothing;
+        // a substantive Added (declared capacity) does announce it.
+        let mut stranger = signal(false);
+        stranger.holder = "w9".into();
+        engine.apply(&stranger);
+        assert_eq!(engine.stats().holders, 1, "bare re-announce mints nothing");
+        stranger.added = Some(AddedControl {
+            metadata: Vec::new(),
+            capacity_blocks: 64,
+            event_fed: false,
+        });
+        engine.apply(&stranger);
+        assert_eq!(
+            engine.stats().holders,
+            2,
+            "a declared capacity announces the worker"
+        );
+    }
+
+    /// An unsequenced `Cleared` on an already-empty holder is no
+    /// transition: relaying it would ping-pong between symmetric peers.
+    #[test]
+    fn cleared_on_an_empty_holder_does_not_relay() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 91, 4));
+        let mut cleared = placement("w1", 91, 0);
+        cleared.events = vec![WireEvent::Cleared];
+        assert!(
+            engine.apply(&cleared).changed,
+            "first clear is a transition"
+        );
+        assert!(
+            !engine.apply(&cleared).changed,
+            "clearing an empty holder must not relay"
+        );
+    }
+
+    /// `Pull` streams holder by holder; the union must equal the whole
+    /// snapshot so a bootstrap loses nothing to the finer granularity.
+    #[test]
+    fn per_holder_snapshot_covers_the_whole_index() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 21, 5));
+        engine.apply(&placement("w2", 22, 3));
+        let mut other = placement("w3", 23, 2);
+        other.keyspace.model = "other-model".into();
+        engine.apply(&other);
+        let mut streamed = Vec::new();
+        for key in engine.snapshot_keys() {
+            for holder in engine.snapshot_holders(&key) {
+                streamed.extend(engine.snapshot_holder(&key, &holder));
+            }
+        }
+        let mut whole = engine.snapshot();
+        let sort_key = |u: &UpdateMsg| (u.keyspace.model.clone(), u.holder.clone(), u.seq);
+        streamed.sort_by_key(sort_key);
+        whole.sort_by_key(sort_key);
+        assert_eq!(streamed, whole);
+        assert_eq!(streamed.len(), 3);
+        assert!(engine.snapshot_holder(&keyspace(), "nobody").is_empty());
+    }
+
+    #[test]
+    fn per_keyspace_locking_survives_concurrent_mixed_traffic() {
+        // Not a performance proof — a race smoke: applies to two
+        // keyspaces race snapshot/stats/sweep from other threads, and
+        // the end state must equal the sequential expectation.
+        let engine = std::sync::Arc::new(Engine::new(EngineConfig::default()));
+        let mut handles = Vec::new();
+        for space_no in 0..2u32 {
+            let engine = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                for round in 0..200u32 {
+                    let mut update = placement(&format!("w{space_no}"), 40 + space_no, 6);
+                    if space_no == 1 {
+                        update.keyspace.model = "other-model".into();
+                    }
+                    engine.apply(&update);
+                    if round % 16 == 0 {
+                        engine.sweep_idle();
+                    }
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let engine = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let _ = engine.snapshot();
+                    let _ = engine.stats();
+                    let _ = engine.entry_count();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("no thread may panic");
+        }
+        let stats = engine.stats();
+        assert_eq!(stats.keyspaces, 2);
+        assert_eq!(stats.holders, 2);
+        assert_eq!(scores(&engine, 40, 6).len(), 1);
+    }
+
+    /// A holder larger than one snapshot chunk (16384 blocks) must fully
+    /// reconstruct on a bootstrapping replica. Event-fed holders are the
+    /// risk: their snapshot chunks all carry the same last_seq, so a naive
+    /// per-chunk apply seq-dedups every chunk after the first — silently
+    /// truncating the holder to 16384 blocks on the new replica.
+    #[test]
+    fn snapshot_bootstrap_reconstructs_large_event_fed_chain() {
+        let src = Engine::new(EngineConfig::default());
+        let big = 20_000usize; // > SNAPSHOT_CHUNK (16384) => multiple chunks
+        let chain = placement_chain(&prefix_hashes(1, big));
+        // Sequenced (event-fed) so the source is not capacity-truncated.
+        src.apply(&event_batch(
+            "w-big",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain,
+            }],
+        ));
+        assert_eq!(scores(&src, 1, big).first().map(|s| s.1), Some(big as u32));
+
+        // Multiple parent-linked chunks for the big holder.
+        let snap = src.snapshot();
+        let chunk_count = snap
+            .iter()
+            .filter(|u| {
+                u.holder == "w-big" && matches!(u.events.as_slice(), [WireEvent::Stored { .. }])
+            })
+            .count();
+        assert!(
+            chunk_count >= 2,
+            "a >16384-block holder must snapshot into multiple chunks, got {chunk_count}"
+        );
+
+        // Bootstrap via the reconstruction path (as bootstrap_from does).
+        let dst = Engine::new(EngineConfig::default());
+        for u in &snap {
+            dst.apply_snapshot(u);
+        }
+        assert_eq!(
+            scores(&dst, 1, big).first().map(|s| s.1),
+            Some(big as u32),
+            "a >16384-block event-fed holder must fully reconstruct from its chunked snapshot"
+        );
+        // last_seq is preserved (the source's, not bumped per chunk) so
+        // the replica resumes the event feed correctly.
+        assert_eq!(
+            scores(&dst, 1, 16_385).first().map(|s| s.1),
+            Some(16_385),
+            "the chunk boundary reconstructs as one contiguous chain"
+        );
+    }
+
+    fn ks_with_block(block_size: u32) -> KeyspaceKey {
+        KeyspaceKey {
+            model: "m".into(),
+            symbol_kind: SymbolKind::Tokens,
+            block_size,
+        }
+    }
+
+    /// A degenerate `block_size == 0` keyspace is rejected, never minted —
+    /// on both the single `apply` and the `apply_batch` run-boundary path,
+    /// where the reject must also not mis-group a following valid update.
+    #[test]
+    fn zero_block_size_keyspace_is_rejected_not_minted() {
+        let engine = Engine::new(EngineConfig::default());
+        let bad = UpdateMsg {
+            keyspace: ks_with_block(0),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(1, 2)),
+            }],
+            added: None,
+            dropped: false,
+        };
+        let outcome = engine.apply(&bad).outcome;
+        assert_eq!(outcome, ApplyOutcome::KeyspaceMismatch);
+        assert!(
+            engine.space(&ks_with_block(0)).is_none(),
+            "no keyspace minted"
+        );
+
+        // apply_batch: [zero-size, valid, valid] — the zero one is rejected
+        // while the two valid updates still group and apply.
+        let v1 = placement("w2", 5, 3);
+        let v2 = placement("w3", 6, 3);
+        let out = engine.apply_batch(&[bad, v1, v2]);
+        assert_eq!(out[0].outcome, ApplyOutcome::KeyspaceMismatch);
+        assert_eq!(out[1].outcome, ApplyOutcome::Applied);
+        assert_eq!(out[2].outcome, ApplyOutcome::Applied);
+        assert_eq!(scores(&engine, 5, 3), vec![("w2".to_string(), 3)]);
+        assert_eq!(scores(&engine, 6, 3), vec![("w3".to_string(), 3)]);
+    }
+
+    /// A bare lifecycle re-announce (`AddedControl.capacity_blocks == 0`)
+    /// must NOT clobber a worker-declared capacity back to the default: if
+    /// it did, the `capacity * 2` runaway bound would collapse to 0 and the
+    /// next placement would truncate the holder to empty — silent cache loss.
+    #[test]
+    fn bare_readvertise_preserves_declared_capacity() {
+        let engine = Engine::new(EngineConfig::default());
+        let announce = |cap: u64| UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![],
+            added: Some(AddedControl {
+                metadata: Vec::new(),
+                capacity_blocks: cap,
+                event_fed: false,
+            }),
+            dropped: false,
+        };
+        engine.apply(&announce(100));
+        engine.apply(&placement("w1", 7, 60));
+        assert_eq!(scores(&engine, 7, 60), vec![("w1".to_string(), 60)]);
+
+        // Bare re-announce with capacity 0, then a placement that extends
+        // the chain (so it takes the store+truncate path, not the pure
+        // duplicate fast path). Capacity 0 clobbered -> bound 0 -> truncate
+        // to empty. Preserved (100) -> bound 200 -> full 61 retained.
+        engine.apply(&announce(0));
+        engine.apply(&placement("w1", 7, 61));
+        assert_eq!(
+            scores(&engine, 7, 61).first().map(|s| s.1),
+            Some(61),
+            "capacity must survive a zero re-announce (no truncation to empty)"
+        );
+    }
+
+    /// The digest fast path's prefix-contiguity soundness rests on a holder
+    /// with no mid-chain holes. A hole can only arrive via `Removed`, which
+    /// pins the holder as event-fed — and event-fed holders reject every
+    /// digest. So a digest can never falsely confirm a chain with a hole.
+    #[test]
+    fn event_fed_holder_with_a_hole_never_confirms_a_digest() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(3, 3));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain.clone(),
+            }],
+        ));
+        // Remove the middle block -> holder is now event-fed with a hole.
+        engine.apply(&event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Removed {
+                seq_hashes: vec![chain[1].seq_hash],
+            }],
+        ));
+        // A digest that would "confirm" tip at len 3 must MISS, not confirm.
+        let outcome = engine.apply(&digest("w1", 3, 3)).outcome;
+        assert_eq!(
+            outcome,
+            ApplyOutcome::DigestMiss,
+            "an event-fed holder must never confirm a digest against a holed chain"
+        );
+    }
+
+    /// Lifecycle relay echo suppression: a control payload relays only on
+    /// a REAL transition. Re-applying a standing `dropped` (or a standing
+    /// re-announce) reports changed=false — otherwise symmetric replicas
+    /// relay the lifecycle echo back and forth forever (the same loop the
+    /// ~190x Stored echo amplification came from).
+    #[test]
+    fn lifecycle_echo_dies_in_one_hop() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 31, 4));
+        let drop_msg = UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![],
+            added: None,
+            dropped: true,
+        };
+        assert!(
+            engine.apply(&drop_msg).changed,
+            "first drop is a transition"
+        );
+        assert!(
+            !engine.apply(&drop_msg).changed,
+            "re-applying a standing drop must not relay (echo ping-pong)"
+        );
+
+        let readvertise = UpdateMsg {
+            added: Some(AddedControl {
+                metadata: Vec::new(),
+                capacity_blocks: 0,
+                event_fed: false,
+            }),
+            dropped: false,
+            ..drop_msg.clone()
+        };
+        assert!(
+            engine.apply(&readvertise).changed,
+            "un-drop is a transition"
+        );
+        assert!(
+            !engine.apply(&readvertise).changed,
+            "re-announcing a live holder must not relay"
+        );
+    }
+
+    /// The digest confirm uses checked position arithmetic: an absurd
+    /// wire-controlled `len` must resolve DigestMiss, never wrap into a
+    /// false confirmation (release builds) or panic (debug builds).
+    #[test]
+    fn digest_with_absurd_len_misses_instead_of_wrapping() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 41, 4));
+        let chain = placement_chain(&prefix_hashes(41, 4));
+        let absurd = UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::StoredDigest {
+                parent: Some(chain[2].seq_hash),
+                tip: chain[3].seq_hash,
+                len: u32::MAX,
+            }],
+            added: None,
+            dropped: false,
+        };
+        assert_eq!(engine.apply(&absurd).outcome, ApplyOutcome::DigestMiss);
+    }
+
+    /// `Applied.epoch` is the holder's STORED epoch, not an echo of the
+    /// update's — the field the publisher ack carries so a restarted
+    /// bridge (back at epoch 1) learns the surviving index's real epoch
+    /// and adopts past it instead of feeding dead-on-arrival updates.
+    #[test]
+    fn apply_reports_the_stored_epoch_not_the_updates() {
+        let engine = Engine::new(EngineConfig::default());
+        // Feed at epoch 7.
+        let mut e7 = event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(51, 2)),
+            }],
+        );
+        e7.epoch = 7;
+        assert_eq!(engine.apply(&e7).epoch, 7);
+
+        // A restarted publisher at epoch 1: Deduped, and the result
+        // carries the STORED epoch (7) — the adoption signal.
+        let mut stale = event_batch("w1", 1, vec![WireEvent::Cleared]);
+        stale.epoch = 1;
+        let r = engine.apply(&stale);
+        assert_eq!(r.outcome, ApplyOutcome::Deduped);
+        assert_eq!(
+            r.epoch, 7,
+            "ack must carry the stored epoch, not the update's"
+        );
+    }
+
+    /// A fresh-seq `Cleared` empties the holder AND relays (`changed`).
+    /// The apply branch had never executed under test — every prior
+    /// `Cleared` was seq-deduped before the events loop, so a cleared
+    /// worker could have kept serving stale blocks to peers unnoticed.
+    #[test]
+    fn cleared_event_empties_the_holder_and_relays() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(9, 4)),
+            }],
+        ));
+        assert_eq!(scores(&engine, 9, 4), vec![("w1".to_string(), 4)]);
+
+        // Fresh seq -> reaches the events loop (not seq-deduped).
+        let changed = engine
+            .apply(&event_batch("w1", 2, vec![WireEvent::Cleared]))
+            .changed;
+        assert!(changed, "a clear changes query answers and must relay");
+        assert!(
+            scores(&engine, 9, 4).is_empty(),
+            "the cleared holder no longer matches"
+        );
+    }
+
+    /// A `Removed` event drops the named blocks, shrinking the match, and
+    /// relays. Only the happy Stored path was covered before.
+    #[test]
+    fn removed_event_drops_blocks_and_relays() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(11, 4));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain.clone(),
+            }],
+        ));
+        assert_eq!(scores(&engine, 11, 4), vec![("w1".to_string(), 4)]);
+
+        // Remove the tail block -> prefix match shrinks to 3, and relays.
+        let changed = engine
+            .apply(&event_batch(
+                "w1",
+                2,
+                vec![WireEvent::Removed {
+                    seq_hashes: vec![chain[3].seq_hash],
+                }],
+            ))
+            .changed;
+        assert!(changed, "a removal changes query answers and must relay");
+        assert_eq!(
+            scores(&engine, 11, 4).first().map(|s| s.1),
+            Some(3),
+            "the removed tail no longer counts toward the prefix"
+        );
+    }
+
+    /// The split-placement fast path anchors the exclusive suffix store at a
+    /// plain-duplicate key found under the shared lock. A concurrent clear
+    /// can delete that anchor before the write lock — the fallback then
+    /// reconstructs the full chain from the original parent. This races the
+    /// two ops hard and asserts the holder is never left corrupted (the
+    /// "linearizable, never lossy" contract).
+    #[test]
+    fn placement_split_races_clear_without_corruption() {
+        use std::thread;
+        for seed in 0..8u32 {
+            let engine = Arc::new(Engine::new(EngineConfig::default()));
+            engine.apply(&placement("w1", seed, 256));
+
+            let extender = {
+                let e = Arc::clone(&engine);
+                thread::spawn(move || {
+                    // Extend the hot 256-prefix -> exercises the split path.
+                    for _ in 0..2000 {
+                        let _ = e.apply(&placement("w1", seed, 288));
+                    }
+                })
+            };
+            let clearer = {
+                let e = Arc::clone(&engine);
+                thread::spawn(move || {
+                    for _ in 0..2000 {
+                        let _ = e.apply(&event_batch("w1", 0, vec![WireEvent::Cleared]));
+                        let _ = e.apply(&placement("w1", seed, 256));
+                    }
+                })
+            };
+            // A panic in either thread (e.g. a corrupt chain) fails the test.
+            extender.join().unwrap();
+            clearer.join().unwrap();
+
+            // Settle: a full placement must land the whole chain — proof the
+            // race never wedged the holder into a suffix-only orphan state.
+            engine.apply(&event_batch("w1", 0, vec![WireEvent::Cleared]));
+            engine.apply(&placement("w1", seed, 288));
+            assert_eq!(
+                scores(&engine, seed, 288).first().map(|s| s.1),
+                Some(288),
+                "after racing split vs clear, a settling full placement must reconstruct the chain"
+            );
+        }
+    }
+
+    /// Keyspace GC unlinks an emptied keyspace only when nothing else holds
+    /// its `Arc` (strong_count guard). This races `sweep_idle` (retiring a
+    /// dropped holder and GC-ing the keyspace) against placements that
+    /// re-create holders in the same keyspace, and asserts no panic/deadlock
+    /// and that a placement issued after the race stays queryable — the
+    /// keyspace was never orphaned out from under a concurrent apply.
+    #[test]
+    fn keyspace_gc_races_placement_without_orphaning() {
+        use std::thread;
+        for seed in 0..8u32 {
+            let engine = Arc::new(Engine::new(EngineConfig {
+                inferred_ttl: Duration::ZERO,
+                ..Default::default()
+            }));
+            // A dropped holder the sweep will retire, emptying the keyspace.
+            engine.apply(&placement("seed", seed, 4));
+            engine.apply(&UpdateMsg {
+                keyspace: keyspace(),
+                holder: "seed".into(),
+                epoch: 1,
+                seq: 0,
+                events: vec![],
+                added: None,
+                dropped: true,
+            });
+
+            let sweeper = {
+                let e = Arc::clone(&engine);
+                thread::spawn(move || {
+                    for _ in 0..3000 {
+                        e.sweep_idle();
+                    }
+                })
+            };
+            let placer = {
+                let e = Arc::clone(&engine);
+                thread::spawn(move || {
+                    for _ in 0..3000 {
+                        let _ = e.apply(&placement("live", seed, 4));
+                    }
+                })
+            };
+            sweeper.join().unwrap();
+            placer.join().unwrap();
+
+            // A fresh placement (no sweep between apply and query) must be
+            // visible: if GC had orphaned the keyspace under a concurrent
+            // apply, the map lookup here would miss it.
+            engine.apply(&placement("final", seed, 4));
+            assert!(
+                scores(&engine, seed, 4).iter().any(|(h, _)| h == "final"),
+                "a placement after the GC race must be queryable (keyspace not orphaned)"
+            );
+        }
+    }
+}
