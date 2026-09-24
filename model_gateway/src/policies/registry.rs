@@ -522,22 +522,32 @@ impl PolicyRegistry {
             model_id
         );
 
-        // Inject and publish under the integration guards so a concurrent
-        // setter cannot fall between them: it either wrote before the reads
-        // here, or its propagation scan runs after the insert and finds
-        // this policy.
-        {
-            let monitor = self.kv_event_monitor.read();
-            let load_rx = self.load_rx.read();
-            let mesh = self.mesh_tree_sync.read();
-            Self::maybe_inject_monitor(&policy, monitor.as_ref());
-            Self::maybe_inject_load_rx(&policy, load_rx.as_ref());
-            Self::maybe_inject_mesh_tree_sync(&policy, mesh.as_ref());
+        self.publish_with_shared_state(&policy, || {
             self.model_policies
                 .insert(model_id.to_string(), Arc::clone(&policy));
-        }
+        });
 
         policy
+    }
+
+    /// Hand `policy` the shared state a cache-aware policy consumes (the KV
+    /// event monitor, the backend load feed, the mesh tree bridge), then run
+    /// `publish` while the three guards are still held. Holding them across
+    /// the publish is what makes this race-free against the setters: a
+    /// setter either wrote before these reads, or its propagation scan runs
+    /// after `publish` and finds the policy in place.
+    fn publish_with_shared_state(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        publish: impl FnOnce(),
+    ) {
+        let monitor = self.kv_event_monitor.read();
+        let load_rx = self.load_rx.read();
+        let mesh = self.mesh_tree_sync.read();
+        Self::maybe_inject_monitor(policy, monitor.as_ref());
+        Self::maybe_inject_load_rx(policy, load_rx.as_ref());
+        Self::maybe_inject_mesh_tree_sync(policy, mesh.as_ref());
+        publish();
     }
 
     /// Called when a worker is removed
@@ -698,11 +708,18 @@ impl PolicyRegistry {
         self.model_worker_counts.clear();
     }
 
-    /// Set the prefill policy for PD mode (lock-free, set once at startup)
+    /// Set the prefill policy for PD mode (lock-free, set once at startup).
+    ///
+    /// The router factory sets the prefill leg after the app context wired the
+    /// KV event monitor, the load feed and the mesh tree bridge into the
+    /// registry, and those setters only reach policies that already exist,
+    /// so the leg takes that state here.
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
-        // OnceLock::set returns Err if already set, which we ignore since
-        // the policy should only be set once at startup
-        let _ = self.prefill_policy.set(policy);
+        self.publish_with_shared_state(&policy, || {
+            // OnceLock::set returns Err if already set, which we ignore since
+            // the policy should only be set once at startup
+            let _ = self.prefill_policy.set(Arc::clone(&policy));
+        });
     }
 
     pub fn set_dp_rank_policy(&self, policy: Arc<dyn DPRankLoadPolicy>) {
@@ -716,18 +733,32 @@ impl PolicyRegistry {
         self.dp_rank_policy.get().map(Arc::clone)
     }
 
-    /// Set the decode policy for PD mode (lock-free, set once at startup)
+    /// Set the decode policy for PD mode (lock-free, set once at startup).
+    ///
+    /// The router factory sets the decode leg after the app context wired the
+    /// KV event monitor, the load feed and the mesh tree bridge into the
+    /// registry, and those setters only reach policies that already exist,
+    /// so the leg takes that state here.
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
-        // OnceLock::set returns Err if already set, which we ignore since
-        // the policy should only be set once at startup
-        let _ = self.decode_policy.set(policy);
+        self.publish_with_shared_state(&policy, || {
+            // OnceLock::set returns Err if already set, which we ignore since
+            // the policy should only be set once at startup
+            let _ = self.decode_policy.set(Arc::clone(&policy));
+        });
     }
 
-    /// Set the encode policy for EPD mode (lock-free, set once at startup)
+    /// Set the encode policy for EPD mode (lock-free, set once at startup).
+    ///
+    /// The router factory sets the encode leg after the app context wired the
+    /// KV event monitor, the load feed and the mesh tree bridge into the
+    /// registry, and those setters only reach policies that already exist,
+    /// so the leg takes that state here.
     pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
-        // OnceLock::set returns Err if already set, which we ignore since
-        // the policy should only be set once at startup
-        let _ = self.encode_policy.set(policy);
+        self.publish_with_shared_state(&policy, || {
+            // OnceLock::set returns Err if already set, which we ignore since
+            // the policy should only be set once at startup
+            let _ = self.encode_policy.set(Arc::clone(&policy));
+        });
     }
 
     /// Get the prefill policy for PD mode, or default if not set (lock-free)
@@ -1003,12 +1034,16 @@ impl std::fmt::Debug for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::HealthCheckConfig;
+    use tokio::sync::watch;
     use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
-        worker::{BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard, WorkerType},
+        worker::{
+            load_state::LoadSnapshot, BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard,
+            WorkerType,
+        },
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -2129,6 +2164,35 @@ mod tests {
             }
             registry.set_kv_event_monitor(None);
             registry.clear();
+        }
+    }
+
+    /// The PD/EPD legs are set after the app context wired the shared state
+    /// into the registry, so the leg setters hand it over themselves.
+    #[test]
+    fn pd_leg_policies_receive_the_shared_state_set_before_them() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new(Some(4)))));
+        let (_load_tx, load_rx) = watch::channel(LoadSnapshot::from_loads_for_test(Vec::new()));
+        registry.set_load_receiver(Some(load_rx));
+
+        let prefill = cache_aware_policy();
+        let decode = cache_aware_policy();
+        let encode = cache_aware_policy();
+        registry.set_prefill_policy(Arc::clone(&prefill));
+        registry.set_decode_policy(Arc::clone(&decode));
+        registry.set_encode_policy(Arc::clone(&encode));
+
+        for (leg, policy) in [("prefill", prefill), ("decode", decode), ("encode", encode)] {
+            let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+            assert!(
+                cache_aware.kv_event_monitor_is_set_for_test(),
+                "{leg} leg missed the KV event monitor"
+            );
+            assert!(
+                cache_aware.has_load_receiver_for_test(),
+                "{leg} leg missed the load feed"
+            );
         }
     }
 
