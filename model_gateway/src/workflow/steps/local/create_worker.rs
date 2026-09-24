@@ -223,12 +223,28 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             vec![None] // single worker, no DP
         };
 
+        // The worker keeps the spec it was registered with, so every field
+        // the API accepted rides along: provider, kv_block_size, the
+        // resilience overrides (which set the per-model retry config at
+        // registration), the pairing protocol, the load-monitor interval,
+        // the HTTP pool and multimodal transport overrides. What this step
+        // resolves is written over it: the normalized URL, the model card,
+        // the merged labels with the KV transfer keys taken out, the KV
+        // transfer fields as resolved, and the DP placement per rank.
+        let mut spec = config.clone();
+        spec.url.clone_from(&url);
+        spec.dp_base_url = None;
+        spec.dp_rank = None;
+        spec.dp_size = None;
+        spec.kv_connector = None;
+        spec.kv_role = None;
+        spec.kv_engine_id = None;
+
         let workers: Vec<Arc<dyn Worker>> = dp_ranks
             .into_iter()
             .map(|dp| {
-                let mut builder = BasicWorkerBuilder::new(url.clone())
+                let mut builder = BasicWorkerBuilder::from_spec(spec.clone())
                     .model(model_card.clone())
-                    .worker_type(config.worker_type)
                     .connection_mode(*connection_mode)
                     .runtime_type(runtime_type)
                     .circuit_breaker_config(circuit_breaker.clone())
@@ -237,20 +253,11 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .resilience(resolved_resilience.clone())
                     .health_config(health_config.clone())
                     .health_endpoint(health_endpoint)
-                    .bootstrap_port(config.bootstrap_port)
-                    .priority(config.priority)
-                    .cost(config.cost)
-                    .overload(config.overload)
-                    .overload_defaults(overload_defaults);
+                    .overload_defaults(overload_defaults)
+                    .labels(labels.clone());
 
                 if let Some((rank, size)) = dp {
                     builder = builder.dp_config(rank, size);
-                }
-                if let Some(ref key) = config.api_key {
-                    builder = builder.api_key(key.clone());
-                }
-                if !labels.is_empty() {
-                    builder = builder.labels(labels.clone());
                 }
                 if let Some(ref c) = kv_connector {
                     builder = builder.kv_connector(c);
@@ -757,6 +764,121 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_app_context() -> Arc<crate::app_context::AppContext> {
+        use crate::{
+            config::RouterConfig,
+            middleware::{AuthConfig, TokenBucket},
+            observability::inflight_tracker::InFlightRequestTracker,
+            routers::{
+                common::{openai_bridge, realtime::RealtimeRegistry},
+                grpc::multimodal::MultimodalConfigRegistry,
+            },
+            worker::WorkerService,
+        };
+
+        let router_config = RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .build_unchecked();
+        let registry = Arc::new(WorkerRegistry::new());
+        let job_queue = Arc::new(std::sync::OnceLock::new());
+
+        Arc::new(crate::app_context::AppContext {
+            gateway_auth: AuthConfig::new(None),
+            client: reqwest::Client::new(),
+            router_config: router_config.clone(),
+            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
+            rate_limit_manager: None,
+            worker_registry: Arc::clone(&registry),
+            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
+                router_config.policy.clone(),
+            )),
+            reasoning_parser_factory: None,
+            tool_parser_factory: None,
+            gateway: None,
+            response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+            conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            conversation_item_storage: Arc::new(
+                smg_data_connector::MemoryConversationItemStorage::new(),
+            ),
+            worker_monitor: None,
+            configured_reasoning_parser: None,
+            configured_tool_parser: None,
+            worker_job_queue: Arc::clone(&job_queue),
+            workflow_engines: Arc::new(std::sync::OnceLock::new()),
+            mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
+            mcp_format_registry: openai_bridge::FormatRegistry::new(),
+            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
+            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
+            wasm_manager: None,
+            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
+                &router_config,
+            )),
+            worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
+            inflight_tracker: InFlightRequestTracker::new(),
+            kv_event_monitor: None,
+            rl: None,
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+        })
+    }
+
+    /// A worker registered through the API keeps every spec field the
+    /// request carried, not only the ones this step copies by hand: the
+    /// provider, the KV block size, the resilience overrides (the per-model
+    /// retry config is derived from them at registration), the pairing
+    /// protocol and the load-monitor interval all have consumers.
+    #[tokio::test]
+    async fn api_registered_worker_keeps_the_fields_the_spec_accepted() {
+        use openai_protocol::worker::{ProviderType, ResilienceUpdate, WorkerModels};
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("http://worker:8000");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        spec.provider = Some(ProviderType::OpenAI);
+        spec.kv_block_size = Some(64);
+        spec.pairing_protocol = Some("cluster-blue".to_string());
+        spec.load_monitor_interval_secs = Some(3);
+        spec.resilience = ResilienceUpdate {
+            max_retries: Some(7),
+            ..Default::default()
+        };
+        spec.labels = HashMap::from([
+            ("kv_role".to_string(), "kv_consumer".to_string()),
+            ("tier".to_string(), "gold".to_string()),
+        ]);
+
+        let mut data =
+            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(reqwest::Client::new()));
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let worker = &ctx.data.actual_workers.as_ref().unwrap()[0];
+        let spec = &worker.metadata().spec;
+        assert_eq!(spec.url, "http://worker:8000");
+        assert_eq!(spec.provider, Some(ProviderType::OpenAI));
+        assert_eq!(spec.kv_block_size, Some(64));
+        assert_eq!(spec.pairing_protocol.as_deref(), Some("cluster-blue"));
+        assert_eq!(spec.load_monitor_interval_secs, Some(3));
+        assert_eq!(spec.resilience.max_retries, Some(7));
+        assert_eq!(worker.resilience().retry.max_retries, 7);
+        // Resolved by this step rather than copied: the KV transfer keys
+        // leave the labels for their own fields, and no DP placement is set.
+        assert_eq!(spec.kv_role.as_deref(), Some("kv_consumer"));
+        assert!(!spec.labels.contains_key("kv_role"));
+        assert_eq!(spec.labels["tier"], "gold");
+        assert_eq!(spec.dp_rank, None);
+        assert_eq!(spec.dp_size, None);
+    }
 
     #[test]
     fn dedicated_kv_metadata_wins_and_legacy_labels_are_removed() {
