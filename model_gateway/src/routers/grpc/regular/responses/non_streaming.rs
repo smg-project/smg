@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use openai_protocol::responses::{
-    ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse,
+    ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
 };
 use serde_json::json;
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput};
@@ -204,6 +204,8 @@ pub(super) async fn execute_tool_loop(
             )
             .await?;
 
+        state.record_usage(chat_response.usage.as_ref());
+
         // Check for function calls (extract all for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&chat_response);
 
@@ -251,6 +253,7 @@ pub(super) async fn execute_tool_loop(
                 );
             }
 
+            responses_response.usage = state.usage.map(ResponsesUsage::Modern);
             return Ok(responses_response);
         } else {
             state.iteration += 1;
@@ -279,7 +282,7 @@ pub(super) async fn execute_tool_loop(
             // If ANY tool call is a function tool, return to caller immediately
             if !function_tool_calls.is_empty() {
                 // Convert chat response to responses format (includes all tool calls)
-                let responses_response = conversions::chat_to_responses(
+                let mut responses_response = conversions::chat_to_responses(
                     &chat_response,
                     original_request,
                     params.response_id.clone(),
@@ -299,6 +302,7 @@ pub(super) async fn execute_tool_loop(
                 })?;
 
                 // Return response with function tool calls to caller
+                responses_response.usage = state.usage.map(ResponsesUsage::Modern);
                 return Ok(responses_response);
             }
 
@@ -405,6 +409,9 @@ pub(super) async fn execute_tool_loop(
                     params.response_id.clone(),
                 )
                 .map_err(|e| {
+                    error!(function = "tool_loop", iteration = state.iteration,
+                        error = %e, context = "tool_call_limit",
+                        "Failed to convert ChatCompletionResponse to ResponsesResponse");
                     error::internal_error(
                         "convert_to_responses_format_failed",
                         format!("Failed to convert to responses format: {e}"),
@@ -433,6 +440,7 @@ pub(super) async fn execute_tool_loop(
                         "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
                     }));
                 }
+                responses_response.usage = state.usage.map(ResponsesUsage::Modern);
                 return Ok(responses_response);
             }
 

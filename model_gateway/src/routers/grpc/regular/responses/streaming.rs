@@ -23,7 +23,7 @@ use openai_protocol::{
         ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
         ChatCompletionStreamResponse,
     },
-    common::{FunctionCallResponse, ToolCall, Usage, UsageInfo},
+    common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage, UsageInfo},
     responses::{
         IncompleteDetails, IncompleteReason, ResponseContentPart, ResponseOutputItem,
         ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
@@ -219,7 +219,7 @@ async fn process_and_transform_sse_stream(
                     if let Ok(value) = serde_json::from_str::<Value>(json_str) {
                         if let Some(error) = value.get("error") {
                             terminal_error = Some(json!({
-                                "code": error.get("code").or_else(|| error.get("type")).and_then(Value::as_str).unwrap_or("server_error"),
+                                "code": error.get("code").and_then(Value::as_str).or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
                                 "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
                             }));
                             break;
@@ -607,24 +607,7 @@ async fn execute_tool_loop_streaming_internal(
     // Flag to track if mcp_list_tools has been emitted
     let mut mcp_list_tools_emitted = false;
 
-    let mut terminal_usage = None;
     let terminal_error = loop {
-        state.iteration += 1;
-
-        // Record tool loop iteration metric
-        Metrics::record_mcp_tool_iteration(&current_request.model);
-
-        if state.iteration > DEFAULT_MAX_ITERATIONS {
-            // Reaching an equal user cap is still normal completion, even
-            // when no further model iteration is allowed by the safety guard.
-            if max_tool_calls.is_some_and(|limit| state.total_calls >= limit) {
-                break None;
-            }
-            break Some(
-                json!({"code": "max_tool_calls_exceeded", "message": format!("Tool loop exceeded maximum iterations ({DEFAULT_MAX_ITERATIONS})")}),
-            );
-        }
-
         trace!("Streaming MCP tool loop iteration {}", state.iteration);
 
         // Emit mcp_list_tools as first output item (only once, on first iteration)
@@ -645,6 +628,8 @@ async fn execute_tool_loop_streaming_internal(
 
         // Prepare tools and tool_choice for this iteration (same logic as non-streaming)
         prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
+        state.iteration += 1;
+        Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Execute chat streaming
         let response = ctx
@@ -665,23 +650,21 @@ async fn execute_tool_loop_streaming_internal(
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
-            match convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx).await {
-                Ok(response) => response,
-                Err(message) => break Some(json!({"code": "stream_error", "message": message})),
-            };
-        terminal_usage = accumulated_response.usage.as_ref().map(|u| {
-            json!({
-                "input_tokens": u.prompt_tokens,
-                "output_tokens": u.completion_tokens,
-                "total_tokens": u.total_tokens,
+            match convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx, |name| {
+                session.has_exposed_tool(name)
             })
-        });
-        // A truncated generation cannot request execution of a partial MCP call.
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => break Some(error),
+            };
+        state.record_usage(accumulated_response.usage.as_ref());
+        // Truncated or failed generation cannot request MCP execution.
         if accumulated_response
             .choices
             .first()
             .and_then(|choice| choice.finish_reason.as_deref())
-            == Some("length")
+            .is_some_and(|reason| matches!(reason, "length" | "failed" | "error"))
         {
             break None;
         }
@@ -949,6 +932,7 @@ async fn execute_tool_loop_streaming_internal(
         break None;
     };
 
+    let terminal_usage = state.usage.as_ref().map(|usage| json!(usage));
     emitter
         .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
         .await
@@ -959,41 +943,80 @@ async fn convert_and_accumulate_stream(
     body: Body,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &SseSender,
-) -> Result<ChatCompletionResponse, String> {
+    is_mcp_tool: impl Fn(&str) -> bool,
+) -> Result<ChatCompletionResponse, Value> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
+    // The parser supplies a complete name before argument deltas. Retain any
+    // preceding id-only deltas until that name tells us who executes the call.
+    let mut mcp_indices: HashMap<u32, bool> = HashMap::new();
+    let mut pending: HashMap<u32, Vec<ToolCallDelta>> = HashMap::new();
 
     while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("Stream read error: {e}"))?;
-
-        // Parse chunk
+        let chunk = chunk_result.map_err(|error| {
+            json!({
+                "code": "stream_error", "message": format!("Stream read error: {error}"),
+            })
+        })?;
         let event_str = String::from_utf8_lossy(&chunk);
         let event = event_str.trim();
-
         if event == "data: [DONE]" {
             break;
         }
-
         if let Some(json_str) = event.strip_prefix("data: ") {
             let json_str = json_str.trim();
-            if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
-                // Convert chat chunk to Responses API events and emit
-                emitter.process_chunk(&chat_chunk, tx).await?;
-
-                // Accumulate for tool call detection
+            if let Ok(mut chat_chunk) =
+                serde_json::from_str::<ChatCompletionStreamResponse>(json_str)
+            {
+                // Keep all calls for server execution; only client-owned calls
+                // may be exposed as Responses function_call items and events.
                 accumulator.process_chunk(&chat_chunk);
+                if let Some(choice) = chat_chunk.choices.first_mut() {
+                    if let Some(calls) = choice.delta.tool_calls.take() {
+                        let mut visible = Vec::new();
+                        for call in calls {
+                            let index = call.index;
+                            if let Some(name) = call
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.as_deref())
+                                .filter(|name| !name.is_empty())
+                            {
+                                mcp_indices
+                                    .entry(index)
+                                    .or_insert_with(|| is_mcp_tool(name));
+                            }
+                            pending.entry(index).or_default().push(call);
+                            if let Some(is_mcp) = mcp_indices.get(&index) {
+                                if let Some(deltas) = pending.remove(&index) {
+                                    if !is_mcp {
+                                        visible.extend(deltas);
+                                    }
+                                }
+                            }
+                        }
+                        choice.delta.tool_calls = (!visible.is_empty()).then_some(visible);
+                    }
+                }
+                emitter
+                    .process_chunk(&chat_chunk, tx)
+                    .await
+                    .map_err(|message| {
+                        json!({
+                            "code": "stream_error", "message": message,
+                        })
+                    })?;
             } else if let Ok(value) = serde_json::from_str::<Value>(json_str) {
                 if let Some(error) = value.get("error") {
-                    return Err(error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Upstream generation failed")
-                        .to_string());
+                    return Err(json!({
+                        "code": error.get("code").and_then(Value::as_str)
+                            .or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
+                        "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
+                    }));
                 }
             }
         }
     }
-
     Ok(accumulator.finalize())
 }
 
@@ -1332,5 +1355,221 @@ mod tests {
             "engine unavailable"
         );
         assert!(!events.iter().any(|e| e["type"] == "response.completed"));
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_retains_and_closes_partial_message_and_function() {
+        for finish in [None, Some("failed"), Some("error")] {
+            let request = ResponsesRequest::default();
+            let mut accumulator = StreamingResponseAccumulator::new(&request);
+            let mut emitter =
+                ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+            let (tx, mut rx) = mpsc::channel(64);
+            let partial: ChatCompletionStreamResponse = serde_json::from_value(json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{"content":"Partial answer", "tool_calls":[{
+                    "index":0,"id":"call_test","type":"function","function":{"name":"lookup","arguments":"{\"city\":"}
+                }]},"finish_reason":null}]
+            })).unwrap();
+            accumulator.process_chunk(&partial);
+            emitter.process_chunk(&partial, &tx).await.unwrap();
+            if let Some(finish) = finish {
+                let last = serde_json::from_value(json!({
+                    "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                    "choices":[{"index":0,"delta":{},"finish_reason":finish}]
+                })).unwrap();
+                accumulator.process_chunk(&last);
+                emitter.process_chunk(&last, &tx).await.unwrap();
+            }
+            let error = json!({"code":"internal_error","message":"engine stopped"});
+            emitter
+                .emit_terminal(None, finish.is_none().then_some(&error), &tx)
+                .await
+                .unwrap();
+            drop(tx);
+            let mut events: Vec<Value> = Vec::new();
+            while let Some(Ok(bytes)) = rx.recv().await {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                events.push(
+                    serde_json::from_str(
+                        text.lines()
+                            .find_map(|line| line.strip_prefix("data: "))
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                );
+            }
+            let terminal = events.last().unwrap();
+            assert_eq!(terminal["type"], "response.failed");
+            assert_eq!(terminal["response"]["output"].as_array().unwrap().len(), 2);
+            accumulator.finish_reason = Some("failed".into());
+            let stored = serde_json::to_value(accumulator.finalize()).unwrap();
+            for kind in ["message", "function_call"] {
+                let output = terminal["response"]["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["type"] == kind)
+                    .unwrap();
+                let saved = stored["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["type"] == kind)
+                    .unwrap();
+                assert_eq!(output["status"], "in_progress", "{output}");
+                assert_eq!(output["status"], saved["status"]);
+                assert_eq!(output["arguments"], saved["arguments"]);
+                assert_eq!(output["content"][0]["text"], saved["content"][0]["text"]);
+                for event_type in ["response.output_item.added", "response.output_item.done"] {
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|e| e["type"] == event_type && e["item"]["id"] == output["id"])
+                            .count(),
+                        1
+                    );
+                }
+            }
+            for kind in [
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.function_call_arguments.done",
+            ] {
+                assert_eq!(
+                    events.iter().filter(|e| e["type"] == kind).count(),
+                    1,
+                    "{events:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_stream_preserves_structured_upstream_errors() {
+        for (error, expected_code) in [
+            (
+                json!({"code":"overloaded","type":"server_error","message":"busy"}),
+                "overloaded",
+            ),
+            (
+                json!({"type":"internal_error","message":"busy"}),
+                "internal_error",
+            ),
+            (
+                json!({"code":null,"type":"internal_error","message":"busy"}),
+                "internal_error",
+            ),
+            (json!({"message":"busy"}), "server_error"),
+        ] {
+            let frame = format!("data: {}\n\n", json!({"error":error}));
+            let body = Body::from(frame);
+            let mut emitter =
+                ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+            let (tx, _) = mpsc::channel(64);
+            let error = convert_and_accumulate_stream(body, &mut emitter, &tx, |_| false)
+                .await
+                .unwrap_err();
+            let wire = serde_json::to_value(error).unwrap();
+            assert_eq!(wire["code"], expected_code, "{wire}");
+            assert_eq!(wire["message"], "busy");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_converter_hides_server_calls_but_streams_interleaved_client_calls() {
+        let chunks: Vec<ChatCompletionStreamResponse> = [
+            (json!({"tool_calls":[{"index":0,"id":"call_server","type":"function"},
+                {"index":1,"id":"call_client","type":"function"}]}), None),
+            (json!({"tool_calls":[{"index":0,"function":{"name":"server_tool","arguments":"{\"q\":"}},
+                {"index":1,"function":{"name":"client_tool","arguments":"{\"q\":"}}]}), None),
+            (json!({"tool_calls":[{"index":1,"function":{"arguments":"1}"}},
+                {"index":0,"function":{"arguments":"2}"}}]}), None),
+            (json!({}), Some("tool_calls")),
+        ].into_iter().map(|(delta, finish)| serde_json::from_value(json!({
+            "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+            "choices":[{"index":0,"delta":delta,"finish_reason":finish}],
+        })).unwrap()).collect();
+        let frames = chunks.into_iter().map(|chunk| {
+            Ok::<_, std::convert::Infallible>(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&chunk).unwrap()
+            ))
+        });
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, mut rx) = mpsc::channel(64);
+        let response = convert_and_accumulate_stream(
+            Body::from_stream(futures_util::stream::iter(frames)),
+            &mut emitter,
+            &tx,
+            |name| name == "server_tool",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.choices[0]
+                .message
+                .tool_calls
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        emitter.emit_terminal(None, None, &tx).await.unwrap();
+        drop(tx);
+        let mut events: Vec<Value> = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            events.push(
+                serde_json::from_str(
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        let output = events.last().unwrap()["response"]["output"]
+            .as_array()
+            .unwrap();
+        assert_eq!(output.len(), 1, "{events:?}");
+        assert_eq!(output[0]["call_id"], "call_client");
+        assert_eq!(output[0]["name"], "client_tool");
+        assert_eq!(output[0]["arguments"], "{\"q\":1}");
+        for kind in [
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.function_call_arguments.done",
+        ] {
+            assert_eq!(events.iter().filter(|e| e["type"] == kind).count(), 1);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == "response.function_call_arguments.delta")
+                .map(|e| e["delta"].as_str().unwrap())
+                .collect::<String>(),
+            "{\"q\":1}"
+        );
+        assert!(!events.iter().any(|e| e["item"]["name"] == "server_tool"));
+    }
+
+    #[tokio::test]
+    async fn mcp_transport_error_keeps_stream_error_code() {
+        let body = Body::from_stream(futures_util::stream::iter([Err::<Bytes, _>(
+            std::io::Error::other("connection reset"),
+        )]));
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, _) = mpsc::channel(64);
+        let error = convert_and_accumulate_stream(body, &mut emitter, &tx, |_| false)
+            .await
+            .unwrap_err();
+        assert_eq!(error["code"], "stream_error");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("connection reset"));
     }
 }

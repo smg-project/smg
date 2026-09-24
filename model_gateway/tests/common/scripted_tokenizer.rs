@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use llm_tokenizer::{
     chat_template::ChatTemplateParams, traits::Tokenizer, Decoder, Encoder, Encoding,
     MockTokenizer, SpecialTokens,
@@ -7,6 +9,8 @@ use llm_tokenizer::{
 pub struct ScriptedTokenizer {
     base: MockTokenizer,
     chunks: Vec<String>,
+    final_answer: Option<(usize, String)>,
+    use_final_answer: AtomicBool,
 }
 
 impl ScriptedTokenizer {
@@ -19,7 +23,16 @@ impl ScriptedTokenizer {
         Self {
             base: MockTokenizer::new(),
             chunks,
+            final_answer: None,
+            use_final_answer: AtomicBool::new(false),
         }
+    }
+
+    /// The canned worker reuses token ids on each request. Select its decoded
+    /// answer from the actual tool-result history sent back by the router.
+    pub fn with_final_answer(mut self, tool_results: usize, answer: &str) -> Self {
+        self.final_answer = Some((tool_results, answer.to_string()));
+        self
     }
 }
 
@@ -34,6 +47,14 @@ impl Encoder for ScriptedTokenizer {
 
 impl Decoder for ScriptedTokenizer {
     fn decode(&self, ids: &[u32], _skip_special: bool) -> anyhow::Result<String> {
+        if self.use_final_answer.load(Ordering::Relaxed) {
+            return Ok(self
+                .final_answer
+                .as_ref()
+                .filter(|_| ids.contains(&100))
+                .map(|(_, answer)| answer.clone())
+                .unwrap_or_default());
+        }
         Ok(ids
             .iter()
             .filter_map(|id| {
@@ -73,6 +94,14 @@ impl Tokenizer for ScriptedTokenizer {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> anyhow::Result<String> {
+        if let Some((limit, _)) = &self.final_answer {
+            let results = messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count();
+            self.use_final_answer
+                .store(results >= *limit, Ordering::Relaxed);
+        }
         self.base.apply_chat_template(messages, params)
     }
 }

@@ -344,13 +344,14 @@ impl ResponseStreamEventEmitter {
         // incomplete_details and terminates the stream with
         // response.incomplete, mirroring the non-streaming conversion.
         let truncated = self.finish_reason.as_deref() == Some("length");
+        let failed = matches!(self.finish_reason.as_deref(), Some("failed" | "error"));
 
         // Build base response object
         let mut response_obj = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
-            "status": if truncated { "incomplete" } else { "completed" },
+            "status": if failed { "failed" } else if truncated { "incomplete" } else { "completed" },
             "model": self.model,
             "output": output
         });
@@ -403,7 +404,9 @@ impl ResponseStreamEventEmitter {
         }
 
         json!({
-            "type": if truncated {
+            "type": if failed {
+                "response.failed"
+            } else if truncated {
                 ResponseEvent::INCOMPLETE
             } else {
                 ResponseEvent::COMPLETED
@@ -413,14 +416,20 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    /// Close any remaining reasoning part and emit exactly one terminal event.
+    /// Close remaining item event sequences, retaining unfinished wire statuses,
+    /// and emit exactly one terminal event.
     pub async fn emit_terminal(
         &mut self,
         usage: Option<&serde_json::Value>,
         error: Option<&serde_json::Value>,
         tx: &SseSender,
     ) -> Result<(), String> {
+        if error.is_some() {
+            self.finish_reason = Some("failed".into());
+        }
         self.close_reasoning_item(tx).await?;
+        self.close_message_item(tx).await?;
+        self.close_tool_call_items(tx).await?;
         let mut event = self.emit_completed(usage);
         if let Some(error) = error {
             event["type"] = json!("response.failed");
@@ -800,6 +809,7 @@ impl ResponseStreamEventEmitter {
         // Match the streamed terminal event: a `length` finish reports
         // status=incomplete with the truncation reason.
         let (status, incomplete_details) = match self.finish_reason.as_deref() {
+            Some("failed" | "error") => (ResponseStatus::Failed, None),
             Some("length") => (
                 ResponseStatus::Incomplete,
                 Some(IncompleteDetails {
@@ -948,9 +958,43 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
+    /// Closing the event sequence does not imply generation succeeded: partial
+    /// messages remain in_progress on the wire, but belong in terminal output.
+    async fn close_message_item(&mut self, tx: &SseSender) -> Result<(), String> {
+        let (Some(output_index), Some(item_id)) = (
+            self.current_message_output_index.take(),
+            self.current_item_id.take(),
+        ) else {
+            return Ok(());
+        };
+        if std::mem::take(&mut self.has_emitted_content_part_added) {
+            let event = self.emit_text_done(output_index, &item_id, 0);
+            self.send_event(&event, tx).await?;
+            let event = self.emit_content_part_done(output_index, &item_id, 0);
+            self.send_event(&event, tx).await?;
+        }
+        if std::mem::take(&mut self.has_emitted_output_item_added) {
+            let item = json!({
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": std::mem::take(&mut self.accumulated_text)}],
+                "status": if matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
+                    "in_progress"
+                } else {
+                    "completed"
+                },
+            });
+            let event = self.emit_output_item_done(output_index, &item);
+            self.send_event(&event, tx).await?;
+        }
+        self.complete_output_item(output_index);
+        Ok(())
+    }
+
     /// Close every streamed tool-call item: arguments (or custom input) done,
     /// then output_item.done, as the non-streaming path pairs them. Called on
-    /// `tool_calls` and on `length` finishes — grammar-constrained models can
+    /// all finishes and terminal errors — grammar-constrained models can
     /// keep emitting valid tool calls until `max_output_tokens` truncates the
     /// turn, and those (possibly partial) calls still belong in the final
     /// output, so they must be closed and collected here.
@@ -1195,47 +1239,8 @@ impl ResponseStreamEventEmitter {
             if let Some(reason) = &choice.finish_reason {
                 self.finish_reason = Some(reason.clone());
                 self.close_reasoning_item(tx).await?;
-                if reason == "stop" || reason == "length" || reason == "tool_calls" {
-                    if let (Some(output_index), Some(item_id)) = (
-                        self.current_message_output_index,
-                        self.current_item_id.clone(),
-                    ) {
-                        let content_index = 0;
-
-                        // Emit closing events
-                        if self.has_emitted_content_part_added {
-                            let event = self.emit_text_done(output_index, &item_id, content_index);
-                            self.send_event(&event, tx).await?;
-                            let event =
-                                self.emit_content_part_done(output_index, &item_id, content_index);
-                            self.send_event(&event, tx).await?;
-                        }
-
-                        if self.has_emitted_output_item_added {
-                            // Build complete message item for output_item.done
-                            let item = json!({
-                                "id": item_id,
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{
-                                    "type": "output_text",
-                                    "text": std::mem::take(&mut self.accumulated_text)
-                                }]
-                            });
-                            let event = self.emit_output_item_done(output_index, &item);
-                            self.send_event(&event, tx).await?;
-                        }
-
-                        // Mark item as completed
-                        self.complete_output_item(output_index);
-                    }
-                }
-                // Tool-call items close on `tool_calls` and on `length`:
-                // truncation can hit mid-call, but whatever arguments
-                // arrived still form a (partial) function-call output item.
-                if reason == "tool_calls" || reason == "length" {
-                    self.close_tool_call_items(tx).await?;
-                }
+                self.close_message_item(tx).await?;
+                self.close_tool_call_items(tx).await?;
             }
         }
 

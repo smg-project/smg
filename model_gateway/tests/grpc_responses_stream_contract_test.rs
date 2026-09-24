@@ -25,18 +25,30 @@ use tokio::{net::TcpListener, time::timeout};
 
 const MODEL: &str = "responses-stream-contract-model";
 
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper: failures should panic; the in-process worker is aborted after the request"
-)]
 async fn responses_result_with_output(
     tools: Value,
     output: Option<&str>,
     max_tool_calls: Option<u32>,
     expected_status: &str,
     stream: bool,
+) -> (Value, Vec<Value>) {
+    responses_result_with_final_answer(tools, output, max_tool_calls, expected_status, stream, None)
+        .await
+}
+
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    reason = "test helper: failures should panic; the in-process worker is aborted after the request"
+)]
+async fn responses_result_with_final_answer(
+    tools: Value,
+    output: Option<&str>,
+    max_tool_calls: Option<u32>,
+    expected_status: &str,
+    stream: bool,
+    final_answer_after: Option<usize>,
 ) -> (Value, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -96,10 +108,17 @@ async fn responses_result_with_output(
         config.tool_call_parser = Some("qwen".into());
     }
     let tokenizer: Arc<dyn Tokenizer> = match output_chunks {
-        Some(chunks) if chunks.len() > 1 => {
-            Arc::new(scripted_tokenizer::ScriptedTokenizer::from_chunks(chunks))
+        Some(chunks) => {
+            let mut tokenizer = if chunks.len() == 1 {
+                scripted_tokenizer::ScriptedTokenizer::new(&chunks.concat())
+            } else {
+                scripted_tokenizer::ScriptedTokenizer::from_chunks(chunks)
+            };
+            if let Some(limit) = final_answer_after {
+                tokenizer = tokenizer.with_final_answer(limit, "Final answer after tools");
+            }
+            Arc::new(tokenizer)
         }
-        Some(chunks) => Arc::new(scripted_tokenizer::ScriptedTokenizer::new(&chunks.concat())),
         None => Arc::new(MockTokenizer::new()),
     };
     tokenizers
@@ -273,18 +292,22 @@ async fn mcp_user_tool_limit_emits_completed_terminal_response() {
 }
 
 #[tokio::test]
-async fn mcp_iteration_safety_limit_emits_failed_terminal_response() {
+async fn mcp_call_safety_limit_emits_failed_terminal_response() {
     let events = mcp_repeated_tool_call_events(None, "failed").await.unwrap();
     let terminal = events.last().unwrap();
     assert_eq!(
         terminal["response"]["error"]["code"],
         "max_tool_calls_exceeded"
     );
-    assert!(terminal["response"]["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("maximum iterations"));
-    assert!(terminal["response"]["incomplete_details"].is_null());
+    assert_eq!(
+        terminal["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "mcp_call")
+            .count(),
+        10
+    );
 }
 
 /// Exercise the same generated MCP batch through both regular Responses paths.
@@ -302,11 +325,28 @@ async fn mcp_cap_response(
             format!("<tool_call>\n{call}\n</tool_call>\n")
         })
         .collect();
-    let (response, _) = responses_result_with_output(
+    let (response, events) = responses_result_with_output(
         json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
         Some(&output), cap, expected_status, stream,
     ).await;
     mcp.stop().await;
+    assert!(
+        !events.iter().any(|event| {
+            event["item"]["type"] == "function_call"
+                || event["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("response.function_call_arguments."))
+        }),
+        "server-executed calls must not be streamed as client functions: {events:?}"
+    );
+    assert!(
+        !response["output"]
+            .as_array()
+            .ok_or("Responses output must be an array")?
+            .iter()
+            .any(|item| item["type"] == "function_call"),
+        "{response}"
+    );
     Ok(response)
 }
 
@@ -411,5 +451,56 @@ async fn mcp_cap_cannot_disable_internal_safety_limit() {
                 assert_executed_mcp_queries(&response, &expected);
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn mcp_final_answer_survives_ten_executed_calls() {
+    for stream in [false, true] {
+        for cap in [None, Some(10), Some(20)] {
+            for batch_size in [1, 2] {
+                let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+                    .await
+                    .unwrap();
+                let output = (0..batch_size).map(|index| format!(
+                    "<tool_call>\n{}\n</tool_call>\n",
+                    json!({"name":"brave_web_search","arguments":{"query":format!("query-{index}")}})
+                )).collect::<String>();
+                let (response, _) = responses_result_with_final_answer(
+                    json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+                    Some(&output), cap, "completed", stream, Some(10),
+                ).await;
+                mcp.stop().await;
+                assert!(
+                    response["output"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["type"] == "message"
+                            && item["content"][0]["text"] == "Final answer after tools"),
+                    "stream={stream}, cap={cap:?}, batch={batch_size}: {response}"
+                );
+                let queries: Vec<_> = (0..10)
+                    .map(|i| format!("query-{}", i % batch_size))
+                    .collect();
+                assert_executed_mcp_queries(
+                    &response,
+                    &queries.iter().map(String::as_str).collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_usage_includes_every_model_call_in_both_modes() {
+    for stream in [false, true] {
+        let response = mcp_cap_response(stream, Some(1), 1, "completed")
+            .await
+            .unwrap();
+        // Two model requests: one executed call, followed by an ignored call.
+        assert_eq!(response["usage"]["input_tokens"], 2, "{response}");
+        assert_eq!(response["usage"]["output_tokens"], 6, "{response}");
+        assert_eq!(response["usage"]["total_tokens"], 8, "{response}");
     }
 }

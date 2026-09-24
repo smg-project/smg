@@ -1014,6 +1014,10 @@ mod responses_finish_reason_tests {
 
     use super::*;
 
+    #[expect(
+        dead_code,
+        reason = "this shared fixture also supports multi-turn MCP tests"
+    )]
     mod scripted_tokenizer {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
