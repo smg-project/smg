@@ -156,3 +156,10 @@ Backend dependencies are isolated via extras or runtime installs to avoid confli
 ## Development
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for local development setup, CI, and release workflows.
+
+### SGLang KV-event recovery
+
+The SGLang gRPC bridge currently streams live KV events. A nonzero resume
+cursor returns `OUT_OF_RANGE`, allowing SMG to discard that worker's stale
+cache mappings and subscribe again with a zero cursor. The fresh subscription
+rebuilds cache knowledge from subsequent events; it is not a full cache snapshot.

@@ -18,8 +18,6 @@ from pathlib import Path
 import grpc
 import msgspec
 import sglang
-import zmq
-import zmq.asyncio
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -30,7 +28,6 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     KVEventBatch,
     KVEventsConfig,
-    ZmqEventPublisher,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.io_struct import (
@@ -54,6 +51,7 @@ from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
 from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
@@ -749,60 +747,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
             return
 
-        config = self._kv_events_config
-
-        # Resolve the PUB endpoint to a connectable address.
-        # The publisher binds to e.g. "tcp://*:5557"; we connect to localhost.
-        pub_endpoint = config.endpoint.replace("*", "127.0.0.1")
-
-        # For DP attention, each rank publishes on port + rank with
-        # independent sequence counters. Subscribing to multiple ranks
-        # on one socket interleaves independent counters, breaking gap
-        # detection. For now, subscribe to rank 0 only.
-        # TODO(phase2): per-rank virtual workers or merged renumbering.
-        pub_endpoint = ZmqEventPublisher.offset_endpoint_port(pub_endpoint, 0)
-
-        zmq_ctx = zmq.asyncio.Context.instance()
-        sub_socket = zmq_ctx.socket(zmq.SUB)
-        sub_socket.subscribe(config.topic.encode("utf-8"))
-        sub_socket.connect(pub_endpoint)
-
-        logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
-
-        # Send response headers immediately so the tonic client's
-        # subscribe_kv_events().await resolves without waiting for the first
-        # yielded event (grpc.aio defers headers until first yield otherwise).
-        await context.send_initial_metadata(())
-
         decoder = msgspec.msgpack.Decoder(KVEventBatch)
-
-        # Stream live events using the ZMQ publisher's native seq numbers.
-        try:
-            while not context.cancelled():
-                try:
-                    frames = await asyncio.wait_for(sub_socket.recv_multipart(), timeout=1.0)
-                except TimeoutError:
-                    continue
-
-                # ZMQ multipart: [topic, seq_bytes, payload]
-                if len(frames) < 3:
-                    continue
-
-                zmq_seq = int.from_bytes(frames[1], "big")
-                payload = frames[2]
-
-                try:
-                    raw_batch = decoder.decode(payload)
-                except Exception as e:
-                    logger.warning("Failed to decode KV event batch: %s", e)
-                    continue
-
-                yield self._convert_kv_event_batch(raw_batch, zmq_seq)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            sub_socket.close(linger=0)
-            logger.info("SubscribeKvEvents: stream closed")
+        async for batch in subscribe_kv_events(
+            self._kv_events_config,
+            request.start_sequence_number,
+            context,
+            decoder.decode,
+            self._convert_kv_event_batch,
+        ):
+            yield batch
 
     def _convert_kv_event_batch(
         self, raw_batch: KVEventBatch, seq_num: int
