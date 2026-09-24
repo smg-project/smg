@@ -21,8 +21,8 @@ use crate::{
         error,
         grpc::{
             context::{
-                DispatchContext, EncodeWorkerAssignment, RequestContext, RoutingSnapshot,
-                WireConstraint, WorkerSelection,
+                DispatchContext, EncodeWorkerAssignment, RequestContext, RequestType,
+                RoutingSnapshot, WireConstraint, WorkerSelection,
             },
             multimodal,
         },
@@ -92,6 +92,7 @@ impl PipelineStage for WorkerSelectionStage {
         let intermediate = ctx.state.multimodal_intermediate.as_ref();
         // Media references only go to workers that advertise worker-side processing.
         let media_refs = ctx.state.multimodal_refs.is_some();
+        let needs_vision = decode_needs_vision(&ctx.input.request_type, intermediate, media_refs);
 
         let text = prep.routing_text();
 
@@ -156,6 +157,10 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
+                // Retries re-select under the same pin; EPD is not pinned:
+                // its encode fleet takes the pixels, and its own selection
+                // never applied the veto.
+                ctx.state.multimodal_payload = needs_vision;
                 match self.select_pd_pair(
                     model_id,
                     text,
@@ -165,6 +170,7 @@ impl PipelineStage for WorkerSelectionStage {
                     cache_namespace,
                     None,
                     media_refs,
+                    needs_vision,
                 ) {
                     Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
@@ -323,6 +329,7 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     wire,
                     false,
+                    false,
                 ) {
                     Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
@@ -343,6 +350,30 @@ impl WorkerSelectionStage {
 /// Candidate predicate for requests carrying media references.
 fn accepts_media_refs(worker: &dyn Worker) -> bool {
     multimodal::worker_accepts_media_refs(worker)
+}
+
+/// Candidate predicate for requests whose decode leg needs a vision
+/// encoder: a `--language-model-only` decode worker cannot take it.
+fn vision_capable(worker: &dyn Worker) -> bool {
+    !multimodal::worker_language_model_only(worker)
+}
+
+/// Whether a request's PD decode leg cannot be served by a
+/// `--language-model-only` decode worker: the cases `sequential_pd_decode_form`
+/// refuses with a non-retryable 400 (media references, which each leg
+/// expands itself; a multimodal request with `n > 1`, which recomputes the
+/// prompt locally; M-RoPE grids, which the leg derives its positions from).
+/// A text request, `n > 1` included, and a plain multimodal request (`n =
+/// 1`, no references, no grids) take such a worker's leg, so they are not
+/// steered away from it.
+fn decode_needs_vision(
+    request: &RequestType,
+    intermediate: Option<&multimodal::MultimodalIntermediate>,
+    media_refs: bool,
+) -> bool {
+    media_refs
+        || intermediate
+            .is_some_and(|intermediate| request.sampling_n() > 1 || intermediate.has_mrope_grids())
 }
 
 /// Runtime of the leg that builds the generate request: the sole worker in
@@ -639,8 +670,10 @@ impl WorkerSelectionStage {
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
         media_refs: bool,
+        multimodal: bool,
     ) -> Result<PdWorkerPair, Response> {
         let media_refs = media_refs || wire.is_some_and(|w| w.requires_media_refs);
+        let multimodal = multimodal || wire.is_some_and(|w| w.requires_vision);
         // Both legs derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
         // that never coexisted. The pools are strictly gRPC (a ZMQ leg would
@@ -650,6 +683,45 @@ impl WorkerSelectionStage {
         // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        // A worker that advertises worker-side processing is vision-capable
+        // by construction. For a decode leg that needs a vision encoder (see
+        // `decode_needs_vision`) a `--language-model-only` decode worker is
+        // left out of the pairing while a vision-capable one can pair
+        // (`sequential_pd_decode_form` would refuse the leg with a
+        // non-retryable 400 after selection); with none the pool is used as
+        // it is, and dispatch names the incompatibility. "Can pair" reads
+        // the index, for both legs since the filter applies to both: an open
+        // vision-capable prefill with an open vision-capable partner on its
+        // runtime, both on the retained wire when one is pinned.
+        let open = |w: &Arc<dyn Worker>| {
+            w.is_available()
+                && wire.is_none_or(|wire| {
+                    w.metadata().spec.runtime_type == wire.runtime
+                        && *w.connection_mode() == wire.connection
+                })
+        };
+        let vision_decode_open = || {
+            pairs
+                .prefill
+                .iter()
+                .zip(&pairs.partners)
+                .filter(|(prefill, _)| open(prefill) && vision_capable(prefill.as_ref()))
+                .any(|(prefill, partners)| {
+                    partners.iter().any(|decode| {
+                        open(decode)
+                            && vision_capable(decode.as_ref())
+                            && decode.metadata().spec.runtime_type
+                                == prefill.metadata().spec.runtime_type
+                    })
+                })
+        };
+        let candidate_filter: Option<fn(&dyn Worker) -> bool> = if media_refs {
+            Some(accepts_media_refs)
+        } else if multimodal && vision_decode_open() {
+            Some(vision_capable)
+        } else {
+            None
+        };
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
@@ -663,7 +735,7 @@ impl WorkerSelectionStage {
                 headers,
                 rid_key,
                 cache_namespace,
-                candidate_filter: media_refs.then_some(accepts_media_refs),
+                candidate_filter,
             },
         )
         .map_err(|failure| {
@@ -1035,12 +1107,240 @@ mod tests {
         let mut decode_hits = HashMap::new();
         for _ in 0..iterations {
             let (prefill, decode, _) = stage
-                .select_pd_pair(model_id, None, None, None, None, None, None, false)
+                .select_pd_pair(model_id, None, None, None, None, None, None, false, false)
                 .expect("select_pd_pair should return a pair");
             *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
         }
         (prefill_hits, decode_hits)
+    }
+
+    /// A decode worker running `--language-model-only` cannot serve a
+    /// multimodal request's decode leg; while a vision-capable decode worker
+    /// is available the pairing leaves it out, rather than fail after
+    /// selection with a non-retryable 400. Text requests still use it, and
+    /// with no capable decode worker the pool is used as it is, so dispatch
+    /// names the incompatibility.
+    #[test]
+    fn multimodal_requests_avoid_language_model_only_decode_workers() {
+        let model_id = "test-model-lmo-decode";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_pd_workers(&worker_registry, model_id, 2);
+        let lmo_url = "grpc://127.0.0.1:8200";
+        worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(lmo_url)
+                    .model(ModelCard::new(model_id))
+                    .worker_type(WorkerType::Decode)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .label(multimodal::SUPPORTS_VISION_LABEL, "false")
+                    .build(),
+            ))
+            .unwrap();
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::PrefillDecode,
+        );
+
+        let decode_urls = |multimodal: bool| -> Vec<String> {
+            (0..12)
+                .map(|_| {
+                    let (_, decode, _) = stage
+                        .select_pd_pair(
+                            model_id, None, None, None, None, None, None, false, multimodal,
+                        )
+                        .expect("a pair");
+                    decode.url().to_string()
+                })
+                .collect()
+        };
+        assert!(decode_urls(true).iter().all(|url| url != lmo_url));
+        assert!(decode_urls(false).iter().any(|url| url == lmo_url));
+
+        // With every vision-capable decode worker vetoed, the language-model-only
+        // worker is the pool: selection proceeds and dispatch decides.
+        for url in ["grpc://127.0.0.1:8100", "grpc://127.0.0.1:8101"] {
+            let worker = worker_registry.get_by_url(url).expect("registered");
+            worker_registry.set_worker_overloaded(&worker, true);
+        }
+        assert!(decode_urls(true).iter().all(|url| url == lmo_url));
+    }
+
+    /// The vision filter is worth applying only when a vision-capable decode
+    /// worker can actually pair: one that no available prefill partners
+    /// (another runtime here) must not shut out the language-model-only
+    /// decode worker the request can still use.
+    #[test]
+    fn an_unpairable_vision_decode_worker_does_not_shut_out_the_pool() {
+        let model_id = "test-model-unpairable-vision";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let register = |url: &str, worker_type: WorkerType, runtime: RuntimeType, lmo: bool| {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model_id))
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(runtime)
+                .health_config(no_health_check());
+            if lmo {
+                builder = builder.label(multimodal::SUPPORTS_VISION_LABEL, "false");
+            }
+            worker_registry.register(Arc::new(builder.build())).unwrap();
+        };
+        register(
+            "grpc://127.0.0.1:8300",
+            WorkerType::Prefill,
+            RuntimeType::Vllm,
+            false,
+        );
+        register(
+            "grpc://127.0.0.1:8310",
+            WorkerType::Decode,
+            RuntimeType::Vllm,
+            true,
+        );
+        register(
+            "grpc://127.0.0.1:8311",
+            WorkerType::Decode,
+            RuntimeType::Sglang,
+            false,
+        );
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::PrefillDecode,
+        );
+        let (_, decode, _) = stage
+            .select_pd_pair(model_id, None, None, None, None, None, None, false, true)
+            .expect("the language-model-only decode worker still pairs");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:8310");
+
+        // The filter applies to both legs: a vision decode worker whose only
+        // partner prefill is itself language-model-only cannot pair either.
+        register(
+            "grpc://127.0.0.1:8301",
+            WorkerType::Prefill,
+            RuntimeType::Sglang,
+            true,
+        );
+        let (prefill, decode, _) = stage
+            .select_pd_pair(model_id, None, None, None, None, None, None, false, true)
+            .expect("a pair from the pool as it is");
+        assert!(
+            (prefill.url(), decode.url()) == ("grpc://127.0.0.1:8300", "grpc://127.0.0.1:8310")
+                || (prefill.url(), decode.url())
+                    == ("grpc://127.0.0.1:8301", "grpc://127.0.0.1:8311"),
+            "{} / {}",
+            prefill.url(),
+            decode.url()
+        );
+    }
+
+    /// The veto is for what a `--language-model-only` decode worker cannot
+    /// serve: references, a multimodal request with `n > 1`, M-RoPE grids.
+    /// A text request of any `n` and a plain image request take its leg and
+    /// are not steered away from it.
+    #[test]
+    fn decode_needs_vision_only_for_what_the_stripped_leg_cannot_serve() {
+        use std::collections::HashMap;
+
+        use llm_multimodal::{
+            EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSource,
+            ModelSpecificValue, PlaceholderRange, PreprocessedEncoderInputs,
+        };
+        use ndarray::{ArrayD, IxDyn};
+        use openai_protocol::chat::ChatCompletionRequest;
+
+        use crate::routers::grpc::{
+            context::RequestType,
+            multimodal::{
+                MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate,
+                PromptBinding,
+            },
+        };
+
+        let chat = |n: Option<u32>| -> RequestType {
+            let mut body = serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(n) = n {
+                body["n"] = serde_json::json!(n);
+            }
+            let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+            RequestType::Chat(Arc::new(request))
+        };
+        let intermediate = |grid_key: Option<&str>| -> MultimodalIntermediate {
+            let mut model_specific = HashMap::new();
+            if let Some(key) = grid_key {
+                model_specific.insert(
+                    key.to_string(),
+                    ModelSpecificValue::UintTensor {
+                        data: vec![1, 2, 2],
+                        shape: vec![1, 3],
+                    },
+                );
+            }
+            MultimodalIntermediate::try_new(vec![PrecomputedMultimodalIntermediate {
+                preprocessed: PreprocessedEncoderInputs {
+                    encoder_input: ArrayD::from_shape_vec(IxDyn(&[1, 2]), vec![1.0, 2.0]).unwrap(),
+                    feature_token_counts: vec![1],
+                    item_sizes: vec![(1, 1)],
+                    model_specific,
+                },
+                media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
+                    image::DynamicImage::new_rgb8(1, 1),
+                    bytes::Bytes::from_static(b"a"),
+                    ImageDetail::Auto,
+                    ImageSource::InlineBytes,
+                    "hash-a".to_string(),
+                ))]),
+                bindings: vec![PromptBinding {
+                    item_index: 0,
+                    prompt_ordinal: 0,
+                    structural: PlaceholderRange {
+                        offset: 1,
+                        length: 1,
+                    },
+                    patches: vec![],
+                }],
+                placeholder_token_id: Some(151_655),
+                field_layouts: EncoderFieldLayouts::new(
+                    FieldLayout::flat("pixel_values"),
+                    HashMap::new(),
+                ),
+                keep_on_cpu_keys: vec![],
+                encoder_input_key: None,
+            }])
+            .unwrap()
+        };
+
+        assert!(!decode_needs_vision(&chat(None), None, false));
+        assert!(
+            !decode_needs_vision(&chat(Some(2)), None, false),
+            "text with n > 1 recomputes a text prompt: no vision needed"
+        );
+        assert!(
+            decode_needs_vision(&chat(None), None, true),
+            "media references"
+        );
+        assert!(
+            decode_needs_vision(&chat(Some(2)), Some(&intermediate(None)), false),
+            "a multimodal request with n > 1 recomputes the prompt locally"
+        );
+        assert!(
+            !decode_needs_vision(&chat(Some(1)), Some(&intermediate(None)), false),
+            "a plain image request takes the stripped leg"
+        );
+        assert!(
+            decode_needs_vision(
+                &chat(None),
+                Some(&intermediate(Some("image_grid_thw"))),
+                false
+            ),
+            "M-RoPE grids"
+        );
     }
 
     /// A saturated prefill leg is a pressure condition, not model absence.
@@ -1061,7 +1361,7 @@ mod tests {
             WorkerSelectionMode::PrefillDecode,
         );
         assert!(stage
-            .select_pd_pair(model_id, None, None, None, None, None, None, false)
+            .select_pd_pair(model_id, None, None, None, None, None, None, false, false)
             .is_ok());
 
         for url in &prefill_urls {
@@ -1071,7 +1371,7 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None, None, false)
+                .select_pd_pair(model_id, None, None, None, None, None, None, false, false)
                 .is_err(),
             "the veto empties the prefill pool"
         );
@@ -1255,7 +1555,7 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None, None, false)
+                .select_pd_pair(model_id, None, None, None, None, None, None, false, false)
                 .is_err(),
             "ZMQ-only PD pools must not yield a pair"
         );
@@ -1263,7 +1563,7 @@ mod tests {
         // Adding gRPC legs makes selection succeed, and it never picks the ZMQ ones.
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
         let (prefill, decode, _) = stage
-            .select_pd_pair(model_id, None, None, None, None, None, None, false)
+            .select_pd_pair(model_id, None, None, None, None, None, None, false, false)
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));
@@ -1587,6 +1887,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                requires_vision: false,
             },
         );
         for _ in 0..8 {
@@ -1654,6 +1955,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                requires_vision: false,
             },
         );
         for _ in 0..8 {
@@ -1713,6 +2015,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                requires_vision: false,
             },
         );
 
@@ -1775,6 +2078,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+            requires_vision: false,
         };
         let namespace = |salt: &str| {
             CacheNamespace::derive(&CachePartition {
@@ -1869,6 +2173,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: true,
+            requires_vision: true,
         };
         let worker = stage
             .select_single_worker(
@@ -1931,6 +2236,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: true,
+            requires_vision: true,
         };
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), false)
@@ -2012,7 +2318,7 @@ mod tests {
         );
 
         let response = stage
-            .select_pd_pair(model_id, None, None, None, None, None, None, true)
+            .select_pd_pair(model_id, None, None, None, None, None, None, true, true)
             .expect_err("no prefill worker at all");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_ne!(
@@ -2061,7 +2367,7 @@ mod tests {
         );
 
         let response = stage
-            .select_pd_pair(model_id, None, None, None, None, None, None, true)
+            .select_pd_pair(model_id, None, None, None, None, None, None, true, true)
             .expect_err("no advertising decode worker yet");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -2079,7 +2385,7 @@ mod tests {
             .unwrap();
         for _ in 0..3 {
             let (prefill, decode, _) = stage
-                .select_pd_pair(model_id, None, None, None, None, None, None, true)
+                .select_pd_pair(model_id, None, None, None, None, None, None, true, true)
                 .expect("advertising pair");
             assert_eq!(prefill.url(), "grpc://127.0.0.1:8721");
             assert_eq!(decode.url(), "grpc://127.0.0.1:8731");
