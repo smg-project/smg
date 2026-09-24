@@ -1636,9 +1636,19 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         .unwrap_or_else(|| "unknown".to_string());
     let message = format!("{e}. URL: {url}");
 
-    // TODO improve error status code
+    // reqwest files a request timeout under `Kind::Request` (with a `TimedOut`
+    // source), so `is_request()` is true for it as well: the timeout and
+    // connect arms have to be consulted before the generic request arm, or a
+    // timed-out upstream reads as a plain 500 and the 504 path is unreachable.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
+    } else if e.is_timeout() {
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
+    } else if e.is_connect() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_connection_failed",
+        )
     } else if e.is_builder() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1663,13 +1673,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "call_upstream_decode_error",
-        )
-    } else if e.is_timeout() {
-        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
-    } else if e.is_connect() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_connection_failed",
         )
     } else {
         (
@@ -3365,5 +3368,57 @@ mod tests {
     async fn missing_worker_falls_back_to_buffered() {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
         assert_falls_back_with_body_intact(&router).await;
+    }
+
+    /// reqwest reports a request timeout as `Kind::Request` with a `TimedOut`
+    /// source, so `is_request()` is true for it too; the converter has to
+    /// consult the timeout arm first or a timed-out upstream is a 500.
+    #[tokio::test]
+    async fn upstream_timeout_is_a_gateway_timeout() {
+        // Never accepted: the connect completes into the backlog and the
+        // request then waits for an answer that never comes, so the client
+        // timeout fires.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        drop(listener);
+        assert!(err.is_timeout());
+        assert!(err.is_request(), "the kind reqwest gives a timeout");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_connection_failure_keeps_its_own_code() {
+        // Bind, then drop: the port is free, so the connect is refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let err = reqwest::Client::new()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_connect());
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_connection_failed"
+        );
     }
 }
