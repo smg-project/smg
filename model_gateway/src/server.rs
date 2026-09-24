@@ -52,6 +52,7 @@ use crate::{
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
+        inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
         metrics_server, otel_trace, runtime_metrics,
@@ -1046,19 +1047,42 @@ pub fn build_app(
         app = app.merge(rl_routes);
     }
 
-    Ok(app
+    Ok(attach_edge_layers(
+        app,
+        max_payload_size,
+        app_state.context.inflight_tracker.clone(),
+        request_id_headers,
+        cors_allowed_origins,
+    )
+    .with_state(app_state))
+}
+
+/// The middleware every request crosses, matched or not: body limits, access
+/// logging, HTTP metrics, request ids and CORS.
+///
+/// `Router::layer` wraps only what the router holds when it is called, so the
+/// not-found fallback goes in first. Registered after the layers, unknown
+/// routes ran outside all of them: no log line, no metric (the metrics layer
+/// already labels them `other`), no `x-request-id`, no CORS headers.
+fn attach_edge_layers<S>(
+    app: Router<S>,
+    max_payload_size: usize,
+    inflight_tracker: Arc<InFlightRequestTracker>,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    app.fallback(sink_handler)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
-        .layer(middleware::HttpMetricsLayer::new(
-            app_state.context.inflight_tracker.clone(),
-        ))
+        .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
-        .fallback(sink_handler)
-        .with_state(app_state))
 }
 
 /// Discovery tasks owned by `startup`, aborted when this guard drops.
@@ -1734,6 +1758,39 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// The not-found fallback sits inside the edge layers: an unknown route
+    /// gets a request id (and a log line and a metric) like a known one.
+    #[tokio::test]
+    async fn unknown_routes_cross_the_edge_middleware() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new().route("/known", get(|| async { StatusCode::OK })),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        for (path, status) in [("/known", StatusCode::OK), ("/nope", StatusCode::NOT_FOUND)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    http::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+            assert!(
+                response.headers().contains_key("x-request-id"),
+                "{path} skipped the edge middleware"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn configured_cors_allows_anthropic_headers() {
