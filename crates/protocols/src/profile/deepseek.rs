@@ -25,7 +25,14 @@ pub(super) fn matches_model(segment: &str) -> bool {
     .any(|model| segment.eq_ignore_ascii_case(model))
 }
 
+fn is_v41_model(model: &str) -> bool {
+    model
+        .split('/')
+        .any(|segment| segment.eq_ignore_ascii_case("deepseek-v4.1-flash"))
+}
+
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
+    let is_v41 = is_v41_model(&req.model);
     for effort in [
         req.reasoning_effort.as_mut(),
         req.thinking
@@ -37,7 +44,9 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     {
         match effort.as_str() {
             "minimal" => *effort = "low".into(),
-            "medium" | "xhigh" => *effort = "high".into(),
+            "medium" => *effort = "high".into(),
+            // V4.1 has its own native xhigh budget (75 rather than high's 50).
+            "xhigh" if !is_v41 => *effort = "high".into(),
             _ => {}
         }
     }
@@ -98,8 +107,25 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     .into_iter()
     .flatten()
     {
-        if !["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort) {
-            return Err(error("reasoning_effort_not_allowed", "DeepSeek V4 reasoning effort must be none, low, high or max (minimal, medium and xhigh aliases are accepted)"));
+        // The V4.1 native renderer restores ASCII-digit strings to 1..=100
+        // budgets. Other V4 renderers do not support that extension.
+        let is_v41 = is_v41_model(&req.model);
+        let native_budget = is_v41
+            && effort.bytes().all(|byte| byte.is_ascii_digit())
+            && effort
+                .parse::<u8>()
+                .is_ok_and(|budget| (1..=100).contains(&budget));
+        if !["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort)
+            && !native_budget
+        {
+            return Err(error(
+                "reasoning_effort_not_allowed",
+                if is_v41 {
+                    "DeepSeek V4.1 reasoning effort must be none, low, high, xhigh, max or an integer budget from 1 to 100 (minimal and medium aliases are accepted)"
+                } else {
+                    "DeepSeek V4 reasoning effort must be none, low, high or max (minimal, medium and xhigh aliases are accepted)"
+                },
+            ));
         }
     }
     let forced = match req.tool_choice.as_ref() {

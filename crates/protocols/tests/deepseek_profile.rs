@@ -203,3 +203,74 @@ fn deepseek_rejects_ambiguous_template_thinking_overrides() {
         false
     );
 }
+
+#[test]
+fn deepseek_v41_preserves_native_xhigh_for_both_effort_fields() {
+    for model in [
+        "deepseek-v4.1-flash",
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        "/models/DEEPSEEK-V4.1-FLASH",
+    ] {
+        for extra in [
+            json!({"reasoning_effort":"xhigh"}),
+            json!({"thinking":{"effort":"xhigh"}}),
+        ] {
+            let mut extra = extra;
+            extra["model"] = json!(model);
+            let req = request(extra);
+            assert!(req.validate().is_ok());
+            assert_eq!(req.effective_reasoning_effort(), Some("xhigh"));
+        }
+    }
+}
+
+#[test]
+fn deepseek_v41_accepts_native_integer_budgets() {
+    for budget in [1, 42, 75, 100] {
+        for mut body in [
+            json!({"reasoning_effort": budget}),
+            json!({"reasoning_effort": budget.to_string()}),
+            // ThinkingConfig.effort is a string; only the top-level field
+            // has the JSON integer-to-string compatibility deserializer.
+            json!({"thinking": {"effort": budget.to_string()}}),
+        ] {
+            body["model"] = json!("deepseek-ai/DeepSeek-V4.1-Flash");
+            let req = request(body.clone());
+            assert!(req.validate().is_ok(), "{body}");
+            assert_eq!(
+                req.effective_reasoning_effort(),
+                Some(budget.to_string().as_str())
+            );
+        }
+    }
+}
+
+#[test]
+fn deepseek_rejects_invalid_or_non_v41_budgets() {
+    for model in ["deepseek-v4.1-flash", "deepseek-flash", "deepseek-v4-pro"] {
+        for budget in [
+            "0",
+            "101",
+            "-1",
+            "+42",
+            " 42 ",
+            "42.0",
+            "٤٢",
+            "999999999999999999999999999",
+        ] {
+            for extra in [
+                json!({"reasoning_effort":budget}),
+                json!({"reasoning_effort":"high","thinking":{"effort":budget}}),
+            ] {
+                let mut extra = extra;
+                extra["model"] = json!(model);
+                assert!(request(extra.clone()).validate().is_err(), "{extra}");
+            }
+        }
+    }
+    for model in ["deepseek-flash", "deepseek-v4-pro"] {
+        assert!(request(json!({"model":model,"reasoning_effort":42}))
+            .validate()
+            .is_err());
+    }
+}

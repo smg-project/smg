@@ -942,4 +942,32 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn deepseek_v41_profile_preserves_requested_effort_budget_in_prompt() {
+        use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
+        let (_tmp, tokenizer) = v41_tokenizer();
+        for (effort, budget) in [
+            (json!("xhigh"), 75),
+            (json!(42), 42),
+            (json!(1), 1),
+            (json!(100), 100),
+        ] {
+            let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"deepseek-ai/DeepSeek-V4.1-Flash", "messages":[{"role":"user","content":"hello"}],
+                "reasoning_effort":effort,
+            })).unwrap();
+            req.normalize();
+            let mut kwargs = HashMap::from([(
+                "reasoning_effort".to_string(),
+                json!(req.effective_reasoning_effort().unwrap()),
+            )]);
+            kwargs.extend(req.chat_template_kwargs.clone().unwrap_or_default());
+            let rendered =
+                render_v41_turn(&tokenizer, Some(&kwargs), req.thinking_toggle()).unwrap();
+            assert!(
+                rendered.contains(&format!("Reasoning Effort: {budget} (range")),
+                "{effort}: {rendered}"
+            );
+        }
+    }
 }
