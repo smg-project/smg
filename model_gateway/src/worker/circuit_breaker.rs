@@ -358,6 +358,17 @@ impl CircuitBreaker {
         }
     }
 
+    /// Publish this breaker's state and counters to the per-worker gauges.
+    ///
+    /// Constructing a breaker sets the state gauge for its label to closed,
+    /// so a replacement worker built for the same URL resets the gauge of
+    /// the live breaker it is about to adopt; the adopter calls this to put
+    /// the adopted state back.
+    pub fn publish_metrics(&self) {
+        Metrics::set_worker_cb_state(&self.metric_label, self.state().as_int());
+        self.publish_gauge_metrics();
+    }
+
     fn publish_gauge_metrics(&self) {
         Metrics::set_worker_cb_consecutive_failures(
             &self.metric_label,

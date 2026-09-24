@@ -1483,6 +1483,9 @@ impl BasicWorker {
         let existing_cb = self.circuit_breaker.load();
         let other_cb = other.circuit_breaker.load_full();
         if other_cb.config() == existing_cb.config() {
+            // Building this worker reset the URL's breaker state gauge to
+            // closed; the adopted breaker is what monitoring must show.
+            other_cb.publish_metrics();
             self.circuit_breaker.store(other_cb);
         }
 
@@ -2102,6 +2105,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 mod tests {
     use std::{thread, time::Duration};
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
@@ -2109,6 +2113,48 @@ mod tests {
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder,
     };
+
+    /// The `smg_worker_cb_state` sample for the test worker's URL in a
+    /// rendered scrape.
+    fn cb_state_gauge(rendered: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("smg_worker_cb_state{worker=\"http://worker:8000\"} ")
+            })
+            .map(|value| value.parse().unwrap())
+    }
+
+    /// A same-URL replacement is built on a fresh breaker, which sets the
+    /// URL's state gauge to closed before the registry adopts the live
+    /// breaker. Adoption must publish the adopted state again, or an open
+    /// breaker reads as closed until its next transition.
+    #[test]
+    fn adopting_a_live_breaker_republishes_its_state_gauge() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let config = CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..CircuitBreakerConfig::default()
+            };
+            let old = BasicWorkerBuilder::new("http://worker:8000")
+                .circuit_breaker_config(config.clone())
+                .build();
+            old.record_circuit_breaker_outcome(false);
+            assert_eq!(old.circuit_breaker_state(), CircuitState::Open);
+            assert_eq!(cb_state_gauge(&handle.render()), Some(1.0));
+
+            let new = BasicWorkerBuilder::new("http://worker:8000")
+                .circuit_breaker_config(config)
+                .build();
+            assert_eq!(cb_state_gauge(&handle.render()), Some(0.0));
+
+            assert!(new.inherit_shared_state_from(&old));
+            assert_eq!(new.circuit_breaker_state(), CircuitState::Open);
+            assert_eq!(cb_state_gauge(&handle.render()), Some(1.0));
+        });
+    }
 
     /// Health config that skips health checks — workers start Ready immediately.
     /// Use in tests that don't test the health check lifecycle.
