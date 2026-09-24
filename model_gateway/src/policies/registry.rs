@@ -708,12 +708,12 @@ impl PolicyRegistry {
         self.model_worker_counts.clear();
     }
 
-    /// Set the prefill policy for PD mode (lock-free, set once at startup).
+    /// Set the prefill policy for PD mode (set once at startup).
     ///
     /// The router factory sets the prefill leg after the app context wired the
     /// KV event monitor, the load feed and the mesh tree bridge into the
     /// registry, and those setters only reach policies that already exist,
-    /// so the leg takes that state here.
+    /// so the leg takes that state here, under the shared-state read guards.
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
@@ -733,12 +733,12 @@ impl PolicyRegistry {
         self.dp_rank_policy.get().map(Arc::clone)
     }
 
-    /// Set the decode policy for PD mode (lock-free, set once at startup).
+    /// Set the decode policy for PD mode (set once at startup).
     ///
     /// The router factory sets the decode leg after the app context wired the
     /// KV event monitor, the load feed and the mesh tree bridge into the
     /// registry, and those setters only reach policies that already exist,
-    /// so the leg takes that state here.
+    /// so the leg takes that state here, under the shared-state read guards.
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
@@ -747,12 +747,12 @@ impl PolicyRegistry {
         });
     }
 
-    /// Set the encode policy for EPD mode (lock-free, set once at startup).
+    /// Set the encode policy for EPD mode (set once at startup).
     ///
     /// The router factory sets the encode leg after the app context wired the
     /// KV event monitor, the load feed and the mesh tree bridge into the
     /// registry, and those setters only reach policies that already exist,
-    /// so the leg takes that state here.
+    /// so the leg takes that state here, under the shared-state read guards.
     pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
@@ -2168,13 +2168,29 @@ mod tests {
     }
 
     /// The PD/EPD legs are set after the app context wired the shared state
-    /// into the registry, so the leg setters hand it over themselves.
-    #[test]
-    fn pd_leg_policies_receive_the_shared_state_set_before_them() {
-        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+    /// into the registry (the KV event monitor, the load feed, and the mesh
+    /// tree bridge that `MeshAdapters::start` attaches), so the leg setters
+    /// hand all of it over themselves.
+    #[tokio::test]
+    async fn pd_leg_policies_receive_the_shared_state_set_before_them() {
+        use std::collections::BTreeMap;
+
+        use smg_mesh::MeshKV;
+
+        use crate::{mesh::MeshAdapters, worker::WorkerRegistry};
+
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
         registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new(Some(4)))));
         let (_load_tx, load_rx) = watch::channel(LoadSnapshot::from_loads_for_test(Vec::new()));
         registry.set_load_receiver(Some(load_rx));
+        let mesh = MeshKV::new("node-a".into());
+        let _adapters = MeshAdapters::start(
+            &mesh,
+            "node-a".into(),
+            Arc::new(WorkerRegistry::new()),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            Arc::clone(&registry),
+        );
 
         let prefill = cache_aware_policy();
         let decode = cache_aware_policy();
@@ -2192,6 +2208,10 @@ mod tests {
             assert!(
                 cache_aware.has_load_receiver_for_test(),
                 "{leg} leg missed the load feed"
+            );
+            assert!(
+                cache_aware.should_populate_hash_index_for_test(),
+                "{leg} leg missed the mesh tree bridge"
             );
         }
     }
