@@ -1,5 +1,7 @@
 //! Unified gRPC client wrapper for SGLang, vLLM, and TensorRT-LLM backends
 
+mod reasoning_json;
+
 use std::collections::HashMap;
 
 use openai_protocol::{
@@ -506,13 +508,14 @@ impl GrpcClient {
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_vllm_request(vllm_mm, |mm| {
-                    VllmEngineClient::build_generate_request_from_chat(
+                    reasoning_json::build_request(
                         request_id,
                         body,
                         processed_text,
                         token_ids,
                         mm,
                         options.tool_constraints,
+                        options.require_reasoning,
                     )
                 })
             }
