@@ -5,7 +5,7 @@
 //! - `execute_tool_loop` - MCP tool loop execution
 //! - `execute_without_mcp` - Simple pipeline execution without MCP
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::response::Response;
 use openai_protocol::responses::{
@@ -208,8 +208,21 @@ pub(super) async fn execute_tool_loop(
 
         // Check for function calls (extract all for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&chat_response);
+        // Classify before conversion splits namespaced client tool identities.
+        let mcp_call_ids: HashSet<_> = tool_calls
+            .iter()
+            .filter(|call| session.has_exposed_tool(&call.name))
+            .map(|call| call.call_id.clone())
+            .collect();
 
-        if tool_calls.is_empty() {
+        // A truncated or failed generation must never dispatch tools, even if a complete
+        // call was parsed before the engine stopped. Match the streaming loop.
+        let generation_interrupted = chat_response
+            .choices
+            .first()
+            .and_then(|choice| choice.finish_reason.as_deref())
+            .is_some_and(|reason| matches!(reason, "length" | "failed" | "error"));
+        if tool_calls.is_empty() || generation_interrupted {
             // No more tool calls, we're done
             trace!(
                 "Tool loop completed: {} iterations, {} total calls",
@@ -237,21 +250,27 @@ pub(super) async fn execute_tool_loop(
                 )
             })?;
 
-            // Inject MCP metadata into output
-            if state.total_calls > 0 {
-                openai_bridge::inject_client_visible_mcp_output_items(
-                    &session,
-                    &mut responses_response.output,
-                    state.mcp_call_items,
-                    &user_function_names,
-                );
+            // Server-side calls belong only in executed MCP results. Do not
+            // hand an unfinished server call to the client as a function.
+            responses_response.output.retain(|item| {
+                !matches!(item,
+                    ResponseOutputItem::FunctionToolCall { call_id, .. }
+                        if mcp_call_ids.contains(call_id)
+                )
+            });
+            // Include results from earlier iterations even when this one fails.
+            openai_bridge::inject_client_visible_mcp_output_items(
+                &session,
+                &mut responses_response.output,
+                state.mcp_call_items,
+                &user_function_names,
+            );
 
-                trace!(
-                    "Injected MCP metadata: {} mcp_list_tools + {} mcp_call items",
-                    session.mcp_servers().len(),
-                    state.total_calls
-                );
-            }
+            trace!(
+                "Injected MCP metadata: {} mcp_list_tools + {} mcp_call items",
+                session.mcp_servers().len(),
+                state.total_calls
+            );
 
             responses_response.usage = state.usage.map(ResponsesUsage::Modern);
             return Ok(responses_response);
@@ -278,33 +297,6 @@ pub(super) async fn execute_tool_loop(
                 mcp_tool_calls.len(),
                 function_tool_calls.len()
             );
-
-            // If ANY tool call is a function tool, return to caller immediately
-            if !function_tool_calls.is_empty() {
-                // Convert chat response to responses format (includes all tool calls)
-                let mut responses_response = conversions::chat_to_responses(
-                    &chat_response,
-                    original_request,
-                    params.response_id.clone(),
-                )
-                .map_err(|e| {
-                    error!(
-                        function = "tool_loop",
-                        iteration = state.iteration,
-                        error = %e,
-                        context = "function_tool_calls",
-                        "Failed to convert ChatCompletionResponse to ResponsesResponse"
-                    );
-                    error::internal_error(
-                        "convert_to_responses_format_failed",
-                        format!("Failed to convert to responses format: {e}"),
-                    )
-                })?;
-
-                // Return response with function tool calls to caller
-                responses_response.usage = state.usage.map(ResponsesUsage::Modern);
-                return Ok(responses_response);
-            }
 
             // Only execute calls that fit; preserve their results before ending
             // the response when this batch exceeds the remaining allowance.
@@ -402,7 +394,7 @@ pub(super) async fn execute_tool_loop(
                 state.total_calls += 1;
             }
 
-            if let Some(limit) = tool_call_limit {
+            if tool_call_limit.is_some() || !function_tool_calls.is_empty() {
                 let mut responses_response = conversions::chat_to_responses(
                     &chat_response,
                     original_request,
@@ -410,7 +402,7 @@ pub(super) async fn execute_tool_loop(
                 )
                 .map_err(|e| {
                     error!(function = "tool_loop", iteration = state.iteration,
-                        error = %e, context = "tool_call_limit",
+                        error = %e, context = "tool_handoff",
                         "Failed to convert ChatCompletionResponse to ResponsesResponse");
                     error::internal_error(
                         "convert_to_responses_format_failed",
@@ -418,11 +410,14 @@ pub(super) async fn execute_tool_loop(
                     )
                 })?;
 
-                // This branch contains only MCP calls. Return their executed
-                // results, not the generated calls that were ignored by the cap.
-                responses_response
-                    .output
-                    .retain(|item| !matches!(item, ResponseOutputItem::FunctionToolCall { .. }));
+                // Preserve client functions while replacing server calls with
+                // their executed results. Calls beyond the cap stay hidden.
+                responses_response.output.retain(|item| {
+                    !matches!(item,
+                        ResponseOutputItem::FunctionToolCall { call_id, .. }
+                            if mcp_call_ids.contains(call_id)
+                    )
+                });
                 openai_bridge::inject_client_visible_mcp_output_items(
                     &session,
                     &mut responses_response.output,
@@ -432,7 +427,7 @@ pub(super) async fn execute_tool_loop(
 
                 // A user processing cap is a normal stop. Only the internal
                 // safety cap introduces an error; keep generation status intact.
-                if limit == McpToolCallLimit::Safety {
+                if tool_call_limit == Some(McpToolCallLimit::Safety) {
                     responses_response.status = ResponseStatus::Failed;
                     responses_response.incomplete_details = None;
                     responses_response.error = Some(json!({

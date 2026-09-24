@@ -1,4 +1,9 @@
 // tests/common/mock_mcp_server.rs - Mock MCP server for testing
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -96,6 +101,7 @@ impl Drop for MockServerHarness {
 /// Mock MCP server that returns hardcoded responses for testing
 pub struct MockMCPServer {
     harness: MockServerHarness,
+    calls: Arc<AtomicUsize>,
 }
 
 /// Mock MCP server that always fails tool execution with a caller-provided marker.
@@ -111,6 +117,7 @@ pub struct MockSearchResponseMCPServer {
 /// Simple test server with mock search tools
 #[derive(Clone)]
 pub struct MockSearchServer {
+    calls: Arc<AtomicUsize>,
     tool_router: ToolRouter<MockSearchServer>,
 }
 
@@ -167,6 +174,7 @@ impl MockSearchResponseServer {
 impl MockSearchServer {
     pub fn new() -> Self {
         Self {
+            calls: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -176,6 +184,7 @@ impl MockSearchServer {
         &self,
         Parameters(params): Parameters<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -190,6 +199,7 @@ impl MockSearchServer {
         &self,
         Parameters(_params): Parameters<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(CallToolResult::success(vec![Content::text(
             "Mock local search results",
         )]))
@@ -278,9 +288,14 @@ impl ServerHandler for MockSearchServer {
 }
 
 impl MockMCPServer {
-    fn router() -> axum::Router {
+    fn router(calls: Arc<AtomicUsize>) -> axum::Router {
         let service = StreamableHttpService::new(
-            || Ok(MockSearchServer::new()),
+            move || {
+                Ok(MockSearchServer {
+                    calls: calls.clone(),
+                    ..MockSearchServer::new()
+                })
+            },
             LocalSessionManager::default().into(),
             Default::default(),
         );
@@ -290,9 +305,15 @@ impl MockMCPServer {
 
     /// Start a mock MCP server on an available port
     pub async fn start() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let calls = Arc::default();
         Ok(Self {
-            harness: MockServerHarness::start(Self::router()).await?,
+            harness: MockServerHarness::start(Self::router(Arc::clone(&calls))).await?,
+            calls,
         })
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 
     pub fn port(&self) -> u16 {

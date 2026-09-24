@@ -22,6 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::utils::generation_failure_error;
 use crate::routers::{
     common::{
         openai_bridge::{self, descriptor, ResponseFormat},
@@ -355,6 +356,9 @@ impl ResponseStreamEventEmitter {
             "model": self.model,
             "output": output
         });
+        if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
+            response_obj["error"] = error;
+        }
         if truncated {
             response_obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
         }
@@ -828,6 +832,9 @@ impl ResponseStreamEventEmitter {
             .maybe_usage(responses_usage);
         if let Some(details) = incomplete_details {
             builder = builder.incomplete_details(details);
+        }
+        if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
+            builder = builder.error(error);
         }
         builder.build()
     }

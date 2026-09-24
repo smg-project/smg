@@ -8,6 +8,9 @@ mod common;
 #[path = "common/scripted_tokenizer.rs"]
 mod scripted_tokenizer;
 
+#[path = "common/scripted_worker.rs"]
+mod scripted_worker;
+
 use std::{error::Error, sync::Arc, time::Duration};
 
 use axum::{body::to_bytes, http::StatusCode};
@@ -36,12 +39,6 @@ async fn responses_result_with_output(
         .await
 }
 
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper: failures should panic; the in-process worker is aborted after the request"
-)]
 async fn responses_result_with_final_answer(
     tools: Value,
     output: Option<&str>,
@@ -49,6 +46,33 @@ async fn responses_result_with_final_answer(
     expected_status: &str,
     stream: bool,
     final_answer_after: Option<usize>,
+) -> (Value, Vec<Value>) {
+    responses_result_with_finishes(
+        tools,
+        output,
+        max_tool_calls,
+        expected_status,
+        stream,
+        final_answer_after.map(|limit| (limit, "Final answer after tools")),
+        vec!["stop"],
+    )
+    .await
+}
+
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    reason = "test helper: failures should panic; the in-process worker is aborted after the request"
+)]
+async fn responses_result_with_finishes(
+    tools: Value,
+    output: Option<&str>,
+    max_tool_calls: Option<u32>,
+    expected_status: &str,
+    stream: bool,
+    final_answer_after: Option<(usize, &str)>,
+    finish_reasons: Vec<&'static str>,
 ) -> (Value, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -60,26 +84,14 @@ async fn responses_result_with_final_answer(
     let output_tokens = output_chunks.as_ref().map_or(2, |chunks| {
         u32::try_from(chunks.len() + 1).expect("scripted output fits in the worker token count")
     });
-    let worker_config = Arc::new(mock_worker::config::Config {
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
-        gen_delay: Duration::ZERO,
-        output_tokens,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-    });
-    let server = tokio::spawn(mock_worker::grpc::serve_with_listener(
-        worker_config,
-        listener,
-    ));
+    let server = tokio::spawn(
+        scripted_worker::ScriptedWorker {
+            output_tokens,
+            finish_reasons,
+            generation: Default::default(),
+        }
+        .serve(listener),
+    );
     let worker = Arc::new(
         BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
             .worker_type(WorkerType::Regular)
@@ -114,8 +126,8 @@ async fn responses_result_with_final_answer(
             } else {
                 scripted_tokenizer::ScriptedTokenizer::from_chunks(chunks)
             };
-            if let Some(limit) = final_answer_after {
-                tokenizer = tokenizer.with_final_answer(limit, "Final answer after tools");
+            if let Some((limit, answer)) = final_answer_after {
+                tokenizer = tokenizer.with_final_answer(limit, answer);
             }
             Arc::new(tokenizer)
         }
@@ -134,8 +146,16 @@ async fn responses_result_with_final_answer(
     context.worker_registry.register(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    // The regular MCP streaming path does not currently implement persistence.
+    // Exercise real storage for both non-streaming and non-MCP streaming paths.
+    let check_persistence = !stream
+        || !tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["type"] == "mcp");
     let request = serde_json::from_value(json!({
-        "model": MODEL, "input": "Hello", "stream": stream, "store": false,
+        "model": MODEL, "input": "Hello", "stream": stream, "store": check_persistence,
         "max_output_tokens": 16, "tools": tools, "max_tool_calls": max_tool_calls,
     }))
     .unwrap();
@@ -149,6 +169,12 @@ async fn responses_result_with_final_answer(
     .await
     .expect("Responses stream should terminate");
     server.abort();
+    if expected_status == "http_error" {
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["code"], "worker_stream_failed");
+        return (error, vec![]);
+    }
     assert_eq!(
         status,
         StatusCode::OK,
@@ -158,6 +184,19 @@ async fn responses_result_with_final_answer(
     if !stream {
         let response: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(response["status"], expected_status, "{response}");
+        let saved = context
+            .response_storage
+            .get_response(&smg_data_connector::ResponseId::from(
+                response["id"].as_str().unwrap(),
+            ))
+            .await
+            .unwrap()
+            .expect("response must be persisted");
+        assert_eq!(saved.raw_response["status"], response["status"]);
+        assert_eq!(
+            saved.raw_response["error"], response["error"],
+            "persisted error must match the wire response"
+        );
         return (response, vec![]);
     }
     assert_eq!(
@@ -199,7 +238,23 @@ async fn responses_result_with_final_answer(
         .windows(2)
         .all(|pair| pair[0]["sequence_number"].as_u64().unwrap()
             < pair[1]["sequence_number"].as_u64().unwrap()));
-    (events.last().unwrap()["response"].clone(), events)
+    let response = events.last().unwrap()["response"].clone();
+    if check_persistence {
+        let saved = context
+            .response_storage
+            .get_response(&smg_data_connector::ResponseId::from(
+                response["id"].as_str().unwrap(),
+            ))
+            .await
+            .unwrap()
+            .expect("response must be persisted");
+        assert_eq!(saved.raw_response["status"], response["status"]);
+        assert_eq!(
+            saved.raw_response["error"], response["error"],
+            "persisted error must match the wire response"
+        );
+    }
+    (response, events)
 }
 
 async fn responses_events_with_output(
@@ -502,5 +557,221 @@ async fn mcp_usage_includes_every_model_call_in_both_modes() {
         assert_eq!(response["usage"]["input_tokens"], 2, "{response}");
         assert_eq!(response["usage"]["output_tokens"], 6, "{response}");
         assert_eq!(response["usage"]["total_tokens"], 8, "{response}");
+    }
+}
+
+#[tokio::test]
+async fn mcp_unfinished_generation_never_dispatches_tools() {
+    for finish in ["length", "failed"] {
+        for stream in [false, true] {
+            let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+                .await
+                .unwrap();
+            let (response, _) = responses_result_with_finishes(
+                json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+                Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>"),
+                Some(1), if finish == "length" { "incomplete" } else { "failed" },
+                stream, None, vec![finish],
+            ).await;
+            mcp.stop().await;
+            assert_eq!(
+                mcp.call_count(),
+                0,
+                "stream={stream}, finish={finish}: {response}"
+            );
+            assert_executed_mcp_queries(&response, &[]);
+            assert!(
+                !response["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i["type"] == "function_call"),
+                "{response}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_mixed_batch_executes_server_prefix_and_returns_client_function() {
+    for stream in [false, true] {
+        for cap in [None, Some(0), Some(1)] {
+            let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+                .await
+                .unwrap();
+            let output = [
+                json!({"name":"brave_web_search","arguments":{"query":"first"}}),
+                json!({"name":"user_tool","arguments":{"city":"Paris"}}),
+                json!({"name":"brave_web_search","arguments":{"query":"second"}}),
+            ]
+            .iter()
+            .map(|call| format!("<tool_call>\n{call}\n</tool_call>\n"))
+            .collect::<String>();
+            let (response, _) = responses_result_with_output(
+                json!([
+                    {"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"},
+                    {"type":"function","name":"user_tool","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}
+                ]), Some(&output), cap, "completed", stream,
+            ).await;
+            mcp.stop().await;
+            let expected: &[&str] = match cap {
+                Some(0) => &[],
+                Some(1) => &["first"],
+                _ => &["first", "second"],
+            };
+            assert_eq!(mcp.call_count(), expected.len(), "{response}");
+            assert_executed_mcp_queries(&response, expected);
+            let calls: Vec<_> = response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["type"] == "function_call")
+                .collect();
+            assert_eq!(calls.len(), 1, "{response}");
+            assert_eq!(calls[0]["name"], "user_tool");
+            assert_eq!(
+                serde_json::from_str::<Value>(calls[0]["arguments"].as_str().unwrap()).unwrap(),
+                json!({"city":"Paris"})
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn bare_generation_failure_includes_error_details() {
+    for stream in [false, true] {
+        for with_mcp in [false, true] {
+            let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+                .await
+                .unwrap();
+            let tools = if with_mcp {
+                json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}])
+            } else {
+                json!([])
+            };
+            let (response, _) = responses_result_with_finishes(
+                tools,
+                Some("Partial answer"),
+                None,
+                "failed",
+                stream,
+                None,
+                vec!["failed"],
+            )
+            .await;
+            mcp.stop().await;
+            assert_eq!(response["error"]["code"], "server_error", "{response}");
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()),
+                "{response}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_unfinished_later_generation_preserves_executed_results() {
+    for finish in ["length", "failed"] {
+        for stream in [false, true] {
+            let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+                .await
+                .unwrap();
+            let (response, _) = responses_result_with_finishes(
+                json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+                Some(r#"<tool_call>
+{"name":"brave_web_search","arguments":{"query":"first"}}
+</tool_call>"#),
+                Some(2), if finish == "length" { "incomplete" } else { "failed" }, stream, None, vec!["stop", finish],
+            ).await;
+            mcp.stop().await;
+            assert_eq!(mcp.call_count(), 1, "{response}");
+            assert_executed_mcp_queries(&response, &["first"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_client_handoff_preserves_previous_server_results() {
+    for stream in [false, true] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let (response, _) = responses_result_with_finishes(
+            json!([
+                {"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"},
+                {"type":"function","name":"user_tool","parameters":{"type":"object","properties":{}}}
+            ]),
+            Some(r#"<tool_call>
+{"name":"brave_web_search","arguments":{"query":"first"}}
+</tool_call>"#),
+            None, "completed", stream,
+            Some((1, r#"<tool_call>
+{"name":"user_tool","arguments":{}}
+</tool_call>"#)), vec!["stop"],
+        ).await;
+        mcp.stop().await;
+        assert_eq!(mcp.call_count(), 1);
+        assert_executed_mcp_queries(&response, &["first"]);
+        let calls: Vec<_> = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["type"] == "function_call")
+            .collect();
+        assert_eq!(calls.len(), 1, "{response}");
+        assert_eq!(calls[0]["name"], "user_tool");
+    }
+}
+
+#[tokio::test]
+async fn mcp_filter_preserves_namespaced_client_function_with_same_member_name() {
+    for finish in ["stop", "length"] {
+        for stream in [false, true] {
+            let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+                .await
+                .unwrap();
+            let (response, _) = responses_result_with_finishes(
+                json!([
+                    {"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"},
+                    {"type":"namespace","name":"client","description":"Client tools","tools":[
+                        {"type":"function","name":"brave_web_search","parameters":{"type":"object","properties":{}}}
+                    ]}
+                ]),
+                Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"first\"}}\n</tool_call>\n<tool_call>\n{\"name\":\"client.brave_web_search\",\"arguments\":{}}\n</tool_call>"),
+                None, if finish == "length" { "incomplete" } else { "completed" }, stream, None, vec![finish],
+            ).await;
+            mcp.stop().await;
+            assert_executed_mcp_queries(
+                &response,
+                if finish == "length" { &[] } else { &["first"] },
+            );
+            let calls: Vec<_> = response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["type"] == "function_call")
+                .collect();
+            assert_eq!(calls.len(), 1, "{response}");
+            assert_eq!(calls[0]["name"], "brave_web_search");
+            assert_eq!(calls[0]["namespace"], "client");
+        }
+    }
+}
+
+#[tokio::test]
+async fn engine_error_never_dispatches_mcp_calls() {
+    for stream in [false, true] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        responses_result_with_finishes(
+            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+            Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{}}\n</tool_call>"),
+            Some(1), if stream { "failed" } else { "http_error" }, stream, None, vec!["error"],
+        ).await;
+        mcp.stop().await;
+        assert_eq!(mcp.call_count(), 0);
     }
 }

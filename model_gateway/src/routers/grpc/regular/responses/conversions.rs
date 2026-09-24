@@ -26,7 +26,8 @@ use tracing::warn;
 
 use crate::routers::grpc::common::responses::utils::{
     custom_tool_input, custom_tool_names, decode_reasoning_content, encode_reasoning_content,
-    extract_tools_from_response_tools, function_call_status, resolve_function_identity,
+    extract_tools_from_response_tools, function_call_status, generation_failure_error,
+    resolve_function_identity,
 };
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
@@ -667,6 +668,9 @@ pub(crate) fn chat_to_responses(
         .maybe_usage(usage);
     if let Some(details) = incomplete_details {
         builder = builder.incomplete_details(details);
+    }
+    if let Some(error) = generation_failure_error(choice.finish_reason.as_deref()) {
+        builder = builder.error(error);
     }
     Ok(builder.build())
 }

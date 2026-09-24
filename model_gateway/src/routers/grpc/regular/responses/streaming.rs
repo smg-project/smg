@@ -60,7 +60,9 @@ use crate::{
             common::responses::{
                 build_sse_response, persist_response_if_needed,
                 streaming::{attach_mcp_server_label, ResponseStreamEventEmitter},
-                utils::{function_call_status, resolve_function_identity},
+                utils::{
+                    function_call_status, generation_failure_error, resolve_function_identity,
+                },
                 ResponsesContext,
             },
             utils,
@@ -161,7 +163,7 @@ async fn process_and_transform_sse_stream(
     let response_id = format!("resp_{}", Uuid::now_v7());
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
-    let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+    let mut event_emitter = ResponseStreamEventEmitter::new(response_id.clone(), model, created_at);
     event_emitter.set_original_request(original_request.clone());
 
     // Emit initial response.created and response.in_progress events
@@ -267,7 +269,11 @@ async fn process_and_transform_sse_stream(
         accumulator.finish_reason = Some("failed".into());
     }
     let mut final_response = accumulator.finalize();
-    final_response.error = terminal_error;
+    // Persist under the public Responses ID, not the upstream Chat ID.
+    final_response.id = response_id;
+    if let Some(error) = terminal_error {
+        final_response.error = Some(error);
+    }
     persist_response_if_needed(
         conversation_storage,
         conversation_item_storage,
@@ -485,6 +491,9 @@ impl StreamingResponseAccumulator {
             .maybe_usage(usage);
         if let Some(details) = incomplete_details {
             builder = builder.incomplete_details(details);
+        }
+        if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
+            builder = builder.error(error);
         }
         builder.build()
     }
@@ -1404,6 +1413,17 @@ mod tests {
             assert_eq!(terminal["response"]["output"].as_array().unwrap().len(), 2);
             accumulator.finish_reason = Some("failed".into());
             let stored = serde_json::to_value(accumulator.finalize()).unwrap();
+            if finish.is_some() {
+                assert_eq!(terminal["response"]["error"]["code"], "server_error");
+                assert_eq!(stored["error"]["code"], "server_error");
+                assert!(stored["error"]["message"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()));
+                let saved = serde_json::to_value(emitter.finalize(None)).unwrap();
+                assert_eq!(saved["error"], stored["error"]);
+            } else {
+                assert_eq!(terminal["response"]["error"], error);
+            }
             for kind in ["message", "function_call"] {
                 let output = terminal["response"]["output"]
                     .as_array()
