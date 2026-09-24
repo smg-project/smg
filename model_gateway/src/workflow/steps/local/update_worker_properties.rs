@@ -89,6 +89,16 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             } else {
                 worker.status()
             };
+            // `from_spec` starts the rebuilt worker on the built-in breaker
+            // config. Carry the one resolved at registration (gateway defaults
+            // plus this worker's overrides) so an update neither loosens nor
+            // tightens the breaker; with matching configs the registry
+            // replacement adopts the live breaker as well, so its state
+            // (open, half-open, failure counts) survives the update.
+            let circuit_breaker_config = worker
+                .as_any()
+                .downcast_ref::<BasicWorker>()
+                .map(BasicWorker::circuit_breaker_config);
             let mut builder = BasicWorkerBuilder::from_spec((*worker.metadata().spec).clone())
                 .http2(worker.http2())
                 .labels(updated_labels)
@@ -105,6 +115,9 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     &app_context.router_config,
                 ))
                 .status(next_status);
+            if let Some(config) = circuit_breaker_config {
+                builder = builder.circuit_breaker_config(config);
+            }
 
             // Adopt the old worker's client only if it was materialized: a
             // never-HTTP worker (ZMQ) keeps a deferred slot instead of having
@@ -193,7 +206,10 @@ mod tests {
                 zmq_client::{EosTokenIds, ZmqEngineClient},
             },
         },
-        worker::{BasicWorker, RuntimeType},
+        worker::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            BasicWorker, RuntimeType,
+        },
     };
 
     fn make_app_context(workers: &[Arc<dyn Worker>]) -> Arc<AppContext> {
@@ -373,6 +389,40 @@ mod tests {
             assert_eq!(updated.metadata().health_config.check_interval_secs, 11);
             assert_eq!(updated.status(), WorkerStatus::Ready);
         }
+    }
+
+    /// A PATCH rebuilds the worker. The breaker it was registered with
+    /// (gateway defaults plus overrides) and the breaker's live state must
+    /// come through; a rebuild on the built-in defaults would silently
+    /// re-arm a worker the breaker had taken out of rotation.
+    #[tokio::test]
+    async fn update_keeps_the_circuit_breaker_config_and_state() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_duration: Duration::from_secs(7),
+            window_duration: Duration::from_secs(9),
+        };
+        assert_ne!(config, CircuitBreakerConfig::default());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8000")
+                .worker_type(WorkerType::Regular)
+                .circuit_breaker_config(config.clone())
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        worker.record_circuit_breaker_outcome(false);
+        worker.record_circuit_breaker_outcome(false);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
+        UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
+
+        let updated = &ctx.data.updated_workers.as_ref().unwrap()[0];
+        let basic = updated.as_any().downcast_ref::<BasicWorker>().unwrap();
+        assert_eq!(basic.circuit_breaker_config(), config);
+        assert_eq!(updated.circuit_breaker_state(), CircuitState::Open);
     }
 
     #[tokio::test]

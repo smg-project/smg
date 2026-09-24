@@ -1394,6 +1394,12 @@ impl BasicWorker {
         self.kv_engine_id_unconfirmed = Arc::clone(&previous.kv_engine_id_unconfirmed);
     }
 
+    /// The circuit breaker configuration this worker runs with: the gateway
+    /// defaults plus its own overrides, as resolved at registration.
+    pub(crate) fn circuit_breaker_config(&self) -> super::circuit_breaker::CircuitBreakerConfig {
+        self.circuit_breaker.load().config().clone()
+    }
+
     fn update_running_requests_metrics(&self) {
         let load = self.load();
         Metrics::set_worker_requests_active(self.url(), load);
