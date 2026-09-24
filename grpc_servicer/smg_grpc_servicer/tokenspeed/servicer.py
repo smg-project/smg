@@ -648,7 +648,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         ``is_scheduler_paused`` is pre-existing on the engine and its
         signature is not pinned by this branch, so accept it whether it
         returns a bool directly or a coroutine.
+
+        An EPD encode worker never gets asked: its encode loop has no pause
+        controller and treats every scheduler message as a generate request,
+        so the query takes the whole scheduler down (seen as every EPD
+        multimodal test 503ing once the gateway probed server info). Encode
+        workers have nothing to pause; report not paused.
         """
+        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+            return False
         query = getattr(self.async_llm, "is_scheduler_paused", None)
         if not callable(query):
             return False

@@ -74,6 +74,20 @@ class TestGetServerInfo:
         assert _server_info(_servicer(paused=False)).is_paused is False
         assert _server_info(_servicer()).is_paused is False
 
+    def test_encode_workers_are_never_asked_for_pause_state(self, monkeypatch):
+        """The EPD encode loop crashes on the pause query, so it is skipped there."""
+        s = _servicer(paused=True)
+        s.server_args.disaggregation_mode = "encode"
+        calls = []
+
+        async def _is_paused():
+            calls.append(1)
+            return True
+
+        s.async_llm.is_scheduler_paused = _is_paused
+        assert _server_info(s).is_paused is False
+        assert calls == [], "encode worker must not receive the scheduler query"
+
     def test_reports_pause_state_from_a_synchronous_query(self, monkeypatch):
         """``is_scheduler_paused`` is not pinned to be a coroutine function."""
         monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
