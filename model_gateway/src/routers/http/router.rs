@@ -1640,6 +1640,10 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     // source), so `is_request()` is true for it as well: the timeout and
     // connect arms have to be consulted before the generic request arm, or a
     // timed-out upstream reads as a plain 500 and the 504 path is unreachable.
+    // The same holds for the client's total timeout expiring while a
+    // non-streaming body is still being read: reqwest files that under
+    // `Kind::Body` with the same `TimedOut` source, so it is a 504 too rather
+    // than the body-error 500.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
     } else if e.is_timeout() {
