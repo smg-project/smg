@@ -626,7 +626,17 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         match self.renderer {
             Renderer::DeepseekV4(encoding) => encoding.valid_native_values(),
             Renderer::DeepseekV41 => deepseek_v41::NATIVE_EFFORT_VALUES,
-            Renderer::DeepseekV32 | Renderer::Jinja => &[],
+            Renderer::DeepseekV32 => &[],
+            Renderer::Jinja => self.chat_template.native_reasoning_effort_values(),
+        }
+    }
+
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        match self.renderer {
+            // The native DeepSeek renderers switch off on the protocol's
+            // `none`/`minimal`, so they declare no words of their own.
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => &[],
+            Renderer::Jinja => self.chat_template.native_reasoning_effort_off_values(),
         }
     }
 

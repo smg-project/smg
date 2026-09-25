@@ -156,12 +156,10 @@ pub(crate) fn extract_thinking_from_kwargs(
                     .flatten()
             })
         }
-        Some(ThinkingKeyName::HyV4Effort) => {
-            match kwargs.get("reasoning_effort").and_then(Value::as_str) {
-                Some("no_think") => Some(false),
-                Some("high") => Some(true),
-                _ => None,
-            }
+        // The template's own on/off words for `reasoning_effort`.
+        Some(ThinkingKeyName::ReasoningEffort) => {
+            let effort = kwargs.get("reasoning_effort").and_then(Value::as_str)?;
+            native_effort_thinking(effort, tokenizer)
         }
         // Tri-state string toggle: adaptive adds no reasoning prefix.
         Some(ThinkingKeyName::ThinkingMode) => {
@@ -175,13 +173,11 @@ pub(crate) fn extract_thinking_from_kwargs(
     }
 }
 
-/// The thinking preference implied by `reasoning_effort` for a renderer
-/// with native effort values, so the reasoning parser is armed consistently
-/// with the rendered prompt: `Some(true)` for a native value (the renderer
-/// enters thinking mode), `Some(false)` for the thinking switch
-/// (`"none"`/`"minimal"`, see [`thinking_from_reasoning_effort`]), which turns
-/// thinking off and short-circuits the generic `reasoning_effort` fallback in
-/// `resolve_thinking_pref`, and `None` otherwise.
+/// The thinking preference implied by `reasoning_effort` for a renderer that
+/// reads the kwarg natively, so the reasoning parser is armed consistently
+/// with the rendered prompt: `Some(true)` for one of its on words, `Some(false)`
+/// for one of its off words (which short-circuits the generic
+/// `reasoning_effort` fallback in `resolve_thinking_pref`), `None` otherwise.
 /// Mirrors the template-kwargs merge: an explicit kwargs entry wins over the
 /// top-level `reasoning_effort` field.
 fn extract_template_effort_thinking(
@@ -189,32 +185,38 @@ fn extract_template_effort_thinking(
     reasoning_effort: Option<&str>,
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
-    if tokenizer.thinking_key_name() == Some(ThinkingKeyName::HyV4Effort) {
-        return match kwargs
-            .and_then(|k| k.get("reasoning_effort"))
-            .and_then(Value::as_str)
-            .or(reasoning_effort)
-        {
-            Some("no_think") => Some(false),
-            Some("high") => Some(true),
-            _ => None,
-        };
-    }
-    let native_values = tokenizer.native_reasoning_effort_values();
-    if native_values.is_empty() {
+    if tokenizer.native_reasoning_effort_values().is_empty()
+        && tokenizer.native_reasoning_effort_off_values().is_empty()
+    {
         return None;
     }
     let effort = kwargs
         .and_then(|k| k.get("reasoning_effort"))
         .and_then(Value::as_str)
         .or(reasoning_effort)?;
-    // `"none"`/`"minimal"` are the renderer's thinking switch, not effort
-    // levels: they render chat mode wherever they arrive (kwargs or
-    // top-level), so the parser must be disarmed the same way.
-    if thinking_from_reasoning_effort(Some(effort)) == Some(false) {
+    native_effort_thinking(effort, tokenizer)
+}
+
+/// What a `reasoning_effort` value means to this renderer: an off word
+/// disarms the parser wherever the value arrives (kwargs or top-level), an on
+/// word arms it, anything else says nothing. A renderer that declares its own
+/// off words (Hy4's `no_think`) is read by those alone; one that declares
+/// none is switched off by the protocol's `"none"`/`"minimal"`, which the
+/// DeepSeek renderers render as chat mode.
+fn native_effort_thinking(effort: &str, tokenizer: &dyn Tokenizer) -> Option<bool> {
+    let off_values = tokenizer.native_reasoning_effort_off_values();
+    let disarms = if off_values.is_empty() {
+        thinking_from_reasoning_effort(Some(effort)) == Some(false)
+    } else {
+        off_values.contains(&effort)
+    };
+    if disarms {
         return Some(false);
     }
-    native_values.contains(&effort).then_some(true)
+    tokenizer
+        .native_reasoning_effort_values()
+        .contains(&effort)
+        .then_some(true)
 }
 
 /// Precedence for the effective thinking preference: an explicit template
@@ -942,7 +944,9 @@ mod hy_v4_tests {
     fn hy4_effort_arms_parser_like_template() {
         let tok = llm_tokenizer::MockTokenizer::new()
             .with_thinking_toggle(ThinkingToggle::DefaultOn)
-            .with_thinking_key_name(ThinkingKeyName::HyV4Effort);
+            .with_thinking_key_name(ThinkingKeyName::ReasoningEffort)
+            .with_native_reasoning_effort_values(&["high"])
+            .with_native_reasoning_effort_off_values(&["no_think"]);
         assert!(should_mark_reasoning_started(None, &tok));
         assert_eq!(
             extract_template_effort_thinking(None, Some("no_think"), &tok),
