@@ -12,7 +12,7 @@ from smg_grpc_servicer import mm_sidecar_protocol as proto  # noqa: E402
 def fingerprint(**overrides) -> proto.Fingerprint:
     values = {
         "model": "Qwen/Qwen3-VL-8B-Instruct",
-        "vllm_version": "0.27.1",
+        "vllm_version": "0.30.0",
         "dtype": "torch.bfloat16",
         "video_backend": "opencv",
         "media_io_kwargs": "{}",

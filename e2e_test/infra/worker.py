@@ -35,6 +35,7 @@ from .process_utils import (
     detect_ib_device,
     detect_rdma_fabric_devices,
     get_open_port,
+    gpu_compute_apps,
     gpu_memory_used_mib,
     wait_for_gpu_memory_release,
     wait_for_health,
@@ -228,13 +229,18 @@ class Worker:
             held = wait_for_gpu_memory_release(self.gpu_ids, self._gpu_mem_baseline, timeout=30.0)
             if held:
                 # The wait gives up once the figure stops moving, usually well
-                # inside the 30 s cap; report what was actually waited.
+                # inside the 30 s cap; report what was actually waited, and
+                # which processes hold a context on those GPUs. An empty list
+                # means the memory belongs to an exited process and a peer
+                # still maps it (see gpu_compute_apps).
                 logger.warning(
-                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, baseline %s MiB",
+                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, "
+                    "baseline %s MiB, processes on those GPUs: %s",
                     self.model_id,
                     time.monotonic() - waited,
                     held,
                     self._gpu_mem_baseline,
+                    gpu_compute_apps(sorted(held)),
                 )
 
         # Clean up log file
@@ -411,10 +417,24 @@ class Worker:
         # PD disaggregation: KV transfer roles (backend via E2E_VLLM_KV_BACKEND)
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
             kv_role = "kv_producer" if self.worker_type == WorkerType.PREFILL else "kv_consumer"
+            config: dict[str, Any]
             if self.effective_kv_backend() == "mooncake":
                 config = {"kv_connector": "MooncakeConnector", "kv_role": kv_role}
             else:
-                config = {"kv_connector": "NixlConnector", "kv_role": kv_role}
+                config = {
+                    "kv_connector": "NixlConnector",
+                    "kv_role": kv_role,
+                    # A decode keeps a dead prefill's KV region mapped until it
+                    # forgets that peer, and the connector forgets idle peers
+                    # only after engine_ttl seconds (an hour by default). A
+                    # prefill restarted on the same GPU inside that window
+                    # fails its startup free-memory check: on 0.29.0, 53 GiB
+                    # of the dead worker stayed resident with the UCX IPC
+                    # cache already off (see _build_env). Forget idle peers
+                    # after a few seconds instead; the next request to one
+                    # re-runs the handshake, which is cheap at this scale.
+                    "kv_connector_extra_config": {"engine_ttl": 3},
+                }
             cmd.extend(["--kv-transfer-config", json.dumps(config)])
 
         extra = spec.get("vllm_args", [])
@@ -608,6 +628,8 @@ class Worker:
                 # allocated 60 s after every prefill process had exited), and
                 # the prefill restarted on that GPU fails its free-memory
                 # check. Drop the cache so a mapping ends with its transfer.
+                # From vLLM 0.29.0 the reader keeps a mapping per peer anyway,
+                # so the engine_ttl in _build_vllm_base_cmd carries the rest.
                 env.setdefault("UCX_CUDA_IPC_CACHE", "n")
 
         if self.engine == "trtllm":
