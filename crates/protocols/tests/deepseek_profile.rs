@@ -92,7 +92,7 @@ fn deepseek_forced_tools_require_non_thinking_mode() {
         json!({"type": "function", "function": {"name": "weather"}}),
     ] {
         for (mode, valid) in [
-            (json!({}), false),
+            (json!({}), true),
             (json!({"thinking": {"type": "enabled"}}), false),
             (json!({"thinking": {"type": "disabled"}}), true),
             (json!({"reasoning_effort": "none"}), true),
@@ -124,39 +124,41 @@ fn deepseek_forced_tools_require_non_thinking_mode() {
 fn deepseek_projects_one_thinking_decision_for_validation_and_rendering() {
     for model in ["deepseek-v4-pro", "deepseek-ai/DeepSeek-V4.1-Flash"] {
         for (extra, enabled) in [
-            (json!({}), true),
-            (json!({"reasoning_effort":"minimal"}), true),
-            (json!({"reasoning_effort":"low"}), true),
-            (json!({"reasoning_effort":"none"}), false),
+            (json!({}), None),
+            (json!({"reasoning_effort":"minimal"}), Some(true)),
+            (json!({"reasoning_effort":"low"}), Some(true)),
+            (json!({"reasoning_effort":"none"}), Some(false)),
             (
                 json!({"thinking":{"type":"disabled"},"reasoning_effort":"high"}),
-                false,
+                Some(false),
             ),
             (
                 json!({"thinking":{"type":"enabled"},"reasoning_effort":"none"}),
-                true,
+                Some(true),
             ),
             (
                 json!({"chat_template_kwargs":{"enable_thinking":false},"reasoning_effort":"high"}),
-                false,
+                Some(false),
             ),
             (
                 json!({"chat_template_kwargs":{"thinking":true},"thinking":{"type":"disabled"}}),
-                true,
+                Some(true),
             ),
             (
                 json!({"chat_template_kwargs":{"reasoning_effort":"none"},"thinking":{"type":"enabled"}}),
-                false,
+                Some(false),
             ),
         ] {
             let mut extra = extra;
             extra["model"] = json!(model);
             let mut req = request(extra.clone());
+            let expected = enabled.map(|enabled| json!(enabled));
             assert_eq!(
                 req.chat_template_kwargs
                     .as_ref()
-                    .and_then(|k| k.get("thinking")),
-                Some(&json!(enabled)),
+                    .and_then(|k| k.get("thinking"))
+                    .cloned(),
+                expected,
                 "{extra}"
             );
             let once = serde_json::to_value(&req).unwrap();

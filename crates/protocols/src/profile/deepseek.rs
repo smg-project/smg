@@ -53,10 +53,12 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     // Native V4 and V4.1 renderers have different defaults and effort
     // precedence. Resolve the provider contract once and pass the same
     // highest-priority toggle to rendering, parser arming and validation.
-    let enabled = thinking_enabled(req);
-    let kwargs = req.chat_template_kwargs.get_or_insert_default();
-    if kwargs.get("thinking").is_none_or(Value::is_null) {
-        kwargs.insert("thinking".into(), Value::Bool(enabled));
+    // A request that says nothing keeps the renderer's own default.
+    if let Some(enabled) = thinking_preference(req) {
+        let kwargs = req.chat_template_kwargs.get_or_insert_default();
+        if kwargs.get("thinking").is_none_or(Value::is_null) {
+            kwargs.insert("thinking".into(), Value::Bool(enabled));
+        }
     }
 }
 
@@ -133,7 +135,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
         Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
         _ => false,
     };
-    if thinking_enabled(req) && forced {
+    if thinking_preference(req).unwrap_or(false) && forced {
         return Err(error(
             "tool_choice_not_supported",
             "DeepSeek V4 requires thinking to be disabled for forced tool choice",
@@ -143,8 +145,9 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
 }
 
 /// SMG template overrides stay explicit; public `thinking.type` then
-/// decides ahead of public effort, with thinking enabled by default.
-fn thinking_enabled(req: &ChatCompletionRequest) -> bool {
+/// decides ahead of public effort. `None` when the request carries no
+/// thinking signal at all.
+fn thinking_preference(req: &ChatCompletionRequest) -> Option<bool> {
     let kwargs = req.chat_template_kwargs.as_ref();
     kwargs
         .and_then(|kwargs| {
@@ -163,7 +166,10 @@ fn thinking_enabled(req: &ChatCompletionRequest) -> bool {
                 })
         })
         .or_else(|| req.thinking_toggle())
-        .unwrap_or_else(|| req.effective_reasoning_effort() != Some("none"))
+        .or_else(|| {
+            req.effective_reasoning_effort()
+                .map(|effort| effort != "none")
+        })
 }
 
 fn error(code: &'static str, message: &'static str) -> validator::ValidationError {
