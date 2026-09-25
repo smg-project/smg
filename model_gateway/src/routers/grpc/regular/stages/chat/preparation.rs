@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{ToolChoice, ToolChoiceValue},
+    common::{ResponseFormat, ToolChoice, ToolChoiceValue},
 };
 use tracing::{debug, error};
 
@@ -314,6 +314,19 @@ pub(crate) async fn prepare_chat_like(
             None
         };
 
+        // Backend selection follows preparation. Keep this response-format tag
+        // separate from tool constraints: it must not acquire tool precedence
+        // or hide conflicting regex/grammar constraints during serialization.
+        ctx.state.response_format_tag = prepare_response_format_tag(
+            request,
+            ctx.components
+                .parser_resolver
+                .reasoning_parser(&request.model)
+                .as_deref(),
+            utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref()),
+            tool_call_constraint.is_some(),
+        );
+
         let preserve_reasoning_special_tokens = request.separate_reasoning
             && utils::reasoning_parser_requires_special_tokens(
                 &ctx.components.reasoning_parser_factory,
@@ -368,5 +381,175 @@ pub(crate) async fn prepare_chat_like(
             processed_messages,
             tool_call_constraint.map(|c| c.to_tuple()),
         ))
+    }
+}
+
+/// Prepare native framing before backend selection; only vLLM gRPC consumes it.
+fn prepare_response_format_tag(
+    request: &ChatCompletionRequest,
+    parser: Option<&str>,
+    starts_in_reasoning: bool,
+    has_tool_constraint: bool,
+) -> Option<String> {
+    // Respect parser overrides, including models served under aliases. With no
+    // override, retain the bounded canonical V4.1 Flash auto-detection.
+    let is_v41 = parser.map_or_else(
+        || {
+            request
+                .model
+                .split('/')
+                .any(|part| part.eq_ignore_ascii_case("deepseek-v4.1-flash"))
+        },
+        |name| name.eq_ignore_ascii_case("deepseek_v41"),
+    );
+    if !is_v41 || !starts_in_reasoning || has_tool_constraint {
+        return None;
+    }
+    let schema = match request.response_format.as_ref()? {
+        ResponseFormat::JsonObject => serde_json::json!({"type": "object"}),
+        ResponseFormat::JsonSchema { json_schema } => json_schema.schema.clone(),
+        ResponseFormat::Text => return None,
+    };
+    debug!(model = %request.model, parser, "Preparing reasoning-aware JSON structural tag for vLLM gRPC");
+    Some(tool_parser::DeepSeekDsmlParser::build_v41_json_structural_tag(&schema).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use llm_tokenizer::{
+        chat_template::{ThinkingKeyName, ThinkingToggle},
+        traits::RendererCapabilities,
+    };
+    use openai_protocol::validated::Normalizable;
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn request(extra: Value) -> ChatCompletionRequest {
+        let mut value = json!({"model":"deepseek-ai/DeepSeek-V4.1-Flash","messages":[{"role":"user","content":"Return JSON."}],"response_format":{"type":"json_object"}});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mut request: ChatCompletionRequest = serde_json::from_value(value).unwrap();
+        request.normalize();
+        request
+    }
+
+    #[test]
+    fn prepared_json_preserves_schema_and_reasoning_boundary() {
+        let schema = json!({"$defs":{"label":{"enum":["amber"]}},"type":"object","properties":{"label":{"$ref":"#/$defs/label"},"count":{"type":["integer","null"]}},"required":["label","count"],"additionalProperties":false});
+        for (format, expected) in [
+            (json!({"type":"json_object"}), json!({"type":"object"})),
+            (
+                json!({"type":"json_schema","json_schema":{"name":"fixture","strict":true,"schema":schema}}),
+                schema,
+            ),
+        ] {
+            let tag = prepare_response_format_tag(
+                &request(json!({"response_format":format})),
+                Some("deepseek_v41"),
+                true,
+                false,
+            )
+            .unwrap();
+            let tag: Value = serde_json::from_str(&tag).unwrap();
+            assert_eq!(
+                tag["format"]["elements"],
+                json!([
+                    {"type":"any_text","excludes":["</think>"]},
+                    {"type":"const_string","value":"</think>"},
+                    {"type":"json_schema","json_schema":expected}
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_json_respects_parser_override_alias_and_tool_precedence() {
+        assert!(prepare_response_format_tag(
+            &request(json!({"model":"served-alias"})),
+            Some("deepseek_v41"),
+            true,
+            false
+        )
+        .is_some());
+        for model in [
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "deepseek-ai/DeepSeek-R1",
+            "Qwen/Qwen3-8B",
+            "openai/gpt-oss-20b",
+            "opaque-alias",
+            "DeepSeek-V4.1-Flash-extra",
+        ] {
+            assert!(
+                prepare_response_format_tag(&request(json!({"model":model})), None, true, false)
+                    .is_none(),
+                "{model}"
+            );
+        }
+        for parser in ["deepseek_v4", "qwen3", "passthrough"] {
+            assert!(
+                prepare_response_format_tag(&request(json!({})), Some(parser), true, false)
+                    .is_none()
+            );
+        }
+        assert!(
+            prepare_response_format_tag(&request(json!({})), Some("deepseek_v41"), true, true)
+                .is_none()
+        );
+        assert!(prepare_response_format_tag(
+            &request(json!({"response_format":{"type":"text"}})),
+            Some("deepseek_v41"),
+            true,
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn prepared_json_uses_resolved_template_state_and_continuation() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::DefaultOn)
+            .with_thinking_key_name(ThinkingKeyName::Thinking)
+            .with_native_reasoning_effort_values(&["low", "high", "xhigh", "max"])
+            .with_renderer_capabilities(RendererCapabilities {
+                enable_thinking_alias: true,
+                native_assistant_continuation: true,
+                raw_tool_call_arguments: true,
+            });
+        for (extra, wrapped) in [
+            (json!({}), true),
+            (json!({"model":"/models/DEEPSEEK-V4.1-FLASH"}), true),
+            (json!({"separate_reasoning":false}), true),
+            (json!({"thinking":{"type":"disabled"}}), false),
+            (json!({"reasoning_effort":"none"}), false),
+            (
+                json!({"chat_template_kwargs":{"enable_thinking":false}}),
+                false,
+            ),
+            (
+                json!({"thinking":{"type":"disabled"},"chat_template_kwargs":{"thinking":true}}),
+                true,
+            ),
+            (
+                json!({"continue_final_message":true,"messages":[{"role":"assistant","content":"{\"label\":"}]}),
+                false,
+            ),
+        ] {
+            let req = request(extra.clone());
+            assert_eq!(
+                prepare_response_format_tag(
+                    &req,
+                    None,
+                    utils::chat_reasoning_starts_in_prefill(&req, &tokenizer),
+                    false
+                )
+                .is_some(),
+                wrapped,
+                "{extra}"
+            );
+        }
     }
 }

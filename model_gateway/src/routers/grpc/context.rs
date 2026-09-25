@@ -182,6 +182,10 @@ pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 
+    /// Native response-format framing prepared before worker selection. Kept
+    /// separate from tool constraints; only the vLLM gRPC adapter consumes it.
+    pub response_format_tag: Option<String>,
+
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
     /// building `take()`s it for the prefill serialization.

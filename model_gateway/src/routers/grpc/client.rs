@@ -7,7 +7,8 @@ use openai_protocol::{
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
 };
 use smg_grpc_client::{
-    common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, MlxEngineClient,
+    common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle,
+    vllm_proto::sampling_params::Constraint as VllmConstraint, MlxEngineClient,
     SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
     TrtllmServiceClient, VllmEngineClient,
 };
@@ -51,6 +52,8 @@ pub struct GenerateRequestBuildOptions {
     pub multimodal_inputs: Option<MultimodalData>,
     pub tool_constraints: Option<(String, String)>,
     pub require_reasoning: bool,
+    /// Prepared response-format structural tag, consumed only by vLLM gRPC.
+    pub response_format_tag: Option<String>,
 }
 
 impl GrpcClient {
@@ -506,14 +509,28 @@ impl GrpcClient {
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_vllm_request(vllm_mm, |mm| {
-                    VllmEngineClient::build_generate_request_from_chat(
+                    let has_tool_constraint = options.tool_constraints.is_some();
+                    let mut request = VllmEngineClient::build_generate_request_from_chat(
                         request_id,
                         body,
                         processed_text,
                         token_ids,
                         mm,
                         options.tool_constraints,
-                    )
+                    )?;
+                    // Serialize prepared framing only after normal validation.
+                    // A tool-provided JSON schema must keep tool precedence.
+                    if !has_tool_constraint {
+                        if let (Some(tag), Some(params)) = (
+                            options.response_format_tag,
+                            request.sampling_params.as_mut(),
+                        ) {
+                            if matches!(params.constraint, Some(VllmConstraint::JsonSchema(_))) {
+                                params.constraint = Some(VllmConstraint::StructuralTag(tag));
+                            }
+                        }
+                    }
+                    Ok(request)
                 })
             }
             Self::Trtllm(client) => {
@@ -973,6 +990,113 @@ mod tests {
     use smg_grpc_client::{sglang_proto, tokenspeed_proto};
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo};
+
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "ephemeral HTTP/2 listener supplies real client connections; no inference RPCs"
+    )]
+    async fn prepared_json_tag_preserves_validation_tools_and_backend_scope() {
+        use openai_protocol::chat::ChatCompletionRequest;
+        use serde_json::json;
+        use smg_grpc_client::vllm_proto::sampling_params::Constraint;
+
+        use super::{GenerateRequestBuildOptions, GrpcClient};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server =
+            tokio::spawn(async move { axum::serve(listener, axum::Router::new()).await.unwrap() });
+        let vllm = GrpcClient::connect(&endpoint, "vllm").await.unwrap();
+        let sglang = GrpcClient::connect(&endpoint, "sglang").await.unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"served-alias", "messages":[{"role":"user","content":"JSON"}],
+            "response_format":{"type":"json_object"}
+        }))
+        .unwrap();
+        let tag = r#"{"format":{"type":"json_schema","json_schema":{"type":"object"}}}"#;
+        let options = |tool_constraints| GenerateRequestBuildOptions {
+            response_format_tag: Some(tag.into()),
+            tool_constraints,
+            ..Default::default()
+        };
+        let build = |client: &GrpcClient, req: &ChatCompletionRequest, tools| {
+            client.build_chat_request(
+                "test".into(),
+                req,
+                "prefill".into(),
+                vec![42],
+                options(tools),
+            )
+        };
+        let output = build(&vllm, &request, None).unwrap();
+        let params = output.as_vllm().sampling_params.as_ref().unwrap();
+        assert_eq!(
+            params.constraint,
+            Some(Constraint::StructuralTag(tag.into()))
+        );
+        assert!(
+            params.skip_special_tokens,
+            "preserve backend token-ID transport defaults"
+        );
+
+        for (kind, expected) in [
+            (
+                "json_schema",
+                Constraint::JsonSchema("{\"type\":\"array\"}".into()),
+            ),
+            (
+                "structural_tag",
+                Constraint::StructuralTag("{\"type\":\"array\"}".into()),
+            ),
+        ] {
+            let output = build(
+                &vllm,
+                &request,
+                Some((kind.into(), "{\"type\":\"array\"}".into())),
+            )
+            .unwrap();
+            assert_eq!(
+                output
+                    .as_vllm()
+                    .sampling_params
+                    .as_ref()
+                    .unwrap()
+                    .constraint,
+                Some(expected)
+            );
+        }
+        for extra in [json!({"regex":"[a-z]+"}), json!({"ebnf":"root ::= \"a\""})] {
+            let mut value = serde_json::to_value(&request).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let req = serde_json::from_value(value).unwrap();
+            assert!(build(&vllm, &req, None).is_err());
+        }
+        let mut plain = request.clone();
+        plain.response_format = None;
+        assert!(build(&vllm, &plain, None)
+            .unwrap()
+            .as_vllm()
+            .sampling_params
+            .as_ref()
+            .unwrap()
+            .constraint
+            .is_none());
+        let output = build(&sglang, &request, None).unwrap();
+        assert!(matches!(
+            output
+                .as_sglang()
+                .sampling_params
+                .as_ref()
+                .unwrap()
+                .constraint,
+            Some(sglang_proto::sampling_params::Constraint::JsonSchema(_))
+        ));
+        server.abort();
+    }
 
     #[test]
     fn trtllm_status_healthy_matches_ok_exactly() {
