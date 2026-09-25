@@ -17,7 +17,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::discover_metadata::ModelsResponse;
 use crate::{
-    worker::ConnectionMode,
+    worker::{ConnectionMode, WorkerMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{do_grpc_health_check, grpc_base_url, http_base_url},
@@ -315,6 +315,30 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
                 config_runtime, config.url
             );
             context.data.detected_runtime_type = Some(config_runtime.to_string());
+            return Ok(StepResult::Success);
+        }
+
+        // An SMG Worker's engine is named by the WorkerControl handshake, which
+        // `DetectConnectionModeStep` already ran; nothing here probes it.
+        if config.worker_mode == WorkerMode::Smg {
+            let Some(runtime) = context
+                .data
+                .smg_worker_discovery
+                .as_ref()
+                .and_then(|discovery| discovery.engines.first())
+                .map(|engine| engine.engine_type.clone())
+            else {
+                return Err(WorkflowError::ContextValueNotFound(
+                    "smg_worker_discovery".to_string(),
+                ));
+            };
+            debug!(
+                worker_url = %config.url,
+                worker_mode = %config.worker_mode,
+                runtime,
+                "Using the runtime the SMG Worker handshake advertised"
+            );
+            context.data.detected_runtime_type = Some(runtime);
             return Ok(StepResult::Success);
         }
 

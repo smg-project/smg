@@ -1,23 +1,35 @@
 //! Local worker creation step.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use openai_protocol::{
     model_card::ModelCard,
     model_type::ModelType,
-    worker::{HealthCheckConfig, WorkerSpec, WorkerType},
+    worker::{HealthCheckConfig, WorkerMode, WorkerSpec, WorkerType},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_dp::DpInfo;
+use super::{
+    discover_dp::DpInfo,
+    discover_metadata::{is_smg_handshake_label, SMG_MODEL_IDS_LABEL},
+};
 use crate::{
     routers::grpc::{multimodal::SUPPORTS_VISION_LABEL, zmq_client::zmq_handshake_address},
     worker::{
-        circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
-        resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
-        Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
+        circuit_breaker::CircuitBreakerConfig,
+        overload::OverloadThresholds,
+        resilience::resolve_resilience,
+        worker::{
+            smg_worker_engine_types, smg_worker_uses_token_only_wire, RuntimeType,
+            SMG_WORKER_ENGINE_TYPES,
+        },
+        BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
 };
@@ -58,10 +70,21 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             });
         }
 
+        reject_handshake_labels_on_spec(config)?;
         // Merge labels: discovered first, then config (config takes precedence)
         let mut labels = context.data.discovered_labels.clone();
         for (key, value) in &config.labels {
             labels.insert(key.clone(), value.clone());
+        }
+        // Decided at registration so a Worker whose wire is unknown never
+        // reaches Ready and fails at first dispatch instead.
+        if config.worker_mode == WorkerMode::Smg {
+            smg_worker_uses_token_only_wire(&labels).map_err(|reason| {
+                WorkflowError::StepFailed {
+                    step_id: StepId::new("create_worker"),
+                    message: format!("SMG Worker {} cannot be registered: {reason}", config.url),
+                }
+            })?;
         }
 
         let (kv_connector, kv_role, kv_engine_id) = take_kv_transfer_metadata(config, &mut labels);
@@ -88,36 +111,46 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             model_id
         };
 
-        let model_card = build_model_card(
-            model_id,
-            config,
-            &labels,
-            &app_context.router_config.model_aliases,
-        );
+        let model_ids = registered_model_ids(config, &labels, model_id)?;
+        let model_cards = model_ids
+            .iter()
+            .map(|model_id| {
+                build_model_card(
+                    model_id,
+                    config,
+                    &labels,
+                    &app_context.router_config.model_aliases,
+                )
+            })
+            .collect::<Vec<_>>();
 
         // A parser override naming an unknown parser would silently ship
         // unparsed output at serve time — fail registration loudly instead
         // (mirrors the fail-fast AppContext applies to the global CLI names).
-        validate_parser_overrides(
-            &model_card,
-            &config.url,
-            app_context.tool_parser_factory.as_ref(),
-            app_context.reasoning_parser_factory.as_ref(),
-        )
-        .map_err(|message| WorkflowError::StepFailed {
-            step_id: StepId::new("create_worker"),
-            message,
-        })?;
+        for model_card in &model_cards {
+            validate_parser_overrides(
+                model_card,
+                &config.url,
+                app_context.tool_parser_factory.as_ref(),
+                app_context.reasoning_parser_factory.as_ref(),
+            )
+            .map_err(|message| WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message,
+            })?;
+        }
 
         // Mixed overrides across same-model workers are a misconfiguration
         // (except transiently during rolling upgrades): resolution picks one
         // deterministically, but only one family parses correctly. Warn, don't
         // fail — failing would block rolling upgrades that change the parser.
-        warn_on_conflicting_parser_overrides(
-            &model_card,
-            &config.url,
-            &app_context.worker_registry,
-        );
+        for model_card in &model_cards {
+            warn_on_conflicting_parser_overrides(
+                model_card,
+                &config.url,
+                &app_context.worker_registry,
+            );
+        }
 
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
@@ -166,6 +199,19 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         }
 
         validate_zmq_worker_type(*connection_mode, config.worker_type, &config.url)?;
+        validate_smg_worker_type(config.worker_mode, config.worker_type, &config.url)?;
+
+        if config.worker_mode == WorkerMode::Smg && !SMG_WORKER_ENGINE_TYPES.contains(&runtime_type)
+        {
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: format!(
+                    "SMG Worker {} resolved to runtime {runtime_type}; an SMG Worker fronts {}",
+                    config.url,
+                    smg_worker_engine_types()
+                ),
+            });
+        }
 
         // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
         // one socket set. Both ZMQ runtimes route per rank: vLLM by in-request
@@ -243,8 +289,10 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let workers: Vec<Arc<dyn Worker>> = dp_ranks
             .into_iter()
             .map(|dp| {
+                // `from_spec` carries every registered field, including the
+                // two-tier `worker_mode` and `control_url`.
                 let mut builder = BasicWorkerBuilder::from_spec(spec.clone())
-                    .model(model_card.clone())
+                    .models(model_cards.clone())
                     .connection_mode(*connection_mode)
                     .runtime_type(runtime_type)
                     .circuit_breaker_config(circuit_breaker.clone())
@@ -288,11 +336,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             .collect();
 
         debug!(
-            "Created {} worker(s) for {} ({:?}, {} labels)",
-            workers.len(),
-            url,
-            connection_mode,
-            labels.len()
+            worker_url = %url,
+            worker_mode = %config.worker_mode,
+            ?connection_mode,
+            workers = workers.len(),
+            labels = labels.len(),
+            "Created worker(s)"
         );
 
         context.data.actual_workers = Some(workers);
@@ -716,6 +765,86 @@ fn validate_zmq_worker_type(
         });
     }
     Ok(())
+}
+
+/// Reject a disaggregated leg an SMG Worker cannot serve: WorkerInference v1
+/// carries no bootstrap lane, so PD/EPD legs are refused at registration as
+/// they are at startup validation.
+fn validate_smg_worker_type(
+    worker_mode: WorkerMode,
+    worker_type: WorkerType,
+    url: &str,
+) -> Result<(), WorkflowError> {
+    if worker_mode == WorkerMode::Smg && worker_type != WorkerType::Regular {
+        return Err(WorkflowError::StepFailed {
+            step_id: StepId::new("create_worker"),
+            message: format!(
+                "SMG Worker {url} cannot serve worker type {worker_type}: WorkerInference v1 has \
+                 no bootstrap lane, so encode/prefill/decode disaggregation requires an engine \
+                 worker"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Labels in the handshake namespace are derived from the Worker itself; a
+/// spec that sets one would shadow what the handshake validated.
+fn reject_handshake_labels_on_spec(config: &WorkerSpec) -> Result<(), WorkflowError> {
+    if config.worker_mode != WorkerMode::Smg {
+        return Ok(());
+    }
+    let mut reserved = config
+        .labels
+        .keys()
+        .filter(|key| is_smg_handshake_label(key))
+        .cloned()
+        .collect::<Vec<_>>();
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    reserved.sort();
+    Err(WorkflowError::StepFailed {
+        step_id: StepId::new("create_worker"),
+        message: format!(
+            "SMG Worker {} spec sets handshake-derived labels {reserved:?}; labels under smg. \
+             come from the Worker's WorkerControl handshake and cannot be set on the spec",
+            config.url
+        ),
+    })
+}
+
+/// Model ids to register cards for. An SMG Worker with a wildcard spec serves
+/// every model its handshake advertised; every other worker registers its
+/// resolved primary id.
+fn registered_model_ids(
+    config: &WorkerSpec,
+    labels: &HashMap<String, String>,
+    primary: &str,
+) -> Result<Vec<String>, WorkflowError> {
+    if config.worker_mode != WorkerMode::Smg || !config.models.is_wildcard() {
+        return Ok(vec![primary.to_string()]);
+    }
+    let mut model_ids = match labels.get(SMG_MODEL_IDS_LABEL) {
+        Some(value) => serde_json::from_str::<Vec<String>>(value).map_err(|error| {
+            WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: format!(
+                    "SMG Worker {}: label {SMG_MODEL_IDS_LABEL} is not a JSON array of model \
+                     ids ({error}): {value}",
+                    config.url
+                ),
+            }
+        })?,
+        None => Vec::new(),
+    };
+    model_ids.retain(|model_id| !model_id.trim().is_empty());
+    if model_ids.is_empty() {
+        model_ids.push(primary.to_string());
+    }
+    let mut seen = HashSet::new();
+    model_ids.retain(|model_id| seen.insert(model_id.clone()));
+    Ok(model_ids)
 }
 
 /// Reject a data-parallel worker the ZMQ path cannot serve.
@@ -1390,5 +1519,266 @@ mod tests {
         // Absent factories skip validation (parsers unused in that config).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
         assert!(validate_parser_overrides(&card, "http://w:1", None, None).is_ok());
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn smg_spec(url: &str) -> WorkerSpec {
+        let mut spec = WorkerSpec::new(url);
+        spec.worker_mode = WorkerMode::Smg;
+        spec.connection_mode = ConnectionMode::Grpc;
+        spec
+    }
+
+    #[test]
+    fn smg_disaggregated_legs_are_rejected_as_a_create_worker_failure() {
+        for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
+            let err = validate_smg_worker_type(WorkerMode::Smg, worker_type, "grpc://w:50051")
+                .expect_err("SMG Worker encode/prefill/decode must be rejected");
+            match err {
+                WorkflowError::StepFailed { step_id, message } => {
+                    assert_eq!(step_id, StepId::new("create_worker"));
+                    assert!(
+                        message.contains(&worker_type.to_string())
+                            && message.contains("no bootstrap lane"),
+                        "message was: {message}"
+                    );
+                }
+                other => panic!("expected StepFailed, got {other:?}"),
+            }
+            validate_smg_worker_type(WorkerMode::Engine, worker_type, "grpc://w:50051")
+                .expect("engine workers serve every role");
+        }
+        validate_smg_worker_type(WorkerMode::Smg, WorkerType::Regular, "grpc://w:50051")
+            .expect("regular is the role an SMG Worker serves");
+    }
+
+    /// An SMG Worker with a wildcard spec registers every advertised model
+    /// once; everything else registers the resolved primary id only.
+    #[test]
+    fn registered_model_ids_follow_the_handshake_only_for_wildcard_smg_workers() {
+        let advertised = labels(&[(SMG_MODEL_IDS_LABEL, r#"["model-b","model-a","model-b",""]"#)]);
+        assert_eq!(
+            registered_model_ids(&smg_spec("grpc://w:50051"), &advertised, "model-b").unwrap(),
+            ["model-b", "model-a"]
+        );
+        assert_eq!(
+            registered_model_ids(&smg_spec("grpc://w:50051"), &labels(&[]), "primary").unwrap(),
+            ["primary"]
+        );
+        assert_eq!(
+            registered_model_ids(
+                &smg_spec("grpc://w:50051"),
+                &labels(&[(SMG_MODEL_IDS_LABEL, "[]")]),
+                "primary"
+            )
+            .unwrap(),
+            ["primary"]
+        );
+
+        let mut explicit = smg_spec("grpc://w:50051");
+        explicit.models = vec![ModelCard::new("spec-a"), ModelCard::new("spec-b")].into();
+        assert_eq!(
+            registered_model_ids(&explicit, &advertised, "spec-a").unwrap(),
+            ["spec-a"]
+        );
+
+        let mut engine = WorkerSpec::new("grpc://w:50051");
+        engine.models = vec![ModelCard::new("spec-a"), ModelCard::new("spec-b")].into();
+        assert_eq!(
+            registered_model_ids(&engine, &advertised, "spec-a").unwrap(),
+            ["spec-a"]
+        );
+        assert_eq!(
+            registered_model_ids(&WorkerSpec::new("grpc://w:50051"), &advertised, "primary")
+                .unwrap(),
+            ["primary"]
+        );
+    }
+
+    #[test]
+    fn a_malformed_smg_model_ids_label_fails_registration_naming_the_label() {
+        for malformed in ["not-json", r#"{"a":1}"#, "[1,2]"] {
+            let err = registered_model_ids(
+                &smg_spec("grpc://w:50051"),
+                &labels(&[(SMG_MODEL_IDS_LABEL, malformed)]),
+                "primary",
+            )
+            .expect_err("malformed model id list must fail registration");
+            match err {
+                WorkflowError::StepFailed { step_id, message } => {
+                    assert_eq!(step_id, StepId::new("create_worker"));
+                    assert!(
+                        message.contains(SMG_MODEL_IDS_LABEL) && message.contains(malformed),
+                        "message was: {message}"
+                    );
+                }
+                other => panic!("expected StepFailed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn handshake_labels_on_an_smg_spec_are_rejected() {
+        let mut spec = smg_spec("grpc://w:50051");
+        spec.labels = labels(&[
+            ("smg.engine.engine_transport", "grpc"),
+            ("smg.ai/pod-name", "pod-0"),
+            ("tokenizer_path", "repo/tokenizer"),
+        ]);
+        let err = reject_handshake_labels_on_spec(&spec).expect_err("reserved label on spec");
+        match err {
+            WorkflowError::StepFailed { message, .. } => {
+                assert!(
+                    message.contains("smg.engine.engine_transport")
+                        && !message.contains("smg.ai/pod-name")
+                        && !message.contains("tokenizer_path"),
+                    "message was: {message}"
+                );
+            }
+            other => panic!("expected StepFailed, got {other:?}"),
+        }
+
+        spec.labels = labels(&[("smg.ai/pod-name", "pod-0"), ("tokenizer_path", "x")]);
+        reject_handshake_labels_on_spec(&spec).expect("discovery and plain labels are allowed");
+
+        let mut engine = WorkerSpec::new("grpc://w:50051");
+        engine.labels = labels(&[("smg.engine.engine_transport", "grpc")]);
+        reject_handshake_labels_on_spec(&engine).expect("engine workers derive nothing from smg.");
+    }
+
+    mod step {
+        use std::sync::{Arc, OnceLock};
+
+        use llm_tokenizer::registry::TokenizerRegistry;
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+        use wfaas::WorkflowInstanceId;
+
+        use super::*;
+        use crate::{
+            app_context::AppContext,
+            config::RouterConfig,
+            policies::PolicyRegistry,
+            worker::{worker::SMG_ENGINE_TRANSPORT_LABEL, WorkerRegistry},
+            workflow::steps::create_worker_workflow_data,
+        };
+
+        fn app_context() -> Arc<AppContext> {
+            let router_config = RouterConfig::default();
+            Arc::new(
+                AppContext::builder()
+                    .client(reqwest::Client::new())
+                    .rate_limiter(None)
+                    .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
+                    .reasoning_parser_factory(None)
+                    .tool_parser_factory(None)
+                    .worker_registry(Arc::new(WorkerRegistry::new()))
+                    .policy_registry(Arc::new(PolicyRegistry::new(router_config.policy.clone())))
+                    .router_config(router_config)
+                    .response_storage(Arc::new(MemoryResponseStorage::new()))
+                    .conversation_storage(Arc::new(MemoryConversationStorage::new()))
+                    .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+                    .worker_monitor(None)
+                    .worker_job_queue(Arc::new(OnceLock::new()))
+                    .workflow_engines(Arc::new(OnceLock::new()))
+                    .mcp_orchestrator(Arc::new(OnceLock::new()))
+                    .build()
+                    .expect("app context"),
+            )
+        }
+
+        /// A context as the discovery steps leave it for an SMG Worker.
+        fn smg_context(discovered: HashMap<String, String>) -> WorkflowContext<WorkerWorkflowData> {
+            let mut data = create_worker_workflow_data(
+                smg_spec("grpc://127.0.0.1:1"),
+                WorkerRegistrationMode::Upsert,
+                app_context(),
+            );
+            data.worker_kind = Some(WorkerKind::Local);
+            data.connection_mode = Some(ConnectionMode::Grpc);
+            data.detected_runtime_type = Some("vllm".to_string());
+            data.discovered_labels = discovered;
+            WorkflowContext::new(WorkflowInstanceId::new(), data)
+        }
+
+        /// Without the handshake-validated transport label the Worker never
+        /// becomes a Ready worker that fails every dispatch.
+        #[tokio::test]
+        async fn smg_worker_without_a_validated_transport_fails_registration() {
+            for discovered in [
+                labels(&[]),
+                labels(&[("engine_transport", "zmq")]),
+                labels(&[(SMG_ENGINE_TRANSPORT_LABEL, "carrier-pigeon")]),
+            ] {
+                let mut ctx = smg_context(discovered.clone());
+                let err = CreateLocalWorkerStep
+                    .execute(&mut ctx)
+                    .await
+                    .expect_err("registration must fail");
+                assert!(
+                    matches!(
+                        err,
+                        WorkflowError::StepFailed { ref message, .. }
+                            if message.contains(SMG_ENGINE_TRANSPORT_LABEL)
+                    ),
+                    "{discovered:?}: {err}"
+                );
+                assert!(ctx.data.actual_workers.is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn smg_worker_registers_one_card_per_advertised_model() {
+            let mut ctx = smg_context(labels(&[
+                (SMG_ENGINE_TRANSPORT_LABEL, "zmq"),
+                (SMG_MODEL_IDS_LABEL, r#"["model-a","model-b"]"#),
+                ("served_model_name", "model-a"),
+            ]));
+
+            let result = CreateLocalWorkerStep.execute(&mut ctx).await.unwrap();
+
+            assert_eq!(result, StepResult::Success);
+            let workers = ctx.data.actual_workers.expect("workers built");
+            assert_eq!(workers.len(), 1);
+            let worker = &workers[0];
+            assert_eq!(worker.worker_mode(), WorkerMode::Smg);
+            assert_eq!(worker.metadata().spec.runtime_type, RuntimeType::Vllm);
+            let mut model_ids = worker
+                .models()
+                .into_iter()
+                .map(|card| card.id)
+                .collect::<Vec<_>>();
+            model_ids.sort();
+            assert_eq!(model_ids, ["model-a", "model-b"]);
+        }
+
+        #[tokio::test]
+        async fn smg_worker_resolving_to_an_unsupported_runtime_fails_registration() {
+            let mut ctx = smg_context(labels(&[
+                (SMG_ENGINE_TRANSPORT_LABEL, "grpc"),
+                ("served_model_name", "model-a"),
+            ]));
+            ctx.data.detected_runtime_type = Some("sglang".to_string());
+
+            let err = CreateLocalWorkerStep
+                .execute(&mut ctx)
+                .await
+                .expect_err("an SMG Worker cannot front sglang");
+            assert!(
+                matches!(
+                    err,
+                    WorkflowError::StepFailed { ref message, .. }
+                        if message.contains("sglang") && message.contains("vllm or tokenspeed")
+                ),
+                "{err}"
+            );
+        }
     }
 }

@@ -1,4 +1,5 @@
 use axum::http::HeaderName;
+use openai_protocol::worker::{ConnectionMode, WorkerMode};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -86,11 +87,33 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     Ok(())
 }
 
+/// Validate an SMG Worker's WorkerControl endpoint: a worker URL whose scheme
+/// is `grpc://` or `grpcs://`, the only transports WorkerControl is served on.
+pub fn validate_worker_control_url(url: &str) -> ConfigResult<()> {
+    validate_worker_url(url).map_err(|error| match error {
+        ConfigError::InvalidValue { value, reason, .. } => ConfigError::InvalidValue {
+            field: "control_url".to_string(),
+            value,
+            reason,
+        },
+        other => other,
+    })?;
+    if ConnectionMode::from_url(url) != Some(ConnectionMode::Grpc) {
+        return Err(ConfigError::InvalidValue {
+            field: "control_url".to_string(),
+            value: url.to_string(),
+            reason: "SMG Worker control URL must use a grpc:// or grpcs:// scheme".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
+        Self::validate_smg_worker_mode(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
@@ -131,6 +154,71 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
+        Ok(())
+    }
+
+    /// `worker_mode=smg` describes the `--worker-urls` workers: each must be a
+    /// `grpc://`/`grpcs://` SMG Worker in the regular role. WorkerInference v1
+    /// has no bootstrap lane, so no disaggregated role exists for them.
+    fn validate_smg_worker_mode(config: &RouterConfig) -> ConfigResult<()> {
+        if config.startup_worker_mode != WorkerMode::Smg {
+            return Ok(());
+        }
+
+        let disaggregated = |legs: &str| ConfigError::IncompatibleConfig {
+            reason: format!(
+                "worker_mode=smg cannot be combined with {legs} disaggregation: WorkerInference \
+                 v1 has no bootstrap lane, so the Router would reject every disaggregated \
+                 request at dispatch"
+            ),
+        };
+        let worker_urls = match &config.mode {
+            RoutingMode::Regular { worker_urls } => worker_urls,
+            RoutingMode::PrefillDecode { .. } => return Err(disaggregated("prefill/decode")),
+            RoutingMode::EncodePrefillDecode { .. } => {
+                return Err(disaggregated("encode/prefill/decode"))
+            }
+            RoutingMode::OpenAI { .. }
+            | RoutingMode::Anthropic { .. }
+            | RoutingMode::Gemini { .. } => {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: format!(
+                        "worker_mode=smg cannot be combined with the {} routing mode: only \
+                         self-hosted --worker-urls workers can be SMG Workers",
+                        config.mode_type()
+                    ),
+                });
+            }
+        };
+
+        if worker_urls.is_empty() {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "worker_mode=smg applies to --worker-urls workers and none were given; \
+                         supply the SMG Workers' grpc:// or grpcs:// URLs with --worker-urls"
+                    .to_string(),
+            });
+        }
+        if let Some(url) = worker_urls
+            .iter()
+            .find(|url| ConnectionMode::from_url(url) != Some(ConnectionMode::Grpc))
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: format!(
+                    "worker_mode=smg requires grpc:// or grpcs:// --worker-urls: an SMG Worker \
+                     serves WorkerControl and WorkerInference over gRPC only; got {url}"
+                ),
+            });
+        }
+        if config.connection_mode != ConnectionMode::Grpc {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: format!(
+                    "worker_mode=smg requires connection_mode=grpc: an SMG Worker serves \
+                     WorkerControl and WorkerInference over gRPC only; got connection_mode={}",
+                    config.connection_mode
+                ),
+            });
+        }
 
         Ok(())
     }
@@ -1295,6 +1383,192 @@ mod tests {
 
         let config = RouterConfig {
             mm_per_request_image_limit: Some(128),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    fn smg_config(mode: RoutingMode, connection_mode: ConnectionMode) -> RouterConfig {
+        RouterConfig {
+            mode,
+            connection_mode,
+            startup_worker_mode: WorkerMode::Smg,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn smg_worker_mode_rejects_disaggregation() {
+        for mode in [
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("grpc://10.0.0.5:50051".to_string(), None)],
+                decode_urls: vec!["grpc://10.0.0.6:50051".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("grpc://10.0.0.4:50051".to_string(), None)],
+                prefill_urls: vec![("grpc://10.0.0.5:50051".to_string(), None)],
+                decode_urls: vec!["grpc://10.0.0.6:50051".to_string()],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+        ] {
+            let config = smg_config(mode, ConnectionMode::Grpc);
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::IncompatibleConfig { ref reason })
+                        if reason.contains("disaggregation")
+                ),
+                "expected {:?} to be rejected under worker_mode=smg",
+                config.mode,
+            );
+        }
+    }
+
+    /// Every non-gRPC lane is rejected, and the message names the fix
+    /// (`grpc://` `--worker-urls`) rather than the derived connection mode.
+    #[test]
+    fn smg_worker_mode_rejects_http_and_zmq_worker_urls() {
+        for (url, connection_mode) in [
+            ("http://10.0.0.5:8000", ConnectionMode::Http),
+            ("ipc:///tmp/smg-zmq/engine-0", ConnectionMode::Zmq),
+        ] {
+            let config = smg_config(
+                RoutingMode::Regular {
+                    worker_urls: vec![url.to_string()],
+                },
+                connection_mode,
+            );
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::IncompatibleConfig { ref reason })
+                        if reason.contains("grpc:// or grpcs:// --worker-urls")
+                            && reason.contains(url)
+                ),
+                "expected {url} to be rejected under worker_mode=smg"
+            );
+        }
+    }
+
+    /// A gRPC-first URL list still derives `connection_mode=grpc`, so a
+    /// non-gRPC entry further down must be caught per URL.
+    #[test]
+    fn smg_worker_mode_rejects_a_mixed_worker_url_list() {
+        let config = smg_config(
+            RoutingMode::Regular {
+                worker_urls: vec![
+                    "grpc://10.0.0.5:50051".to_string(),
+                    "http://10.0.0.6:8000".to_string(),
+                ],
+            },
+            ConnectionMode::Grpc,
+        );
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { ref reason })
+                if reason.contains("http://10.0.0.6:8000")
+        ));
+    }
+
+    /// Without `--worker-urls` the flag has nothing to describe; the message
+    /// says so instead of blaming the defaulted connection mode.
+    #[test]
+    fn smg_worker_mode_without_worker_urls_names_the_missing_urls() {
+        let config = smg_config(
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            ConnectionMode::Http,
+        );
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { ref reason })
+                if reason.contains("none were given") && !reason.contains("connection_mode=http")
+        ));
+    }
+
+    #[test]
+    fn smg_worker_mode_rejects_provider_routing_modes() {
+        let config = smg_config(
+            RoutingMode::OpenAI {
+                worker_urls: vec!["https://api.example.com".to_string()],
+            },
+            ConnectionMode::Http,
+        );
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { ref reason }) if reason.contains("openai routing mode")
+        ));
+    }
+
+    #[test]
+    fn smg_worker_mode_accepts_regular_grpc() {
+        for url in ["grpc://10.0.0.5:50051", "grpcs://10.0.0.5:50051"] {
+            let config = smg_config(
+                RoutingMode::Regular {
+                    worker_urls: vec![url.to_string()],
+                },
+                ConnectionMode::Grpc,
+            );
+            assert!(
+                ConfigValidator::validate(&config).is_ok(),
+                "expected worker_mode=smg with {url} to pass"
+            );
+        }
+    }
+
+    /// The gate runs regardless of IGW, which skips the fleet-shape checks.
+    #[test]
+    fn smg_worker_mode_is_validated_under_igw() {
+        let mut config = smg_config(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://10.0.0.5:8000".to_string()],
+            },
+            ConnectionMode::Http,
+        );
+        config.enable_igw = true;
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn control_url_must_be_a_grpc_worker_url() {
+        assert!(validate_worker_control_url("grpc://10.0.0.5:50051").is_ok());
+        assert!(validate_worker_control_url("grpcs://smg-worker:50051").is_ok());
+        for bad in [
+            "http://10.0.0.5:50051",
+            "https://10.0.0.5:50051",
+            "ipc:///tmp/smg-zmq/control",
+            "10.0.0.5:50051",
+            "grpc://",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    validate_worker_control_url(bad),
+                    Err(ConfigError::InvalidValue { ref field, .. }) if field == "control_url"
+                ),
+                "control_url {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_worker_mode_still_allows_disaggregation() {
+        let config = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![("grpc://10.0.0.5:50051".to_string(), None)],
+                decode_urls: vec!["grpc://10.0.0.6:50051".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            connection_mode: ConnectionMode::Grpc,
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());

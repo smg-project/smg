@@ -123,6 +123,12 @@ impl BuildStage for EmbeddingRequestBuildingStage {
                     "TokenSpeed backend does not support embeddings",
                 ));
             }
+            BackendClient::Smg(_) => {
+                return Err(error::not_implemented(
+                    "unsupported_backend",
+                    "WorkerInference v1 does not support embeddings",
+                ));
+            }
             BackendClient::Zmq(_) => {
                 return Err(error::not_implemented(
                     "unsupported_backend",

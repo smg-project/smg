@@ -309,6 +309,12 @@ pub(crate) async fn execute_plan(
     let model = dispatch.model.as_str();
     let request_type = execution_plan.request_type();
     let mode = execution_plan.mode_label();
+    // The request tokenizer's primary EOS id, for a Worker whose engine
+    // cannot resolve it (`BackendClient::generate`).
+    let primary_eos = ctx
+        .tokenizer
+        .as_ref()
+        .and_then(|tokenizer| tokenizer.eos_token_ids().first().copied());
 
     // Create OTEL span for gRPC request execution
     let span = info_span!(
@@ -323,7 +329,9 @@ pub(crate) async fn execute_plan(
     let result = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => execute_single(req, clients, workers).await,
+                ProtoRequest::Generate(req) => {
+                    execute_single(req, clients, workers, primary_eos).await
+                }
                 ProtoRequest::Embed(req) => execute_single_embed(req, clients, workers).await,
             },
             ExecutionPlan::PrefillDecode(req) => {
@@ -336,7 +344,7 @@ pub(crate) async fn execute_plan(
                 execute_epd_dispatch(request, clients, workers, model, encode_dispatch).await
             }
             ExecutionPlan::Batch { kind, requests, .. } => {
-                execute_batch_dispatch(kind, requests, clients, workers, model).await
+                execute_batch_dispatch(kind, requests, clients, workers, model, primary_eos).await
             }
         }
     }
@@ -530,12 +538,15 @@ async fn execute_batch_dispatch(
     clients: &ClientSelection,
     workers: &WorkerSelection,
     model: &str,
+    primary_eos: Option<u32>,
 ) -> Result<ExecutionResult, Response> {
     let dispatches = requests.into_iter().map(|request| {
         let mut clients = clients.clone();
         async move {
             match kind {
-                ExecutionPlanKind::Single => execute_single(request, &mut clients, workers).await,
+                ExecutionPlanKind::Single => {
+                    execute_single(request, &mut clients, workers, primary_eos).await
+                }
                 // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
                 ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
                     execute_pd_dispatch(request, &mut clients, workers, model).await
@@ -552,6 +563,7 @@ async fn execute_single(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
+    primary_eos: Option<u32>,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_mut().ok_or_else(|| {
         error!(
@@ -568,7 +580,7 @@ async fn execute_single(
         proto_request.set_data_parallel_rank(rank as i32);
     }
 
-    let result = client.generate(proto_request).await;
+    let result = client.generate(proto_request, primary_eos).await;
     workers.record_outcome(result.cb_status_code());
 
     let stream = result.map_err(|e| {
@@ -687,10 +699,11 @@ async fn execute_parallel_pd(
     // its partner fails can be moved off the request path.
     let mut prefill_client = prefill_client.clone();
     let mut decode_client = decode_client.clone();
+    // Disaggregated legs are direct engine workers: no Router-supplied EOS.
     let prefill_dispatch: PdLegDispatch =
-        Box::pin(async move { prefill_client.generate(prefill_request).await });
+        Box::pin(async move { prefill_client.generate(prefill_request, None).await });
     let decode_dispatch: PdLegDispatch =
-        Box::pin(async move { decode_client.generate(decode_request).await });
+        Box::pin(async move { decode_client.generate(decode_request, None).await });
 
     match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
@@ -1098,11 +1111,12 @@ async fn execute_sequential_pd(
         "vLLM PD: sending prefill request (max_tokens=1)"
     );
 
-    // Send to prefill, wait for completion
+    // Send to prefill, wait for completion. Disaggregated legs are direct
+    // engine workers: no Router-supplied EOS.
     let (prefill_label, decode_label) = pd_leg_labels(workers);
     let prefill_start = Instant::now();
     let mut prefill_stream = prefill_client
-        .generate(prefill_request)
+        .generate(prefill_request, None)
         .await
         .map_err(|e| {
             workers.record_outcome_prefill(e.http_status().as_u16());
@@ -1253,20 +1267,23 @@ async fn execute_sequential_pd(
     }
 
     // Send request to decode
-    let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
-        workers.record_outcome_decode(e.http_status().as_u16());
-        Metrics::record_worker_error(
-            metrics_labels::WORKER_DECODE,
-            decode_label,
-            metrics_labels::ERROR_BACKEND,
-        );
-        start_failure_response(
-            &e,
-            "execute_sequential_pd",
-            PdLeg::Decode.error_message(),
-            PdLeg::Decode.error_code(),
-        )
-    })?;
+    let decode_stream = decode_client
+        .generate(decode_request, None)
+        .await
+        .map_err(|e| {
+            workers.record_outcome_decode(e.http_status().as_u16());
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_DECODE,
+                decode_label,
+                metrics_labels::ERROR_BACKEND,
+            );
+            start_failure_response(
+                &e,
+                "execute_sequential_pd",
+                PdLeg::Decode.error_message(),
+                PdLeg::Decode.error_code(),
+            )
+        })?;
 
     workers.record_outcome_decode(200);
     // Decode established: record the success-only PD metrics here.

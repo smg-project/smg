@@ -1,0 +1,120 @@
+syntax = "proto3";
+
+package smg.worker.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Node-local control plane exposed by a Worker SMG to Router SMGs.
+//
+// The API is deliberately separate from engine-specific scheduler protocols:
+// Router SMGs describe desired node state here, while the Worker translates
+// that state into backend-specific operations and reports observed state.
+service WorkerControl {
+  rpc GetIdentity(GetIdentityRequest) returns (GetIdentityResponse);
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+  rpc GetHealth(GetHealthRequest) returns (GetHealthResponse);
+  rpc GetTopology(GetTopologyRequest) returns (GetTopologyResponse);
+}
+
+// =====================
+// Worker discovery
+// =====================
+
+message GetIdentityRequest {}
+
+message GetIdentityResponse {
+  WorkerIdentity identity = 1;
+}
+
+message WorkerIdentity {
+  // Stable logical identity used in Router membership and ownership records.
+  string worker_id = 1;
+
+  // Unique process incarnation. Changes whenever the Worker restarts.
+  string instance_id = 2;
+  string hostname = 3;
+  string zone = 4;
+  string version = 5;
+  google.protobuf.Timestamp started_at = 6;
+  map<string, string> labels = 7;
+}
+
+message GetCapabilitiesRequest {}
+
+message GetCapabilitiesResponse {
+  WorkerCapabilities capabilities = 1;
+}
+
+message WorkerCapabilities {
+  uint32 api_major = 1;
+  uint32 api_minor = 2;
+
+  // String feature names are intentionally open-ended. Initial values include
+  // "generate", "embed", "abort", and "token_id_streaming".
+  repeated string features = 3;
+  repeated EngineCapability engines = 4;
+
+  uint32 max_concurrent_requests = 5;
+  map<string, string> attributes = 6;
+}
+
+message EngineCapability {
+  string engine_type = 1;
+  string engine_version = 2;
+  repeated string model_ids = 3;
+  repeated string features = 4;
+}
+
+enum WorkerHealthState {
+  WORKER_HEALTH_STATE_UNSPECIFIED = 0;
+  WORKER_HEALTH_STATE_STARTING = 1;
+  WORKER_HEALTH_STATE_SERVING = 2;
+  WORKER_HEALTH_STATE_DEGRADED = 3;
+  WORKER_HEALTH_STATE_DRAINING = 4;
+  WORKER_HEALTH_STATE_NOT_SERVING = 5;
+}
+
+message GetHealthRequest {
+  bool include_components = 1;
+}
+
+message GetHealthResponse {
+  WorkerHealthState state = 1;
+  string message = 2;
+  google.protobuf.Timestamp checked_at = 3;
+  repeated ComponentHealth components = 4;
+}
+
+message ComponentHealth {
+  string component_id = 1;
+  WorkerHealthState state = 2;
+  string message = 3;
+  google.protobuf.Timestamp checked_at = 4;
+}
+
+message GetTopologyRequest {}
+
+message GetTopologyResponse {
+  WorkerTopology topology = 1;
+}
+
+message WorkerTopology {
+  string worker_id = 1;
+
+  // Changes whenever an endpoint or rank assignment changes.
+  uint64 topology_version = 2;
+  repeated EngineEndpoint engines = 3;
+  google.protobuf.Timestamp observed_at = 4;
+}
+
+message EngineEndpoint {
+  string engine_id = 1;
+  string engine_type = 2;
+  string endpoint = 3;
+  repeated string model_ids = 4;
+  string replica_group = 5;
+  optional uint32 data_parallel_rank = 6;
+  optional uint32 tensor_parallel_rank = 7;
+  optional uint32 pipeline_parallel_rank = 8;
+  map<string, string> attributes = 9;
+}

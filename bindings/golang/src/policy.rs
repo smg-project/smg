@@ -32,7 +32,8 @@ use smg::{
         circuit_breaker::{CircuitBreaker, CircuitState},
         resilience::ResolvedResilience,
         worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
-        ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
+        ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerMode, WorkerResult,
+        WorkerType,
     },
 };
 use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
@@ -126,6 +127,10 @@ impl Worker for GrpcWorker {
 
     fn connection_mode(&self) -> &ConnectionMode {
         &self.metadata.spec.connection_mode
+    }
+
+    fn worker_mode(&self) -> WorkerMode {
+        self.metadata.spec.worker_mode
     }
 
     fn status(&self) -> WorkerStatus {
@@ -234,6 +239,10 @@ impl Worker for GrpcWorker {
     }
 
     async fn grpc_health_check(&self) -> WorkerResult<bool> {
+        Ok(self.is_healthy())
+    }
+
+    async fn smg_worker_health_check(&self) -> WorkerResult<bool> {
         Ok(self.is_healthy())
     }
 

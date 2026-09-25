@@ -283,6 +283,7 @@ class RouterArgs:
     rdma_slot_ttl_s: int | None = None
     # Per-request multimodal timing at INFO; False falls back to SMG_LOG_MM_TIMING
     log_mm_timing: bool = False
+    worker_mode: str = "engine"  # engine (direct) or smg (two-tier Worker)
 
     @staticmethod
     def add_cli_args(
@@ -405,6 +406,12 @@ class RouterArgs:
                 "List of worker URLs. Supports IPv4 and IPv6 addresses"
                 " (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)"
             ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-mode",
+            choices=["engine", "smg"],
+            default=RouterArgs.worker_mode,
+            help="Use the direct engine endpoint or the two-tier SMG Worker service",
         )
         worker_group.add_argument(
             f"--{prefix}upstream-http2",

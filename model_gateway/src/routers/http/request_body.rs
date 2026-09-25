@@ -647,6 +647,9 @@ mod tests {
         fn url(&self) -> &str {
             self.0.url()
         }
+        fn worker_mode(&self) -> crate::worker::WorkerMode {
+            self.0.worker_mode()
+        }
         fn api_key(&self) -> Option<&String> {
             self.0.api_key()
         }
@@ -739,6 +742,9 @@ mod tests {
         }
         async fn grpc_health_check(&self) -> WorkerResult<bool> {
             self.0.grpc_health_check().await
+        }
+        async fn smg_worker_health_check(&self) -> WorkerResult<bool> {
+            self.0.smg_worker_health_check().await
         }
         async fn zmq_health_check(&self) -> WorkerResult<bool> {
             self.0.zmq_health_check().await
