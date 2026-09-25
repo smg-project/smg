@@ -162,13 +162,13 @@ async fn hy4_typed_value_end_marker_can_be_split_after_cached_scan() {
         .unwrap();
     assert_eq!(value.calls[0].parameters, "\"items\":");
     assert!(parser
-        .parse_incremental("</arg_val", &schemas)
+        .parse_incremental("</arg_va", &schemas)
         .await
         .unwrap()
         .calls
         .is_empty());
     let last = parser
-        .parse_incremental("ue></tool_call></tool_calls>", &schemas)
+        .parse_incremental("lue></tool_call></tool_calls>", &schemas)
         .await
         .unwrap();
     assert_eq!(last.calls[0].parameters, "[1,2]}");
@@ -214,9 +214,12 @@ async fn hy4_emits_name_and_string_before_call_ends() {
         .unwrap();
     assert_eq!(value.calls[0].name, None);
     assert_eq!(value.calls[0].parameters, "\"text\":\"hello");
-    let split = p.parse_incremental("</arg_val", &tools()).await.unwrap();
+    let split = p.parse_incremental("</arg_va", &tools()).await.unwrap();
     assert!(split.calls.is_empty());
-    let close = p.parse_incremental("ue:6124c78e>", &tools()).await.unwrap();
+    let close = p
+        .parse_incremental("lue:6124c78e>", &tools())
+        .await
+        .unwrap();
     assert_eq!(close.calls[0].parameters, "\"");
     let end = p
         .parse_incremental("</tool_call:6124c78e></tool_calls:6124c78e>", &tools())
@@ -278,14 +281,14 @@ async fn hy4_union_waits_for_value_but_not_whole_call() {
     let mut p = HyV4Parser::new();
     let r = p
         .parse_incremental(
-            "<tool_calls><tool_call>run<arg_key>mixed</arg_key><arg_value>TR",
+            "<tool_calls><tool_call>run<arg_key>mixed</arg_key><arg_value>T",
             &tools(),
         )
         .await
         .unwrap();
     assert_eq!(r.calls[0].parameters, "{\"mixed\":");
     let r = p
-        .parse_incremental("UE</arg_value>", &tools())
+        .parse_incremental("RUE</arg_value>", &tools())
         .await
         .unwrap();
     assert_eq!(r.calls[0].parameters, "true");
