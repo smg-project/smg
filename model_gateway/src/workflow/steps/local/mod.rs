@@ -37,43 +37,49 @@ use wfaas::{BackoffStrategy, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use crate::{
     app_context::AppContext,
-    worker::{Worker, WorkerRegistry},
+    worker::{endpoint::Endpoint, Worker, WorkerRegistry},
     workflow::data::{WorkerRemovalWorkflowData, WorkerUpdateWorkflowData},
 };
 
-/// Find workers by their registered URL, optionally including a backend's DP ranks.
+/// Find the registered workers a query address selects.
 ///
-/// When including DP ranks, a base URL selects its plain registration and
-/// expanded ranks. A rank URL selects only that rank. Scheme-less discovery
-/// addresses match the address part; an explicit scheme must match exactly.
-pub(crate) fn find_workers_by_url(
-    registry: &WorkerRegistry,
-    url: &str,
-    include_dp_ranks: bool,
-) -> Vec<Arc<dyn Worker>> {
-    if include_dp_ranks {
-        let has_scheme = url.contains("://");
-        let matches_url = |registered: &str| {
-            let candidate = if has_scheme {
-                registered
-            } else {
-                registered
-                    .split_once("://")
-                    .map_or(registered, |(_, address)| address)
+/// Matching is on [`EndpointKey`], so every spelling of one backend — bare
+/// `host:port`, any scheme, either IPv6 form — selects the same group. Two
+/// narrowings apply on top of the key:
+///
+/// - A query naming a scheme selects only registrations under that scheme, so
+///   `http://h:p` leaves a `grpc://h:p` sibling alone. A scheme-less query, as
+///   discovery and the reconciler submit, selects every scheme.
+/// - A query carrying a `@rank` suffix selects only that rank. Without one, a
+///   base address selects its plain registration and every expanded rank.
+///
+/// The group is read from what is registered, never from the gateway's global
+/// DP setting: a rank exists in the registry or it does not, and a removal
+/// must find the same set either way.
+///
+/// An address neither side can parse selects nothing rather than falling back
+/// to a string comparison that could match the wrong backend.
+pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<Arc<dyn Worker>> {
+    let Ok((query, query_rank)) = Endpoint::parse_with_rank(url) else {
+        return Vec::new();
+    };
+    let query_key = query.key();
+    registry
+        .get_all()
+        .into_iter()
+        .filter(|worker| {
+            let Ok((registered, registered_rank)) = Endpoint::parse_with_rank(worker.url()) else {
+                return false;
             };
-            candidate == url
-        };
-        registry
-            .get_all()
-            .into_iter()
-            .filter(|worker| matches_url(worker.url()) || matches_url(worker.base_url()))
-            .collect()
-    } else {
-        match registry.get_by_url(url) {
-            Some(worker) => vec![worker],
-            None => Vec::new(),
-        }
-    }
+            if registered.key() != query_key {
+                return false;
+            }
+            if query.scheme().is_some() && query.scheme() != registered.scheme() {
+                return false;
+            }
+            query_rank.is_none() || query_rank == registered_rank
+        })
+        .collect()
 }
 
 /// Create a worker removal workflow definition.
@@ -256,12 +262,31 @@ mod dp_removal_tests {
     }
 
     fn urls(registry: &WorkerRegistry, url: &str) -> Vec<String> {
-        let mut urls: Vec<_> = find_workers_by_url(registry, url, true)
+        let mut urls: Vec<_> = find_workers_by_url(registry, url)
             .iter()
             .map(|worker| worker.url().to_string())
             .collect();
         urls.sort_unstable();
         urls
+    }
+
+    /// Two registrations spelling one IPv6 address differently are one
+    /// backend, so either spelling now selects both. Exact string matching
+    /// returned only the spelling that was asked for.
+    ///
+    /// This matters beyond lookup: `DELETE`/`PUT /workers/{id}` resolve an id
+    /// to a URL and come back through here, so an id naming one of these
+    /// selects both. Resolving those by id instead would keep the caller's
+    /// choice intact — see the worker-removal identity follow-up.
+    #[test]
+    fn one_address_spelled_two_ways_selects_both_registrations() {
+        let registry = WorkerRegistry::new();
+        register(&registry, "http://[::1]:8080", None);
+        register(&registry, "http://[0:0:0:0:0:0:0:1]:8080", None);
+
+        let both = vec!["http://[0:0:0:0:0:0:0:1]:8080", "http://[::1]:8080"];
+        assert_eq!(urls(&registry, "http://[::1]:8080"), both);
+        assert_eq!(urls(&registry, "http://[0:0:0:0:0:0:0:1]:8080"), both);
     }
 
     #[test]

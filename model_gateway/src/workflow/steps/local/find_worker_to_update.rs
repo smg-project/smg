@@ -20,15 +20,16 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
         context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let worker_url = &context.data.worker_url;
-        let dp_aware = context.data.dp_aware;
         let app_context = context
             .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
-        let workers_to_update =
-            find_workers_by_url(&app_context.worker_registry, worker_url, dp_aware);
+        // The registry decides whether this address has expanded ranks; the
+        // gateway's global DP setting does not, so an update finds the same
+        // group a removal would.
+        let workers_to_update = find_workers_by_url(&app_context.worker_registry, worker_url);
 
         if workers_to_update.is_empty() {
             return Err(WorkflowError::StepFailed {
