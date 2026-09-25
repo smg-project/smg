@@ -197,26 +197,29 @@ fn extract_template_effort_thinking(
     native_effort_thinking(effort, tokenizer)
 }
 
-/// What a `reasoning_effort` value means to this renderer: an off word
-/// disarms the parser wherever the value arrives (kwargs or top-level), an on
-/// word arms it, anything else says nothing. A renderer that declares its own
-/// off words (Hy4's `no_think`) is read by those alone; one that declares
-/// none is switched off by the protocol's `"none"`/`"minimal"`, which the
-/// DeepSeek renderers render as chat mode.
+/// What a `reasoning_effort` value means to this renderer, wherever it
+/// arrives (kwargs or top-level; the gateway forwards both to the template).
+/// A renderer that declares its own off words (Hy4's `no_think`) is read by
+/// those alone: an off word disarms the parser and every other value renders
+/// the template's default, so the protocol switch must not apply. One that
+/// declares none is switched off by the protocol's `"none"`/`"minimal"`,
+/// which the DeepSeek renderers render as chat mode, and armed by an on word.
 fn native_effort_thinking(effort: &str, tokenizer: &dyn Tokenizer) -> Option<bool> {
     let off_values = tokenizer.native_reasoning_effort_off_values();
-    let disarms = if off_values.is_empty() {
-        thinking_from_reasoning_effort(Some(effort)) == Some(false)
-    } else {
-        off_values.contains(&effort)
-    };
-    if disarms {
+    let on_values = tokenizer.native_reasoning_effort_values();
+    if off_values.is_empty() {
+        if thinking_from_reasoning_effort(Some(effort)) == Some(false) {
+            return Some(false);
+        }
+        return on_values.contains(&effort).then_some(true);
+    }
+    if off_values.contains(&effort) {
         return Some(false);
     }
-    tokenizer
-        .native_reasoning_effort_values()
-        .contains(&effort)
-        .then_some(true)
+    Some(
+        on_values.contains(&effort)
+            || matches!(tokenizer.thinking_toggle(), ThinkingToggle::DefaultOn),
+    )
 }
 
 /// Precedence for the effective thinking preference: an explicit template
@@ -962,6 +965,20 @@ mod hy_v4_tests {
         );
         assert_eq!(
             extract_template_effort_thinking(Some(&kwargs), Some("no_think"), &tok),
+            Some(true)
+        );
+        // The template renders its default for a value it does not know, so
+        // the protocol's `none` must not disarm the parser here.
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &tok),
+            Some(true)
+        );
+        let unknown = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("none"),
+        )]);
+        assert_eq!(
+            resolve_user_thinking(Some(&unknown), None, None, &tok),
             Some(true)
         );
     }

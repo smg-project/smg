@@ -707,6 +707,20 @@ impl TokenizerTrait for TiktokenTokenizer {
             _ => self.chat_template.thinking_key_name(),
         }
     }
+
+    fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+        match self.renderer {
+            Renderer::KimiK3Xtml => &[],
+            _ => self.chat_template.native_reasoning_effort_values(),
+        }
+    }
+
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        match self.renderer {
+            Renderer::KimiK3Xtml => &[],
+            _ => self.chat_template.native_reasoning_effort_off_values(),
+        }
+    }
     fn eos_token_ids(&self) -> &[TokenIdType] {
         &self.eos_token_ids
     }
