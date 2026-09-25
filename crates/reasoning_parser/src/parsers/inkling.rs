@@ -1,6 +1,8 @@
 //! Inkling/TML typed-content reasoning parser.
 
-use crate::traits::{ParseError, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE};
+use crate::traits::{
+    ParseError, ParserResult, PromptReasoning, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE,
+};
 
 const CONTENT_THINKING: &str = "<|content_thinking|>";
 const CONTENT_TEXT: &str = "<|content_text|>";
@@ -239,6 +241,22 @@ impl ReasoningParser for InklingParser {
     fn mark_think_start_stripped(&mut self) {
         // Inkling uses typed blocks rather than a separately injected start tag.
     }
+
+    /// The last control token decides: a trailing `<|content_thinking|>`
+    /// opens reasoning, a bare `<|message_model|>` header leaves the block
+    /// kind to the model, any other trailing token puts it in content.
+    fn prompt_reasoning(&self, prompt: &str) -> PromptReasoning {
+        let last = CONTROL_TOKENS
+            .iter()
+            .filter_map(|token| prompt.rfind(token).map(|at| (at, *token)))
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, token)| token);
+        match last {
+            Some(CONTENT_THINKING) => PromptReasoning::Open,
+            Some(MESSAGE_MODEL) | None => PromptReasoning::Absent,
+            Some(_) => PromptReasoning::Closed,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +268,28 @@ mod tests {
         r#"{"name":"search","args":{"q":"rust"}}"#,
         "<|end_message|>"
     );
+
+    #[test]
+    fn prompt_reasoning_reads_the_trailing_control_token() {
+        let parser = InklingParser::new();
+        let turn = "<|message_user|><|content_text|>hi<|end_message|>";
+        assert_eq!(
+            parser.prompt_reasoning(&format!("{turn}<|message_model|><|content_thinking|>")),
+            PromptReasoning::Open
+        );
+        assert_eq!(
+            parser.prompt_reasoning(&format!("{turn}<|message_model|>")),
+            PromptReasoning::Absent
+        );
+        assert_eq!(
+            parser.prompt_reasoning(&format!("{turn}<|message_model|><|content_text|>")),
+            PromptReasoning::Closed
+        );
+        assert_eq!(
+            parser.prompt_reasoning("plain text"),
+            PromptReasoning::Absent
+        );
+    }
     // Canonical typed-content fixture.
     // Structured tool calls carry their tool name in the model-message header
     // as well as in the JSON payload; only the payload reaches the tool parser.

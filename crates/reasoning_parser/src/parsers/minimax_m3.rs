@@ -3,7 +3,9 @@
 // MiniMax M3 can emit stray '</mm:think>' delimiters before normal content.
 // Its markers may also be decoded across arbitrary streaming chunk boundaries.
 
-use crate::traits::{ParseError, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE};
+use crate::traits::{
+    ParseError, ParserResult, PromptReasoning, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE,
+};
 
 const THINK_START: &str = "<mm:think>";
 const THINK_END: &str = "</mm:think>";
@@ -328,6 +330,10 @@ impl ReasoningParser for MinimaxM3Parser {
         // 'mark_reasoning_started' owns the state transition. The dedicated M3
         // state machine already knows that a generated start marker is optional.
     }
+
+    fn prompt_reasoning(&self, prompt: &str) -> PromptReasoning {
+        PromptReasoning::from_markers(prompt, THINK_START, THINK_END)
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +361,22 @@ mod tests {
         let parser = MinimaxM3Parser::new();
         // always_in_reasoning=false -> starts outside reasoning.
         assert!(!parser.is_in_reasoning());
+    }
+
+    #[test]
+    fn prompt_reasoning_follows_the_thinking_mode_prefill() {
+        let parser = MinimaxM3Parser::new();
+        // thinking_mode "enabled" prefills the opener, "disabled" the closer,
+        // "adaptive" nothing.
+        assert_eq!(
+            parser.prompt_reasoning("]~b]ai\n<mm:think>"),
+            PromptReasoning::Open
+        );
+        assert_eq!(
+            parser.prompt_reasoning("]~b]ai\n</mm:think>"),
+            PromptReasoning::Closed
+        );
+        assert_eq!(parser.prompt_reasoning("]~b]ai\n"), PromptReasoning::Absent);
     }
 
     #[test]

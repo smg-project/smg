@@ -7,10 +7,9 @@
 //! exception: its tool loop re-reads the request across iterations, so its
 //! spec explicitly owns a handle to it.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use llm_multimodal::registry::transcription::TranscriptionFamily;
-use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{StreamOptions, StringOrArray, Tool, ToolChoice},
@@ -20,7 +19,6 @@ use openai_protocol::{
     profile::ProviderProfile,
     responses::ResponsesRequest,
 };
-use serde_json::Value;
 
 use crate::routers::grpc::utils;
 
@@ -65,13 +63,9 @@ pub(crate) struct ChatResponseSpec {
     pub tools: Option<Vec<Tool>>,
     pub history_tool_calls_count: usize,
     pub stream_options: Option<StreamOptions>,
-    pub chat_template_kwargs: Option<HashMap<String, Value>>,
-    /// The effective effort (`thinking.effort` else `reasoning_effort`).
-    pub reasoning_effort: Option<String>,
-    /// The typed `thinking.type` toggle.
-    pub thinking: Option<bool>,
-    /// `continue_final_message` on a trailing assistant message.
-    pub continues_final_assistant: bool,
+    /// The rendered prompt ends inside the reasoning block, so the reasoning
+    /// parser starts armed (see `utils::ReasoningPrefill`).
+    pub starts_in_reasoning: bool,
     /// `n`, normalized.
     pub expected_choices: u32,
     pub logprobs: bool,
@@ -85,8 +79,8 @@ pub(crate) struct ChatResponseSpec {
     pub unbilled_prompt_tokens: u32,
 }
 
-impl From<&ChatCompletionRequest> for ChatResponseSpec {
-    fn from(request: &ChatCompletionRequest) -> Self {
+impl ChatResponseSpec {
+    pub(crate) fn new(request: &ChatCompletionRequest, starts_in_reasoning: bool) -> Self {
         Self {
             provider: ProviderProfile::for_model(&request.model),
             separate_reasoning: request.separate_reasoning,
@@ -104,10 +98,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             },
             history_tool_calls_count: utils::get_history_tool_calls_count(request),
             stream_options: request.stream_options.clone(),
-            chat_template_kwargs: request.chat_template_kwargs.clone(),
-            reasoning_effort: request.effective_reasoning_effort().map(str::to_string),
-            thinking: request.thinking_toggle(),
-            continues_final_assistant: utils::continues_final_assistant(request),
+            starts_in_reasoning,
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
             stop: request.stop.clone(),
@@ -117,20 +108,6 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             skip_special_tokens: request.skip_special_tokens,
             unbilled_prompt_tokens: 0,
         }
-    }
-}
-
-impl ChatResponseSpec {
-    /// Whether the reasoning parser starts in reasoning mode for this
-    /// request (see [`utils::reasoning_starts_in_prefill`]).
-    pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
-        utils::reasoning_starts_in_prefill(
-            self.chat_template_kwargs.as_ref(),
-            self.reasoning_effort.as_deref(),
-            self.thinking,
-            self.continues_final_assistant,
-            tokenizer,
-        )
     }
 }
 
@@ -158,6 +135,9 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
 #[derive(Clone)]
 pub(crate) struct MessagesResponseSpec {
     pub thinking: Option<messages::ThinkingConfig>,
+    /// The rendered prompt ends inside the reasoning block, so the reasoning
+    /// parser starts armed (see `utils::ReasoningPrefill`).
+    pub starts_in_reasoning: bool,
     pub tool_choice: Option<messages::ToolChoice>,
     pub has_tools: bool,
     pub history_tool_calls_count: usize,
@@ -166,10 +146,11 @@ pub(crate) struct MessagesResponseSpec {
     pub stop_sequences: Option<Vec<String>>,
 }
 
-impl From<&CreateMessageRequest> for MessagesResponseSpec {
-    fn from(request: &CreateMessageRequest) -> Self {
+impl MessagesResponseSpec {
+    pub(crate) fn new(request: &CreateMessageRequest, starts_in_reasoning: bool) -> Self {
         Self {
             thinking: request.thinking.clone(),
+            starts_in_reasoning,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
             history_tool_calls_count: utils::message_utils::get_history_tool_calls_count_messages(
@@ -243,7 +224,7 @@ pub(crate) enum HarmonyResponseSpec {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::*;
 
@@ -277,7 +258,7 @@ mod tests {
             "tool_choice": "required"
         }));
 
-        let spec = ChatResponseSpec::from(&request);
+        let spec = ChatResponseSpec::new(&request, false);
 
         assert_eq!(tool_names(&spec), ["get_weather"]);
     }
@@ -294,7 +275,7 @@ mod tests {
             "tools": [tool("global")]
         }));
 
-        let spec = ChatResponseSpec::from(&request);
+        let spec = ChatResponseSpec::new(&request, false);
 
         assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
     }
@@ -306,7 +287,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }));
 
-        assert!(ChatResponseSpec::from(&request).tools.is_none());
+        assert!(ChatResponseSpec::new(&request, false).tools.is_none());
     }
 
     #[test]
@@ -321,11 +302,11 @@ mod tests {
         }));
 
         assert_eq!(
-            ChatResponseSpec::from(&minimax).provider,
+            ChatResponseSpec::new(&minimax, false).provider,
             ProviderProfile::Minimax
         );
         assert_eq!(
-            ChatResponseSpec::from(&openai).provider,
+            ChatResponseSpec::new(&openai, false).provider,
             ProviderProfile::OpenAi
         );
     }
@@ -337,6 +318,9 @@ mod tests {
             "messages": [{"role": "user", "content": "try again"}]
         }));
 
-        assert_eq!(ChatResponseSpec::from(&request).tools, Some(Vec::new()));
+        assert_eq!(
+            ChatResponseSpec::new(&request, false).tools,
+            Some(Vec::new())
+        );
     }
 }

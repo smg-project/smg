@@ -44,6 +44,7 @@ SglErrorCode sgl_preprocess_chat_request_with_tokenizer(
 
 SglErrorCode sgl_chat_requires_reasoning_with_tokenizer(
     const char* request_json,
+    const char* prompt_text,
     void* tokenizer_handle,
     int32_t* require_reasoning_out,
     char** error_out
@@ -223,10 +224,15 @@ func PreprocessChatRequestWithTokenizer(requestJSON string, tokenizerHandle *Tok
 }
 
 // ChatRequiresReasoningWithTokenizer returns whether the request should ask
-// SGLang to count reasoning tokens, using the tokenizer's thinking defaults.
-func ChatRequiresReasoningWithTokenizer(requestJSON string, tokenizerHandle *TokenizerHandle) (bool, error) {
+// SGLang to count reasoning tokens. promptText is the rendered prompt from
+// PreprocessChatRequestWithTokenizer: its tail says whether the completion
+// starts inside the model's reasoning block; the tokenizer's thinking
+// defaults decide only when the prompt carries no reasoning marker.
+func ChatRequiresReasoningWithTokenizer(requestJSON string, promptText string, tokenizerHandle *TokenizerHandle) (bool, error) {
 	requestJSONC := C.CString(requestJSON)
 	defer C.free(unsafe.Pointer(requestJSONC))
+	promptTextC := C.CString(promptText)
+	defer C.free(unsafe.Pointer(promptTextC))
 
 	if tokenizerHandle == nil || tokenizerHandle.handle == nil {
 		return false, fmt.Errorf("invalid tokenizer handle")
@@ -237,6 +243,7 @@ func ChatRequiresReasoningWithTokenizer(requestJSON string, tokenizerHandle *Tok
 
 	errorCode := C.sgl_chat_requires_reasoning_with_tokenizer(
 		requestJSONC,
+		promptTextC,
 		unsafe.Pointer(tokenizerHandle.handle),
 		&requireReasoningOut,
 		&errorOut,

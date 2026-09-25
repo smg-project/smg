@@ -240,7 +240,7 @@ impl ParserRegistry {
     /// Returns `Ok(None)` for auto/none tool_choice.
     ///
     /// `reasoning` says the rendered prompt ends inside the model's thinking
-    /// block (the gateway's `chat_reasoning_starts_in_prefill`). A parser that
+    /// block (the gateway's `ReasoningPrefill::starts_in_reasoning`). A parser that
     /// registered a reasoning prefix then gets its tag wrapped so the forced
     /// call follows the reasoning instead of preempting it; every other
     /// constraint is unchanged and applies from the first generated token.

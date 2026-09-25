@@ -283,11 +283,19 @@ impl MessagePreparationStage {
         // Step 4: Build tool constraints if tools present. On a thinking
         // prompt a parser with a reasoning prefix gets its tag wrapped so a
         // forced call follows the reasoning instead of preempting it.
+        let reasoning = utils::messages_reasoning_prefill(
+            request,
+            &processed_messages.text,
+            &ctx.components.reasoning_parser_factory,
+            ctx.components
+                .parser_resolver
+                .reasoning_parser(&request.model)
+                .as_deref(),
+            tokenizer.as_ref(),
+        );
         let tool_call_constraint = if let (false, Some(tool_choice)) =
             (filtered_tools.is_empty(), chat_tool_choice.as_ref())
         {
-            let reasoning =
-                utils::messages_reasoning_starts_in_prefill(request, tokenizer.as_ref());
             ctx.components
                 .tool_parser_factory
                 .registry()
@@ -298,7 +306,7 @@ impl MessagePreparationStage {
                         .as_deref(),
                     &filtered_tools,
                     tool_choice,
-                    reasoning,
+                    reasoning.starts_in_reasoning,
                 )
                 .map_err(|e| {
                     error!(function = "MessagePreparationStage::execute", error = %e, "Invalid tool configuration");
@@ -363,6 +371,7 @@ impl MessagePreparationStage {
             token_ids,
             processed_messages,
             tool_constraints: tool_call_constraint.map(|c| c.to_tuple()),
+            reasoning,
         });
 
         // Store stop decoder and derived skip_special_tokens for response processing.

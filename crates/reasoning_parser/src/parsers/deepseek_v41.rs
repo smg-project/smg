@@ -21,7 +21,9 @@
 //! whitespace trimming. Streaming holds back a buffer suffix that could still
 //! grow into a marker of the current state and emits everything before it.
 
-use crate::traits::{ParseError, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE};
+use crate::traits::{
+    ParseError, ParserResult, PromptReasoning, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE,
+};
 
 /// The spaced DSML tool-call block opener; inside reasoning it ends the
 /// reasoning block implicitly and is kept at the start of the normal text.
@@ -215,4 +217,8 @@ impl ReasoningParser for DeepSeekV41Parser {
     /// The prefill consumed `<think>`; nothing to record, because a `<think>`
     /// that still appears inside reasoning is absorbed by the state machine.
     fn mark_think_start_stripped(&mut self) {}
+
+    fn prompt_reasoning(&self, prompt: &str) -> PromptReasoning {
+        PromptReasoning::from_markers(prompt, THINK_START, THINK_END)
+    }
 }

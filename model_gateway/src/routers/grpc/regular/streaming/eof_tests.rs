@@ -194,8 +194,9 @@ fn chat_spec(with_tools: bool) -> ChatResponseSpec {
             }
         }]);
     }
-    ChatResponseSpec::from(
+    ChatResponseSpec::new(
         &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
+        false,
     )
 }
 
@@ -340,8 +341,9 @@ async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
             "model": "eof-test", "messages": [], "stream": true,
             "stream_options": {"include_usage": true, "continuous_usage_stats": continuous}
         });
-        let mut spec = ChatResponseSpec::from(
+        let mut spec = ChatResponseSpec::new(
             &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
+            false,
         );
         spec.unbilled_prompt_tokens = unbilled;
         let result = processor(false)
@@ -410,6 +412,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
                 budget_tokens: 1024,
                 display: None,
             }),
+            starts_in_reasoning: false,
             tool_choice: None,
             has_tools: false,
             history_tool_calls_count: 0,

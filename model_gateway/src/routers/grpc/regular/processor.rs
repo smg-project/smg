@@ -115,10 +115,9 @@ impl ResponseProcessor {
                 reasoning_parser_name,
                 model,
             ) {
-                // If the template injected `<think>` in the prefill (thinking toggle
-                // is supported and effectively ON), start in reasoning mode.
-                if original_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
+                if original_request.starts_in_reasoning {
                     parser.mark_reasoning_started();
+                    parser.mark_think_start_stripped();
                 }
 
                 match parser.detect_and_parse_reasoning(&processed_text) {
@@ -499,7 +498,6 @@ impl ResponseProcessor {
         execution_result: ExecutionResult,
         messages_request: MessagesResponseSpec,
         dispatch: DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, axum::response::Response> {
         let model = &dispatch.model;
@@ -626,19 +624,9 @@ impl ResponseProcessor {
                 reasoning_parser_name.as_deref(),
                 model,
             ) {
-                // If thinking is effectively ON and template has a toggle, start in reasoning mode.
-                {
-                    let user_thinking = match &messages_request.thinking {
-                        Some(
-                            messages::ThinkingConfig::Enabled { .. }
-                            | messages::ThinkingConfig::Adaptive { .. },
-                        ) => Some(true),
-                        Some(messages::ThinkingConfig::Disabled) => Some(false),
-                        None => None,
-                    };
-                    if utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref()) {
-                        parser.mark_reasoning_started();
-                    }
+                if messages_request.starts_in_reasoning {
+                    parser.mark_reasoning_started();
+                    parser.mark_think_start_stripped();
                 }
 
                 match parser.detect_and_parse_reasoning(&processed_text) {

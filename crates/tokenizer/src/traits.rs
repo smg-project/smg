@@ -202,11 +202,6 @@ pub trait Tokenizer: Encoder + Decoder {
         &[]
     }
 
-    /// Whether the template injects `<think>` in the generation prompt.
-    fn think_in_prefill(&self) -> bool {
-        false
-    }
-
     /// Renderer behaviours the gateway mirrors when it prepares a request.
     fn renderer_capabilities(&self) -> RendererCapabilities {
         RendererCapabilities::default()

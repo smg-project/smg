@@ -475,11 +475,13 @@ pub(crate) enum PreparationOutput {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
         tool_constraints: Option<(String, String)>,
+        reasoning: super::utils::ReasoningPrefill,
     },
     Messages {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
         tool_constraints: Option<(String, String)>,
+        reasoning: super::utils::ReasoningPrefill,
     },
     /// Transcription reuses the chat backend request shape. The chat-shaped
     /// request is synthesized here (inside the pipeline) from the family's
@@ -489,6 +491,7 @@ pub(crate) enum PreparationOutput {
     Transcription {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
+        reasoning: super::utils::ReasoningPrefill,
         chat_request: Arc<ChatCompletionRequest>,
         format: super::spec::TranscriptionResponseFormat,
         family: &'static dyn TranscriptionFamily,
