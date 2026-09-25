@@ -1,0 +1,123 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ci-node-health-trigger
+  namespace: actions-runner-system
+spec:
+  schedule: "17 * * * *"
+  timeZone: Etc/UTC
+  suspend: false
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Do not retry an ambiguous POST: GitHub may already have accepted it.
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          volumes:
+            - name: github-app
+              secret:
+                secretName: github-arc-secret
+                defaultMode: 0440
+                items:
+                  - key: github_app_id
+                    path: app-id
+                  - key: github_app_installation_id
+                    path: installation-id
+                  - key: github_app_private_key
+                    path: private-key.pem
+          containers:
+            - name: dispatch
+              image: docker.io/library/ruby:3.3-slim
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: github-app
+                  mountPath: /var/run/github-app
+                  readOnly: true
+              env:
+                # Set to "true" in a one-off test Job to avoid issue changes.
+                - name: DRY_RUN
+                  value: "false"
+              command: [ruby, -rjson, -rnet/http, -ropenssl, -rbase64, -e]
+              args:
+                - |
+                  def api(method, path, token, body = nil)
+                    uri = URI("https://api.github.com#{path}")
+                    request = method.new(uri)
+                    request["Authorization"] = "Bearer #{token}"
+                    request["Accept"] = "application/vnd.github+json"
+                    request["Content-Type"] = "application/json"
+                    request["X-GitHub-Api-Version"] = "2026-03-10"
+                    request["User-Agent"] = "smg-ci-node-health-trigger"
+                    request.body = JSON.generate(body) if body
+                    response = Net::HTTP.start(
+                      uri.host, uri.port, use_ssl: true,
+                      open_timeout: 10, read_timeout: 30, write_timeout: 30
+                    ) do |http|
+                      http.max_retries = 0
+                      http.request(request)
+                    end
+                    # Never log credentials or response bodies containing tokens.
+                    unless response.is_a?(Net::HTTPSuccess)
+                      raise "GitHub #{method::METHOD} #{path}: HTTP #{response.code}"
+                    end
+                    response.body.to_s.empty? ? {} : JSON.parse(response.body)
+                  end
+
+                  def encode(value)
+                    Base64.urlsafe_encode64(value, padding: false)
+                  end
+
+                  secret_dir = "/var/run/github-app"
+                  app_id = File.read("#{secret_dir}/app-id").strip
+                  installation_id = File.read("#{secret_dir}/installation-id").strip
+                  key = OpenSSL::PKey::RSA.new(File.read("#{secret_dir}/private-key.pem"))
+                  now = Time.now.to_i
+                  header = encode(JSON.generate(alg: "RS256", typ: "JWT"))
+                  claims = encode(JSON.generate(iat: now - 60, exp: now + 540, iss: app_id))
+                  message = "#{header}.#{claims}"
+                  jwt = "#{message}.#{encode(key.sign(OpenSSL::Digest::SHA256.new, message))}"
+
+                  access = api(
+                    Net::HTTP::Post, "/app/installations/#{installation_id}/access_tokens", jwt,
+                    { repositories: ["smg"], permissions: { actions: "write" } }
+                  )
+                  token = access.fetch("token")
+                  begin
+                    result = api(
+                      Net::HTTP::Post,
+                      "/repos/smg-project/smg/actions/workflows/ci-node-health.yml/dispatches",
+                      token, { ref: "main", inputs: { dry_run: ENV.fetch("DRY_RUN", "false") } }
+                    )
+                    puts "Dispatch accepted: #{result.fetch('html_url', 'ci-node-health.yml')}"
+                  ensure
+                    api(Net::HTTP::Delete, "/installation/token", token)
+                  end

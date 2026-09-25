@@ -4,7 +4,8 @@ name: CI node health
 # node-exporter, kube-state-metrics) and the GitHub Actions queue, and keeps one
 # GitHub issue per active problem under the `ci-node-health` label. Slack hears
 # about it through the GitHub Slack app:
-#   /github subscribe smg-project/smg issues label:"ci-node-health"
+#   /github subscribe smg-project/smg issues +label:"ci-node-health"
+# Triggered hourly by scripts/k8s-runner-resources/ci-node-health-trigger.yaml.
 # Docs: scripts/k8s-runner-resources/README.md, section "CI node health monitor".
 #
 # Runbook (issue title -> first action; the issue body repeats it):
@@ -25,8 +26,6 @@ name: CI node health
 # State findings close on their own after two clean runs. XID issues are closed by a human.
 
 on:
-  schedule:
-    - cron: '17 * * * *' # hourly, off the round hour
   workflow_dispatch:
     inputs:
       dry_run:

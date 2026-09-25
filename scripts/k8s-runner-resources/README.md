@@ -224,13 +224,17 @@ and must not be applied alongside the active runner scale sets.
 
 ## CI node health monitor
 
-`.github/workflows/ci-node-health.yml` runs `scripts/ci_node_health.py` every hour on the
-`k8s-runner-cpu` scale set. It reads Prometheus (node-problem-detector, DCGM, node-exporter,
+[`ci-node-health-trigger.yaml`](ci-node-health-trigger.yaml) dispatches
+`.github/workflows/ci-node-health.yml` at minute 17 of every hour (UTC) from a Kubernetes
+CronJob in `actions-runner-system`. GitHub's native schedule is disabled to avoid duplicate
+checks; the workflow can still be dispatched manually, including with `dry_run: true`.
+The workflow runs `scripts/ci_node_health.py` on the `k8s-runner-cpu` scale set.
+It reads Prometheus (node-problem-detector, DCGM, node-exporter,
 kube-state-metrics) over the ClusterIP and the GitHub Actions API, and keeps **one GitHub
-issue per active problem** under the `ci-node-health` label. No kubeconfig and no secret
-beyond `GITHUB_TOKEN`.
+issue per active problem** under the `ci-node-health` label. The workflow itself needs no
+kubeconfig and no secret beyond `GITHUB_TOKEN`.
 
-- Slack: `/github subscribe smg-project/smg issues label:"ci-node-health"` in the channel.
+- Slack: `/github subscribe smg-project/smg issues +label:"ci-node-health"` in the channel.
   Only "opened" and "closed" reach Slack; body updates while a problem persists do not.
 - Acknowledge a known problem (for example a deliberate cordon) by assigning the issue to
   yourself and leaving it open. It closes on its own two runs after the condition clears.
@@ -240,6 +244,45 @@ beyond `GITHUB_TOKEN`.
 - Dry run from a laptop:
   `kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 19090:9090 &`
   then `GITHUB_TOKEN=$(gh auth token) python3 scripts/ci_node_health.py --dry-run --repo smg-project/smg --prom-url http://127.0.0.1:19090`.
+
+### Deploy the hourly trigger
+
+The CronJob reads the existing `github-arc-secret` (App ID, installation ID, and private
+key). The App **and its installation** must grant **Actions: Read and write** on
+`smg-project/smg`, in addition to the ARC permissions above. It creates a short-lived
+installation token limited to the `smg` repository and Actions write permission, dispatches
+the workflow, and revokes the token. No personal access token is needed. The App private key
+is mounted read-only; neither it nor the generated token is printed in logs.
+
+With `kubectl` pointed at the CI runner cluster:
+
+```bash
+kubectl apply --dry-run=server -f scripts/k8s-runner-resources/ci-node-health-trigger.yaml
+kubectl apply -f scripts/k8s-runner-resources/ci-node-health-trigger.yaml
+kubectl get cronjob ci-node-health-trigger -n actions-runner-system
+```
+
+To test without changing health issues, create a one-off Job with `DRY_RUN=true`:
+
+```bash
+kubectl create job ci-node-health-trigger-test \
+  --from=cronjob/ci-node-health-trigger -n actions-runner-system \
+  --dry-run=client -o yaml \
+  | kubectl set env --local -f - DRY_RUN=true -o yaml \
+  | kubectl create -f -
+kubectl logs -f job/ci-node-health-trigger-test -n actions-runner-system
+kubectl delete job ci-node-health-trigger-test -n actions-runner-system
+```
+
+The dispatch log links to the GitHub run; verify that run also completes successfully.
+Kubernetes Job success confirms dispatch and token revocation, not workflow completion.
+The trigger does not retry failed requests, since an ambiguous response may mean GitHub
+already accepted the dispatch. Failed Jobs are retained for inspection. To pause dispatches:
+
+```bash
+kubectl patch cronjob ci-node-health-trigger -n actions-runner-system \
+  --type=merge -p '{"spec":{"suspend":true}}'
+```
 
 ### Checks
 
