@@ -2656,6 +2656,23 @@ pub struct FanoutStream<C = ProtoStream> {
     cursor: usize,
 }
 
+#[cfg(test)]
+impl<C: FanoutChild> FanoutChild for FanoutStream<C> {
+    fn next_item(
+        &mut self,
+    ) -> impl Future<Output = Option<Result<ProtoGenerateResponse, tonic::Status>>> + Send {
+        self.next()
+    }
+
+    fn mark_completed(&mut self) {
+        Self::mark_completed(self);
+    }
+
+    fn defer_abort_until_first_item(self) -> Self {
+        Self::defer_abort_until_first_item(self)
+    }
+}
+
 type FanoutItem = Option<Result<ProtoGenerateResponse, tonic::Status>>;
 /// One child's pending `next_item`, tagged with the child's position.
 type FanoutPoll<'a> = Pin<Box<dyn Future<Output = (usize, FanoutItem)> + Send + 'a>>;
@@ -2849,6 +2866,13 @@ mod fanout_tests {
     };
 
     use super::*;
+    use crate::{
+        routers::grpc::common::response_collection::drain_prefill,
+        worker::{
+            BasicWorkerBuilder, PrefillAdmission, PrefillLoadGuard, Worker, WorkerLoadGuard,
+            WorkerType,
+        },
+    };
 
     /// A child that yields a script, then ends.
     struct Scripted {
@@ -2958,6 +2982,49 @@ mod fanout_tests {
         let mut fanout = FanoutStream::new(vec![second, first]);
         let first_item = fanout.next().await.unwrap();
         assert!(matches!(first_item, Err(status) if status.message() == "leg died"));
+    }
+
+    #[tokio::test]
+    async fn prefill_fanout_retains_unfinished_sample_guards() {
+        for finish_at_complete in [false, true] {
+            for bounded in [false, true] {
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new("http://prefill-fanout")
+                        .worker_type(WorkerType::Prefill)
+                        .build(),
+                );
+                let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+                let guard = if bounded {
+                    let admitted = admission
+                        .admit(None, |capacity| capacity.select(Arc::clone(&worker), ()))
+                        .await
+                        .unwrap();
+                    PrefillLoadGuard::Admission {
+                        _reservation: Arc::new(admitted.reservation),
+                    }
+                } else {
+                    PrefillLoadGuard::Unbounded {
+                        _guard: WorkerLoadGuard::new(Arc::clone(&worker), None),
+                    }
+                };
+                let guards = guard.replicate_to(2).into_iter().map(Some).collect();
+                assert_eq!(worker.load(), if bounded { 1 } else { 2 });
+                // Each n=1 Prefill dispatch returns one terminal response.
+                // The second dispatch is unfinished when the first completes.
+                let (first, _) = child(vec![complete()]);
+                let (second, _) = child(vec![complete()]);
+                let mut stream = FanoutStream::new(vec![first, second]);
+                let mut indices = Vec::new();
+                drain_prefill(&mut stream, guards, finish_at_complete, |complete| {
+                    indices.push(complete.index());
+                    assert_eq!(worker.load(), if complete.index() == 0 { 1 } else { 0 });
+                })
+                .await
+                .unwrap();
+                assert_eq!(indices, vec![0, 1]);
+                assert_eq!(worker.load(), 0);
+            }
+        }
     }
 
     #[test]

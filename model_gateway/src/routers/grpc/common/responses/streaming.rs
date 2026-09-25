@@ -18,16 +18,20 @@ use openai_protocol::{
 };
 use serde_json::json;
 use smg_mcp::{self as mcp};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 use uuid::Uuid;
 
 use super::utils::generation_failure_error;
+#[cfg(test)]
+use crate::routers::common::sse::sse_channel;
 use crate::routers::{
     common::{
         openai_bridge::{self, descriptor, ResponseFormat},
         sse::{SseReceiver, SseSender},
     },
+    error,
     grpc::harmony::responses::ToolResult,
 };
 
@@ -1375,6 +1379,41 @@ impl ResponseStreamEventEmitter {
     }
 }
 
+/// One-shot signal used by streaming `/v1/responses` handlers to avoid
+/// returning HTTP 200 until the first backend request has actually started.
+pub(crate) type StreamStartupSender = oneshot::Sender<Result<(), Response>>;
+pub(crate) type StreamStartupReceiver = oneshot::Receiver<Result<(), Response>>;
+
+pub(crate) fn stream_startup_channel() -> (StreamStartupSender, StreamStartupReceiver) {
+    oneshot::channel()
+}
+
+#[must_use]
+pub(crate) fn signal_stream_startup(
+    startup: &mut Option<StreamStartupSender>,
+    result: Result<(), Response>,
+) -> bool {
+    let Some(startup) = startup.take() else {
+        return true;
+    };
+
+    startup.send(result).is_ok()
+}
+
+pub(crate) async fn await_stream_startup(
+    startup: StreamStartupReceiver,
+    rx: SseReceiver,
+) -> Response {
+    match startup.await {
+        Ok(Ok(())) => build_sse_response(rx),
+        Ok(Err(response)) => response,
+        Err(_) => error::internal_error(
+            "responses_stream_startup_failed",
+            "Streaming response failed before backend request startup",
+        ),
+    }
+}
+
 /// Build a Server-Sent Events (SSE) response
 ///
 /// Creates a Response with proper SSE headers and streaming body.
@@ -1448,6 +1487,40 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn await_stream_startup_returns_backend_error_response() {
+        let (startup_tx, startup_rx) = stream_startup_channel();
+        let (_sse_tx, sse_rx) = sse_channel();
+        let response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::empty())
+            .expect("test response should build");
+
+        assert!(startup_tx.send(Err(response)).is_ok());
+
+        let response = await_stream_startup(startup_rx, sse_rx).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn signal_stream_startup_returns_sse_after_success() {
+        let (startup_tx, startup_rx) = stream_startup_channel();
+        let (_sse_tx, sse_rx) = sse_channel();
+        let mut startup = Some(startup_tx);
+
+        assert!(signal_stream_startup(&mut startup, Ok(())));
+        assert!(startup.is_none());
+
+        let response = await_stream_startup(startup_rx, sse_rx).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "text/event-stream; charset=utf-8"
+            ))
+        );
     }
 }
 

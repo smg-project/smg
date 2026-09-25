@@ -34,6 +34,7 @@ pub(super) fn create_test_app_context() -> Arc<AppContext> {
         rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
         rate_limit_manager: None,
         worker_registry: worker_registry.clone(),
+        prefill_admission: None,
         policy_registry: Arc::new(crate::policies::PolicyRegistry::with_override(
             router_config.policy.clone(),
             router_config.routing_key_override.clone(),

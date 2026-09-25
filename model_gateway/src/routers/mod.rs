@@ -42,6 +42,23 @@ pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
 
+pub(crate) const PD_PREFILL_QUEUE_FULL: &str = "pd_prefill_queue_full";
+pub(crate) const PD_PREFILL_QUEUE_TIMEOUT: &str = "pd_prefill_queue_timeout";
+
+/// The client answer when the Prefill admission queue has no room.
+pub(crate) fn prefill_queue_full() -> Response {
+    error::too_many_requests(PD_PREFILL_QUEUE_FULL, "Prefill admission queue is full")
+}
+
+/// The client answer when a queued request waited out its Prefill admission
+/// timeout.
+pub(crate) fn prefill_queue_timeout() -> Response {
+    error::too_many_requests(
+        PD_PREFILL_QUEUE_TIMEOUT,
+        "Timed out waiting for Prefill admission",
+    )
+}
+
 /// Core trait for all router implementations
 ///
 /// This trait provides a unified interface for routing requests,

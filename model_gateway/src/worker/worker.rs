@@ -387,6 +387,22 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Increment the load counter
     fn increment_load(&self);
 
+    /// Increment the load counter only when the resulting value does not exceed `max`.
+    ///
+    /// Implementations backed by an atomic counter should override this method
+    /// with a compare-and-update operation. This fallback preserves the limit
+    /// for existing external implementations, but can reject usable capacity
+    /// during concurrent attempts.
+    fn try_increment_load(&self, max: usize) -> bool {
+        self.increment_load();
+        if self.load() <= max {
+            true
+        } else {
+            self.decrement_load();
+            false
+        }
+    }
+
     /// Decrement the load counter
     fn decrement_load(&self);
 
@@ -1236,6 +1252,14 @@ impl WorkerRuntime {
         self.load_counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn try_increment_load(&self, max: usize) -> bool {
+        self.load_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1).filter(|next| *next <= max)
+            })
+            .is_ok()
+    }
+
     /// Saturating decrement. Returns `true` if the counter was decremented,
     /// `false` if it was already zero — callers can log when that happens.
     pub fn try_decrement_load(&self) -> bool {
@@ -1645,6 +1669,14 @@ impl Worker for BasicWorker {
         self.update_running_requests_metrics();
     }
 
+    fn try_increment_load(&self, max: usize) -> bool {
+        let incremented = self.runtime.load().try_increment_load(max);
+        if incremented {
+            self.update_running_requests_metrics();
+        }
+        incremented
+    }
+
     fn decrement_load(&self) {
         if !self.runtime.load().try_decrement_load() {
             tracing::warn!(
@@ -2000,7 +2032,46 @@ impl WorkerLoadGuard {
     /// wins over the header), so keyed-load accounting matches selection.
     pub fn with_key(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
         worker.increment_load();
+        Self::from_acquired_load(worker, routing_key)
+    }
 
+    pub fn try_new(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        max: usize,
+    ) -> Option<Self> {
+        let key = extract_routing_key(headers);
+        Self::try_new_with_key(worker, key, max)
+    }
+
+    pub fn try_new_with_key(
+        worker: Arc<dyn Worker>,
+        routing_key: Option<&str>,
+        max: usize,
+    ) -> Option<Self> {
+        if !worker.try_increment_load(max) {
+            return None;
+        }
+        Some(Self::from_acquired_load(worker, routing_key))
+    }
+
+    /// Acquire another load guard for the same worker and routing key.
+    ///
+    /// This is explicit instead of implementing `Clone` because replication
+    /// increments externally visible worker load.
+    pub(crate) fn replicate(&self) -> Self {
+        self.worker.increment_load();
+        if let Some(ref key) = self.routing_key {
+            self.worker.increment_routing_key_load(key);
+        }
+
+        Self {
+            worker: Arc::clone(&self.worker),
+            routing_key: self.routing_key.clone(),
+        }
+    }
+
+    fn from_acquired_load(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
         let routing_key = routing_key.map(String::from);
         if let Some(ref key) = routing_key {
             worker.increment_routing_key_load(key);
@@ -3267,6 +3338,23 @@ mod tests {
         drop(guard2);
         assert_eq!(worker.load(), 0);
         assert_eq!(worker.routing_key_load(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_respects_atomic_limit() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+
+        let first = WorkerLoadGuard::try_new(Arc::clone(&worker), None, 1).unwrap();
+        assert!(WorkerLoadGuard::try_new(Arc::clone(&worker), None, 1).is_none());
+
+        drop(first);
+        let second = WorkerLoadGuard::try_new(Arc::clone(&worker), None, 1).unwrap();
+        drop(second);
+        assert_eq!(worker.load(), 0);
     }
 
     #[test]

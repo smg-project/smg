@@ -100,6 +100,7 @@ impl ConfigValidator {
         Self::validate_tenant_api_keys(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
+        Self::validate_prefill_admission(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -131,6 +132,45 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
+        Ok(())
+    }
+
+    fn validate_prefill_admission(config: &RouterConfig) -> ConfigResult<()> {
+        if config.prefill_max_inflight_requests_per_worker <= 0 {
+            if config.prefill_queue_size.is_some() || config.prefill_queue_timeout_secs.is_some() {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Prefill queue options require --prefill-max-inflight-requests-per-worker to be positive".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        if !matches!(
+            config.mode,
+            RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
+        ) {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Prefill admission is only supported in PD or EPD mode".to_string(),
+            });
+        }
+
+        if config.priority_scheduler_enabled {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Prefill admission cannot be combined with --priority-scheduler-enabled"
+                    .to_string(),
+            });
+        }
+
+        if config.effective_prefill_queue_size() > 0
+            && config.effective_prefill_queue_timeout_secs() == 0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "prefill_queue_timeout_secs".to_string(),
+                value: "0".to_string(),
+                reason: "Must be > 0 when the Prefill queue is enabled".to_string(),
+            });
+        }
 
         Ok(())
     }
@@ -1820,6 +1860,65 @@ mod tests {
             },
             PolicyConfig::Random,
         );
+
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    fn pd_mode_config() -> RouterConfig {
+        RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        )
+    }
+
+    #[test]
+    fn prefill_queue_options_require_admission() {
+        let mut config = pd_mode_config();
+        config.prefill_queue_size = Some(1);
+
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn prefill_admission_rejects_priority_scheduler() {
+        let mut config = pd_mode_config();
+        config.prefill_max_inflight_requests_per_worker = 1;
+        config.priority_scheduler_enabled = true;
+
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn enabled_prefill_queue_requires_nonzero_timeout() {
+        let mut config = pd_mode_config();
+        config.prefill_max_inflight_requests_per_worker = 1;
+        config.prefill_queue_size = Some(1);
+        config.prefill_queue_timeout_secs = Some(0);
+
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "prefill_queue_timeout_secs"
+        ));
+    }
+
+    #[test]
+    fn zero_size_prefill_queue_does_not_require_timeout() {
+        let mut config = pd_mode_config();
+        config.prefill_max_inflight_requests_per_worker = 1;
+        config.prefill_queue_size = Some(0);
+        config.prefill_queue_timeout_secs = Some(0);
 
         assert!(ConfigValidator::validate(&config).is_ok());
     }

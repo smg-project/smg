@@ -26,7 +26,10 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::error;
 
 use super::{
-    common::{responses::ResponsesContext, stages::*},
+    common::{
+        responses::{ResponsesContext, StreamStartupSender},
+        stages::*,
+    },
     context::*,
     harmony,
     mode::Mode,
@@ -67,7 +70,7 @@ use crate::{
         common::retry::{is_retryable_response, BackoffCalculator},
         error,
     },
-    worker::WorkerRegistry,
+    worker::{PrefillAdmission, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
@@ -93,6 +96,7 @@ pub(crate) enum Endpoint {
 pub(crate) struct PipelineDeps {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
+    prefill_admission: Option<Arc<PrefillAdmission>>,
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
@@ -105,9 +109,14 @@ pub(crate) struct PipelineDeps {
 impl PipelineDeps {
     /// Full deps for the chat/messages/harmony endpoints, which consume the
     /// configured parser factories/overrides.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "pipeline construction wires the endpoint dependency bundle"
+    )]
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
+        prefill_admission: Option<Arc<PrefillAdmission>>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
@@ -117,6 +126,7 @@ impl PipelineDeps {
         Self {
             worker_registry,
             policy_registry,
+            prefill_admission,
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
@@ -130,11 +140,13 @@ impl PipelineDeps {
     pub(crate) fn pair(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
+        prefill_admission: Option<Arc<PrefillAdmission>>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
     ) -> Self {
         Self {
             worker_registry,
             policy_registry,
+            prefill_admission,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
@@ -199,6 +211,7 @@ impl PipelineDeps {
         Self {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            prefill_admission: None,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
@@ -260,6 +273,7 @@ impl RequestPipeline {
             deps.worker_registry.clone(),
             deps.policy_registry.clone(),
             mode.worker_selection(),
+            deps.prefill_admission.clone(),
         );
         let plan_kind = mode.plan_kind();
         let inject_pd_metadata = mode.inject_pd_metadata();
@@ -472,7 +486,7 @@ impl RequestPipeline {
             // re-stamped (engine ids, sampling defaults, PD rooms) for the
             // new workers. Buffered decode state from the failed attempt is
             // reset.
-            self.stages.worker_selection.reselect(dctx)?;
+            self.stages.worker_selection.reselect(dctx).await?;
             let workers = dctx.workers.as_ref().ok_or_else(|| {
                 error!(
                     function = "run_attempt",
@@ -623,6 +637,7 @@ impl RequestPipeline {
             // This releases its PD admission claim too, so the retry is not
             // queued behind its own predecessor's bootstrap rooms.
             dctx.load_guards = None;
+            dctx.pd_prefill_guard = None;
 
             let Some(config) = retry_config else {
                 return Err(failure);
@@ -763,6 +778,38 @@ impl RequestPipeline {
             .await;
     }
 
+    /// [`Self::run`], reporting to a Responses stream's startup barrier
+    /// whether the backend request started. A run that fails before then
+    /// hands its response to the barrier; the caller gets a placeholder the
+    /// Responses stream never forwards.
+    async fn run_signalling(
+        &self,
+        ctx: RequestContext,
+        metrics_endpoint: Option<&'static str>,
+        retry_config: Option<&RetryConfig>,
+        stream_start: Option<StreamStartupSender>,
+    ) -> Result<RunOutcome, Response> {
+        let outcome = Box::pin(self.run(ctx, metrics_endpoint, retry_config)).await;
+        let Some(startup) = stream_start else {
+            return outcome;
+        };
+        // A dropped receiver means the client left; nothing waits for either
+        // message.
+        match outcome {
+            Ok(outcome) => {
+                let _ = startup.send(Ok(()));
+                Ok(outcome)
+            }
+            Err(failure) => {
+                let _ = startup.send(Err(failure));
+                Err(error::internal_error(
+                    "responses_stream_startup_failed",
+                    "Streaming response failed before backend request startup",
+                ))
+            }
+        }
+    }
+
     /// Execute the complete pipeline for a chat request
     #[expect(clippy::too_many_arguments)]
     pub async fn execute_chat(
@@ -774,13 +821,17 @@ impl RequestPipeline {
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
+        stream_start: Option<StreamStartupSender>,
     ) -> Response {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
 
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CHAT;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+        match self
+            .run_signalling(ctx, Some(ENDPOINT), retry_config, stream_start)
+            .await
+        {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Chat(response)) => {
@@ -1161,6 +1212,7 @@ impl RequestPipeline {
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
+        stream_start: Option<StreamStartupSender>,
     ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
@@ -1170,7 +1222,7 @@ impl RequestPipeline {
         );
         ctx.input.tenant_request_meta = tenant_request_meta;
 
-        let mut dctx = match Box::pin(self.run(ctx, None, None)).await {
+        let mut dctx = match self.run_signalling(ctx, None, None, stream_start).await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses_streaming",
@@ -1375,7 +1427,7 @@ mod alias_pipeline_tests {
             .unwrap();
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None);
+        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None, None);
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
             tokenizer_registry,
@@ -1786,6 +1838,7 @@ mod request_release_tests {
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
             None,
         );
         RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
@@ -2246,6 +2299,7 @@ mod request_release_tests {
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             None,
+            None,
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
@@ -2258,6 +2312,7 @@ mod request_release_tests {
                 None,
                 MODEL.to_string(),
                 components,
+                None,
                 None,
                 None,
                 None,

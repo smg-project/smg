@@ -172,6 +172,14 @@ impl Worker for GrpcWorker {
         self.load.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn try_increment_load(&self, max: usize) -> bool {
+        self.load
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1).filter(|next| *next <= max)
+            })
+            .is_ok()
+    }
+
     fn decrement_load(&self) {
         self.load.fetch_sub(1, Ordering::Relaxed);
     }

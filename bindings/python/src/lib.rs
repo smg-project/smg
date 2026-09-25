@@ -541,6 +541,9 @@ struct Router {
     rdma_listen_ip: Option<String>,
     rdma_slot_ttl_s: Option<u64>,
     log_mm_timing: bool,
+    prefill_max_inflight_requests_per_worker: i32,
+    prefill_queue_size: Option<usize>,
+    prefill_queue_timeout_secs: Option<u64>,
 }
 
 impl Router {
@@ -878,6 +881,9 @@ impl Router {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
+            .prefill_queue_size(self.prefill_queue_size)
+            .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -1151,6 +1157,9 @@ impl Router {
         rdma_listen_ip = None,
         rdma_slot_ttl_s = None,
         log_mm_timing = false,
+        prefill_max_inflight_requests_per_worker = -1,
+        prefill_queue_size = None,
+        prefill_queue_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1317,6 +1326,9 @@ impl Router {
         rdma_listen_ip: Option<String>,
         rdma_slot_ttl_s: Option<u64>,
         log_mm_timing: bool,
+        prefill_max_inflight_requests_per_worker: i32,
+        prefill_queue_size: Option<usize>,
+        prefill_queue_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1495,6 +1507,9 @@ impl Router {
             rdma_listen_ip,
             rdma_slot_ttl_s,
             log_mm_timing,
+            prefill_max_inflight_requests_per_worker,
+            prefill_queue_size,
+            prefill_queue_timeout_secs,
         })
     }
 

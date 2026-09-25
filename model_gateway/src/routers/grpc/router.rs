@@ -126,6 +126,7 @@ impl GrpcRouter {
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
             policy_registry.clone(),
+            ctx.prefill_admission.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -138,6 +139,7 @@ impl GrpcRouter {
         let pair_deps = PipelineDeps::pair(
             worker_registry.clone(),
             policy_registry.clone(),
+            ctx.prefill_admission.clone(),
             ctx.rate_limit_manager.clone(),
         );
 
@@ -309,6 +311,7 @@ impl GrpcRouter {
                 Some(tenant_meta.clone()),
                 Some(rate_limit_cell.clone()),
                 Some(&retry_config),
+                None,
             )
             .await;
 

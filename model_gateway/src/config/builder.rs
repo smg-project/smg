@@ -385,6 +385,21 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn prefill_max_inflight_requests_per_worker(mut self, max: i32) -> Self {
+        self.config.prefill_max_inflight_requests_per_worker = max;
+        self
+    }
+
+    pub fn prefill_queue_size(mut self, size: Option<usize>) -> Self {
+        self.config.prefill_queue_size = size;
+        self
+    }
+
+    pub fn prefill_queue_timeout_secs(mut self, timeout: Option<u64>) -> Self {
+        self.config.prefill_queue_timeout_secs = timeout;
+        self
+    }
+
     pub fn rate_limit_tokens_per_second(mut self, tokens: i32) -> Self {
         self.config.rate_limit_tokens_per_second = Some(tokens);
         self
