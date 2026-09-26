@@ -30,6 +30,16 @@ pub fn default_unknown_model() -> String {
     super::UNKNOWN_MODEL_ID.to_string()
 }
 
+/// Serde skip predicate: the wildcard model id is a gateway-internal
+/// placeholder for "the request named no model", never a value to forward.
+/// A model-less SGLang-native `/generate` (slime, verl) must reach the
+/// engine without a `model` key, exactly as the client sent it; a
+/// model-aware upstream (a sidecar in front of another gateway) would
+/// otherwise look up a model called "unknown" and answer 404.
+pub fn is_unknown_model(model: &str) -> bool {
+    model == super::UNKNOWN_MODEL_ID
+}
+
 /// Helper function for serde default value (returns true)
 pub fn default_true() -> bool {
     true

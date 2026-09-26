@@ -36,7 +36,7 @@ use smg::{
     middleware::TenantRequestMeta,
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType, UNKNOWN_MODEL_ID},
 };
 use tokio::net::TcpListener;
 use tower::ServiceExt;
@@ -170,6 +170,27 @@ fn register_tokenspeed(
         .expect("TokenSpeed worker registered");
 }
 
+/// Register a TokenSpeed gRPC worker with no model card and no `model_id`
+/// label. `Worker::model_id`'s fallback then reports [`UNKNOWN_MODEL_ID`],
+/// so the registry's model index carries an extra `"unknown"` entry
+/// alongside any real model -- the shape the model-less `/generate` default
+/// must see through.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn register_untagged_tokenspeed(ctx: &Arc<AppContext>, grpc_port: u16) {
+    let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{grpc_port}"))
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Grpc)
+        .runtime_type(RuntimeType::TokenSpeed)
+        .health_config(health_off())
+        .build();
+    ctx.worker_registry
+        .register(Arc::new(worker))
+        .expect("untagged TokenSpeed worker registered");
+}
+
 /// Register an HTTP SGLang worker, which controls itself over its own URL.
 #[expect(
     clippy::expect_used,
@@ -223,15 +244,6 @@ fn generate_request(stream: bool) -> GenerateRequest {
         "stream": stream,
     }))
     .unwrap()
-}
-
-/// The gRPC `/generate` path answers with one element per sample; `n` is
-/// unset here, so the single element is the whole answer.
-fn first_generate_result(body: Value) -> Value {
-    match body {
-        Value::Array(items) => items.into_iter().next().unwrap_or(Value::Null),
-        other => other,
-    }
 }
 
 /// Two TokenSpeed gRPC workers (one with a control endpoint at an HTTP mock
@@ -413,9 +425,10 @@ async fn grpc_generate_reports_the_engine_stamped_version() {
         .route_generate(None, &tenant(), generate_request(false), MODEL)
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let first = first_generate_result(json_of(resp).await);
+    let body = json_of(resp).await;
+    assert!(body.is_object(), "single prompt -> object, got {body}");
     assert_eq!(
-        first["meta_info"]["weight_version"], ENGINE_VERSION,
+        body["meta_info"]["weight_version"], ENGINE_VERSION,
         "engine value beats the `{REGISTERED_VERSION}` label"
     );
 
@@ -437,4 +450,84 @@ async fn grpc_generate_reports_the_engine_stamped_version() {
         text.contains(&format!(r#""weight_version":"{ENGINE_VERSION}""#)),
         "{text}"
     );
+}
+
+/// slime's rollout client sends one prompt per `/generate` call and indexes
+/// `meta_info` straight off the response; SGLang answers that shape with a
+/// single JSON object rather than a one-element list, and the gRPC path
+/// must match.
+#[tokio::test]
+async fn single_prompt_generate_answers_with_an_object_like_sglang() {
+    let f = fleet(18929, 18930).await;
+    let resp = f
+        .router
+        .route_generate(None, &tenant(), generate_request(false), MODEL)
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert!(body.is_object(), "single prompt -> object, got {body}");
+    assert_eq!(body["meta_info"]["weight_version"], ENGINE_VERSION);
+}
+
+/// slime never sends `model` on `/generate`; when the fleet serves exactly
+/// one model (as this fixture does), the gRPC router defaults the wildcard
+/// placeholder to it instead of 404ing.
+#[tokio::test]
+async fn model_less_generate_defaults_to_the_single_served_model() {
+    let f = fleet(18931, 18932).await;
+    let request: GenerateRequest = serde_json::from_value(json!({
+        "input_ids": [1, 2, 3],
+        "sampling_params": {"max_new_tokens": 3},
+    }))
+    .unwrap();
+    assert_eq!(request.model, UNKNOWN_MODEL_ID, "no `model` in the body");
+
+    let resp = f
+        .router
+        .route_generate(None, &tenant(), request, UNKNOWN_MODEL_ID)
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert!(body.is_object(), "single prompt -> object, got {body}");
+    assert_eq!(body["meta_info"]["weight_version"], ENGINE_VERSION);
+}
+
+/// An untagged worker (no model card, no `model_id` label) registers under
+/// the wildcard itself and must not defeat the single-model default: the
+/// registry then carries one real model plus the wildcard's own entry, and
+/// the default has to see through the latter.
+#[tokio::test]
+async fn model_less_generate_defaults_when_an_untagged_worker_is_also_registered() {
+    let ctx = grpc_rl_context().await;
+    let tagged_port = start_mock_grpc_engine(BTreeMap::new()).await;
+    let untagged_port = start_mock_grpc_engine(BTreeMap::new()).await;
+    register_tokenspeed(&ctx, tagged_port, None, None);
+    register_untagged_tokenspeed(&ctx, untagged_port);
+    let mut served = ctx.worker_registry.get_models();
+    served.sort();
+    assert_eq!(
+        served,
+        vec![MODEL.to_string(), UNKNOWN_MODEL_ID.to_string()],
+        "the untagged worker registers under the wildcard placeholder itself, \
+         which the model-less default must filter out"
+    );
+
+    let router: Arc<dyn RouterTrait> = Arc::from(
+        RouterFactory::create_router(&ctx)
+            .await
+            .expect("gRPC RL router should build"),
+    );
+    let request: GenerateRequest = serde_json::from_value(json!({
+        "input_ids": [1, 2, 3],
+        "sampling_params": {"max_new_tokens": 3},
+    }))
+    .unwrap();
+
+    let resp = router
+        .route_generate(None, &tenant(), request, UNKNOWN_MODEL_ID)
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert!(body.is_object(), "single prompt -> object, got {body}");
+    assert_eq!(body["meta_info"]["weight_version"], ENGINE_VERSION);
 }

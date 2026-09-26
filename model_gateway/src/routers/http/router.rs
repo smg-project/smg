@@ -2860,6 +2860,37 @@ mod tests {
         );
     }
 
+    /// slime posts `/generate` without a `model`. The wildcard id must reach a
+    /// model-tagged worker, and the body forwarded upstream must not carry the
+    /// gateway's "unknown" placeholder: a model-aware upstream (a sidecar in
+    /// front of another gateway) would 404 on it, and SGLang ignores it only
+    /// by accident.
+    #[tokio::test]
+    async fn model_less_generate_forwards_without_the_placeholder_model() {
+        let (url, captured) = spawn_capture_stub("application/json", r#"{"text":"ok"}"#).await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .models(vec![crate::worker::ModelCard::new("model-a")])
+            .build();
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+        let req: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hello" })).unwrap();
+        assert_eq!(req.model, crate::worker::UNKNOWN_MODEL_ID);
+        let response = router
+            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (_headers, body) = captured.lock().await.take().unwrap();
+        let forwarded: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(forwarded["text"], "hello");
+        assert!(
+            forwarded.get("model").is_none(),
+            "the wildcard placeholder leaked upstream: {forwarded}"
+        );
+    }
+
     #[tokio::test]
     async fn streamed_request_forwards_chunked_and_relays_response() {
         let (url, captured) = spawn_capture_stub("application/json", r#"{"text":"ok"}"#).await;
