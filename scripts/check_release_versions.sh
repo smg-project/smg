@@ -77,7 +77,6 @@ CRATES=(
     "smg-external-router|crates/external_router|smg-external-router"
     "smg-rl|crates/rl|smg-rl"
     "smg-client|clients/rust|-"
-    "openapi-gen|clients/openapi-gen|-"
     "smg|model_gateway|-"
 )
 

@@ -628,7 +628,9 @@ impl SchedulerState {
                 break;
             }
 
-            let w = self.waiting.pop_front().expect("front exists");
+            let Some(w) = self.waiting.pop_front() else {
+                break;
+            };
             let NewRequest {
                 request_id,
                 prompt_token_ids,
