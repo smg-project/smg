@@ -2160,6 +2160,15 @@ impl ProtoGenerateStreamChunk {
             Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
         }
     }
+
+    /// Weight version the engine reported for this chunk. Only TokenSpeed
+    /// carries it on the wire; an empty string counts as unset.
+    pub fn weight_version(&self) -> Option<&str> {
+        match self {
+            Self::TokenSpeed(c) => c.weight_version.as_deref().filter(|v| !v.is_empty()),
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+        }
+    }
 }
 
 /// Unified GenerateComplete response
@@ -2381,6 +2390,15 @@ impl ProtoGenerateComplete {
         match self {
             Self::Sglang(c) => c.reasoning_tokens,
             Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
+        }
+    }
+
+    /// Weight version the engine reported for this completion. Only TokenSpeed
+    /// carries it on the wire; an empty string counts as unset.
+    pub fn weight_version(&self) -> Option<&str> {
+        match self {
+            Self::TokenSpeed(c) => c.weight_version.as_deref().filter(|v| !v.is_empty()),
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 
@@ -3473,5 +3491,33 @@ mod tests {
         ] {
             assert_eq!(complete.chunk_semantics(), ChunkSemantics::Cumulative);
         }
+    }
+
+    #[test]
+    fn tokenspeed_generate_messages_expose_the_engine_weight_version() {
+        let complete = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some("v7".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(complete.weight_version(), Some("v7"));
+        let empty = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some(String::new()),
+            ..Default::default()
+        });
+        assert_eq!(empty.weight_version(), None, "empty is the same as unset");
+        let unset = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete::default());
+        assert_eq!(unset.weight_version(), None);
+
+        let chunk = ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+            weight_version: Some("v7".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(chunk.weight_version(), Some("v7"));
+        let sglang = ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default());
+        assert_eq!(
+            sglang.weight_version(),
+            None,
+            "no other proto carries the field"
+        );
     }
 }

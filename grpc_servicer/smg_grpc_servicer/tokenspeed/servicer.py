@@ -14,6 +14,7 @@ import asyncio
 import dataclasses
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -118,6 +119,19 @@ def _engine_supports_dp_rank_pin() -> bool:
             "upgrade smg-grpc-proto."
         )
     return engine_has_field and stub_has_field
+
+
+# Whether the installed smg-grpc-proto stubs carry the ``weight_version``
+# field added to these two messages alongside the engine-reported weight
+# version work. A stale wheel predates the field entirely, and passing the
+# kwarg to the constructor would raise ``ValueError`` on every response —
+# checked once at import time, same shape as ``_engine_supports_dp_rank_pin``.
+_GENERATE_CHUNK_HAS_WEIGHT_VERSION = (
+    "weight_version" in tokenspeed_scheduler_pb2.GenerateStreamChunk.DESCRIPTOR.fields_by_name
+)
+_GENERATE_COMPLETE_HAS_WEIGHT_VERSION = (
+    "weight_version" in tokenspeed_scheduler_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
+)
 
 
 def _finish_reason_to_dict(reason: Any) -> dict | None:
@@ -478,7 +492,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             model_path=model_path,
             tokenizer_path=tokenizer_path or "",
             default_sampling_params_json=self.server_args.preferred_sampling_params or "",
-            weight_version="",
+            weight_version=str(getattr(self.server_args, "weight_version", "") or ""),
             served_model_name=(self.server_args.served_model_name or model_path),
             max_context_length=int(self.async_llm.context_len),
             vocab_size=int(model_config.vocab_size),
@@ -588,6 +602,14 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         pairing_protocol = pairing_protocol_from_env()
         if pairing_protocol:
             server_args_dict["pairing_protocol"] = pairing_protocol
+
+        # Control endpoint and capabilities for a fronting gateway (SMG reads
+        # the `rl.*` keys straight into worker labels). Older engines have no
+        # advertisement; they simply stay label-free.
+        advertise = getattr(self.async_llm, "rl_advertisement", None)
+        if callable(advertise):
+            server_args_dict.update(advertise())
+        server_args_dict = _redact_secrets(server_args_dict)
         server_args_struct = Struct()
         server_args_struct.update(_make_json_serializable(server_args_dict))
 
@@ -613,12 +635,39 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             server_args=server_args_struct,
             scheduler_info=scheduler_info_struct,
             active_requests=len(self.async_llm.rid_to_state),
-            is_paused=False,
+            is_paused=await self._is_paused(),
             uptime_seconds=float(uptime),
             tokenspeed_version=version,
             start_time=start_timestamp,
             max_total_num_tokens=int(self.scheduler_info.get("max_total_num_tokens", 0)),
         )
+
+    async def _is_paused(self) -> bool:
+        """Live scheduler pause state; False on engines without the query.
+
+        ``is_scheduler_paused`` is pre-existing on the engine and its
+        signature is not pinned by this branch, so accept it whether it
+        returns a bool directly or a coroutine.
+
+        An EPD encode worker never gets asked: its encode loop has no pause
+        controller and treats every scheduler message as a generate request,
+        so the query takes the whole scheduler down (seen as every EPD
+        multimodal test 503ing once the gateway probed server info). Encode
+        workers have nothing to pause; report not paused.
+        """
+        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+            return False
+        query = getattr(self.async_llm, "is_scheduler_paused", None)
+        if not callable(query):
+            return False
+        try:
+            result = query()
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+        except Exception:  # noqa: BLE001 — a failed probe must not break discovery
+            logger.warning("is_scheduler_paused failed; reporting not paused", exc_info=True)
+            return False
 
     # ------------------------------------------------------------------
     # GetLoads (unary) — bridges to TokenSpeed's scheduler-side load metrics
@@ -1544,16 +1593,20 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> tokenspeed_scheduler_pb2.GenerateResponse:
         meta = output.get("meta_info", {})
         token_ids = self._generated_output_ids(output, reason_dict, no_stop_trim=no_stop_trim)
+        chunk_kwargs: dict[str, Any] = dict(
+            token_ids=token_ids,
+            prompt_tokens=int(meta.get("prompt_tokens", 0)),
+            completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
+            cached_tokens=int(meta.get("cached_tokens", 0)),
+            output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
+            index=choice_index,
+        )
+        if _GENERATE_CHUNK_HAS_WEIGHT_VERSION:
+            # protobuf treats None as unset for an optional field.
+            chunk_kwargs["weight_version"] = meta.get("weight_version")
         return tokenspeed_scheduler_pb2.GenerateResponse(
             request_id=rid,
-            chunk=tokenspeed_scheduler_pb2.GenerateStreamChunk(
-                token_ids=token_ids,
-                prompt_tokens=int(meta.get("prompt_tokens", 0)),
-                completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
-                cached_tokens=int(meta.get("cached_tokens", 0)),
-                output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
-                index=choice_index,
-            ),
+            chunk=tokenspeed_scheduler_pb2.GenerateStreamChunk(**chunk_kwargs),
         )
 
     def _complete_response(
@@ -1582,20 +1635,24 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             elif isinstance(matched, str):
                 matched_kwargs["matched_stop_str"] = matched
 
+        complete_kwargs: dict[str, Any] = dict(
+            output_ids=token_ids,
+            finish_reason=finish_reason,
+            prompt_tokens=int(meta.get("prompt_tokens", 0)),
+            completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
+            cached_tokens=int(meta.get("cached_tokens", 0)),
+            spec_accepted_tokens=int(meta.get("spec_accepted_tokens", 0)),
+            spec_draft_tokens=int(meta.get("spec_draft_tokens", 0)),
+            output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
+            index=choice_index,
+            **matched_kwargs,
+        )
+        if _GENERATE_COMPLETE_HAS_WEIGHT_VERSION:
+            # protobuf treats None as unset for an optional field.
+            complete_kwargs["weight_version"] = meta.get("weight_version")
         return tokenspeed_scheduler_pb2.GenerateResponse(
             request_id=rid,
-            complete=tokenspeed_scheduler_pb2.GenerateComplete(
-                output_ids=token_ids,
-                finish_reason=finish_reason,
-                prompt_tokens=int(meta.get("prompt_tokens", 0)),
-                completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
-                cached_tokens=int(meta.get("cached_tokens", 0)),
-                spec_accepted_tokens=int(meta.get("spec_accepted_tokens", 0)),
-                spec_draft_tokens=int(meta.get("spec_draft_tokens", 0)),
-                output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
-                index=choice_index,
-                **matched_kwargs,
-            ),
+            complete=tokenspeed_scheduler_pb2.GenerateComplete(**complete_kwargs),
         )
 
     @staticmethod
@@ -1675,6 +1732,19 @@ def _abort_status_code(reason: dict) -> grpc.StatusCode:
     if status_code == 429:
         return grpc.StatusCode.RESOURCE_EXHAUSTED
     return grpc.StatusCode.INTERNAL
+
+
+_SECRET_FRAGMENTS = ("api_key", "secret", "password")
+
+
+def _is_secret_key(key: str) -> bool:
+    """Whether a server-args key names a credential that must not leave the engine."""
+    lowered = key.lower()
+    return any(fragment in lowered for fragment in _SECRET_FRAGMENTS) or lowered.endswith("_token")
+
+
+def _redact_secrets(args: dict) -> dict:
+    return {k: v for k, v in args.items() if not _is_secret_key(str(k))}
 
 
 def _make_json_serializable(obj: Any) -> Any:

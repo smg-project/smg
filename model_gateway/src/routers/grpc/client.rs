@@ -898,6 +898,16 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "kv_cache_dtype",
     "attention_backend",
     "pairing_protocol",
+    // RL control plane (crates/rl): where the engine's SGLang-compatible
+    // control app listens and what it implements. The engine advertises
+    // these; SMG's discovery turns them into the labels the RL crate reads.
+    "rl.control_url",
+    "rl.pause_modes",
+    "rl.update_from",
+    "rl.abort",
+    "rl.flush_cache",
+    "rl.sleep_wake",
+    "rl.reports_weight_version",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1032,18 @@ mod tests {
                     ("kv_cache_dtype".to_string(), string_value("auto")),
                     ("attention_backend".to_string(), string_value("flashinfer")),
                     ("pipeline_parallel_size".to_string(), number_value(2.0)),
+                    (
+                        "rl.control_url".to_string(),
+                        string_value("http://10.0.0.5:40100"),
+                    ),
+                    (
+                        "rl.pause_modes".to_string(),
+                        string_value("wait,abort,keep"),
+                    ),
+                    (
+                        "rl.reports_weight_version".to_string(),
+                        string_value("true"),
+                    ),
                     // Not in TOKENSPEED_GRPC_KEYS — must not become a label.
                     ("host".to_string(), string_value("127.0.0.1")),
                 ]),
@@ -1083,6 +1105,18 @@ mod tests {
         assert_eq!(
             labels.get("pipeline_parallel_size").map(String::as_str),
             Some("2")
+        );
+        assert_eq!(
+            labels.get("rl.control_url").map(String::as_str),
+            Some("http://10.0.0.5:40100")
+        );
+        assert_eq!(
+            labels.get("rl.pause_modes").map(String::as_str),
+            Some("wait,abort,keep")
+        );
+        assert_eq!(
+            labels.get("rl.reports_weight_version").map(String::as_str),
+            Some("true")
         );
         // scheduler_info and transient runtime state never become labels.
         assert!(!labels.contains_key("status"));

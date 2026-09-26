@@ -249,6 +249,10 @@ message GenerateStreamChunk {
 
   // For ordering when n>1.
   uint32 index = 6;
+
+  // Weight version that produced these tokens, as the engine reports it.
+  // Unset on engines that predate the field.
+  optional string weight_version = 7;
 }
 
 message GenerateComplete {
@@ -273,6 +277,10 @@ message GenerateComplete {
 
   uint32 spec_accepted_tokens = 10;
   uint32 spec_draft_tokens = 11;
+
+  // Weight version that produced this completion, as the engine reports it.
+  // Unset on engines that predate the field.
+  optional string weight_version = 12;
 }
 
 message OutputLogProbs {

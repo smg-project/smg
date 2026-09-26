@@ -59,6 +59,7 @@ impl TokenSpeedScheduler for ScriptedWorker {
                     completion_tokens: 1,
                     cached_tokens: 0,
                     output_logprobs: None,
+                    weight_version: None,
                     index: 0,
                 })),
             }));
