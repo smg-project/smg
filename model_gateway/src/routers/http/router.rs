@@ -15,8 +15,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use bytes::{Bytes, BytesMut};
-use futures_util::{stream, Stream, StreamExt};
+use bytes::Bytes;
+use futures_util::{stream, StreamExt};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -35,6 +35,7 @@ use openai_protocol::{
     transcription::{AudioFile, TranscriptionRequest},
 };
 use reqwest::multipart::{Form, Part};
+use smg_http_utils::read_body_capped;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, warn};
@@ -1129,32 +1130,25 @@ impl Router {
 
     /// Buffer a worker response body, capped at `limit` bytes; a larger body
     /// is a misbehaving worker and yields a 502 before memory balloons.
-    async fn read_worker_body_capped<S, E>(mut stream: S, limit: usize) -> Result<Bytes, Response>
+    async fn read_worker_body_capped<S, E>(stream: S, limit: usize) -> Result<Bytes, Response>
     where
-        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        S: futures::Stream<Item = Result<Bytes, E>>,
         E: std::fmt::Display,
     {
-        let mut body = BytesMut::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(e) => {
-                    return Err(error::internal_error(
-                        "read_response_body_failed",
-                        format!("Failed to get response body: {e}"),
-                    ));
-                }
-            };
-            if body.len().saturating_add(chunk.len()) > limit {
+        match read_body_capped(stream, limit).await {
+            Ok((body, false)) => Ok(body),
+            Ok((_, true)) => {
                 warn!(limit, "Worker response exceeded the body limit");
-                return Err(error::bad_gateway(
+                Err(error::bad_gateway(
                     "upstream_response_too_large",
                     format!("Response from worker exceeded {limit} bytes"),
-                ));
+                ))
             }
-            body.extend_from_slice(&chunk);
+            Err(e) => Err(error::internal_error(
+                "read_response_body_failed",
+                format!("Failed to get response body: {e}"),
+            )),
         }
-        Ok(body.freeze())
     }
 
     // Send an already-serialized request body. The stale-connection resend
@@ -1475,13 +1469,10 @@ impl Router {
         max_body_bytes: usize,
     ) -> Response {
         let (_, response_body) = response.into_parts();
-        let body_bytes = match to_bytes(response_body, max_body_bytes).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                if e.source()
-                    .and_then(|s| s.downcast_ref::<http_body_util::LengthLimitError>())
-                    .is_some()
-                {
+        let body_bytes =
+            match read_body_capped(response_body.into_data_stream(), max_body_bytes).await {
+                Ok((bytes, false)) => bytes,
+                Ok((_, true)) => {
                     warn!(
                         limit = max_body_bytes,
                         "Rerank worker response exceeded the body limit"
@@ -1491,13 +1482,14 @@ impl Router {
                         format!("Rerank response from worker exceeded {max_body_bytes} bytes"),
                     );
                 }
-                error!("Failed to read rerank worker response: {e}");
-                return error::internal_error(
-                    "rerank_response_build_failed",
-                    "Failed to build rerank response",
-                );
-            }
-        };
+                Err(e) => {
+                    error!("Failed to read rerank worker response: {e}");
+                    return error::internal_error(
+                        "rerank_response_build_failed",
+                        "Failed to build rerank response",
+                    );
+                }
+            };
         let rerank_results = match serde_json::from_slice::<Vec<RerankResult>>(&body_bytes) {
             Ok(results) => results,
             Err(e) => {
@@ -2539,6 +2531,23 @@ mod tests {
         assert_eq!(
             extract_error_code_from_response(&response),
             "upstream_response_too_large"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_rerank_response_maps_read_failure_to_500() {
+        let req = rerank_request();
+        let chunks = stream::iter([
+            Ok(Bytes::from_static(b"[")),
+            Err(std::io::Error::other("body read failed")),
+        ]);
+        let upstream = Response::new(Body::from_stream(chunks));
+        let response =
+            Router::build_rerank_response(RerankResponseSpec::from(&req), None, upstream, 32).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "rerank_response_build_failed"
         );
     }
 
