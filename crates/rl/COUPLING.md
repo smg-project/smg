@@ -5,7 +5,7 @@ that adds a surface must update this file.
 
 | # | Surface | model_gateway file | Notes |
 |---|---|---|---|
-| (a) | `RlWorkerView` read-only registry view | `src/rl_adapter.rs`, `src/lib.rs` | `RegistryRlView` over `WorkerRegistry::{get_all,get,get_id_by_url}`; hands the RL crate each HTTP worker's negotiated client through `Worker::{http_client_handle_if_initialized,http_client}`, the same client the gateway's admin ops use, so control calls inherit the worker's HTTP version, TLS identity and roots, and pool tuning; `lib.rs` gains `pub mod rl_adapter;` |
+| (a) | `RlWorkerView` read-only registry view | `src/rl_adapter.rs`, `src/lib.rs` | `RegistryRlView` over `WorkerRegistry::{get_all,get,get_id_by_url}`; hands the RL crate each HTTP worker's negotiated client through `Worker::{http_client_handle_if_initialized,http_client}`, the same client the gateway's admin ops use, so control calls inherit the worker's HTTP version, TLS identity and roots, and pool tuning; `lib.rs` gains `pub mod rl_adapter;`; for gRPC/ZMQ workers it borrows a control client from `WorkerHttpClientCache::get(&spec.http_pool, false)` (`AppContext.worker_client_cache`) and reads the `rl.control_url` label (`CONTROL_URL_LABEL`), resolving wildcard hosts with `smg_rl::resolve_control_url` |
 | (d) | `AppContext.rl: Option<Arc<RlState>>` | `src/app_context.rs` | built in `AppContextBuilder::build()` when `router_config.rl.enabled` |
 | (d) | route mount | `src/server.rs` `build_app` | `nest("/v1/rl", smg_rl::router(..))` under `apply_control_plane_auth` |
 | (d) | metrics HELP registration | `src/observability/metrics.rs` | `smg_rl::init_rl_metrics()` |
@@ -21,6 +21,22 @@ mock), and the three `#[cfg(test)]` `AppContext { .. }` literals in
 because the struct grew a field. The gateway-level test relies on
 `TestRouterConfig` disabling health checks, so the mock stopped mid-test
 stays registered and the fan-out still targets it.
+
+Gateway-side changes that carry RL data but are not crate couplings (the RL
+crate does not call into them; they exist so the data plane reports what the
+control plane changed): `src/routers/grpc/client.rs` lifts `rl.control_url`
+and the `rl.*` capability keys from TokenSpeed gRPC server info into worker
+labels (`TOKENSPEED_GRPC_KEYS`); `src/routers/grpc/proto_wrapper.rs`,
+`src/routers/grpc/common/response_formatting.rs` (`effective_weight_version`),
+`src/routers/grpc/regular/{processor,streaming}.rs` and
+`src/routers/grpc/pipeline.rs` carry the engine-reported
+`meta_info.weight_version`; `src/routers/grpc/router.rs` and
+`src/routers/grpc/pipeline.rs` give slime's model-less single-prompt
+`/generate` SGLang's shape; `src/routers/http/router.rs` (with
+`crates/protocols/src/generate.rs`) stops forwarding the wildcard `model`
+placeholder. `model_gateway/tests/rl_tokenspeed_control_endpoint_test.rs`
+drives a TokenSpeed gRPC worker through `/v1/rl` via its control endpoint and
+checks the generate shape.
 
 Wire types are not a gateway coupling: they live in `crates/protocols/src/rl.rs`
 (`openai_protocol::rl`) next to the `/workers` types, and

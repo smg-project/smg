@@ -8,9 +8,10 @@ with paused(rl, "engine=sglang"):   # pause_generation ... continue_generation, 
 SGLang requires a JSON body on `pause_generation` and `continue_generation`
 (a bodyless POST is a 400), so bodyless routes are sent as `{}`.
 
-Only HTTP workers can be proxied. A gRPC or ZMQ worker matched by a selector is
-reported in `failed[]` as `unsupported_connection_mode`, which makes `fanout`
-raise `FanoutError` unless `allow_partial=True`.
+A worker with no control endpoint (a gRPC or ZMQ worker without an
+`rl.control_url` label) matched by a selector is reported in `failed[]` as
+`no_control_endpoint`, which makes `fanout` raise `FanoutError` unless
+`allow_partial=True`.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ class Worker:
     role: str | None
     health: str
     weight_version: str | None
+    control_url: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     capabilities: dict[str, Any] = field(default_factory=dict)
 

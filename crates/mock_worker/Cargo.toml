@@ -24,6 +24,7 @@ serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+prost-types.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

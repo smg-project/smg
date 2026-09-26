@@ -18,7 +18,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
@@ -87,6 +87,8 @@ fn start_mock_zmq_engines(handshake: &str, count: u16) {
         output_tokens: OUTPUT_TOKENS,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        server_args: BTreeMap::new(),
+        weight_version: None,
     });
     for rank in 0..u32::from(count) {
         tokio::spawn(mock_worker::zmq::serve(

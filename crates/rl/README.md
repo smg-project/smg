@@ -14,13 +14,28 @@ Response bodies are the `openai_protocol::rl` types (`RlWorkersResponse`,
 `clients/openapi-gen` so the generated SDKs carry them. `GET /v1/rl/workers`
 reports `protocol_version` (currently 1), bumped only for incompatible changes.
 
-Only HTTP workers can be proxied. A gRPC or ZMQ worker that matches a selector is
-reported in `failed[]` as `unsupported_connection_mode` (HTTP 422 on the per-worker
-route), so a fan-out over a mixed fleet answers 207 and `smg.rl.RL.fanout` raises
-`FanoutError` unless `allow_partial=True`.
+## Control endpoints
+
+Control calls go to a worker's **control endpoint**, not necessarily its data
+transport. An HTTP worker is controlled through itself; an `rl.control_url`
+label on an HTTP worker is ignored. A gRPC or ZMQ worker needs the
+`rl.control_url` label: TokenSpeed engines advertise it in server
+info (SMG's discovery turns it into the label), and any worker can be given one
+at `POST /workers` or through the worker update route. A wildcard bind host in
+the advertised URL (`0.0.0.0`, `::`) is replaced by the worker's own host. The
+worker's `api_key` is sent as the bearer to the control endpoint. The label is
+trusted: whatever host `rl.control_url` names receives the worker's `api_key`
+as a bearer, so only engines and operators you trust may set it. A worker with
+no control endpoint is reported in `failed[]` as `no_control_endpoint` (HTTP
+422 on the per-worker route), so a fan-out over such a fleet answers 207 and
+`smg.rl.RL.fanout` raises `FanoutError` unless `allow_partial=True`.
+
+Capabilities come from the `rl.*` labels when an engine (or operator) supplies
+them (`"source": "label"`), else from the built-in table (`"source": "static"`).
 
 Flags: `--enable-rl`, `--rl-control-timeout-secs` (600), `--rl-fanout-concurrency` (32).
 Recommended RL launch profile: `--enable-rl --disable-health-check --disable-circuit-breaker --request-timeout-secs 14400`.
+TokenSpeed rollout engines: `python3 -m smg_grpc_servicer.tokenspeed --model … --port 30000 --rl-control-host <reachable> --rl-control-port 30400 [--rl-control-api-key …]`, registered as `grpc://host:30000`. TokenSpeed refits are trainer-driven over NCCL (`init_weights_update_group` → `update_weights_from_distributed` → `destroy_weights_update_group`, each proxied per worker through `/v1/rl`); `update_weights_from_disk` and `update_weights_from_tensor` answer HTTP 501 on TokenSpeed. See `docs/guides/rl-tokenspeed.md`.
 
 ## Python client
 

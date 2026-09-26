@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import logging
 import os
 import random
@@ -15,7 +16,10 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 
 from smg.launch_router import launch_router
@@ -81,6 +85,19 @@ def _zmq_handshake_port(ipc_url: str) -> int:
         h ^= b
         h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return _ZMQ_HANDSHAKE_PORT_BASE + (h % _ZMQ_HANDSHAKE_PORT_SPAN)
+
+
+def _rl_control_port(port: int) -> int:
+    """Port for a TokenSpeed worker's in-engine RL control app.
+
+    Offset from the worker port so co-located workers (consecutive ports) and
+    the engine's own +233 distributed store never collide, reflected below the
+    u16 ceiling and hopped past SMG's ZMQ handshake band like ``dist_port``.
+    """
+    p = port + 400 if port + 400 <= 65535 else port - 400
+    if _ZMQ_HANDSHAKE_PORT_BASE <= p < _ZMQ_HANDSHAKE_PORT_BASE + _ZMQ_HANDSHAKE_PORT_SPAN:
+        p += _ZMQ_HANDSHAKE_PORT_SPAN
+    return p
 
 
 def _reject_handshake_port_collisions(ports: list[int]) -> None:
@@ -354,6 +371,10 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         return getattr(args, "tensor_parallel_size", 1) or 1
 
+    def control_url(self, port: int) -> str:
+        """URL of the in-engine RL control app this launcher started for ``port``."""
+        return f"http://127.0.0.1:{_rl_control_port(port)}"
+
     def build_command(
         self, args: argparse.Namespace, backend_args: list[str], host: str, port: int
     ) -> list[str]:
@@ -420,6 +441,10 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
             str(rpc_port),
             "--zmq-engine-index",
             "0",
+            "--rl-control-host",
+            "127.0.0.1",
+            "--rl-control-port",
+            str(_rl_control_port(port)),
         ]
         cmd.extend(
             self._backend_arg_defaults(
@@ -449,6 +474,8 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
                     "--data-parallel-address",
                     "--data-parallel-rpc-port",
                     "--zmq-engine-index",
+                    "--rl-control-host",
+                    "--rl-control-port",
                 ],
             )
         )
@@ -547,8 +574,6 @@ BACKEND_LAUNCHERS: dict[str, type[WorkerLauncher]] = {
 def _http_health_check(url: str, timeout: float) -> bool:
     """GET the URL and return True on HTTP 200."""
     try:
-        import urllib.request
-
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
@@ -868,6 +893,60 @@ def parse_serve_args(
 _WORKER_SHUTDOWN_TIMEOUT = 30
 
 
+def _stamp_rl_control_labels(
+    gateway_url: str,
+    api_key: str | None,
+    targets: list[tuple[str, str]],
+    deadline_s: float,
+) -> None:
+    """Label each ZMQ worker with its control endpoint once the gateway lists it.
+
+    ZMQ discovery yields no labels, so the launcher, which owns both ends,
+    stamps ``rl.control_url`` through the worker update route (labels merge).
+    """
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    pending = dict(targets)
+    stop_at = time.monotonic() + deadline_s
+    while pending and time.monotonic() < stop_at:
+        try:
+            req = urllib.request.Request(f"{gateway_url}/workers", headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                workers = json.loads(resp.read()).get("workers", [])
+        except Exception as e:  # noqa: BLE001 — the gateway may not be up yet
+            logger.debug("rl.control_url stamping: gateway not ready: %s", e)
+            time.sleep(1)
+            continue
+        for w in workers:
+            url = str(w.get("url", ""))
+            if url not in pending:
+                continue
+            body = json.dumps({"labels": {"rl.control_url": pending[url]}}).encode()
+            req = urllib.request.Request(
+                f"{gateway_url}/workers/{w['id']}", data=body, headers=headers, method="PATCH"
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5):
+                    pass
+                logger.info("stamped rl.control_url=%s on %s", pending[url], url)
+                del pending[url]
+            except urllib.error.HTTPError as e:
+                if 400 <= e.code < 500:
+                    logger.warning(
+                        "rl.control_url stamping got HTTP %s for %s; not retrying", e.code, url
+                    )
+                    del pending[url]
+                else:
+                    logger.warning("rl.control_url stamping failed for %s: %s", url, e)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("rl.control_url stamping failed for %s: %s", url, e)
+        if pending:
+            time.sleep(1)
+    for url in pending:
+        logger.warning("rl.control_url never stamped on %s (gateway did not list it)", url)
+
+
 class ServeOrchestrator:
     """Coordinate worker launch, health checking, router startup, and shutdown."""
 
@@ -890,6 +969,27 @@ class ServeOrchestrator:
             self._launch_workers()
             self._wait_healthy()
             router_args = self._build_router_args()
+            if (
+                getattr(router_args, "enable_rl", False)
+                and self.backend == "tokenspeed"
+                and getattr(self.args, "connection_mode", "grpc") == "zmq"
+            ):
+                control = getattr(self.launcher, "control_url", None)
+                if callable(control):
+                    targets = [
+                        (
+                            self.launcher.worker_url(self.args, self.args.worker_host, port),
+                            control(port),
+                        )
+                        for _, port in self.workers
+                    ]
+                    gateway_url = f"http://127.0.0.1:{router_args.port}"
+                    threading.Thread(
+                        target=_stamp_rl_control_labels,
+                        args=(gateway_url, getattr(router_args, "api_key", None), targets, 300.0),
+                        name="smg-rl-control-labels",
+                        daemon=True,
+                    ).start()
             launch_router(router_args)
         finally:
             self._cleanup_workers()
