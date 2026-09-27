@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     common::{StringOrArray, ToolChoice, ToolChoiceValue},
-    messages::CreateMessageRequest,
+    messages::{CreateMessageRequest, ToolChoice as AnthropicToolChoice},
 };
 use tracing::{debug, error};
 
@@ -280,9 +280,24 @@ impl MessagePreparationStage {
             }
         }
 
-        // Step 4: Build tool constraints if tools present. On a thinking
-        // prompt a parser with a reasoning prefix gets its tag wrapped so a
-        // forced call follows the reasoning instead of preempting it.
+        // Step 4: Build tool constraints if tools present
+        // Anthropic's tool_choice.disable_parallel_tool_use is the Messages
+        // API equivalent of OpenAI's parallel_tool_calls=false.
+        let parallel_tool_calls = match request.tool_choice.as_ref() {
+            Some(
+                AnthropicToolChoice::Auto {
+                    disable_parallel_tool_use,
+                }
+                | AnthropicToolChoice::Any {
+                    disable_parallel_tool_use,
+                }
+                | AnthropicToolChoice::Tool {
+                    disable_parallel_tool_use,
+                    ..
+                },
+            ) => !disable_parallel_tool_use.unwrap_or(false),
+            _ => true,
+        };
         let tool_call_constraint = if let (false, Some(tool_choice)) =
             (filtered_tools.is_empty(), chat_tool_choice.as_ref())
         {
@@ -298,7 +313,7 @@ impl MessagePreparationStage {
                         .as_deref(),
                     &filtered_tools,
                     tool_choice,
-                    reasoning,
+                    parallel_tool_calls,
                 )
                 .map_err(|e| {
                     error!(function = "MessagePreparationStage::execute", error = %e, "Invalid tool configuration");
