@@ -20,7 +20,7 @@ pub use factory::{ParserFactory, PooledParser, ToolConstraint};
 pub use parsers::{
     CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser, HyV4Parser,
     InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser, MinimaxM2Parser,
-    MinimaxM3Parser, MistralParser, PythonicParser, QwenParser, Step3Parser,
+    MinimaxM3Parser, MistralParser, PythonicParser, QwenParser, Step3Parser, TemplateToolParser,
 };
 pub use traits::ToolParser;
 pub use types::{FunctionCall, StreamingParseResult, ToolCall};

@@ -5,6 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
 use parking_lot::RwLock;
 use serde_json::json;
+use smg_response_template::CompiledTemplate;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -12,7 +13,7 @@ use crate::{
         CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
         HyV4Parser, InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser,
         MinimaxM2Parser, MinimaxM3Parser, MistralParser, PassthroughParser, PythonicParser,
-        QwenParser, QwenXmlParser, SarashinaParser, Step3Parser,
+        QwenParser, QwenXmlParser, SarashinaParser, Step3Parser, TemplateToolParser,
     },
     traits::ToolParser,
 };
@@ -582,6 +583,19 @@ impl ParserFactory {
     /// Get the internal registry for custom registration.
     pub fn registry(&self) -> &ParserRegistry {
         &self.registry
+    }
+
+    /// Register a [`TemplateToolParser`] under the template's
+    /// [`CompiledTemplate::parser_name`] unless that name is already taken,
+    /// and return the name.
+    pub fn register_response_template(&self, template: Arc<CompiledTemplate>) -> String {
+        let name = template.parser_name().to_string();
+        if !self.registry.has_parser(&name) {
+            self.registry.register_parser(&name, move || {
+                Box::new(TemplateToolParser::new(template.clone()))
+            });
+        }
+        name
     }
 
     /// Clear the parser pool.
