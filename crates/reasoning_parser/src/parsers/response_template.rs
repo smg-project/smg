@@ -11,7 +11,8 @@ use crate::traits::{ParseError, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFE
 /// Splits output into the `thinking` and `content` fields of a template.
 ///
 /// Field framing is removed. `tool_calls` blocks stay in the normal text
-/// verbatim, framing included, for the template tool parser. Whitespace
+/// verbatim, framing included, for the template tool parser, or are dropped
+/// when the request does not parse tool calls. Whitespace
 /// between blocks is dropped and any other text outside a block is normal
 /// text. A block without a close ends with the input, because a close that
 /// is an EOS token never reaches the parser.
@@ -23,6 +24,7 @@ pub struct TemplateReasoningParser {
     /// Offset in `buffer` before which no opener can start.
     checked: usize,
     block: Option<Field>,
+    tool_calls_enabled: bool,
     max_buffer_size: usize,
 }
 
@@ -34,6 +36,7 @@ impl TemplateReasoningParser {
             context: 0,
             checked: 0,
             block: None,
+            tool_calls_enabled: true,
             max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
         }
     }
@@ -66,7 +69,10 @@ impl TemplateReasoningParser {
             match field {
                 Field::Thinking => result.reasoning_text.push_str(&text[..text_end]),
                 Field::Content => result.normal_text.push_str(&text[..text_end]),
-                Field::ToolCalls => result.normal_text.push_str(&text[..end]),
+                Field::ToolCalls if self.tool_calls_enabled => {
+                    result.normal_text.push_str(&text[..end]);
+                }
+                Field::ToolCalls => {}
             }
             self.advance(self.context + end);
             if !closed {
@@ -110,7 +116,7 @@ impl TemplateReasoningParser {
             self.advance(text_end);
             return false;
         }
-        if field == Field::ToolCalls {
+        if field == Field::ToolCalls && self.tool_calls_enabled {
             result.normal_text.push_str(&self.buffer[text_end..end]);
         }
         self.advance(end);
@@ -126,6 +132,7 @@ impl ReasoningParser for TemplateReasoningParser {
         }
         // Complete parsing is independent of any streaming state.
         let mut parser = Self::new(self.template.clone());
+        parser.tool_calls_enabled = self.tool_calls_enabled;
         parser.buffer.push_str(text);
         Ok(parser.parse(true))
     }
@@ -159,6 +166,10 @@ impl ReasoningParser for TemplateReasoningParser {
 
     fn requires_special_tokens(&self) -> bool {
         true
+    }
+
+    fn set_tool_calls_enabled(&mut self, enabled: bool) {
+        self.tool_calls_enabled = enabled;
     }
 
     fn is_in_reasoning(&self) -> bool {
@@ -343,6 +354,21 @@ mod tests {
         ];
         assert_eq!(joined(&stream(tokens)).normal_text, json);
         assert_eq!(whole(json).normal_text, json);
+    }
+
+    #[test]
+    fn drops_tool_blocks_when_tool_calls_are_off() {
+        let mut parser = parser();
+        parser.set_tool_calls_enabled(false);
+        let expected = ParserResult::new("Paris it is.".to_string(), "check the map".to_string());
+        assert_eq!(parser.detect_and_parse_reasoning(OUTPUT).unwrap(), expected);
+        let mut streamed = ParserResult::default();
+        for chunk in OUTPUT.split_inclusive("|>") {
+            let result = parser.parse_reasoning_streaming_incremental(chunk).unwrap();
+            streamed.normal_text.push_str(&result.normal_text);
+            streamed.reasoning_text.push_str(&result.reasoning_text);
+        }
+        assert_eq!(streamed, expected);
     }
 
     #[test]

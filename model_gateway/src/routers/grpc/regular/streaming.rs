@@ -479,6 +479,9 @@ impl StreamingProcessor {
             );
         }
 
+        let tool_choice_enabled =
+            !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
+
         // Phase 2: Main streaming loop
         let mut final_indices: Option<Vec<u32>> = None;
         loop {
@@ -664,6 +667,7 @@ impl StreamingProcessor {
                         &mut reasoning_parsers,
                         thinking_override,
                         think_in_prefill,
+                        tool_parser_available && tool_choice_enabled,
                         reasoning_parser_name.as_deref(),
                         request_id,
                         model,
@@ -689,9 +693,6 @@ impl StreamingProcessor {
             }
 
             // Tool call handling
-            let tool_choice_enabled =
-                !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
-
             if let Some(tools_ref) = tools.as_ref() {
                 if !in_reasoning
                     && tool_choice_enabled
@@ -1531,6 +1532,7 @@ impl StreamingProcessor {
         reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         thinking_override: bool,
         think_in_prefill: bool,
+        tool_calls_enabled: bool,
         // Resolved once per request by the caller: re-resolving here could
         // disagree with the upfront availability check if the worker registry
         // changed mid-stream, turning the `expect` below into a panic.
@@ -1552,6 +1554,7 @@ impl StreamingProcessor {
                 model,
             )
             .expect("Parser should be available - checked upfront");
+            parser.set_tool_calls_enabled(tool_calls_enabled);
             if thinking_override {
                 parser.mark_reasoning_started();
                 if think_in_prefill {
@@ -1835,12 +1838,14 @@ impl StreamingProcessor {
     /// Returns `(normal_text, reasoning_text, in_reasoning)`.
     /// `None` marks EOF and releases the parser's held text.
     /// Caller handles SSE event emission.
+    #[expect(clippy::too_many_arguments)]
     async fn process_messages_reasoning(
         &self,
         delta: Option<&str>,
         reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         thinking_override: bool,
         think_in_prefill: bool,
+        tool_calls_enabled: bool,
         // Resolved once per request by the caller (see process_reasoning_stream).
         reasoning_parser_name: Option<&str>,
         model: &str,
@@ -1852,6 +1857,7 @@ impl StreamingProcessor {
                 reasoning_parser_name,
                 model,
             ) {
+                parser.set_tool_calls_enabled(tool_calls_enabled);
                 if thinking_override {
                     parser.mark_reasoning_started();
                     if think_in_prefill {
@@ -2269,6 +2275,7 @@ impl StreamingProcessor {
                     &mut reasoning_parser,
                     thinking_override,
                     think_in_prefill,
+                    tool_parser_available,
                     reasoning_parser_name.as_deref(),
                     model,
                 )

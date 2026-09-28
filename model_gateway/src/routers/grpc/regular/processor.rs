@@ -115,6 +115,7 @@ impl ResponseProcessor {
                 reasoning_parser_name,
                 model,
             ) {
+                parser.set_tool_calls_enabled(tool_parser_available);
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
                 if original_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
@@ -626,6 +627,7 @@ impl ResponseProcessor {
                 reasoning_parser_name.as_deref(),
                 model,
             ) {
+                parser.set_tool_calls_enabled(tool_parser_available);
                 // If thinking is effectively ON and template has a toggle, start in reasoning mode.
                 {
                     let user_thinking = match &messages_request.thinking {

@@ -400,6 +400,39 @@ async fn chat_splits_fields_and_calls_even_when_eos_hides_the_last_close() {
 }
 
 #[tokio::test]
+async fn tool_blocks_are_dropped_when_the_request_parses_no_tool_calls() {
+    let gateway = gateway(Setup::default(), OUTPUT).await;
+    let expected = Chat {
+        reasoning: "check the map".to_string(),
+        content: "Paris it is.".to_string(),
+        finish: "stop".to_string(),
+        ..Chat::default()
+    };
+    for request in [json!({}), json!({"tools": tools(), "tool_choice": "none"})] {
+        for stream in [false, true] {
+            let mut request = request.clone();
+            request["stream"] = json!(stream);
+            assert_eq!(
+                chat(&gateway, request.clone()).await.0,
+                expected,
+                "{request}"
+            );
+        }
+    }
+    let blocks = [
+        json!(["thinking", "check the map"]),
+        json!(["text", "Paris it is."]),
+    ];
+    for stream in [false, true] {
+        assert_eq!(
+            messages(&gateway, stream, false).await,
+            blocks,
+            "stream: {stream}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_call_without_arguments_closed_by_eos_streams_its_name() {
     let output = "<|tool|>get_time<|args|><|eos|>";
     let gateway = gateway(Setup::default(), output).await;

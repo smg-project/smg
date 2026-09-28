@@ -85,6 +85,11 @@ pub trait ReasoningParser: Send + Sync {
         false
     }
 
+    /// Say whether the request parses tool calls. Parsers that pass tool-call
+    /// blocks through as normal text for the tool parser drop them when it
+    /// does not, so the raw blocks do not end up in the content.
+    fn set_tool_calls_enabled(&mut self, _enabled: bool) {}
+
     /// Check if the parser is currently in reasoning mode.
     ///
     /// Returns true if the parser is currently parsing reasoning content.
