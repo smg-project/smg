@@ -5,6 +5,7 @@ mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
+mod response_template;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
@@ -30,3 +31,4 @@ pub(crate) use parsers::{
     reasoning_parser_requires_special_tokens, reasoning_starts_in_prefill,
     should_mark_reasoning_started, ParserResolver,
 };
+pub(crate) use response_template::ResponseTemplateParsers;

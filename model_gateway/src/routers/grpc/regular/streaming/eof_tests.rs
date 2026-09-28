@@ -168,6 +168,7 @@ fn processor(with_tools: bool) -> StreamingProcessor {
             Arc::new(WorkerRegistry::new()),
             with_tools.then(|| "json".to_string()),
             Some("qwen3".to_string()),
+            None,
         ),
         "vllm",
     )

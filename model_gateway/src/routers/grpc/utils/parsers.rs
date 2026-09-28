@@ -17,15 +17,20 @@ use tool_parser::{
 };
 use tracing::warn;
 
+use super::ResponseTemplateParsers;
 use crate::worker::WorkerRegistry;
 
 /// Per-request parser-name resolution.
 ///
 /// Precedence: the model's `ModelCard` override (`tool_parser` /
 /// `reasoning_parser`, populated from worker labels or an explicit
-/// `WorkerSpec` card) → the process-wide configured name
+/// `WorkerSpec` card) → the parsers of a supported `response_template` in
+/// the model's tokenizer → the process-wide configured name
 /// (`--tool-call-parser` / `--reasoning-parser`) → `None`, which lets the
 /// factory helpers fall back to their name-based auto-detection, unchanged.
+/// A template is the model's own output format, so it outranks the flags,
+/// which apply to every model; it selects both parsers, and a card override
+/// replaces only its own side.
 ///
 /// Lookups borrow straight from worker metadata (no card clones); only the
 /// resolved name is cloned.
@@ -35,6 +40,8 @@ pub(crate) struct ParserResolver {
     worker_registry: Option<Arc<WorkerRegistry>>,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
+    /// `None` disables response-template lookups.
+    response_templates: Option<Arc<ResponseTemplateParsers>>,
 }
 
 impl ParserResolver {
@@ -42,11 +49,13 @@ impl ParserResolver {
         worker_registry: Arc<WorkerRegistry>,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        response_templates: Option<Arc<ResponseTemplateParsers>>,
     ) -> Self {
         Self {
             worker_registry: Some(worker_registry),
             configured_tool_parser,
             configured_reasoning_parser,
+            response_templates,
         }
     }
 
@@ -57,19 +66,26 @@ impl ParserResolver {
             worker_registry: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            response_templates: None,
         }
     }
 
     /// Effective tool-parser name for `model`, if any.
     pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.tool_parser.as_ref())
+            .or_else(|| self.template_parser(model))
             .or_else(|| self.configured_tool_parser.clone())
     }
 
     /// Effective reasoning-parser name for `model`, if any.
     pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.reasoning_parser.as_ref())
+            .or_else(|| self.template_parser(model))
             .or_else(|| self.configured_reasoning_parser.clone())
+    }
+
+    fn template_parser(&self, model: &str) -> Option<String> {
+        self.response_templates.as_ref()?.parser_name(model)
     }
 
     fn card_parser(
@@ -883,6 +899,7 @@ mod parser_resolver_tests {
             registry,
             Some("mistral".to_string()),
             Some("deepseek_r1".to_string()),
+            None,
         );
         assert_eq!(resolver.tool_parser("m").as_deref(), Some("json"));
         assert_eq!(resolver.reasoning_parser("m").as_deref(), Some("basic"));
@@ -895,6 +912,7 @@ mod parser_resolver_tests {
             registry,
             Some("mistral".to_string()),
             Some("deepseek_r1".to_string()),
+            None,
         );
         assert_eq!(resolver.tool_parser("m").as_deref(), Some("mistral"));
         assert_eq!(
@@ -908,7 +926,7 @@ mod parser_resolver_tests {
     #[test]
     fn no_override_and_no_configured_resolves_none() {
         let registry = registry_with_card(ModelCard::new("m"));
-        let resolver = ParserResolver::new(registry, None, None);
+        let resolver = ParserResolver::new(registry, None, None, None);
         assert_eq!(resolver.tool_parser("m"), None);
         assert_eq!(resolver.reasoning_parser("m"), None);
     }
@@ -934,7 +952,7 @@ mod parser_resolver_tests {
                     .build();
                 registry.register(Arc::new(worker));
             }
-            let resolver = ParserResolver::new(registry, None, None);
+            let resolver = ParserResolver::new(registry, None, None, None);
             assert_eq!(resolver.tool_parser("m").as_deref(), Some("alpha"));
         }
     }
