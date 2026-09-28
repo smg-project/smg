@@ -3,12 +3,14 @@
 use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
+use smg_response_template::CompiledTemplate;
 
 use crate::{
     parsers::{
         BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, DeepSeekV41Parser, Glm45Parser,
         HyV4Parser, InklingParser, KimiK3Parser, KimiParser, MiniMaxParser, MinimaxM3Parser,
         NanoV3Parser, PassthroughParser, Qwen3Parser, QwenThinkingParser, Step3Parser,
+        TemplateReasoningParser,
     },
     traits::{ParserConfig, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE},
 };
@@ -282,6 +284,19 @@ impl ParserFactory {
     /// Get the internal registry for custom registration.
     pub fn registry(&self) -> &ParserRegistry {
         &self.registry
+    }
+
+    /// Register a [`TemplateReasoningParser`] under the template's
+    /// [`CompiledTemplate::parser_name`] unless that name is already taken,
+    /// and return the name.
+    pub fn register_response_template(&self, template: Arc<CompiledTemplate>) -> String {
+        let name = template.parser_name().to_string();
+        if !self.registry.has_parser(&name) {
+            self.registry.register_parser(&name, move || {
+                Box::new(TemplateReasoningParser::new(template.clone()))
+            });
+        }
+        name
     }
 
     /// List all registered parser names.
