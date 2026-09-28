@@ -83,6 +83,15 @@ pub(crate) struct ChatResponseSpec {
     pub skip_special_tokens: bool,
     /// Rendered prompt tokens the provider does not bill; set by request building.
     pub unbilled_prompt_tokens: u32,
+    /// Exact rendered prompt prefix used to validate the response template's
+    /// start anchor without rendering the request a second time.
+    pub rendered_prompt_prefix: String,
+    /// A checkpoint-provided response template. `None` preserves the existing
+    /// reasoning/tool parser precedence unchanged.
+    pub response_template: Option<Value>,
+    /// Template close literals that are single EOS/stop tokens. These must be
+    /// visible to the template parser while remaining hidden from client output.
+    pub template_close_token_ids: Vec<u32>,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -116,6 +125,9 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
             unbilled_prompt_tokens: 0,
+            rendered_prompt_prefix: String::new(),
+            response_template: None,
+            template_close_token_ids: Vec::new(),
         }
     }
 }

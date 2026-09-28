@@ -62,6 +62,7 @@ CRATES=(
     "smg-mm-rdma|crates/mm_rdma|smg-mm-rdma"
     "engine-zmq-client|crates/engine_zmq_client|engine-zmq-client"
     "reasoning-parser|crates/reasoning_parser|reasoning-parser"
+    "response-template-parser|crates/response_template_parser|response-template-parser"
     "tool-parser|crates/tool_parser|tool-parser"
     "wfaas|crates/workflow|wfaas"
     "llm-tokenizer|crates/tokenizer|llm-tokenizer"

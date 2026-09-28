@@ -287,7 +287,13 @@ pub(crate) async fn prepare_chat_like(
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools();
-        let tool_call_constraint = if let (false, Some(tool_choice)) =
+        let tool_call_constraint = if tokenizer.response_template().is_some() {
+            // The checkpoint template owns both tool framing and argument
+            // serialization. A legacy JSON/structural constraint would force
+            // an incompatible wire format before the authoritative response
+            // parser gets a chance to consume it.
+            None
+        } else if let (false, Some(tool_choice)) =
             (constraint_tools.is_empty(), request.tool_choice.as_ref())
         {
             let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
@@ -328,31 +334,38 @@ pub(crate) async fn prepare_chat_like(
         // - typed reasoning parsers need their control tokens preserved
         // - json_schema: backend forces JSON, no trigger tokens to preserve
         // - structural_tag or no constraint (auto): parser needs trigger tokens
-        let skip_special_tokens = if preserve_reasoning_special_tokens {
-            false
-        } else {
-            match &tool_call_constraint {
-                Some(c) if c.is_json_schema() => request.skip_special_tokens,
-                _ if request.tools.is_some()
-                    && !matches!(
-                        request.tool_choice,
-                        Some(ToolChoice::Value(ToolChoiceValue::None))
-                    ) =>
-                {
-                    false
+        let skip_special_tokens =
+            if tokenizer.response_template().is_some() || preserve_reasoning_special_tokens {
+                false
+            } else {
+                match &tool_call_constraint {
+                    Some(c) if c.is_json_schema() => request.skip_special_tokens,
+                    _ if request.tools.is_some()
+                        && !matches!(
+                            request.tool_choice,
+                            Some(ToolChoice::Value(ToolChoiceValue::None))
+                        ) =>
+                    {
+                        false
+                    }
+                    _ => request.skip_special_tokens,
                 }
-                _ => request.skip_special_tokens,
-            }
-        };
+            };
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
-        let stop_decoder = utils::create_stop_decoder(
+        let template_close_token_ids = utils::response_template_close_token_ids(
+            &tokenizer,
+            request.stop_token_ids.as_ref(),
+            request.ignore_eos,
+        );
+        let stop_decoder = utils::create_stop_decoder_with_visible_stop_tokens(
             &tokenizer,
             request.stop.as_ref(),
             request.stop_token_ids.as_ref(),
             skip_special_tokens,
             request.no_stop_trim,
             request.ignore_eos,
+            &template_close_token_ids,
         );
 
         // Store the intermediate + decoder + derived skip_special_tokens on

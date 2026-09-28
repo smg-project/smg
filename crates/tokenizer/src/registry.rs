@@ -51,7 +51,7 @@ impl LoadOutcome {
 }
 
 /// Error type for tokenizer loading operations
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LoadError {
     /// Name cannot be empty
     #[error("tokenizer name cannot be empty")]
@@ -62,6 +62,22 @@ pub enum LoadError {
     /// Loading failed
     #[error("{0}")]
     LoadFailed(String),
+    /// A checkpoint declared a response template that failed schema validation.
+    #[error(
+        "invalid response template for model {model_name} field {field} (limit {limit}): {reason}"
+    )]
+    InvalidResponseTemplate {
+        model_name: String,
+        field: String,
+        limit: usize,
+        reason: String,
+    },
+}
+
+impl From<String> for LoadError {
+    fn from(error: String) -> Self {
+        Self::LoadFailed(error)
+    }
 }
 
 /// Metadata and tokenizer instance for a registered tokenizer
@@ -146,6 +162,43 @@ impl TokenizerRegistry {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Arc<dyn Tokenizer>, String>>,
     {
+        self.load_inner(id, name, source, || async move {
+            loader().await.map_err(LoadError::LoadFailed)
+        })
+        .await
+    }
+
+    /// Load and register a tokenizer while preserving typed loading errors.
+    ///
+    /// This is the typed counterpart to [`Self::load`]. Callers that need to
+    /// distinguish a structured loading failure from an ordinary load error
+    /// should use this method; existing string-returning loaders remain
+    /// compatible with [`Self::load`].
+    pub async fn load_typed<F, Fut>(
+        &self,
+        id: &str,
+        name: &str,
+        source: &str,
+        loader: F,
+    ) -> Result<LoadOutcome, LoadError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<dyn Tokenizer>, LoadError>>,
+    {
+        self.load_inner(id, name, source, loader).await
+    }
+
+    async fn load_inner<F, Fut>(
+        &self,
+        id: &str,
+        name: &str,
+        source: &str,
+        loader: F,
+    ) -> Result<LoadOutcome, LoadError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<dyn Tokenizer>, LoadError>>,
+    {
         // Validate inputs
         if name.is_empty() {
             return Err(LoadError::EmptyName);
@@ -189,7 +242,7 @@ impl TokenizerRegistry {
         info!("Loading tokenizer '{}' from source: {}", name, source);
         let result = loader().await;
 
-        let tokenizer = result.map_err(LoadError::LoadFailed)?;
+        let tokenizer = result?;
 
         // Create entry with provided ID
         let entry = TokenizerEntry {
@@ -541,6 +594,30 @@ mod tests {
         assert!(result.is_err());
         assert!(!registry.contains("failing_model"));
         assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_response_template_error_is_preserved() {
+        let registry = TokenizerRegistry::new();
+        let id = TokenizerRegistry::generate_id();
+        let expected = LoadError::InvalidResponseTemplate {
+            model_name: "model-with-template".to_string(),
+            field: "tool_calls".to_string(),
+            limit: 4_194_304,
+            reason: "invalid open pattern".to_string(),
+        };
+
+        let actual = registry
+            .load_typed(&id, "model-with-template", "source", || {
+                let expected = expected.clone();
+                async move { Err(expected) }
+            })
+            .await
+            .expect_err("typed invalid-template failures must not be collapsed into strings");
+
+        assert_eq!(actual, expected);
+        assert!(registry.is_empty());
+        assert!(!registry.contains("model-with-template"));
     }
 
     #[tokio::test]

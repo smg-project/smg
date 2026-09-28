@@ -27,6 +27,8 @@ jobs:
             path: crates/protocols
           - crate: reasoning-parser
             path: crates/reasoning_parser
+          - crate: response-template-parser
+            path: crates/response_template_parser
           - crate: kv-index
             path: crates/kv_index
           - crate: data-connector

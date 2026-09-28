@@ -2,9 +2,13 @@
 //! tokenizes and sends token ids; this service streams back canned token ids.
 
 use std::{
+    collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 use futures::{stream, Stream};
@@ -21,6 +25,82 @@ use crate::{
     config::Config,
     engine::{self, Engine, NewRequest},
 };
+
+/// Deterministic replies used by focused in-process gateway tests.
+///
+/// The ordinary mock-worker process never installs controls and therefore
+/// retains its historical canned-token/Unimplemented behaviour.
+#[derive(Clone, Debug)]
+pub enum GrpcTestTokenizerReply {
+    Bundle { data: Vec<u8>, sha256: String },
+    Unavailable(String),
+    Unimplemented,
+}
+
+/// Port-scoped controls for deterministic gRPC integration tests.
+#[derive(Clone, Debug, Default)]
+pub struct GrpcTestControls {
+    pub output_ids: Option<Vec<u32>>,
+    pub tokenizer_replies: VecDeque<GrpcTestTokenizerReply>,
+    pub get_tokenizer_calls: Arc<AtomicUsize>,
+}
+
+static TEST_CONTROLS: OnceLock<Mutex<HashMap<u16, GrpcTestControls>>> = OnceLock::new();
+
+/// Install deterministic controls before calling [`serve`].
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned test-control lock indicates a failed deterministic test setup"
+)]
+pub fn install_test_controls(port: u16, controls: GrpcTestControls) {
+    TEST_CONTROLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("mock gRPC test controls mutex poisoned")
+        .insert(port, controls);
+}
+
+/// Remove port-scoped controls after a test server is aborted.
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned test-control lock indicates a failed deterministic test setup"
+)]
+pub fn remove_test_controls(port: u16) {
+    if let Some(controls) = TEST_CONTROLS.get() {
+        controls
+            .lock()
+            .expect("mock gRPC test controls mutex poisoned")
+            .remove(&port);
+    }
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned test-control lock indicates a failed deterministic test setup"
+)]
+fn test_controls(port: u16) -> Option<GrpcTestControls> {
+    TEST_CONTROLS.get().and_then(|controls| {
+        controls
+            .lock()
+            .expect("mock gRPC test controls mutex poisoned")
+            .get(&port)
+            .cloned()
+    })
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned test-control lock indicates a failed deterministic test setup"
+)]
+fn pop_tokenizer_reply(port: u16) -> Option<GrpcTestTokenizerReply> {
+    TEST_CONTROLS.get().and_then(|controls| {
+        controls
+            .lock()
+            .expect("mock gRPC test controls mutex poisoned")
+            .get_mut(&port)
+            .and_then(|control| control.tokenizer_replies.pop_front())
+    })
+}
 
 /// Serve the mock TokenSpeed gRPC service on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
@@ -45,9 +125,13 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
 /// port 0 and read it back instead of picking one and binding it later.
 pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
     let addr = listener.local_addr().ok();
+    let Some(port) = addr.map(|addr| addr.port()) else {
+        tracing::error!("grpc worker failed to read listener address");
+        return;
+    };
     // One simulated engine per listener (i.e. per virtual worker).
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
-    let service = MockScheduler { cfg, engine };
+    let service = MockScheduler { cfg, engine, port };
     if let Err(e) = Server::builder()
         .add_service(TokenSpeedSchedulerServer::new(service))
         .serve_with_incoming(TcpListenerStream::new(listener))
@@ -62,6 +146,7 @@ struct MockScheduler {
     cfg: Arc<Config>,
     /// Present iff the worker runs the realistic engine simulator.
     engine: Option<Engine>,
+    port: u16,
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -111,7 +196,9 @@ impl TokenSpeedScheduler for MockScheduler {
         if !self.cfg.gen_delay.is_zero() {
             tokio::time::sleep(self.cfg.gen_delay).await;
         }
-        let ids: Vec<u32> = (0..self.cfg.output_tokens).map(|i| 100 + i).collect();
+        let ids: Vec<u32> = test_controls(self.port)
+            .and_then(|controls| controls.output_ids)
+            .unwrap_or_else(|| (0..self.cfg.output_tokens).map(|i| 100 + i).collect());
 
         let mut items: Vec<Result<ts::GenerateResponse, Status>> = Vec::new();
         for id in &ids {
@@ -279,9 +366,20 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        // The mock has no tokenizer artifacts to serve; the gateway's
-        // remote-tokenizer fallback treats Unimplemented as "not supported".
-        Err(Status::unimplemented("mock-worker"))
+        let Some(controls) = test_controls(self.port) else {
+            // The mock has no tokenizer artifacts to serve by default; the
+            // gateway's remote-tokenizer fallback treats this as unsupported.
+            return Err(Status::unimplemented("mock-worker"));
+        };
+        controls.get_tokenizer_calls.fetch_add(1, Ordering::SeqCst);
+        match pop_tokenizer_reply(self.port).unwrap_or(GrpcTestTokenizerReply::Unimplemented) {
+            GrpcTestTokenizerReply::Bundle { data, sha256 } => {
+                let chunks = vec![Ok(common::GetTokenizerChunk { data, sha256 })];
+                Ok(Response::new(Box::pin(stream::iter(chunks))))
+            }
+            GrpcTestTokenizerReply::Unavailable(message) => Err(Status::unavailable(message)),
+            GrpcTestTokenizerReply::Unimplemented => Err(Status::unimplemented("mock-worker")),
+        }
     }
 }
 

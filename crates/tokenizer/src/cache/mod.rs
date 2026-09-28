@@ -282,6 +282,10 @@ impl Tokenizer for CachedTokenizer {
         self
     }
 
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.inner.response_template()
+    }
+
     fn apply_chat_template(
         &self,
         messages: &[serde_json::Value],
@@ -349,6 +353,7 @@ mod tests {
     /// so duplicated specials across a prefix/suffix merge are observable.
     struct BosTokenizer {
         special_tokens: SpecialTokens,
+        response_template: Option<serde_json::Value>,
     }
 
     const BOS_ID: TokenIdType = 99;
@@ -364,6 +369,7 @@ mod tests {
                     ],
                     ..Default::default()
                 },
+                response_template: None,
             }
         }
     }
@@ -407,6 +413,9 @@ mod tests {
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+        fn response_template(&self) -> Option<&serde_json::Value> {
+            self.response_template.as_ref()
         }
     }
 
@@ -762,5 +771,15 @@ mod tests {
         let _ = flat.encode(&rendered.text, false).unwrap();
         let _ = flat.encode(&rendered.text, false).unwrap();
         assert_eq!(flat.cache_stats().map(|s| s.hits), Some(1));
+    }
+
+    #[test]
+    fn cached_tokenizer_retains_response_template() {
+        let expected = serde_json::json!({"sentinel": "retained-through-cache"});
+        let mut inner = BosTokenizer::new();
+        inner.response_template = Some(expected.clone());
+        let cached = CachedTokenizer::new(Arc::new(inner), CacheConfig::default());
+
+        assert_eq!(cached.response_template(), Some(&expected));
     }
 }

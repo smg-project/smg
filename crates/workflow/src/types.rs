@@ -249,6 +249,13 @@ pub enum WorkflowError {
     #[error("Step failed: {step_id} - {message}")]
     StepFailed { step_id: StepId, message: String },
 
+    /// The workflow input names a permanent, invalid configuration.
+    ///
+    /// Unlike [`WorkflowError::StepFailed`], retrying this error without
+    /// changing the configuration cannot succeed.
+    #[error("Invalid configuration: {message}")]
+    InvalidConfiguration { message: String },
+
     #[error("Step timeout: {step_id}")]
     StepTimeout { step_id: StepId },
 
