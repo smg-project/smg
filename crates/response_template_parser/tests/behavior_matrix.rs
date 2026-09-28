@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use response_template_parser::{
-    ClosePattern, ContentArgs, FieldTemplate, ParserConfig, ResponseTemplate,
+    ClosePattern, ContentArgs, DelimiterBound, FieldTemplate, ParserConfig, ResponseTemplate,
     ResponseTemplateError, ResponseTemplateParser, Transform, ValueParser, ValueParserArgs,
 };
 use serde_json::{json, Value};
@@ -381,6 +381,162 @@ fn retained_ignorable_whitespace_is_bounded_by_pending_limit() {
     assert_eq!(overflow.pending_bytes(), 0, "failed feed must not commit");
     assert_eq!(overflow.feed(b"ignored").unwrap_err(), error);
     assert_eq!(overflow.finish().unwrap_err(), error);
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "the synthetic template declares tool_calls"
+)]
+fn bounded_openers_parser() -> ResponseTemplateParser {
+    let mut bounded = template();
+    "<tool:(?P<name>foo)>"
+        .clone_into(&mut bounded.fields.get_mut("tool_calls").unwrap().open_pattern);
+    let parser = ResponseTemplateParser::new(MODEL, bounded, config_with_limits(32, 64, 256))
+        .expect("bounded tool-name capture remains a supported template");
+    assert!(parser
+        .delimiter_metadata()
+        .iter()
+        .filter(|delimiter| delimiter.role == "open")
+        .all(
+            |delimiter| matches!(delimiter.bound, DelimiterBound::Bounded(maximum) if maximum < 32)
+        ));
+    parser
+}
+
+#[test]
+fn bounded_openers_pending_limit_exact_and_overflow() {
+    let parser = bounded_openers_parser();
+    let mut exact = parser.stream(PREFIX);
+    assert!(exact.feed(&[b' '; 32]).unwrap().is_empty());
+    assert_eq!(exact.pending_bytes(), 32);
+    assert!(exact.finish().unwrap().is_empty());
+
+    // Unrecognized text, like whitespace, is retained before a complete opener.
+    for byte in *b" x" {
+        let mut overflow = parser.stream(PREFIX);
+        let error = overflow
+            .feed(&[byte; 33])
+            .expect_err("bounded opener width must not hide retained bytes");
+        assert!(matches!(
+            error,
+            ResponseTemplateError::PendingOverflow { ref field, limit: 32, .. }
+                if field == "max_pending_bytes"
+        ));
+        assert_eq!(overflow.pending_bytes(), 0, "failed feed must not commit");
+        assert_eq!(overflow.feed(b"ignored").unwrap_err(), error);
+        assert_eq!(overflow.finish().unwrap_err(), error);
+    }
+}
+
+#[test]
+fn bounded_openers_pending_limit_accumulates_whitespace_chunks() {
+    let parser = bounded_openers_parser();
+    let mut stream = parser.stream(PREFIX);
+    for count in 1..=8 {
+        assert!(stream.feed(b"    ").unwrap().is_empty());
+        assert_eq!(stream.pending_bytes(), count * 4);
+    }
+    let error = stream
+        .feed(b" ")
+        .expect_err("pending cap applies across feeds, not to individual chunks");
+    assert!(matches!(
+        error,
+        ResponseTemplateError::PendingOverflow { ref field, limit: 32, .. }
+            if field == "max_pending_bytes"
+    ));
+    assert_eq!(stream.pending_bytes(), 32, "keep the last committed state");
+    assert_eq!(
+        stream
+            .feed(b"<|channel|>final<|message|>ok<|return|>")
+            .unwrap_err(),
+        error
+    );
+    assert_eq!(stream.finish().unwrap_err(), error);
+}
+
+#[test]
+fn bounded_openers_pending_limit_keeps_separate_body_and_close_holdback() {
+    let parser = bounded_openers_parser();
+    let mut stream = parser.stream(PREFIX);
+    let body = "a".repeat(128);
+    let partial = format!("<|channel|>final<|message|>{body}<|ret");
+    assert!(stream.feed(partial.as_bytes()).unwrap().is_empty());
+    // The body has its own 256-byte limit; only the undecided close suffix
+    // counts against the pending cap once an opener has been recognized.
+    assert!(stream.pending_bytes() > 32);
+    let output = stream.feed(b"urn|>").unwrap();
+    assert_eq!(output.content, body);
+    assert!(output.wire_bytes.is_empty());
+    assert_eq!(stream.pending_bytes(), 0);
+    assert!(stream.finish().unwrap().is_empty());
+}
+
+#[test]
+fn bounded_openers_pending_limit_counts_undrained_leading_prefix() {
+    let parser = bounded_openers_parser();
+    for (opener, body, close) in [
+        ("<|channel|>final<|message|>", "x", "<|return|>"),
+        ("<tool:foo>", "", "<|end|>"),
+    ] {
+        let mut exact = parser.stream(PREFIX);
+        let partial = format!("{}{opener}{body}", " ".repeat(32));
+        assert!(exact.feed(partial.as_bytes()).unwrap().is_empty());
+        assert_eq!(exact.pending_bytes(), partial.len());
+        assert!(!exact.feed(close.as_bytes()).unwrap().is_empty());
+        assert_eq!(exact.pending_bytes(), 0);
+        assert!(exact.finish().unwrap().is_empty());
+
+        let mut overflow = parser.stream(PREFIX);
+        let partial = format!("{}{opener}{body}", " ".repeat(33));
+        let error = overflow
+            .feed(partial.as_bytes())
+            .expect_err("an unfinished field must not hide its retained prefix");
+        assert!(matches!(
+            error,
+            ResponseTemplateError::PendingOverflow { ref field, limit: 32, .. }
+                if field == "max_pending_bytes"
+        ));
+        assert_eq!(overflow.pending_bytes(), 0, "failed feed must not commit");
+        assert_eq!(overflow.feed(close.as_bytes()).unwrap_err(), error);
+        assert_eq!(overflow.finish().unwrap_err(), error);
+    }
+}
+
+#[test]
+fn bounded_openers_pending_limit_combines_prefix_and_close_holdback() {
+    let parser = bounded_openers_parser();
+    let body = "x".repeat(128);
+    for prefix_len in [27, 28] {
+        let mut stream = parser.stream(PREFIX);
+        let partial = format!(
+            "{}<|channel|>final<|message|>{body}<|ret",
+            " ".repeat(prefix_len)
+        );
+        let result = stream.feed(partial.as_bytes());
+        if prefix_len == 27 {
+            // 27 retained prefix bytes + 5 undecided close bytes = exact cap.
+            assert!(result.unwrap().is_empty());
+            assert_eq!(stream.feed(b"urn|>").unwrap().content, body);
+            assert_eq!(stream.pending_bytes(), 0);
+        } else {
+            assert!(matches!(
+                result,
+                Err(ResponseTemplateError::PendingOverflow { limit: 32, .. })
+            ));
+            assert_eq!(stream.pending_bytes(), 0);
+        }
+    }
+
+    // A complete field and its prefix drain in this feed. Neither its body nor
+    // its already-consumed whitespace belongs to the remaining pending suffix.
+    let mut complete = parser.stream(PREFIX);
+    let wire = format!(
+        "{}<|channel|>final<|message|>{body}<|return|>",
+        " ".repeat(33)
+    );
+    assert_eq!(complete.feed(wire.as_bytes()).unwrap().content, body);
+    assert_eq!(complete.pending_bytes(), 0);
+    assert!(complete.finish().unwrap().is_empty());
 }
 
 #[test]

@@ -37,7 +37,6 @@ pub(crate) struct CompiledTemplate {
 pub(crate) struct CompiledField {
     pub(crate) name: String,
     pub(crate) open: Regex,
-    pub(crate) open_bound: DelimiterBound,
     pub(crate) closes: Vec<String>,
     pub(crate) content: ContentKind,
     pub(crate) repeats: bool,
@@ -290,7 +289,6 @@ fn compile_field(
     Ok(CompiledField {
         name,
         open,
-        open_bound,
         closes,
         content,
         repeats: field.repeats,

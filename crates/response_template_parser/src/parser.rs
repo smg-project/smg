@@ -246,21 +246,11 @@ fn pending_byte_len(template: &CompiledTemplate, text: &str) -> usize {
             })
             .min_by_key(|(start, _, _)| *start);
         let Some((start, open_end, field)) = selected else {
-            // `consume_available` deliberately retains ignorable whitespace
-            // until it can decide whether a field opener follows.  Count the
-            // retained bytes here too; trimming them for accounting while
-            // keeping them in `StreamingParser::bytes` would let a whitespace-
-            // only stream grow without bound.
-            let remaining = &text[cursor..];
-            return template
-                .fields
-                .iter()
-                .map(|field| match field.open_bound {
-                    DelimiterBound::Bounded(maximum) => remaining.len().min(maximum),
-                    DelimiterBound::Unbounded => remaining.len(),
-                })
-                .max()
-                .unwrap_or(remaining.len());
+            // No opener has been recognized, so `consume_available` retains
+            // this entire undecided suffix, including ignorable whitespace.
+            // A delimiter's finite regex width does not bound those retained
+            // bytes. Recognized field bodies retain their separate limits below.
+            return text.len() - cursor;
         };
         if !text[cursor..start].trim().is_empty() {
             return text.len() - cursor;
@@ -270,11 +260,15 @@ fn pending_byte_len(template: &CompiledTemplate, text: &str) -> usize {
             cursor = open_end + body_end + close_len;
             continue;
         }
-        return match field.content {
+        // An unfinished field keeps its leading whitespace in `bytes` too.
+        // Only complete fields took the draining `continue` above; their prefix
+        // is no longer pending. Body bytes retain their independent body limit.
+        let retained_prefix = start - cursor;
+        let pending_field = match field.content {
             ContentKind::Text => longest_close_prefix_suffix(tail, &field.closes),
             ContentKind::XmlInline => {
                 let Some(tag) = &field.tag else {
-                    return tail.len();
+                    return retained_prefix + tail.len();
                 };
                 let last_complete_tag = tag
                     .regex
@@ -289,6 +283,7 @@ fn pending_byte_len(template: &CompiledTemplate, text: &str) -> usize {
                 }
             }
         };
+        return retained_prefix + pending_field;
     }
     0
 }
