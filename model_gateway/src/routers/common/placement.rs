@@ -41,6 +41,9 @@ pub(crate) struct WireConstraint {
     /// runtime and transport; the gRPC selection helpers derive their
     /// candidate predicate from this flag.
     pub requires_media_refs: bool,
+    /// The retained plan carries a multimodal payload (pixels, identity or
+    /// references), so its decode leg needs a vision-capable worker.
+    pub requires_vision: bool,
 }
 
 /// Everything a single-worker placement reads from the request.
@@ -857,6 +860,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+            requires_vision: false,
         });
 
         assert_eq!(
@@ -974,6 +978,7 @@ mod tests {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                requires_vision: false,
             }),
             false,
             PlacementInputs::default(),

@@ -1278,7 +1278,7 @@ pub enum ProtoGenerateRequest {
 /// timing has two spellings: `second_per_grid_ts` from the Qwen-VL
 /// processors, `video_second_per_grid` from the Qwen-Omni family and this
 /// gateway's own processors. The servicer's `GRID_KEYS` mirrors this list.
-const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
+pub(crate) const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
     "image_grid_thw",
     "video_grid_thw",
     "second_per_grid_ts",

@@ -118,6 +118,19 @@ impl RequestType {
         }
     }
 
+    /// Parallel samples the request asks for (1 when unset or not a
+    /// sampling request): with more than one, a PD decode leg recomputes the
+    /// prompt locally instead of pulling prefill's KV.
+    pub fn sampling_n(&self) -> u32 {
+        let n = match self {
+            Self::Chat(r) => r.n,
+            Self::Completion(r) => r.n,
+            Self::Generate(r) => r.sampling_params.as_ref().and_then(|p| p.n),
+            _ => None,
+        };
+        n.filter(|&n| n > 0).unwrap_or(1)
+    }
+
     /// Client-supplied backend request id (`rid`), where the protocol carries
     /// one. Responses ids are storage-owned (`resp_*`) and never client-set.
     pub fn rid(&self) -> Option<&str> {
@@ -195,6 +208,10 @@ pub(crate) struct ProcessingState {
     /// re-selection stays pinned to workers that accept them.
     pub media_refs_forwarded: bool,
 
+    /// Set by worker selection when the request carries a multimodal
+    /// payload, so retry re-selection keeps its decode leg vision-capable.
+    pub multimodal_payload: bool,
+
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments. Request building injects the bootstrap info and drops
     /// prefill pixels; request execution `take()`s the dispatch plan.
@@ -243,18 +260,20 @@ pub(crate) struct RoutingSnapshot {
 pub(crate) use crate::routers::common::placement::WireConstraint;
 
 impl WireConstraint {
-    fn of(workers: &WorkerSelection, requires_media_refs: bool) -> Self {
+    fn of(workers: &WorkerSelection, requires_media_refs: bool, requires_vision: bool) -> Self {
         match workers {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
                 requires_media_refs,
+                requires_vision,
             },
             // Disaggregated legs are gRPC-only.
             WorkerSelection::Disaggregated { runtime_type, .. } => Self {
                 runtime: *runtime_type,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs,
+                requires_vision,
             },
         }
     }
@@ -838,7 +857,13 @@ impl RequestContext {
         let wire = state
             .workers
             .as_ref()
-            .map(|workers| WireConstraint::of(workers, state.media_refs_forwarded))
+            .map(|workers| {
+                WireConstraint::of(
+                    workers,
+                    state.media_refs_forwarded,
+                    state.media_refs_forwarded || state.multimodal_payload,
+                )
+            })
             .ok_or_else(|| {
                 error!(
                     function = "RequestContext::into_dispatch",
