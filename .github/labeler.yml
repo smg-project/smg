@@ -51,6 +51,10 @@ reasoning-parser:
   - changed-files:
       - any-glob-to-any-file: 'crates/reasoning_parser/**/*'
 
+response-template:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/response_template/**/*'
+
 wasm:
   - changed-files:
       - any-glob-to-any-file:

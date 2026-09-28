@@ -1,0 +1,21 @@
+[package]
+name = "smg-response-template"
+version = "0.1.0"
+edition = "2021"
+description = "Tokenizer-declared response templates for the SMG reasoning and tool parsers"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+readme = "README.md"
+keywords = ["llm", "parser", "response-template"]
+categories = ["parsing", "text-processing"]
+
+[dependencies]
+regex = "1.12"
+regex-automata = "0.4"
+regex-syntax = "0.8"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

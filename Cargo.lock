@@ -7761,6 +7761,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "smg-response-template"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "smg-rl"
 version = "0.1.0"
 dependencies = [

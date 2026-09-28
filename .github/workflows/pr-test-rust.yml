@@ -566,6 +566,7 @@ jobs:
               - 'crates/workflow/**'
             chat-completions:
               - 'crates/reasoning_parser/**'
+              - 'crates/response_template/**'
               - 'crates/multimodal/**'
               - 'crates/grpc_client/**'
               # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes, which gate
