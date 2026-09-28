@@ -50,10 +50,15 @@ state whose `feed` method accepts byte slices, including partial UTF-8
 characters. Call `finish` once at the end.
 
 Fields are emitted after their closing delimiter arrives. A field still
-open at the end of the response is an error. Missing reasoning and content
-fields use their string defaults; an omitted tool-call field produces no
-calls, and `defaults.tool_calls`, when supplied, must be an empty array.
-Delimiters and unrecognized wire text are never emitted as content.
+open at the end of the response is an error, except under
+`FinishMode::LengthLimit`, which is for output cut off by a generation
+length limit: `finish_with_mode` and `parse_complete_with_mode` then emit
+an unfinished text field as received, including any partial close
+delimiter. An unfinished tool call is still an error. Missing reasoning
+and content fields use their string defaults; an omitted tool-call field
+produces no calls, and `defaults.tool_calls`, when supplied, must be an
+empty array. Delimiters and unrecognized wire text are never emitted as
+content.
 
 Pending delimiter state, each structured value, and each field body have
 independent 4 MiB default limits in `ParserConfig`. A failed stream stays in

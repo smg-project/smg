@@ -15,6 +15,16 @@ pub struct ResponseTemplateParser {
     config: ParserConfig,
 }
 
+/// Whether the backend exhausted its generation budget or ended normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishMode {
+    /// Require every opened field to have its declared closing delimiter.
+    Strict,
+    /// Accept an unfinished text field at a confirmed generation length limit.
+    /// Structured fields, unknown bytes, UTF-8 and size limits remain strict.
+    LengthLimit,
+}
+
 impl ResponseTemplateParser {
     pub fn new(
         model_name: impl Into<String>,
@@ -67,9 +77,18 @@ impl ResponseTemplateParser {
         rendered_prompt_prefix: &str,
         decoded_output: &str,
     ) -> Result<ParseOutput, ResponseTemplateError> {
+        self.parse_complete_with_mode(rendered_prompt_prefix, decoded_output, FinishMode::Strict)
+    }
+
+    pub fn parse_complete_with_mode(
+        &self,
+        rendered_prompt_prefix: &str,
+        decoded_output: &str,
+        mode: FinishMode,
+    ) -> Result<ParseOutput, ResponseTemplateError> {
         let mut stream = self.stream(rendered_prompt_prefix);
         let mut output = stream.feed(decoded_output.as_bytes())?;
-        output.merge(stream.finish()?);
+        output.merge(stream.finish_with_mode(mode)?);
         Ok(output)
     }
 }
@@ -131,7 +150,7 @@ impl StreamingParser {
         }
         let mut staged_seen = self.seen_fields.clone();
         let (output, consumed) =
-            match consume_available(&self.compiled, self.config, valid, false, &mut staged_seen) {
+            match consume_available(&self.compiled, self.config, valid, None, &mut staged_seen) {
                 Ok(result) => result,
                 Err(error) => return Err(self.poison(error)),
             };
@@ -150,6 +169,13 @@ impl StreamingParser {
     }
 
     pub fn finish(&mut self) -> Result<ParseOutput, ResponseTemplateError> {
+        self.finish_with_mode(FinishMode::Strict)
+    }
+
+    pub fn finish_with_mode(
+        &mut self,
+        mode: FinishMode,
+    ) -> Result<ParseOutput, ResponseTemplateError> {
         if let Some(error) = &self.poison {
             return Err(error.clone());
         }
@@ -180,11 +206,16 @@ impl StreamingParser {
             return Err(self.poison(error));
         }
         let mut staged_seen = self.seen_fields.clone();
-        let (mut output, consumed) =
-            match consume_available(&self.compiled, self.config, text, true, &mut staged_seen) {
-                Ok(result) => result,
-                Err(error) => return Err(self.poison(error)),
-            };
+        let (mut output, consumed) = match consume_available(
+            &self.compiled,
+            self.config,
+            text,
+            Some(mode),
+            &mut staged_seen,
+        ) {
+            Ok(result) => result,
+            Err(error) => return Err(self.poison(error)),
+        };
         if consumed != text.len() {
             return Err(self.poison(runtime(
                 &self.compiled,
@@ -371,9 +402,10 @@ fn consume_available(
     template: &CompiledTemplate,
     config: ParserConfig,
     text: &str,
-    eos: bool,
+    finish_mode: Option<FinishMode>,
     seen: &mut BTreeSet<String>,
 ) -> Result<(ParseOutput, usize), ResponseTemplateError> {
+    let eos = finish_mode.is_some();
     let mut output = ParseOutput::default();
     let mut cursor = 0usize;
 
@@ -441,16 +473,25 @@ fn consume_available(
                 )
             })?;
         let tail = &text[open_end..];
-        let Some((body_end, close_len)) = earliest_close(tail, &field.closes) else {
-            if !eos {
-                break;
+        let (body_end, close_len) = match earliest_close(tail, &field.closes) {
+            Some(close) => close,
+            None if !eos => break,
+            None if finish_mode == Some(FinishMode::LengthLimit)
+                && field.content == ContentKind::Text =>
+            {
+                // At a length limit, a partial close delimiter is literal text.
+                // Count it against the body limit below; do not manufacture a
+                // structured/tool field.
+                (tail.len(), 0)
             }
-            return Err(runtime(
-                template,
-                &field.name,
-                config.max_body_bytes,
-                "unterminated field",
-            ));
+            None => {
+                return Err(runtime(
+                    template,
+                    &field.name,
+                    config.max_body_bytes,
+                    "unterminated field",
+                ));
+            }
         };
         let body = &tail[..body_end];
         ensure_body_limit(template, config, body.len())?;

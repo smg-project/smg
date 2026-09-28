@@ -13,8 +13,9 @@
 use std::collections::BTreeMap;
 
 use response_template_parser::{
-    ClosePattern, ContentArgs, DelimiterBound, FieldTemplate, ParserConfig, ResponseTemplate,
-    ResponseTemplateError, ResponseTemplateParser, Transform, ValueParser, ValueParserArgs,
+    ClosePattern, ContentArgs, DelimiterBound, FieldTemplate, FinishMode, ParserConfig,
+    ResponseTemplate, ResponseTemplateError, ResponseTemplateParser, Transform, ValueParser,
+    ValueParserArgs,
 };
 use serde_json::{json, Value};
 
@@ -104,6 +105,159 @@ fn config_with_limits(pending: usize, structured: usize, body: usize) -> ParserC
 
 fn parser(config: ParserConfig) -> ResponseTemplateParser {
     ResponseTemplateParser::new(MODEL, template(), config).expect("fixture must load")
+}
+
+#[test]
+fn length_limit_accepts_only_unfinished_text_at_every_byte_split() {
+    let parser = parser(ParserConfig::default());
+    for (wire, thinking, content) in [
+        (
+            "<|channel|>final<|message|>서울 café 🌏",
+            "",
+            "서울 café 🌏",
+        ),
+        ("<|channel|>analysis<|message|>생각", "생각", ""),
+        ("<|channel|>final<|message|>", "", ""),
+        ("<|channel|>final<|message|>part<|ret", "", "part<|ret"),
+        (
+            "<|channel|>analysis<|message|>think<|end|><|channel|>final<|message|>part",
+            "think",
+            "part",
+        ),
+    ] {
+        assert!(
+            parser.parse_complete(PREFIX, wire).is_err(),
+            "strict: {wire}"
+        );
+        let expected = parser
+            .parse_complete_with_mode(PREFIX, wire, FinishMode::LengthLimit)
+            .expect("length-terminated text");
+        assert_eq!(expected.thinking, thinking);
+        assert_eq!(expected.content, content);
+        assert!(expected.tool_calls.is_empty());
+        assert!(expected.wire_bytes.is_empty());
+        for split in 0..=wire.len() {
+            let mut stream = parser.stream(PREFIX);
+            let mut output = stream.feed(&wire.as_bytes()[..split]).expect("first chunk");
+            output.merge(
+                stream
+                    .feed(&wire.as_bytes()[split..])
+                    .expect("second chunk"),
+            );
+            output.merge(
+                stream
+                    .finish_with_mode(FinishMode::LengthLimit)
+                    .expect("finish"),
+            );
+            assert_eq!(output, expected, "{wire}, split {split}");
+            assert_eq!(stream.pending_bytes(), 0);
+            assert!(stream.finish_with_mode(FinishMode::LengthLimit).is_err());
+            assert!(stream.feed(b"extra").is_err());
+        }
+    }
+    let closed = complete_wire();
+    assert_eq!(
+        parser.parse_complete(PREFIX, &closed).unwrap(),
+        parser
+            .parse_complete_with_mode(PREFIX, &closed, FinishMode::LengthLimit)
+            .unwrap()
+    );
+}
+
+#[test]
+fn length_limit_preserves_malformed_structured_and_utf8_errors() {
+    let parser = parser(ParserConfig::default());
+    for wire in [
+        "unknown",
+        "<|channel|>fin",
+        "unknown<|channel|>final<|message|>part",
+        "<|channel|>final<|message|>done<|end|>unknown",
+        "<|channel|>final<|message|>done<|end|><|channel|>final<|message|>again",
+        " to=tool<|channel|>analysis<|message|><arg name=\"a\">x",
+        " to=tool<|channel|>analysis<|message|><arg name=\"a\">x</arg>",
+        " to=tool<|channel|>analysis<|message|><arg name=\"a\">x<|call|>",
+    ] {
+        for split in 0..=wire.len() {
+            let mut stream = parser.stream(PREFIX);
+            let result = stream
+                .feed(&wire.as_bytes()[..split])
+                .and_then(|_| stream.feed(&wire.as_bytes()[split..]))
+                .and_then(|_| stream.finish_with_mode(FinishMode::LengthLimit));
+            let error = result.expect_err("length must not forgive malformed/structured output");
+            assert_eq!(
+                stream
+                    .finish_with_mode(FinishMode::LengthLimit)
+                    .unwrap_err(),
+                error
+            );
+            assert_eq!(stream.feed(b"extra").unwrap_err(), error);
+        }
+    }
+    for invalid in [&b"\xff"[..], &b"\xf0\x9f"[..]] {
+        let mut stream = parser.stream(PREFIX);
+        stream.feed(b"<|channel|>final<|message|>").unwrap();
+        let error = stream
+            .feed(invalid)
+            .and_then(|_| stream.finish_with_mode(FinishMode::LengthLimit))
+            .expect_err("invalid or incomplete UTF-8 must fail");
+        assert_eq!(error.field(), "utf8");
+        assert_eq!(
+            stream
+                .finish_with_mode(FinishMode::LengthLimit)
+                .unwrap_err(),
+            error
+        );
+    }
+}
+
+#[test]
+fn length_limit_preserves_body_pending_and_structured_limits() {
+    let parser = parser(config_with_limits(128, 4, 4));
+    assert_eq!(
+        parser
+            .parse_complete_with_mode(
+                PREFIX,
+                "<|channel|>final<|message|>1234",
+                FinishMode::LengthLimit
+            )
+            .unwrap()
+            .content,
+        "1234"
+    );
+    // A held close-prefix becomes literal body at length termination, so it
+    // must count toward max_body_bytes rather than bypassing the body cap.
+    for wire in [
+        "<|channel|>final<|message|>12345",
+        "<|channel|>final<|message|>1234<",
+    ] {
+        assert_eq!(
+            parser
+                .parse_complete_with_mode(PREFIX, wire, FinishMode::LengthLimit)
+                .unwrap_err()
+                .field(),
+            "max_body_bytes"
+        );
+    }
+    let mut stream = parser.stream(PREFIX);
+    let error = stream.feed(&[b'x'; 129]).unwrap_err();
+    assert_eq!(error.field(), "max_pending_bytes");
+    assert_eq!(
+        stream
+            .finish_with_mode(FinishMode::LengthLimit)
+            .unwrap_err(),
+        error
+    );
+    assert_eq!(
+        parser
+            .parse_complete_with_mode(
+                PREFIX,
+                " to=toolname<|channel|>analysis<|message|>",
+                FinishMode::LengthLimit
+            )
+            .unwrap_err()
+            .field(),
+        "max_structured_field_bytes"
+    );
 }
 
 fn complete_wire() -> String {
