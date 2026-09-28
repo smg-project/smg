@@ -30,8 +30,8 @@ use openai_protocol::{
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use response_template_parser::{
-    FinishMode, ParseOutput as ResponseTemplateOutput, ParserConfig as ResponseParserConfig,
-    ResponseTemplateError, ResponseTemplateParser, StreamingParser as ResponseStreamingParser,
+    FinishMode, ParseOutput as ResponseTemplateOutput, ResponseTemplateError,
+    StreamingParser as ResponseStreamingParser,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -463,13 +463,7 @@ impl StreamingProcessor {
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
         let tool_parser_name = self.parser_resolver.tool_parser(model);
 
-        let response_template_parser = original_request
-            .response_template
-            .as_ref()
-            .map(|template| {
-                ResponseTemplateParser::from_json(model, template, ResponseParserConfig::default())
-            })
-            .transpose()?;
+        let response_template_parser = original_request.response_template.clone();
         let mut response_template_streams: HashMap<u32, ResponseStreamingParser> = HashMap::new();
         let mut response_template_tool_counts: HashMap<u32, usize> = HashMap::new();
         let mut response_template_external_stops: HashMap<u32, String> = HashMap::new();
@@ -646,7 +640,7 @@ impl StreamingProcessor {
                                     .matched_stop()
                                     .map(|s| Value::String(s.to_string()))
                                     .filter(|value| {
-                                        !Self::template_owns_matched_stop(&original_request, value)
+                                        !original_request.template_owns_matched_stop(value)
                                     })
                             });
                             stopped_indices.insert(index);
@@ -740,7 +734,7 @@ impl StreamingProcessor {
                             matched_stops.insert(
                                 index,
                                 complete.matched_stop_json().filter(|value| {
-                                    !Self::template_owns_matched_stop(&original_request, value)
+                                    !original_request.template_owns_matched_stop(value)
                                 }),
                             );
                         }
@@ -1324,28 +1318,6 @@ impl StreamingProcessor {
                 .map_err(|_| "Failed to send tool-call chunk".to_string())?;
         }
         Ok(())
-    }
-
-    fn template_owns_matched_stop(request: &ChatResponseSpec, matched_stop: &Value) -> bool {
-        if let Some(token_id) = matched_stop.as_u64().and_then(|id| u32::try_from(id).ok()) {
-            return request.template_close_token_ids.contains(&token_id);
-        }
-        let Some(literal) = matched_stop.as_str() else {
-            return false;
-        };
-        request
-            .response_template
-            .as_ref()
-            .and_then(|template| template.get("fields"))
-            .and_then(Value::as_object)
-            .into_iter()
-            .flat_map(|fields| fields.values())
-            .filter_map(|field| field.get("close"))
-            .any(|close| match close {
-                Value::String(value) => value == literal,
-                Value::Array(values) => values.iter().any(|value| value.as_str() == Some(literal)),
-                _ => false,
-            })
     }
 
     /// Process prefill/decode streaming chunks (prefill + decode) - PD mode

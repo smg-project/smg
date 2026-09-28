@@ -18,9 +18,7 @@ use openai_protocol::{
     messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
-use response_template_parser::{
-    FinishMode, ParserConfig as ResponseParserConfig, ResponseTemplateParser,
-};
+use response_template_parser::FinishMode;
 use serde_json::Value;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
@@ -43,32 +41,6 @@ pub(crate) struct ResponseProcessor {
     pub reasoning_parser_factory: ReasoningParserFactory,
     /// Per-request parser-name resolution (model-card override → configured).
     pub parser_resolver: utils::ParserResolver,
-}
-
-/// Template-owned close markers are response framing. They are handed to the
-/// response parser, but must not be echoed through the public `matched_stop`
-/// field when a backend also reports the same stop as metadata.
-fn template_owns_matched_stop(request: &ChatResponseSpec, matched_stop: &Value) -> bool {
-    if let Some(token_id) = matched_stop.as_u64().and_then(|id| u32::try_from(id).ok()) {
-        return request.template_close_token_ids.contains(&token_id);
-    }
-
-    let Some(literal) = matched_stop.as_str() else {
-        return false;
-    };
-    request
-        .response_template
-        .as_ref()
-        .and_then(|template| template.get("fields"))
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|fields| fields.values())
-        .filter_map(|field| field.get("close"))
-        .any(|close| match close {
-            Value::String(value) => value == literal,
-            Value::Array(values) => values.iter().any(|value| value.as_str() == Some(literal)),
-            _ => false,
-        })
 }
 
 impl ResponseProcessor {
@@ -141,7 +113,7 @@ impl ResponseProcessor {
         // A checkpoint response template is authoritative for all assistant
         // fields. Template-less tokenizers continue through the pre-existing
         // reasoning/tool parser precedence below.
-        if let Some(template) = original_request.response_template.as_ref() {
+        if let Some(parser) = original_request.response_template.as_ref() {
             let external_visible_stop = if stopped
                 && stopped_with_text
                 && original_request.no_stop_trim
@@ -162,11 +134,6 @@ impl ResponseProcessor {
             } else {
                 None
             };
-            let parser =
-                ResponseTemplateParser::from_json(model, template, ResponseParserConfig::default())
-                    .map_err(|error| {
-                        format!("Invalid response template for model '{model}': {error}")
-                    })?;
             let mut parsed = parser
                 .parse_complete_with_mode(
                     &original_request.rendered_prompt_prefix,
@@ -226,7 +193,7 @@ impl ResponseProcessor {
                 .matched_stop()
                 .map(|value| Value::String(value.to_string()))
                 .or_else(|| complete.matched_stop_json())
-                .filter(|value| !template_owns_matched_stop(original_request, value));
+                .filter(|value| !original_request.template_owns_matched_stop(value));
             let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
                 utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer)
             });

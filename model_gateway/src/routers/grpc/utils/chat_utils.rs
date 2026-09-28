@@ -1,7 +1,7 @@
 //! Chat message processing, tool constraints, and shared utilities for gRPC routers.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
@@ -23,6 +23,7 @@ use openai_protocol::{
     },
     generate::GenerateFinishReason,
 };
+use response_template_parser::ResponseTemplateParser;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use tracing::{debug, error};
@@ -744,18 +745,16 @@ pub fn create_stop_decoder_with_visible_stop_tokens(
     builder.build()
 }
 
-/// Resolve response-template close literals that are represented by one token.
-/// Only these EOS/stop IDs are made visible to the response-template parser;
-/// every other stop keeps the pre-existing trim policy.
+/// Resolve the compiled template's close literals that are represented by one
+/// token. Only these EOS/stop IDs are made visible to the response-template
+/// parser; every other stop keeps the pre-existing trim policy.
 pub fn response_template_close_token_ids(
     tokenizer: &Arc<dyn Tokenizer>,
+    template: &ResponseTemplateParser,
     stop_token_ids: Option<&Vec<u32>>,
     ignore_eos: bool,
 ) -> Vec<u32> {
-    let close_literals = tokenizer
-        .response_template()
-        .map(response_template_close_literals)
-        .unwrap_or_default();
+    let close_literals = template.close_literals().collect::<HashSet<_>>();
     let eos_ids = if ignore_eos {
         &[] as &[u32]
     } else {
@@ -773,25 +772,9 @@ pub fn response_template_close_token_ids(
         .filter(|token_id| {
             tokenizer
                 .decode(&[*token_id], false)
-                .is_ok_and(|literal| close_literals.contains(&literal))
+                .is_ok_and(|literal| close_literals.contains(literal.as_str()))
         })
         .collect::<Vec<_>>()
-}
-
-fn response_template_close_literals(template: &Value) -> std::collections::HashSet<String> {
-    template
-        .get("fields")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|fields| fields.values())
-        .filter_map(|field| field.get("close"))
-        .flat_map(|close| match close {
-            Value::String(value) => vec![value.as_str()],
-            Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
-            _ => Vec::new(),
-        })
-        .map(str::to_owned)
-        .collect()
 }
 
 /// Parse tool calls from JSON schema constrained response

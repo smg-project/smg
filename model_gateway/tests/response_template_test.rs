@@ -1440,6 +1440,30 @@ async fn response_template_gateway_semantics() {
     assert_eq!(completed_positions.len(), 1);
     let events_after_completed = response_events.len() - completed_positions[0] - 1;
     assert_eq!(events_after_completed, 0);
+    // The shared Chat-to-Responses emitter is the only source of streamed
+    // items: each reasoning, message and function_call item is added once and
+    // done once, and every done function_call is completed.
+    let item_ids = |event_type: &str, item_type: &str| {
+        response_events
+            .iter()
+            .filter(|event| event["type"] == event_type && event["item"]["type"] == item_type)
+            .map(|event| event["item"]["id"].clone())
+            .collect::<Vec<_>>()
+    };
+    for (item_type, expected) in [("reasoning", 1), ("message", 1), ("function_call", 2)] {
+        let added = item_ids("response.output_item.added", item_type);
+        assert_eq!(added.len(), expected, "{item_type} added events");
+        assert_eq!(
+            item_ids("response.output_item.done", item_type),
+            added,
+            "{item_type} done events"
+        );
+    }
+    assert!(response_events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done"
+            && event["item"]["type"] == "function_call")
+        .all(|event| event["item"]["status"] == "completed"));
     assert_eq!(responses_nonstream["status"], "completed");
     let responses_nonstream_fields_mapped = responses_fields_mapped(&responses_nonstream);
     let responses_stream_fields_mapped =

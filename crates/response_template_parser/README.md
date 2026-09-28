@@ -15,6 +15,10 @@ The initial schema requires exactly three fields:
 | `content` | `text` | No | No `content_args` or `transform` |
 | `tool_calls` | `xml-inline` | Yes | Named `name` capture in the opener, `content_args`, and `transform` |
 
+Unknown keys in the template, field, `content_args`, `value_parser` and
+`value_parser.args` objects are rejected, so a misspelled key such as
+`repeat` fails registration instead of being silently ignored.
+
 `start_anchor_pattern` must match the rendered prompt prefix. `open_pattern`
 and `tag_pattern` use Rust's `regex` syntax. Empty-matching patterns,
 lookaround, and backreferences are rejected. `close` is a literal string or
@@ -47,7 +51,11 @@ For example, a tool-call field can use:
 `ResponseTemplateParser::from_json` validates and compiles a template.
 `parse_complete` parses a complete response. `stream` creates independent
 state whose `feed` method accepts byte slices, including partial UTF-8
-characters. Call `finish` once at the end.
+characters. Call `finish` once at the end. A compiled parser is cheap to
+clone and can be shared across requests; each stream owns its own state.
+While a field is open, `feed` examines only the newly supplied bytes. The
+feed that closes the field parses it in full, and so does any feed that
+could take the field past one of its limits.
 
 Fields are emitted after their closing delimiter arrives. A field still
 open at the end of the response is an error, except under

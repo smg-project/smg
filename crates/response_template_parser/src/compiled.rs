@@ -10,17 +10,24 @@ use crate::{
     schema::{FieldTemplate, ResponseTemplate, Transform},
 };
 
+/// The longest match a delimiter pattern can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "max_bytes", rename_all = "snake_case")]
 pub enum DelimiterBound {
+    /// At most this many bytes.
     Bounded(usize),
+    /// No finite maximum.
     Unbounded,
 }
 
+/// The width bound of one compiled delimiter pattern.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelimiterMetadata {
+    /// Field name, or `start_anchor_pattern`.
     pub field: String,
+    /// Pattern role: `start_anchor`, `open`, `close` or `tag`.
     pub role: String,
+    /// Longest possible match.
     pub bound: DelimiterBound,
 }
 

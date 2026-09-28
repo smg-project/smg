@@ -1384,6 +1384,7 @@ mod alias_pipeline_tests {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
+            response_templates: Default::default(),
         });
         let request: GenerateRequest = serde_json::from_value(json!({
             "model": MODEL_ALIAS,
@@ -1768,6 +1769,7 @@ mod request_release_tests {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
+            response_templates: Default::default(),
         })
     }
 
@@ -2214,6 +2216,7 @@ mod request_release_tests {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal,
+            response_templates: Default::default(),
         })
     }
 
@@ -2454,6 +2457,7 @@ mod rate_limit_reserve_tests {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
+            response_templates: Default::default(),
         })
     }
 

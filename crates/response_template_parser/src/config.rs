@@ -6,8 +6,11 @@ pub const DEFAULT_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 /// Independent UTF-8 byte limits for one parser request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParserConfig {
+    /// Limit for pending delimiter state.
     pub max_pending_bytes: usize,
+    /// Limit for each structured value: a tool name, argument key or value.
     pub max_structured_field_bytes: usize,
+    /// Limit for each field body.
     pub max_body_bytes: usize,
 }
 

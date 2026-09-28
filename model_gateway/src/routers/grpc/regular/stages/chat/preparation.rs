@@ -278,6 +278,20 @@ pub(crate) async fn prepare_chat_like(
             }
         }
 
+        // The tokenizer's compiled response template, shared across requests.
+        let response_template = ctx
+            .components
+            .response_templates
+            .get_or_compile(&tokenizer, &request.model)
+            .map_err(|e| {
+                error!(
+                    function = "ChatPreparationStage::execute",
+                    error = %e,
+                    "Invalid response template"
+                );
+                error::internal_error("invalid_response_template", e.to_string())
+            })?;
+
         // Step 4: Build tool constraints if needed
         // The tool parser registry handles both structural tag (for native format
         // parsers like Mistral, KimiK2) and generic JSON schema fallback. When
@@ -287,7 +301,7 @@ pub(crate) async fn prepare_chat_like(
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools();
-        let tool_call_constraint = if tokenizer.response_template().is_some() {
+        let tool_call_constraint = if response_template.is_some() {
             // The checkpoint template owns both tool framing and argument
             // serialization. A legacy JSON/structural constraint would force
             // an incompatible wire format before the authoritative response
@@ -335,7 +349,7 @@ pub(crate) async fn prepare_chat_like(
         // - json_schema: backend forces JSON, no trigger tokens to preserve
         // - structural_tag or no constraint (auto): parser needs trigger tokens
         let skip_special_tokens =
-            if tokenizer.response_template().is_some() || preserve_reasoning_special_tokens {
+            if response_template.is_some() || preserve_reasoning_special_tokens {
                 false
             } else {
                 match &tool_call_constraint {
@@ -353,11 +367,17 @@ pub(crate) async fn prepare_chat_like(
             };
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
-        let template_close_token_ids = utils::response_template_close_token_ids(
-            &tokenizer,
-            request.stop_token_ids.as_ref(),
-            request.ignore_eos,
-        );
+        let template_close_token_ids = response_template
+            .as_ref()
+            .map(|template| {
+                utils::response_template_close_token_ids(
+                    &tokenizer,
+                    template,
+                    request.stop_token_ids.as_ref(),
+                    request.ignore_eos,
+                )
+            })
+            .unwrap_or_default();
         let stop_decoder = utils::create_stop_decoder_with_visible_stop_tokens(
             &tokenizer,
             request.stop.as_ref(),
@@ -375,6 +395,8 @@ pub(crate) async fn prepare_chat_like(
         ctx.state.multimodal_refs = multimodal_refs;
         ctx.state.response.stop_decoder = Some(stop_decoder);
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
+        ctx.state.response.response_template = response_template;
+        ctx.state.response.template_close_token_ids = template_close_token_ids;
 
         Ok((
             token_ids,

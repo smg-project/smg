@@ -26,6 +26,7 @@ pub enum FinishMode {
 }
 
 impl ResponseTemplateParser {
+    /// Validate and compile `template`. `model_name` labels every error.
     pub fn new(
         model_name: impl Into<String>,
         template: ResponseTemplate,
@@ -38,6 +39,8 @@ impl ResponseTemplateParser {
         })
     }
 
+    /// Decode a raw `response_template` value, then validate and compile it.
+    /// Unknown keys are rejected.
     pub fn from_json(
         model_name: impl Into<String>,
         template: &Value,
@@ -55,10 +58,21 @@ impl ResponseTemplateParser {
         Self::new(model_name, decoded, config)
     }
 
+    /// Width bound of each compiled delimiter pattern.
     pub fn delimiter_metadata(&self) -> &[crate::DelimiterMetadata] {
         &self.compiled.metadata
     }
 
+    /// Every literal close delimiter declared by the template's fields.
+    pub fn close_literals(&self) -> impl Iterator<Item = &str> {
+        self.compiled
+            .fields
+            .iter()
+            .flat_map(|field| field.closes.iter().map(String::as_str))
+    }
+
+    /// Start independent streaming state for one response. The rendered
+    /// prompt prefix must contain the template's start anchor.
     pub fn stream(&self, rendered_prompt_prefix: impl Into<String>) -> StreamingParser {
         StreamingParser {
             compiled: Arc::clone(&self.compiled),
@@ -74,6 +88,7 @@ impl ResponseTemplateParser {
         }
     }
 
+    /// Parse one complete response with strict finalization.
     pub fn parse_complete(
         &self,
         rendered_prompt_prefix: &str,
@@ -82,6 +97,7 @@ impl ResponseTemplateParser {
         self.parse_complete_with_mode(rendered_prompt_prefix, decoded_output, FinishMode::Strict)
     }
 
+    /// Parse one complete response, finalizing it with `mode`.
     pub fn parse_complete_with_mode(
         &self,
         rendered_prompt_prefix: &str,
@@ -129,6 +145,8 @@ struct OpenField {
 }
 
 impl StreamingParser {
+    /// Accept the next output bytes and return every field completed by them.
+    /// An error poisons the stream: later calls return the same error.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<ParseOutput, ResponseTemplateError> {
         if let Some(error) = &self.poison {
             return Err(error.clone());
@@ -230,10 +248,12 @@ impl StreamingParser {
         Ok(output)
     }
 
+    /// Finalize strictly: every opened field must be closed. Applies defaults.
     pub fn finish(&mut self) -> Result<ParseOutput, ResponseTemplateError> {
         self.finish_with_mode(FinishMode::Strict)
     }
 
+    /// Finalize the stream with `mode`. Applies defaults for omitted fields.
     pub fn finish_with_mode(
         &mut self,
         mode: FinishMode,
@@ -295,6 +315,7 @@ impl StreamingParser {
         Ok(output)
     }
 
+    /// Retained bytes that have not been emitted yet.
     pub fn pending_bytes(&self) -> usize {
         self.bytes.len()
     }

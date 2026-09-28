@@ -20,6 +20,7 @@ use openai_protocol::{
     transcription::{AudioFile, TranscriptionRequest},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use response_template_parser::ResponseTemplateParser;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
@@ -36,7 +37,7 @@ use super::{
         ProtoRequest, ProtoStream,
     },
     spec::ResponseSpec,
-    utils::ParserResolver,
+    utils::{ParserResolver, ResponseTemplateCache},
 };
 use crate::{
     middleware::TenantRequestMeta,
@@ -173,6 +174,8 @@ pub(crate) struct SharedComponents {
     pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
+    /// Tokenizer response templates, compiled once and shared by requests.
+    pub response_templates: ResponseTemplateCache,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,
@@ -723,6 +726,11 @@ pub(crate) struct ResponseState {
     /// Stored here because PreparationOutput is consumed by request_building before
     /// response_processing runs.
     pub skip_special_tokens: Option<bool>,
+
+    /// Compiled response template and the single-token closes kept visible to
+    /// it. Set in chat preparation; request building moves them into the spec.
+    pub response_template: Option<ResponseTemplateParser>,
+    pub template_close_token_ids: Vec<u32>,
 
     /// Execution result (streams from workers)
     pub execution_result: Option<ExecutionResult>,

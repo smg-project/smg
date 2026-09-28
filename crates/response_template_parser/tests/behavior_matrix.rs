@@ -1085,3 +1085,44 @@ fn opener_like_text_inside_a_text_body_is_content_at_every_split() {
     assert_eq!(streamed.output.content, "ok");
     assert!(streamed.output.tool_calls.is_empty());
 }
+
+#[test]
+fn unknown_template_keys_are_rejected_at_load() {
+    let valid = serde_json::to_value(template()).expect("template value");
+    assert!(ResponseTemplateParser::from_json(MODEL, &valid, ParserConfig::default()).is_ok());
+    for (path, key) in [
+        (vec![], "field"),
+        (vec!["fields", "tool_calls"], "repeat"),
+        (vec!["fields", "tool_calls", "content_args"], "tag"),
+        (
+            vec!["fields", "tool_calls", "content_args", "value_parser"],
+            "arg",
+        ),
+        (
+            vec![
+                "fields",
+                "tool_calls",
+                "content_args",
+                "value_parser",
+                "args",
+            ],
+            "trim",
+        ),
+    ] {
+        let mut misspelled = valid.clone();
+        let target = path
+            .iter()
+            .fold(&mut misspelled, |value, segment| &mut value[*segment]);
+        target[key] = json!(true);
+        let error = ResponseTemplateParser::from_json(MODEL, &misspelled, ParserConfig::default())
+            .expect_err("unknown template keys must fail loading");
+        assert!(
+            matches!(
+                &error,
+                ResponseTemplateError::InvalidTemplate { field, reason, .. }
+                    if field == "response_template" && reason.contains(key)
+            ),
+            "{key}: {error:?}"
+        );
+    }
+}

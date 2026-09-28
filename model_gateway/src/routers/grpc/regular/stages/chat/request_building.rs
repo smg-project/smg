@@ -236,16 +236,11 @@ impl BuildStage for ChatRequestBuildingStage {
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
         let mut spec = ChatResponseSpec::from(chat_request.as_ref());
-        if let Some(tokenizer) = ctx.tokenizer_arc() {
-            if let Some(template) = tokenizer.response_template() {
-                spec.rendered_prompt_prefix = processed_messages.text.clone();
-                spec.response_template = Some(template.clone());
-                spec.template_close_token_ids = utils::response_template_close_token_ids(
-                    &tokenizer,
-                    chat_request.stop_token_ids.as_ref(),
-                    chat_request.ignore_eos,
-                );
-            }
+        if let Some(template) = ctx.state.response.response_template.take() {
+            spec.rendered_prompt_prefix = processed_messages.text.clone();
+            spec.response_template = Some(template);
+            spec.template_close_token_ids =
+                std::mem::take(&mut ctx.state.response.template_close_token_ids);
         }
 
         let (plan, stamp) = build_chat_backed_plan(

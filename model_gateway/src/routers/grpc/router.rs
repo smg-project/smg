@@ -120,6 +120,7 @@ impl GrpcRouter {
                 ctx.configured_reasoning_parser.clone(),
             ),
             multimodal,
+            response_templates: Default::default(),
         });
 
         // Deps for the parser-consuming endpoints (chat/messages/harmony).

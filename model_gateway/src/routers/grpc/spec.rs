@@ -20,6 +20,7 @@ use openai_protocol::{
     profile::ProviderProfile,
     responses::ResponsesRequest,
 };
+use response_template_parser::ResponseTemplateParser;
 use serde_json::Value;
 
 use crate::routers::grpc::utils;
@@ -86,9 +87,9 @@ pub(crate) struct ChatResponseSpec {
     /// Exact rendered prompt prefix used to validate the response template's
     /// start anchor without rendering the request a second time.
     pub rendered_prompt_prefix: String,
-    /// A checkpoint-provided response template. `None` preserves the existing
-    /// reasoning/tool parser precedence unchanged.
-    pub response_template: Option<Value>,
+    /// The tokenizer's compiled response template. `None` preserves the
+    /// existing reasoning/tool parser precedence unchanged.
+    pub response_template: Option<ResponseTemplateParser>,
     /// Template close literals that are single EOS/stop tokens. These must be
     /// visible to the template parser while remaining hidden from client output.
     pub template_close_token_ids: Vec<u32>,
@@ -133,6 +134,20 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
 }
 
 impl ChatResponseSpec {
+    /// Template-owned close markers are response framing. They are handed to
+    /// the template parser, but must not be echoed through the client-facing
+    /// `matched_stop` field when a backend also reports the same stop.
+    pub(crate) fn template_owns_matched_stop(&self, matched_stop: &Value) -> bool {
+        if let Some(token_id) = matched_stop.as_u64().and_then(|id| u32::try_from(id).ok()) {
+            return self.template_close_token_ids.contains(&token_id);
+        }
+        matched_stop.as_str().is_some_and(|literal| {
+            self.response_template
+                .as_ref()
+                .is_some_and(|parser| parser.close_literals().any(|close| close == literal))
+        })
+    }
+
     /// Whether the reasoning parser starts in reasoning mode for this
     /// request (see [`utils::reasoning_starts_in_prefill`]).
     pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
