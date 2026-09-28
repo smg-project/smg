@@ -3,7 +3,7 @@
 #
 # The gRPC serve command from PR #11037 and the Harmony parser fixes (#12045,
 # #12467) referenced by SMG #801 first shipped in 1.3.0rc14 (released
-# 2026-05-07) and remain included in the pinned 1.3.0rc24 pre-release wheel.
+# 2026-05-07) and remain included in the pinned 1.3.0rc27 pre-release wheel.
 # We install it directly from PyPI instead of building TensorRT-LLM from
 # source, which saves ~30 min of CMake compile time per CI run. See git
 # history for the previous source-build logic.
@@ -20,8 +20,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
 
-TRTLLM_VERSION="1.3.0rc24"
-NCCL_VERSION_CONSTRAINT="nvidia-nccl-cu13>=2.28.9,<=2.29.2"
+TRTLLM_VERSION="1.3.0rc27"
+NCCL_VERSION_CONSTRAINT="nvidia-nccl-cu13>=2.29.7,<=2.30.3"
 
 # Activate venv if it exists
 if [ -f ".venv/bin/activate" ]; then
@@ -78,11 +78,15 @@ $RETRY 3 10 pip install --no-cache-dir "$NCCL_VERSION_CONSTRAINT"
 # of cudaIpcMemHandle_t that tensorrt-llm's IPC memory setup still reads, so
 # every multi-GPU engine died at startup with an AttributeError the moment
 # the release appeared. 13.3.1 is the last version the lane ran on.
-echo "Installing tensorrt-llm==${TRTLLM_VERSION} from pypi.nvidia.com..."
+# The grpc-smg extra carries smg-grpc-proto, which the gRPC serving path needs.
+# It used to be an unconditional dependency; 1.3.0rc27 moved it behind an extra,
+# so a plain install now starts and then dies at worker startup with
+# "gRPC serving with the SMG protocol requires the optional 'smg-grpc-proto'".
+echo "Installing tensorrt-llm[grpc-smg]==${TRTLLM_VERSION} from pypi.nvidia.com..."
 $RETRY 3 10 pip install --no-cache-dir --pre \
     --extra-index-url https://pypi.nvidia.com \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
-    "tensorrt-llm==${TRTLLM_VERSION}" "cuda-bindings==13.3.1"
+    "tensorrt-llm[grpc-smg]==${TRTLLM_VERSION}" "cuda-bindings==13.3.1"
 
 # Import canary: fail here (not 20 minutes into the lane) if the pin above
 # no longer matches what tensorrt-llm's IPC path expects.
