@@ -30,7 +30,7 @@ use openai_protocol::{
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use response_template_parser::{
-    ParseOutput as ResponseTemplateOutput, ParserConfig as ResponseParserConfig,
+    FinishMode, ParseOutput as ResponseTemplateOutput, ParserConfig as ResponseParserConfig,
     ResponseTemplateError, ResponseTemplateParser, StreamingParser as ResponseStreamingParser,
 };
 use serde::Serialize;
@@ -947,13 +947,20 @@ impl StreamingProcessor {
         });
 
         for (index, parser) in &mut response_template_streams {
-            let parsed = if let Some(stop) = response_template_external_stops.remove(index) {
-                let mut parsed = parser.finish()?;
-                parsed.content.push_str(&stop);
-                parsed
+            // Local stop matches pin "stop" before backend completion. Only
+            // an explicit, effective length termination permits partial text.
+            let mode = if finish_reasons
+                .get(index)
+                .is_some_and(|reason| reason == "length")
+            {
+                FinishMode::LengthLimit
             } else {
-                parser.finish()?
+                FinishMode::Strict
             };
+            let mut parsed = parser.finish_with_mode(mode)?;
+            if let Some(stop) = response_template_external_stops.remove(index) {
+                parsed.content.push_str(&stop);
+            }
             Self::emit_response_template_output(
                 parsed,
                 None,

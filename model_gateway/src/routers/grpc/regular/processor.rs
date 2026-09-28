@@ -18,7 +18,9 @@ use openai_protocol::{
     messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
-use response_template_parser::{ParserConfig as ResponseParserConfig, ResponseTemplateParser};
+use response_template_parser::{
+    FinishMode, ParserConfig as ResponseParserConfig, ResponseTemplateParser,
+};
 use serde_json::Value;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
@@ -166,7 +168,15 @@ impl ResponseProcessor {
                         format!("Invalid response template for model '{model}': {error}")
                     })?;
             let mut parsed = parser
-                .parse_complete(&original_request.rendered_prompt_prefix, &final_text)
+                .parse_complete_with_mode(
+                    &original_request.rendered_prompt_prefix,
+                    &final_text,
+                    if !stopped && complete.finish_reason() == "length" {
+                        FinishMode::LengthLimit
+                    } else {
+                        FinishMode::Strict
+                    },
+                )
                 .map_err(|error| {
                     format!("Response-template parse failed for model '{model}': {error}")
                 })?;
