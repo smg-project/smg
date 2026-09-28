@@ -287,8 +287,6 @@ pub struct WorkerUpdateWorkflowData {
     pub config: ProtocolWorkerUpdateRequest,
     /// URL of worker(s) to update
     pub worker_url: String,
-    /// Whether to include registered DP ranks when resolving the URL
-    pub dp_aware: bool,
     /// Application context (transient, must be re-initialized after deserialization)
     #[serde(skip, default)]
     pub app_context: Option<Arc<AppContext>>,

@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::{
     app_context::AppContext,
     observability::metrics::{metrics_labels, Metrics},
-    worker::{registry::WorkerId, EndpointKey, WorkerOrigin},
+    worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
     workflow::{Job, WorkerRegistrationMode},
 };
 
@@ -66,8 +66,10 @@ pub(super) struct OwnedWorker {
     /// id is what distinguishes its ranks — and what the removal guard needs
     /// to pin each rank to its own revision.
     pub(super) id: WorkerId,
-    /// Canonical identity of the registered address.
-    pub(super) key: EndpointKey,
+    /// The registered address, parsed. Its [`Endpoint::key`] is the identity
+    /// used for grouping; the endpoint itself is kept so a removal can submit
+    /// a form that parses back (an IPC key is a bare socket path).
+    pub(super) endpoint: Endpoint,
     pub(super) pod_uid: String,
     /// Revision guard for removal: a concurrently replaced worker is skipped
     /// and re-evaluated on the next pass instead of removed blindly.
@@ -82,7 +84,8 @@ pub(super) struct OwnedWorker {
 /// Pod that is already gone.
 #[derive(Debug, Clone)]
 pub(super) struct RemovalTarget {
-    pub(super) key: EndpointKey,
+    /// One member's parsed address; every member shares its key.
+    pub(super) endpoint: Endpoint,
     /// Pod uid of whichever member the registry happened to yield first.
     /// Ranks of one DP group do share it, but a stale-scheme sibling can not:
     /// `grpc://h:p` and `http://h:p` canonicalize alike, so two registrations
@@ -109,8 +112,8 @@ fn k8s_owned_workers(app_context: &AppContext) -> Vec<OwnedWorker> {
             // A registered address the shared parser rejects is one this
             // reconciler cannot safely match against a desired endpoint, so it
             // is left alone rather than guessed at.
-            let key = match crate::worker::endpoint_key(worker.url()) {
-                Ok(key) => key,
+            let endpoint = match Endpoint::parse_with_rank(worker.url()) {
+                Ok((endpoint, _)) => endpoint,
                 Err(e) => {
                     warn!(
                         worker_url = %worker.url(),
@@ -122,7 +125,7 @@ fn k8s_owned_workers(app_context: &AppContext) -> Vec<OwnedWorker> {
             };
             Some(OwnedWorker {
                 id,
-                key,
+                endpoint,
                 pod_uid,
                 revision: worker.revision(),
             })
@@ -148,19 +151,20 @@ pub(super) fn compute_actions(
 ) -> ReconcileActions {
     let mut actions = ReconcileActions::default();
 
-    let mut registered_uid: HashMap<&EndpointKey, &str> = HashMap::new();
+    let mut registered_uid: HashMap<EndpointKey, &str> = HashMap::new();
     // DP-rank expansions share one canonical URL: remove it once, but keep
     // every rank's own `(id, revision)` so the guard cannot drop the ranks
     // whose revision happens to differ from an arbitrarily chosen one.
-    let mut remove_by_key: HashMap<&EndpointKey, RemovalTarget> = HashMap::new();
+    let mut remove_by_key: HashMap<EndpointKey, RemovalTarget> = HashMap::new();
     for worker in registered {
-        registered_uid.insert(&worker.key, worker.pod_uid.as_str());
-        match desired.uid_by_url.get(&worker.key) {
+        let key = worker.endpoint.key();
+        registered_uid.insert(key.clone(), worker.pod_uid.as_str());
+        match desired.uid_by_url.get(&key) {
             Some(uid) if *uid == worker.pod_uid => {}
             _ => remove_by_key
-                .entry(&worker.key)
+                .entry(key)
                 .or_insert_with(|| RemovalTarget {
-                    key: worker.key.clone(),
+                    endpoint: worker.endpoint.clone(),
                     pod_uid: worker.pod_uid.clone(),
                     guards: Vec::new(),
                 })
@@ -171,7 +175,9 @@ pub(super) fn compute_actions(
     actions.remove = remove_by_key.into_values().collect();
     // `HashMap` iteration order is unspecified; sort so a pass submits jobs
     // and logs them in a stable order.
-    actions.remove.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    actions
+        .remove
+        .sort_unstable_by_key(|target| target.endpoint.key());
     for target in &mut actions.remove {
         target
             .guards
@@ -257,7 +263,7 @@ pub(super) async fn reconcile(
     let removals: Vec<&RemovalTarget> = actions
         .remove
         .iter()
-        .filter(|target| !in_flight(target.key.as_str()))
+        .filter(|target| !in_flight(&target.endpoint.lookup_form()))
         .collect();
     let additions: Vec<&DesiredWorker> = actions
         .add
@@ -284,14 +290,16 @@ pub(super) async fn reconcile(
         info!(
             "Removing worker {} ({} registration(s), pod {}): pod unready, gone, \
              terminating, or replaced",
-            target.key,
+            target.endpoint.key(),
             target.guards.len(),
             target.pod_uid
         );
-        // The canonical key is scheme-less, which `find_workers_by_url`
-        // resolves against every spelling the group was registered under.
+        // Scheme-less for a network address, so `find_workers_by_url` reaches
+        // every spelling the group was registered under. An IPC endpoint keeps
+        // its scheme, because its key is a bare socket path that would not
+        // parse back.
         let job = Job::RemoveWorker {
-            url: target.key.as_str().to_string(),
+            url: target.endpoint.lookup_form(),
             expected_revisions: Some(
                 target
                     .guards
@@ -305,7 +313,11 @@ pub(super) async fn reconcile(
                 metrics_labels::DISCOVERY_KUBERNETES,
                 metrics_labels::DEREGISTRATION_RECONCILED,
             ),
-            Err(e) => error!("Failed to submit worker removal for {}: {}", target.key, e),
+            Err(e) => error!(
+                "Failed to submit worker removal for {}: {}",
+                target.endpoint.key(),
+                e
+            ),
         }
     }
 
@@ -402,7 +414,7 @@ mod tests {
     fn owned_rank(url: &str, uid: &str, id: &str, revision: u64) -> OwnedWorker {
         OwnedWorker {
             id: WorkerId::from_string(id.to_string()),
-            key: key(url),
+            endpoint: Endpoint::parse_with_rank(url).expect(url).0,
             pod_uid: uid.to_string(),
             revision,
         }
@@ -437,7 +449,7 @@ mod tests {
         let actions = compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
         assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].key.as_str(), "10.0.0.2:8080");
+        assert_eq!(actions.remove[0].endpoint.key().as_str(), "10.0.0.2:8080");
     }
 
     #[test]
@@ -462,7 +474,7 @@ mod tests {
         ];
         let actions = compute_actions(&DesiredState::default(), &registered);
         assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].key.as_str(), "10.0.0.1:8080");
+        assert_eq!(actions.remove[0].endpoint.key().as_str(), "10.0.0.1:8080");
         assert_eq!(actions.remove[0].guards.len(), 2);
         assert!(actions.add.is_empty());
     }
@@ -528,7 +540,7 @@ mod tests {
 
         let owned = k8s_owned_workers(&app_context);
         assert_eq!(owned.len(), 1);
-        assert_eq!(owned[0].key.as_str(), "10.0.0.1:8080");
+        assert_eq!(owned[0].endpoint.key().as_str(), "10.0.0.1:8080");
         assert_eq!(owned[0].pod_uid, "uid-1");
     }
 

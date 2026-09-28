@@ -289,7 +289,6 @@ mod tests {
                 health: None,
             },
             worker_url: worker.url().to_string(),
-            dp_aware: false,
             app_context: Some(app_context),
             workers_to_update: Some(vec![worker]),
             updated_workers: None,

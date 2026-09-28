@@ -693,7 +693,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{registry::WorkerId, EndpointKey};
+    use crate::worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey};
 
     fn create_k8s_pod(
         name: Option<&str>,
@@ -1234,7 +1234,7 @@ mod tests {
     fn owned(url: &str, uid: &str) -> reconciler::OwnedWorker {
         reconciler::OwnedWorker {
             id: WorkerId::from_string(url.to_string()),
-            key: key(url),
+            endpoint: Endpoint::parse_with_rank(url).expect(url).0,
             pod_uid: uid.to_string(),
             revision: 1,
         }

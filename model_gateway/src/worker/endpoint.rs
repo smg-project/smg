@@ -125,6 +125,11 @@ pub struct Endpoint {
     scheme: Option<Scheme>,
     host: Host,
     port: Option<u16>,
+    /// Path prefix, when the address carries one. `validate_worker_url`
+    /// accepts `http://proxy:8080/sglang`, and `endpoint_url` appends the
+    /// route to it, so the prefix is part of which backend this names.
+    /// Stored with its leading `/` and without a trailing one.
+    path: Option<String>,
 }
 
 /// Canonical identity of a backend: scheme- and rank-stripped.
@@ -180,13 +185,26 @@ impl Endpoint {
                     scheme,
                     host: Host::IpcPath(rest.to_string()),
                     port: None,
+                    path: None,
                 },
                 rank,
             ));
         }
 
-        let (host, port) = split_host_port(rest)?;
-        Ok((Endpoint { scheme, host, port }, rank))
+        let (authority, path) = split_path(rest);
+        if authority.is_empty() {
+            return Err(EndpointError::Empty);
+        }
+        let (host, port) = split_host_port(authority)?;
+        Ok((
+            Endpoint {
+                scheme,
+                host,
+                port,
+                path,
+            },
+            rank,
+        ))
     }
 
     pub fn scheme(&self) -> Option<Scheme> {
@@ -201,6 +219,11 @@ impl Endpoint {
         self.port
     }
 
+    /// Path prefix, if the address carries one.
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
     /// Whether this endpoint names an `ipc://` socket.
     pub fn is_ipc(&self) -> bool {
         matches!(self.host, Host::IpcPath(_))
@@ -213,21 +236,37 @@ impl Endpoint {
     /// path is a filesystem path, so in practice it cannot collide with a
     /// `host:port`; a contrived path shaped like one would.
     pub fn key(&self) -> EndpointKey {
+        let path = self.path.as_deref().unwrap_or("");
         EndpointKey(match (&self.host, self.port) {
-            (Host::IpcPath(path), _) => path.clone(),
-            (host, Some(port)) => format!("{}:{port}", render_host(host)),
-            (host, None) => render_host(host),
+            (Host::IpcPath(socket), _) => socket.clone(),
+            (host, Some(port)) => format!("{}:{port}{path}", render_host(host)),
+            (host, None) => format!("{}{path}", render_host(host)),
         })
+    }
+
+    /// The form to submit when something has to look this endpoint up again
+    /// by string, as a removal job does.
+    ///
+    /// Identical to [`Self::key`] for a network address. An IPC endpoint keeps
+    /// its `ipc://` prefix, because its key is a bare socket path and a bare
+    /// path is not a parseable address — feeding the key back would select
+    /// nothing.
+    pub fn lookup_form(&self) -> String {
+        match &self.host {
+            Host::IpcPath(socket) => format!("ipc://{socket}"),
+            _ => self.key().0,
+        }
     }
 
     /// Render the endpoint as written, preserving the scheme and bracketing
     /// IPv6. Round-trips through [`Self::parse`].
     pub fn render(&self) -> String {
         let prefix = self.scheme.map(Scheme::as_prefix).unwrap_or("");
+        let path = self.path.as_deref().unwrap_or("");
         match (&self.host, self.port) {
-            (Host::IpcPath(path), _) => format!("ipc://{path}"),
-            (host, Some(port)) => format!("{prefix}{}:{port}", render_host(host)),
-            (host, None) => format!("{prefix}{}", render_host(host)),
+            (Host::IpcPath(socket), _) => format!("ipc://{socket}"),
+            (host, Some(port)) => format!("{prefix}{}:{port}{path}", render_host(host)),
+            (host, None) => format!("{prefix}{}{path}", render_host(host)),
         }
     }
 
@@ -273,6 +312,25 @@ fn split_rank(input: &str) -> (&str, Option<usize>) {
         // A run of digits too long for usize is not a rank anyone assigned.
         Err(_) => (input, None),
     }
+}
+
+/// Split an authority from its path prefix.
+///
+/// The search starts after a bracketed IPv6 host so the brackets' own colons
+/// and the authority are never mistaken for a path.
+fn split_path(rest: &str) -> (&str, Option<String>) {
+    let after_brackets = rest.find(']').map_or(0, |close| close + 1);
+    let Some(offset) = rest[after_brackets..].find('/') else {
+        return (rest, None);
+    };
+    let at = after_brackets + offset;
+    let path = rest[at..].trim_end_matches('/');
+    if path.is_empty() {
+        // A bare trailing slash names the same backend; `endpoint_url` appends
+        // a route that already starts with one.
+        return (&rest[..at], None);
+    }
+    (&rest[..at], Some(path.to_string()))
 }
 
 fn split_host_port(rest: &str) -> Result<(Host, Option<u16>), EndpointError> {
@@ -504,9 +562,13 @@ mod tests {
             EndpointError::MalformedIpv6 { .. }
         ));
         assert!(matches!(
-            Endpoint::parse("host/path:8080").unwrap_err(),
+            Endpoint::parse("ho st:8080").unwrap_err(),
             EndpointError::InvalidHost { .. }
         ));
+        assert_eq!(
+            Endpoint::parse("/just/a/path").unwrap_err(),
+            EndpointError::Empty
+        );
     }
 
     #[test]
@@ -514,6 +576,61 @@ mod tests {
         let endpoint = Endpoint::parse("fd00::1").unwrap();
         assert_eq!(endpoint.port(), None);
         assert_eq!(endpoint.key().as_str(), "[fd00::1]");
+    }
+
+    /// `validate_worker_url` accepts a path prefix and `endpoint_url` appends
+    /// the route to it, so the prefix names part of the backend and has to
+    /// survive into the key. Rejecting these made a worker registered behind a
+    /// path unfindable for removal and update.
+    #[test]
+    fn a_path_prefix_is_part_of_the_backend() {
+        assert_eq!(key_of("http://proxy:8080/sglang"), "proxy:8080/sglang");
+        assert_eq!(key_of("https://api.example.com/v1"), "api.example.com/v1");
+        assert_eq!(key_of("http://[fd00::1]:8080/v1"), "[fd00::1]:8080/v1");
+
+        // Same backend, different spellings.
+        assert_eq!(key_of("grpc://proxy:8080/sglang@2"), "proxy:8080/sglang");
+        // Different path, different backend.
+        assert_ne!(key_of("http://proxy:8080/a"), key_of("http://proxy:8080/b"));
+        // A path is not optional decoration.
+        assert_ne!(key_of("http://proxy:8080/a"), key_of("http://proxy:8080"));
+    }
+
+    #[test]
+    fn a_trailing_slash_names_the_same_backend() {
+        assert_eq!(key_of("http://proxy:8080/"), key_of("http://proxy:8080"));
+        assert_eq!(
+            key_of("http://proxy:8080/v1/"),
+            key_of("http://proxy:8080/v1")
+        );
+        assert_eq!(
+            Endpoint::parse("http://proxy:8080/v1/").unwrap().render(),
+            "http://proxy:8080/v1"
+        );
+    }
+
+    /// An IPC key is a bare socket path, which is not a parseable address, so
+    /// a removal that re-submits the key by string must use the lookup form.
+    #[test]
+    fn lookup_form_round_trips_where_the_key_cannot() {
+        let ipc = Endpoint::parse("ipc:///tmp/w.sock").unwrap();
+        assert_eq!(ipc.key().as_str(), "/tmp/w.sock");
+        assert!(Endpoint::parse(ipc.key().as_str()).is_err());
+
+        assert_eq!(ipc.lookup_form(), "ipc:///tmp/w.sock");
+        assert_eq!(
+            Endpoint::parse(&ipc.lookup_form()).unwrap().key(),
+            ipc.key()
+        );
+
+        // For a network address the two coincide, and stay scheme-less so a
+        // removal still reaches every spelling of the backend.
+        let net = Endpoint::parse("http://proxy:8080/sglang").unwrap();
+        assert_eq!(net.lookup_form(), net.key().as_str());
+        assert_eq!(
+            Endpoint::parse(&net.lookup_form()).unwrap().key(),
+            net.key()
+        );
     }
 
     #[test]

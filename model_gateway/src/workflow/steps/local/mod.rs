@@ -235,12 +235,9 @@ pub fn create_worker_update_workflow_data(
     update_config: WorkerUpdateRequest,
     app_context: Arc<AppContext>,
 ) -> WorkerUpdateWorkflowData {
-    // Determine if this is a DP-aware update based on URL pattern
-    let dp_aware = worker_url.contains('@');
     WorkerUpdateWorkflowData {
         config: update_config,
         worker_url,
-        dp_aware,
         app_context: Some(app_context),
         workers_to_update: None,
         updated_workers: None,
@@ -287,6 +284,52 @@ mod dp_removal_tests {
         let both = vec!["http://[0:0:0:0:0:0:0:1]:8080", "http://[::1]:8080"];
         assert_eq!(urls(&registry, "http://[::1]:8080"), both);
         assert_eq!(urls(&registry, "http://[0:0:0:0:0:0:0:1]:8080"), both);
+    }
+
+    /// `validate_worker_url` accepts a path prefix and `endpoint_url` appends
+    /// the route to it, so workers really are registered behind one. Rejecting
+    /// those addresses made them unfindable: `DELETE`/`PATCH` failed with
+    /// "not found", and health-check removal took the stale-removal branch and
+    /// reported success without removing anything.
+    #[test]
+    fn a_path_prefixed_registration_is_still_found() {
+        let registry = WorkerRegistry::new();
+        register(&registry, "http://proxy:8080/sglang", None);
+        register(&registry, "http://proxy:8080/other", None);
+        register(&registry, "http://proxy:8080", None);
+
+        assert_eq!(
+            urls(&registry, "http://proxy:8080/sglang"),
+            vec!["http://proxy:8080/sglang"]
+        );
+        // The path is part of the backend, so siblings are left alone.
+        assert_eq!(
+            urls(&registry, "http://proxy:8080"),
+            vec!["http://proxy:8080"]
+        );
+        // And a scheme-less query still reaches it.
+        assert_eq!(
+            urls(&registry, "proxy:8080/sglang"),
+            vec!["http://proxy:8080/sglang"]
+        );
+    }
+
+    /// A DP group behind a path prefix resolves as a group.
+    #[test]
+    fn a_path_prefixed_dp_group_resolves_together() {
+        let registry = WorkerRegistry::new();
+        let base = "http://proxy:8080/sglang";
+        register(&registry, base, Some(0));
+        register(&registry, base, Some(1));
+
+        assert_eq!(
+            urls(&registry, base),
+            vec!["http://proxy:8080/sglang@0", "http://proxy:8080/sglang@1"]
+        );
+        assert_eq!(
+            urls(&registry, "http://proxy:8080/sglang@1"),
+            vec!["http://proxy:8080/sglang@1"]
+        );
     }
 
     #[test]
