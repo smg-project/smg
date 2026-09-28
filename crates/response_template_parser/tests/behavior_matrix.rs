@@ -1002,11 +1002,25 @@ fn behavior_matrix_exactly_cap_cap_plus_one_poisoned_after_overflow_every_split_
     let body_plus_one_wire = tool_wire("x", body_plus_one);
     let body_config = config_with_limits(4_096, 4_096, body_cap);
 
+    // A text body's cap is checked while the field is still open, including
+    // when only the appended bytes of that field are scanned.
+    let text_body_cap = 16;
+    let text_body_exact_wire = format!(
+        "<|channel|>final<|message|>{}<|return|>",
+        "x".repeat(text_body_cap)
+    );
+    let text_body_plus_one_wire = format!(
+        "<|channel|>final<|message|>{}<|return|>",
+        "x".repeat(text_body_cap + 1)
+    );
+    let text_body_config = config_with_limits(4_096, 4_096, text_body_cap);
+
     for (config, input) in [
         (pending_config, pending_exact.as_bytes()),
         (name_config, name_exact_wire.as_bytes()),
         (value_config, value_exact_wire.as_bytes()),
         (body_config, body_exact_wire.as_bytes()),
+        (text_body_config, text_body_exact_wire.as_bytes()),
     ] {
         exactly_cap(config, input);
         all_chunkings(config, input);
@@ -1041,10 +1055,33 @@ fn behavior_matrix_exactly_cap_cap_plus_one_poisoned_after_overflow_every_split_
             "max_body_bytes",
             body_cap,
         ),
+        (
+            text_body_config,
+            text_body_plus_one_wire.as_bytes(),
+            "StructuredFieldOverflow",
+            "max_body_bytes",
+            text_body_cap,
+        ),
     ] {
         let error = cap_plus_one(config, input, variant, field);
         assert_eq!(error.limit, limit);
         let streamed = all_chunkings(config, input);
         assert_eq!(streamed.error, Some(error));
     }
+}
+
+#[test]
+fn opener_like_text_inside_a_text_body_is_content_at_every_split() {
+    // The quoted tool opener's name exceeds the structured cap, but it sits
+    // inside a thinking body and is therefore body text, not framing.
+    let config = config_with_limits(4_096, 8, 4_096);
+    let quoted = "quoted to=very.long.tool.name<|channel|>analysis<|message|> text";
+    let wire = format!(
+        "<|channel|>analysis<|message|>{quoted}<|end|><|channel|>final<|message|>ok<|return|>"
+    );
+    let streamed = one_chunk_equals_every_byte_split(config, &wire);
+    assert_eq!(streamed.error, None);
+    assert_eq!(streamed.output.thinking, quoted);
+    assert_eq!(streamed.output.content, "ok");
+    assert!(streamed.output.tool_calls.is_empty());
 }
