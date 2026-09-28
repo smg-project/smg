@@ -36,7 +36,10 @@ use llm_tokenizer::{
 use mock_worker::{
     config::Config as MockConfig,
     engine::EngineParams,
-    grpc::{install_test_controls, remove_test_controls, GrpcTestControls, GrpcTestTokenizerReply},
+    grpc::{
+        install_test_controls, install_test_generate_replies, remove_test_controls,
+        GrpcTestControls, GrpcTestTokenizerReply,
+    },
 };
 use openai_protocol::worker::HealthCheckConfig;
 use response_template_parser::{
@@ -54,6 +57,7 @@ use smg::{
         TokenizerConfigRequest,
     },
 };
+use smg_grpc_client::tokenspeed_proto as ts;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wfaas::{
@@ -527,10 +531,16 @@ async fn request_json(app: &axum::Router, uri: &str, payload: Value) -> Value {
         ))
         .expect("build request");
     let response = app.clone().oneshot(request).await.expect("route request");
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read response body");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{uri}: {}",
+        String::from_utf8_lossy(&body)
+    );
     serde_json::from_slice(&body).expect("response json")
 }
 
@@ -544,10 +554,16 @@ async fn request_sse(app: &axum::Router, uri: &str, payload: Value) -> Vec<Value
         ))
         .expect("build request");
     let response = app.clone().oneshot(request).await.expect("route request");
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read response stream");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{uri}: {}",
+        String::from_utf8_lossy(&body)
+    );
     String::from_utf8(body.to_vec())
         .expect("utf8 SSE")
         .lines()
@@ -673,6 +689,224 @@ fn responses_fields_mapped(response: &Value) -> bool {
         && calls.len() == 2
         && call_matches(0, "weather.lookup", json!({"city":"Paris","days":"2"}))
         && call_matches(1, "calendar.lookup", json!({"day":"tomorrow"}))
+}
+
+fn logprob_replies(ids: &[u32], width: usize, chunk_scores: bool) -> Vec<ts::GenerateResponse> {
+    let scores = |count: usize| ts::OutputLogProbs {
+        token_ids: ids[..count].to_vec(),
+        token_logprobs: (0..count).map(|i| -((i + 1) as f32) / 128.0).collect(),
+        top_logprobs: (0..count)
+            .map(|i| ts::TopLogProbs {
+                token_ids: vec![ids[i], BYTE_BASE + u32::from(b'z')],
+                values: vec![-((i + 1) as f32) / 128.0, -((i + 1) as f32) / 128.0 - 0.25],
+            })
+            .collect(),
+    };
+    let mut replies = Vec::new();
+    let mut end = 0;
+    for chunk in ids.chunks(width) {
+        end += chunk.len();
+        // Token IDs are delta; TokenSpeed score arrays are cumulative. Complete
+        // alone owns the final two score records, even with one large chunk.
+        replies.push(ts::GenerateResponse {
+            request_id: String::new(),
+            response: Some(ts::generate_response::Response::Chunk(
+                ts::GenerateStreamChunk {
+                    token_ids: chunk.to_vec(),
+                    prompt_tokens: 1,
+                    completion_tokens: end as u32,
+                    cached_tokens: 0,
+                    output_logprobs: chunk_scores.then(|| scores(end.min(ids.len() - 2))),
+                    index: 0,
+                },
+            )),
+        });
+    }
+    replies.push(ts::GenerateResponse {
+        request_id: String::new(),
+        response: Some(ts::generate_response::Response::Complete(
+            ts::GenerateComplete {
+                output_ids: ids.to_vec(),
+                finish_reason: "length".to_owned(),
+                prompt_tokens: 1,
+                completion_tokens: ids.len() as u32,
+                cached_tokens: 0,
+                output_logprobs: Some(scores(ids.len())),
+                matched_stop: None,
+                index: 0,
+                ..Default::default()
+            },
+        )),
+    });
+    replies
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the deterministic test aborts its server task after each scenario"
+)]
+async fn response_template_gateway_logprobs_match_raw_unary() {
+    struct MockCleanup {
+        port: u16,
+        server: tokio::task::AbortHandle,
+    }
+
+    impl Drop for MockCleanup {
+        fn drop(&mut self) {
+            self.server.abort();
+            remove_test_controls(self.port);
+        }
+    }
+
+    let port = free_port();
+    let server = tokio::spawn(mock_worker::grpc::serve(
+        mock_config(port),
+        "127.0.0.1".to_owned(),
+        port,
+    ));
+    let _cleanup = MockCleanup {
+        port,
+        server: server.abort_handle(),
+    };
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    let registry = Arc::new(TokenizerRegistry::new());
+    let tokenizer: Arc<dyn TokenizerTrait> = Arc::new(SyntheticTokenizer::new(Some(
+        serde_json::to_value(response_template()).expect("template value"),
+    )));
+    let registered = tokenizer.clone();
+    registry
+        .load("logprobs-synthetic", MODEL, "synthetic", || async move {
+            Ok(registered)
+        })
+        .await
+        .expect("register logprobs tokenizer");
+    let context =
+        common::create_test_context_with_tokenizer_registry(router_config(), registry).await;
+    register_grpc_worker(&context, port);
+    let router: Arc<dyn RouterTrait> = Arc::from(
+        RouterFactory::create_router(&context)
+            .await
+            .expect("build logprobs router"),
+    );
+    let app = common::test_app::create_test_app_with_context(router, context);
+    let payload = |stream: bool, requested: bool| {
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": stream,
+            "logprobs": requested,
+            "stop": ["<|end|>STOP"]
+        })
+    };
+
+    // Empty analysis produces no mapped text. The final <|end|> is a complete
+    // field close but only a prefix of the caller's stop: the real decoder
+    // holds it until Complete. EOS separately exercises a local stop.
+    for (tail, content, finish) in [
+        ("aaaa<|end|>", "aaaa", "length"),
+        ("aaaa<|return|>", "aaaa", "stop"),
+    ] {
+        let wire =
+            format!("<|channel|>analysis<|message|><|end|><|channel|>final<|message|>{tail}");
+        let ids = SyntheticTokenizer::token_ids(&wire);
+        let expected = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let token = tokenizer.decode(&[*id], false).expect("decode raw token");
+                let score = -((i + 1) as f32) / 128.0;
+                json!({
+                    "token": token, "bytes": token.as_bytes(), "logprob": score,
+                    "top_logprobs": [
+                        {"token": token, "bytes": token.as_bytes(), "logprob": score},
+                        {"token": "z", "bytes": [122], "logprob": score - 0.25}
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(ids
+            .windows(4)
+            .any(|window| window == [BYTE_BASE + u32::from(b'a'); 4]));
+
+        for (width, chunk_scores) in [(1, true), (7, true), (ids.len(), true), (ids.len(), false)] {
+            install_test_generate_replies(port, logprob_replies(&ids, width, chunk_scores));
+            let unary = request_json(&app, "/v1/chat/completions", payload(false, true)).await;
+            let events = request_sse(&app, "/v1/chat/completions", payload(true, true)).await;
+            assert_eq!(unary["choices"][0]["logprobs"]["content"], json!(expected));
+            let score_events = events
+                .iter()
+                .filter(|event| event["choices"][0]["logprobs"]["content"].is_array())
+                .collect::<Vec<_>>();
+            let streamed = score_events
+                .iter()
+                .flat_map(|event| {
+                    event["choices"][0]["logprobs"]["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                streamed, expected,
+                "tail={tail}, width={width}, chunk_scores={chunk_scores}"
+            );
+            assert_eq!(
+                serde_json::to_vec(&streamed).unwrap(),
+                serde_json::to_vec(&unary["choices"][0]["logprobs"]["content"]).unwrap()
+            );
+            assert_eq!(
+                score_events.last().expect("terminal score suffix")["choices"][0]["logprobs"]
+                    ["content"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                if chunk_scores { 2 } else { ids.len() }
+            );
+            for event in &score_events {
+                let choice = &event["choices"][0];
+                assert_eq!(choice["index"], 0);
+                for key in ["role", "content", "reasoning_content", "tool_calls"] {
+                    assert!(
+                        choice["delta"][key].is_null(),
+                        "scores must not be attached to mapped text: {event}"
+                    );
+                }
+                assert!(choice["finish_reason"].is_null());
+            }
+            let mapped = normalize_chat_events(&events);
+            assert_eq!(
+                mapped,
+                normalize_chat_message(&unary["choices"][0]["message"])
+            );
+            assert_eq!(mapped["content"], content);
+            assert_eq!(mapped["reasoning_content"], "");
+            assert!(!contains_delimiter(&mapped));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["choices"][0]["finish_reason"].is_string())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .find(|event| event["choices"][0]["finish_reason"].is_string())
+                    .unwrap()["choices"][0]["finish_reason"],
+                finish
+            );
+
+            // The override deliberately ignores request.logprobs: suppression
+            // must happen in the real template streaming branch, not the mock.
+            let unrequested = request_sse(&app, "/v1/chat/completions", payload(true, false)).await;
+            assert!(unrequested
+                .iter()
+                .all(|event| event["choices"][0]["logprobs"].is_null()));
+            assert_eq!(normalize_chat_events(&unrequested), mapped);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

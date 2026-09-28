@@ -16,7 +16,7 @@ use llm_tokenizer::{
     traits::Tokenizer,
 };
 use openai_protocol::{
-    chat::ChatCompletionStreamResponse,
+    chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice},
     common::{
         ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
         ToolChoiceValue, Usage,
@@ -54,7 +54,8 @@ use crate::{
             },
             context,
             proto_wrapper::{
-                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoResponseVariant, ProtoStream,
+                ChunkSemantics, ProtoGenerateComplete, ProtoGenerateStreamChunk,
+                ProtoOutputLogProbs, ProtoResponseVariant, ProtoStream,
             },
             spec::{
                 ChatResponseSpec, CompletionResponseSpec, GenerateResponseSpec,
@@ -175,6 +176,14 @@ impl ChatStreamError {
             _ => "internal_error",
         }
     }
+}
+
+/// Only a contiguous raw-token prefix may be emitted. Delta payloads after a
+/// score gap wait for a cumulative snapshot; token identity is not a cursor.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResponseTemplateLogprobState {
+    sent: usize,
+    observed: usize,
 }
 
 /// Shared streaming processor for both single and prefill/decode dispatch modes
@@ -383,6 +392,9 @@ impl StreamingProcessor {
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), ChatStreamError> {
+        // gRPC vLLM repeats its final Chunk in Complete. ZMQ also uses vLLM
+        // response types, but its Complete carries cumulative totals instead.
+        let complete_repeats_delta = matches!(&grpc_stream, ProtoStream::Vllm(_));
         // Metrics timing
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -461,6 +473,8 @@ impl StreamingProcessor {
         let mut response_template_streams: HashMap<u32, ResponseStreamingParser> = HashMap::new();
         let mut response_template_tool_counts: HashMap<u32, usize> = HashMap::new();
         let mut response_template_external_stops: HashMap<u32, String> = HashMap::new();
+        let mut response_template_logprobs_sent: HashMap<u32, ResponseTemplateLogprobState> =
+            HashMap::new();
 
         // Check parser availability once upfront (log warning only once per request)
         let reasoning_parser_available = separate_reasoning
@@ -638,14 +652,40 @@ impl StreamingProcessor {
                             stopped_indices.insert(index);
                         }
 
-                        if chunk_text.is_empty() && external_visible_stop.is_none() {
+                        // Preserve the template-less empty-text fast path.
+                        if response_template_parser.is_none()
+                            && chunk_text.is_empty()
+                            && external_visible_stop.is_none()
+                        {
                             continue;
                         }
 
-                        // Process logprobs if present
-                        let choice_logprobs = chunk.output_logprobs().map(|ref proto_logprobs| {
-                            utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer)
-                        });
+                        // Process template logprobs even when the decoder holds
+                        // all text (partial stops or incomplete token decoding).
+                        let choice_logprobs = if response_template_parser.is_some() {
+                            if original_request.logprobs {
+                                Self::response_template_logprobs_delta(
+                                    chunk.output_logprobs(),
+                                    chunk.chunk_semantics(),
+                                    chunk.token_ids().len(),
+                                    response_template_logprobs_sent.entry(index).or_default(),
+                                    &tokenizer,
+                                )?
+                            } else {
+                                None
+                            }
+                        } else {
+                            chunk.output_logprobs().map(|ref proto_logprobs| {
+                                utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer)
+                            })
+                        };
+
+                        if chunk_text.is_empty()
+                            && external_visible_stop.is_none()
+                            && (response_template_parser.is_none() || choice_logprobs.is_none())
+                        {
+                            continue;
+                        }
 
                         Some((index, chunk_text, choice_logprobs, external_visible_stop))
                     }
@@ -705,8 +745,25 @@ impl StreamingProcessor {
                             );
                         }
 
+                        // Recover only from cumulative terminals; gRPC vLLM's
+                        // repeated final delta must not be emitted a second time.
+                        let choice_logprobs =
+                            if response_template_parser.is_some() && original_request.logprobs {
+                                Self::response_template_logprobs_complete(
+                                    complete.output_logprobs(),
+                                    complete_repeats_delta,
+                                    response_template_logprobs_sent.entry(index).or_default(),
+                                    &tokenizer,
+                                )?
+                            } else {
+                                None
+                            };
                         // Don't break - continue reading all Complete messages for n>1
-                        flushed.map(|text| (index, text, None, None))
+                        if flushed.is_some() || choice_logprobs.is_some() {
+                            Some((index, flushed.unwrap_or_default(), choice_logprobs, None))
+                        } else {
+                            None
+                        }
                     }
                     Some(ProtoResponseVariant::None) => continue,
                     None => {
@@ -755,6 +812,7 @@ impl StreamingProcessor {
                 let parsed = stream.feed(text.as_bytes())?;
                 Self::emit_response_template_output(
                     parsed,
+                    choice_logprobs,
                     index,
                     &mut response_template_tool_counts,
                     &mut has_tool_calls,
@@ -898,6 +956,7 @@ impl StreamingProcessor {
             };
             Self::emit_response_template_output(
                 parsed,
+                None,
                 *index,
                 &mut response_template_tool_counts,
                 &mut has_tool_calls,
@@ -1073,9 +1132,84 @@ impl StreamingProcessor {
         Ok(())
     }
 
+    /// The unary template path exposes raw generated-token logprobs, not
+    /// probabilities for the parser's rewritten content/tool JSON. Normalize
+    /// backend cumulative/delta payloads before emitting the same token stream.
+    /// Parser buffering and finish/default output do not advance this cursor.
+    fn response_template_logprobs_delta(
+        logprobs: Option<ProtoOutputLogProbs>,
+        semantics: ChunkSemantics,
+        token_count: usize,
+        state: &mut ResponseTemplateLogprobState,
+        tokenizer: &Arc<dyn Tokenizer>,
+    ) -> Result<Option<ChatLogProbs>, ChatStreamError> {
+        let delta_start = state.observed;
+        if semantics.is_delta() {
+            state.observed += token_count;
+        }
+        let Some(logprobs) = logprobs else {
+            return Ok(None);
+        };
+        let count = logprobs.token_logprobs.len();
+        if semantics.is_delta() && (state.sent != delta_start || count != token_count) {
+            // Even the scores supplied by an incomplete chunk cannot safely
+            // be positioned. Keep the last emitted prefix, and recover from
+            // a subsequent cumulative payload rather than reorder/duplicate.
+            return Ok(None);
+        }
+        let start = if semantics.is_delta() { 0 } else { state.sent };
+        if count < start {
+            return Err(ChatStreamError::Message(
+                "Response-template cumulative logprobs shrank after emission".to_string(),
+            ));
+        }
+        if !semantics.is_delta() {
+            state.observed = state.observed.max(count);
+        }
+        if count == start {
+            return Ok(None);
+        }
+        let delta = ProtoOutputLogProbs {
+            token_logprobs: logprobs.token_logprobs.into_iter().skip(start).collect(),
+            token_ids: logprobs.token_ids.into_iter().skip(start).collect(),
+            top_logprobs: logprobs.top_logprobs.into_iter().skip(start).collect(),
+        };
+        state.sent += count - start;
+        Ok(Some(utils::convert_proto_to_openai_logprobs(
+            &delta, tokenizer,
+        )))
+    }
+
+    fn response_template_logprobs_complete(
+        logprobs: Option<ProtoOutputLogProbs>,
+        repeats_delta: bool,
+        state: &mut ResponseTemplateLogprobState,
+        tokenizer: &Arc<dyn Tokenizer>,
+    ) -> Result<Option<ChatLogProbs>, ChatStreamError> {
+        let suffix = if repeats_delta {
+            None
+        } else {
+            Self::response_template_logprobs_delta(
+                logprobs,
+                ChunkSemantics::Cumulative,
+                0,
+                state,
+                tokenizer,
+            )?
+        };
+        if state.sent < state.observed {
+            return Err(ChatStreamError::Message(
+                "Response-template stream ended with unrecoverable missing token logprobs"
+                    .to_string(),
+            ));
+        }
+        Ok(suffix)
+    }
+
     #[expect(clippy::too_many_arguments)]
     async fn emit_response_template_output(
         output: ResponseTemplateOutput,
+        logprobs: Option<ChatLogProbs>,
         index: u32,
         tool_counts: &mut HashMap<u32, usize>,
         has_tool_calls: &mut HashMap<u32, bool>,
@@ -1093,6 +1227,34 @@ impl StreamingProcessor {
             return Err(ChatStreamError::Message(
                 "Response-template parser exposed raw wire bytes".to_string(),
             ));
+        }
+        if let Some(logprobs) = logprobs {
+            // No text delta: raw tokens may cover template framing, thinking,
+            // multiple fields, or a still-buffered delimiter. Attaching them
+            // to any one parsed field would imply a false token alignment.
+            let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice(ChatStreamChoice {
+                    index,
+                    delta: ChatMessageDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: None,
+                        reasoning_content: None,
+                    },
+                    logprobs: Some(logprobs),
+                    finish_reason: None,
+                    matched_stop: None,
+                })
+                .maybe_system_fingerprint(system_fingerprint)
+                .maybe_usage(usage.cloned())
+                .build();
+            let data = encoder
+                .encode_data(&ChatChunkWithUsage::new(&chunk, emit_usage_null))
+                .map_err(|error| format!("Failed to serialize logprobs chunk: {error}"))?;
+            tx.send(Ok(data))
+                .await
+                .map_err(|_| "Failed to send logprobs chunk".to_string())?;
         }
         if !output.thinking.is_empty() {
             let chunk = ChatCompletionStreamResponse::builder(request_id, model)
@@ -3729,6 +3891,370 @@ mod eof_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn template_test_logprobs(ids: &[u32]) -> ProtoOutputLogProbs {
+        ProtoOutputLogProbs {
+            token_logprobs: vec![-0.25; ids.len()],
+            token_ids: ids.to_vec(),
+            top_logprobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn response_template_logprobs_count_repeated_tokens_and_terminal_suffix_once() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(llm_tokenizer::MockTokenizer::new());
+        for semantics in [ChunkSemantics::Cumulative, ChunkSemantics::Delta] {
+            let mut sent = ResponseTemplateLogprobState::default();
+            let mut tokens = Vec::new();
+            let second = if semantics.is_delta() {
+                vec![1]
+            } else {
+                vec![1, 1]
+            };
+            for (ids, shape) in [
+                (vec![1], semantics),
+                (second, semantics),
+                (vec![1, 1, 2], ChunkSemantics::Cumulative),
+                (vec![1, 1, 2], ChunkSemantics::Cumulative),
+            ] {
+                if let Some(ChatLogProbs::Detailed {
+                    content: Some(content),
+                }) = StreamingProcessor::response_template_logprobs_delta(
+                    Some(template_test_logprobs(&ids)),
+                    shape,
+                    ids.len(),
+                    &mut sent,
+                    &tokenizer,
+                )
+                .unwrap()
+                {
+                    tokens.extend(content.into_iter().map(|entry| entry.token));
+                }
+            }
+            assert_eq!(tokens, ["Hello", "Hello", "world"]);
+            assert_eq!(sent.sent, 3);
+        }
+    }
+
+    #[test]
+    fn response_template_logprobs_choices_are_independent_and_missing_is_not_zero() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(llm_tokenizer::MockTokenizer::new());
+        let mut sent = HashMap::<u32, ResponseTemplateLogprobState>::new();
+        for index in [1, 0, 1, 0] {
+            let count = sent.entry(index).or_default();
+            let result = StreamingProcessor::response_template_logprobs_delta(
+                Some(template_test_logprobs(&vec![1; count.sent + 1])),
+                ChunkSemantics::Cumulative,
+                1,
+                count,
+                &tokenizer,
+            )
+            .unwrap();
+            let value = serde_json::to_value(result.unwrap()).unwrap();
+            assert_eq!(value["content"].as_array().unwrap().len(), 1);
+        }
+        assert!(sent
+            .values()
+            .all(|state| state.sent == 2 && state.observed == 2));
+        assert!(StreamingProcessor::response_template_logprobs_delta(
+            None,
+            ChunkSemantics::Cumulative,
+            0,
+            sent.get_mut(&0).unwrap(),
+            &tokenizer,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(sent[&0].sent, 2);
+        assert!(StreamingProcessor::response_template_logprobs_delta(
+            Some(template_test_logprobs(&[1])),
+            ChunkSemantics::Cumulative,
+            0,
+            sent.get_mut(&0).unwrap(),
+            &tokenizer,
+        )
+        .is_err());
+        assert_eq!(sent[&0].sent, 2);
+    }
+
+    fn template_score_tokens(scores: Option<ChatLogProbs>) -> Vec<String> {
+        match scores {
+            Some(ChatLogProbs::Detailed {
+                content: Some(content),
+            }) => content.into_iter().map(|entry| entry.token).collect(),
+            None => Vec::new(),
+            other => panic!("unexpected scores: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_template_logprobs_delta_gap_recovers_ordered_cumulative_suffix() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(llm_tokenizer::MockTokenizer::new());
+        // Missing A before B, and an already-emitted prefix before that gap.
+        // Also cover incomplete scores for a token-bearing two-token delta.
+        for prefix in [false, true] {
+            for incomplete in [false, true] {
+                let mut state = ResponseTemplateLogprobState::default();
+                let mut tokens = Vec::new();
+                let mut all_ids = Vec::new();
+                if prefix {
+                    tokens.extend(template_score_tokens(
+                        StreamingProcessor::response_template_logprobs_delta(
+                            Some(template_test_logprobs(&[3])),
+                            ChunkSemantics::Delta,
+                            1,
+                            &mut state,
+                            &tokenizer,
+                        )
+                        .unwrap(),
+                    ));
+                    all_ids.push(3);
+                }
+                let missing = if incomplete {
+                    Some(template_test_logprobs(&[1]))
+                } else {
+                    None
+                };
+                let missing_count = if incomplete { 2 } else { 1 };
+                assert!(StreamingProcessor::response_template_logprobs_delta(
+                    missing,
+                    ChunkSemantics::Delta,
+                    missing_count,
+                    &mut state,
+                    &tokenizer,
+                )
+                .unwrap()
+                .is_none());
+                all_ids.extend(std::iter::repeat_n(1, missing_count));
+                assert!(StreamingProcessor::response_template_logprobs_delta(
+                    Some(template_test_logprobs(&[2])),
+                    ChunkSemantics::Delta,
+                    1,
+                    &mut state,
+                    &tokenizer,
+                )
+                .unwrap()
+                .is_none());
+                all_ids.push(2);
+                tokens.extend(template_score_tokens(
+                    StreamingProcessor::response_template_logprobs_complete(
+                        Some(template_test_logprobs(&all_ids)),
+                        false,
+                        &mut state,
+                        &tokenizer,
+                    )
+                    .unwrap(),
+                ));
+                let expected = all_ids
+                    .iter()
+                    .map(|id| tokenizer.decode(&[*id], false).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(tokens, expected);
+                assert_eq!(state.sent, all_ids.len());
+                assert_eq!(state.observed, state.sent);
+                assert!(StreamingProcessor::response_template_logprobs_complete(
+                    Some(template_test_logprobs(&all_ids)),
+                    false,
+                    &mut state,
+                    &tokenizer,
+                )
+                .unwrap()
+                .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn response_template_logprobs_cumulative_snapshot_heals_delta_gap() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(llm_tokenizer::MockTokenizer::new());
+        let mut state = ResponseTemplateLogprobState::default();
+        assert!(StreamingProcessor::response_template_logprobs_delta(
+            None,
+            ChunkSemantics::Delta,
+            1,
+            &mut state,
+            &tokenizer,
+        )
+        .unwrap()
+        .is_none());
+        let first = StreamingProcessor::response_template_logprobs_delta(
+            Some(template_test_logprobs(&[1])),
+            ChunkSemantics::Cumulative,
+            0,
+            &mut state,
+            &tokenizer,
+        )
+        .unwrap();
+        assert_eq!(template_score_tokens(first), ["Hello"]);
+        let next = StreamingProcessor::response_template_logprobs_delta(
+            Some(template_test_logprobs(&[2])),
+            ChunkSemantics::Delta,
+            1,
+            &mut state,
+            &tokenizer,
+        )
+        .unwrap();
+        assert_eq!(template_score_tokens(next), ["world"]);
+    }
+
+    #[test]
+    fn response_template_logprobs_vllm_replayed_terminal_is_not_cumulative() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(llm_tokenizer::MockTokenizer::new());
+        let mut state = ResponseTemplateLogprobState::default();
+        let mut tokens = Vec::new();
+        for ids in [&[1, 1, 1][..], &[2][..]] {
+            tokens.extend(template_score_tokens(
+                StreamingProcessor::response_template_logprobs_delta(
+                    Some(template_test_logprobs(ids)),
+                    ChunkSemantics::Delta,
+                    ids.len(),
+                    &mut state,
+                    &tokenizer,
+                )
+                .unwrap(),
+            ));
+        }
+        // Four emitted scores followed by a one-score Complete: no shrink
+        // error and no fifth score, unlike a cumulative terminal suffix.
+        assert_eq!(tokens, ["Hello", "Hello", "Hello", "world"]);
+        assert!(StreamingProcessor::response_template_logprobs_complete(
+            Some(template_test_logprobs(&[2])),
+            true,
+            &mut state,
+            &tokenizer,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(state.sent, 4);
+        assert!(StreamingProcessor::response_template_logprobs_complete(
+            None, true, &mut state, &tokenizer,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn response_template_logprobs_delta_gap_is_choice_local_and_unrecoverable_fails() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(llm_tokenizer::MockTokenizer::new());
+        let mut states = HashMap::<u32, ResponseTemplateLogprobState>::new();
+        assert!(StreamingProcessor::response_template_logprobs_delta(
+            None,
+            ChunkSemantics::Delta,
+            1,
+            states.entry(0).or_default(),
+            &tokenizer,
+        )
+        .unwrap()
+        .is_none());
+        // A no-token heartbeat does not introduce a gap in another choice.
+        assert!(StreamingProcessor::response_template_logprobs_delta(
+            None,
+            ChunkSemantics::Delta,
+            0,
+            states.entry(1).or_default(),
+            &tokenizer,
+        )
+        .unwrap()
+        .is_none());
+        let other = StreamingProcessor::response_template_logprobs_delta(
+            Some(template_test_logprobs(&[2])),
+            ChunkSemantics::Delta,
+            1,
+            states.entry(1).or_default(),
+            &tokenizer,
+        )
+        .unwrap();
+        assert_eq!(template_score_tokens(other), ["world"]);
+        assert!(StreamingProcessor::response_template_logprobs_complete(
+            Some(template_test_logprobs(&[2])),
+            true,
+            states.get_mut(&1).unwrap(),
+            &tokenizer,
+        )
+        .unwrap()
+        .is_none());
+        for repeats_delta in [false, true] {
+            let error = StreamingProcessor::response_template_logprobs_complete(
+                None,
+                repeats_delta,
+                states.get_mut(&0).unwrap(),
+                &tokenizer,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("unrecoverable missing token logprobs"));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_template_logprobs_emit_without_text_and_never_attach_to_parsed_fields() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(llm_tokenizer::MockTokenizer::new());
+        let logprobs =
+            utils::convert_proto_to_openai_logprobs(&template_test_logprobs(&[1, 1]), &tokenizer);
+        let (tx, mut rx) = sse_channel();
+        let mut tool_counts = HashMap::new();
+        let mut has_tool_calls = HashMap::new();
+        let mut encoder = SseEncoder::new();
+        // A buffered delimiter produces no mapped field. A later feed/finish
+        // may produce multiple fields, but must not repeat these token scores.
+        for (output, scores) in [
+            (ResponseTemplateOutput::default(), Some(logprobs)),
+            (
+                ResponseTemplateOutput {
+                    thinking: "reason".into(),
+                    content: "answer".into(),
+                    ..ResponseTemplateOutput::default()
+                },
+                None,
+            ),
+            (ResponseTemplateOutput::default(), None),
+        ] {
+            StreamingProcessor::emit_response_template_output(
+                output,
+                scores,
+                1,
+                &mut tool_counts,
+                &mut has_tool_calls,
+                0,
+                "request",
+                "model",
+                7,
+                None,
+                None,
+                false,
+                &tx,
+                &mut encoder,
+            )
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(data) = rx.recv().await {
+            let data = data.unwrap();
+            let text = std::str::from_utf8(&data).unwrap();
+            events.push(
+                serde_json::from_str::<Value>(text.strip_prefix("data: ").unwrap().trim()).unwrap(),
+            );
+        }
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["choices"][0]["index"], 1);
+        let choice = &events[0]["choices"][0];
+        assert_eq!(choice["logprobs"]["content"].as_array().unwrap().len(), 2);
+        for field in ["content", "reasoning_content", "tool_calls"] {
+            assert!(choice["delta"][field].is_null());
+        }
+        assert!(choice["finish_reason"].is_null());
+        assert_eq!(
+            events[1]["choices"][0]["delta"]["reasoning_content"],
+            "reason"
+        );
+        assert_eq!(events[2]["choices"][0]["delta"]["content"], "answer");
+        assert!(events[1..]
+            .iter()
+            .all(|event| event["choices"][0]["logprobs"].is_null()));
+    }
 
     #[test]
     fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {

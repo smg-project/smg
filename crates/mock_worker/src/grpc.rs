@@ -46,6 +46,23 @@ pub struct GrpcTestControls {
 }
 
 static TEST_CONTROLS: OnceLock<Mutex<HashMap<u16, GrpcTestControls>>> = OnceLock::new();
+static TEST_GENERATE_REPLIES: OnceLock<Mutex<HashMap<u16, Vec<ts::GenerateResponse>>>> =
+    OnceLock::new();
+
+/// Override canned generation for tests of chunk/Complete payload contracts
+/// (e.g. cumulative logprobs). Ordinary mock workers never install this hook.
+/// Removed by [`remove_test_controls`] with the other port-scoped controls.
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned test-control lock indicates a failed deterministic test setup"
+)]
+pub fn install_test_generate_replies(port: u16, replies: Vec<ts::GenerateResponse>) {
+    TEST_GENERATE_REPLIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("mock gRPC generate replies mutex poisoned")
+        .insert(port, replies);
+}
 
 /// Install deterministic controls before calling [`serve`].
 #[expect(
@@ -70,6 +87,12 @@ pub fn remove_test_controls(port: u16) {
         controls
             .lock()
             .expect("mock gRPC test controls mutex poisoned")
+            .remove(&port);
+    }
+    if let Some(replies) = TEST_GENERATE_REPLIES.get() {
+        replies
+            .lock()
+            .expect("mock gRPC generate replies mutex poisoned")
             .remove(&port);
     }
 }
@@ -164,6 +187,25 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned test-control lock indicates a failed deterministic test setup"
+        )]
+        let replies = TEST_GENERATE_REPLIES.get().and_then(|replies| {
+            replies
+                .lock()
+                .expect("mock gRPC generate replies mutex poisoned")
+                .get(&self.port)
+                .cloned()
+        });
+        if let Some(mut replies) = replies {
+            for reply in &mut replies {
+                reply.request_id.clone_from(&request.get_ref().request_id);
+            }
+            return Ok(Response::new(Box::pin(stream::iter(
+                replies.into_iter().map(Ok),
+            ))));
+        }
         // Realistic mode: submit to the engine simulator and stream its output.
         if let Some(engine) = &self.engine {
             let req = request.into_inner();
