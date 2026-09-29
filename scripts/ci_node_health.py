@@ -158,14 +158,6 @@ CHECKS: dict[str, Check] = {
             "runner pods) or raise `maxRunners` in `scripts/k8s-runner-resources/`.",
         ),
         Check(
-            "npd_unknown",
-            "WARN",
-            "NPD condition Unknown",
-            "The node-problem-detector plugin timed out or refused to run for most of the last "
-            "six hours, so a real fault on this node would go unnoticed.",
-            "`kubectl -n monitoring logs <npd pod on the node> | grep -iE 'timeout|not RDMA'`.",
-        ),
-        Check(
             "gpu_mem_leak",
             "WARN",
             "GPU memory held by no pod",
@@ -280,12 +272,6 @@ PROM_CHECKS: tuple[PromCheck, ...] = (
         CHECKS["node_cordoned"],
         "max by (node) (min_over_time(kube_node_spec_unschedulable[2h])) == 1",
         lambda m, v: "unschedulable for over 2h",
-    ),
-    PromCheck(
-        CHECKS["npd_unknown"],
-        "max by (node, condition) (avg_over_time(kube_node_status_condition"
-        f'{{condition=~"{NPD_CONDITIONS}",status="unknown"}}[6h])) > 0.5',
-        lambda m, v: f"{m['condition']} Unknown {v * 100:.0f}% of the last 6h",
     ),
     # A subquery, not min_over_time: when a GPU gets attributed to a pod, its
     # pod="" series goes stale but its old samples stay inside a [30m] range

@@ -299,13 +299,14 @@ One issue per check, never per node; the issue body lists the affected nodes.
 | CRIT | Monitor cannot reach Prometheus | the node checks were skipped this run |
 | WARN | H100 node cordoned | unschedulable for over 2 h |
 | WARN | GPU jobs waiting for runners | median H100 queue wait over 30 min in the last 2 h |
-| WARN | NPD condition Unknown | an NPD condition Unknown for over half of the last 6 h (plugin timeouts) |
 | WARN | GPU memory held by no pod | over 2 GiB allocated with no pod attached for 30 min |
 | WARN | GPU over 85C | for 15 min |
 | WARN | Workflow runs queued over 24h | runs that will never be picked up |
 
 ### Noise rules
 
+- NPD conditions stuck `Unknown` (plugin timeouts) do not open issues: they fired
+  constantly and cleared on their own. The count is still in the run summary's fleet table.
 - An issue opens on the first sighting and is edited in place while the problem persists,
   which the Slack app does not relay.
 - A state finding closes only after it has been absent for two consecutive runs. Checks that

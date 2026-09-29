@@ -18,7 +18,6 @@ name: CI node health
 #   [CRIT] Monitor cannot reach Prometheus   kubectl -n monitoring get pods | grep prometheus
 #   [WARN] H100 node cordoned        intentional? assign the issue to yourself. else kubectl uncordon
 #   [WARN] GPU jobs waiting for runners      free GPUs or raise maxRunners in scripts/k8s-runner-resources
-#   [WARN] NPD condition Unknown     kubectl -n monitoring logs <npd pod> | grep -iE 'timeout|not RDMA'
 #   [WARN] GPU memory held by no pod nvidia-smi --query-compute-apps on the node; kill the orphan
 #   [WARN] GPU over 85C              check clocks/power; OCI ticket if it persists idle
 #   [WARN] Workflow runs queued over 24h     gh run cancel <id>; fix the runs-on label

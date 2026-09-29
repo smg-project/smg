@@ -712,3 +712,8 @@ def test_main_dry_run_reports_monitor_blind_when_prometheus_is_down(mod, monkeyp
     rc = mod.main(["--dry-run", "--repo", "x/y"])
     assert rc == 1
     assert "monitor_blind" in capsys.readouterr().out
+
+
+def test_npd_unknown_does_not_open_issues(mod):
+    assert "npd_unknown" not in mod.CHECKS
+    assert all('status="unknown"' not in pc.promql for pc in mod.PROM_CHECKS)
