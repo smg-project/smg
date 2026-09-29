@@ -13,7 +13,7 @@ use std::{
 
 use axum::{
     extract::{Json, Multipart, Path, State},
-    http::{StatusCode, Version},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode, Version},
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
@@ -170,6 +170,7 @@ fn clear_scheduler_controls(port: u16) {
 pub struct RequestRecorder {
     bodies: Mutex<Vec<serde_json::Value>>,
     versions: Mutex<Vec<Version>>,
+    authorizations: Mutex<Vec<Option<String>>>,
 }
 
 impl RequestRecorder {
@@ -184,6 +185,21 @@ impl RequestRecorder {
     )]
     pub fn versions(&self) -> Vec<Version> {
         self.versions
+            .lock()
+            .expect("request recorder mutex poisoned")
+            .clone()
+    }
+
+    /// The `authorization` header of each RL control request received,
+    /// oldest first (RL control routes only; not aligned with
+    /// [`Self::bodies`]). `None` is a request that arrived without the
+    /// header.
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper - panicking on failure is intentional"
+    )]
+    pub fn authorizations(&self) -> Vec<Option<String>> {
+        self.authorizations
             .lock()
             .expect("request recorder mutex poisoned")
             .clone()
@@ -248,6 +264,20 @@ fn record_request(port: u16, version: Version, body: &serde_json::Value) {
         }
         if let Ok(mut versions) = recorder.versions.lock() {
             versions.push(version);
+        }
+    }
+}
+
+/// Record the `authorization` header of one RL control request. Called
+/// alongside [`record_request`] so the two vectors stay index-aligned.
+fn record_authorization(port: u16, value: Option<String>) {
+    let recorder = request_recorders_table()
+        .lock()
+        .ok()
+        .and_then(|table| table.get(&port).cloned());
+    if let Some(recorder) = recorder {
+        if let Ok(mut authorizations) = recorder.authorizations.lock() {
+            authorizations.push(value);
         }
     }
 }
@@ -1517,6 +1547,7 @@ async fn responses_handler(
 async fn rl_control_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
     version: Version,
+    headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let config = config.read().await;
@@ -1531,6 +1562,13 @@ async fn rl_control_handler(
 
     if let Some(Json(body)) = body {
         record_request(config.port, version, &body);
+        record_authorization(
+            config.port,
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+        );
     }
 
     Json(json!({"success": true, "message": "ok"})).into_response()

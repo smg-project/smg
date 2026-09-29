@@ -22,7 +22,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
@@ -78,6 +78,8 @@ async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
         output_tokens,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        server_args: BTreeMap::new(),
+        weight_version: None,
     });
     tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
     port

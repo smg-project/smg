@@ -13,7 +13,7 @@ pub struct RlWorkerInfo {
     pub id: String,
     /// `Worker::url()`; carries an `@<rank>` suffix for DP-aware workers.
     pub url: String,
-    /// `Worker::base_url()`; the address control calls are sent to.
+    /// `Worker::base_url()`; see `control_url` for where control calls go.
     pub base_url: String,
     pub api_key: Option<String>,
     pub model_id: String,
@@ -25,10 +25,16 @@ pub struct RlWorkerInfo {
     pub dp_size: Option<usize>,
     /// `WorkerSpec.labels`: discovered metadata merged with caller labels.
     pub labels: HashMap<String, String>,
-    /// The client the gateway negotiated for this worker (HTTP version,
-    /// TLS identity and roots, pool tuning), shared with its data-plane and
-    /// admin calls. `None` when the gateway does not speak HTTP to it.
-    pub http_client: Option<Arc<reqwest::Client>>,
+    /// Base URL of the worker's RL control routes: the worker itself for an
+    /// HTTP worker, the engine-advertised `rl.control_url` (wildcard host
+    /// resolved) for a gRPC or ZMQ worker, `None` when it has neither.
+    pub control_url: Option<String>,
+    /// The client used for control calls. For an HTTP worker it is the
+    /// client the gateway negotiated for the worker (HTTP version, TLS
+    /// identity and roots, pool tuning); for other transports it is a cached
+    /// client with the same TLS settings on HTTP/1.1. `None` when the worker
+    /// has no control endpoint.
+    pub control_client: Option<Arc<reqwest::Client>>,
 }
 
 impl fmt::Debug for RlWorkerInfo {
@@ -46,7 +52,11 @@ impl fmt::Debug for RlWorkerInfo {
             .field("is_dp_aware", &self.is_dp_aware)
             .field("dp_size", &self.dp_size)
             .field("labels", &self.labels)
-            .field("http_client", &self.http_client.as_ref().map(|_| ".."))
+            .field("control_url", &self.control_url)
+            .field(
+                "control_client",
+                &self.control_client.as_ref().map(|_| ".."),
+            )
             .finish()
     }
 }
@@ -63,9 +73,8 @@ pub trait RlWorkerView: Send + Sync {
 mod tests {
     use super::*;
 
-    #[test]
-    fn debug_output_redacts_the_api_key() {
-        let info = RlWorkerInfo {
+    fn sample() -> RlWorkerInfo {
+        RlWorkerInfo {
             id: "w".to_string(),
             url: "http://a:1".to_string(),
             base_url: "http://a:1".to_string(),
@@ -78,11 +87,24 @@ mod tests {
             is_dp_aware: false,
             dp_size: None,
             labels: HashMap::new(),
-            http_client: None,
-        };
+            control_url: None,
+            control_client: None,
+        }
+    }
+
+    #[test]
+    fn debug_output_redacts_the_api_key() {
+        let info = sample();
         let dbg = format!("{info:?}");
         assert!(!dbg.contains("hunter2-secret"), "{dbg}");
         assert!(dbg.contains("api_key: Some(\"<redacted>\")"), "{dbg}");
         assert!(dbg.contains("id: \"w\""), "{dbg}");
+    }
+
+    #[test]
+    fn debug_output_shows_the_control_url() {
+        let mut info = sample();
+        info.control_url = Some("http://ctl:1".to_string());
+        assert!(format!("{info:?}").contains("control_url: Some(\"http://ctl:1\")"));
     }
 }

@@ -108,7 +108,13 @@ pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
         model_id: info.model_id.clone(),
         worker_type: enum_str(&info.worker_type),
         connection_mode: enum_str(&info.connection_mode),
-        tp_size: int_label(&info.labels, "tp_size"),
+        control_url: info.control_url.clone(),
+        // TokenSpeed spells its tensor-parallel width `attn_tp_size` and leaves
+        // it unset unless the operator asks for one, so a plain launch reports
+        // no `tp_size` at all. A trainer laying out NCCL ranks needs the real
+        // width, and a wrong one deadlocks the weight-update group.
+        tp_size: int_label(&info.labels, "tp_size")
+            .or_else(|| int_label(&info.labels, "attn_tp_size")),
         dp_size: int_label(&info.labels, "dp_size"),
         pp_size: int_label(&info.labels, "pp_size"),
         dp_ranks,
@@ -166,7 +172,8 @@ mod tests {
 
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
-    use openai_protocol::worker::RuntimeType;
+    use openai_protocol::worker::{ConnectionMode, RuntimeType};
+    use serde_json::Value;
     use tower::ServiceExt;
 
     use super::*;
@@ -181,6 +188,10 @@ mod tests {
             Arc::new(FakeView(workers)),
             RlConfig::default(),
         ))
+    }
+
+    async fn json_body(resp: Response) -> Value {
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
     }
 
     #[test]
@@ -221,7 +232,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["dp_ranks"], 2);
 
@@ -230,7 +241,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["dp_ranks"], 1);
     }
@@ -251,6 +262,32 @@ mod tests {
         assert_eq!(m["tp_size"], "1");
     }
 
+    #[test]
+    fn tp_size_falls_back_to_tokenspeeds_attn_tp_size() {
+        // A TokenSpeed engine launched without an explicit parallelism flag
+        // reports `attn_tp_size` and no `tp_size`; a trainer needs the width to
+        // lay out its NCCL ranks.
+        let mut w = worker("w1", "http://a:1", RuntimeType::TokenSpeed);
+        w.labels.remove("tp_size");
+        w.labels.insert("attn_tp_size".to_string(), "2".to_string());
+        assert_eq!(entry(&w, 1).tp_size, Some(2));
+    }
+
+    #[test]
+    fn an_explicit_tp_size_wins_over_attn_tp_size() {
+        let mut w = worker("w1", "http://a:1", RuntimeType::TokenSpeed);
+        w.labels.insert("tp_size".to_string(), "4".to_string());
+        w.labels.insert("attn_tp_size".to_string(), "2".to_string());
+        assert_eq!(entry(&w, 1).tp_size, Some(4));
+    }
+
+    #[test]
+    fn tp_size_is_null_when_neither_label_is_present() {
+        let mut w = worker("w1", "http://a:1", RuntimeType::TokenSpeed);
+        w.labels.remove("tp_size");
+        assert_eq!(entry(&w, 1).tp_size, None);
+    }
+
     #[tokio::test]
     async fn list_reports_the_protocol_version() {
         let app = crate::router::<()>(state(vec![worker("w1", "http://a:1", RuntimeType::Sglang)]));
@@ -258,7 +295,7 @@ mod tests {
             .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["protocol_version"], 1);
     }
@@ -276,18 +313,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["total"], 1);
         let e = &body["workers"][0];
         assert_eq!(e["id"], "w1");
         assert_eq!(e["engine"], "sglang");
         assert_eq!(e["engine_version"], "0.5.15");
-        assert_eq!(
-            e["tp_size"],
-            serde_json::Value::Null,
-            "garbage label -> null"
-        );
+        assert_eq!(e["tp_size"], Value::Null, "garbage label -> null");
         assert_eq!(e["dp_size"], 1);
         assert_eq!(e["dp_ranks"], 1);
         assert_eq!(e["health"], "ready");
@@ -307,5 +340,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn entry_reports_the_control_url() {
+        let mut g = worker("g1", "grpc://a:1", RuntimeType::TokenSpeed);
+        g.connection_mode = ConnectionMode::Grpc;
+        g.control_url = Some("http://a:40100".to_string());
+        let mut n = worker("n1", "grpc://b:1", RuntimeType::TokenSpeed);
+        n.connection_mode = ConnectionMode::Grpc;
+        n.control_url = None;
+        n.control_client = None;
+        let app = crate::router::<()>(state(vec![g, n]));
+        let resp = app
+            .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        let by_id = |id: &str| {
+            body["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(by_id("g1")["control_url"], "http://a:40100");
+        assert_eq!(by_id("n1")["control_url"], Value::Null);
+        assert_eq!(by_id("g1")["engine"], "tokenspeed");
     }
 }

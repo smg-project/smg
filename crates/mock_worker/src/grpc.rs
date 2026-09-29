@@ -92,6 +92,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 .and_then(|s| s.max_new_tokens)
                 .unwrap_or(self.cfg.output_tokens);
             let stream_chunks = req.stream;
+            let weight_version = self.cfg.weight_version.clone();
             let (tx, rx) = mpsc::unbounded_channel();
             engine.submit(NewRequest {
                 request_id: request_id.clone(),
@@ -103,6 +104,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 rx,
                 stream_chunks,
                 request_id,
+                weight_version,
             )));
         }
 
@@ -124,7 +126,7 @@ impl TokenSpeedScheduler for MockScheduler {
                     cached_tokens: 0,
                     output_logprobs: None,
                     index: 0,
-                    weight_version: None,
+                    weight_version: self.cfg.weight_version.clone(),
                 })),
             }));
         }
@@ -139,6 +141,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 output_logprobs: None,
                 matched_stop: None,
                 index: 0,
+                weight_version: self.cfg.weight_version.clone(),
                 ..Default::default()
             })),
         }));
@@ -193,8 +196,23 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetServerInfoRequest>,
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
+        let server_args = (!self.cfg.server_args.is_empty()).then(|| prost_types::Struct {
+            fields: self
+                .cfg
+                .server_args
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue(v.clone())),
+                        },
+                    )
+                })
+                .collect(),
+        });
         Ok(Response::new(ts::GetServerInfoResponse {
-            server_args: None,
+            server_args,
             scheduler_info: None,
             active_requests: 0,
             is_paused: false,
@@ -295,11 +313,18 @@ fn generate_stream(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     stream_chunks: bool,
     request_id: String,
+    weight_version: Option<String>,
 ) -> GenStream {
-    let init = (rx, Vec::<u32>::new(), stream_chunks, request_id);
+    let init = (
+        rx,
+        Vec::<u32>::new(),
+        stream_chunks,
+        request_id,
+        weight_version,
+    );
     Box::pin(stream::unfold(
         init,
-        |(mut rx, mut output_ids, stream_chunks, request_id)| async move {
+        |(mut rx, mut output_ids, stream_chunks, request_id, weight_version)| async move {
             loop {
                 match rx.recv().await {
                     Some(engine::GenEvent::Token {
@@ -318,10 +343,13 @@ fn generate_stream(
                                     cached_tokens,
                                     output_logprobs: None,
                                     index: 0,
-                                    weight_version: None,
+                                    weight_version: weight_version.clone(),
                                 })),
                             };
-                            return Some((Ok(resp), (rx, output_ids, stream_chunks, request_id)));
+                            return Some((
+                                Ok(resp),
+                                (rx, output_ids, stream_chunks, request_id, weight_version),
+                            ));
                         }
                         // Non-streaming: keep accumulating until Done.
                     }
@@ -342,10 +370,14 @@ fn generate_stream(
                                 output_logprobs: None,
                                 matched_stop: None,
                                 index: 0,
+                                weight_version: weight_version.clone(),
                                 ..Default::default()
                             })),
                         };
-                        return Some((Ok(resp), (rx, output_ids, stream_chunks, request_id)));
+                        return Some((
+                            Ok(resp),
+                            (rx, output_ids, stream_chunks, request_id, weight_version),
+                        ));
                     }
                     None => return None,
                 }

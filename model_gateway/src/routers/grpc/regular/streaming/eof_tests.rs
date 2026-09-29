@@ -1,6 +1,6 @@
 //! Test gateway parsers and SSE events with exact gRPC frames.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::BufMut;
@@ -128,6 +128,8 @@ async fn scripted_stream(
         output_tokens: 0,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        server_args: BTreeMap::new(),
+        weight_version: None,
     });
     let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
     let client = VllmEngineClient::connect(&format!("http://127.0.0.1:{port}"))

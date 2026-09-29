@@ -1634,3 +1634,113 @@ class TestServeOrchestrator:
         assert launched_envs[1]["CUDA_VISIBLE_DEVICES"] == "2,3"
         assert launched_envs[0]["PYTHONUNBUFFERED"] == "1"
         assert launched_envs[1]["PYTHONUNBUFFERED"] == "1"
+
+
+def test_rl_control_port_avoids_neighbors_and_the_handshake_band():
+    from smg.serve import _ZMQ_HANDSHAKE_PORT_BASE, _ZMQ_HANDSHAKE_PORT_SPAN, _rl_control_port
+
+    assert _rl_control_port(30000) == 30400
+    assert _rl_control_port(65500) == 65100
+    inside = _ZMQ_HANDSHAKE_PORT_BASE - 400 + 10
+    assert not (
+        _ZMQ_HANDSHAKE_PORT_BASE
+        <= _rl_control_port(inside)
+        < _ZMQ_HANDSHAKE_PORT_BASE + _ZMQ_HANDSHAKE_PORT_SPAN
+    )
+
+
+def test_tokenspeed_zmq_command_wires_the_control_app(monkeypatch):
+    from types import SimpleNamespace
+
+    from smg.serve import TokenspeedWorkerLauncher
+
+    args = SimpleNamespace(model="/models/q", connection_mode="zmq", tensor_parallel_size=1)
+    cmd = TokenspeedWorkerLauncher().build_command(args, [], "127.0.0.1", 30000)
+    assert cmd[cmd.index("--rl-control-host") + 1] == "127.0.0.1"
+    assert cmd[cmd.index("--rl-control-port") + 1] == "30400"
+    assert TokenspeedWorkerLauncher().control_url(30000) == "http://127.0.0.1:30400"
+
+
+def test_stamp_rl_control_labels_patches_each_worker(monkeypatch):
+    import json
+
+    from smg import serve
+
+    calls = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = json.dumps(payload).encode()
+            self.status = 200
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=0):
+        calls.append((req.get_method(), req.full_url, req.data, req.get_header("Authorization")))
+        if req.get_method() == "GET":
+            return _Resp({"workers": [{"id": "w1", "url": "ipc:///tmp/engine-30000"}]})
+        return _Resp({})
+
+    monkeypatch.setattr(serve.urllib.request, "urlopen", fake_urlopen)
+    serve._stamp_rl_control_labels(
+        "http://127.0.0.1:8000",
+        "adm",
+        [("ipc:///tmp/engine-30000", "http://127.0.0.1:30400")],
+        deadline_s=1.0,
+    )
+    patch = [c for c in calls if c[0] == "PATCH"]
+    assert len(patch) == 1
+    assert patch[0][1] == "http://127.0.0.1:8000/workers/w1"
+    assert json.loads(patch[0][2]) == {"labels": {"rl.control_url": "http://127.0.0.1:30400"}}
+    assert patch[0][3] == "Bearer adm"
+
+
+def test_stamp_rl_control_labels_stops_retrying_after_a_4xx(monkeypatch):
+    import json
+    import time
+    import urllib.error
+
+    from smg import serve
+
+    calls = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = json.dumps(payload).encode()
+            self.status = 200
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=0):
+        calls.append((req.get_method(), req.full_url, req.data, req.get_header("Authorization")))
+        if req.get_method() == "GET":
+            return _Resp({"workers": [{"id": "w1", "url": "ipc:///tmp/engine-30000"}]})
+        raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", {}, None)
+
+    monkeypatch.setattr(serve.urllib.request, "urlopen", fake_urlopen)
+    start = time.monotonic()
+    serve._stamp_rl_control_labels(
+        "http://127.0.0.1:8000",
+        "adm",
+        [("ipc:///tmp/engine-30000", "http://127.0.0.1:30400")],
+        deadline_s=5.0,
+    )
+    elapsed = time.monotonic() - start
+
+    patch = [c for c in calls if c[0] == "PATCH"]
+    assert len(patch) == 1, "a 4xx must not be retried"
+    assert elapsed < 3.0, "giving up on the 4xx must not wait out the deadline"

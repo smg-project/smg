@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use openai_protocol::{rl::RlCallOutcome, worker::ConnectionMode};
+use openai_protocol::rl::RlCallOutcome;
 use serde_json::Value;
 use tracing::info;
 
@@ -76,8 +76,8 @@ impl ProxyRequest {
         })
     }
 
-    fn url_for(&self, worker: &RlWorkerInfo) -> String {
-        let base = worker.base_url.trim_end_matches('/');
+    fn url_for(&self, base: &str) -> String {
+        let base = base.trim_end_matches('/');
         match &self.query {
             Some(q) => format!("{base}/{}?{q}", self.path),
             None => format!("{base}/{}", self.path),
@@ -117,6 +117,16 @@ pub(crate) fn parse_body(
     )
 }
 
+/// The worker has nowhere to send control calls, or nothing to send them with.
+fn no_control_endpoint(worker: &RlWorkerInfo, message: &str) -> RlError {
+    RlError::NoControlEndpoint {
+        worker_id: worker.id.clone(),
+        url: worker.url.clone(),
+        connection_mode: enum_str(&worker.connection_mode),
+        message: message.to_string(),
+    }
+}
+
 /// Send `req` to `worker`. `Err` only for transport failures; an upstream
 /// 4xx/5xx is a successful proxy with that status in the outcome.
 pub async fn call_worker(
@@ -124,18 +134,21 @@ pub async fn call_worker(
     worker: &RlWorkerInfo,
     req: &ProxyRequest,
 ) -> Result<RlCallOutcome, RlError> {
-    // A worker the gateway never speaks HTTP to has no client to borrow.
-    let client = match &worker.http_client {
-        Some(client) if worker.connection_mode == ConnectionMode::Http => client,
-        _ => {
-            return Err(RlError::UnsupportedConnectionMode {
-                worker_id: worker.id.clone(),
-                url: worker.url.clone(),
-                mode: enum_str(&worker.connection_mode),
-            })
-        }
+    // Control is independent of the data transport: what matters is that the
+    // gateway knows an HTTP control endpoint and has a client to reach it.
+    let Some(base) = worker.control_url.as_deref() else {
+        return Err(no_control_endpoint(
+            worker,
+            "no `rl.control_url` label; register the worker with one or upgrade the engine to advertise it",
+        ));
     };
-    let url = req.url_for(worker);
+    let Some(client) = worker.control_client.as_ref() else {
+        return Err(no_control_endpoint(
+            worker,
+            "the gateway could not build an HTTP client for the control endpoint (see the gateway log)",
+        ));
+    };
+    let url = req.url_for(base);
     // The worker's client carries the gateway's request timeout; a refit
     // can outlive it, so the control deadline is set per request, as the
     // gateway's own flush/profile admin calls do.
@@ -231,8 +244,9 @@ pub async fn call_worker(
     );
     info!(
         target: "smg_rl",
-        worker_id = %worker.id, url = %worker.url, method = %req.method,
-        path = %req.path, status, latency_ms = outcome.latency_ms, "rl.proxy"
+        worker_id = %worker.id, url = %worker.url, control_url = %base,
+        method = %req.method, path = %req.path, status,
+        latency_ms = outcome.latency_ms, "rl.proxy"
     );
     Ok(outcome)
 }
@@ -403,6 +417,8 @@ mod tests {
         let engine = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
         let mut grpc = worker("g1", &engine.url, RuntimeType::Sglang);
         grpc.connection_mode = ConnectionMode::Grpc;
+        grpc.control_url = None;
+        grpc.control_client = None;
         let app = crate::router::<()>(state(
             vec![worker("w1", &engine.url, RuntimeType::Sglang), grpc],
             5,
@@ -430,7 +446,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json_body(r).await["error"], "unsupported_connection_mode");
+        assert_eq!(json_body(r).await["error"], "no_control_endpoint");
 
         let r = app
             .clone()
@@ -456,13 +472,62 @@ mod tests {
         assert!(engine.seen().is_empty());
     }
 
+    /// The transport SMG uses for data is irrelevant to control: a gRPC
+    /// worker with a control endpoint is proxied exactly like an HTTP one.
+    #[tokio::test]
+    async fn grpc_worker_with_a_control_endpoint_is_proxied() {
+        let control_app = FakeEngine::start(StatusCode::OK, json!({"success": true}), 0).await;
+        let mut w = worker("g1", "grpc://engine:30000", RuntimeType::TokenSpeed);
+        w.connection_mode = ConnectionMode::Grpc;
+        w.control_url = Some(control_app.url.clone());
+        w.api_key = Some("ts-secret".to_string());
+        let app = crate::router::<()>(state(vec![w], 5));
+
+        let resp = app
+            .oneshot(
+                Request::post("/workers/g1/engine/pause_generation")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"wait"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = control_app.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, "/pause_generation");
+        assert_eq!(&seen[0].body[..], br#"{"mode":"wait"}"#);
+        assert_eq!(seen[0].headers["authorization"], "Bearer ts-secret");
+    }
+
+    #[tokio::test]
+    async fn control_url_without_a_client_is_reported_not_routed() {
+        let mut w = worker("g2", "grpc://engine:30000", RuntimeType::TokenSpeed);
+        w.connection_mode = ConnectionMode::Grpc;
+        w.control_url = Some("http://ctl:1".to_string());
+        w.control_client = None;
+        let app = crate::router::<()>(state(vec![w], 5));
+        let r = app
+            .oneshot(
+                Request::post("/workers/g2/engine/pause")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(r).await;
+        assert_eq!(body["error"], "no_control_endpoint");
+        assert!(body["message"].as_str().unwrap().contains("HTTP client"));
+    }
+
     /// The control deadline is applied per request, so it holds even when
     /// the worker's client carries no client-level timeout of its own.
     #[tokio::test]
     async fn control_timeout_is_applied_per_request_on_the_worker_client() {
         let slow_engine = FakeEngine::start(StatusCode::OK, json!({}), 1500).await;
         let mut w = worker("slow", &slow_engine.url, RuntimeType::Sglang);
-        w.http_client = Some(Arc::new(reqwest::Client::new()));
+        w.control_client = Some(Arc::new(reqwest::Client::new()));
         let app = crate::router::<()>(state(vec![w], 1));
 
         let r = app
