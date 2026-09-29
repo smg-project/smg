@@ -36,6 +36,7 @@
 /crates/multimodal @slin1237 @CatherineSue
 /crates/protocols @CatherineSue @key4ng
 /crates/reasoning_parser @CatherineSue
+/crates/response_template @yechank-nvidia
 /crates/tokenizer @slin1237 @CatherineSue
 /crates/tool_parser @slin1237 @CatherineSue
 /crates/wasm @slin1237 @tonyluj
