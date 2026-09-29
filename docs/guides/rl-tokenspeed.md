@@ -45,14 +45,66 @@ broadcast (slime's path): the trainer calls, per worker, through `/v1/rl`,
 with `pause_generation` / `continue_generation` fanned out around the
 `update_weights_from_distributed` call, same as a disk refit. The next
 `/generate` through SMG reports the new `meta_info.weight_version`, stamped
-by the engine on the gRPC response. A worked trainer-side example will land
-under `examples/rl` once available; until then, drive the three calls
-directly with `smg.rl.RL.call`/`fanout` as shown in `crates/rl/README.md`.
-Ranks come from each worker's `tp_size`: discovery reads it from the engine's
+by the engine on the gRPC response.
+
+`examples/rl/refit_from_trainer.py` is that refit, end to end:
+
+    python examples/rl/refit_from_trainer.py --smg http://smg:30000 \
+      --master-address trainer-0.internal \
+      --model-path /ckpt/step-42 --weight-version 42 --selector engine=tokenspeed
+
+It runs on the trainer's host, needs `torch` built with CUDA and
+`transformers`, and loads `--model-path` onto `--device` (default `cuda:0`) in
+place of a live policy. `--master-address` is the trainer host's address as the
+engines see it, since each engine dials it to join the group; the default
+`127.0.0.1` only works when engines and trainer share a host, and the script
+refuses to start when `--smg` names a non-loopback host while
+`--master-address` is still loopback. Ranks come from each worker's `tp_size`: the trainer
+takes rank 0 and engine *k* takes `rank_offset_k .. rank_offset_k + tp_k - 1`,
+so `world_size = 1 + sum(tp)`. Discovery reads `tp_size` from the engine's
 server args and falls back to TokenSpeed's own spelling, `attn_tp_size`, so an
-engine launched with either reports a width. An engine launched with neither
-(TokenSpeed leaves `attn_tp_size` unset unless asked) reports `tp_size: null`,
-and a trainer must then assume 1 or be told.
+engine launched with either reports a width. An engine launched with neither —
+TokenSpeed leaves `attn_tp_size` unset unless asked — reports `tp_size: null`,
+and the script then assumes 1 and says so on stderr; `--tp-size` overrides it.
+`init_weights_update_group` is a
+per-worker call, because each worker gets a different `rank_offset`; the
+broadcast is a fan-out, because the body is identical. `--chunk` (default 64) parameters ride
+on each `update_weights_from_distributed` call, so a large policy streams in
+batches. The version is stamped only on the last chunk, so a refit is never
+advertised as complete before every weight has landed.
+
+An HTTP-level failure is cleaned up: the group is destroyed, the cache flushed,
+the engines resumed, and any engine left holding a part-old, part-new model is
+named on stderr. An engine that stops participating in the collective is not.
+The trainer's main thread is inside NCCL by then, so torch's watchdog takes the
+process down without raising into Python and nothing resumes the fleet. Recover
+with a `continue_generation` fan-out:
+
+    python -c 'from smg.rl import RL; RL("http://smg:30000").fanout(
+        "continue_generation", {}, selector="engine=tokenspeed")'
+
+The engine expects the checkpoint's own HuggingFace parameter names, in
+broadcast order; its `load_weights` does the fused/stacked mapping (`q_proj`,
+`k_proj`, `v_proj` into `qkv_proj`, and so on) exactly as it did for the
+initial load.
+
+## `/generate` parity with slime
+
+slime's rollout client speaks SGLang's native `/generate` format directly over
+gRPC: it sends one prompt per request (`text` as a string, or `input_ids` as a
+flat token list) and never sets `model`. The gRPC router matches SGLang's
+shape for that case: a single prompt with `n` unset (or `1`) and exactly one
+response comes back as one JSON object, so `resp["meta_info"]` indexes
+directly instead of unwrapping a one-element list; a batch or `n > 1` still
+comes back as a list. When `model` is omitted, the gateway resolves it to the
+single real model at least one worker is tagged with (an untagged worker
+doesn't count as a model of its own); with zero or more than one such model
+behind the gateway an unnamed request still 404s (`model_not_found`), since
+there is no longer a single unambiguous target. Sending `text` as a list of
+prompts (SGLang's batch text form) is rejected before it reaches any
+router — the JSON body fails to parse (422) on every path, gRPC included,
+since `text` is a plain string field. Use `input_ids` as a list of lists for
+a token-id batch instead; gRPC rejects that too (400), but HTTP accepts it.
 
 ## Security
 
