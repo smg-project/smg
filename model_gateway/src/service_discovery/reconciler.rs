@@ -290,7 +290,7 @@ pub(super) async fn reconcile(
         info!(
             "Removing worker {} ({} registration(s), pod {}): pod unready, gone, \
              terminating, or replaced",
-            target.endpoint.key(),
+            target.endpoint.redacted(),
             target.guards.len(),
             target.pod_uid
         );
@@ -315,7 +315,7 @@ pub(super) async fn reconcile(
             ),
             Err(e) => error!(
                 "Failed to submit worker removal for {}: {}",
-                target.endpoint.key(),
+                target.endpoint.redacted(),
                 e
             ),
         }

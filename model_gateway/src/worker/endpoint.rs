@@ -145,14 +145,13 @@ pub struct Endpoint {
 pub struct EndpointKey(String);
 
 impl EndpointKey {
+    /// The key as stored.
+    ///
+    /// This is a lookup and comparison value, and it retains any userinfo the
+    /// address carried, so it can name credentials. It is deliberately not
+    /// `Display`: use [`Endpoint::redacted`] for anything a person reads.
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl fmt::Display for EndpointKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
     }
 }
 
@@ -172,7 +171,9 @@ impl Endpoint {
     /// Parse an endpoint that may carry the workflow's `@rank` suffix.
     ///
     /// A suffix counts as a rank only when every character after the final `@`
-    /// is a digit, so an IPC path or a host containing `@` is left intact.
+    /// is a digit, so an IPC path is left intact and an authority's own `@`
+    /// stays put — it is split off as userinfo further down, not treated as a
+    /// rank marker.
     pub fn parse_with_rank(input: &str) -> Result<(Self, Option<usize>), EndpointError> {
         let trimmed = input.trim();
         let (body, rank) = split_rank(trimmed);
@@ -294,6 +295,27 @@ impl Endpoint {
         }
     }
 
+    /// A form safe to log: the secret half of any userinfo is masked.
+    ///
+    /// The username is kept, because it distinguishes two registrations at one
+    /// address and is what makes a log line useful.
+    pub fn redacted(&self) -> String {
+        let Some(userinfo) = self.userinfo.as_deref() else {
+            return self.render();
+        };
+        let masked = match userinfo.split_once(':') {
+            Some((user, _)) => format!("{user}:***"),
+            None => userinfo.to_string(),
+        };
+        let exact = self.render();
+        let Some((prefix, rest)) = exact.split_once(&format!("{userinfo}@")) else {
+            // Unreachable while `render` emits the userinfo it was built from;
+            // masking everything is the safe answer if that ever changes.
+            return exact.replace(userinfo, "***");
+        };
+        format!("{prefix}{masked}@{rest}")
+    }
+
     /// Render this endpoint with the workflow's rank suffix.
     pub fn render_with_rank(&self, rank: usize) -> String {
         format!("{}@{rank}", self.render())
@@ -301,8 +323,10 @@ impl Endpoint {
 }
 
 impl fmt::Display for Endpoint {
+    /// Redacted, so an endpoint cannot leak a password into a log by being
+    /// formatted. [`Endpoint::render`] gives the exact address.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.render())
+        f.write_str(&self.redacted())
     }
 }
 
@@ -428,13 +452,12 @@ fn parse_host(host: &str) -> Result<Host, EndpointError> {
     }
     // Conservative: a DNS name, and nothing that would change how the key is
     // read back (no path, query, or whitespace).
-    // `@` is deliberately allowed: workers are registered under addresses like
-    // `http://user@worker:3000`, and the rank split has already taken any
-    // trailing `@<digits>` off, so what remains belongs to the address.
-    if host
-        .bytes()
-        .any(|b| b.is_ascii_whitespace() || matches!(b, b'/' | b'?' | b'#' | b'\\' | b'[' | b']'))
-    {
+    // Userinfo was split off at the authority's final `@` before this point,
+    // so a host reaching here can no longer contain one — `@` is rejected to
+    // hold that invariant here rather than leaving it implied by the caller.
+    if host.bytes().any(|b| {
+        b.is_ascii_whitespace() || matches!(b, b'/' | b'?' | b'#' | b'\\' | b'[' | b']' | b'@')
+    }) {
         return Err(EndpointError::InvalidHost {
             host: host.to_string(),
         });
@@ -639,6 +662,44 @@ mod tests {
     /// A `]` in a path used to abort the path scan, leaving the whole string
     /// as an authority that then failed as a malformed IPv6 host. `url::Url`
     /// leaves brackets unencoded in a path, so this registers.
+    /// The key retains userinfo because two registrations at one address with
+    /// different credentials are different backends. That makes the key unsafe
+    /// to log, so `Display` is redacted and `EndpointKey` has none at all —
+    /// a caller wanting the raw value has to ask for `as_str`.
+    #[test]
+    fn a_password_is_masked_for_display_but_kept_for_lookup() {
+        let endpoint = Endpoint::parse("http://user:pass@worker:3000").unwrap();
+
+        assert_eq!(endpoint.redacted(), "http://user:***@worker:3000");
+        assert_eq!(format!("{endpoint}"), "http://user:***@worker:3000");
+        assert!(!endpoint.redacted().contains("pass"));
+
+        // Identity and lookup keep the exact value.
+        assert_eq!(endpoint.key().as_str(), "user:pass@worker:3000");
+        assert_eq!(endpoint.lookup_form(), "user:pass@worker:3000");
+        assert_eq!(endpoint.render(), "http://user:pass@worker:3000");
+
+        // Two credentials at one address stay distinct.
+        assert_ne!(
+            key_of("http://user:a@worker:3000"),
+            key_of("http://user:b@worker:3000")
+        );
+    }
+
+    #[test]
+    fn redaction_leaves_addresses_without_secrets_alone() {
+        for spelling in [
+            "http://worker:3000",
+            "grpc://[fd00::1]:8080/v1",
+            "ipc:///tmp/w.sock",
+            // A bare username is not a secret and identifies the registration.
+            "http://user@worker:3000",
+        ] {
+            let endpoint = Endpoint::parse(spelling).expect(spelling);
+            assert_eq!(endpoint.redacted(), endpoint.render(), "{spelling}");
+        }
+    }
+
     #[test]
     fn brackets_inside_a_path_do_not_hide_it() {
         assert_eq!(key_of("http://proxy:8080/v1/[x]"), "proxy:8080/v1/[x]");
