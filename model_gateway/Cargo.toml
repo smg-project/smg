@@ -175,7 +175,7 @@ npyz = { version = "0.9", features = ["npz"] }
 opentelemetry-proto = { version = "0.32", features = ["gen-tonic"] }
 serial_test = "3.5"
 rsa = { version = "0.9", features = ["sha2"] }
-jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
 validator = "0.20.0"
 tracing-test = "0.2"
 tokio = { workspace = true, features = ["test-util"] }

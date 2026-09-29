@@ -31,7 +31,7 @@ tracing.workspace = true
 # Only used by auth
 # jsonwebtoken 10 decouples crypto behind a provider trait; `rust_crypto` selects the
 # RustCrypto backend (matches the workspace's pure-Rust stack, no aws-lc-sys C build).
-jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "rust_crypto"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["use_pem", "rust_crypto"] }
 sha2 = "0.11"
 url = "2.5"
 
