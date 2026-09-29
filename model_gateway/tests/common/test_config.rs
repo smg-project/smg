@@ -114,6 +114,24 @@ impl TestRouterConfig {
         )
     }
 
+    /// Create a consistent-hashing config
+    pub fn consistent_hashing(port: u16) -> RouterConfig {
+        apply_test_defaults(
+            RouterConfig::builder()
+                .regular_mode(vec![])
+                .policy(PolicyConfig::ConsistentHashing)
+                .host(defaults::HOST)
+                .port(port)
+                .max_payload_size(defaults::MAX_PAYLOAD_SIZE)
+                .request_timeout_secs(defaults::REQUEST_TIMEOUT_SECS)
+                .worker_startup_timeout_secs(defaults::WORKER_STARTUP_TIMEOUT_SECS)
+                .worker_startup_check_interval_secs(defaults::WORKER_STARTUP_CHECK_INTERVAL_SECS)
+                .max_concurrent_requests(defaults::MAX_CONCURRENT_REQUESTS)
+                .queue_timeout_secs(defaults::QUEUE_TIMEOUT_SECS)
+                .build_unchecked(),
+        )
+    }
+
     /// Create a prefix-hash config
     pub fn prefix_hash(port: u16, prefix_token_count: usize) -> RouterConfig {
         apply_test_defaults(

@@ -4,8 +4,12 @@
 //! is consistently mapped to the same worker. Unlike consistent hashing,
 //! this policy:
 //! - Does NOT redistribute any sessions when workers are added
-//! - Only remaps sessions when their assigned worker becomes unhealthy
+//! - Only remaps sessions when their assigned worker becomes unhealthy or has
+//!   already failed the request being routed
 //! - Maintains up to 2 candidate workers per routing key for fast failover
+//! - Failover is permanent: the worker that takes over becomes the key's
+//!   primary (it now holds the session state); the displaced worker stays as
+//!   a fallback candidate rather than reclaiming the key on recovery
 //!
 //! Use this when you need stronger stickiness guarantees than consistent hashing,
 //! for example with stateful chat sessions where context is stored on the worker.
@@ -99,11 +103,13 @@ struct Node {
 }
 
 impl Node {
-    fn push_bounded(&mut self, url: String) {
-        while self.candi_worker_urls.len() >= MAX_CANDIDATE_WORKERS {
-            self.candi_worker_urls.remove(0);
-        }
-        self.candi_worker_urls.push(url);
+    /// Make `url` the primary candidate, keeping displaced candidates as
+    /// fallbacks up to the bound. Candidates are tried front-first, so the
+    /// front must always be the worker currently serving the key.
+    fn promote_front_bounded(&mut self, url: String) {
+        self.candi_worker_urls.retain(|u| u != &url);
+        self.candi_worker_urls.insert(0, url);
+        self.candi_worker_urls.truncate(MAX_CANDIDATE_WORKERS);
     }
 }
 
@@ -196,7 +202,12 @@ impl ManualPolicy {
             Some(mut entry) => {
                 entry.last_access = Instant::now();
                 match find_healthy_worker(&entry.candi_worker_urls, workers, healthy_indices) {
-                    Some(idx) => PinState::Pinned(idx),
+                    Some((idx, pos)) => {
+                        if pos > 0 {
+                            entry.promote_front_bounded(workers[idx].url().to_string());
+                        }
+                        PinState::Pinned(idx)
+                    }
                     None => PinState::Stale,
                 }
             }
@@ -257,13 +268,20 @@ impl ManualPolicy {
             Entry::Occupied(mut entry) => {
                 let node = entry.get_mut();
                 node.last_access = Instant::now();
-                if let Some(idx) =
+                if let Some((idx, pos)) =
                     find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices)
                 {
+                    // A selection past the front means the earlier candidates were
+                    // unavailable (e.g. excluded after failing this request).
+                    // Promote the worker that actually serves traffic so subsequent
+                    // requests don't retry the failed candidate first every time.
+                    if pos > 0 {
+                        node.promote_front_bounded(workers[idx].url().to_string());
+                    }
                     (idx, ExecutionBranch::OccupiedHit)
                 } else {
                     let selected_idx = self.select_new_worker(workers, healthy_indices);
-                    node.push_bounded(workers[selected_idx].url().to_string());
+                    node.promote_front_bounded(workers[selected_idx].url().to_string());
                     (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
             }
@@ -331,15 +349,17 @@ impl LoadBalancingPolicy for ManualPolicy {
     }
 }
 
+/// Return the worker index of the first healthy candidate, along with the
+/// candidate's position in `urls` so callers can promote it on failover.
 fn find_healthy_worker(
     urls: &[String],
     workers: &[Arc<dyn Worker>],
     healthy_indices: &[usize],
-) -> Option<usize> {
-    for url in urls {
+) -> Option<(usize, usize)> {
+    for (pos, url) in urls.iter().enumerate() {
         if let Some(idx) = find_worker_index_by_url(workers, url) {
             if healthy_indices.contains(&idx) {
-                return Some(idx);
+                return Some((idx, pos));
             }
         }
     }
@@ -742,8 +762,19 @@ mod tests {
         let (after_recovery, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(
             after_recovery,
+            Some(second_idx),
+            "Failover is permanent: the key stays with the worker now serving it \
+             (which holds the session state) instead of snapping back on recovery"
+        );
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+
+        workers[second_idx].set_status(WorkerStatus::NotReady);
+
+        let (after_second_failure, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(
+            after_second_failure,
             Some(first_idx),
-            "Should return to original worker after recovery since it's first in candidate list"
+            "The recovered original worker serves as the fallback candidate"
         );
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
     }
@@ -799,24 +830,37 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_routing_info_push_bounded() {
+    fn test_manual_routing_info_promote_front_bounded() {
         let mut info = Node {
             candi_worker_urls: vec!["http://w1:8000".to_string()],
             last_access: Instant::now(),
         };
 
-        info.push_bounded("http://w2:8000".to_string());
-        assert_eq!(info.candi_worker_urls.len(), 2);
-        assert_eq!(info.candi_worker_urls[0], "http://w1:8000");
-        assert_eq!(info.candi_worker_urls[1], "http://w2:8000");
-
-        info.push_bounded("http://w3:8000".to_string());
+        info.promote_front_bounded("http://w2:8000".to_string());
         assert_eq!(info.candi_worker_urls.len(), 2);
         assert_eq!(
             info.candi_worker_urls[0], "http://w2:8000",
-            "Oldest entry should be removed"
+            "Newly serving worker becomes the primary candidate"
         );
-        assert_eq!(info.candi_worker_urls[1], "http://w3:8000");
+        assert_eq!(
+            info.candi_worker_urls[1], "http://w1:8000",
+            "Displaced worker stays as fallback"
+        );
+
+        info.promote_front_bounded("http://w3:8000".to_string());
+        assert_eq!(info.candi_worker_urls.len(), 2);
+        assert_eq!(info.candi_worker_urls[0], "http://w3:8000");
+        assert_eq!(
+            info.candi_worker_urls[1], "http://w2:8000",
+            "Last fallback should be evicted by the bound"
+        );
+
+        info.promote_front_bounded("http://w2:8000".to_string());
+        assert_eq!(
+            info.candi_worker_urls,
+            vec!["http://w2:8000".to_string(), "http://w3:8000".to_string()],
+            "Promoting an existing fallback reorders instead of duplicating"
+        );
     }
 
     #[test]
@@ -833,19 +877,23 @@ mod tests {
         let result = find_healthy_worker(&urls, &workers, &healthy_indices);
         assert_eq!(
             result,
-            Some(0),
+            Some((0, 0)),
             "Should return first healthy worker in urls"
         );
 
         workers[0].set_status(WorkerStatus::NotReady);
         let healthy_indices = vec![1, 2];
         let result = find_healthy_worker(&urls, &workers, &healthy_indices);
-        assert_eq!(result, Some(1), "Should skip unhealthy and return next");
+        assert_eq!(
+            result,
+            Some((1, 1)),
+            "Should skip unhealthy and return next"
+        );
 
         workers[1].set_status(WorkerStatus::NotReady);
         let healthy_indices = vec![2];
         let result = find_healthy_worker(&urls, &workers, &healthy_indices);
-        assert_eq!(result, Some(2), "Should return last healthy worker");
+        assert_eq!(result, Some((2, 2)), "Should return last healthy worker");
 
         workers[2].set_status(WorkerStatus::NotReady);
         let healthy_indices: Vec<usize> = vec![];

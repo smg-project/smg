@@ -246,6 +246,54 @@ impl Router {
         }
     }
 
+    /// Resolve an `X-SMG-Target-Worker` index to a worker, once per request.
+    ///
+    /// The index is resolved against the unfiltered worker list for the model:
+    /// availability filtering (circuit breaker, exclusion of workers that
+    /// failed the request) would shift indices between attempts and requests,
+    /// silently re-pinning the index to a different worker. An explicit pin
+    /// overrides the circuit breaker; only a non-Ready worker rejects the pin.
+    fn resolve_pinned_worker(
+        &self,
+        model_id: &str,
+        idx_str: &str,
+    ) -> Result<Arc<dyn Worker>, Response> {
+        let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
+            None
+        } else {
+            Some(model_id)
+        };
+        let workers = self.worker_registry.get_workers_filtered(
+            model_filter,
+            Some(WorkerType::Regular),
+            Some(ConnectionMode::Http),
+            None,
+            false,
+        );
+        let worker = idx_str
+            .parse::<usize>()
+            .ok()
+            .and_then(|idx| workers.get(idx).cloned());
+        match worker {
+            Some(worker) if worker.is_healthy() => {
+                // Pinned selection bypasses the policy, so record it under its
+                // own label to keep smg_worker_selection_total covering all
+                // routed traffic.
+                Metrics::record_worker_selection(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    "pinned",
+                );
+                Ok(worker)
+            }
+            _ => Err(error::service_unavailable(
+                "pinned_worker_unavailable",
+                "X-SMG-Target-Worker does not resolve to a healthy worker",
+            )),
+        }
+    }
+
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
@@ -258,14 +306,54 @@ impl Router {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
     ) -> Option<Arc<dyn Worker>> {
-        // This router proxies plain HTTP to the worker's URL, so only HTTP
-        // workers are candidates; nothing pins a wire on this path.
-        placement::select_single(
+        self.select_worker_for_model_excluding(
+            model_id,
+            text,
+            tokens,
+            headers,
+            rid_key,
+            cache_namespace,
+            None,
+        )
+    }
+
+    /// Select worker considering circuit breaker state.
+    /// Filters to workers serving the specified model. When model is "unknown"
+    /// (generate endpoint without model), considers all HTTP workers.
+    #[expect(clippy::too_many_arguments)]
+    fn select_worker_for_model_excluding(
+        &self,
+        model_id: &str,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
+        exclude_urls: Option<&std::collections::HashSet<String>>,
+    ) -> Option<Arc<dyn Worker>> {
+        let candidates = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::HttpRegular);
+        // A retry avoids failed workers only while an available alternative
+        // remains; once every worker has failed, fall back to the full pool.
+        let filtered = exclude_urls
+            .filter(|exclude| !exclude.is_empty())
+            .map(|exclude| {
+                candidates
+                    .iter()
+                    .filter(|worker| worker.is_available() && !exclude.contains(worker.url()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+        let workers = match filtered.as_deref() {
+            Some(workers) if !workers.is_empty() => workers,
+            _ => candidates.as_ref(),
+        };
+        placement::select_from(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            RoutingPool::HttpRegular,
-            None,
+            workers,
             PlacementInputs {
                 text,
                 tokens,
@@ -389,6 +477,17 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
+        let failed_urls = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
+        // Resolve the target-worker index once, before availability or retry
+        // exclusion can change the selection slice.
+        let pinned_worker = match header_utils::extract_target_worker(headers) {
+            Some(index) => match self.resolve_pinned_worker(model_id, index) {
+                Ok(worker) => Some(worker),
+                Err(response) => return response,
+            },
+            None => None,
+        };
+
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
@@ -413,6 +512,8 @@ impl Router {
                     model_id,
                     canonical_model.as_deref(),
                     is_stream,
+                    &failed_urls,
+                    pinned_worker.as_ref(),
                 )
                 .await;
             Metrics::record_router_upstream_response(
@@ -441,6 +542,8 @@ impl Router {
                             model_id,
                             canonical_model.as_deref(),
                             is_stream,
+                            &failed_urls,
+                            pinned_worker.as_ref(),
                         )
                         .await;
 
@@ -496,6 +599,7 @@ impl Router {
         response
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -504,16 +608,25 @@ impl Router {
         model_id: &str,
         canonical_model: Option<&str>,
         is_stream: bool,
+        failed_urls: &std::sync::Mutex<std::collections::HashSet<String>>,
+        pinned_worker: Option<&Arc<dyn Worker>>,
     ) -> Response {
-        let worker = match lease.with_view(|view| {
-            self.select_worker_for_model(
-                model_id,
-                view.text,
-                view.tokens,
-                headers,
-                view.rid_key,
-                view.cache_namespace,
-            )
+        let exclude = failed_urls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let worker = match pinned_worker.cloned().or_else(|| {
+            lease.with_view(|view| {
+                self.select_worker_for_model_excluding(
+                    model_id,
+                    view.text,
+                    view.tokens,
+                    headers,
+                    view.rid_key,
+                    view.cache_namespace,
+                    Some(&exclude),
+                )
+            })
         }) {
             Some(w) => w,
             None => {
@@ -603,6 +716,12 @@ impl Router {
 
         let status = response.status();
         worker.record_outcome(status.as_u16());
+        if is_retryable_status(status) {
+            failed_urls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(worker.url().to_string());
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
