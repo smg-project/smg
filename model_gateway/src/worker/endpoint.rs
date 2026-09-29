@@ -120,7 +120,7 @@ impl fmt::Display for EndpointError {
 impl std::error::Error for EndpointError {}
 
 /// A worker address, parsed once.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Endpoint {
     scheme: Option<Scheme>,
     /// Anything before the authority's final `@`. `validate_worker_url`
@@ -141,8 +141,22 @@ pub struct Endpoint {
 ///
 /// Two endpoints share a key exactly when they name the same backend, however
 /// they were spelled.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EndpointKey(String);
+
+impl fmt::Debug for EndpointKey {
+    /// A key that carries userinfo would print a password, and the bare
+    /// string cannot say which half is which. A key holding an `@` is
+    /// therefore masked whole; one without is printed, because that is the
+    /// common case and the one worth reading in a failing assertion.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.contains('@') {
+            f.write_str("EndpointKey(<redacted>)")
+        } else {
+            f.debug_tuple("EndpointKey").field(&self.0).finish()
+        }
+    }
+}
 
 impl EndpointKey {
     /// The key as stored.
@@ -319,6 +333,15 @@ impl Endpoint {
     /// Render this endpoint with the workflow's rank suffix.
     pub fn render_with_rank(&self, rank: usize) -> String {
         format!("{}@{rank}", self.render())
+    }
+}
+
+impl fmt::Debug for Endpoint {
+    /// Masked like [`Self::redacted`]. The derive would have printed
+    /// `userinfo: Some("user:pass")`, and `?endpoint` is the usual idiom when
+    /// debugging the reconciler.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Endpoint").field(&self.redacted()).finish()
     }
 }
 
@@ -659,9 +682,6 @@ mod tests {
         assert_ne!(key_of("http://proxy:8080/a"), key_of("http://proxy:8080"));
     }
 
-    /// A `]` in a path used to abort the path scan, leaving the whole string
-    /// as an authority that then failed as a malformed IPv6 host. `url::Url`
-    /// leaves brackets unencoded in a path, so this registers.
     /// The key retains userinfo because two registrations at one address with
     /// different credentials are different backends. That makes the key unsafe
     /// to log, so `Display` is redacted and `EndpointKey` has none at all —
@@ -686,6 +706,30 @@ mod tests {
         );
     }
 
+    /// `{:?}` is the usual idiom when debugging the reconciler, and the
+    /// structs that hold an endpoint derive `Debug`. A derived impl would
+    /// have printed `userinfo: Some("user:pass")` verbatim.
+    #[test]
+    fn debug_masks_credentials_too() {
+        let endpoint = Endpoint::parse("http://user:pass@worker:3000").unwrap();
+        let shown = format!("{endpoint:?}");
+        assert!(!shown.contains("pass"), "{shown}");
+        assert!(shown.contains("user:***"), "{shown}");
+
+        // A key cannot tell userinfo from the rest of its own string, so one
+        // carrying an `@` is masked whole.
+        assert!(!format!("{:?}", endpoint.key()).contains("pass"));
+
+        // The common case stays readable, so a failing assertion still says
+        // which key it got.
+        let plain = Endpoint::parse("http://worker:3000").unwrap();
+        assert_eq!(
+            format!("{:?}", plain.key()),
+            r#"EndpointKey("worker:3000")"#
+        );
+        assert!(format!("{plain:?}").contains("http://worker:3000"));
+    }
+
     #[test]
     fn redaction_leaves_addresses_without_secrets_alone() {
         for spelling in [
@@ -700,6 +744,9 @@ mod tests {
         }
     }
 
+    /// A `]` in a path used to abort the path scan, leaving the whole string
+    /// as an authority that then failed as a malformed IPv6 host. `url::Url`
+    /// leaves brackets unencoded in a path, so this registers.
     #[test]
     fn brackets_inside_a_path_do_not_hide_it() {
         assert_eq!(key_of("http://proxy:8080/v1/[x]"), "proxy:8080/v1/[x]");
