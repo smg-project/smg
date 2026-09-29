@@ -123,6 +123,11 @@ impl std::error::Error for EndpointError {}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Endpoint {
     scheme: Option<Scheme>,
+    /// Anything before the authority's final `@`. `validate_worker_url`
+    /// accepts `http://user:pass@worker:3000`, so it has to survive into the
+    /// key rather than being rejected or folded into the host, where its
+    /// second colon would look like an unbracketed IPv6 literal.
+    userinfo: Option<String>,
     host: Host,
     port: Option<u16>,
     /// Path prefix, when the address carries one. `validate_worker_url`
@@ -183,6 +188,7 @@ impl Endpoint {
             return Ok((
                 Endpoint {
                     scheme,
+                    userinfo: None,
                     host: Host::IpcPath(rest.to_string()),
                     port: None,
                     path: None,
@@ -195,10 +201,18 @@ impl Endpoint {
         if authority.is_empty() {
             return Err(EndpointError::Empty);
         }
-        let (host, port) = split_host_port(authority)?;
+        let (userinfo, hostport) = match authority.rsplit_once('@') {
+            Some((userinfo, hostport)) => (Some(userinfo.to_string()), hostport),
+            None => (None, authority),
+        };
+        if hostport.is_empty() {
+            return Err(EndpointError::Empty);
+        }
+        let (host, port) = split_host_port(hostport)?;
         Ok((
             Endpoint {
                 scheme,
+                userinfo,
                 host,
                 port,
                 path,
@@ -237,10 +251,15 @@ impl Endpoint {
     /// `host:port`; a contrived path shaped like one would.
     pub fn key(&self) -> EndpointKey {
         let path = self.path.as_deref().unwrap_or("");
+        let user = self
+            .userinfo
+            .as_deref()
+            .map(|u| format!("{u}@"))
+            .unwrap_or_default();
         EndpointKey(match (&self.host, self.port) {
             (Host::IpcPath(socket), _) => socket.clone(),
-            (host, Some(port)) => format!("{}:{port}{path}", render_host(host)),
-            (host, None) => format!("{}{path}", render_host(host)),
+            (host, Some(port)) => format!("{user}{}:{port}{path}", render_host(host)),
+            (host, None) => format!("{user}{}{path}", render_host(host)),
         })
     }
 
@@ -263,10 +282,15 @@ impl Endpoint {
     pub fn render(&self) -> String {
         let prefix = self.scheme.map(Scheme::as_prefix).unwrap_or("");
         let path = self.path.as_deref().unwrap_or("");
+        let user = self
+            .userinfo
+            .as_deref()
+            .map(|u| format!("{u}@"))
+            .unwrap_or_default();
         match (&self.host, self.port) {
             (Host::IpcPath(socket), _) => format!("ipc://{socket}"),
-            (host, Some(port)) => format!("{prefix}{}:{port}{path}", render_host(host)),
-            (host, None) => format!("{prefix}{}{path}", render_host(host)),
+            (host, Some(port)) => format!("{prefix}{user}{}:{port}{path}", render_host(host)),
+            (host, None) => format!("{prefix}{user}{}{path}", render_host(host)),
         }
     }
 
@@ -319,7 +343,13 @@ fn split_rank(input: &str) -> (&str, Option<usize>) {
 /// The search starts after a bracketed IPv6 host so the brackets' own colons
 /// and the authority are never mistaken for a path.
 fn split_path(rest: &str) -> (&str, Option<String>) {
-    let after_brackets = rest.find(']').map_or(0, |close| close + 1);
+    // Only a bracketed host has brackets to skip. Searching for `]`
+    // unconditionally let one inside a path hide the `/` that preceded it.
+    let after_brackets = if rest.starts_with('[') {
+        rest.find(']').map_or(0, |close| close + 1)
+    } else {
+        0
+    };
     let Some(offset) = rest[after_brackets..].find('/') else {
         return (rest, None);
     };
@@ -477,12 +507,11 @@ mod tests {
             Endpoint::parse_with_rank("10.0.0.1:8080@2").unwrap().1,
             Some(2)
         );
-        // Not a rank, so the `@abc` stays with the address and fails as a port
-        // rather than silently truncating the key.
-        assert!(matches!(
-            Endpoint::parse_with_rank("10.0.0.1:8080@abc").unwrap_err(),
-            EndpointError::InvalidPort { .. }
-        ));
+        // Not a rank, so the `@` separates userinfo from a host, which is how
+        // `url::Url` reads it too. Either way the key is not truncated.
+        let (endpoint, rank) = Endpoint::parse_with_rank("10.0.0.1:8080@abc").unwrap();
+        assert_eq!(rank, None);
+        assert_eq!(endpoint.key().as_str(), "10.0.0.1:8080@abc");
     }
 
     /// The registry holds workers registered as `http://user@worker:3000`, so
@@ -491,6 +520,17 @@ mod tests {
     #[test]
     fn an_at_sign_in_the_address_is_kept_not_truncated() {
         assert_eq!(key_of("http://user@worker:3000"), "user@worker:3000");
+        // Credentials carry a second colon, which read as an unbracketed IPv6
+        // literal before userinfo became its own component. `url::Url` accepts
+        // this shape, so `validate_worker_url` lets it register.
+        assert_eq!(
+            key_of("http://user:pass@worker:3000"),
+            "user:pass@worker:3000"
+        );
+        assert_eq!(
+            key_of("grpc://user:pass@worker:3000@1"),
+            "user:pass@worker:3000"
+        );
         let (endpoint, rank) = Endpoint::parse_with_rank("http://user@worker:3000@0").unwrap();
         assert_eq!(rank, Some(0));
         assert_eq!(endpoint.key().as_str(), "user@worker:3000");
@@ -594,6 +634,19 @@ mod tests {
         assert_ne!(key_of("http://proxy:8080/a"), key_of("http://proxy:8080/b"));
         // A path is not optional decoration.
         assert_ne!(key_of("http://proxy:8080/a"), key_of("http://proxy:8080"));
+    }
+
+    /// A `]` in a path used to abort the path scan, leaving the whole string
+    /// as an authority that then failed as a malformed IPv6 host. `url::Url`
+    /// leaves brackets unencoded in a path, so this registers.
+    #[test]
+    fn brackets_inside_a_path_do_not_hide_it() {
+        assert_eq!(key_of("http://proxy:8080/v1/[x]"), "proxy:8080/v1/[x]");
+        // A genuinely bracketed host still splits at the right place.
+        assert_eq!(
+            key_of("http://[fd00::1]:8080/v1/[x]"),
+            "[fd00::1]:8080/v1/[x]"
+        );
     }
 
     #[test]
