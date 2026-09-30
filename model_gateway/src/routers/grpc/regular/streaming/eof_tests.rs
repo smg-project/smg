@@ -686,8 +686,9 @@ async fn messages_blocks(
 
 /// The content block starts and stops of a Messages stream of `texts`, and
 /// the input of each `tool_use` block joined from its `input_json_delta`s as
-/// a client SDK builds it. A block starts only when none is open, and every
-/// delta goes to the open block and matches its type.
+/// a client SDK builds it (the joined text if it is not complete JSON). A
+/// block starts only when none is open, and every delta goes to the open
+/// block and matches its type.
 async fn messages_blocks_and_inputs(
     processor: StreamingProcessor,
     tool_choice: Option<messages::ToolChoice>,
@@ -761,7 +762,7 @@ async fn messages_blocks_and_inputs(
         .iter()
         .map(|json| match json.as_str() {
             "" => serde_json::json!({}),
-            json => serde_json::from_str(json).expect("tool input JSON"),
+            json => serde_json::from_str(json).unwrap_or_else(|_| json.into()),
         })
         .collect();
     (blocks, inputs)
@@ -956,7 +957,7 @@ async fn messages_tool_arguments_precede_text_in_the_same_chunk() {
 }
 
 #[tokio::test]
-async fn messages_specific_tool_arguments_need_an_open_block() {
+async fn messages_tool_arguments_need_an_open_block() {
     // Reasoning that starts only after the specific tool's block stops that
     // block; the arguments after it have no block to go to and are dropped.
     let tool = messages::ToolChoice::Tool {
@@ -979,4 +980,39 @@ async fn messages_specific_tool_arguments_need_an_open_block() {
         ]
     );
     assert_eq!(inputs, [serde_json::json!({})]);
+    // Until qwen3 strips a `<think>`, it takes the first one anywhere as the
+    // start of reasoning, so one inside an argument stops the call's block.
+    // The rest of the arguments are dropped, in the middle of the stream and
+    // at its end, where qwen_xml releases the closing brace.
+    for (texts, input) in [
+        (
+            [
+                "<tool_call>\n<function=lookup>\n<parameter=q>\nA ",
+                "<think>x</think> B\n</parameter>\n",
+                "</function>\n</tool_call>",
+            ],
+            serde_json::json!({}),
+        ),
+        (
+            [
+                "<tool_call>\n<function=lookup>\n<parameter=q>\nA\n</parameter>\n",
+                "<parameter=r>\nB ",
+                "<think>x",
+            ],
+            serde_json::json!("{\"q\": \"A\""),
+        ),
+    ] {
+        let (blocks, inputs) =
+            messages_blocks_and_inputs(named_processor("qwen_xml", "qwen3"), None, &texts).await;
+        assert_eq!(
+            blocks,
+            [
+                "start 0 \"tool_use\"",
+                "stop 0",
+                "start 1 \"thinking\"",
+                "stop 1",
+            ]
+        );
+        assert_eq!(inputs, [input]);
+    }
 }

@@ -1842,6 +1842,30 @@ impl StreamingProcessor {
         Ok(())
     }
 
+    /// Send tool call arguments to the open `tool_use` block. Reasoning can
+    /// stop that block in the middle of a call, and the arguments after it
+    /// have no block to go to, so they are dropped.
+    async fn send_tool_arguments(
+        tx: &SseSender,
+        buffer: &mut Vec<u8>,
+        index: u32,
+        tool_block_open: bool,
+        partial_json: String,
+    ) -> Result<(), String> {
+        if partial_json.is_empty() {
+            return Ok(());
+        }
+        if !tool_block_open {
+            debug!("Dropping tool arguments without an open tool_use block");
+            return Ok(());
+        }
+        let delta = MessageStreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentBlockDelta::InputJsonDelta { partial_json },
+        };
+        Self::send_messages_event(tx, buffer, &delta).await
+    }
+
     /// Process reasoning content in Messages streaming mode (n=1 only).
     ///
     /// Returns `(normal_text, reasoning_text, in_reasoning)`.
@@ -2395,23 +2419,14 @@ impl StreamingProcessor {
                         tool_block_open = true;
                     }
                     // Emit arguments delta, unless reasoning stopped the block
-                    if !normal_text.is_empty() {
-                        if tool_block_open {
-                            Self::send_messages_event(
-                                tx,
-                                &mut sse_buffer,
-                                &MessageStreamEvent::ContentBlockDelta {
-                                    index: current_block_index,
-                                    delta: ContentBlockDelta::InputJsonDelta {
-                                        partial_json: normal_text,
-                                    },
-                                },
-                            )
-                            .await?;
-                        } else {
-                            warn!("Dropping tool arguments without an open tool_use block");
-                        }
-                    }
+                    Self::send_tool_arguments(
+                        tx,
+                        &mut sse_buffer,
+                        current_block_index,
+                        tool_block_open,
+                        normal_text,
+                    )
+                    .await?;
                 } else if let Some(ref mut parser) = streaming_tool_parser {
                     // Regular/required tool choice: use incremental parser
                     match parser.parse_incremental(&normal_text, chat_tools).await {
@@ -2430,19 +2445,14 @@ impl StreamingProcessor {
                                 0
                             };
                             for tool_call_item in calls.drain(..finishing) {
-                                if !tool_call_item.parameters.is_empty() {
-                                    Self::send_messages_event(
-                                        tx,
-                                        &mut sse_buffer,
-                                        &MessageStreamEvent::ContentBlockDelta {
-                                            index: current_block_index,
-                                            delta: ContentBlockDelta::InputJsonDelta {
-                                                partial_json: tool_call_item.parameters,
-                                            },
-                                        },
-                                    )
-                                    .await?;
-                                }
+                                Self::send_tool_arguments(
+                                    tx,
+                                    &mut sse_buffer,
+                                    current_block_index,
+                                    tool_block_open,
+                                    tool_call_item.parameters,
+                                )
+                                .await?;
                             }
 
                             // Emit normal text from parser as text content blocks
@@ -2527,19 +2537,14 @@ impl StreamingProcessor {
                                 }
 
                                 // Emit incremental arguments
-                                if !tool_call_item.parameters.is_empty() {
-                                    Self::send_messages_event(
-                                        tx,
-                                        &mut sse_buffer,
-                                        &MessageStreamEvent::ContentBlockDelta {
-                                            index: current_block_index,
-                                            delta: ContentBlockDelta::InputJsonDelta {
-                                                partial_json: tool_call_item.parameters,
-                                            },
-                                        },
-                                    )
-                                    .await?;
-                                }
+                                Self::send_tool_arguments(
+                                    tx,
+                                    &mut sse_buffer,
+                                    current_block_index,
+                                    tool_block_open,
+                                    tool_call_item.parameters,
+                                )
+                                .await?;
                             }
                         }
                         Err(e) => {
@@ -2678,19 +2683,14 @@ impl StreamingProcessor {
                         tool_block_open = true;
                     }
 
-                    if !tool_call_item.parameters.is_empty() {
-                        Self::send_messages_event(
-                            tx,
-                            &mut sse_buffer,
-                            &MessageStreamEvent::ContentBlockDelta {
-                                index: current_block_index,
-                                delta: ContentBlockDelta::InputJsonDelta {
-                                    partial_json: tool_call_item.parameters,
-                                },
-                            },
-                        )
-                        .await?;
-                    }
+                    Self::send_tool_arguments(
+                        tx,
+                        &mut sse_buffer,
+                        current_block_index,
+                        tool_block_open,
+                        tool_call_item.parameters,
+                    )
+                    .await?;
                 }
             }
         }
