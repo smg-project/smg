@@ -1,0 +1,44 @@
+{
+ "transformers": "5.18.0",
+ "transformers_tag": "v5.18.0",
+ "regex": "2026.9.10",
+ "python": "3.12",
+ "unicodedata": "15.0.0",
+ "inputs": {
+  "src/transformers/utils/chat_parsing/__init__.py": "ktnhyhvmmzttjtyz",
+  "src/transformers/utils/chat_parsing/response_parser.py": "rwsphpgthgssqrtq",
+  "src/transformers/utils/chat_parsing/response_templates.py": "wxvnrrrmzswpqmkt",
+  "src/transformers/utils/chat_parsing/content_parsers.py": "txykwyvwvyssgxvy",
+  "tests/utils/test_chat_parsing.py": "hmqypkhjnjkrkkjy"
+ },
+ "generator": "gsjttyvkppzksxzt",
+ "hf_test_run": {
+  "tests_run": 69,
+  "tests_excluded": [
+   "test_batched_parse_response_with_prefix",
+   "test_batched_response",
+   "test_explicit_template_schema",
+   "test_get_response_parser_forwards_tools",
+   "test_numpy_inputs",
+   "test_prefix_token_ids_decoded",
+   "test_response_template_save_load",
+   "test_tensor_inputs",
+   "test_token_id_inputs",
+   "test_tokenizer_get_response_parser_with_prefix",
+   "test_tokenizer_parse_response",
+   "test_tokenizer_parse_response_forwards_tools"
+  ]
+ },
+ "hf_test_sessions_skipped": {
+  "load_error": 1
+ },
+ "counts": {
+  "templates": 399,
+  "sessions": 689,
+  "random_sessions": 1000,
+  "regex_rows": 1636,
+  "units": 254
+ },
+ "digest": "sha256 of the canonical JSON, first 8 bytes, nibbles as ghjkmnpqrstvwxyz",
+ "license": "Recorded from transformers (Apache-2.0); templates and inputs under hf-tests/ come from its tests/utils/test_chat_parsing.py, templates under serve/ from src/transformers/cli/serving/utils.py."
+}
