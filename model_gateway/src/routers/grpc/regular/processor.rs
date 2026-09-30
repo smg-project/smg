@@ -636,7 +636,13 @@ impl ResponseProcessor {
                         Some(messages::ThinkingConfig::Disabled) => Some(false),
                         None => None,
                     };
-                    if utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref()) {
+                    if utils::reasoning_starts_in_prefill(
+                        None,
+                        None,
+                        user_thinking,
+                        messages_request.continues_final_assistant,
+                        tokenizer.as_ref(),
+                    ) {
                         parser.mark_reasoning_started();
                     }
                 }
