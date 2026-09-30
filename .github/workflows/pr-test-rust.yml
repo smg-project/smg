@@ -551,6 +551,7 @@ jobs:
               - 'scripts/ci_build_wheel.sh'
               - 'crates/tokenizer/**'
               - 'crates/tool_parser/**'
+              - 'crates/response_template/**'
               # Router-embedded crates: changes here alter gateway behavior
               # across every API surface, so they must trigger the e2e lanes.
               - 'crates/auth/**'
@@ -562,7 +563,6 @@ jobs:
               - 'crates/workflow/**'
             chat-completions:
               - 'crates/reasoning_parser/**'
-              - 'crates/response_template/**'
               - 'crates/multimodal/**'
               - 'crates/grpc_client/**'
               # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes, which gate

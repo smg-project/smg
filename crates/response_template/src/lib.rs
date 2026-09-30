@@ -11,6 +11,8 @@
 //! `content_parsers.rs`); the README maps each transformers name to its Rust
 //! counterpart and lists what is not supported.
 
+#[cfg(feature = "adapter")]
+pub mod adapter;
 mod content_parsers;
 mod error;
 mod py;

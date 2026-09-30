@@ -6316,6 +6316,8 @@ version = "1.8.0"
 dependencies = [
  "parking_lot",
  "regex",
+ "serde_json",
+ "smg-response-template",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -8809,6 +8811,7 @@ dependencies = [
  "rustpython-parser",
  "serde",
  "serde_json",
+ "smg-response-template",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
