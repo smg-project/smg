@@ -935,3 +935,29 @@ async fn messages_tool_arguments_precede_text_in_the_same_chunk() {
         assert_eq!(inputs, [input]);
     }
 }
+
+#[tokio::test]
+async fn messages_specific_tool_arguments_need_an_open_block() {
+    // Reasoning that starts only after the specific tool's block stops that
+    // block; the arguments after it have no block to go to and are dropped.
+    let tool = messages::ToolChoice::Tool {
+        name: "lookup".to_string(),
+        disable_parallel_tool_use: None,
+    };
+    let (blocks, inputs) = messages_blocks_and_inputs(
+        named_processor("qwen", "qwen3"),
+        Some(tool),
+        &["<thi", "nk>plan", "</think>", "{}"],
+    )
+    .await;
+    assert_eq!(
+        blocks,
+        [
+            "start 0 \"tool_use\"",
+            "stop 0",
+            "start 1 \"thinking\"",
+            "stop 1",
+        ]
+    );
+    assert_eq!(inputs, [serde_json::json!({})]);
+}

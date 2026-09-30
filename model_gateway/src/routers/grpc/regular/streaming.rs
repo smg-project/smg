@@ -2394,19 +2394,23 @@ impl StreamingProcessor {
                         .await?;
                         tool_block_open = true;
                     }
-                    // Emit arguments delta
+                    // Emit arguments delta, unless reasoning stopped the block
                     if !normal_text.is_empty() {
-                        Self::send_messages_event(
-                            tx,
-                            &mut sse_buffer,
-                            &MessageStreamEvent::ContentBlockDelta {
-                                index: current_block_index,
-                                delta: ContentBlockDelta::InputJsonDelta {
-                                    partial_json: normal_text,
+                        if tool_block_open {
+                            Self::send_messages_event(
+                                tx,
+                                &mut sse_buffer,
+                                &MessageStreamEvent::ContentBlockDelta {
+                                    index: current_block_index,
+                                    delta: ContentBlockDelta::InputJsonDelta {
+                                        partial_json: normal_text,
+                                    },
                                 },
-                            },
-                        )
-                        .await?;
+                            )
+                            .await?;
+                        } else {
+                            warn!("Dropping tool arguments without an open tool_use block");
+                        }
                     }
                 } else if let Some(ref mut parser) = streaming_tool_parser {
                     // Regular/required tool choice: use incremental parser
