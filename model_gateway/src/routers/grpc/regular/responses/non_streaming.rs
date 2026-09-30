@@ -18,8 +18,9 @@ use tracing::{debug, error, trace};
 use super::{
     common::{
         apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
-        extract_all_tool_calls_from_chat, load_conversation_history, prepare_chat_tools_and_choice,
-        ExtractedToolCall, McpToolCallLimit, ResponsesCallContext, ToolLoopState,
+        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, load_conversation_history,
+        prepare_chat_tools_and_choice, ExtractedToolCall, McpToolCallLimit, ResponsesCallContext,
+        ToolLoopState,
     },
     conversions,
 };
@@ -216,12 +217,14 @@ pub(super) async fn execute_tool_loop(
             .collect();
 
         // A truncated or failed generation must never dispatch tools, even if a complete
-        // call was parsed before the engine stopped. Match the streaming loop.
+        // call was parsed before the engine stopped, and neither must a server call the
+        // generation did not finish. Match the streaming loop.
         let generation_interrupted = chat_response
             .choices
             .first()
             .and_then(|choice| choice.finish_reason.as_deref())
-            .is_some_and(|reason| matches!(reason, "length" | "failed" | "error"));
+            .is_some_and(|reason| matches!(reason, "length" | "failed" | "error"))
+            || has_unfinished_mcp_call(&tool_calls, &session);
         if tool_calls.is_empty() || generation_interrupted {
             // No more tool calls, we're done
             trace!(

@@ -214,6 +214,20 @@ pub(super) fn apply_mcp_tool_call_limit(
     )
 }
 
+/// Whether a server call among `calls` has arguments that are not JSON. A
+/// parser can report a call's name before its arguments, so a call whose
+/// output was cut short or failed to parse arrives without them. Like the
+/// calls of a truncated or failed generation, it must not be dispatched.
+pub(super) fn has_unfinished_mcp_call(
+    calls: &[ExtractedToolCall],
+    session: &McpToolSession<'_>,
+) -> bool {
+    calls.iter().any(|call| {
+        session.has_exposed_tool(&call.name)
+            && serde_json::from_str::<serde_json::Value>(&call.arguments).is_err()
+    })
+}
+
 /// Extract all tool calls from chat response (for parallel tool call support)
 pub(super) fn extract_all_tool_calls_from_chat(
     response: &openai_protocol::chat::ChatCompletionResponse,

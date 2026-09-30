@@ -38,8 +38,8 @@ use uuid::Uuid;
 use super::{
     common::{
         apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
-        extract_all_tool_calls_from_chat, prepare_chat_tools_and_choice, ExtractedToolCall,
-        McpToolCallLimit, ResponsesCallContext, ToolLoopState,
+        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, prepare_chat_tools_and_choice,
+        ExtractedToolCall, McpToolCallLimit, ResponsesCallContext, ToolLoopState,
     },
     conversions,
 };
@@ -685,6 +685,10 @@ async fn execute_tool_loop_streaming_internal(
 
         // Check for tool calls (extract all of them for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
+        // Neither can a server call the generation did not finish.
+        if has_unfinished_mcp_call(&tool_calls, &session) {
+            break None;
+        }
 
         if !tool_calls.is_empty() {
             trace!(

@@ -593,6 +593,56 @@ async fn mcp_unfinished_generation_never_dispatches_tools() {
 }
 
 #[tokio::test]
+async fn mcp_call_without_json_arguments_never_dispatches() {
+    // The parser names the server call, but the output ends before the
+    // call's arguments start.
+    for stream in [false, true] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let (response, _) = responses_result_with_output(
+            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+            Some("<tool_call>\n{\"name\":\"brave_web_search\""), None, "completed", stream,
+        ).await;
+        mcp.stop().await;
+        assert_eq!(mcp.call_count(), 0, "stream={stream}: {response}");
+        assert_executed_mcp_queries(&response, &[]);
+        assert!(
+            !response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["type"] == "function_call"),
+            "{response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_call_without_arguments_runs_with_an_empty_object() {
+    // A whole server call that takes no arguments.
+    for stream in [false, true] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let (response, _) = responses_result_with_output(
+            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+            Some("<tool_call>\n{\"name\":\"brave_web_search\"}\n</tool_call>\n"), Some(1), "completed", stream,
+        ).await;
+        mcp.stop().await;
+        assert_eq!(mcp.call_count(), 1, "stream={stream}: {response}");
+        let calls: Vec<_> = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["type"] == "mcp_call")
+            .collect();
+        assert_eq!(calls.len(), 1, "stream={stream}: {response}");
+        assert_eq!(calls[0]["arguments"], "{}", "stream={stream}: {response}");
+    }
+}
+
+#[tokio::test]
 async fn mcp_mixed_batch_executes_server_prefix_and_returns_client_function() {
     for stream in [false, true] {
         for cap in [None, Some(0), Some(1)] {
