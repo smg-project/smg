@@ -89,6 +89,8 @@ fn tokens(output: &str) -> Vec<String> {
 struct Setup {
     template: Option<Value>,
     prompt_tail: &'static str,
+    /// What the prompt tokens decode to in place of `prompt_tail`.
+    decoded_prompt_tail: Option<&'static str>,
     output: &'static str,
     card: ModelCard,
     reasoning_parser: Option<&'static str>,
@@ -100,6 +102,7 @@ impl Default for Setup {
         Self {
             template: Some(qwen3_5()),
             prompt_tail: THINKING,
+            decoded_prompt_tail: None,
             output: OUTPUT,
             card: ModelCard::new(MODEL),
             reasoning_parser: None,
@@ -150,7 +153,8 @@ async fn serve(setup: Setup) -> Gateway {
     config.tool_call_parser = setup.tool_parser.map(str::to_string);
     let tokenizer = ScriptedTokenizer::from_chunks(tokens(setup.output))
         .with_special_tokens(EOS)
-        .with_prompt_tail(setup.prompt_tail);
+        .with_prompt_tail(setup.prompt_tail)
+        .with_prompt_ids(setup.decoded_prompt_tail);
     let tokenizer: Arc<dyn Tokenizer> = match setup.template {
         Some(template) => Arc::new(tokenizer.with_response_template(template)),
         None => Arc::new(tokenizer),
@@ -545,24 +549,63 @@ async fn the_prompt_tail_says_where_the_output_starts() {
     let gateway = serve(setup).await;
     let unary = chat(&gateway, json!({})).await;
     assert_eq!(unary, chat_of("", "It is sunny.", &[], "stop"));
-    // The prompt's trailing whitespace could have begun a delimiter, so it is
-    // streamed once the output shows it did not.
+    // The prompt's trailing whitespace could have begun a delimiter, so the
+    // parser held it; a stream shows only the output.
     let streamed = chat(&gateway, json!({"stream": true})).await;
-    assert_eq!(streamed, chat_of("", "\n\nIt is sunny.", &[], "stop"));
+    assert_eq!(streamed, chat_of("", "It is sunny.", &[], "stop"));
 
-    // Without the anchor in the prompt, transformers parses the whole prompt
-    // as the start of the message: a stream shows what follows it, and the
-    // parsed message holds the prompt text too.
+    // Without the anchor in the prompt (a chat template that does not write
+    // it), the parsers start from the output: transformers would parse the
+    // whole prompt, the user's text included, as the start of the message.
     let setup = Setup {
         prompt_tail: "",
         output: "It is sunny.<|im_end|>",
         ..Setup::default()
     };
     let gateway = serve(setup).await;
-    let streamed = chat(&gateway, json!({"stream": true})).await;
-    assert_eq!(streamed, chat_of("", " It is sunny.", &[], "stop"));
+    let user_texts = [
+        "weather?",
+        // A call in the user's text is no call, and one it leaves open does
+        // not take the output.
+        "Summarize: <tool_call>\n<function=get_time>\n</function>\n</tool_call> thanks",
+        "What is <tool_call>\n<function=get_time>",
+    ];
+    for text in user_texts {
+        for stream in [false, true] {
+            let request = json!({"stream": stream, "tools": tools(),
+                                 "messages": [{"role": "user", "content": text}]});
+            let chat = chat(&gateway, request).await;
+            assert_eq!(
+                chat,
+                chat_of("", "It is sunny.", &[], "stop"),
+                "{text} {stream}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_prompt_is_read_from_its_tokens() {
+    // The rendered prompt leaves thinking open, but its tokens decode with
+    // thinking off: the parsers start from the tokens the model was given.
+    let setup = Setup {
+        decoded_prompt_tail: Some(NO_THINKING),
+        output: "It is sunny.<|im_end|>",
+        ..Setup::default()
+    };
+    let gateway = serve(setup).await;
     let unary = chat(&gateway, json!({})).await;
-    assert_eq!(unary.content, "user: weather?\nassistant: It is sunny.");
+    assert_eq!(unary, chat_of("", "It is sunny.", &[], "stop"));
+    let streamed = chat(&gateway, json!({"stream": true})).await;
+    assert_eq!(streamed, chat_of("", "It is sunny.", &[], "stop"));
+    assert_eq!(
+        messages(&gateway, false, false).await,
+        [json!(["text", "It is sunny."])]
+    );
+    assert_eq!(
+        messages(&gateway, true, false).await,
+        [json!(["text", "It is sunny."])]
+    );
 }
 
 #[tokio::test]
@@ -583,6 +626,36 @@ async fn a_continued_message_returns_what_was_generated() {
         });
         let chat = chat(&gateway, request).await;
         assert_eq!(chat, chat_of("", " is sunny.", &[], "stop"), "{stream}");
+    }
+
+    // The end of the message the client sent could have begun a delimiter,
+    // so the parser held it; it is not sent back with the output.
+    let cases = [
+        ("The weather ", "is sunny.<|im_end|>", "is sunny."),
+        ("so x <", "= 5<|im_end|>", "= 5"),
+    ];
+    for (prefix, output, generated) in cases {
+        let setup = Setup {
+            prompt_tail: NO_THINKING,
+            output,
+            ..Setup::default()
+        };
+        let gateway = serve(setup).await;
+        let messages = json!([
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": prefix}
+        ]);
+        for stream in [false, true] {
+            let request = json!({
+                "messages": messages, "continue_final_message": true, "stream": stream
+            });
+            let chat = chat(&gateway, request).await;
+            assert_eq!(
+                chat,
+                chat_of("", generated, &[], "stop"),
+                "{prefix:?} {stream}"
+            );
+        }
     }
 }
 
@@ -689,12 +762,9 @@ async fn a_json_response_format_is_content_without_a_content_opener() {
     let gateway = serve(setup).await;
     let format = json!({"type": "json_schema",
                         "json_schema": {"name": "weather", "schema": {"type": "object"}}});
-    // A stream also shows the prompt's trailing whitespace, as in
-    // the_prompt_tail_says_where_the_output_starts.
-    for (stream, lead) in [(false, ""), (true, "\n\n")] {
+    for stream in [false, true] {
         let request = json!({"response_format": format, "stream": stream});
-        let content = format!("{lead}{{\"city\": \"Paris\"}}");
-        let expected = chat_of("", &content, &[], "stop");
+        let expected = chat_of("", r#"{"city": "Paris"}"#, &[], "stop");
         assert_eq!(chat(&gateway, request).await, expected);
     }
 }

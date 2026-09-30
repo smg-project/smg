@@ -52,10 +52,15 @@ impl ResponseTemplate {
     /// transformers: `truncate_past_last_anchor`. The text after the last
     /// start anchor, or the whole text when there is none.
     pub fn truncate_past_last_anchor<'a>(&self, text: &'a str) -> &'a str {
-        match self.0.start_anchor.finditer(text).last() {
-            Some(m) => &text[m.end..],
-            None => text,
-        }
+        &text[self.last_anchor_end(text).unwrap_or(0)..]
+    }
+
+    /// Where the last start anchor in `text` ends, or `None` without one; a
+    /// caller can then tell a prompt that holds no anchor, which
+    /// [`truncate_past_last_anchor`](Self::truncate_past_last_anchor) keeps
+    /// whole, from one that ends with it.
+    pub fn last_anchor_end(&self, text: &str) -> Option<usize> {
+        self.0.start_anchor.finditer(text).last().map(|m| m.end)
     }
 }
 

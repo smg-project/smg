@@ -185,9 +185,10 @@ struct Text {
 }
 
 impl ResponseParserState {
-    /// The state of one output. `prompt_tail` is the rendered prompt after the
-    /// template's last start anchor (transformers' `prefix`, truncated), and
-    /// `tools` cast tool-call arguments. With `continuation` (the prompt ends
+    /// The state of one output. `prompt_tail` is the prompt, decoded from the
+    /// token ids the model was given, after the template's last start anchor
+    /// (transformers' `prefix`, truncated), and `tools` cast tool-call
+    /// arguments. With `continuation` (the prompt ends
     /// inside the assistant message), a complete output returns what was
     /// generated, as a stream does, instead of the parsed message. When the
     /// prompt fails to parse, the whole output is content.

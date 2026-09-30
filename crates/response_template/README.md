@@ -26,6 +26,10 @@ differently. Callers can then fall back to another parser.
 | `ValueError` while loading | `LoadError::Invalid` |
 | exceptions while parsing | `ParseError` (`Content { kind, .. }` names the Python class) |
 
+`ResponseTemplate::last_anchor_end` gives where the last start anchor of a text
+ends, or `None` without one, where `truncate_past_last_anchor` keeps the whole
+text.
+
 `prefix` is required as in transformers; pass `""` to opt out. `finalize`
 consumes the parser, so the `RuntimeError`s of feeding or finalizing twice
 cannot happen. Results match transformers' for a template `Value` equal to
@@ -54,14 +58,25 @@ Where smg's use differs from `transformers serve` by design:
 - The parsers see the output without the stop or end-of-sequence text the stop
   decoder removes; `transformers serve` also feeds that text, so whitespace
   before it, or the marker inside a region it ends, can differ.
-- The prompt tail is cut from the rendered prompt, not from the decoded prompt
-  tokens, which can differ in special tokens the tokenizer adds (such as a
-  BOS token, which matters only when the prompt holds no start anchor), in
-  `clean_up_tokenization_spaces` and in Unicode normalization.
+- The prompt tail is cut from the prompt tokens decoded with special tokens
+  kept, as in `transformers serve`, but the tokens are smg's own encode. They
+  can differ from transformers' where transformers 5 rebuilds the tokenizer (as
+  for a legacy Llama `tokenizer.json`), a processor adds a BOS token or media
+  expands to a different number of tokens, and the model's input then differs
+  already. smg does not apply `clean_up_tokenization_spaces`, which
+  transformers applies where a tokenizer sets it and its model is not BPE.
+  Without a tokenizer, or when decoding fails, the rendered prompt stands in. A
+  prompt without a start anchor gives no tail: the parsers start from the
+  output, where transformers parses the whole prompt, user text included, as
+  the start of the message; the gateway logs it once per model and tokenizer.
+  An anchor that only an earlier turn wrote still starts the tail there.
 - Without tools (or with `tool_choice: none`) the tool parser does not run and
   tool calls are dropped; with `separate_reasoning: false` reasoning is
-  returned as content; prompt regions are not streamed; a continued assistant
-  message returns only the generated part.
+  returned as content; no prompt text is streamed, neither prompt regions nor
+  text at the end of the prompt that the parser held back as the possible
+  start of a delimiter (`transformers serve` streams that once the output
+  shows it began none); a continued assistant message returns only the
+  generated part.
 - When the template reads content only after an opener, a forced tool
   choice (Chat `required`, a named function or `allowed_tools` in required
   mode, Messages `any` or `tool`) and a JSON `response_format` are refused

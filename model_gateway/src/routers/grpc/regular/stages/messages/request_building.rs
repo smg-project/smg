@@ -145,18 +145,22 @@ impl BuildStage for MessageRequestBuildingStage {
 
         // The response-template parsers start from the end of the prompt.
         let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
-        spec.response_parser = ctx
+        if let Some(template) = ctx
             .components
             .parser_resolver
             .response_template(&messages_request.model)
-            .map(|template| {
-                utils::ResponseParserSpec::new(
-                    template,
-                    &processed_messages.text,
-                    &spec.chat_tools,
-                    false,
-                )
-            });
+        {
+            let (tokenizer, text) = (ctx.tokenizer_arc(), &processed_messages.text);
+            let model = &messages_request.model;
+            let tail =
+                utils::response_prompt_tail(&template, tokenizer, &token_ids, text, model).await;
+            spec.response_parser = Some(utils::ResponseParserSpec::new(
+                template,
+                tail,
+                &spec.chat_tools,
+                false,
+            ));
+        }
 
         let mut proto_request = builder_client
             .build_messages_request(

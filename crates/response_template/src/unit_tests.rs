@@ -339,6 +339,18 @@ fn refused_characters_say_why() {
     }
 }
 
+#[test]
+fn the_last_start_anchor_ends_where_the_tail_begins() {
+    let spec = json!({"start_anchor": "<a>", "fields": {"content": {}}});
+    let template = load_response_template(&spec).unwrap();
+    assert_eq!(template.last_anchor_end("x<a>y<a>z"), Some(8));
+    assert_eq!(template.truncate_past_last_anchor("x<a>y<a>z"), "z");
+    assert_eq!(template.last_anchor_end("x<a>"), Some(4));
+    // Without an anchor transformers keeps the whole text.
+    assert_eq!(template.last_anchor_end("xyz"), None);
+    assert_eq!(template.truncate_past_last_anchor("xyz"), "xyz");
+}
+
 fn class(kind: PyErrorKind) -> Value {
     Value::from(kind.to_string())
 }

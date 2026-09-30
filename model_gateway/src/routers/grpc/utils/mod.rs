@@ -32,5 +32,5 @@ pub(crate) use parsers::{
     reject_json_constraint_for_template, should_mark_reasoning_started, ParserResolver,
 };
 pub(crate) use response_template::{
-    log_template_error, ResponseParserSpec, ResponseTemplateParsers,
+    log_template_error, response_prompt_tail, ResponseParserSpec, ResponseTemplateParsers,
 };

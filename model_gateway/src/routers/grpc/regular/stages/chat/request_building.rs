@@ -236,18 +236,26 @@ impl BuildStage for ChatRequestBuildingStage {
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
         // The response-template parsers start from the end of the prompt.
-        let response_parser = ctx
+        let response_parser = match ctx
             .components
             .parser_resolver
             .response_template(&chat_request.model)
-            .map(|template| {
-                utils::ResponseParserSpec::new(
+        {
+            Some(template) => {
+                let (tokenizer, text) = (ctx.tokenizer_arc(), &processed_messages.text);
+                let model = &chat_request.model;
+                let tail =
+                    utils::response_prompt_tail(&template, tokenizer, &token_ids, text, model)
+                        .await;
+                Some(utils::ResponseParserSpec::new(
                     template,
-                    &processed_messages.text,
+                    tail,
                     chat_request.effective_tools(),
                     utils::continues_final_assistant(&chat_request),
-                )
-            });
+                ))
+            }
+            None => None,
+        };
         let (plan, stamp) = build_chat_backed_plan(
             ctx,
             &chat_request,

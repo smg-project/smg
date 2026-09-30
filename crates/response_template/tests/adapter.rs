@@ -146,19 +146,22 @@ fn crate_stream(
 }
 
 /// Where a step raises, a region failed: `got` reads what the steps before
-/// it read, then more, and its content ends with output (the failed region
-/// from its start and what follows, unparsed).
+/// it read (but for prompt text, see [`after_prompt`]), then more, and its
+/// content ends with output (the failed region from its start and what
+/// follows, unparsed).
 fn extends(got: &Read, before: &Read, tail: &str, text: &str) -> bool {
     let output = format!("{tail}{text}");
+    let rest = |got: &'_ str, before: &str| -> Option<String> {
+        after_prompt(before, tail)
+            .iter()
+            .find_map(|before| got.strip_prefix(before).map(str::to_owned))
+    };
     got.calls.starts_with(&before.calls)
-        && got.reasoning.starts_with(&before.reasoning)
-        && got
-            .content
-            .strip_prefix(&before.content)
-            .is_some_and(|rest| {
-                let last = rest.chars().last();
-                last.is_none_or(|last| output.ends_with(last))
-            })
+        && rest(&got.reasoning, &before.reasoning).is_some()
+        && rest(&got.content, &before.content).is_some_and(|rest| {
+            let last = rest.chars().last();
+            last.is_none_or(|last| output.ends_with(last))
+        })
 }
 
 fn new_state(template: &ResponseTemplate, prefix: &str, tools: &[Value]) -> ResponseParserState {
@@ -196,6 +199,30 @@ fn state_stream(
         push_calls(&mut read, calls);
     }
     read
+}
+
+/// The reads `expected` can leave after prompt text it starts with: a stream
+/// through a parser state shows no prompt text, where `transformers serve`
+/// streams the text the prompt held back once the output shows that it began
+/// no delimiter. Such text comes from `tail` in order, in pieces when the held
+/// text spans delimiters, so it is a subsequence of `tail`.
+fn after_prompt<'a>(expected: &'a str, tail: &str) -> Vec<&'a str> {
+    let mut tail = tail.chars();
+    let mut reads = vec![expected];
+    for (i, c) in expected.char_indices() {
+        if !tail.any(|t| t == c) {
+            break;
+        }
+        reads.push(&expected[i + c.len_utf8()..]);
+    }
+    reads
+}
+
+/// `got` reads what `expected` does, but for prompt text (see [`after_prompt`]).
+fn same_but_prompt(got: &Read, expected: &Read, tail: &str) -> bool {
+    got.calls == expected.calls
+        && after_prompt(&expected.reasoning, tail).contains(&got.reasoning.as_str())
+        && after_prompt(&expected.content, tail).contains(&got.content.as_str())
 }
 
 fn state_complete(template: &ResponseTemplate, prefix: &str, tools: &[Value], text: &str) -> Read {
@@ -291,7 +318,7 @@ fn replay(name: &str) -> (usize, usize, usize) {
                 let matches = if failed {
                     extends(&got, &expected, tail, text)
                 } else {
-                    got == expected
+                    same_but_prompt(&got, &expected, tail)
                 };
                 if !matches {
                     failures.push(format!(
@@ -313,7 +340,7 @@ fn replay(name: &str) -> (usize, usize, usize) {
                     let matches = if failed {
                         extends(&got, &expected, tail, text)
                     } else {
-                        got == expected
+                        same_but_prompt(&got, &expected, tail)
                     };
                     if !matches {
                         failures.push(format!(
@@ -607,4 +634,37 @@ fn a_stream_holds_back_a_bounded_amount_of_text() {
     }
     assert_eq!(reasoning, "plan");
     assert!(content.starts_with("<tool_call>\n<function=x") && content.ends_with("xdone"));
+}
+
+/// Text at the end of the prompt that could begin a delimiter waits for the
+/// output; once the output shows that it does not, a stream shows only the
+/// output.
+#[test]
+fn a_stream_shows_no_prompt_text() {
+    let template = serve_qwen3_5();
+    let cases = [
+        ("<think>\n\n</think>\n\n", "It is sunny.", "It is sunny."),
+        // A continued message: the held text is where the client's prefix ends.
+        (
+            "<think>\n\n</think>\n\nThe weather ",
+            "is sunny.",
+            "is sunny.",
+        ),
+        ("<think>\n\n</think>\n\nso x <", "= 5", "= 5"),
+    ];
+    for (tail, output, content) in cases {
+        for merge in [false, true] {
+            assert_eq!(
+                stream_read(&template, tail, output, merge),
+                content_read("", content, &[]),
+                "{tail:?}"
+            );
+        }
+    }
+    // The parsed message holds the prompt's text, as transformers' does.
+    let state = ResponseParserState::new(&template, "<think>\n\n</think>\n\nso x <", &[], false);
+    assert_eq!(
+        state.reasoning_complete("= 5"),
+        (String::new(), "so x <= 5".into())
+    );
 }

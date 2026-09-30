@@ -156,8 +156,8 @@ pub struct ResponseParser {
     /// Where the current region starts in `buffer`: at its opener, or for the
     /// implicit field where the delimiter before it ended.
     region_start: usize,
-    /// Where the output starts in `buffer`, after the prompt.
-    #[cfg(feature = "adapter")]
+    /// Where the output starts in `buffer`, after the prompt (smg's adapter;
+    /// 0 otherwise). Region chunks leave out the text before it.
     output_start: usize,
     /// Called with each region's field, value and taint before the value is
     /// stored (smg's adapter); an error fails the region.
@@ -241,7 +241,6 @@ impl ResponseParser {
             opened: false,
             initial_events: Vec::new(),
             region_start: 0,
-            #[cfg(feature = "adapter")]
             output_start: 0,
             check: None,
         }
@@ -547,7 +546,9 @@ impl ResponseParser {
     }
 
     /// transformers: `_accumulate`. Route text into the current region; the
-    /// null sink (no implicit field, no open region) drops it.
+    /// null sink (no implicit field, no open region) drops it. `text` starts
+    /// at `pos`; the prompt text it holds (smg's adapter) goes to the body
+    /// but not to the chunk, so a stream shows no prompt text.
     fn accumulate(&mut self, events: &mut Vec<Event>, text: String) {
         let Some(current) = self.current.filter(|_| !text.is_empty()) else {
             return;
@@ -560,11 +561,19 @@ impl ResponseParser {
             self.opened = true;
         }
         self.body.push_str(&text);
-        events.push(Event::RegionChunk {
-            field: field.name.clone(),
-            text,
-            dirty: !field.content.parser.streamable(),
-        });
+        let prompt = self.output_start.saturating_sub(self.pos).min(text.len());
+        let text = if prompt > 0 {
+            text[prompt..].to_owned()
+        } else {
+            text
+        };
+        if !text.is_empty() {
+            events.push(Event::RegionChunk {
+                field: field.name.clone(),
+                text,
+                dirty: !field.content.parser.streamable(),
+            });
+        }
     }
 
     /// transformers: `_open_explicit`.
