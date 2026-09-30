@@ -32,7 +32,9 @@ use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, Re
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
-use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
+use tool_parser::{
+    types::ToolCallItem, ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser,
+};
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -795,19 +797,12 @@ impl StreamingProcessor {
 
             if let Some(unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
                 for tool_call_item in unstreamed_items {
-                    let tool_call_delta = ToolCallDelta {
-                        index: tool_call_item.tool_index as u32,
-                        id: None,
-                        tool_type: None,
-                        function: Some(FunctionCallDelta {
-                            name: None,
-                            arguments: if tool_call_item.parameters.is_empty() {
-                                None
-                            } else {
-                                Some(tool_call_item.parameters)
-                            },
-                        }),
-                    };
+                    // A parser can report a whole call only when the output ends.
+                    if tool_call_item.name.is_some() {
+                        has_tool_calls.insert(*index, true);
+                    }
+                    let tool_call_delta =
+                        Self::tool_call_delta(tool_call_item, model, history_tool_calls_count);
 
                     let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
@@ -1701,34 +1696,8 @@ impl StreamingProcessor {
                     for tool_call_item in calls {
                         has_tool_calls.insert(index, true);
 
-                        let tool_call_id = if let Some(ref name) = tool_call_item.name {
-                            Some(utils::generate_tool_call_id(
-                                model,
-                                name,
-                                tool_call_item.tool_index,
-                                history_tool_calls_count,
-                            ))
-                        } else {
-                            None
-                        };
-
-                        let tool_call_delta = ToolCallDelta {
-                            index: tool_call_item.tool_index as u32,
-                            id: tool_call_id,
-                            tool_type: if tool_call_item.name.is_some() {
-                                Some("function".to_string())
-                            } else {
-                                None
-                            },
-                            function: Some(FunctionCallDelta {
-                                name: tool_call_item.name,
-                                arguments: if tool_call_item.parameters.is_empty() {
-                                    None
-                                } else {
-                                    Some(tool_call_item.parameters)
-                                },
-                            }),
-                        };
+                        let tool_call_delta =
+                            Self::tool_call_delta(tool_call_item, model, history_tool_calls_count);
 
                         chunks.push(
                             ChatCompletionStreamResponse::builder(request_id, model)
@@ -1748,6 +1717,27 @@ impl StreamingProcessor {
         }
 
         chunks
+    }
+
+    /// The chat delta of a parsed tool-call item: an item with a name starts
+    /// a call, with its id.
+    fn tool_call_delta(
+        item: ToolCallItem,
+        model: &str,
+        history_tool_calls_count: usize,
+    ) -> ToolCallDelta {
+        let id = item.name.as_ref().map(|name| {
+            utils::generate_tool_call_id(model, name, item.tool_index, history_tool_calls_count)
+        });
+        ToolCallDelta {
+            index: item.tool_index as u32,
+            id,
+            tool_type: item.name.is_some().then(|| "function".to_string()),
+            function: Some(FunctionCallDelta {
+                name: item.name,
+                arguments: (!item.parameters.is_empty()).then_some(item.parameters),
+            }),
+        }
     }
 
     /// Format a response as SSE chunk into a reusable buffer
