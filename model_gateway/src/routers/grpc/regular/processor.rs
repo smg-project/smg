@@ -755,12 +755,13 @@ impl ResponseProcessor {
                 .and_then(|v| v.as_str().map(String::from))
         });
 
-        let stop_reason = if tool_calls.is_some() || finish_reason_str == "tool_calls" {
+        // Parsed calls do not override a truncation, as in Chat.
+        let stop_reason = if finish_reason_str == "length" {
+            Some(messages::StopReason::MaxTokens)
+        } else if tool_calls.is_some() || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if stop_sequence.is_some() {
             Some(messages::StopReason::StopSequence)
-        } else if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
         } else {
             Some(messages::StopReason::EndTurn)
         };

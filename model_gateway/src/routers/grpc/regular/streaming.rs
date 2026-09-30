@@ -2663,13 +2663,15 @@ impl StreamingProcessor {
             .await?;
         }
 
-        // Phase 4: Emit message_delta with stop_reason and usage
-        let stop_reason = if has_tool_calls || finish_reason_str == "tool_calls" {
+        // Phase 4: Emit message_delta with stop_reason and usage. A truncation
+        // stays max_tokens after a tool call started, as Chat keeps `length`:
+        // the call may be cut short.
+        let stop_reason = if finish_reason_str == "length" {
+            Some(messages::StopReason::MaxTokens)
+        } else if has_tool_calls || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if matched_stop.is_some() {
             Some(messages::StopReason::StopSequence)
-        } else if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
         } else {
             Some(messages::StopReason::EndTurn)
         };

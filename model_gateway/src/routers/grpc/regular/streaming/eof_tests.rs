@@ -17,7 +17,10 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tonic::codec::Codec;
 
 use super::*;
-use crate::{routers::common::sse::SseReceiver, worker::WorkerRegistry};
+use crate::{
+    routers::{common::sse::SseReceiver, grpc::regular::processor::ResponseProcessor},
+    worker::WorkerRegistry,
+};
 
 #[derive(Default)]
 struct CharacterTokenizer {
@@ -461,6 +464,108 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
                 "end_turn"
             }
         );
+    }
+}
+
+/// A Messages response to `text` through the `qwen_xml` tool parser, which
+/// reports a call's name before its arguments: the type of each content block
+/// and the stop reason.
+async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<String>, String) {
+    let resolver = || {
+        utils::ParserResolver::new(
+            Arc::new(WorkerRegistry::new()),
+            Some("qwen_xml".to_string()),
+            None,
+        )
+    };
+    let request = serde_json::from_value::<messages::CreateMessageRequest>(serde_json::json!({
+        "model": "eof-test", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}]
+    }))
+    .expect("messages request");
+    let spec = MessagesResponseSpec::from(&request);
+    let mut last = complete(0, finish);
+    if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+        complete.output_ids = text.chars().map(u32::from).collect();
+    }
+    let (grpc_stream, server) = scripted_stream(vec![chunk(0, text), last], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let read = if stream {
+        let processor = StreamingProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            resolver(),
+            "vllm",
+        );
+        let (tx, rx) = sse_channel();
+        let result = processor
+            .process_messages_streaming_chunks(
+                grpc_stream,
+                dispatch(),
+                tokenizer,
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        assert!(result.is_ok(), "{result:?}");
+        let events = collect_events(rx).await;
+        let blocks = events
+            .iter()
+            .filter(|event| event["type"] == "content_block_start")
+            .map(|event| event["content_block"]["type"].as_str().unwrap().to_string())
+            .collect();
+        let delta = events.iter().find(|event| event["type"] == "message_delta");
+        let stop_reason = &delta.unwrap()["delta"]["stop_reason"];
+        (blocks, stop_reason.as_str().unwrap().to_string())
+    } else {
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            resolver(),
+        );
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let message = processor
+            .process_non_streaming_messages_response(
+                context::ExecutionResult::Single {
+                    stream: grpc_stream,
+                },
+                spec,
+                dispatch(),
+                tokenizer,
+                &mut decoder,
+            )
+            .await
+            .unwrap_or_else(|response| panic!("{}", response.status()));
+        let message = serde_json::to_value(message).unwrap();
+        let blocks = message["content"].as_array().unwrap().iter();
+        let blocks = blocks
+            .map(|block| block["type"].as_str().unwrap().to_string())
+            .collect();
+        (blocks, message["stop_reason"].as_str().unwrap().to_string())
+    };
+    server.abort();
+    read
+}
+
+#[tokio::test]
+async fn messages_truncated_after_a_tool_call_starts_stop_at_max_tokens() {
+    // The output ends inside a call the parser already named, or after a
+    // whole call. Only an output that finished calls a tool.
+    let cut = "<tool_call>\n<function=lookup>\n<parameter=city>\nPar";
+    let whole = "<tool_call>\n<function=lookup>\n</function>\n</tool_call>\nThen";
+    for (text, stream) in [(cut, true), (whole, true), (whole, false)] {
+        for (finish, stop_reason) in [("length", "max_tokens"), ("stop", "tool_use")] {
+            let (blocks, got) = qwen_xml_messages(text, finish, stream).await;
+            assert!(
+                blocks.iter().any(|block| block == "tool_use"),
+                "{text:?} {finish} stream={stream}: {blocks:?}"
+            );
+            assert_eq!(got, stop_reason, "{text:?} {finish} stream={stream}");
+        }
     }
 }
 
