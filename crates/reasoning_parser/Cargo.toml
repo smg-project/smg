@@ -15,10 +15,12 @@ categories = ["parsing", "text-processing"]
 [dependencies]
 parking_lot = { workspace = true }
 regex = "1.12"
+smg-response-template = { workspace = true, features = ["adapter"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+serde_json.workspace = true
 tokio = { workspace = true, features = ["full", "test-util", "macros", "rt-multi-thread"] }
 
 [lints]

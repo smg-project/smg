@@ -138,7 +138,7 @@ pub(crate) fn coerce(raw: &str, types: &[String], taint: &mut Taint) -> PyResult
 /// Feed model output with [`feed`](Self::feed) and finish with
 /// [`finalize`](Self::finalize); each returns the region events it produced.
 /// Events from the prompt prefix are in [`initial_events`](Self::initial_events).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResponseParser {
     spec: ResponseTemplate,
     /// Tool name to the `properties` of its parameters schema.
@@ -153,7 +153,19 @@ pub struct ResponseParser {
     body: String,
     opened: bool,
     initial_events: Vec<Event>,
+    /// Where the current region starts in `buffer`: at its opener, or for the
+    /// implicit field where the delimiter before it ended.
+    region_start: usize,
+    /// Where the output starts in `buffer`, after the prompt.
+    #[cfg(feature = "adapter")]
+    output_start: usize,
+    /// Called with each region's field, value and taint before the value is
+    /// stored (smg's adapter); an error fails the region.
+    check: Option<RegionCheck>,
 }
+
+/// See [`ResponseParser::check`].
+pub(crate) type RegionCheck = fn(&str, &Value, Taint) -> Result<(), ParseError>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -169,6 +181,38 @@ impl ResponseParser {
         prefix: &str,
         tools: &[Value],
     ) -> Result<Self, ParseError> {
+        Self::from_truncated(template, template.truncate_past_last_anchor(prefix), tools)
+    }
+
+    /// [`new`](Self::new) with the prefix already truncated past its last
+    /// start anchor; truncating it again could cut more.
+    pub(crate) fn from_truncated(
+        template: &ResponseTemplate,
+        truncated: &str,
+        tools: &[Value],
+    ) -> Result<Self, ParseError> {
+        let mut parser = Self::unprimed(template, tools);
+        parser.prime(truncated)?;
+        Ok(parser)
+    }
+
+    /// A parser for smg's adapter: the output starts after `prompt_tail`, and
+    /// `check` sees the value of each region that closes in it before the
+    /// value is stored.
+    #[cfg(feature = "adapter")]
+    pub(crate) fn for_adapter(
+        template: &ResponseTemplate,
+        prompt_tail: &str,
+        tools: &[Value],
+        check: RegionCheck,
+    ) -> Result<Self, ParseError> {
+        let mut parser = Self::from_truncated(template, prompt_tail, tools)?;
+        parser.check = Some(check);
+        parser.output_start = parser.buffer.len();
+        Ok(parser)
+    }
+
+    fn unprimed(template: &ResponseTemplate, tools: &[Value]) -> Self {
         let mut tool_params = HashMap::new();
         for tool in tools {
             let function = match tool {
@@ -184,7 +228,7 @@ impl ResponseParser {
                 .and_then(Value::as_object);
             tool_params.insert(name.clone(), properties.cloned().unwrap_or_default());
         }
-        let mut parser = Self {
+        Self {
             spec: template.clone(),
             tool_params,
             buffer: String::new(),
@@ -196,13 +240,21 @@ impl ResponseParser {
             body: String::new(),
             opened: false,
             initial_events: Vec::new(),
-        };
-        if !prefix.is_empty() {
-            let mut events = Vec::new();
-            parser.consume_prefix(prefix, &mut events)?;
-            parser.initial_events = events;
+            region_start: 0,
+            #[cfg(feature = "adapter")]
+            output_start: 0,
+            check: None,
         }
-        Ok(parser)
+    }
+
+    /// Consume the truncated prefix, keeping its events.
+    fn prime(&mut self, truncated: &str) -> Result<(), ParseError> {
+        if !truncated.is_empty() {
+            let mut events = Vec::new();
+            self.consume_prefix(truncated, &mut events)?;
+            self.initial_events = events;
+        }
+        Ok(())
     }
 
     /// Events produced while consuming the prefix, to replay before the output.
@@ -210,15 +262,22 @@ impl ResponseParser {
         &self.initial_events
     }
 
-    /// transformers: `_consume_prefix`.
-    fn consume_prefix(&mut self, prefix: &str, events: &mut Vec<Event>) -> Result<(), ParseError> {
-        let truncated = self.spec.truncate_past_last_anchor(prefix);
-        if truncated.is_empty() {
-            return Ok(());
-        }
+    /// The field of the current region: the open explicit region, else the
+    /// implicit field.
+    #[cfg(feature = "adapter")]
+    pub(crate) fn current_field(&self) -> Option<&str> {
+        self.current.map(|i| self.spec.0.fields[i].name.as_str())
+    }
+
+    /// transformers: `_consume_prefix`, from the truncation on.
+    fn consume_prefix(
+        &mut self,
+        truncated: &str,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ParseError> {
         truncated.clone_into(&mut self.buffer);
         let mut taint = None;
-        self.process(events, false, &mut taint)?;
+        self.process(events, false, &mut taint, 0)?;
         taint.map_or(Ok(()), |t| Err(ParseError::Unrepresentable(t)))
     }
 
@@ -227,8 +286,76 @@ impl ResponseParser {
         self.buffer.push_str(text);
         let mut events = Vec::new();
         let mut taint = None;
-        self.process(&mut events, false, &mut taint)?;
+        self.process(&mut events, false, &mut taint, 0)?;
         taint.map_or(Ok(events), |t| Err(ParseError::Unrepresentable(t)))
+    }
+
+    /// [`feed`](Self::feed) for smg's adapter, adding the events to `events`,
+    /// also those before an error. With `hold_limit`, when more than that
+    /// many bytes stay uncommitted, the text up to the last `hold_limit / 2`
+    /// bytes goes to the current region, delimiters there that are complete
+    /// included, and only matches that start in those bytes are waited for:
+    /// transformers holds such text and searches it again on every feed.
+    #[cfg(feature = "adapter")]
+    pub(crate) fn feed_into(
+        &mut self,
+        text: &str,
+        events: &mut Vec<Event>,
+        hold_limit: Option<usize>,
+    ) -> Result<(), ParseError> {
+        self.buffer.push_str(text);
+        let mut taint = None;
+        self.process(events, false, &mut taint, 0)?;
+        if let Some(limit) = hold_limit.filter(|&limit| self.buffer.len() - self.pos > limit) {
+            let floor = self
+                .buffer
+                .floor_char_boundary(self.buffer.len() - limit / 2);
+            self.process(events, false, &mut taint, floor)?;
+        }
+        // The region check fails on a taint; without it, `taint_of` reads it.
+        debug_assert!(taint.is_none() || self.check.is_none());
+        Ok(())
+    }
+
+    /// `finalize` for smg's adapter: the end of the output, adding the events
+    /// to `events`, also those before an error. A required field that is
+    /// missing is not an error; the parsed message stays in
+    /// [`message`](Self::message).
+    #[cfg(feature = "adapter")]
+    pub(crate) fn finish_into(&mut self, events: &mut Vec<Event>) -> Result<(), ParseError> {
+        let mut taint = None;
+        self.process(events, true, &mut taint, 0)
+    }
+
+    /// The message parsed so far.
+    #[cfg(feature = "adapter")]
+    pub(crate) fn message(&self) -> &Message {
+        &self.output
+    }
+
+    /// A copy without the region check: transformers' own parser.
+    #[cfg(feature = "adapter")]
+    pub(crate) fn unchecked(&self) -> Self {
+        Self {
+            check: None,
+            ..self.clone()
+        }
+    }
+
+    /// Why the message's value of one of `fields` cannot be held in JSON.
+    #[cfg(feature = "adapter")]
+    pub(crate) fn taint_of(&self, fields: &[&str]) -> Option<&'static str> {
+        fields
+            .iter()
+            .find_map(|field| self.tainted.get(*field).copied())
+    }
+
+    /// After an error: the output from the start of the region that failed
+    /// (from the start of the output when that region began in the prompt)
+    /// to the end of what was fed.
+    #[cfg(feature = "adapter")]
+    pub(crate) fn unparsed(&self) -> &str {
+        &self.buffer[self.region_start.max(self.output_start)..]
     }
 
     /// transformers: `finalize`. Close the stream; returns the message and the
@@ -236,7 +363,7 @@ impl ResponseParser {
     pub fn finalize(mut self) -> Result<(Message, Vec<Event>), ParseError> {
         let mut events = Vec::new();
         let mut taint = None;
-        self.process(&mut events, true, &mut taint)?;
+        self.process(&mut events, true, &mut taint, 0)?;
         let missing: Vec<String> = self
             .spec
             .0
@@ -263,18 +390,20 @@ impl ResponseParser {
         Ok((self.output, events))
     }
 
-    /// transformers: `_process`.
+    /// transformers: `_process`. No match that starts before `floor` is
+    /// waited for (see [`feed_into`](Self::feed_into)); transformers' is 0.
     fn process(
         &mut self,
         events: &mut Vec<Event>,
         eos: bool,
         taint: &mut Taint,
+        floor: usize,
     ) -> Result<(), ParseError> {
         // The buffer does not change here, so searches of it are remembered.
         let mut memos = vec![[Memo::default(), Memo::default()]; self.spec.0.fields.len()];
         loop {
             let watch = self.watchlist();
-            let (best, hold_start) = self.scan(&watch, eos, &mut memos);
+            let (best, hold_start) = self.scan(&watch, eos, &mut memos, floor);
             if let Some((kind, field, m)) = best {
                 if m.start > self.pos {
                     let text = self.buffer[self.pos..m.start].to_owned();
@@ -348,6 +477,7 @@ impl ResponseParser {
         watch: &[(Kind, usize)],
         eos: bool,
         memos: &mut [[Memo; 2]],
+        floor: usize,
     ) -> (Option<(Kind, usize, Match)>, usize) {
         let mut best: Option<(Kind, usize, Match)> = None;
         let mut hold_start = self.buffer.len();
@@ -362,9 +492,15 @@ impl ResponseParser {
                     .search(&self.buffer, self.pos, memo)
                     .map(Found::Complete)
             } else {
-                delimiter
+                match delimiter
                     .pattern
                     .search_partial(&self.buffer, self.pos, memo)
+                {
+                    Some(Found::Partial(start)) if start < floor => {
+                        delimiter.pattern.search_partial(&self.buffer, floor, memo)
+                    }
+                    found => found,
+                }
             };
             let m = match found {
                 None => continue,
@@ -372,7 +508,9 @@ impl ResponseParser {
                     hold_start = hold_start.min(start);
                     continue;
                 }
-                Some(Found::Complete(m)) if !eos && self.can_grow(delimiter, &m) => {
+                Some(Found::Complete(m))
+                    if !eos && m.start >= floor && self.can_grow(delimiter, &m) =>
+                {
                     hold_start = hold_start.min(m.start);
                     continue;
                 }
@@ -445,6 +583,7 @@ impl ResponseParser {
         };
         self.body.clear();
         self.opened = true;
+        self.region_start = m.start;
         events.push(Event::RegionOpen {
             field: f.name.clone(),
         });
@@ -466,6 +605,9 @@ impl ResponseParser {
         let fail = |e: PyError| e.in_field(&field.name);
         let (value, value_taint) =
             py::unless_unreached(|| self.field_value(field)).map_err(fail)?;
+        if let Some(check) = self.check {
+            check(&field.name, &value, value_taint)?;
+        }
         let name = &field.name;
         if let Some(join) = &field.join {
             let Value::String(part) = &value else {
@@ -583,6 +725,7 @@ impl ResponseParser {
         self.captures.clear();
         self.body.clear();
         self.opened = false;
+        self.region_start = self.pos;
     }
 }
 
