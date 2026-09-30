@@ -204,6 +204,12 @@ opt-level = 3
 [profile.release.package.kv-index]
 opt-level = 3
 
+# The response-template parser runs on every streamed chunk, so it is built
+# like the other hot crates (#2768): 0.36 to 0.76 of the time it takes at
+# the profile's opt-level "z", 15 KB larger.
+[profile.release.package.smg-response-template]
+opt-level = 3
+
 [profile.ci]
 inherits = "release"
 opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
