@@ -685,6 +685,83 @@ async fn deepseek_does_not_emit_aggregate_usage_without_complete_frames() {
     }
 }
 
+/// Reports one whole call, name included, only when the output ends.
+struct CallAtEnd;
+
+#[async_trait::async_trait]
+impl ToolParser for CallAtEnd {
+    async fn parse_complete(
+        &self,
+        output: &str,
+    ) -> tool_parser::errors::ParserResult<(String, Vec<tool_parser::ToolCall>)> {
+        Ok((output.to_string(), Vec::new()))
+    }
+
+    async fn parse_incremental(
+        &mut self,
+        _chunk: &str,
+        _tools: &[Tool],
+    ) -> tool_parser::errors::ParserResult<StreamingParseResult> {
+        Ok(StreamingParseResult::default())
+    }
+
+    fn has_tool_markers(&self, _text: &str) -> bool {
+        false
+    }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        Some(vec![ToolCallItem {
+            tool_index: 0,
+            name: Some("lookup".to_string()),
+            parameters: "{}".to_string(),
+        }])
+    }
+}
+
+#[tokio::test]
+async fn chat_eof_starts_a_call_a_parser_reports_at_the_end() {
+    let tools = ToolParserFactory::new();
+    tools
+        .registry()
+        .register_parser("call-at-end", || Box::new(CallAtEnd));
+    let resolver = utils::ParserResolver::new(
+        Arc::new(WorkerRegistry::new()),
+        Some("call-at-end".to_string()),
+        None,
+    );
+    let processor = StreamingProcessor::new(tools, ReasoningParserFactory::new(), resolver, "vllm");
+    let mut spec = chat_spec(true);
+    spec.expected_choices = 1;
+    let (stream, server) = scripted_stream(vec![chunk(0, "x"), complete(0, "stop")], "0").await;
+    let (tx, rx) = sse_channel();
+    let result = processor
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    let calls: Vec<&Value> = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].get(0))
+        .collect();
+    assert_eq!(calls.len(), 1, "{events:?}");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "lookup");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
+    assert!(calls[0]["id"].as_str().is_some_and(|id| !id.is_empty()));
+    let finish = events.last().unwrap()["choices"][0]["finish_reason"].clone();
+    assert_eq!(finish, "tool_calls");
+}
+
 /// Reasoning for every chunk but "text"; `is_in_reasoning` reports `.0`.
 struct ReasoningButText(bool);
 
