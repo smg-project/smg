@@ -31,4 +31,6 @@ pub(crate) use parsers::{
     reasoning_parser_requires_special_tokens, reasoning_starts_in_prefill,
     should_mark_reasoning_started, ParserResolver,
 };
-pub(crate) use response_template::{ResponseParserSpec, ResponseTemplateParsers};
+pub(crate) use response_template::{
+    response_prompt_tail, ResponseParserSpec, ResponseTemplateParsers,
+};

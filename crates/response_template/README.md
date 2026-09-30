@@ -54,10 +54,14 @@ Where smg's use differs from `transformers serve` by design:
 - The parsers see the output without the stop or end-of-sequence text the stop
   decoder removes; `transformers serve` also feeds that text, so whitespace
   before it, or the marker inside a region it ends, can differ.
-- The prompt tail is cut from the rendered prompt, not from the decoded prompt
-  tokens, which can differ in special tokens the tokenizer adds (such as a
-  BOS token, which matters only when the prompt holds no start anchor), in
-  `clean_up_tokenization_spaces` and in Unicode normalization.
+- The prompt tail is cut from the prompt tokens decoded with special tokens
+  kept, as in `transformers serve`, but the tokens are smg's own encode. They
+  can differ from transformers' where transformers 5 rebuilds the tokenizer
+  (as for a legacy Llama `tokenizer.json`), a processor adds a BOS token or
+  media expands to a different number of tokens, and the model's input then
+  differs already. smg does not apply `clean_up_tokenization_spaces`, which
+  transformers applies where a tokenizer sets it and its model is not BPE.
+  Without a tokenizer, or when decoding fails, the rendered prompt stands in.
 - Without tools (or with `tool_choice: none`) the tool parser does not run and
   tool calls are dropped; with `separate_reasoning: false` reasoning is
   returned as content; prompt regions are not streamed; a continued assistant
