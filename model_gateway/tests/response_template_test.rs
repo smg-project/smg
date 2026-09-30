@@ -92,6 +92,9 @@ struct Setup {
     /// What the prompt tokens decode to in place of `prompt_tail`.
     decoded_prompt_tail: Option<&'static str>,
     output: &'static str,
+    /// The output's tokens, in place of `tokens(output)`.
+    chunks: Option<&'static [&'static str]>,
+    finish: &'static str,
     card: ModelCard,
     reasoning_parser: Option<&'static str>,
     tool_parser: Option<&'static str>,
@@ -104,6 +107,8 @@ impl Default for Setup {
             prompt_tail: THINKING,
             decoded_prompt_tail: None,
             output: OUTPUT,
+            chunks: None,
+            finish: "stop",
             card: ModelCard::new(MODEL),
             reasoning_parser: None,
             tool_parser: None,
@@ -130,10 +135,14 @@ impl Drop for Gateway {
 async fn serve(setup: Setup) -> Gateway {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let chunks = match setup.chunks {
+        Some(chunks) => chunks.iter().map(|chunk| chunk.to_string()).collect(),
+        None => tokens(setup.output),
+    };
     let worker = tokio::spawn(
         scripted_worker::ScriptedWorker {
-            output_tokens: u32::try_from(tokens(setup.output).len()).unwrap(),
-            finish_reasons: vec!["stop"],
+            output_tokens: u32::try_from(chunks.len()).unwrap(),
+            finish_reasons: vec![setup.finish],
             generation: Default::default(),
         }
         .serve(listener),
@@ -151,7 +160,7 @@ async fn serve(setup: Setup) -> Gateway {
     config.health_check.disable_health_check = true;
     config.reasoning_parser = setup.reasoning_parser.map(str::to_string);
     config.tool_call_parser = setup.tool_parser.map(str::to_string);
-    let tokenizer = ScriptedTokenizer::from_chunks(tokens(setup.output))
+    let tokenizer = ScriptedTokenizer::from_chunks(chunks)
         .with_special_tokens(EOS)
         .with_prompt_tail(setup.prompt_tail)
         .with_prompt_ids(setup.decoded_prompt_tail);
@@ -254,7 +263,11 @@ async fn chat(gateway: &Gateway, extra: Value) -> Chat {
     let stream = request["stream"] == true;
     let request = serde_json::from_value(request).unwrap();
     let body = read(gateway.router.route_chat(None, &tenant(), request, MODEL)).await;
-    let arguments = |call: &Value| serde_json::from_str(call.as_str().unwrap()).unwrap();
+    // A call whose arguments never came reads as null.
+    let arguments = |args: &str| match args {
+        "" => Value::Null,
+        args => serde_json::from_str(args).unwrap(),
+    };
     if !stream {
         let response: Value = serde_json::from_str(&body).unwrap();
         let choice = &response["choices"][0];
@@ -265,7 +278,10 @@ async fn chat(gateway: &Gateway, extra: Value) -> Chat {
             .flatten()
             .map(|call| {
                 let name = call["function"]["name"].as_str().unwrap().to_string();
-                (name, arguments(&call["function"]["arguments"]))
+                (
+                    name,
+                    arguments(call["function"]["arguments"].as_str().unwrap()),
+                )
             })
             .collect();
         let text = |key: &str| message[key].as_str().unwrap_or("").to_string();
@@ -307,7 +323,7 @@ async fn chat(gateway: &Gateway, extra: Value) -> Chat {
     }
     chat.calls = calls
         .into_iter()
-        .map(|(name, args)| (name, serde_json::from_str(&args).unwrap()))
+        .map(|(name, args)| (name, arguments(&args)))
         .collect();
     chat
 }
@@ -317,22 +333,7 @@ async fn chat(gateway: &Gateway, extra: Value) -> Chat {
 /// overlap.
 #[expect(clippy::unwrap_used, reason = "test helper")]
 async fn messages(gateway: &Gateway, stream: bool, with_tools: bool) -> Vec<Value> {
-    let tools = json!([
-        {"name": "get_weather", "input_schema": tools()[0]["function"]["parameters"]},
-        {"name": "get_time", "input_schema": {"type": "object"}}
-    ]);
-    let request = serde_json::from_value(json!({
-        "model": MODEL, "max_tokens": 64, "stream": stream,
-        "messages": [{"role": "user", "content": "weather?"}],
-        "tools": if with_tools { tools } else { Value::Null },
-    }))
-    .unwrap();
-    let body = read(
-        gateway
-            .router
-            .route_messages(None, &tenant(), request, MODEL),
-    )
-    .await;
+    let body = messages_body(gateway, stream, with_tools).await;
     assert!(!body.contains("<tool_call>"), "no framing in {body}");
     let mut blocks: Vec<Value> = Vec::new();
     if !stream {
@@ -373,6 +374,69 @@ async fn messages(gateway: &Gateway, stream: bool, with_tools: bool) -> Vec<Valu
             json!([block["type"], body])
         })
         .collect()
+}
+
+#[expect(clippy::unwrap_used, reason = "test helper")]
+async fn messages_body(gateway: &Gateway, stream: bool, with_tools: bool) -> String {
+    let tools = json!([
+        {"name": "get_weather", "input_schema": tools()[0]["function"]["parameters"]},
+        {"name": "get_time", "input_schema": {"type": "object"}}
+    ]);
+    let request = serde_json::from_value(json!({
+        "model": MODEL, "max_tokens": 64, "stream": stream,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": if with_tools { tools } else { Value::Null },
+    }))
+    .unwrap();
+    read(
+        gateway
+            .router
+            .route_messages(None, &tenant(), request, MODEL),
+    )
+    .await
+}
+
+/// The stop reason of a Messages response with tools.
+#[expect(clippy::unwrap_used, reason = "test helper")]
+async fn messages_stop_reason(gateway: &Gateway, stream: bool) -> Value {
+    let body = messages_body(gateway, stream, true).await;
+    if !stream {
+        let response: Value = serde_json::from_str(&body).unwrap();
+        return response["stop_reason"].clone();
+    }
+    let events = events(&body);
+    let delta = events.iter().find(|e| e["type"] == "message_delta");
+    delta.unwrap()["delta"]["stop_reason"].clone()
+}
+
+#[expect(clippy::unwrap_used, reason = "test helper")]
+async fn responses_body(gateway: &Gateway, stream: bool, tools: Value) -> String {
+    let request = serde_json::from_value(json!({
+        "model": MODEL, "input": "weather?", "store": false, "stream": stream, "tools": tools,
+    }))
+    .unwrap();
+    read(
+        gateway
+            .router
+            .route_responses(None, &tenant(), request, MODEL),
+    )
+    .await
+}
+
+/// A Responses response, or the response of a stream's terminal event.
+#[expect(clippy::unwrap_used, reason = "test helper")]
+async fn responses(gateway: &Gateway, stream: bool, tools: Value) -> Value {
+    let body = responses_body(gateway, stream, tools).await;
+    if stream {
+        return events(&body).pop().unwrap()["response"].clone();
+    }
+    serde_json::from_str(&body).unwrap()
+}
+
+/// `get_weather` as a Responses function tool.
+fn weather_function() -> Value {
+    let parameters = &tools()[0]["function"]["parameters"];
+    json!([{"type": "function", "name": "get_weather", "parameters": parameters}])
 }
 
 fn weather() -> (&'static str, Value) {
@@ -524,6 +588,215 @@ async fn reasoning_and_calls_can_alternate() {
             json!(["text", "\n\nDone."]),
         ]
     );
+}
+
+#[tokio::test]
+async fn a_stream_names_a_call_when_its_region_opens() {
+    let gateway = serve(Setup::default()).await;
+    for separate_reasoning in [true, false] {
+        let request = serde_json::from_value(json!({
+            "model": MODEL, "messages": [{"role": "user", "content": "weather?"}],
+            "max_tokens": 64, "stream": true, "tools": tools(),
+            "separate_reasoning": separate_reasoning,
+        }))
+        .unwrap();
+        let body = read(gateway.router.route_chat(None, &tenant(), request, MODEL)).await;
+        let events = events(&body);
+        let call = |event: &Value| event["choices"][0]["delta"]["tool_calls"][0].clone();
+        let named = events.iter().map(call).position(|call| !call.is_null());
+        let args = events.iter().map(call).position(|call| {
+            call["function"]["arguments"]
+                .as_str()
+                .is_some_and(|args| !args.is_empty())
+        });
+        // The name comes with the token after the opener, which could grow
+        // until then; the arguments when the region closes, here at the end.
+        let (named, args) = (named.unwrap(), args.unwrap());
+        assert_eq!(call(&events[named])["function"]["name"], "get_weather");
+        assert!(call(&events[named])["function"]["arguments"].is_null());
+        assert!(named < args, "{events:?}");
+    }
+}
+
+/// qwen3_5 output whose call closes in the chunk that goes on with the answer.
+const CLOSE_THEN_ANSWER: &[&str] = &[
+    "plan the call\n</think>\n\nChecking.\n",
+    "<tool_call>\n<function=get_weather>\n",
+    "<parameter=city>\nParis\n</parameter>\n<parameter=days>\n2\n</parameter>\n",
+    "</function>\n</tool_call>\n\nDone.",
+    "<|im_end|>",
+];
+
+#[tokio::test]
+async fn output_after_a_call_in_one_chunk_follows_its_arguments() {
+    let setup = Setup {
+        chunks: Some(CLOSE_THEN_ANSWER),
+        ..Setup::default()
+    };
+    let gateway = serve(setup).await;
+    let stream = json!({"tools": tools(), "stream": true});
+    assert_eq!(
+        chat(&gateway, stream).await,
+        chat_of(
+            "plan the call\n",
+            "\n\nChecking.\n\nDone.",
+            &[weather()],
+            "tool_calls"
+        )
+    );
+    // The text after the close starts a block after the call's.
+    let input = json!({"city": "Paris", "days": 2});
+    assert_eq!(
+        messages(&gateway, true, true).await,
+        [
+            json!(["thinking", "plan the call\n"]),
+            json!(["text", "\n\nChecking."]),
+            json!(["tool_use", input]),
+            json!(["text", "\n\nDone."]),
+        ]
+    );
+    let events = events(&responses_body(&gateway, true, weather_function()).await);
+    let position = |kind: &str, text: &str| {
+        events.iter().position(|e| {
+            e["type"] == kind
+                && e["delta"]
+                    .as_str()
+                    .is_some_and(|delta| delta.contains(text))
+        })
+    };
+    let args = position("response.function_call_arguments.delta", "Paris").unwrap();
+    let done = position("response.output_text.delta", "Done.").unwrap();
+    assert!(args < done, "{events:?}");
+}
+
+/// A template whose opener names each call, holding JSON arguments.
+fn json_calls() -> Value {
+    json!({
+        "start_anchor_pattern": "<\\|bot\\|>",
+        "fields": {
+            "tool_calls": {
+                "open_pattern": "<\\|call\\|>(?P<name>\\w+)",
+                "close": "<|end_call|>",
+                "repeats": true,
+                "content": "json",
+                "transform": {
+                    "type": "function",
+                    "function": {"name": "{name}", "arguments": "{content}"}
+                }
+            },
+            "content": {}
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_streamed_call_cut_short_keeps_its_name() {
+    let setup = Setup {
+        template: Some(json_calls()),
+        prompt_tail: "<|bot|>",
+        output: "<|call|>get_weather{\"city\": \"Par",
+        finish: "length",
+        ..Setup::default()
+    };
+    let gateway = serve(setup).await;
+    // A stream reported the name before the output ended inside the call.
+    let stream = json!({"tools": tools(), "stream": true});
+    assert_eq!(
+        chat(&gateway, stream).await,
+        chat_of("", "", &[("get_weather", Value::Null)], "length")
+    );
+    assert_eq!(
+        messages(&gateway, true, true).await,
+        [json!(["tool_use", {}])]
+    );
+    assert_eq!(messages_stop_reason(&gateway, true).await, "max_tokens");
+    // A complete output does not parse, and passes through.
+    let unary = chat(&gateway, json!({"tools": tools()})).await;
+    assert_eq!((unary.calls, unary.finish.as_str()), (vec![], "length"));
+    assert_eq!(messages_stop_reason(&gateway, false).await, "max_tokens");
+    for stream in [false, true] {
+        let response = responses(&gateway, stream, weather_function()).await;
+        assert_eq!(response["status"], "incomplete", "{response}");
+        let calls: Vec<_> = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .map(|item| {
+                (
+                    item["name"].clone(),
+                    item["arguments"].clone(),
+                    item["status"].clone(),
+                )
+            })
+            .collect();
+        let expected = if stream {
+            vec![(json!("get_weather"), json!(""), json!("incomplete"))]
+        } else {
+            vec![]
+        };
+        assert_eq!(calls, expected, "{response}");
+    }
+}
+
+#[tokio::test]
+async fn a_streamed_call_that_does_not_parse_keeps_its_name() {
+    let setup = Setup {
+        template: Some(json_calls()),
+        prompt_tail: "<|bot|>",
+        output: "<|call|>get_weather{\"city\": Paris}<|end_call|>Sorry.<|im_end|>",
+        ..Setup::default()
+    };
+    let gateway = serve(setup).await;
+    // The chunk that closes the call passes through, and so does the rest.
+    let stream = json!({"tools": tools(), "stream": true});
+    assert_eq!(
+        chat(&gateway, stream).await,
+        chat_of(
+            "",
+            "<|end_call|>Sorry.",
+            &[("get_weather", Value::Null)],
+            "tool_calls"
+        )
+    );
+    assert_eq!(
+        messages(&gateway, true, true).await,
+        [
+            json!(["tool_use", {}]),
+            json!(["text", "<|end_call|>Sorry."])
+        ]
+    );
+    assert_eq!(messages_stop_reason(&gateway, true).await, "tool_use");
+    let response = responses(&gateway, true, weather_function()).await;
+    assert_eq!(response["status"], "completed", "{response}");
+    let call = response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap();
+    assert_eq!(
+        (&call["arguments"], &call["status"]),
+        (&json!(""), &json!("completed"))
+    );
+
+    // The Responses tool loop does not run an MCP tool for such a call.
+    let setup = Setup {
+        template: Some(json_calls()),
+        prompt_tail: "<|bot|>",
+        output: "<|call|>brave_web_search{\"query\": Paris}<|end_call|><|im_end|>",
+        ..Setup::default()
+    };
+    let gateway = serve(setup).await;
+    let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+        .await
+        .unwrap();
+    let tools = json!([{"type": "mcp", "server_label": "test-tools", "server_url": mcp.url(),
+                        "require_approval": "never"}]);
+    let response = responses(&gateway, true, tools).await;
+    mcp.stop().await;
+    assert_eq!(response["status"], "completed", "{response}");
+    assert_eq!(mcp.call_count(), 0, "{response}");
 }
 
 #[tokio::test]
@@ -709,24 +982,10 @@ async fn a_server_call_without_json_arguments_does_not_run() {
     let mut mcp = common::mock_mcp_server::MockMCPServer::start()
         .await
         .unwrap();
+    let tools = json!([{"type": "mcp", "server_label": "test-tools", "server_url": mcp.url(),
+                        "require_approval": "never"}]);
     for stream in [false, true] {
-        let request = serde_json::from_value(json!({
-            "model": MODEL, "input": "weather?", "store": false, "stream": stream,
-            "tools": [{"type": "mcp", "server_label": "test-tools", "server_url": mcp.url(),
-                       "require_approval": "never"}],
-        }))
-        .unwrap();
-        let body = read(
-            gateway
-                .router
-                .route_responses(None, &tenant(), request, MODEL),
-        )
-        .await;
-        let response = if stream {
-            events(&body).pop().unwrap()["response"].clone()
-        } else {
-            serde_json::from_str(&body).unwrap()
-        };
+        let response = responses(&gateway, stream, tools.clone()).await;
         assert_eq!(response["status"], "completed", "{response}");
         let output = response["output"].as_array().unwrap();
         assert!(

@@ -3,7 +3,8 @@
 //! reasoning parser or else by the tool parser, reads the region events as
 //! `transformers serve` does: transformers' own events for one feed, and this
 //! crate's events (which the replay test matches to transformers') for every
-//! two-way split.
+//! two-way split. A stream whose tool parser reads calls by name first adds up
+//! to the same.
 
 #![expect(clippy::unwrap_used, reason = "a test: a bad fixture should panic")]
 
@@ -12,7 +13,7 @@ mod common;
 use common::{canonical, fixtures_dir, read_json, read_jsonl, tag, untag};
 use serde_json::{json, Value};
 use smg_response_template::{
-    adapter::{check, ResponseParserState, ToolCall},
+    adapter::{check, CallItem, ResponseParserState, ToolCall},
     load_response_template, parse_response, ResponseParser, ResponseTemplate,
 };
 
@@ -145,6 +146,78 @@ fn state_stream(
     Some(read)
 }
 
+/// [`state_stream`] with the tool parser reading items, and how many calls
+/// were named before their region closed. Nothing comes between a call's name
+/// and its arguments.
+fn items_stream(
+    template: &ResponseTemplate,
+    prefix: &str,
+    tools: &[Value],
+    chunks: &[&str],
+    with_reasoning: bool,
+) -> Option<(Read, usize)> {
+    let state = new_state(template, prefix, tools);
+    let mut read = Read::default();
+    let mut calls: Vec<(String, Option<Value>)> = Vec::new();
+    let (mut named, mut names) = (None, 0);
+    for chunk in chunks.iter().copied().map(Some).chain([None]) {
+        let (reasoning, content) = if with_reasoning {
+            let (reasoning, content) = state.reasoning(chunk).ok()?;
+            (reasoning, Some(content))
+        } else {
+            (String::new(), chunk.map(str::to_owned))
+        };
+        let (content, items) = state.tool_items(content.as_deref()).ok()?;
+        if named.is_some() {
+            assert!(
+                reasoning.is_empty() && content.is_empty(),
+                "{reasoning:?} {content:?}"
+            );
+            assert!(
+                matches!(items.first(), None | Some(CallItem::Arguments(_))),
+                "{items:?}"
+            );
+        }
+        read.reasoning.push_str(&reasoning);
+        read.content.push_str(&content);
+        for item in items {
+            match item {
+                CallItem::Call(call) => calls.push((call.name, Some(call.arguments))),
+                CallItem::Name(name) => {
+                    assert!(named.replace(calls.len()).is_none());
+                    names += 1;
+                    calls.push((name, None));
+                }
+                CallItem::Arguments(arguments) => calls[named.take().unwrap()].1 = Some(arguments),
+            }
+        }
+    }
+    if state.take_error().is_some() {
+        return None;
+    }
+    for (name, arguments) in calls {
+        read.calls.push(call(&json!(name), &arguments.unwrap()));
+    }
+    Some((read, names))
+}
+
+/// Whether a template's opener names every call: the rule the adapter
+/// applies, restated over the template's JSON.
+fn names_calls(template: &Value) -> bool {
+    let field = &template["fields"]["tool_calls"];
+    let function = &field["transform"]["function"];
+    let group = function["name"]
+        .as_str()
+        .and_then(|name| name.strip_prefix('{')?.strip_suffix('}'));
+    let pattern = field["open_pattern"].as_str().unwrap_or_default();
+    field["transform_each"] != true
+        && field["join"].is_null()
+        && function.get("arguments").is_some()
+        && group.is_some_and(|group| {
+            group != "content" && !group.contains('.') && pattern.contains(&format!("(?P<{group}>"))
+        })
+}
+
 fn state_complete(
     template: &ResponseTemplate,
     prefix: &str,
@@ -163,22 +236,25 @@ fn state_complete(
     Some(read)
 }
 
-fn replay(name: &str) -> (usize, usize) {
+fn replay(name: &str) -> (usize, usize, usize) {
     let dir = fixtures_dir();
-    let templates: std::collections::HashMap<String, ResponseTemplate> =
+    let templates: std::collections::HashMap<String, (ResponseTemplate, bool)> =
         read_jsonl(&dir, "templates")
             .iter()
             .filter_map(|row| {
-                let template = load_response_template(&untag(&row["template"])).ok()?;
+                let json = untag(&row["template"]);
+                let template = load_response_template(&json).ok()?;
                 check(&template).ok()?;
-                Some((row["id"].as_str().unwrap().to_owned(), template))
+                let id = row["id"].as_str().unwrap().to_owned();
+                Some((id, (template, names_calls(&json))))
             })
             .collect();
     let tool_sets = read_json(&dir, "tools.json");
-    let (mut sessions, mut splits) = (0, 0);
+    let (mut sessions, mut splits, mut names) = (0, 0, 0);
     let mut failures = Vec::new();
     for case in read_jsonl(&dir, name) {
-        let Some(template) = templates.get(case["template"].as_str().unwrap()) else {
+        let Some((template, names_calls)) = templates.get(case["template"].as_str().unwrap())
+        else {
             continue;
         };
         let tools = match case.get("tools") {
@@ -191,6 +267,16 @@ fn replay(name: &str) -> (usize, usize) {
         );
         let id = case["id"].as_str().unwrap();
         sessions += 1;
+        // The read of `chunks` with the tool parser taking items, which must
+        // add up to `expected`; only an opener that names calls names them.
+        let by_items = |chunks: &[&str], merge: bool, expected: &Option<Read>| {
+            let got = items_stream(template, prefix, &tools, chunks, !merge);
+            let (got, named) = got.map_or((None, 0), |(read, named)| (Some(read), named));
+            let failure = (got != *expected || (named > 0 && !names_calls)).then(|| {
+                format!("{id} items {chunks:?} (merge {merge}): {got:?}, {named} named, expected {expected:?}")
+            });
+            (named, failure)
+        };
 
         // transformers raises from `parse_response` where this crate does (the
         // replay test matches every step); its message otherwise.
@@ -227,6 +313,9 @@ fn replay(name: &str) -> (usize, usize) {
                         "{id} stream (merge {merge}): {got:?}, expected {expected:?}"
                     ));
                 }
+                let (named, failure) = by_items(&[text], merge, &expected);
+                names += named;
+                failures.extend(failure);
             }
         }
 
@@ -243,6 +332,9 @@ fn replay(name: &str) -> (usize, usize) {
                             "{id} split at {b} (merge {merge}): {got:?}, expected {expected:?}"
                         ));
                     }
+                    let (named, failure) = by_items(&chunks, merge, &expected);
+                    names += named;
+                    failures.extend(failure);
                 }
             }
         }
@@ -253,21 +345,21 @@ fn replay(name: &str) -> (usize, usize) {
         failures.len(),
         failures[..failures.len().min(20)].join("\n")
     );
-    (sessions, splits)
+    (sessions, splits, names)
 }
 
 #[test]
 fn sessions_read_like_transformers_serve() {
-    let (sessions, splits) = replay("sessions");
+    let (sessions, splits, names) = replay("sessions");
     assert!(
-        sessions > 100 && splits > 1000,
-        "{sessions} sessions, {splits} splits"
+        sessions > 100 && splits > 1000 && names > 1000,
+        "{sessions} sessions, {splits} splits, {names} calls named"
     );
 }
 
 #[test]
 fn random_sessions_read_like_transformers_serve() {
-    let (sessions, _) = replay("random");
+    let (sessions, _, _) = replay("random");
     assert!(sessions > 100, "{sessions} sessions");
 }
 
@@ -291,4 +383,160 @@ fn check_names_what_smg_cannot_use() {
     assert!(!unsuitable(json!({"start_anchor": "S", "fields": {
         "reasoning_content": {"open": "<a>", "close": "</a>", "repeats": true, "join": "\n"},
         "content": {}}})));
+}
+
+/// Calls named by the opener, holding JSON arguments.
+fn named_calls() -> Value {
+    json!({
+        "start_anchor": "<|assistant|>",
+        "fields": {
+            "thinking": {"open": "<think>", "close": "</think>"},
+            "tool_calls": {
+                "open_pattern": "<call name=\"(?P<name>\\w*)\">",
+                "close": "</call>",
+                "repeats": true,
+                "content": "json",
+                "transform": {
+                    "type": "function",
+                    "function": {"name": "{name}", "arguments": "{content}"}
+                }
+            },
+            "content": {"close": "<|end|>"}
+        }
+    })
+}
+
+fn named_state(template: &Value, prompt_tail: &str) -> ResponseParserState {
+    let template = load_response_template(template).unwrap();
+    ResponseParserState::new(&template, prompt_tail, &[], false)
+}
+
+fn name(name: &str) -> CallItem {
+    CallItem::Name(name.to_owned())
+}
+
+fn arguments(arguments: Value) -> CallItem {
+    CallItem::Arguments(arguments)
+}
+
+#[test]
+fn a_stream_names_a_call_once_its_region_opens() {
+    let state = named_state(&named_calls(), "");
+    let items = |text| state.tool_items(text).unwrap();
+    // A regex opener at the edge of the text could still grow: the region
+    // opens, and the name comes, with the next text.
+    assert_eq!(items(Some("Hi <call name=\"f\">")), ("Hi ".into(), vec![]));
+    assert_eq!(items(Some("{\"a\": 1")), (String::new(), vec![name("f")]));
+    // The arguments come alone; the text after the close waits.
+    assert_eq!(
+        items(Some("}</call>Bye")),
+        (String::new(), vec![arguments(json!({"a": 1}))])
+    );
+    assert_eq!(items(None), ("Bye".into(), vec![]));
+
+    // A region that opens and closes in one text gives the whole call.
+    let state = named_state(&named_calls(), "");
+    let (text, items) = state
+        .tool_items(Some("<call name=\"f\">{}</call>"))
+        .unwrap();
+    let call = ToolCall {
+        name: "f".into(),
+        arguments: json!({}),
+    };
+    assert_eq!((text, items), (String::new(), vec![CallItem::Call(call)]));
+}
+
+#[test]
+fn reasoning_after_a_named_call_waits_for_its_arguments() {
+    let state = named_state(&named_calls(), "");
+    assert_eq!(
+        state.reasoning(Some("<call name=\"f\">{")).unwrap(),
+        (String::new(), String::new())
+    );
+    assert_eq!(
+        state.tool_items(Some("")).unwrap(),
+        (String::new(), vec![name("f")])
+    );
+    // The region closes and reasoning follows in one chunk: the reasoning
+    // waits, and the tool parser runs for the arguments.
+    assert_eq!(
+        state.reasoning(Some("}</call><think>more")).unwrap(),
+        (String::new(), String::new())
+    );
+    assert!(!state.in_reasoning());
+    assert_eq!(
+        state.tool_items(Some("")).unwrap(),
+        (String::new(), vec![arguments(json!({}))])
+    );
+    assert_eq!(
+        state.reasoning(None).unwrap(),
+        ("more".into(), String::new())
+    );
+}
+
+#[test]
+fn an_error_after_deferred_output_comes_with_the_next_call() {
+    let named = |state: &ResponseParserState| {
+        state.tool_items(Some("<call name=\"f\">{")).unwrap();
+        let (text, items) = state
+            .tool_items(Some("}</call>Hi <call name=\"g\">{bad"))
+            .unwrap();
+        assert_eq!((text, items), (String::new(), vec![arguments(json!({}))]));
+    };
+    // The deferred text and the failing chunk pass through; the next call
+    // returns the error.
+    let state = named_state(&named_calls(), "");
+    named(&state);
+    assert_eq!(
+        state.tool_items(Some("</call>")).unwrap(),
+        ("Hi </call>".into(), vec![])
+    );
+    assert!(state.tool_items(Some("x")).is_err());
+    // At the end of the output there is no next call: `take_error` has it.
+    let state = named_state(&named_calls(), "");
+    named(&state);
+    assert_eq!(state.tool_items(None).unwrap(), ("Hi ".into(), vec![]));
+    assert!(state.take_error().is_some());
+}
+
+#[test]
+fn a_named_call_whose_region_fails_keeps_only_its_name() {
+    let state = named_state(&named_calls(), "");
+    assert_eq!(
+        state.tool_items(Some("<call name=\"f\">{\"a\"")).unwrap(),
+        (String::new(), vec![name("f")])
+    );
+    assert!(state.tool_items(None).is_err());
+}
+
+#[test]
+fn a_call_is_named_only_by_a_capture_every_call_takes() {
+    // A region left open in the prompt is named on the first call.
+    let state = named_state(&named_calls(), "<call name=\"f\">{");
+    assert_eq!(
+        state.tool_items(Some("\"a\"")).unwrap(),
+        (String::new(), vec![name("f")])
+    );
+    // An empty capture names no call.
+    let state = named_state(&named_calls(), "");
+    let (_, items) = state.tool_items(Some("<call name=\"\">{")).unwrap();
+    assert_eq!(items, vec![]);
+
+    let unnamed = |edit: fn(&mut Value)| {
+        let mut template = named_calls();
+        edit(&mut template["fields"]["tool_calls"]);
+        let state = named_state(&template, "");
+        let (_, items) = state.tool_items(Some("<call name=\"f\">{")).unwrap();
+        assert_eq!(items, vec![], "{template}");
+    };
+    // The name is in the region's JSON.
+    unnamed(|field| field["transform"]["function"] = json!("{content}"));
+    // No arguments to read, or a value per item.
+    unnamed(|field| field["transform"]["function"] = json!({"name": "{name}"}));
+    unnamed(|field| field["transform_each"] = json!(true));
+    // A literal opener captures nothing.
+    unnamed(|field| {
+        field["open"] = json!("<call name=\"f\">");
+        field.as_object_mut().unwrap().remove("open_pattern");
+    });
 }
