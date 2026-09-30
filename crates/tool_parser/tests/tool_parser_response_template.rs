@@ -56,7 +56,8 @@ fn chunks(text: &str, size: usize) -> Vec<String> {
 }
 
 /// Normal text and `(index, name, arguments)` of each call, over a stream
-/// ended as the gateway ends it.
+/// ended as the gateway ends it. An item without a name adds arguments to
+/// its call.
 async fn stream(
     parser: &mut TemplateToolParser,
     text: &str,
@@ -70,12 +71,19 @@ async fn stream(
     }
     normal.push_str(&parser.take_unstreamed_normal_text());
     items.extend(parser.get_unstreamed_tool_args().unwrap_or_default());
-    let calls = items
+    let mut calls: Vec<(usize, String, String)> = Vec::new();
+    for item in items {
+        match item.name {
+            Some(name) => {
+                assert_eq!(item.tool_index, calls.len(), "a new call, in order");
+                calls.push((item.tool_index, name, item.parameters));
+            }
+            None => calls[item.tool_index].2.push_str(&item.parameters),
+        }
+    }
+    let calls = calls
         .into_iter()
-        .map(|item| {
-            let arguments = serde_json::from_str(&item.parameters).unwrap();
-            (item.tool_index, item.name.unwrap(), arguments)
-        })
+        .map(|(index, name, arguments)| (index, name, serde_json::from_str(&arguments).unwrap()))
         .collect();
     (normal, calls)
 }
@@ -164,6 +172,87 @@ async fn a_region_that_fails_is_content_with_the_rest_of_the_output() {
         .await
         .unwrap();
     assert_eq!(result.normal_text, "<tool_call>");
+    assert!(result.calls.is_empty());
+    assert_eq!(parser.take_unstreamed_normal_text(), "");
+    assert!(parser.get_unstreamed_tool_args().is_none());
+}
+
+#[tokio::test]
+async fn a_stream_names_a_call_once_its_region_opens() {
+    let mut parser = TemplateToolParser::new(qwen3_5());
+    let tools = create_test_tools();
+    let mut named_before_close = false;
+    for chunk in chunks(CALL, 3) {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        if let Some(item) = result.calls.first() {
+            assert_eq!(item.name.as_deref(), Some("calculate"));
+            assert_eq!((item.tool_index, item.parameters.as_str()), (0, ""));
+            named_before_close = true;
+        }
+    }
+    assert!(named_before_close);
+    // The close pattern can grow at the edge of the output: the arguments
+    // come when it ends, without the name.
+    assert_eq!(parser.take_unstreamed_normal_text(), "");
+    let items = parser.get_unstreamed_tool_args().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!((items[0].tool_index, items[0].name.as_deref()), (0, None));
+    let arguments: Value = serde_json::from_str(&items[0].parameters).unwrap();
+    assert_eq!(arguments, json!({"x": 2, "y": 1.5}));
+}
+
+#[tokio::test]
+async fn output_after_a_named_call_waits_for_its_arguments() {
+    let mut parser = TemplateToolParser::new(qwen3_5());
+    let tools = create_test_tools();
+    let result = parser
+        .parse_incremental("<tool_call>\n<function=get_time>\n", &tools)
+        .await
+        .unwrap();
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].name.as_deref(), Some("get_time"));
+    let result = parser
+        .parse_incremental("</function>\n</tool_call>Done", &tools)
+        .await
+        .unwrap();
+    assert_eq!(result.normal_text, "");
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].name, None);
+    assert_eq!(result.calls[0].parameters, "{}");
+    let result = parser.parse_incremental("", &tools).await.unwrap();
+    assert_eq!(result.normal_text, "Done");
+    assert!(result.calls.is_empty());
+}
+
+#[tokio::test]
+async fn a_named_call_that_fails_keeps_only_its_name() {
+    let template = load_response_template(&json!({
+        "start_anchor": "<|assistant|>",
+        "fields": {
+            "tool_calls": {
+                "open_pattern": "<call name=\"(?P<name>\\w+)\">", "close": "</call>",
+                "repeats": true, "content": "json",
+                "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}}
+            },
+            "content": {}
+        }
+    }))
+    .unwrap();
+    let mut parser = TemplateToolParser::new(template);
+    let tools = create_test_tools();
+    let result = parser
+        .parse_incremental("<call name=\"search\">{", &tools)
+        .await
+        .unwrap();
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].name.as_deref(), Some("search"));
+    // The arguments do not parse: the region, from its opener, is content,
+    // and no arguments follow the name.
+    let result = parser
+        .parse_incremental("bad}</call>", &tools)
+        .await
+        .unwrap();
+    assert_eq!(result.normal_text, "<call name=\"search\">{bad}</call>");
     assert!(result.calls.is_empty());
     assert_eq!(parser.take_unstreamed_normal_text(), "");
     assert!(parser.get_unstreamed_tool_args().is_none());

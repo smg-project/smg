@@ -4,14 +4,16 @@
 //! read the fields `transformers serve` reads: `thinking` (here also
 //! `reasoning_content`), `content` and `tool_calls`. A stream reads the text of
 //! their regions and each closed tool-call region after the prompt; a complete
-//! output reads the parsed message. A region that fails to parse is content.
+//! output reads the parsed message. A stream's tool parser also reads the name
+//! of a call once its region is open, when the template's opener captures it.
+//! A region that fails to parse is content.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::Value;
 
 use crate::{
-    content_parsers::ContentParser,
+    content_parsers::{self, ContentParser},
     error::{ParseError, PyErrorKind, Taint},
     py,
     response_parser::{Event, ResponseParser},
@@ -80,6 +82,45 @@ pub fn content_needs_opener(template: &ResponseTemplate) -> bool {
 pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
+}
+
+/// What the tool parser of a stream reads, in output order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallItem {
+    /// A call read whole when its region closed.
+    Call(ToolCall),
+    /// The name of the call in the open tool-call region, which the
+    /// template's opener captured.
+    Name(String),
+    /// The arguments of the call last named, read when its region closed,
+    /// before any output that followed the close.
+    Arguments(Value),
+}
+
+/// Output read from the parser's events.
+enum Piece {
+    Reasoning(String),
+    Content(String),
+    Item(CallItem),
+}
+
+/// The opener group that names every call of the template's `tool_calls`
+/// field: its transform is one dict whose `function.name` is `{group}`, with a
+/// `function.arguments`. A region of the field that closes without an error
+/// then holds one call, named with the opener's capture.
+fn name_group(template: &ResponseTemplate) -> Option<String> {
+    let field = template.0.fields.iter().find(|f| f.name == TOOL_CALLS)?;
+    if field.transform_each || field.join.is_some() {
+        return None;
+    }
+    let open = field.open.as_ref()?;
+    let function = field.transform.as_ref()?.get("function")?;
+    function.get("arguments")?;
+    let group = content_parsers::placeholder(function.get("name")?.as_str()?)?;
+    let named = group != CONTENT
+        && !group.contains('.')
+        && open.pattern.group_names().any(|name| name == group);
+    named.then(|| group.to_owned())
 }
 
 /// The calls of a `tool_calls` value: one call, or a list of them.
@@ -174,8 +215,15 @@ struct Inner {
     continuation: bool,
     /// The reasoning parser feeds the parser; the tool parser only takes calls.
     reasoning_feeds: bool,
-    /// Closed tool calls the tool parser has not taken.
-    calls: Vec<ToolCall>,
+    /// Tool-call items the tool parser has not taken.
+    calls: Vec<CallItem>,
+    /// See [`name_group`].
+    name_group: Option<String>,
+    /// The name read for the open tool-call region.
+    named: Option<String>,
+    /// Output that followed the close of the named call's region, deferred
+    /// to the next call so that the call's arguments come first.
+    deferred: Vec<Piece>,
 }
 
 #[derive(Default)]
@@ -209,6 +257,9 @@ impl ResponseParserState {
             continuation,
             reasoning_feeds: false,
             calls: Vec::new(),
+            name_group: name_group(template),
+            named: None,
+            deferred: Vec::new(),
         })))
     }
 
@@ -252,7 +303,7 @@ impl ResponseParserState {
             .feed_into(output, &mut events, None)
             .and_then(|()| plain.finish_into(&mut events));
         if let Ok((reasoning, content, calls)) = parsed.and_then(|()| read_message(&plain)) {
-            state.calls.extend(calls);
+            state.calls.extend(calls.into_iter().map(CallItem::Call));
             return (reasoning, content);
         }
         events.clear();
@@ -268,7 +319,7 @@ impl ResponseParserState {
             .filter(|v| py::truthy(v))
             .map(read_calls)
         {
-            Some(Ok(calls)) => state.calls.extend(calls),
+            Some(Ok(calls)) => state.calls.extend(calls.into_iter().map(CallItem::Call)),
             Some(Err(error)) => state.fail(error),
             None => {}
         }
@@ -296,13 +347,35 @@ impl ResponseParserState {
     /// otherwise this state is fed `text`, and reasoning is content.
     pub fn tools(&self, text: Option<&str>) -> (String, Vec<ToolCall>) {
         let mut state = self.state();
-        let mut out = Text::default();
-        if state.reasoning_feeds {
-            out.content.push_str(text.unwrap_or_default());
-        } else {
-            state.stream(text, true, &mut out);
+        let content = state.tool_content(text);
+        // Only `tool_items` names calls.
+        let calls = std::mem::take(&mut state.calls).into_iter();
+        let calls = calls.filter_map(|item| match item {
+            CallItem::Call(call) => Some(call),
+            CallItem::Name(_) | CallItem::Arguments(_) => None,
+        });
+        (content, calls.collect())
+    }
+
+    /// For the tool parser of a stream: [`tools`](Self::tools) as items, and a
+    /// [`Name`](CallItem::Name) when the output is in a tool-call region whose
+    /// opener captured the name of its call (the template's transform is one
+    /// dict whose `function.name` is a group of the open pattern, with a
+    /// `function.arguments`). A regex opener that ends at the edge of the text
+    /// is only committed with the next text, and the name with it. The call's
+    /// [`Arguments`](CallItem::Arguments) come when its region closes, with no
+    /// text: output that followed the close in the same text is deferred to
+    /// the next call. A call whose region fails keeps only its name, and the
+    /// region is content.
+    pub fn tool_items(&self, text: Option<&str>) -> (String, Vec<CallItem>) {
+        let mut state = self.state();
+        let content = state.tool_content(text);
+        let mut items = std::mem::take(&mut state.calls);
+        if let Some(name) = state.open_call_name() {
+            items.push(CallItem::Name(name.clone()));
+            state.named = Some(name);
         }
-        (out.content, std::mem::take(&mut state.calls))
+        (content, items)
     }
 
     /// Why parsing stopped, once: the region that failed, or the prompt. The
@@ -316,13 +389,43 @@ impl Inner {
     /// Keep the first reason parsing stopped.
     fn fail(&mut self, error: ParseError) {
         self.parser = None;
+        self.named = None;
         self.error.get_or_insert(error);
     }
 
-    /// Feed `output` (`None` ends it) and read the region events, reasoning
-    /// into the content when `merge`. Without a parser, `output` passes
-    /// through.
+    /// The tool parser's content of `text`: `text` itself when the reasoning
+    /// parser feeds the parser, else what feeding it gives.
+    fn tool_content(&mut self, text: Option<&str>) -> String {
+        let mut out = Text::default();
+        if self.reasoning_feeds {
+            out.content.push_str(text.unwrap_or_default());
+        } else {
+            self.stream(text, true, &mut out);
+        }
+        out.content
+    }
+
+    /// The name of the call in the open tool-call region, when none is read
+    /// yet and no output is deferred.
+    fn open_call_name(&self) -> Option<String> {
+        if self.named.is_some() || !self.deferred.is_empty() {
+            return None;
+        }
+        let group = self.name_group.as_deref()?;
+        let (field, captures) = self.parser.as_ref()?.open_region()?;
+        let (_, name) = captures
+            .iter()
+            .find(|(key, _)| key == group)
+            .filter(|_| field == TOOL_CALLS)?;
+        (!name.is_empty()).then(|| name.clone())
+    }
+
+    /// Feed `output` (`None` ends it) after the deferred output, and read the
+    /// region events, reasoning into the content when `merge`. Without a
+    /// parser, `output` passes through.
     fn stream(&mut self, output: Option<&str>, merge: bool, text: &mut Text) {
+        let deferred = std::mem::take(&mut self.deferred);
+        self.apply(deferred, merge, text);
         let Some(mut parser) = self.parser.take() else {
             text.content.push_str(output.unwrap_or_default());
             return;
@@ -334,7 +437,7 @@ impl Inner {
         };
         // The events before an error come from the regions before the one
         // that failed, whose text this does not read.
-        self.read(&events, merge, text);
+        let (mut pieces, cut) = self.read(events);
         match parsed {
             Ok(()) if output.is_some() => self.parser = Some(parser),
             Ok(()) => {}
@@ -342,33 +445,57 @@ impl Inner {
                 debug_assert!(parser
                     .current_field()
                     .is_none_or(|field| field != CONTENT && !REASONING.contains(&field)));
-                text.content.push_str(parser.unparsed());
+                pieces.push(Piece::Content(parser.unparsed().to_owned()));
                 self.fail(error);
             }
         }
+        if let Some(cut) = cut.filter(|_| output.is_some()) {
+            self.deferred = pieces.split_off(cut);
+        }
+        self.apply(pieces, merge, text);
     }
 
-    fn read(&mut self, events: &[Event], merge: bool, text: &mut Text) {
+    /// The output of `events`, and where what follows the close of the named
+    /// call's region starts: that close gives the call's arguments.
+    fn read(&mut self, events: Vec<Event>) -> (Vec<Piece>, Option<usize>) {
+        let (mut pieces, mut cut) = (Vec::new(), None);
         for event in events {
             match event {
-                Event::RegionChunk { field, text: t, .. }
-                    if REASONING.contains(&field.as_str()) =>
+                Event::RegionChunk { field, text, .. } if REASONING.contains(&field.as_str()) => {
+                    pieces.push(Piece::Reasoning(text));
+                }
+                Event::RegionChunk { field, text, .. } if field == CONTENT => {
+                    pieces.push(Piece::Content(text));
+                }
+                Event::RegionClose { field, value }
+                    if field == TOOL_CALLS && py::truthy(&value) =>
                 {
-                    if merge {
-                        &mut text.content
-                    } else {
-                        &mut text.reasoning
-                    }
-                    .push_str(t);
-                }
-                Event::RegionChunk { field, text: t, .. } if field == CONTENT => {
-                    text.content.push_str(t);
-                }
-                Event::RegionClose { field, value } if field == TOOL_CALLS && py::truthy(value) => {
                     // The region check read these calls before the close.
-                    self.calls.extend(read_calls(value).unwrap_or_default());
+                    let mut calls = read_calls(&value).unwrap_or_default().into_iter();
+                    if let Some(name) = self.named.take() {
+                        // One call, named with the opener's capture (`name_group`).
+                        if let Some(call) = calls.next() {
+                            debug_assert_eq!(call.name, name);
+                            pieces.push(Piece::Item(CallItem::Arguments(call.arguments)));
+                            cut = Some(pieces.len());
+                        }
+                    }
+                    pieces.extend(calls.map(|call| Piece::Item(CallItem::Call(call))));
                 }
                 _ => {}
+            }
+        }
+        (pieces, cut)
+    }
+
+    /// Add the text of `pieces`, reasoning into the content when `merge`, and
+    /// queue their items.
+    fn apply(&mut self, pieces: Vec<Piece>, merge: bool, text: &mut Text) {
+        for piece in pieces {
+            match piece {
+                Piece::Reasoning(t) if !merge => text.reasoning.push_str(&t),
+                Piece::Reasoning(t) | Piece::Content(t) => text.content.push_str(&t),
+                Piece::Item(item) => self.calls.push(item),
             }
         }
     }

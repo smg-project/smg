@@ -87,15 +87,31 @@ Where smg's use differs from `transformers serve` by design:
   `parse_response(..., tools=...)` does; `transformers serve` passes no tools.
 - A tool-call region whose value is a list gives one call per item
   (`transformers serve` fails there), and arguments are serialized as smg's
-  other tool parsers do. In a stream, the content of a chunk is sent before
-  the tool calls that close in it.
+  other tool parsers do.
+- In a stream, when the opener of a `tool_calls` region captures the name of
+  its call (the transform is one dict whose `function.name` is a group of the
+  open pattern, with a `function.arguments`), the tool parser sends the name
+  once the region is open, and the arguments when it closes; `transformers
+  serve` sends the whole call when it closes. An open pattern whose match
+  reaches the end of the text so far could still grow, so the region opens, and
+  the name goes out, with the next chunk. Output that follows the close in the
+  same chunk waits for the next chunk, so that the arguments come first.
+  Otherwise the content of a chunk is sent before the tool calls that close in
+  it.
 - A region that fails to parse (its content does not parse, it holds a value
   JSON cannot, or its calls cannot be read), also of a field the parsers do not
   read, is content from where it began, as generated, and the rest of the
   output passes through unparsed, where `transformers serve` fails a complete
   response and ends a stream. A complete output is still the parsed message
   wherever `transformers serve` can read that. `take_error` says why, for a
-  log. A missing required field is not an error.
+  log. A missing required field is not an error. A call whose name was sent and
+  whose region then fails, for example when the output is cut short or its
+  arguments do not parse, keeps its name without arguments, and the region is
+  content after it. A Chat stream then finishes with `tool_calls`, or `length`
+  when cut short. A Messages stream keeps a `tool_use` block with an empty
+  input and stops with `tool_use`, or `max_tokens`. Responses keeps a
+  `function_call` with empty arguments, `incomplete` when cut short, and does
+  not run an MCP tool for it.
 - A stream holds back at most 8 KiB of text that could still begin a delimiter,
   where `transformers serve` holds it all and searches it again for every
   chunk; past that, the text goes to the current region, and only a delimiter

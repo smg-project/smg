@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use openai_protocol::common::Tool;
 use serde_json::Value;
 use smg_response_template::{
-    adapter::{self, ResponseParserState},
+    adapter::{CallItem, ResponseParserState},
     ResponseTemplate,
 };
 
@@ -20,14 +20,19 @@ use crate::{
 /// output feeds the state, the input is its content and the calls are the ones
 /// it closed; otherwise this parser feeds the state and reasoning text stays in
 /// the content. A call is reported whole, name and arguments, when its region
-/// closes. A region that fails to parse is content, with the rest of the
-/// output. Without an attached state the parser has no prompt, as
-/// transformers with `prefix=""`.
+/// closes. When the template's opener captures the name of every call, a
+/// stream reports the name once the region is open and the arguments when it
+/// closes, before any output that followed the close. A region that fails to
+/// parse is content, with the rest of the output; a call named before its
+/// region failed keeps only its name. Without an attached state the parser
+/// has no prompt, as transformers with `prefix=""`.
 pub struct TemplateToolParser {
     template: ResponseTemplate,
     state: Option<ResponseParserState>,
     /// Calls reported so far.
     reported: usize,
+    /// The index of the call reported by name, whose arguments are to come.
+    named: Option<usize>,
     /// Calls closed at the end of the output.
     unstreamed: Vec<ToolCallItem>,
 }
@@ -38,6 +43,7 @@ impl TemplateToolParser {
             template,
             state: None,
             reported: 0,
+            named: None,
             unstreamed: Vec::new(),
         }
     }
@@ -50,18 +56,41 @@ impl TemplateToolParser {
         ResponseParserState::new(&self.template, "", &tools, false)
     }
 
-    fn items(&mut self, calls: Vec<adapter::ToolCall>) -> Vec<ToolCallItem> {
-        calls
-            .into_iter()
-            .map(|call| {
-                self.reported += 1;
-                ToolCallItem {
-                    tool_index: self.reported - 1,
-                    name: Some(call.name),
-                    parameters: arguments(call.arguments),
+    /// Report a new call, the next index.
+    fn next(&mut self, name: String, parameters: String) -> ToolCallItem {
+        self.reported += 1;
+        ToolCallItem {
+            tool_index: self.reported - 1,
+            name: Some(name),
+            parameters,
+        }
+    }
+
+    fn items(&mut self, items: Vec<CallItem>) -> Vec<ToolCallItem> {
+        let mut reported = Vec::new();
+        for item in items {
+            match item {
+                CallItem::Call(call) => {
+                    reported.push(self.next(call.name, arguments(call.arguments)));
                 }
-            })
-            .collect()
+                CallItem::Name(name) => {
+                    let item = self.next(name, String::new());
+                    self.named = Some(item.tool_index);
+                    reported.push(item);
+                }
+                CallItem::Arguments(value) => {
+                    let parameters = arguments(value);
+                    if let Some(tool_index) = self.named.take().filter(|_| !parameters.is_empty()) {
+                        reported.push(ToolCallItem {
+                            tool_index,
+                            name: None,
+                            parameters,
+                        });
+                    }
+                }
+            }
+        }
+        reported
     }
 }
 
@@ -110,10 +139,10 @@ impl ToolParser for TemplateToolParser {
             Some(state) => state.clone(),
             None => self.state.insert(self.new_state(tools)).clone(),
         };
-        let (normal_text, calls) = state.tools(Some(chunk));
+        let (normal_text, items) = state.tool_items(Some(chunk));
         Ok(StreamingParseResult {
             normal_text,
-            calls: self.items(calls),
+            calls: self.items(items),
         })
     }
 
@@ -134,14 +163,15 @@ impl ToolParser for TemplateToolParser {
         let Some(state) = self.state.clone() else {
             return String::new();
         };
-        let (text, calls) = state.tools(None);
-        self.unstreamed = self.items(calls);
+        let (text, items) = state.tool_items(None);
+        self.unstreamed = self.items(items);
         text
     }
 
     fn reset(&mut self) {
         self.state = None;
         self.reported = 0;
+        self.named = None;
         self.unstreamed.clear();
     }
 

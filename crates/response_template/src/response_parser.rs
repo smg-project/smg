@@ -268,6 +268,15 @@ impl ResponseParser {
         self.current.map(|i| self.spec.0.fields[i].name.as_str())
     }
 
+    /// The field and opener captures of the open explicit region.
+    #[cfg(feature = "adapter")]
+    pub(crate) fn open_region(&self) -> Option<(&str, &[(String, String)])> {
+        let current = self
+            .current
+            .filter(|&c| self.opened && Some(c) != self.spec.0.implicit)?;
+        Some((self.spec.0.fields[current].name.as_str(), &self.captures))
+    }
+
     /// transformers: `_consume_prefix`, from the truncation on.
     fn consume_prefix(
         &mut self,
