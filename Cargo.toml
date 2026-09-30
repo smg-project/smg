@@ -155,6 +155,10 @@ opt-level = 2
 [profile.release.package.regex-automata]
 opt-level = 2
 
+# The response-template parser runs on every streamed chunk.
+[profile.release.package.smg-response-template]
+opt-level = 2
+
 [profile.ci]
 inherits = "release"
 opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
