@@ -2187,8 +2187,13 @@ impl StreamingProcessor {
             Some(messages::ThinkingConfig::Disabled) => Some(false),
             None => None,
         };
-        let thinking_override =
-            utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref());
+        let thinking_override = utils::reasoning_starts_in_prefill(
+            None,
+            None,
+            user_thinking,
+            original_request.continues_final_assistant,
+            tokenizer.as_ref(),
+        );
         let think_in_prefill = tokenizer.think_in_prefill();
 
         let tool_choice_enabled = !matches!(

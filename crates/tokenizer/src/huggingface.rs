@@ -661,7 +661,13 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 native_assistant_continuation: true,
                 raw_tool_call_arguments: true,
             },
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::Jinja => {
+            // The Jinja renderer continues a trailing assistant message the
+            // way transformers' `continue_final_message` does.
+            Renderer::Jinja => crate::traits::RendererCapabilities {
+                native_assistant_continuation: true,
+                ..Default::default()
+            },
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => {
                 crate::traits::RendererCapabilities::default()
             }
         }

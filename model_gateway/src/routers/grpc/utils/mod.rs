@@ -27,6 +27,5 @@ pub(crate) use parsers::{
     check_reasoning_parser_availability, check_tool_parser_availability,
     constraint_covers_reasoning, continues_final_assistant, create_reasoning_parser,
     create_tool_parser, get_tool_parser, messages_reasoning_starts_in_prefill,
-    reasoning_parser_requires_special_tokens, reasoning_starts_in_prefill,
-    should_mark_reasoning_started, ParserResolver,
+    reasoning_parser_requires_special_tokens, reasoning_starts_in_prefill, ParserResolver,
 };
