@@ -917,8 +917,13 @@ impl TokenizerTrait for TiktokenTokenizer {
     }
 
     fn renderer_capabilities(&self) -> RendererCapabilities {
+        // A renderer with an encoder of its own answers from its profile; the
+        // others render through the Jinja template, which continues a
+        // trailing assistant message the way transformers does.
         self.profile
-            .map_or_else(Default::default, |profile| profile.capabilities)
+            .map_or(RendererProfile::TEMPLATE_CAPABILITIES, |profile| {
+                profile.capabilities
+            })
     }
 
     fn native_thinking_mode(
@@ -1720,7 +1725,10 @@ mod tests {
         let jinja = TiktokenTokenizer::from_dir(jinja.path()).unwrap();
         assert_eq!(
             jinja.renderer_capabilities(),
-            RendererCapabilities::default()
+            RendererCapabilities {
+                native_assistant_continuation: true,
+                ..RendererCapabilities::default()
+            }
         );
     }
 

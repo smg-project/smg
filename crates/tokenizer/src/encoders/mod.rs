@@ -68,4 +68,12 @@ impl RendererProfile {
         raw_tool_call_arguments: false,
         declares_tools_under_tool_choice_none: false,
     };
+
+    /// The behaviours of a renderer without a profile: the Jinja template,
+    /// which continues a trailing assistant message the way transformers'
+    /// `continue_final_message` does.
+    pub(crate) const TEMPLATE_CAPABILITIES: RendererCapabilities = RendererCapabilities {
+        native_assistant_continuation: true,
+        ..Self::NO_CAPABILITIES
+    };
 }

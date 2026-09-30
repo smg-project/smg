@@ -46,9 +46,10 @@ impl std::fmt::Debug for EncodeJob {
 pub struct RendererCapabilities {
     /// The renderer reads `enable_thinking` as an alias of its thinking key.
     pub enable_thinking_alias: bool,
-    /// With `add_generation_prompt` false the renderer continues a trailing
-    /// assistant message itself (no EOS, no generation header); the gateway
-    /// must keep the message instead of popping it into a text prefix.
+    /// With `add_generation_prompt` false and `continue_final_message` set
+    /// the renderer continues a trailing assistant message itself (no EOS, no
+    /// generation header); the gateway must keep the message instead of
+    /// popping it into a text prefix.
     pub native_assistant_continuation: bool,
     /// The renderer parses tool-call `arguments` strings itself with the
     /// reference's tolerance (non-object and double-encoded values); the

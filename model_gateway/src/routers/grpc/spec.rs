@@ -201,6 +201,8 @@ pub(crate) struct MessagesResponseSpec {
     pub stop_sequences: Option<Vec<String>>,
     /// Symphony's assignment when a table reads the message (see `regular::symphony`).
     pub symphony: Option<Assignment>,
+    /// A trailing assistant message with text, continued as a prefill.
+    pub continues_final_assistant: bool,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -220,6 +222,9 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
             symphony: None,
+            continues_final_assistant: utils::message_utils::continues_final_assistant(
+                &request.messages,
+            ),
         }
     }
 }
@@ -237,7 +242,13 @@ impl MessagesResponseSpec {
             Some(messages::ThinkingConfig::Disabled) => Some(false),
             None => None,
         };
-        utils::should_mark_reasoning_started(user_thinking, tokenizer)
+        utils::reasoning_starts_in_prefill(
+            None,
+            None,
+            user_thinking,
+            self.continues_final_assistant,
+            tokenizer,
+        )
     }
 }
 

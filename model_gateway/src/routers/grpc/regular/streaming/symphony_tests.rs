@@ -341,6 +341,7 @@ fn lookup_tools() -> Vec<Tool> {
 /// A Messages spec with Symphony assigned `format`, replaying `prompt`, with the `lookup` tool.
 fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        continues_final_assistant: false,
         thinking: thinking.then_some(messages::ThinkingConfig::Enabled {
             budget_tokens: 1024,
             display: None,

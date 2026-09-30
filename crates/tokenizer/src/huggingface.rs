@@ -1400,8 +1400,13 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     }
 
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+        // A renderer with an encoder of its own answers from its profile; the
+        // Jinja renderer continues a trailing assistant message the way
+        // transformers' `continue_final_message` does.
         self.profile
-            .map_or_else(Default::default, |profile| profile.capabilities)
+            .map_or(RendererProfile::TEMPLATE_CAPABILITIES, |profile| {
+                profile.capabilities
+            })
     }
 
     fn native_thinking_mode(
