@@ -115,6 +115,17 @@ ensure_rdma_libs() {
 install_tokenspeed() {
     $RETRY 3 10 python3 -m pip install --upgrade tokenspeed \
         --extra-index-url https://lightseek.org/whl/nightly
+    python3 - <<'PY'
+import re
+from importlib import metadata
+
+version = metadata.version("tokenspeed")
+print(f"Installed tokenspeed=={version}", flush=True)
+nightly = re.fullmatch(r"\d+\.\d+\.\d+\.post(\d{8})", version)
+if nightly is None:
+    raise RuntimeError(f"Expected a dated TokenSpeed nightly, installed {version}")
+print(f"TokenSpeed nightly date: {nightly.group(1)}", flush=True)
+PY
     $RETRY 3 10 python3 "${SCRIPT_DIR}/ci_install_flashinfer.py"
 }
 
