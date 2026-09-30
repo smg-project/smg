@@ -2413,8 +2413,34 @@ impl StreamingProcessor {
                     match parser.parse_incremental(&normal_text, chat_tools).await {
                         Ok(StreamingParseResult {
                             normal_text: text,
-                            calls,
+                            mut calls,
                         }) => {
+                            // Arguments that finish the open call come before
+                            // the text after it in the same chunk.
+                            let finishing = if tool_block_open {
+                                calls
+                                    .iter()
+                                    .position(|call| call.name.is_some())
+                                    .unwrap_or(calls.len())
+                            } else {
+                                0
+                            };
+                            for tool_call_item in calls.drain(..finishing) {
+                                if !tool_call_item.parameters.is_empty() {
+                                    Self::send_messages_event(
+                                        tx,
+                                        &mut sse_buffer,
+                                        &MessageStreamEvent::ContentBlockDelta {
+                                            index: current_block_index,
+                                            delta: ContentBlockDelta::InputJsonDelta {
+                                                partial_json: tool_call_item.parameters,
+                                            },
+                                        },
+                                    )
+                                    .await?;
+                                }
+                            }
+
                             // Emit normal text from parser as text content blocks
                             if !text.is_empty() {
                                 if !text_block_open {
