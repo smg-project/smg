@@ -1823,6 +1823,25 @@ impl StreamingProcessor {
             .map_err(|_| "Client disconnected".to_string())
     }
 
+    /// Stop the open content block, if any, so the next block gets the next
+    /// index: reasoning, text and tool calls can alternate.
+    async fn stop_open_block(
+        tx: &SseSender,
+        buffer: &mut Vec<u8>,
+        index: &mut u32,
+        open: [&mut bool; 3],
+    ) -> Result<(), String> {
+        if open
+            .into_iter()
+            .fold(false, |any, open| std::mem::take(open) | any)
+        {
+            let stop = MessageStreamEvent::ContentBlockStop { index: *index };
+            Self::send_messages_event(tx, buffer, &stop).await?;
+            *index += 1;
+        }
+        Ok(())
+    }
+
     /// Process reasoning content in Messages streaming mode (n=1 only).
     ///
     /// Returns `(normal_text, reasoning_text, in_reasoning)`.
@@ -2275,6 +2294,17 @@ impl StreamingProcessor {
             // Emit thinking content block deltas
             if !reasoning_chunk_text.is_empty() {
                 if !thinking_block_open {
+                    Self::stop_open_block(
+                        tx,
+                        &mut sse_buffer,
+                        &mut current_block_index,
+                        [
+                            &mut thinking_block_open,
+                            &mut text_block_open,
+                            &mut tool_block_open,
+                        ],
+                    )
+                    .await?;
                     Self::send_messages_event(
                         tx,
                         &mut sse_buffer,
@@ -2326,19 +2356,18 @@ impl StreamingProcessor {
                     // Specific function: entire output is arguments for one tool
                     if !has_tool_calls {
                         has_tool_calls = true;
-                        // Close text block if open before starting tool block
-                        if text_block_open {
-                            Self::send_messages_event(
-                                tx,
-                                &mut sse_buffer,
-                                &MessageStreamEvent::ContentBlockStop {
-                                    index: current_block_index,
-                                },
-                            )
-                            .await?;
-                            text_block_open = false;
-                            current_block_index += 1;
-                        }
+                        // Close the open block before starting tool block
+                        Self::stop_open_block(
+                            tx,
+                            &mut sse_buffer,
+                            &mut current_block_index,
+                            [
+                                &mut thinking_block_open,
+                                &mut text_block_open,
+                                &mut tool_block_open,
+                            ],
+                        )
+                        .await?;
                         // Emit content_block_start for the tool_use
                         let tool_name = match &original_request.tool_choice {
                             Some(messages::ToolChoice::Tool { name, .. }) => name.clone(),
@@ -2389,6 +2418,17 @@ impl StreamingProcessor {
                             // Emit normal text from parser as text content blocks
                             if !text.is_empty() {
                                 if !text_block_open {
+                                    Self::stop_open_block(
+                                        tx,
+                                        &mut sse_buffer,
+                                        &mut current_block_index,
+                                        [
+                                            &mut thinking_block_open,
+                                            &mut text_block_open,
+                                            &mut tool_block_open,
+                                        ],
+                                    )
+                                    .await?;
                                     Self::send_messages_event(
                                         tx,
                                         &mut sse_buffer,
@@ -2420,29 +2460,17 @@ impl StreamingProcessor {
 
                                 if let Some(ref name) = tool_call_item.name {
                                     // New tool call: close previous blocks, emit start
-                                    if text_block_open {
-                                        Self::send_messages_event(
-                                            tx,
-                                            &mut sse_buffer,
-                                            &MessageStreamEvent::ContentBlockStop {
-                                                index: current_block_index,
-                                            },
-                                        )
-                                        .await?;
-                                        text_block_open = false;
-                                        current_block_index += 1;
-                                    }
-                                    if tool_block_open {
-                                        Self::send_messages_event(
-                                            tx,
-                                            &mut sse_buffer,
-                                            &MessageStreamEvent::ContentBlockStop {
-                                                index: current_block_index,
-                                            },
-                                        )
-                                        .await?;
-                                        current_block_index += 1;
-                                    }
+                                    Self::stop_open_block(
+                                        tx,
+                                        &mut sse_buffer,
+                                        &mut current_block_index,
+                                        [
+                                            &mut thinking_block_open,
+                                            &mut text_block_open,
+                                            &mut tool_block_open,
+                                        ],
+                                    )
+                                    .await?;
 
                                     let tool_call_id = utils::generate_tool_call_id(
                                         model,
@@ -2495,6 +2523,17 @@ impl StreamingProcessor {
             // Regular text emission (no tools active)
             if !normal_text.is_empty() {
                 if !text_block_open {
+                    Self::stop_open_block(
+                        tx,
+                        &mut sse_buffer,
+                        &mut current_block_index,
+                        [
+                            &mut thinking_block_open,
+                            &mut text_block_open,
+                            &mut tool_block_open,
+                        ],
+                    )
+                    .await?;
                     Self::send_messages_event(
                         tx,
                         &mut sse_buffer,
@@ -2529,6 +2568,17 @@ impl StreamingProcessor {
             let leftover_text = parser.take_unstreamed_normal_text();
             if !leftover_text.is_empty() {
                 if !text_block_open {
+                    Self::stop_open_block(
+                        tx,
+                        &mut sse_buffer,
+                        &mut current_block_index,
+                        [
+                            &mut thinking_block_open,
+                            &mut text_block_open,
+                            &mut tool_block_open,
+                        ],
+                    )
+                    .await?;
                     Self::send_messages_event(
                         tx,
                         &mut sse_buffer,
@@ -2563,30 +2613,18 @@ impl StreamingProcessor {
                     has_tool_calls = true;
 
                     if let Some(ref name) = tool_call_item.name {
-                        // Close text block if open before starting tool block
-                        if text_block_open {
-                            Self::send_messages_event(
-                                tx,
-                                &mut sse_buffer,
-                                &MessageStreamEvent::ContentBlockStop {
-                                    index: current_block_index,
-                                },
-                            )
-                            .await?;
-                            text_block_open = false;
-                            current_block_index += 1;
-                        }
-                        if tool_block_open {
-                            Self::send_messages_event(
-                                tx,
-                                &mut sse_buffer,
-                                &MessageStreamEvent::ContentBlockStop {
-                                    index: current_block_index,
-                                },
-                            )
-                            .await?;
-                            current_block_index += 1;
-                        }
+                        // Close the open block before starting tool block
+                        Self::stop_open_block(
+                            tx,
+                            &mut sse_buffer,
+                            &mut current_block_index,
+                            [
+                                &mut thinking_block_open,
+                                &mut text_block_open,
+                                &mut tool_block_open,
+                            ],
+                        )
+                        .await?;
 
                         let tool_call_id = utils::generate_tool_call_id(
                             model,

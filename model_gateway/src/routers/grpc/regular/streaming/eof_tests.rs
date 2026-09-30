@@ -15,6 +15,7 @@ use smg_grpc_client::vllm_engine::{
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use tonic::codec::Codec;
+use tool_parser::types::ToolCallItem;
 
 use super::*;
 use crate::{routers::common::sse::SseReceiver, worker::WorkerRegistry};
@@ -577,4 +578,263 @@ async fn deepseek_does_not_emit_aggregate_usage_without_complete_frames() {
             "{events:?}"
         );
     }
+}
+
+/// Reasoning for every chunk but "text"; `is_in_reasoning` reports `.0`.
+struct ReasoningButText(bool);
+
+impl ReasoningParser for ReasoningButText {
+    fn detect_and_parse_reasoning(
+        &mut self,
+        text: &str,
+    ) -> Result<ParserResult, reasoning_parser::ParseError> {
+        Ok(ParserResult::normal(text.to_string()))
+    }
+
+    fn parse_reasoning_streaming_incremental(
+        &mut self,
+        text: &str,
+    ) -> Result<ParserResult, reasoning_parser::ParseError> {
+        Ok(match text {
+            "text" => ParserResult::normal(text.to_string()),
+            _ => ParserResult::reasoning(text.to_string()),
+        })
+    }
+
+    fn reset(&mut self) {}
+
+    fn model_type(&self) -> &str {
+        "reasoning-but-text"
+    }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.0
+    }
+
+    fn mark_reasoning_started(&mut self) {}
+
+    fn mark_think_start_stripped(&mut self) {}
+}
+
+/// Reports one whole call on its first chunk, before the chunk's text.
+#[derive(Default)]
+struct CallFirst {
+    called: bool,
+}
+
+#[async_trait::async_trait]
+impl ToolParser for CallFirst {
+    async fn parse_complete(
+        &self,
+        output: &str,
+    ) -> tool_parser::errors::ParserResult<(String, Vec<tool_parser::ToolCall>)> {
+        Ok((output.to_string(), Vec::new()))
+    }
+
+    async fn parse_incremental(
+        &mut self,
+        chunk: &str,
+        _tools: &[Tool],
+    ) -> tool_parser::errors::ParserResult<StreamingParseResult> {
+        let calls = (!std::mem::replace(&mut self.called, true)).then(|| ToolCallItem {
+            tool_index: 0,
+            name: Some("lookup".to_string()),
+            parameters: "{}".to_string(),
+        });
+        Ok(StreamingParseResult {
+            normal_text: chunk.to_string(),
+            calls: calls.into_iter().collect(),
+        })
+    }
+
+    fn has_tool_markers(&self, _text: &str) -> bool {
+        false
+    }
+}
+
+/// A processor with the stub parsers above.
+fn stub_processor(in_reasoning: bool) -> StreamingProcessor {
+    let reasoning = ReasoningParserFactory::new();
+    reasoning
+        .registry()
+        .register_parser("reasoning-but-text", move || {
+            Box::new(ReasoningButText(in_reasoning))
+        });
+    let tools = ToolParserFactory::new();
+    tools
+        .registry()
+        .register_parser("call-first", || Box::new(CallFirst::default()));
+    let resolver = utils::ParserResolver::new(
+        Arc::new(WorkerRegistry::new()),
+        Some("call-first".to_string()),
+        Some("reasoning-but-text".to_string()),
+    );
+    StreamingProcessor::new(tools, reasoning, resolver, "vllm")
+}
+
+/// The content block starts and stops of a Messages stream of `texts`. A
+/// block starts only when none is open, and every delta goes to the open one.
+async fn messages_blocks(
+    processor: StreamingProcessor,
+    tool_choice: Option<messages::ToolChoice>,
+    texts: &[&str],
+) -> Vec<String> {
+    let spec = MessagesResponseSpec {
+        thinking: Some(messages::ThinkingConfig::Enabled {
+            budget_tokens: 1024,
+            display: None,
+        }),
+        tool_choice,
+        has_tools: true,
+        history_tool_calls_count: 0,
+        chat_tools: chat_spec(true).tools.unwrap(),
+        stop_sequences: None,
+    };
+    let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
+    frames.push(complete(0, "stop"));
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let (tx, rx) = sse_channel();
+    let result = processor
+        .process_messages_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    let mut open = None;
+    let mut blocks = Vec::new();
+    for event in &events {
+        let index = &event["index"];
+        match event["type"].as_str() {
+            Some("content_block_start") => {
+                blocks.push(format!("start {index} {}", event["content_block"]["type"]));
+                assert!(open.replace(index).is_none(), "{blocks:?}");
+            }
+            Some("content_block_delta") => {
+                assert_eq!(open, Some(index), "delta {index} after {blocks:?}");
+            }
+            Some("content_block_stop") => {
+                blocks.push(format!("stop {index}"));
+                assert_eq!(open.take(), Some(index), "{blocks:?}");
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+#[tokio::test]
+async fn messages_blocks_do_not_overlap_when_reasoning_calls_and_text_alternate() {
+    // Reasoning, then a call with no text between; text; reasoning again.
+    assert_eq!(
+        messages_blocks(stub_processor(false), None, &["a", "text", "b"]).await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"tool_use\"",
+            "stop 1",
+            "start 2 \"text\"",
+            "stop 2",
+            "start 3 \"thinking\"",
+            "stop 3",
+        ]
+    );
+    // Text the reasoning parser returns while it stays in reasoning, as when
+    // one chunk ends reasoning, adds text and starts reasoning again.
+    assert_eq!(
+        messages_blocks(stub_processor(true), None, &["a", "text", "b"]).await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"text\"",
+            "stop 1",
+            "start 2 \"thinking\"",
+            "stop 2",
+        ]
+    );
+    // A specific tool right after reasoning.
+    let tool = messages::ToolChoice::Tool {
+        name: "lookup".to_string(),
+        disable_parallel_tool_use: None,
+    };
+    assert_eq!(
+        messages_blocks(stub_processor(false), Some(tool), &["a"]).await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"tool_use\"",
+            "stop 1",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn messages_blocks_do_not_overlap_with_deepseek_parsers() {
+    let processor = |tool: &str, reasoning: &str| {
+        StreamingProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::new(
+                Arc::new(WorkerRegistry::new()),
+                Some(tool.to_string()),
+                Some(reasoning.to_string()),
+            ),
+            "vllm",
+        )
+    };
+    // `</think>` ends reasoning without text, and the arguments of a specific
+    // tool follow in the next chunk.
+    let tool = messages::ToolChoice::Tool {
+        name: "lookup".to_string(),
+        disable_parallel_tool_use: None,
+    };
+    assert_eq!(
+        messages_blocks(
+            processor("deepseek", "deepseek_r1"),
+            Some(tool),
+            &["plan", "</think>", "{}"],
+        )
+        .await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"tool_use\"",
+            "stop 1",
+        ]
+    );
+    // A reasoning parser that enters reasoning again after text.
+    assert_eq!(
+        messages_blocks(
+            processor("deepseek_v41", "deepseek_v41"),
+            None,
+            &[
+                "<think>plan",
+                "</think>",
+                "answer",
+                "<think>",
+                "more",
+                "</think>",
+                "done"
+            ],
+        )
+        .await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"text\"",
+            "stop 1",
+            "start 2 \"thinking\"",
+            "stop 2",
+            "start 3 \"text\"",
+            "stop 3",
+        ]
+    );
 }
