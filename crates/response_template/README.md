@@ -68,11 +68,28 @@ Where smg's use differs from `transformers serve` by design:
   message returns only the generated part.
 - A tool-call region whose value is a list gives one call per item
   (`transformers serve` fails there), and arguments are serialized as smg's
-  other tool parsers do. In a stream, the content of a chunk is sent before
-  the tool calls that close in it.
+  other tool parsers do.
+- In a stream, when the opener of a `tool_calls` region captures the name of
+  its call (the transform is one dict whose `function.name` is a group of
+  the open pattern, with a `function.arguments`), the tool parser sends the
+  name once the region is open, and the arguments when it closes;
+  `transformers serve` sends the whole call when it closes. An open pattern
+  whose match reaches the end of the text so far could still grow, so the
+  region opens, and the name goes out, with the next chunk. Output that
+  follows the close in the same chunk waits for the next chunk, so that the
+  arguments come first. Otherwise the content of a chunk is sent before the
+  tool calls that close in it.
 - After an error the rest of the output passes through unparsed, also when
   the error comes from a field the parsers do not read (such as a value JSON
-  cannot hold).
+  cannot hold). When output that waited comes first, the error is reported
+  with the next chunk, or when the output ends. A call whose name was sent
+  and whose region then fails, for example when the output is cut short or
+  its arguments do not parse, keeps its name without arguments. A Chat
+  stream then finishes with `tool_calls`, or `length` when cut short. A
+  Messages stream keeps a `tool_use` block with an empty input and stops with
+  `tool_use`, or `max_tokens`. Responses keeps a `function_call` with empty
+  arguments, `incomplete` when cut short, and does not run an MCP tool for
+  it.
 
 ## Regular expressions
 

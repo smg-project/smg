@@ -344,7 +344,7 @@ fn quote_keys(text: &str) -> String {
 }
 
 /// `_PLACEHOLDER.fullmatch(s)` for `\{(\w+(?:\.\w+)*)\}`: the dotted path.
-fn placeholder(s: &str) -> Option<&str> {
+pub(crate) fn placeholder(s: &str) -> Option<&str> {
     let path = s.strip_prefix('{')?.strip_suffix('}')?;
     is_path(path).then_some(path)
 }
