@@ -204,6 +204,10 @@ opt-level = 3
 [profile.release.package.kv-index]
 opt-level = 3
 
+# The response-template parser runs on every streamed chunk.
+[profile.release.package.smg-response-template]
+opt-level = 2
+
 [profile.ci]
 inherits = "release"
 opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
