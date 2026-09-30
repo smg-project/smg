@@ -3,9 +3,10 @@
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    sync::{Arc, Weak},
+    sync::{Arc, OnceLock, Weak},
 };
 
+use anyhow::anyhow;
 use llm_tokenizer::{traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::common::Tool;
 use parking_lot::RwLock;
@@ -16,7 +17,9 @@ use smg_response_template::{
     load_response_template, ResponseTemplate,
 };
 use tool_parser::{ParserFactory as ToolParserFactory, TemplateToolParser};
-use tracing::warn;
+use tracing::{debug, warn};
+
+use super::chat_utils::offload;
 
 /// The tokenizer an entry was computed for, and its parser name and template.
 type Entry = (Weak<dyn Tokenizer>, Option<(String, ResponseTemplate)>);
@@ -103,7 +106,7 @@ fn has_float(value: &Value) -> bool {
 }
 
 /// What the response-template parsers of one request start from: the
-/// rendered prompt after the template's last start anchor, and the tools.
+/// decoded prompt after the template's last start anchor, and the tools.
 #[derive(Clone)]
 pub(crate) struct ResponseParserSpec {
     template: ResponseTemplate,
@@ -113,10 +116,11 @@ pub(crate) struct ResponseParserSpec {
 }
 
 impl ResponseParserSpec {
+    /// `prompt_tail`: what [`response_prompt_tail`] returns for the request.
     /// `continuation`: the prompt ends inside the assistant message.
     pub(crate) fn new<'a>(
         template: ResponseTemplate,
-        prompt: &str,
+        prompt_tail: Arc<str>,
         tools: impl IntoIterator<Item = &'a Tool>,
         continuation: bool,
     ) -> Self {
@@ -124,7 +128,7 @@ impl ResponseParserSpec {
             .into_iter()
             .filter_map(|t| serde_json::to_value(t).ok());
         Self {
-            prompt_tail: template.truncate_past_last_anchor(prompt).into(),
+            prompt_tail,
             template,
             tools: tools.collect(),
             continuation,
@@ -136,6 +140,38 @@ impl ResponseParserSpec {
         let tools = &self.tools;
         ResponseParserState::new(&self.template, &self.prompt_tail, tools, self.continuation)
     }
+}
+
+/// The `prefix` of `transformers serve` past the template's last start
+/// anchor: the prompt tokens decoded with special tokens kept, so the parsers
+/// start from what the model was given. The rendered prompt stands in without
+/// a tokenizer or when decoding fails.
+pub(crate) async fn response_prompt_tail(
+    template: &ResponseTemplate,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    prompt_ids: &[u32],
+    rendered: &str,
+) -> Arc<str> {
+    let decoded = match tokenizer {
+        Some(tokenizer) => {
+            let (template, ids) = (template.clone(), prompt_ids.to_vec());
+            // The decode is about as long as the rendered prompt.
+            offload(rendered.len(), move || {
+                let prompt = tokenizer.decode(&ids, false)?;
+                Ok(Arc::from(template.truncate_past_last_anchor(&prompt)))
+            })
+            .await
+        }
+        None => Err(anyhow!("no tokenizer")),
+    };
+    decoded.unwrap_or_else(|error| {
+        debug!(%error, "response templates read the rendered prompt");
+        static WARNED: OnceLock<()> = OnceLock::new();
+        WARNED.get_or_init(|| {
+            warn!(%error, "cannot decode the prompt; response templates read the rendered prompt");
+        });
+        template.truncate_past_last_anchor(rendered).into()
+    })
 }
 
 #[cfg(test)]
@@ -257,5 +293,68 @@ mod tests {
         assert_eq!(resolver.reasoning_parser("m").as_deref(), Some("qwen3"));
         assert_eq!(resolver.tool_parser("m"), None);
         assert!(resolver.response_template("m").is_none());
+    }
+
+    /// A byte-fallback BPE `tokenizer.json` with an NFC normalizer, so its
+    /// decode can differ from the text it encoded, and two special tokens.
+    fn nfc_tokenizer(dir: &std::path::Path) -> Arc<dyn Tokenizer> {
+        let vocab: serde_json::Map<_, _> = (0..=255u32)
+            .map(|byte| (format!("<0x{byte:02X}>"), json!(byte)))
+            .collect();
+        let added: Vec<_> = ["<|user|>", "<|assistant|>"]
+            .into_iter()
+            .zip(256..)
+            .map(|(content, id)| {
+                json!({"id": id, "content": content, "single_word": false, "lstrip": false,
+                       "rstrip": false, "normalized": false, "special": true})
+            })
+            .collect();
+        let decoders = json!([{"type": "ByteFallback"}, {"type": "Fuse"}]);
+        let tokenizer = json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": added,
+            "normalizer": {"type": "NFC"},
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": {"type": "Sequence", "decoders": decoders},
+            "model": {"type": "BPE", "vocab": vocab, "merges": [], "byte_fallback": true}
+        });
+        let path = dir.join("tokenizer.json");
+        std::fs::write(&path, tokenizer.to_string()).unwrap();
+        let path = path.to_str().unwrap();
+        Arc::new(llm_tokenizer::HuggingFaceTokenizer::from_file(path).unwrap())
+    }
+
+    /// The tail comes from the decoded prompt tokens, as the `prefix` of
+    /// `transformers serve` does, and differs from the rendered prompt where
+    /// the tokenizer normalizes: here `e` and U+0301 compose to `é`.
+    #[tokio::test]
+    async fn the_prompt_tail_is_the_decoded_prompt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tokenizer = nfc_tokenizer(dir.path());
+        let template = load_response_template(&template("</think>")).unwrap();
+        let long = format!(
+            "<|user|>{}<|assistant|>Cafe\u{301} is",
+            "weather? ".repeat(100)
+        );
+        let cases = [
+            // A continued assistant message, inline and on the blocking pool.
+            (
+                "<|user|>weather?<|assistant|>Cafe\u{301} is",
+                "Caf\u{e9} is",
+            ),
+            (long.as_str(), "Caf\u{e9} is"),
+            // Without a start anchor, the whole prompt with its special tokens.
+            ("<|user|>Cafe\u{301}?", "<|user|>Caf\u{e9}?"),
+        ];
+        for (rendered, decoded) in cases {
+            let ids = tokenizer.encode(rendered, false).unwrap();
+            let ids = ids.token_ids();
+            let tail = response_prompt_tail(&template, Some(tokenizer.clone()), ids, rendered);
+            assert_eq!(&*tail.await, decoded);
+            // Without a tokenizer the rendered prompt stands in.
+            let tail = response_prompt_tail(&template, None, ids, rendered).await;
+            assert_eq!(&*tail, template.truncate_past_last_anchor(rendered));
+        }
     }
 }

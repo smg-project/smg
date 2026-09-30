@@ -5,6 +5,9 @@ use llm_tokenizer::{
     MockTokenizer, SpecialTokens,
 };
 
+/// Prompt tokens, one per character, start above every `char`.
+const PROMPT_ID_BASE: u32 = 0x0020_0000;
+
 /// Decode the canned worker's generated tokens starting at 100 as chosen chunks.
 pub struct ScriptedTokenizer {
     base: MockTokenizer,
@@ -17,6 +20,10 @@ pub struct ScriptedTokenizer {
     response_template: Option<serde_json::Value>,
     /// Appended to the rendered prompt.
     prompt_tail: String,
+    /// Encode text one token per character, from `PROMPT_ID_BASE`.
+    prompt_ids: bool,
+    /// What a decoded prompt ends with in place of `prompt_tail`.
+    decoded_prompt_tail: Option<String>,
 }
 
 impl ScriptedTokenizer {
@@ -35,6 +42,8 @@ impl ScriptedTokenizer {
             eos_ids: Vec::new(),
             response_template: None,
             prompt_tail: String::new(),
+            prompt_ids: false,
+            decoded_prompt_tail: None,
         }
     }
 
@@ -64,6 +73,16 @@ impl ScriptedTokenizer {
         self
     }
 
+    /// Encode text one token per character, so that decoding the prompt
+    /// tokens gives the prompt back. With `decoded_tail`, a decoded prompt
+    /// ends with it in place of the rendered tail, as when a tokenizer's
+    /// decode differs from the text it encoded.
+    pub fn with_prompt_ids(mut self, decoded_tail: Option<&str>) -> Self {
+        self.prompt_ids = true;
+        self.decoded_prompt_tail = decoded_tail.map(str::to_string);
+        self
+    }
+
     fn ids_where(&self, pick: impl Fn(&str) -> bool) -> Vec<u32> {
         (0..self.chunks.len())
             .filter(|&index| pick(&self.chunks[index]))
@@ -74,15 +93,34 @@ impl ScriptedTokenizer {
 
 impl Encoder for ScriptedTokenizer {
     fn encode(&self, text: &str, add_special: bool) -> anyhow::Result<Encoding> {
+        if self.prompt_ids {
+            let ids = text.chars().map(|c| PROMPT_ID_BASE + u32::from(c));
+            return Ok(Encoding::Plain(ids.collect()));
+        }
         self.base.encode(text, add_special)
     }
     fn encode_batch(&self, texts: &[&str], add_special: bool) -> anyhow::Result<Vec<Encoding>> {
-        self.base.encode_batch(texts, add_special)
+        texts
+            .iter()
+            .map(|text| self.encode(text, add_special))
+            .collect()
     }
 }
 
 impl Decoder for ScriptedTokenizer {
     fn decode(&self, ids: &[u32], skip_special: bool) -> anyhow::Result<String> {
+        if self.prompt_ids && !ids.is_empty() && ids.iter().all(|&id| id >= PROMPT_ID_BASE) {
+            let prompt: String = ids
+                .iter()
+                .filter_map(|&id| char::from_u32(id - PROMPT_ID_BASE))
+                .collect();
+            if let Some(tail) = &self.decoded_prompt_tail {
+                if let Some(head) = prompt.strip_suffix(self.prompt_tail.as_str()) {
+                    return Ok(format!("{head}{tail}"));
+                }
+            }
+            return Ok(prompt);
+        }
         if self.use_final_answer.load(Ordering::Relaxed) {
             return Ok(self
                 .final_answer
