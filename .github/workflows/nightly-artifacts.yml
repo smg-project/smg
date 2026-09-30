@@ -256,7 +256,7 @@ jobs:
           set -euo pipefail
           mkdir -p crate-dist filelists
 
-          TIER1="crates/protocols crates/reasoning_parser crates/kv_index crates/data_connector crates/workflow crates/auth crates/mcp crates/mm_rdma crates/engine_zmq_client crates/radix_tree"
+          TIER1="crates/protocols crates/reasoning_parser crates/kv_index crates/data_connector crates/workflow crates/auth crates/mcp crates/mm_rdma crates/engine_zmq_client crates/radix_tree crates/response_template"
           TIER2="crates/tool_parser crates/grpc_client clients/rust crates/mesh crates/wasm crates/tokenizer crates/rl crates/external_router"
           TIER3="crates/multimodal"
           TIER4="model_gateway"

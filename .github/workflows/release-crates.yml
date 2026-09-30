@@ -43,6 +43,8 @@ jobs:
             path: crates/engine_zmq_client
           - crate: smg-radix-tree
             path: crates/radix_tree
+          - crate: smg-response-template
+            path: crates/response_template
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate
