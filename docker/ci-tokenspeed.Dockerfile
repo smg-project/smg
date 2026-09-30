@@ -19,11 +19,8 @@
 #     payload; the install script apt-installs them on the runner when
 #     missing.
 #
-# Built by .github/workflows/ci-tokenspeed-image.yml on every bump of
-# .github/versions/tokenspeed.ref or of the image tooling, and tagged
-# ghcr.io/<owner>/smg:<tag> with the content-addressed tag printed by
-# scripts/ci_tokenspeed_image_tag.sh. CUDA tooling is installed for runtime
-# JIT, but no GPU is needed to install wheels on the CPU/docker runner pool.
+# Built by ci-tokenspeed-image.yml using the published nightly version date.
+# CUDA tooling supports runtime JIT; wheel installation needs no GPU.
 
 ARG BASE_IMAGE=ubuntu:24.04
 FROM ${BASE_IMAGE}
@@ -48,9 +45,11 @@ RUN bash scripts/ci_apt_mirror.sh \
 COPY scripts/ci_setup_python_venv.sh scripts/ci_install_tokenspeed.sh scripts/ci_install_flashinfer.py scripts/ci_ensure_python_headers.sh scripts/
 COPY .github/versions/tokenspeed.ref .github/versions/tokenspeed.ref
 
+ARG TOKENSPEED_VERSION
+
 # Bake nightly wheels; per-PR SMG gRPC packages are installed in each job.
 RUN bash scripts/ci_setup_python_venv.sh \
-    && TOKENSPEED_BUILD_ONLY=1 \
+    && TOKENSPEED_BUILD_ONLY=1 TOKENSPEED_VERSION="${TOKENSPEED_VERSION}" \
        bash scripts/ci_install_tokenspeed.sh \
     && if [ -x "$HOME/.local/bin/uv" ] && [ ! -x /usr/local/bin/uv ]; then \
            cp "$HOME/.local/bin/uv" /usr/local/bin/uv; \

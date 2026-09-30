@@ -496,17 +496,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Resolve the prebuilt TokenSpeed carrier image (built by
-      # ci-tokenspeed-image.yml, content-addressed by the pinned engine ref +
-      # image-tooling hash — see scripts/ci_tokenspeed_image_tag.sh). The
-      # lanes run bare on the runner pods, so the image is not a job
-      # container: setup-tokenspeed extracts its payload onto the runner
-      # (scripts/ci_fetch_tokenspeed_prebuilt.sh). Any failure — a missing
-      # image (e.g. a PR that bumps the ref or edits the tooling before the
-      # image exists), a broken ref file, a registry hiccup — resolves to
-      # empty, and the tokenspeed lanes fall back to the source build. This
-      # step must NEVER fail the job: a failed detect-changes silently skips
-      # every gated lane.
+      # Resolve today's published nightly carrier to an immutable digest.
+      # A missing image falls back to installing nightly wheels on the runner.
+      # Resolution must stay tolerant so detect-changes can gate other lanes.
       - name: Resolve TokenSpeed CI image
         id: tokenspeed-image
         env:
@@ -517,15 +509,18 @@ jobs:
           if [ -n "$tag" ]; then
             candidate="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
             if docker login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN" > /dev/null 2>&1 \
-               && docker manifest inspect "$candidate" > /dev/null 2>&1; then
-              image="$candidate"
+               && manifest="$(docker manifest inspect --verbose "$candidate" 2>/dev/null)"; then
+              digest="$(jq -r 'if type == "array" then .[] | select(.Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "amd64") | .Descriptor.digest else .Descriptor.digest // empty end' <<< "$manifest")"
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                image="${candidate%:*}@${digest}"
+              fi
             fi
           fi
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           if [ -n "$image" ]; then
             echo "TokenSpeed lanes use prebuilt image: ${image}"
           else
-            echo "Prebuilt TokenSpeed image not available (tag: ${tag:-unresolved}); lanes build from source"
+            echo "Prebuilt TokenSpeed image not available (tag: ${tag:-unresolved}); lanes install nightly wheels"
           fi
       - uses: dorny/paths-filter@v4
         id: filter

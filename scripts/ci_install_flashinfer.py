@@ -6,6 +6,23 @@ import subprocess
 import sys
 from importlib import metadata
 
+from pip._vendor.packaging.requirements import Requirement
+
+
+def artifacts_match(expected: tuple[tuple[str, str], ...]) -> bool:
+    try:
+        if any(metadata.version(package) != version for package, version in expected):
+            return False
+        for requirement in metadata.requires("flashinfer-jit-cache") or []:
+            dependency = Requirement(requirement)
+            if dependency.marker is not None and not dependency.marker.evaluate():
+                continue
+            if metadata.version(dependency.name) not in dependency.specifier:
+                return False
+    except metadata.PackageNotFoundError:
+        return False
+    return True
+
 
 def install(version: str, cuda_version: str, architecture: str) -> None:
     cuda_index = "".join(cuda_version.split(".")[:2])
@@ -14,6 +31,14 @@ def install(version: str, cuda_version: str, architecture: str) -> None:
     release = f"https://github.com/flashinfer-ai/flashinfer/releases/download/{tag}"
     index = f"https://flashinfer.ai/whl/{'nightly/' if nightly else ''}cu{cuda_index}"
     jit_version = f"{version}+cu{cuda_index}"
+    expected = (
+        ("flashinfer-python", version),
+        ("flashinfer-cubin", version),
+        ("flashinfer-jit-cache", jit_version),
+    )
+    if artifacts_match(expected):
+        print("FlashInfer artifacts and providers already match; skipping install", flush=True)
+        return
     subprocess.check_call(
         [
             sys.executable,
@@ -29,15 +54,10 @@ def install(version: str, cuda_version: str, architecture: str) -> None:
             index,
         ]
     )
-    for package, expected in (
-        ("flashinfer-python", version),
-        ("flashinfer-cubin", version),
-        ("flashinfer-jit-cache", jit_version),
-    ):
-        installed = metadata.version(package)
-        if installed != expected:
-            raise RuntimeError(f"{package}: expected {expected}, installed {installed}")
-        print(f"{package}=={installed}", flush=True)
+    if not artifacts_match(expected):
+        raise RuntimeError("FlashInfer artifacts or provider dependencies do not match")
+    for package, version in expected:
+        print(f"{package}=={version}", flush=True)
 
 
 if __name__ == "__main__":

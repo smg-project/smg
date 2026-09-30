@@ -54,8 +54,8 @@ fallback() {
 command -v docker &> /dev/null || fallback "docker not available on this runner"
 if command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
 
-# The tag is content-addressed (scripts/ci_tokenspeed_image_tag.sh), so it is
-# the cache key; reduce it to a plain path segment.
+# Consumers resolve date tags to immutable digests before caching payloads.
+# Reduce the digest (or a legacy tag) to a plain path segment.
 tag="$(printf '%s' "${IMAGE##*:}" | tr -c 'A-Za-z0-9._-' '_')"
 [ -n "$tag" ] || fallback "cannot derive a tag from ${IMAGE}"
 init_cache_root() { mkdir -p "$1/.locks" "$1/jobs" 2> /dev/null; }
@@ -82,7 +82,7 @@ retire_entry() {
 }
 
 # Housekeeping: job copies left behind by cancelled jobs, and tags nothing
-# pulls anymore (the tag changes on every tokenspeed.ref bump).
+# pulls anymore (the digest changes on every carrier rebuild).
 find "${CACHE_ROOT}/jobs" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2> /dev/null
 find "${CACHE_ROOT}" -mindepth 1 -maxdepth 1 -type d ! -name "${tag}" ! -name jobs ! -name .locks \
     -mtime +7 -exec rm -rf {} + 2> /dev/null

@@ -1,16 +1,8 @@
 #!/bin/bash
 # Delete superseded prebuilt TokenSpeed CI images from GHCR.
 #
-# The tags scripts/ci_tokenspeed_image_tag.sh prints are content-addressed
-# (engine ref + a hash of the image tooling), so every bump strands the
-# previous ~8 GB image under a tag nothing will ever ask for again. Keep the
-# newest few and delete the rest.
-#
-# Keeping more than one is purely about speed. A run that resolved the
-# previous tag before this ran still pulls it instead of falling back to the
-# ~25 minute source build — and even when it can't,
-# ci_fetch_tokenspeed_prebuilt.sh treats a failed pull as a soft fallback, so
-# a deleted tag can never fail a lane.
+# Keep recent nightly date tags for jobs that already resolved a carrier.
+# Missing carriers fall back to installing nightly wheels.
 #
 # Only versions whose tags ALL carry the ci-tokenspeed- prefix are eligible.
 # The package also holds the nightly and release images, and they are not this

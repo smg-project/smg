@@ -113,9 +113,21 @@ ensure_rdma_libs() {
 }
 
 install_tokenspeed() {
-    $RETRY 3 10 python3 -m pip install --upgrade tokenspeed \
+    # Reuse downloaded wheels across ephemeral runner jobs when available.
+    if [ "${TOKENSPEED_BUILD_ONLY:-0}" != "1" ]; then
+        cache="${PIP_CACHE_DIR:-/models/.ci-cache/pip}"
+        if mkdir -p "$cache" 2>/dev/null && [ -w "$cache" ]; then
+            export PIP_CACHE_DIR="$cache"
+        fi
+    fi
+    requirement="tokenspeed"
+    if [ -n "${TOKENSPEED_VERSION:-}" ]; then
+        requirement="tokenspeed==${TOKENSPEED_VERSION}"
+    fi
+    $RETRY 3 10 python3 -m pip install --upgrade "$requirement" \
         --extra-index-url https://lightseek.org/whl/nightly
     python3 - <<'PY'
+import os
 import re
 from importlib import metadata
 
@@ -124,6 +136,9 @@ print(f"Installed tokenspeed=={version}", flush=True)
 nightly = re.fullmatch(r"\d+\.\d+\.\d+\.post(\d{8})", version)
 if nightly is None:
     raise RuntimeError(f"Expected a dated TokenSpeed nightly, installed {version}")
+expected = os.environ.get("TOKENSPEED_VERSION")
+if expected and version != expected:
+    raise RuntimeError(f"Expected tokenspeed=={expected}, installed {version}")
 print(f"TokenSpeed nightly date: {nightly.group(1)}", flush=True)
 PY
     $RETRY 3 10 python3 "${SCRIPT_DIR}/ci_install_flashinfer.py"

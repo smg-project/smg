@@ -12,8 +12,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/ci_fetch_tokenspeed_prebuilt.sh"
-IMAGE="ghcr.io/smg-project/smg:ci-tokenspeed-aaaa-bbbb"
-TAG="ci-tokenspeed-aaaa-bbbb"
+TAG="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+IMAGE="ghcr.io/smg-project/smg@sha256:${TAG}"
 
 assert_eq() {
     local expected="$1" actual="$2" what="${3:-}"
