@@ -31,8 +31,7 @@ HOST_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.ve
 # downstream step (the GITHUB_PATH entry below, pip installs, pytest) uses the
 # baked interpreter + packages transparently. Adoption is conditional on the
 # interpreter matching the pin: a stale image falls through to a fresh venv
-# here, and scripts/ci_install_tokenspeed.sh then rebuilds from source — slow
-# but correct, never silently broken.
+# here, and scripts/ci_install_tokenspeed.sh installs nightly wheels.
 ADOPTED_VENV=""
 if [ -n "${SMG_BAKED_VENV:-}" ] && [ -x "${SMG_BAKED_VENV}/bin/python" ]; then
     BAKED_VERSION="$("${SMG_BAKED_VENV}/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
