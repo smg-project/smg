@@ -35,6 +35,7 @@ tooling_hash="$(cat \
     scripts/ci_apt_mirror.sh \
     scripts/ci_ensure_python_headers.sh \
     scripts/ci_install_tokenspeed.sh \
+    scripts/ci_install_flashinfer.py \
     scripts/ci_retry.sh \
     scripts/ci_setup_python_venv.sh \
     scripts/ci_tokenspeed_image_tag.sh \

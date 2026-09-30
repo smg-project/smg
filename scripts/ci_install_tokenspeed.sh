@@ -115,6 +115,7 @@ ensure_rdma_libs() {
 install_tokenspeed() {
     $RETRY 3 10 python3 -m pip install --upgrade tokenspeed \
         --extra-index-url https://lightseek.org/whl/nightly
+    $RETRY 3 10 python3 "${SCRIPT_DIR}/ci_install_flashinfer.py"
 }
 
 persist_ci_env() {
