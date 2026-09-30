@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{ToolChoice, ToolChoiceValue},
+    common::{ResponseFormat, ToolChoice, ToolChoiceValue},
 };
 use tracing::{debug, error};
 
@@ -313,6 +313,17 @@ pub(crate) async fn prepare_chat_like(
         } else {
             None
         };
+        utils::reject_json_constraint_for_template(
+            &ctx.components.parser_resolver,
+            &request.model,
+            tool_call_constraint
+                .as_ref()
+                .is_some_and(|c| c.is_json_schema()),
+            matches!(
+                request.response_format,
+                Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+            ),
+        )?;
 
         let preserve_reasoning_special_tokens = request.separate_reasoning
             && utils::reasoning_parser_requires_special_tokens(

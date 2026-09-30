@@ -147,6 +147,14 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Enable downcasting to concrete types
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// The `response_template` object of `tokenizer_config.json`, if any.
+    ///
+    /// The value is kept verbatim. Parser selection decides whether it
+    /// describes a supported output format.
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        None
+    }
+
     /// Apply chat template to messages. Default returns an error for tokenizers without template support.
     fn apply_chat_template(
         &self,

@@ -45,15 +45,48 @@ template, and an `adapter::ResponseParserState` holds the parser of one output
 for both of them. They read the fields `transformers serve` reads (`thinking`,
 here also `reasoning_content`, `content` and `tool_calls`): a stream from the
 region chunks and closed tool-call regions after the prompt, a complete output
-from the parsed message. A region that fails to parse (its content does not
-parse, it holds a value JSON cannot, or its calls cannot be read) is not an
-error for them: its text from where it began, and the rest of the output, are
-content, as generated; `take_error` says why, for a log. Nor is a missing
-required field. A complete output is still the parsed message wherever
-`transformers serve` can read that. A stream holds back at most 8 KiB of text
-that could still begin a delimiter, where transformers holds it all and
-searches it again on every chunk; past that, the text goes to the current
-region, and only a delimiter that starts in its last 4 KiB is waited for.
+from the parsed message.
+
+Where smg's use differs from `transformers serve` by design:
+
+- smg does not use a template that holds a float, since it reads the tokenizer
+  config with serde_json.
+- The parsers see the output without the stop or end-of-sequence text the stop
+  decoder removes; `transformers serve` also feeds that text, so whitespace
+  before it, or the marker inside a region it ends, can differ.
+- The prompt tail is cut from the rendered prompt, not from the decoded prompt
+  tokens, which can differ in special tokens the tokenizer adds (such as a
+  BOS token, which matters only when the prompt holds no start anchor), in
+  `clean_up_tokenization_spaces` and in Unicode normalization.
+- Without tools (or with `tool_choice: none`) the tool parser does not run and
+  tool calls are dropped; with `separate_reasoning: false` reasoning is
+  returned as content; prompt regions are not streamed; a continued assistant
+  message returns only the generated part.
+- When the template reads content only after an opener, a forced tool
+  choice (Chat `required`, a named function or `allowed_tools` in required
+  mode, Messages `any` or `tool`) and a JSON `response_format` are refused
+  with a 400: smg would constrain them to JSON from the first token, which
+  opens no region, so the parsers would read none of it. A template whose
+  content has no opener reads that JSON as content.
+- Tool-call arguments are cast to the types the request's tools declare, as
+  `parse_response(..., tools=...)` does; `transformers serve` passes no tools.
+- A tool-call region whose value is a list gives one call per item
+  (`transformers serve` fails there), and arguments are serialized as smg's
+  other tool parsers do. In a stream, the content of a chunk is sent before
+  the tool calls that close in it.
+- A region that fails to parse (its content does not parse, it holds a value
+  JSON cannot, or its calls cannot be read), also of a field the parsers do not
+  read, is content from where it began, as generated, and the rest of the
+  output passes through unparsed, where `transformers serve` fails a complete
+  response and ends a stream. A complete output is still the parsed message
+  wherever `transformers serve` can read that. `take_error` says why, for a
+  log. A missing required field is not an error.
+- A stream holds back at most 8 KiB of text that could still begin a delimiter,
+  where `transformers serve` holds it all and searches it again for every
+  chunk; past that, the text goes to the current region, and only a delimiter
+  that starts in its last 4 KiB is waited for. A longer delimiter, such as a
+  long whitespace run before an opener, can leave part of its text in the
+  region.
 
 ## Regular expressions
 

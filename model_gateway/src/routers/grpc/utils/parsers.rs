@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use axum::response::Response;
 use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
@@ -12,20 +13,25 @@ use openai_protocol::{
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
+use smg_response_template::{adapter, ResponseTemplate};
 use tool_parser::{
     ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
 };
 use tracing::warn;
 
-use crate::worker::WorkerRegistry;
+use super::ResponseTemplateParsers;
+use crate::{routers::error, worker::WorkerRegistry};
 
 /// Per-request parser-name resolution.
 ///
 /// Precedence: the model's `ModelCard` override (`tool_parser` /
 /// `reasoning_parser`, populated from worker labels or an explicit
 /// `WorkerSpec` card) → the process-wide configured name
-/// (`--tool-call-parser` / `--reasoning-parser`) → `None`, which lets the
-/// factory helpers fall back to their name-based auto-detection, unchanged.
+/// (`--tool-call-parser` / `--reasoning-parser`) → the parsers of the
+/// `response_template` in the model's tokenizer, for both sides and only
+/// when neither side has an override or a configured name → `None`, which
+/// lets the factory helpers fall back to their name-based auto-detection,
+/// unchanged.
 ///
 /// Lookups borrow straight from worker metadata (no card clones); only the
 /// resolved name is cloned.
@@ -35,6 +41,8 @@ pub(crate) struct ParserResolver {
     worker_registry: Option<Arc<WorkerRegistry>>,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
+    /// `None` disables response-template lookups.
+    response_templates: Option<Arc<ResponseTemplateParsers>>,
 }
 
 impl ParserResolver {
@@ -42,11 +50,13 @@ impl ParserResolver {
         worker_registry: Arc<WorkerRegistry>,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        response_templates: Option<Arc<ResponseTemplateParsers>>,
     ) -> Self {
         Self {
             worker_registry: Some(worker_registry),
             configured_tool_parser,
             configured_reasoning_parser,
+            response_templates,
         }
     }
 
@@ -57,6 +67,7 @@ impl ParserResolver {
             worker_registry: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            response_templates: None,
         }
     }
 
@@ -64,12 +75,35 @@ impl ParserResolver {
     pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.tool_parser.as_ref())
             .or_else(|| self.configured_tool_parser.clone())
+            .or_else(|| Some(self.template_parsers(model)?.0))
     }
 
     /// Effective reasoning-parser name for `model`, if any.
     pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.reasoning_parser.as_ref())
             .or_else(|| self.configured_reasoning_parser.clone())
+            .or_else(|| Some(self.template_parsers(model)?.0))
+    }
+
+    /// The response template that selects `model`'s parsers, if any.
+    pub(crate) fn response_template(&self, model: &str) -> Option<ResponseTemplate> {
+        Some(self.template_parsers(model)?.1)
+    }
+
+    fn template_parsers(&self, model: &str) -> Option<(String, ResponseTemplate)> {
+        let templates = self.response_templates.as_ref()?;
+        let explicit = self.configured_tool_parser.is_some()
+            || self.configured_reasoning_parser.is_some()
+            || self
+                .card_parser(model, |card| card.tool_parser.as_ref())
+                .is_some()
+            || self
+                .card_parser(model, |card| card.reasoning_parser.as_ref())
+                .is_some();
+        if explicit {
+            return None;
+        }
+        templates.get(model)
     }
 
     fn card_parser(
@@ -321,6 +355,47 @@ pub fn constraint_covers_reasoning(
         && tool_parser_factory
             .registry()
             .has_reasoning_prefix(configured_parser)
+}
+
+/// Refuses a JSON-schema constraint for a model whose parsers come from a
+/// response template that reads content only after an opener.
+///
+/// A forced tool choice falls back to a JSON-schema constraint when the tool
+/// parser has no structural tag, which a template's has not, and a JSON
+/// `response_format` is one too. The engine then writes JSON from the first
+/// token, which opens no region of the template. When the template's content
+/// needs an opener, its parsers read none of that JSON, and the response
+/// would come back with no content and no calls. A template whose content
+/// has no opener reads the JSON as content, as without a template, so its
+/// requests go through.
+pub(crate) fn reject_json_constraint_for_template(
+    resolver: &ParserResolver,
+    model: &str,
+    json_tool_constraint: bool,
+    json_response_format: bool,
+) -> Result<(), Response> {
+    if !(json_tool_constraint || json_response_format) {
+        return Ok(());
+    }
+    let needs_opener = resolver
+        .response_template(model)
+        .is_some_and(|template| adapter::content_needs_opener(&template));
+    if !needs_opener {
+        return Ok(());
+    }
+    let reason = format!(
+        "Model '{model}' parses its output with a response template that reads \
+         content only after an opener, which output constrained to JSON does not write"
+    );
+    Err(if json_tool_constraint {
+        let message = format!(
+            "{reason}, so a forced tool choice is not supported; use automatic tool choice."
+        );
+        error::bad_request("unsupported_tool_choice", message)
+    } else {
+        let message = format!("{reason}, so a JSON response_format is not supported.");
+        error::bad_request("unsupported_response_format", message)
+    })
 }
 
 /// Resolve the user's effective thinking preference.
@@ -883,6 +958,7 @@ mod parser_resolver_tests {
             registry,
             Some("mistral".to_string()),
             Some("deepseek_r1".to_string()),
+            None,
         );
         assert_eq!(resolver.tool_parser("m").as_deref(), Some("json"));
         assert_eq!(resolver.reasoning_parser("m").as_deref(), Some("basic"));
@@ -895,6 +971,7 @@ mod parser_resolver_tests {
             registry,
             Some("mistral".to_string()),
             Some("deepseek_r1".to_string()),
+            None,
         );
         assert_eq!(resolver.tool_parser("m").as_deref(), Some("mistral"));
         assert_eq!(
@@ -908,7 +985,7 @@ mod parser_resolver_tests {
     #[test]
     fn no_override_and_no_configured_resolves_none() {
         let registry = registry_with_card(ModelCard::new("m"));
-        let resolver = ParserResolver::new(registry, None, None);
+        let resolver = ParserResolver::new(registry, None, None, None);
         assert_eq!(resolver.tool_parser("m"), None);
         assert_eq!(resolver.reasoning_parser("m"), None);
     }
@@ -934,7 +1011,7 @@ mod parser_resolver_tests {
                     .build();
                 registry.register(Arc::new(worker));
             }
-            let resolver = ParserResolver::new(registry, None, None);
+            let resolver = ParserResolver::new(registry, None, None, None);
             assert_eq!(resolver.tool_parser("m").as_deref(), Some("alpha"));
         }
     }

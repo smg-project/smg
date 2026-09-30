@@ -62,6 +62,18 @@ pub fn check(template: &ResponseTemplate) -> Result<(), Unsuitable> {
     Ok(())
 }
 
+/// Whether `template` reads content only inside a region it opens: output
+/// that opens no region, such as output constrained to JSON from its first
+/// token, is then not content. False when `content` is the field without an
+/// opener.
+pub fn content_needs_opener(template: &ResponseTemplate) -> bool {
+    let spec = &template.0;
+    !spec
+        .implicit
+        .and_then(|i| spec.fields.get(i))
+        .is_some_and(|field| field.name == CONTENT)
+}
+
 /// A call read from a `tool_calls` value: its `function`'s `name` and
 /// `arguments`, as `transformers serve` reads them.
 #[derive(Debug, Clone, PartialEq)]
