@@ -7536,6 +7536,7 @@ dependencies = [
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
+ "smg-response-template",
  "smg-rl",
  "smg-wasm",
  "str0m",

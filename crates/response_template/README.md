@@ -47,6 +47,29 @@ here also `reasoning_content`, `content` and `tool_calls`): a stream from the
 region chunks and closed tool-call regions after the prompt, a complete output
 from the parsed message.
 
+Where smg's use differs from `transformers serve` by design:
+
+- smg does not use a template that holds a float, since it reads the tokenizer
+  config with serde_json.
+- The parsers see the output without the stop or end-of-sequence text the stop
+  decoder removes; `transformers serve` also feeds that text, so whitespace
+  before it, or the marker inside a region it ends, can differ.
+- The prompt tail is cut from the rendered prompt, not from the decoded prompt
+  tokens, which can differ in special tokens the tokenizer adds (such as a
+  BOS token, which matters only when the prompt holds no start anchor), in
+  `clean_up_tokenization_spaces` and in Unicode normalization.
+- Without tools (or with `tool_choice: none`) the tool parser does not run and
+  tool calls are dropped; with `separate_reasoning: false` reasoning is
+  returned as content; prompt regions are not streamed; a continued assistant
+  message returns only the generated part.
+- A tool-call region whose value is a list gives one call per item
+  (`transformers serve` fails there), and arguments are serialized as smg's
+  other tool parsers do. In a stream, the content of a chunk is sent before
+  the tool calls that close in it.
+- After an error the rest of the output passes through unparsed, also when
+  the error comes from a field the parsers do not read (such as a value JSON
+  cannot hold).
+
 ## Regular expressions
 
 transformers compiles patterns with the `regex` module, and streaming depends on
