@@ -549,6 +549,35 @@ async fn test_minimax_empty_parameters() {
 }
 
 #[tokio::test]
+async fn test_minimax_streaming_empty_parameters() {
+    // A streamed call without parameters ends with `{}`, as parse_complete returns.
+    let tools = create_test_tools();
+    for chunks in [
+        vec!["<minimax:tool_call>\n<invoke name=\"get_weather\">\n</invoke>\n</minimax:tool_call>"],
+        vec![
+            "<minimax:tool_call>",
+            "\n<invoke name=\"get_weather\">",
+            "\n</invoke>",
+            "\n</minimax:tool_call>",
+        ],
+    ] {
+        let mut parser = MinimaxM2Parser::new();
+        let mut name = None;
+        let mut arguments = String::new();
+        for chunk in chunks {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            for call in result.calls {
+                assert_eq!(call.tool_index, 0);
+                name = call.name.or(name);
+                arguments.push_str(&call.parameters);
+            }
+        }
+        assert_eq!(name.as_deref(), Some("get_weather"));
+        assert_eq!(arguments, "{}");
+    }
+}
+
+#[tokio::test]
 async fn test_minimax_multiline_parameter_values() {
     let parser = MinimaxM2Parser::new();
 
