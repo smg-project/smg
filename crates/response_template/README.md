@@ -39,6 +39,14 @@ built-ins the parser applies to model output (`str.strip`, `int`, `float`,
 committed again, so a stream costs time quadratic in how much text stays
 uncommitted.
 
+The `adapter` feature adds the glue smg's reasoning and tool parsers use,
+which is not part of transformers: `adapter::check` says whether they can use a
+template, and an `adapter::ResponseParserState` holds the parser of one output
+for both of them. They read the fields `transformers serve` reads (`thinking`,
+here also `reasoning_content`, `content` and `tool_calls`): a stream from the
+region chunks and closed tool-call regions after the prompt, a complete output
+from the parsed message.
+
 ## Regular expressions
 
 transformers compiles patterns with the `regex` module, and streaming depends on
@@ -129,7 +137,7 @@ and are next regenerated when transformers 5.18 is released. To regenerate:
 pip install transformers==5.17.0 regex==2026.9.10
 git clone --depth 1 --branch v5.17.0 https://github.com/huggingface/transformers /tmp/transformers
 python crates/response_template/scripts/generate_hf_fixtures.py --transformers-src /tmp/transformers
-cargo test -p smg-response-template
+cargo test -p smg-response-template --features adapter
 ```
 
 `--check` fails when the committed fixtures are stale.

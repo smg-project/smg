@@ -165,6 +165,16 @@ impl ResponseParser {
         prefix: &str,
         tools: &[Value],
     ) -> Result<Self, ParseError> {
+        Self::from_truncated(template, template.truncate_past_last_anchor(prefix), tools)
+    }
+
+    /// [`new`](Self::new) with the prefix already truncated past its last
+    /// start anchor; truncating it again could cut more.
+    pub(crate) fn from_truncated(
+        template: &ResponseTemplate,
+        truncated: &str,
+        tools: &[Value],
+    ) -> Result<Self, ParseError> {
         let mut tool_params = HashMap::new();
         for tool in tools {
             let function = match tool {
@@ -193,9 +203,9 @@ impl ResponseParser {
             opened: false,
             initial_events: Vec::new(),
         };
-        if !prefix.is_empty() {
+        if !truncated.is_empty() {
             let mut events = Vec::new();
-            parser.consume_prefix(prefix, &mut events)?;
+            parser.consume_prefix(truncated, &mut events)?;
             parser.initial_events = events;
         }
         Ok(parser)
@@ -206,12 +216,19 @@ impl ResponseParser {
         &self.initial_events
     }
 
-    /// transformers: `_consume_prefix`.
-    fn consume_prefix(&mut self, prefix: &str, events: &mut Vec<Event>) -> Result<(), ParseError> {
-        let truncated = self.spec.truncate_past_last_anchor(prefix);
-        if truncated.is_empty() {
-            return Ok(());
-        }
+    /// The field of the current region: the open explicit region, else the
+    /// implicit field.
+    #[cfg(feature = "adapter")]
+    pub(crate) fn current_field(&self) -> Option<&str> {
+        self.current.map(|i| self.spec.0.fields[i].name.as_str())
+    }
+
+    /// transformers: `_consume_prefix`, from the truncation on.
+    fn consume_prefix(
+        &mut self,
+        truncated: &str,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ParseError> {
         truncated.clone_into(&mut self.buffer);
         let mut taint = None;
         self.process(events, false, &mut taint)?;

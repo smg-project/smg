@@ -18,5 +18,13 @@ thiserror.workspace = true
 [dev-dependencies]
 sha2 = "0.11"
 
+[features]
+# Glue for smg's reasoning and tool parsers (`adapter` module).
+adapter = []
+
+[[test]]
+name = "adapter"
+required-features = ["adapter"]
+
 [lints]
 workspace = true
