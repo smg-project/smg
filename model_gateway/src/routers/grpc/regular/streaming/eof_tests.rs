@@ -616,7 +616,8 @@ impl ReasoningParser for ReasoningButText {
     fn mark_think_start_stripped(&mut self) {}
 }
 
-/// Reports one whole call on its first chunk, before the chunk's text.
+/// Returns the chunk as normal text and reports one whole `lookup` call on
+/// its first parse.
 #[derive(Default)]
 struct CallFirst {
     called: bool,
@@ -782,8 +783,10 @@ async fn messages_blocks_do_not_overlap_when_reasoning_calls_and_text_alternate(
             "stop 3",
         ]
     );
-    // Text the reasoning parser returns while it stays in reasoning, as when
-    // one chunk ends reasoning, adds text and starts reasoning again.
+    // Text the reasoning parser returns while it stays in reasoning. Such text
+    // skips the tool parser and follows the chunk's reasoning, so a chunk like
+    // `</think>answer<think>more` still comes out in the wrong order; only the
+    // block boundaries are checked here.
     assert_eq!(
         messages_blocks(stub_processor(true), None, &["a", "text", "b"]).await,
         [
@@ -795,18 +798,16 @@ async fn messages_blocks_do_not_overlap_when_reasoning_calls_and_text_alternate(
             "stop 2",
         ]
     );
-    // A specific tool right after reasoning.
-    let tool = messages::ToolChoice::Tool {
-        name: "lookup".to_string(),
-        disable_parallel_tool_use: None,
-    };
+    // Reasoning right after a call.
     assert_eq!(
-        messages_blocks(stub_processor(false), Some(tool), &["a"]).await,
+        messages_blocks(stub_processor(false), None, &["a", "b"]).await,
         [
             "start 0 \"thinking\"",
             "stop 0",
             "start 1 \"tool_use\"",
             "stop 1",
+            "start 2 \"thinking\"",
+            "stop 2",
         ]
     );
 }
@@ -872,6 +873,24 @@ async fn messages_blocks_do_not_overlap_with_deepseek_parsers() {
             "stop 2",
             "start 3 \"text\"",
             "stop 3",
+        ]
+    );
+    // Reasoning again while the tool parser holds text that it releases at
+    // the end of the stream.
+    assert_eq!(
+        messages_blocks(
+            named_processor("json", "deepseek_v41"),
+            None,
+            &["<think>plan", "</think>", "{", "<think>", "more"],
+        )
+        .await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"thinking\"",
+            "stop 1",
+            "start 2 \"text\"",
+            "stop 2",
         ]
     );
 }
