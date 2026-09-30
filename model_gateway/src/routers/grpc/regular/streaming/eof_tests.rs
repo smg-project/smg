@@ -172,6 +172,7 @@ fn processor(with_tools: bool) -> StreamingProcessor {
             Arc::new(WorkerRegistry::new()),
             with_tools.then(|| "json".to_string()),
             Some("qwen3".to_string()),
+            None,
         ),
         "vllm",
     )
@@ -419,6 +420,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
             stop_sequences: None,
+            response_parser: None,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -476,6 +478,7 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
         utils::ParserResolver::new(
             Arc::new(WorkerRegistry::new()),
             Some("qwen_xml".to_string()),
+            None,
             None,
         )
     };
@@ -728,6 +731,7 @@ async fn chat_eof_starts_a_call_a_parser_reports_at_the_end() {
         Arc::new(WorkerRegistry::new()),
         Some("call-at-end".to_string()),
         None,
+        None,
     );
     let processor = StreamingProcessor::new(tools, ReasoningParserFactory::new(), resolver, "vllm");
     let mut spec = chat_spec(true);
@@ -851,6 +855,7 @@ fn stub_processor(in_reasoning: bool) -> StreamingProcessor {
         Arc::new(WorkerRegistry::new()),
         Some("call-first".to_string()),
         Some("reasoning-but-text".to_string()),
+        None,
     );
     StreamingProcessor::new(tools, reasoning, resolver, "vllm")
 }
@@ -886,6 +891,7 @@ async fn messages_blocks_and_inputs(
         history_tool_calls_count: 0,
         chat_tools: chat_spec(true).tools.unwrap(),
         stop_sequences: None,
+        response_parser: None,
     };
     let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
     frames.push(complete(0, "stop"));
@@ -1004,6 +1010,7 @@ fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
             Arc::new(WorkerRegistry::new()),
             Some(tool.to_string()),
             Some(reasoning.to_string()),
+            None,
         ),
         "vllm",
     )

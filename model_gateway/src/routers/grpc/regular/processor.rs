@@ -18,6 +18,7 @@ use openai_protocol::{
     messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use smg_response_template::adapter::ResponseParserState;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
@@ -106,6 +107,10 @@ impl ResponseProcessor {
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
+        let state = original_request
+            .response_parser
+            .as_ref()
+            .map(utils::ResponseParserSpec::new_state);
 
         if original_request.separate_reasoning && reasoning_parser_available {
             // Fresh parser per request: non-streaming extraction keeps no state
@@ -115,6 +120,9 @@ impl ResponseProcessor {
                 reasoning_parser_name,
                 model,
             ) {
+                if let Some(state) = &state {
+                    parser.attach_response_parser_state(state.clone());
+                }
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
                 if original_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
@@ -174,6 +182,7 @@ impl ResponseProcessor {
                         tool_parser_name,
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
+                        state,
                     )
                     .await;
             }
@@ -334,15 +343,27 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
+        // A response-parser state is per request: it needs a fresh parser.
+        state: Option<ResponseParserState>,
     ) -> (Option<Vec<ToolCall>>, String) {
-        // Get pooled parser for this model
-        let pooled_parser =
-            utils::get_tool_parser(&self.tool_parser_factory, tool_parser_name, model);
+        let fresh = state.and_then(|state| {
+            let mut parser =
+                utils::create_tool_parser(&self.tool_parser_factory, tool_parser_name, model)?;
+            parser.attach_response_parser_state(state);
+            Some(parser)
+        });
 
         // Try parsing directly (parser will handle detection internally). Pass the
         // tool schemas so schema-aware parsers coerce argument types by their
         // declared type instead of guessing from the raw text.
-        let result = {
+        let result = if let Some(parser) = fresh {
+            parser
+                .parse_complete_with_tools(processed_text, tools)
+                .await
+        } else {
+            // Get pooled parser for this model
+            let pooled_parser =
+                utils::get_tool_parser(&self.tool_parser_factory, tool_parser_name, model);
             let parser = pooled_parser.lock().await;
             parser
                 .parse_complete_with_tools(processed_text, tools)
@@ -617,6 +638,10 @@ impl ResponseProcessor {
         // Step 1: Parse reasoning content
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
+        let state = messages_request
+            .response_parser
+            .as_ref()
+            .map(utils::ResponseParserSpec::new_state);
 
         if reasoning_parser_available {
             // Fresh parser per request: non-streaming extraction keeps no state
@@ -626,6 +651,9 @@ impl ResponseProcessor {
                 reasoning_parser_name.as_deref(),
                 model,
             ) {
+                if let Some(state) = &state {
+                    parser.attach_response_parser_state(state.clone());
+                }
                 // If thinking is effectively ON and template has a toggle, start in reasoning mode.
                 {
                     let user_thinking = match &messages_request.thinking {
@@ -691,6 +719,7 @@ impl ResponseProcessor {
                         tool_parser_name.as_deref(),
                         &messages_request.chat_tools,
                         messages_request.history_tool_calls_count,
+                        state,
                     )
                     .await;
             }
