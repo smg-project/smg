@@ -1139,11 +1139,11 @@ fn test_validate_tool_continuation_keeps_other_constraints() {
         "input": [{"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}]
     }))
     .unwrap();
-    assert!(request
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("mutually exclusive"));
+    let errors = request.validate().unwrap_err();
+    let field_errors = errors.field_errors();
+    assert!(field_errors.get("__all__").is_some_and(|errors| errors
+        .iter()
+        .any(|error| error.code == "mutually_exclusive_parameters")));
 
     for item in [
         json!({"type": "function_call_output", "output": "sunny"}),
