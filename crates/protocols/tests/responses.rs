@@ -11,6 +11,74 @@ use serde_json::json;
 use validator::Validate;
 
 #[test]
+fn function_result_only_continuation_validates_with_stored_response() {
+    for stream in [false, true] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "previous_response_id": "resp_previous",
+            "stream": stream,
+            "input": [{
+                "type": "function_call_output", "call_id": "call_weather",
+                "output": "{\"temperature_f\":72}"
+            }]
+        }))
+        .unwrap();
+        request.validate().unwrap();
+    }
+}
+
+#[test]
+fn function_result_only_continuation_validates_with_conversation() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model", "conversation": "conv_weather",
+        "input": [{"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}]
+    }))
+    .unwrap();
+    request.validate().unwrap();
+}
+
+#[test]
+fn stateless_function_history_validates_without_new_user_message() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model", "store": false,
+        "input": [
+            {"role": "user", "content": "What is the weather?"},
+            {"type": "reasoning", "id": "rs_weather", "summary": []},
+            {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+        ]
+    }))
+    .unwrap();
+    request.validate().unwrap();
+}
+
+#[test]
+fn tool_continuation_keeps_other_input_and_cross_field_validation() {
+    for input in [
+        json!(""),
+        json!([]),
+        json!([{"role": "user", "content": ""}]),
+    ] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model", "previous_response_id": "resp_previous", "input": input
+        }))
+        .unwrap();
+        assert!(request.validate().is_err());
+    }
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model", "previous_response_id": "resp_previous", "conversation": "conv_weather",
+        "input": [{"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}]
+    }))
+    .unwrap();
+    assert!(request.validate().is_err());
+    assert!(serde_json::from_value::<ResponsesRequest>(json!({
+        "model": "test-model", "previous_response_id": "resp_previous",
+        "input": [{"type": "function_call_output", "output": "sunny"}]
+    }))
+    .is_err());
+}
+
+#[test]
 fn stateless_function_replay_preserves_namespace_and_content_part_output() {
     let call = json!({
         "type":"function_call", "call_id":"call_test", "name":"lookup",
