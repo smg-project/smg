@@ -2495,10 +2495,8 @@ fn test_custom_tool_call_output_parts_reject_output_text() {
 fn test_custom_tool_call_output_validation_rejects_empty_text_and_parts() {
     use validator::Validate;
 
-    // cross-parameter validation (L2145-2160) requires a Message/SimpleInputMessage
-    // alongside any tool item, so every payload below pairs the custom_tool_call_output
-    // with a plain user message to isolate the CustomToolCallOutput branch we want
-    // to cover.
+    // Pair the tool output with a message to exercise content validation
+    // within a mixed-item request.
     let user_msg = json!({"role": "user", "content": "hi"});
 
     // Empty string output — validate_input_item's
@@ -3791,10 +3789,8 @@ fn test_apply_patch_request_validate_accepts_relaxed_shapes() {
     // locks those relaxed branches in so they cannot regress back to a
     // stricter non-empty check.
     //
-    // The cross-parameter validator (see `validate_response_request`)
-    // requires at least one Message/SimpleInputMessage alongside any tool
-    // item, so every fixture below pairs the apply_patch item with a plain
-    // user message to isolate the apply_patch branch under test.
+    // Pair each apply_patch item with a message to exercise these relaxed
+    // shapes within a mixed-item request.
     use validator::Validate;
 
     let user_msg = json!({"role": "user", "content": "hi"});

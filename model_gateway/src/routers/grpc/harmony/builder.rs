@@ -1251,6 +1251,52 @@ mod tests {
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
 
     #[test]
+    fn function_call_output_rejects_unmatched_resolved_history() {
+        for input in [
+            json!([{"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}]),
+            json!([
+                {"role": "user", "content": "What is the weather?"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]),
+            json!([
+                {"type": "function_call", "call_id": "call_other", "name": "weather", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]),
+        ] {
+            let request: ResponsesRequest = serde_json::from_value(json!({
+                "model": "test-model", "input": input
+            }))
+            .unwrap();
+            let error = HarmonyBuilder::new()
+                .construct_input_messages_with_harmony(&request)
+                .expect_err("An unmatched tool result must fail after history resolution");
+            assert_eq!(error, "No function call found for call_id: call_weather");
+        }
+    }
+
+    #[test]
+    fn function_call_output_uses_matching_resolved_history() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "What is the weather?"},
+                {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_other", "name": "other", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]
+        }))
+        .unwrap();
+        let messages = HarmonyBuilder::new()
+            .construct_input_messages_with_harmony(&request)
+            .expect("A matching tool result should convert successfully");
+        let tool = messages.last().unwrap();
+        assert_eq!(tool.author.role, Role::Tool);
+        assert_eq!(tool.author.name.as_deref(), Some("functions.weather"));
+        assert_eq!(tool.recipient.as_deref(), Some("assistant"));
+        assert!(matches!(&tool.content[..], [Content::Text(text)] if text.text == "sunny"));
+    }
+
+    #[test]
     fn build_from_chat_rejects_unknown_content_parts_before_loading_encoding() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
             "model": "gpt-oss-120b",
