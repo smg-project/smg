@@ -32,6 +32,12 @@ use crate::worker::WorkerRegistry;
 /// lets the factory helpers fall back to their name-based auto-detection,
 /// unchanged.
 ///
+/// A configured `--reasoning-parser passthrough` does not turn the template
+/// off: launchers pass it for every model they start, to parse no reasoning
+/// rather than guess a parser from the model name, so it applies where no
+/// template is used, in place of that guess. `--disable-response-template`
+/// turns the templates off.
+///
 /// Lookups borrow straight from worker metadata (no card clones); only the
 /// resolved name is cloned.
 #[derive(Clone)]
@@ -40,6 +46,8 @@ pub(crate) struct ParserResolver {
     worker_registry: Option<Arc<WorkerRegistry>>,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
+    /// A configured `passthrough`, which comes after the template.
+    passthrough_reasoning_parser: Option<String>,
     /// `None` disables response-template lookups.
     response_templates: Option<Arc<ResponseTemplateParsers>>,
 }
@@ -51,10 +59,16 @@ impl ParserResolver {
         configured_reasoning_parser: Option<String>,
         response_templates: Option<Arc<ResponseTemplateParsers>>,
     ) -> Self {
+        let (configured_reasoning_parser, passthrough_reasoning_parser) =
+            match configured_reasoning_parser {
+                Some(name) if name == "passthrough" => (None, Some(name)),
+                name => (name, None),
+            };
         Self {
             worker_registry: Some(worker_registry),
             configured_tool_parser,
             configured_reasoning_parser,
+            passthrough_reasoning_parser,
             response_templates,
         }
     }
@@ -66,6 +80,7 @@ impl ParserResolver {
             worker_registry: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            passthrough_reasoning_parser: None,
             response_templates: None,
         }
     }
@@ -82,6 +97,7 @@ impl ParserResolver {
         self.card_parser(model, |card| card.reasoning_parser.as_ref())
             .or_else(|| self.configured_reasoning_parser.clone())
             .or_else(|| Some(self.template_parsers(model)?.0))
+            .or_else(|| self.passthrough_reasoning_parser.clone())
     }
 
     /// The response template that selects `model`'s parsers, if any.

@@ -17,7 +17,7 @@ use smg_response_template::{
     load_response_template, ResponseTemplate,
 };
 use tool_parser::{ParserFactory as ToolParserFactory, TemplateToolParser};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::chat_utils::offload;
 
@@ -65,7 +65,12 @@ impl ResponseTemplateParsers {
                 load_response_template(raw).map_err(|error| error.to_string())
             }
             .and_then(|t| adapter::check(&t).map(|()| t).map_err(|e| e.to_string()))
-            .inspect_err(|reason| warn!(model, reason, "not using the response_template"))
+            .inspect_err(|reason| {
+                warn!(
+                    model,
+                    reason, "not using the response_template; parsers are chosen as without one"
+                );
+            })
             .ok()?;
             let mut hasher = DefaultHasher::new();
             raw.to_string().hash(&mut hasher);
@@ -80,6 +85,7 @@ impl ResponseTemplateParsers {
                 let parser = move || Box::new(TemplateToolParser::new(t.clone())) as _;
                 self.tools.registry().register_parser(&name, parser);
             }
+            info!(model, parser = name, "parsing with the response_template");
             Some((name, template))
         });
         let cached = (current, entry.clone());
@@ -291,6 +297,59 @@ mod tests {
         // So does a configured name.
         let resolver = ParserResolver::new(workers, None, Some("qwen3".into()), Some(parsers));
         assert_eq!(resolver.reasoning_parser("m").as_deref(), Some("qwen3"));
+        assert_eq!(resolver.tool_parser("m"), None);
+        assert!(resolver.response_template("m").is_none());
+    }
+
+    /// A configured `passthrough` reasoning parser applies where no template
+    /// is used: without one, for a refused one, beside an explicit choice,
+    /// and with the templates turned off.
+    #[tokio::test]
+    async fn a_passthrough_reasoning_parser_gives_way_to_the_template() {
+        let registry = Arc::new(TokenizerRegistry::new());
+        load(&registry, "m", Some(template("</think>"))).await;
+        load(&registry, "carded", Some(template("</think>"))).await;
+        load(&registry, "plain", None).await;
+        let mut with_float = template("</think>");
+        with_float["fields"]["content"]["content_args"] = json!({"strip": 0.5});
+        load(&registry, "refused", Some(with_float)).await;
+        let parsers = Arc::new(parsers(&registry));
+        let name = parsers.get("m").map(|(name, _)| name);
+
+        let workers = Arc::new(WorkerRegistry::new());
+        let card = ModelCard::new("carded").with_tool_parser("json");
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .model(card)
+            .worker_type(WorkerType::Regular)
+            .build();
+        workers.register(Arc::new(worker));
+        let passthrough = Some("passthrough".to_owned());
+        let with = |tool: Option<&str>, templates| {
+            let tool = tool.map(str::to_owned);
+            ParserResolver::new(workers.clone(), tool, passthrough.clone(), templates)
+        };
+
+        let resolver = with(None, Some(parsers.clone()));
+        assert_eq!(resolver.reasoning_parser("m"), name);
+        assert_eq!(resolver.tool_parser("m"), name);
+        assert!(resolver.response_template("m").is_some());
+        for model in ["plain", "refused"] {
+            assert_eq!(resolver.reasoning_parser(model), passthrough);
+            assert_eq!(resolver.tool_parser(model), None);
+            assert!(resolver.response_template(model).is_none());
+        }
+        assert_eq!(resolver.reasoning_parser("carded"), passthrough);
+        assert_eq!(resolver.tool_parser("carded").as_deref(), Some("json"));
+
+        // A configured tool parser still turns the template off.
+        let resolver = with(Some("json"), Some(parsers));
+        assert_eq!(resolver.reasoning_parser("m"), passthrough);
+        assert_eq!(resolver.tool_parser("m").as_deref(), Some("json"));
+        assert!(resolver.response_template("m").is_none());
+
+        // So does `--disable-response-template`, which leaves no templates.
+        let resolver = with(None, None);
+        assert_eq!(resolver.reasoning_parser("m"), passthrough);
         assert_eq!(resolver.tool_parser("m"), None);
         assert!(resolver.response_template("m").is_none());
     }

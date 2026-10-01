@@ -1016,6 +1016,12 @@ struct CliArgs {
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 
+    /// Do not choose parsers from the response_template in a model's
+    /// tokenizer_config.json (used when no parser other than
+    /// `--reasoning-parser passthrough` is configured)
+    #[arg(long, default_value_t = false, help_heading = "Parsers")]
+    disable_response_template: bool,
+
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
     mcp_config_path: Option<String>,
@@ -2022,6 +2028,7 @@ impl CliArgs {
             .maybe_redis(redis)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .disable_response_template(self.disable_response_template)
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
             .pd_pairing_mode(PdPairingMode::parse(&self.pd_pairing_mode).unwrap_or_default())

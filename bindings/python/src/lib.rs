@@ -544,6 +544,7 @@ struct Router {
     prefill_max_inflight_requests_per_worker: i32,
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
+    disable_response_template: bool,
 }
 
 impl Router {
@@ -944,6 +945,7 @@ impl Router {
             .maybe_redis(redis_config)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .disable_response_template(self.disable_response_template)
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
@@ -1160,6 +1162,7 @@ impl Router {
         prefill_max_inflight_requests_per_worker = -1,
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
+        disable_response_template = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1329,6 +1332,7 @@ impl Router {
         prefill_max_inflight_requests_per_worker: i32,
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
+        disable_response_template: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1510,6 +1514,7 @@ impl Router {
             prefill_max_inflight_requests_per_worker,
             prefill_queue_size,
             prefill_queue_timeout_secs,
+            disable_response_template,
         })
     }
 
