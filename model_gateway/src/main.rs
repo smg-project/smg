@@ -434,11 +434,10 @@ struct CliArgs {
     dp_aware: bool,
 
     /// Sticky sessions: route every request of a conversation to the same
-    /// worker, on any policy. The key is derived from the request body's rid
-    /// with per-turn/per-retry suffixes stripped (conv_t2_r1 -> conv),
-    /// falling back to the routing-key headers when no rid is present.
-    /// Enabling this keeps automatic body forwarding buffered so body rid
-    /// precedence is preserved.
+    /// worker, on any policy. Valid routing-key headers take priority over
+    /// a key derived from the request body's rid, with per-turn/per-retry
+    /// suffixes stripped (conv_t2_r1 -> conv). Enabling this keeps automatic
+    /// body forwarding buffered so the body rid remains available as fallback.
     /// Reuses the manual eviction/idle/assignment knobs for the sticky map
     #[arg(
         long,

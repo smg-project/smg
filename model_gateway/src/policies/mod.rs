@@ -304,8 +304,8 @@ pub struct SelectWorkerInfo<'a> {
     /// engine cannot serve from the same cache never match each other.
     pub cache_namespace: Option<CacheNamespace>,
     /// Session key derived from the request body's `rid` (routers with typed
-    /// body access populate it); consumed by the routing-key override when
-    /// its key source includes rid.
+    /// body access populate it); used when no valid routing-key header is
+    /// present under the routing-key override.
     pub rid_key: Option<&'a str>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds

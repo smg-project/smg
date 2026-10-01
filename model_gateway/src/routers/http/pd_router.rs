@@ -528,11 +528,7 @@ impl PDRouter {
                 view.cache_namespace,
             )
         });
-        // Keyed-load accounting uses the same effective key as selection:
-        // rid-derived first, header fallback.
-        let sticky_key = rid_key
-            .as_deref()
-            .or_else(|| self.policy_registry.sticky_header_key(headers));
+        let sticky_key = self.policy_registry.sticky_key(headers, rid_key.as_deref());
         let selected = self
             .select_pd_pair_with_admission(
                 context.model_id,

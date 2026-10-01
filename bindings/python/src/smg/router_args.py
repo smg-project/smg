@@ -801,8 +801,8 @@ class RouterArgs:
             action="store_true",
             help=(
                 "Sticky sessions: route every request of a conversation to the"
-                " same worker, on any policy (keys derived from the request-id"
-                " lineage, falling back to the routing-key headers)"
+                " same worker, on any policy (valid routing-key headers take"
+                " priority, falling back to the request-id lineage)"
             ),
         )
         routing_group.add_argument(

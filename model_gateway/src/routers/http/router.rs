@@ -547,13 +547,10 @@ impl Router {
             return shed;
         }
 
-        // Keyed-load accounting uses the same effective key as selection:
-        // rid-derived first, header fallback.
         let load_guard = lease.with_view(|view| {
             WorkerLoadGuard::with_key(
                 worker.clone(),
-                view.rid_key
-                    .or_else(|| self.policy_registry.sticky_header_key(headers)),
+                self.policy_registry.sticky_key(headers, view.rid_key),
             )
         });
 

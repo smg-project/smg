@@ -134,11 +134,10 @@ impl PipelineStage for WorkerSelectionStage {
             .policy_registry
             .derive_rid_key(ctx.input.request_type.rid())
             .map(str::to_string);
-        ctx.state.sticky_key = rid_key.clone().or_else(|| {
-            self.policy_registry
-                .sticky_header_key(headers)
-                .map(str::to_string)
-        });
+        ctx.state.sticky_key = self
+            .policy_registry
+            .sticky_key(headers, rid_key.as_deref())
+            .map(str::to_string);
 
         // Selection inputs that survive the request drop: retry attempts
         // re-select from these. Text is copied only when a configured policy
@@ -1581,11 +1580,9 @@ mod tests {
         assert!(decode_urls.contains(&decode.url().to_string()));
     }
 
-    /// gRPC selection pins by the rid-derived key under the override: repeats
-    /// of one conversation land on one worker even as a poisoned per-request
-    /// header key rotates; the header only keys requests without a rid.
+    /// gRPC selection honors the conversation header across fresh request IDs.
     #[test]
-    fn grpc_selection_pins_by_rid_key_under_override() {
+    fn grpc_selection_pins_by_header_key_under_override() {
         use crate::config::types::{ManualAssignmentMode, RoutingKeyOverrideConfig};
 
         let model_id = "test-model-rid-sticky";
@@ -1620,39 +1617,34 @@ mod tests {
         let rid_key = policy_registry.derive_rid_key(Some("conv7_t1"));
         assert_eq!(rid_key, Some("conv7"));
 
-        let mut poison = HeaderMap::new();
-        poison.insert("x-smg-routing-key", "req-unique-1".parse().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "conversation-42".parse().unwrap());
         let first = stage
             .select_single_worker(
                 model_id,
                 None,
                 None,
-                Some(&poison),
+                Some(&headers),
                 rid_key,
                 None,
                 None,
                 false,
             )
             .unwrap();
-        for (i, rid) in ["conv7_t2", "conv7_t2_r1", "conv7_t3"].iter().enumerate() {
-            let mut rotated = HeaderMap::new();
-            rotated.insert(
-                "x-smg-routing-key",
-                format!("req-unique-{}", i + 2).parse().unwrap(),
-            );
+        for rid in ["request-2", "request-3", "request-4"] {
             let again = stage
                 .select_single_worker(
                     model_id,
                     None,
                     None,
-                    Some(&rotated),
+                    Some(&headers),
                     policy_registry.derive_rid_key(Some(rid)),
                     None,
                     None,
                     false,
                 )
                 .unwrap();
-            assert_eq!(again.url(), first.url(), "follow-up must pin by rid key");
+            assert_eq!(again.url(), first.url(), "follow-up must pin by header key");
         }
     }
 

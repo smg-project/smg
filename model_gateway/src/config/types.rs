@@ -40,7 +40,7 @@ pub struct RouterConfig {
     /// boundary. Ascending; empty disables boundary-based keying.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache_boundaries: Vec<usize>,
-    /// Per-request sticky-session routing (rid-lineage keys, header fallback).
+    /// Per-request sticky-session routing (header keys, rid-lineage fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
     /// How strictly PD placement pairs a prefill with a decode on their KV
@@ -640,12 +640,11 @@ impl PdPairingMode {
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
 /// config-file users with only `enabled: true` still get TTL eviction (no leak).
 ///
-/// Key priority is fixed: a key derived from the typed body's `rid` (per-turn
-/// `_t<n>` and per-retry `_r<n>` suffixes stripped, so every turn of a
-/// conversation shares one key) wins over the routing-key headers; the first
-/// configured header carrying a valid value is the fallback when no rid is
-/// present. An enabled override keeps automatic body forwarding buffered so
-/// body `rid` precedence is preserved.
+/// Key priority is fixed: the first configured routing-key header carrying a
+/// valid value wins. A key derived from the typed body's `rid` is the fallback
+/// (per-turn `_t<n>` and per-retry `_r<n>` suffixes stripped). An enabled
+/// override keeps automatic body forwarding buffered so the body `rid`
+/// remains available when no valid header key is present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.
