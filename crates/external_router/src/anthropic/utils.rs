@@ -3,7 +3,7 @@
 //! This module contains common helper functions used across different
 //! Anthropic API handlers (messages, models, etc.)
 
-use futures::StreamExt;
+use smg_http_utils::read_body_capped;
 // ============================================================================
 // Header Propagation
 // ============================================================================
@@ -41,29 +41,60 @@ pub async fn read_response_body_limited(
     response: reqwest::Response,
     max_size: usize,
 ) -> ReadBodyResult {
-    let mut stream = response.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut total_size: usize = 0;
+    match read_body_capped(response.bytes_stream(), max_size).await {
+        Ok((_, true)) => ReadBodyResult::TooLarge,
+        Ok((body, false)) => match String::from_utf8(body.to_vec()) {
+            Ok(body) => ReadBodyResult::Ok(body),
+            Err(e) => ReadBodyResult::Error(format!("invalid UTF-8 in response body: {e}")),
+        },
+        Err(e) => ReadBodyResult::Error(e.to_string()),
+    }
+}
 
-    while let Some(chunk_result) = stream.next().await {
-        match chunk_result {
-            Ok(chunk) => {
-                total_size += chunk.len();
-                if total_size > max_size {
-                    return ReadBodyResult::TooLarge;
-                }
-                buf.extend_from_slice(&chunk);
-            }
-            Err(e) => {
-                return ReadBodyResult::Error(e.to_string());
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    fn response(chunks: Vec<Result<Bytes, std::io::Error>>) -> reqwest::Response {
+        let body = reqwest::Body::wrap_stream(futures::stream::iter(chunks));
+        http::Response::new(body).into()
     }
 
-    // Decode the entire buffer at once to avoid corrupting multibyte UTF-8
-    // sequences that may be split across chunk boundaries.
-    match String::from_utf8(buf) {
-        Ok(body) => ReadBodyResult::Ok(body),
-        Err(e) => ReadBodyResult::Error(format!("invalid UTF-8 in response body: {e}")),
+    #[tokio::test]
+    async fn decodes_utf8_after_all_chunks() {
+        let input = response(vec![
+            Ok(Bytes::from_static(&[0xe4])),
+            Ok(Bytes::from_static(&[0xbd, 0xa0])),
+        ]);
+        let result = read_response_body_limited(input, 3).await;
+        assert!(matches!(result, ReadBodyResult::Ok(ref text) if text == "你"));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_utf8() {
+        let input = response(vec![Ok(Bytes::from_static(&[0xff]))]);
+        let result = read_response_body_limited(input, 1).await;
+        assert!(matches!(result, ReadBodyResult::Error(ref e)
+            if e.starts_with("invalid UTF-8 in response body:")));
+    }
+
+    #[tokio::test]
+    async fn reports_overflow_before_utf8_decode() {
+        let input = response(vec![Ok(Bytes::from_static(&[0xff, 0xff]))]);
+        assert!(matches!(
+            read_response_body_limited(input, 1).await,
+            ReadBodyResult::TooLarge
+        ));
+    }
+
+    #[tokio::test]
+    async fn preserves_a_body_read_error() {
+        let input = response(vec![Err(std::io::Error::other("body read failed"))]);
+        assert!(matches!(
+            read_response_body_limited(input, 8).await,
+            ReadBodyResult::Error(_)
+        ));
     }
 }

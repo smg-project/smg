@@ -1,0 +1,14 @@
+[package]
+name = "smg-http-utils"
+version = "0.1.0"
+edition = "2021"
+description = "Shared HTTP body utilities for SMG"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true
