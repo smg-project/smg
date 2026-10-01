@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use axum::response::Response;
 use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
@@ -12,14 +13,14 @@ use openai_protocol::{
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
-use smg_response_template::ResponseTemplate;
+use smg_response_template::{adapter, ResponseTemplate};
 use tool_parser::{
     ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
 };
 use tracing::warn;
 
 use super::ResponseTemplateParsers;
-use crate::worker::WorkerRegistry;
+use crate::{routers::error, worker::WorkerRegistry};
 
 /// Per-request parser-name resolution.
 ///
@@ -370,6 +371,47 @@ pub fn constraint_covers_reasoning(
         && tool_parser_factory
             .registry()
             .has_reasoning_prefix(configured_parser)
+}
+
+/// Refuses a JSON-schema constraint for a model whose parsers come from a
+/// response template that reads content only after an opener.
+///
+/// A forced tool choice falls back to a JSON-schema constraint when the tool
+/// parser has no structural tag, which a template's has not, and a JSON
+/// `response_format` is one too. The engine then writes JSON from the first
+/// token, which opens no region of the template. When the template's content
+/// needs an opener, its parsers read none of that JSON, and the response
+/// would come back with no content and no calls. A template whose content
+/// has no opener reads the JSON as content, as without a template, so its
+/// requests go through.
+pub(crate) fn reject_json_constraint_for_template(
+    resolver: &ParserResolver,
+    model: &str,
+    json_tool_constraint: bool,
+    json_response_format: bool,
+) -> Result<(), Response> {
+    if !(json_tool_constraint || json_response_format) {
+        return Ok(());
+    }
+    let needs_opener = resolver
+        .response_template(model)
+        .is_some_and(|template| adapter::content_needs_opener(&template));
+    if !needs_opener {
+        return Ok(());
+    }
+    let reason = format!(
+        "Model '{model}' parses its output with a response template that reads \
+         content only after an opener, which output constrained to JSON does not write"
+    );
+    Err(if json_tool_constraint {
+        let message = format!(
+            "{reason}, so a forced tool choice is not supported; use automatic tool choice."
+        );
+        error::bad_request("unsupported_tool_choice", message)
+    } else {
+        let message = format!("{reason}, so a JSON response_format is not supported.");
+        error::bad_request("unsupported_response_format", message)
+    })
 }
 
 /// Resolve the user's effective thinking preference.

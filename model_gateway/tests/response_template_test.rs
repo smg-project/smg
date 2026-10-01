@@ -211,6 +211,18 @@ async fn read(response: impl std::future::Future<Output = Response>) -> String {
     body
 }
 
+/// The status and `error` object of a response the gateway refuses.
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test helper")]
+async fn refusal(response: impl std::future::Future<Output = Response>) -> (StatusCode, Value) {
+    let response = timeout(Duration::from_secs(30), response)
+        .await
+        .expect("request should finish");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    (status, body["error"].clone())
+}
+
 /// JSON payloads of an SSE body.
 #[expect(clippy::unwrap_used, reason = "test helper")]
 fn events(body: &str) -> Vec<Value> {
@@ -879,6 +891,82 @@ async fn a_continued_message_returns_what_was_generated() {
 }
 
 #[tokio::test]
+async fn a_forced_output_the_template_cannot_frame_is_refused() {
+    // A forced tool choice or a JSON response_format would be decoded as JSON
+    // from the first token, which opens no region of a template whose content
+    // needs an opener.
+    const TOOL: &str = "unsupported_tool_choice";
+    const FORMAT: &str = "unsupported_response_format";
+    let setup = Setup {
+        template: Some(framed()),
+        prompt_tail: "<|bot|>",
+        ..Setup::default()
+    };
+    let gateway = serve(setup).await;
+    let tenant = tenant();
+    let check = |(status, error): (StatusCode, Value), code: &str, case: &Value| {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {error}");
+        assert_eq!(error["code"], code, "{case}: {error}");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("response template"), "{message}");
+    };
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+    let allowed = json!({"type": "allowed_tools", "mode": "required",
+                         "tools": [{"type": "function", "name": "get_weather"}]});
+    let schema = json!({"type": "json_schema",
+                        "json_schema": {"name": "weather", "schema": {"type": "object"}}});
+    let chat_cases = [
+        (json!({"tools": tools(), "tool_choice": "required"}), TOOL),
+        (json!({"tools": tools(), "tool_choice": named}), TOOL),
+        (json!({"tools": tools(), "tool_choice": allowed}), TOOL),
+        (json!({"response_format": schema}), FORMAT),
+        (json!({"response_format": {"type": "json_object"}}), FORMAT),
+    ];
+    for (extra, code) in chat_cases {
+        for stream in [false, true] {
+            let mut request = json!({
+                "model": MODEL, "max_tokens": 64, "stream": stream,
+                "messages": [{"role": "user", "content": "weather?"}],
+            });
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let case = request.clone();
+            let request = serde_json::from_value(request).unwrap();
+            let response = gateway.router.route_chat(None, &tenant, request, MODEL);
+            check(refusal(response).await, code, &case);
+        }
+    }
+
+    let weather_tool = json!([{"name": "get_weather",
+                               "input_schema": tools()[0]["function"]["parameters"]}]);
+    for tool_choice in [
+        json!({"type": "any"}),
+        json!({"type": "tool", "name": "get_weather"}),
+    ] {
+        for stream in [false, true] {
+            let case = json!({
+                "model": MODEL, "max_tokens": 64, "stream": stream, "tools": weather_tool,
+                "tool_choice": tool_choice, "messages": [{"role": "user", "content": "weather?"}],
+            });
+            let request = serde_json::from_value(case.clone()).unwrap();
+            let response = gateway.router.route_messages(None, &tenant, request, MODEL);
+            check(refusal(response).await, TOOL, &case);
+        }
+    }
+
+    let format = json!({"format": {"type": "json_schema", "name": "weather",
+                                   "schema": {"type": "object"}}});
+    let case = json!({"model": MODEL, "input": "weather?", "store": false, "text": format});
+    let request = serde_json::from_value(case.clone()).unwrap();
+    let response = gateway
+        .router
+        .route_responses(None, &tenant, request, MODEL);
+    check(refusal(response).await, FORMAT, &case);
+}
+
+#[tokio::test]
 async fn tool_choice_required_reads_the_content_as_json() {
     let setup = Setup {
         prompt_tail: NO_THINKING,
@@ -891,6 +979,27 @@ async fn tool_choice_required_reads_the_content_as_json() {
         let chat = chat(&gateway, request).await;
         assert_eq!(chat.calls, [weather()].map(|(n, a)| (n.to_string(), a)));
         assert_eq!(chat.finish, "tool_calls");
+    }
+}
+
+#[tokio::test]
+async fn a_json_response_format_is_content_without_a_content_opener() {
+    // qwen3_5's content has no opener, so JSON from the first token is content.
+    let setup = Setup {
+        prompt_tail: NO_THINKING,
+        output: r#"{"city": "Paris"}<|im_end|>"#,
+        ..Setup::default()
+    };
+    let gateway = serve(setup).await;
+    let format = json!({"type": "json_schema",
+                        "json_schema": {"name": "weather", "schema": {"type": "object"}}});
+    // A stream also shows the prompt's trailing whitespace, as in
+    // the_prompt_tail_says_where_the_output_starts.
+    for (stream, lead) in [(false, ""), (true, "\n\n")] {
+        let request = json!({"response_format": format, "stream": stream});
+        let content = format!("{lead}{{\"city\": \"Paris\"}}");
+        let expected = chat_of("", &content, &[], "stop");
+        assert_eq!(chat(&gateway, request).await, expected);
     }
 }
 
@@ -918,9 +1027,9 @@ async fn without_reasoning_separation_reasoning_stays_in_the_content() {
     );
 }
 
-#[tokio::test]
-async fn special_tokens_reach_the_parsers() {
-    let template = json!({
+/// A template whose fields all open with special tokens, content too.
+fn framed() -> Value {
+    json!({
         "start_anchor_pattern": "<\\|bot\\|>",
         "fields": {
             "thinking": {"open": "<|think|>", "close": "<|done|>"},
@@ -937,9 +1046,13 @@ async fn special_tokens_reach_the_parsers() {
                 }
             }
         }
-    });
+    })
+}
+
+#[tokio::test]
+async fn special_tokens_reach_the_parsers() {
     let setup = Setup {
-        template: Some(template),
+        template: Some(framed()),
         prompt_tail: "<|bot|>",
         output: concat!(
             "<|think|>check the map<|done|><|say|>Paris it is.<|done|>",
