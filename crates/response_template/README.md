@@ -66,6 +66,12 @@ Where smg's use differs from `transformers serve` by design:
   tool calls are dropped; with `separate_reasoning: false` reasoning is
   returned as content; prompt regions are not streamed; a continued assistant
   message returns only the generated part.
+- When the template reads content only after an opener, a forced tool
+  choice (Chat `required`, a named function or `allowed_tools` in required
+  mode, Messages `any` or `tool`) and a JSON `response_format` are refused
+  with a 400: smg would constrain them to JSON from the first token, which
+  opens no region, so the parsers would read none of it. A template whose
+  content has no opener reads that JSON as content.
 - A tool-call region whose value is a list gives one call per item
   (`transformers serve` fails there), and arguments are serialized as smg's
   other tool parsers do.

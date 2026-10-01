@@ -29,7 +29,7 @@ pub(crate) use parsers::{
     constraint_covers_reasoning, continues_final_assistant, create_reasoning_parser,
     create_tool_parser, get_tool_parser, messages_reasoning_starts_in_prefill,
     reasoning_parser_requires_special_tokens, reasoning_starts_in_prefill,
-    should_mark_reasoning_started, ParserResolver,
+    reject_json_constraint_for_template, should_mark_reasoning_started, ParserResolver,
 };
 pub(crate) use response_template::{
     response_prompt_tail, ResponseParserSpec, ResponseTemplateParsers,

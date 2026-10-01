@@ -13,7 +13,7 @@ mod common;
 use common::{canonical, fixtures_dir, read_json, read_jsonl, tag, untag};
 use serde_json::{json, Value};
 use smg_response_template::{
-    adapter::{check, CallItem, ResponseParserState, ToolCall},
+    adapter::{check, content_needs_opener, CallItem, ResponseParserState, ToolCall},
     load_response_template, parse_response, ResponseParser, ResponseTemplate,
 };
 
@@ -383,6 +383,24 @@ fn check_names_what_smg_cannot_use() {
     assert!(!unsuitable(json!({"start_anchor": "S", "fields": {
         "reasoning_content": {"open": "<a>", "close": "</a>", "repeats": true, "join": "\n"},
         "content": {}}})));
+}
+
+#[test]
+fn content_needs_an_opener_unless_it_is_the_field_without_one() {
+    let needs = |fields: Value| {
+        let template = json!({"start_anchor": "S", "fields": fields});
+        content_needs_opener(&load_response_template(&template).unwrap())
+    };
+    let thinking = json!({"open": "<t>", "close": "</t>"});
+    assert!(!needs(json!({"thinking": thinking, "content": {}})));
+    assert!(needs(
+        json!({"thinking": thinking, "content": {"open": "<c>", "close": "</c>"}})
+    ));
+    // Output outside every region is thinking, or nothing.
+    assert!(needs(
+        json!({"thinking": {"close": "</t>"}, "content": {"open": "<c>"}})
+    ));
+    assert!(needs(json!({"thinking": thinking})));
 }
 
 /// Calls named by the opener, holding JSON arguments.
