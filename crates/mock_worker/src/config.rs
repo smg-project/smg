@@ -38,6 +38,9 @@ pub struct Config {
     pub realistic: bool,
     /// Engine-simulator parameters (only used when `realistic`).
     pub engine: EngineParams,
+    /// Token ids to answer successive generate calls with, in order; the
+    /// last entry answers every call past the end. Empty: canned ids.
+    pub scripted_outputs: Vec<Vec<u32>>,
 }
 
 impl Config {
@@ -58,6 +61,7 @@ impl Config {
             output_tokens: 8,
             realistic: false,
             engine: EngineParams::default(),
+            scripted_outputs: Vec::new(),
         };
 
         let mut args = std::env::args().skip(1);

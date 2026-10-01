@@ -4,7 +4,10 @@
 use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use futures::{stream, Stream};
@@ -47,7 +50,11 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
     let addr = listener.local_addr().ok();
     // One simulated engine per listener (i.e. per virtual worker).
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
-    let service = MockScheduler { cfg, engine };
+    let service = MockScheduler {
+        cfg,
+        engine,
+        script_cursor: Arc::new(AtomicUsize::new(0)),
+    };
     if let Err(e) = Server::builder()
         .add_service(TokenSpeedSchedulerServer::new(service))
         .serve_with_incoming(TcpListenerStream::new(listener))
@@ -62,6 +69,8 @@ struct MockScheduler {
     cfg: Arc<Config>,
     /// Present iff the worker runs the realistic engine simulator.
     engine: Option<Engine>,
+    /// Which scripted output the next generate call receives.
+    script_cursor: Arc<AtomicUsize>,
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -111,7 +120,14 @@ impl TokenSpeedScheduler for MockScheduler {
         if !self.cfg.gen_delay.is_zero() {
             tokio::time::sleep(self.cfg.gen_delay).await;
         }
-        let ids: Vec<u32> = (0..self.cfg.output_tokens).map(|i| 100 + i).collect();
+        let ids: Vec<u32> = if self.cfg.scripted_outputs.is_empty() {
+            (0..self.cfg.output_tokens).map(|i| 100 + i).collect()
+        } else {
+            let turn = self.script_cursor.fetch_add(1, Ordering::Relaxed);
+            let last = self.cfg.scripted_outputs.len() - 1;
+            self.cfg.scripted_outputs[turn.min(last)].clone()
+        };
+        let completion_tokens = ids.len() as u32;
 
         let mut items: Vec<Result<ts::GenerateResponse, Status>> = Vec::new();
         for id in &ids {
@@ -133,7 +149,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 output_ids: ids,
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 1,
-                completion_tokens: self.cfg.output_tokens,
+                completion_tokens,
                 cached_tokens: 0,
                 output_logprobs: None,
                 matched_stop: None,
