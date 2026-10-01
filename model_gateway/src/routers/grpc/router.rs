@@ -108,11 +108,13 @@ impl GrpcRouter {
             .map_err(|e| format!("multimodal components: {e:#}"))?,
         ));
 
-        let response_templates = Some(Arc::new(ResponseTemplateParsers::new(
-            tokenizer_registry.clone(),
-            reasoning_parser_factory.clone(),
-            tool_parser_factory.clone(),
-        )));
+        let response_templates = (!ctx.router_config.disable_response_template).then(|| {
+            Arc::new(ResponseTemplateParsers::new(
+                tokenizer_registry.clone(),
+                reasoning_parser_factory.clone(),
+                tool_parser_factory.clone(),
+            ))
+        });
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {

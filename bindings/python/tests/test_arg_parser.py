@@ -1541,6 +1541,7 @@ class TestRouterArgsFieldOrder:
         "prefill_max_inflight_requests_per_worker",
         "prefill_queue_size",
         "prefill_queue_timeout_secs",
+        "disable_response_template",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

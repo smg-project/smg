@@ -286,6 +286,8 @@ class RouterArgs:
     prefill_max_inflight_requests_per_worker: int = -1
     prefill_queue_size: int | None = None
     prefill_queue_timeout_secs: int | None = None
+    # Do not choose parsers from the response_template of a model's tokenizer
+    disable_response_template: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -1477,6 +1479,14 @@ class RouterArgs:
             default=None,
             choices=tool_call_parser_choices,
             help="Specify the parser for tool-call interactions (e.g., json, qwen)",
+        )
+        parser_group.add_argument(
+            f"--{prefix}disable-response-template",
+            action="store_true",
+            default=RouterArgs.disable_response_template,
+            help="Do not choose parsers from the response_template in a model's "
+            "tokenizer_config.json (used when no parser other than "
+            "--reasoning-parser passthrough is configured)",
         )
         parser_group.add_argument(
             f"--{prefix}mcp-config-path",

@@ -98,6 +98,7 @@ struct Setup {
     card: ModelCard,
     reasoning_parser: Option<&'static str>,
     tool_parser: Option<&'static str>,
+    disable_response_template: bool,
 }
 
 impl Default for Setup {
@@ -112,6 +113,7 @@ impl Default for Setup {
             card: ModelCard::new(MODEL),
             reasoning_parser: None,
             tool_parser: None,
+            disable_response_template: false,
         }
     }
 }
@@ -160,6 +162,7 @@ async fn serve(setup: Setup) -> Gateway {
     config.health_check.disable_health_check = true;
     config.reasoning_parser = setup.reasoning_parser.map(str::to_string);
     config.tool_call_parser = setup.tool_parser.map(str::to_string);
+    config.disable_response_template = setup.disable_response_template;
     let tokenizer = ScriptedTokenizer::from_chunks(chunks)
         .with_special_tokens(EOS)
         .with_prompt_tail(setup.prompt_tail)
@@ -1021,6 +1024,35 @@ async fn explicit_parsers_turn_the_template_off() {
     let chat = chat(&gateway, json!({})).await;
     assert_eq!(chat.reasoning, "");
     assert!(chat.content.contains("</think>"), "{chat:?}");
+}
+
+#[tokio::test]
+async fn a_passthrough_reasoning_parser_gives_way_to_the_template() {
+    // What a launcher passes for every model it starts: the template still
+    // selects both parsers.
+    let setup = Setup {
+        reasoning_parser: Some("passthrough"),
+        ..Setup::default()
+    };
+    let gateway = serve(setup).await;
+    assert_eq!(
+        chat(&gateway, json!({"tools": tools()})).await,
+        chat_of("plan the call", "Checking.", &[weather()], "tool_calls")
+    );
+
+    // With the templates turned off, the output passes through.
+    let setup = Setup {
+        reasoning_parser: Some("passthrough"),
+        disable_response_template: true,
+        ..Setup::default()
+    };
+    let gateway = serve(setup).await;
+    let chat = chat(&gateway, json!({})).await;
+    assert_eq!(chat.reasoning, "");
+    assert!(
+        chat.content.starts_with("plan the call\n</think>"),
+        "{chat:?}"
+    );
 }
 
 #[tokio::test]

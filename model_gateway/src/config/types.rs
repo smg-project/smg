@@ -308,6 +308,9 @@ pub struct RouterConfig {
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
     pub tool_call_parser: Option<String>,
+    /// Never select parsers from the `response_template` of a tokenizer
+    #[serde(default)]
+    pub disable_response_template: bool,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
     /// Server TLS certificate (PEM)
@@ -1253,6 +1256,7 @@ impl Default for RouterConfig {
             redis: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            disable_response_template: false,
             tokenizer_cache: TokenizerCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
