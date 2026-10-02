@@ -1,0 +1,31 @@
+[package]
+name = "engine-servicer"
+version = "0.1.0"
+edition = "2021"
+description = "Rust gRPC servicers for inference engines: the engine's own proto, served over the same-host ZMQ wire"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+
+[dependencies]
+engine-zmq-adapter.workspace = true
+smg-grpc-client.workspace = true
+llm-tokenizer.workspace = true
+openai-protocol.workspace = true
+
+chrono.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic.workspace = true
+tonic-health.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+engine-zmq-client = { workspace = true, features = ["mock-engine"] }
+portpicker = "0.1"
+tempfile = "3"
+
+[lints]
+workspace = true

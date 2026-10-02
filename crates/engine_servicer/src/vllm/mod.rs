@@ -1,0 +1,316 @@
+//! The vLLM gRPC servicer in Rust: serves `vllm.grpc.engine.VllmEngine` (the
+//! proto the Router already speaks to the Python servicer) and
+//! `grpc.health.v1` over a same-host vLLM EngineCore reached through the
+//! existing ZMQ engine client.
+//!
+//! What the Python frontend did that EngineCore cannot, this servicer does:
+//! it supplies EOS ids, defaults `max_tokens` to the remaining context, fans
+//! `n > 1` out into independent engine requests, and matches string stops on
+//! the decoded output with the model's tokenizer. Everything else is the ZMQ
+//! client's existing translation; the Router sees the vLLM proto either way.
+//!
+//! Not served yet (answered `UNIMPLEMENTED`): `Embed`, `FlushCache`,
+//! `GetTokenizer`, `SubscribeKvEvents`, and worker-side media processing.
+//! Those stay with the Python servicer until the ZMQ client grows the paths.
+
+mod engine;
+mod generate;
+mod info;
+mod requests;
+mod service;
+#[cfg(test)]
+mod tests;
+
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
+};
+
+use engine::{connect_engine, EngineLink};
+use engine_zmq_adapter::ZmqEngineClient;
+use futures::FutureExt;
+use llm_tokenizer::traits::Tokenizer;
+use requests::Registry;
+use service::VllmEngineService;
+use smg_grpc_client::vllm_proto::vllm_engine_server::VllmEngineServer;
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{transport::Server, Status};
+use tonic_health::pb::health_server::HealthServer;
+use tracing::{info, warn};
+
+use crate::{health::HealthReporter, lock, ServerThread, ServicerError, Shutdown};
+
+pub(crate) const SERVICE_NAME: &str = "vllm.grpc.engine.VllmEngine";
+/// `GetServerInfo.server_type` for this implementation.
+pub(crate) const SERVER_TYPE: &str = "vllm-grpc";
+
+/// What `GetModelInfo` reports. The Python servicer reads these off vLLM's
+/// `ModelConfig`; the launcher computes them from the same config before it
+/// starts the headless engine, so the Router sees identical metadata.
+#[derive(Debug, Clone, Default)]
+pub struct VllmModelInfo {
+    pub model_path: String,
+    pub served_model_name: String,
+    pub tokenizer_path: String,
+    pub is_generation: bool,
+    pub max_context_length: u32,
+    pub vocab_size: u32,
+    pub supports_vision: bool,
+    pub model_type: String,
+    pub architectures: Vec<String>,
+    /// EOS ids in config order (`config.json` first): the first is the
+    /// primary id EngineCore stops on, the rest join the stop set.
+    pub eos_token_ids: Vec<u32>,
+    pub pad_token_id: i32,
+    pub bos_token_id: i32,
+    pub default_sampling_params_json: String,
+    pub data_parallel_size: i32,
+    /// `GetServerInfo.pairing_protocol` (`SMG_PAIRING_PROTOCOL`).
+    pub pairing_protocol: String,
+}
+
+/// How to bind, where the engine dials in, and what to advertise.
+#[derive(Debug, Clone)]
+pub struct VllmServicerConfig {
+    /// `host:port` for the gRPC listener.
+    pub bind_address: String,
+    /// `ipc://<path>` base for the data-plane sockets (`<path>-in.sock` and
+    /// `<path>-out.sock`), owned by this process's uid.
+    pub ipc_base_url: String,
+    /// `tcp://host:port` the headless engine dials for the handshake (its
+    /// `--data-parallel-address`/`--data-parallel-rpc-port`).
+    pub handshake_address: String,
+    /// Engines that will dial in (the engine-level data-parallel size).
+    pub engine_count: usize,
+    /// Local directory holding the model's tokenizer files; without it,
+    /// requests carrying string stops are refused.
+    pub tokenizer_dir: Option<String>,
+    pub model: VllmModelInfo,
+}
+
+pub(super) struct State {
+    pub(super) model: VllmModelInfo,
+    pub(super) engine: EngineLink,
+    /// Loaded once alongside the engine connect; `Some(None)` records a load
+    /// that failed (string stops are then refused, EOS still comes from config).
+    pub(super) tokenizer: OnceLock<Option<Arc<dyn Tokenizer>>>,
+    pub(super) registry: Registry,
+    pub(super) generation: AtomicU64,
+    /// Cleared by the lifecycle owner to drain: health flips to NOT_SERVING
+    /// while in-flight streams finish.
+    pub(super) serving: AtomicBool,
+    pub(super) started: Instant,
+}
+
+impl State {
+    pub(super) fn engine(&self) -> Result<&ZmqEngineClient, Status> {
+        if let Some(client) = self.engine.client.get() {
+            return Ok(client);
+        }
+        Err(match self.engine.error() {
+            Some(error) => Status::unavailable(format!("engine connection failed: {error}")),
+            None => Status::unavailable("engine is still connecting"),
+        })
+    }
+
+    pub(super) fn tokenizer(&self) -> Option<&Arc<dyn Tokenizer>> {
+        self.tokenizer.get().and_then(Option::as_ref)
+    }
+
+    /// SERVING only once the engine link is up and alive and the lifecycle
+    /// owner has not started draining.
+    pub(super) fn is_serving(&self) -> bool {
+        self.serving.load(Ordering::Acquire)
+            && self
+                .engine
+                .client
+                .get()
+                .is_some_and(ZmqEngineClient::is_alive)
+    }
+
+    pub(super) fn health_message(&self) -> &'static str {
+        if !self.serving.load(Ordering::Acquire) {
+            return "Draining";
+        }
+        match (self.engine.client.get(), self.engine.error()) {
+            (Some(client), _) if client.is_alive() => "Health",
+            (Some(_), _) => "Engine is not alive",
+            (None, Some(_)) => "Engine connection failed",
+            (None, None) => "Engine is starting",
+        }
+    }
+
+    pub(super) fn active_requests(&self) -> u32 {
+        self.registry
+            .lock()
+            .map(|registry| u32::try_from(registry.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0)
+    }
+}
+
+/// A running Rust vLLM servicer. `start` returns once the gRPC listener is
+/// bound; the engine connects in the background and gates health.
+pub struct VllmServicerServer {
+    thread: ServerThread,
+    state: Arc<State>,
+}
+
+impl VllmServicerServer {
+    /// Validate, bind, and serve on a dedicated runtime thread.
+    pub fn start(config: VllmServicerConfig) -> Result<Self, ServicerError> {
+        Self::start_inner(config, None)
+    }
+
+    /// [`Self::start`] with the tokenizer supplied instead of loaded from
+    /// `tokenizer_dir`.
+    #[cfg(test)]
+    pub(crate) fn start_with_tokenizer(
+        config: VllmServicerConfig,
+        tokenizer: Arc<dyn Tokenizer>,
+    ) -> Result<Self, ServicerError> {
+        Self::start_inner(config, Some(tokenizer))
+    }
+
+    fn start_inner(
+        config: VllmServicerConfig,
+        tokenizer: Option<Arc<dyn Tokenizer>>,
+    ) -> Result<Self, ServicerError> {
+        let invalid = |message: &str| ServicerError::InvalidConfig(message.to_string());
+        if config.bind_address.rsplit_once(':').is_none() {
+            return Err(invalid("bind_address must be host:port"));
+        }
+        if !config.ipc_base_url.starts_with("ipc://") {
+            return Err(invalid("ipc_base_url must be ipc://<path>"));
+        }
+        if !config.handshake_address.starts_with("tcp://") {
+            return Err(invalid("handshake_address must be tcp://host:port"));
+        }
+        if config.engine_count == 0 {
+            return Err(invalid("engine_count must be positive"));
+        }
+        if config.model.model_path.trim().is_empty() {
+            return Err(invalid("model_path must not be empty"));
+        }
+        let state = Arc::new(State {
+            model: config.model,
+            engine: EngineLink::default(),
+            tokenizer: OnceLock::new(),
+            registry: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+            serving: AtomicBool::new(true),
+            started: Instant::now(),
+        });
+        if let Some(tokenizer) = tokenizer {
+            let _ = state.tokenizer.set(Some(tokenizer));
+        }
+        let service = VllmEngineService {
+            state: Arc::clone(&state),
+        };
+        let health_state = Arc::clone(&state);
+        let health = HealthReporter::new(
+            &["", SERVICE_NAME],
+            Arc::new(move || health_state.is_serving()),
+        );
+        let connect_state = Arc::clone(&state);
+        let VllmServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            tokenizer_dir,
+            ..
+        } = config;
+        let thread = ServerThread::start(
+            "smg-vllm-servicer",
+            &bind_address,
+            move |listener: TcpListener, shutdown: Shutdown, last_error| async move {
+                // Fire-and-forget on the server runtime: dropping the runtime
+                // with the server thread cancels a still-running connect.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
+                )]
+                let _connect = tokio::spawn(connect_engine(
+                    connect_state,
+                    ipc_base_url,
+                    handshake_address,
+                    engine_count,
+                    tokenizer_dir,
+                    last_error,
+                ));
+                info!(address = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "vLLM gRPC servicer listening");
+                // Graceful first: stop accepting, let open streams finish. A
+                // connected client's idle keepalive connection would hold a
+                // purely graceful shutdown forever, so the drain grace bounds it
+                // and the server future is dropped (connections closed) after.
+                let graceful = Server::builder()
+                    .add_service(
+                        VllmEngineServer::new(service)
+                            .max_decoding_message_size(usize::MAX)
+                            .max_encoding_message_size(usize::MAX),
+                    )
+                    .add_service(HealthServer::new(health))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        shutdown.clone().map(|_| ()),
+                    );
+                let forced = async move {
+                    let grace = shutdown.await;
+                    tokio::time::sleep(grace).await;
+                };
+                tokio::select! {
+                    result = graceful => result.map_err(|error| error.to_string()),
+                    () = forced => {
+                        warn!("gRPC servicer closed its remaining connections after the drain grace");
+                        Ok(())
+                    }
+                }
+            },
+        )?;
+        Ok(Self { thread, state })
+    }
+
+    /// The bound `ip:port`.
+    pub fn address(&self) -> String {
+        self.thread.address().to_string()
+    }
+
+    pub fn running(&self) -> bool {
+        self.thread.running()
+    }
+
+    /// Whether the engine handshake completed.
+    pub fn engine_ready(&self) -> bool {
+        self.state.engine.client.get().is_some()
+    }
+
+    pub fn last_error(&self) -> Result<Option<String>, ServicerError> {
+        self.thread.last_error()
+    }
+
+    /// Announce SERVING (`true`) or drain (`false`): health flips at once,
+    /// in-flight streams keep running until `stop`.
+    pub fn set_serving(&self, serving: bool) {
+        self.state.serving.store(serving, Ordering::Release);
+    }
+
+    /// Signal shutdown and wait up to `timeout` for the server thread; in-flight
+    /// streams are cancelled with it (which aborts their engine requests).
+    pub fn stop(&self, timeout: Duration) -> Result<(), ServicerError> {
+        self.set_serving(false);
+        // Fire every registered cancellation so streams end before the
+        // listener closes, then let the thread wind down.
+        {
+            let mut registry = lock(&self.state.registry)?;
+            for (_, (_, cancel)) in registry.drain() {
+                let _ = cancel.send(());
+            }
+        }
+        self.thread.stop(timeout)
+    }
+}

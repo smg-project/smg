@@ -1,6 +1,6 @@
 [workspace]
 members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
-    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
+    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -23,6 +23,7 @@ smg-mesh = { version = "1.4.3", path = "crates/mesh", package = "smg-mesh" }
 smg-grpc-client = { version = "1.13.0", path = "crates/grpc_client" }
 engine-zmq-client = { version = "0.2.0", path = "crates/engine_zmq_client" }
 engine-zmq-adapter = { version = "0.1.0", path = "crates/engine_zmq_adapter" }
+engine-servicer = { version = "0.1.0", path = "crates/engine_servicer" }
 smg-rl = { version = "0.1.0", path = "crates/rl" }
 
 # Shared dependencies
@@ -33,6 +34,7 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 tonic = { version = "0.14.6", features = ["gzip", "transport"] }
 tonic-prost = "0.14.6"
+tonic-health = "0.14.6"
 axum = { version = "0.8.9" }
 blake3 = "1.8"
 lz4_flex = "0.14"

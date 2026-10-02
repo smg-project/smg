@@ -2211,6 +2211,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-servicer"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "engine-zmq-adapter",
+ "engine-zmq-client",
+ "futures",
+ "llm-tokenizer",
+ "openai-protocol",
+ "portpicker",
+ "smg-grpc-client",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-health",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "engine-zmq-adapter"
 version = "0.1.0"
 dependencies = [
@@ -7798,6 +7820,7 @@ dependencies = [
 name = "smg-python"
 version = "1.11.0"
 dependencies = [
+ "engine-servicer",
  "once_cell",
  "pyo3",
  "rand 0.10.2",
@@ -8765,6 +8788,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tonic-health"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcfab99db777fba2802f0dfa861d1628d1ae916fb199d29819941f139ae85082"
+dependencies = [
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]
