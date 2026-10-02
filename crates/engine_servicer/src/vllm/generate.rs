@@ -74,6 +74,12 @@ pub(super) async fn generate(
     match submit(state, client, req).await {
         Ok(stream) => Ok(stream),
         Err(status) => {
+            // A duplicate id names a request that is still live; a notice
+            // under that id would reuse it (and, past an `n > 1` fan-out,
+            // get in and free the live leg's blocks).
+            if status.code() == tonic::Code::AlreadyExists {
+                return Err(status);
+            }
             if let Some((request_id, params, rank)) = rejection {
                 client
                     .notify_kv_transfer_rejected(&request_id, params, rank)
@@ -90,6 +96,13 @@ async fn submit(
     client: &ZmqEngineClient,
     mut req: vllm::GenerateRequest,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
+    // A pooling runner serves no generation task; vLLM's frontend refuses
+    // this before the engine sees it, in these words.
+    if !state.model.is_generation {
+        return Err(Status::invalid_argument(
+            "This model does not support generation",
+        ));
+    }
     // Refused here rather than dropped on translation: a request the engine
     // would run without its media must fail, not answer text-only.
     if req
@@ -198,8 +211,9 @@ impl ChoiceStream {
 
     /// Feed this tick's tokens to the stop matcher, honouring `min_tokens` as
     /// vLLM does: string stops are only checked once the output exceeds it,
-    /// and the text up to that point is excluded from the search, so a match
-    /// inside it is dropped and the matcher restarts there.
+    /// so a match inside that window is dropped; the matcher keeps its decode
+    /// context and the matched text's tail, so a stop that ends past the
+    /// window still matches (vLLM searches back by the stop's length).
     fn match_stops(&mut self, token_ids: &[u32]) -> Result<Option<String>, Status> {
         let Some(decoder) = self.decoder.as_mut() else {
             self.generated = self
@@ -216,7 +230,7 @@ impl ChoiceStream {
                 continue;
             }
             if self.generated <= self.min_tokens {
-                decoder.reset();
+                decoder.resume();
                 continue;
             }
             // Only string sequences are registered on the decoder, so a stop

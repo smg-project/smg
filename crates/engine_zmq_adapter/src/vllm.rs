@@ -12,6 +12,7 @@ use engine_zmq_client::{
     connector::EngineCoreStream,
     protocol::vllm::{
         logprobs::TokenLogprob,
+        multimodal::MmFeatures,
         output::{EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics, StopReason},
         request::EngineCoreRequest,
         sampling::EngineCoreSamplingParams,
@@ -445,55 +446,129 @@ pub(crate) fn translate_request(
     translate_request_with_backend(req, max_model_len, model_dtype, eos, None)
 }
 
-/// The grammar backend vLLM's own frontend would stamp on a request given the
-/// engine's `--structured-outputs-config.backend`: an explicit backend as is;
-/// `auto` resolves to xgrammar, which is what vLLM picks whenever xgrammar
-/// accepts the grammar (its guidance fallback only matters before the engine
-/// pins a backend, which happens on the first structured request).
-pub fn structured_outputs_backend_from_config(name: &str) -> StructuredOutputBackend {
-    match name.trim() {
-        "guidance" => StructuredOutputBackend::Guidance,
-        "outlines" => StructuredOutputBackend::Outlines,
-        "lm-format-enforcer" => StructuredOutputBackend::LmFormatEnforcer,
-        _ => StructuredOutputBackend::Xgrammar,
+/// The engine's `--structured-outputs-config.backend`, as it bears on the
+/// `_backend` this translation stamps on structured requests: `auto` (vLLM's
+/// default) resolves per constraint the way vLLM's frontend does
+/// ([`StructuredOutputsParams::with_auto_backend`]); an explicit backend is
+/// pinned on every request. The engine keeps the backend of its first
+/// structured request, as it does behind vLLM's own frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredOutputsBackendConfig {
+    Auto,
+    Pinned(StructuredOutputBackend),
+}
+
+/// [`StructuredOutputsBackendConfig`] from the configured backend name.
+/// vLLM accepts `xgrammar:...`/`guidance:...` option spellings and reads the
+/// backend off the prefix; an unknown name is `auto`.
+pub fn structured_outputs_backend_from_config(name: &str) -> StructuredOutputsBackendConfig {
+    let name = name.trim();
+    let backend = if name.starts_with("xgrammar") {
+        StructuredOutputBackend::Xgrammar
+    } else if name.starts_with("guidance") {
+        StructuredOutputBackend::Guidance
+    } else if name == "outlines" {
+        StructuredOutputBackend::Outlines
+    } else if name == "lm-format-enforcer" {
+        StructuredOutputBackend::LmFormatEnforcer
+    } else {
+        return StructuredOutputsBackendConfig::Auto;
+    };
+    StructuredOutputsBackendConfig::Pinned(backend)
+}
+
+/// A request's multimodal batches translated once, for every choice of the
+/// request: the per-item features, or the identity salt of a tensor-less
+/// payload. Cloning shares the tensor bytes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TranslatedMedia {
+    pub(crate) mm_features: Option<MmFeatures>,
+    pub(crate) cache_salt: Option<String>,
+}
+
+/// Whether the request carries multimodal batches to translate.
+pub(crate) fn has_media(req: &vllm::GenerateRequest) -> bool {
+    req.mm_inputs.is_some() || !req.extra_mm_inputs.is_empty()
+}
+
+fn prompt_token_ids(req: &vllm::GenerateRequest) -> Result<&[u32], String> {
+    match &req.input {
+        Some(vllm::generate_request::Input::Tokenized(tokenized)) => Ok(&tokenized.input_ids),
+        Some(vllm::generate_request::Input::Text(_)) => {
+            Err("ZMQ mode requires pre-tokenized input (TokenizedInput)".to_string())
+        }
+        None => Err("ZMQ mode requires pre-tokenized input; no input provided".to_string()),
     }
 }
 
-/// [`translate_request`] with the grammar backend pinned for the engine
-/// (`None` keeps the per-constraint default of the translation).
+/// Take the request's multimodal batches (`mm_inputs` plus `extra_mm_inputs`)
+/// and translate them: the per-item split the Python servicer performs before
+/// the engine happens here instead (the ZMQ path bypasses it). This reads
+/// `/dev/shm` payloads (once; the file is unlinked) and casts tensors, so a
+/// caller on an async runtime runs it off the runtime for requests that carry
+/// media ([`has_media`]).
+pub(crate) fn translate_media(
+    req: &mut vllm::GenerateRequest,
+    model_dtype: ModelDtype,
+) -> Result<TranslatedMedia, String> {
+    let batches: Vec<vllm::MultimodalInputs> = req
+        .mm_inputs
+        .take()
+        .into_iter()
+        .chain(std::mem::take(&mut req.extra_mm_inputs))
+        .collect();
+    if batches.is_empty() {
+        return Ok(TranslatedMedia::default());
+    }
+    let has_kv_transfer = kv_transfer_params(req)?.is_some();
+    let (mm_features, cache_salt) = multimodal::translate_batches(
+        batches,
+        prompt_token_ids(req)?,
+        model_dtype,
+        has_kv_transfer,
+    )?;
+    Ok(TranslatedMedia {
+        mm_features,
+        cache_salt,
+    })
+}
+
+/// [`translate_request`] with the grammar backend configured for the engine
+/// (`None` keeps the per-constraint default of the translation); the
+/// request's media is translated inline.
+#[cfg(test)]
 pub(crate) fn translate_request_with_backend(
-    req: vllm::GenerateRequest,
+    mut req: vllm::GenerateRequest,
     max_model_len: u64,
     model_dtype: ModelDtype,
     eos: &EosTokenIds,
-    structured_backend: Option<StructuredOutputBackend>,
+    structured_backend: Option<StructuredOutputsBackendConfig>,
+) -> Result<EngineCoreRequest, String> {
+    let media = translate_media(&mut req, model_dtype)?;
+    translate_request_with_media(req, media, max_model_len, eos, structured_backend)
+}
+
+/// Translate a request whose media was already translated
+/// ([`translate_media`]), so the choices of one request share the work.
+pub(crate) fn translate_request_with_media(
+    req: vllm::GenerateRequest,
+    media: TranslatedMedia,
+    max_model_len: u64,
+    eos: &EosTokenIds,
+    structured_backend: Option<StructuredOutputsBackendConfig>,
 ) -> Result<EngineCoreRequest, String> {
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
     let kv_transfer_params = kv_transfer_params(&req)?;
+    prompt_token_ids(&req)?;
     let prompt_token_ids = match req.input {
         Some(vllm::generate_request::Input::Tokenized(tokenized)) => Some(tokenized.input_ids),
-        Some(vllm::generate_request::Input::Text(_)) => {
-            return Err("ZMQ mode requires pre-tokenized input (TokenizedInput)".to_string());
-        }
-        None => {
-            return Err("ZMQ mode requires pre-tokenized input; no input provided".to_string());
-        }
+        _ => None,
     };
-    // Per-item mm features: the split the Python servicer performs before the
-    // engine happens here instead (the ZMQ path bypasses it). Every batch of
-    // the request (`mm_inputs` plus `extra_mm_inputs`) goes in.
-    let batches: Vec<vllm::MultimodalInputs> = req
-        .mm_inputs
-        .into_iter()
-        .chain(req.extra_mm_inputs)
-        .collect();
-    let (mm_features, cache_salt) = multimodal::translate_batches(
-        batches,
-        prompt_token_ids.as_deref().unwrap_or(&[]),
-        model_dtype,
-        kv_transfer_params.is_some(),
-    )?;
+    let TranslatedMedia {
+        mm_features,
+        cache_salt,
+    } = media;
     let data_parallel_rank = req
         .data_parallel_rank
         .map(|rank| u32::try_from(rank).map_err(|_| format!("invalid data_parallel_rank: {rank}")))
@@ -564,7 +639,7 @@ pub(crate) fn translate_sampling(
     default_max_tokens: u32,
     eos: &EosTokenIds,
     kv_transfer_params: Option<serde_json::Value>,
-    structured_backend: Option<StructuredOutputBackend>,
+    structured_backend: Option<StructuredOutputsBackendConfig>,
 ) -> EngineCoreSamplingParams {
     // Stopping at EOS is the frontend's duty here: the primary id rides
     // `_eos_token_id`, extra ids merge into `stop_token_ids`, and the union
@@ -620,15 +695,15 @@ pub(crate) fn translate_sampling(
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,
-        structured_outputs: sp
-            .constraint
-            .and_then(translate_constraint)
-            .map(|mut params| {
-                if let Some(backend) = structured_backend {
-                    params.backend = backend;
+        structured_outputs: sp.constraint.and_then(translate_constraint).map(|params| {
+            match structured_backend {
+                None => params,
+                Some(StructuredOutputsBackendConfig::Auto) => params.with_auto_backend(),
+                Some(StructuredOutputsBackendConfig::Pinned(backend)) => {
+                    params.with_backend(backend)
                 }
-                params
-            }),
+            }
+        }),
         extra_args: kv_transfer_params
             .map(|params| HashMap::from([("kv_transfer_params".to_string(), params)])),
         ..EngineCoreSamplingParams::default()
@@ -1450,29 +1525,31 @@ mod tests {
 
     #[test]
     fn structured_output_backend_follows_the_engine_config() {
-        use engine_zmq_client::protocol::vllm::structured_outputs::StructuredOutputBackend;
+        use engine_zmq_client::protocol::vllm::structured_outputs::{
+            StructuredOutputBackend, StructuredOutputConstraint,
+        };
+        use StructuredOutputsBackendConfig::{Auto, Pinned};
 
         assert_eq!(
             structured_outputs_backend_from_config("guidance"),
-            StructuredOutputBackend::Guidance
+            Pinned(StructuredOutputBackend::Guidance)
         );
         assert_eq!(
             structured_outputs_backend_from_config(" outlines "),
-            StructuredOutputBackend::Outlines
+            Pinned(StructuredOutputBackend::Outlines)
         );
         assert_eq!(
             structured_outputs_backend_from_config("lm-format-enforcer"),
-            StructuredOutputBackend::LmFormatEnforcer
+            Pinned(StructuredOutputBackend::LmFormatEnforcer)
         );
-        // `auto` (and anything unknown) is what vLLM's frontend settles on.
+        // vLLM reads the backend off an option-carrying spelling's prefix.
         assert_eq!(
-            structured_outputs_backend_from_config("auto"),
-            StructuredOutputBackend::Xgrammar
+            structured_outputs_backend_from_config("xgrammar:disable-any-whitespace"),
+            Pinned(StructuredOutputBackend::Xgrammar)
         );
-        assert_eq!(
-            structured_outputs_backend_from_config(""),
-            StructuredOutputBackend::Xgrammar
-        );
+        // `auto` (and anything unknown) resolves per constraint.
+        assert_eq!(structured_outputs_backend_from_config("auto"), Auto);
+        assert_eq!(structured_outputs_backend_from_config(""), Auto);
 
         let constrained = || {
             tokenized_req(vllm::SamplingParams {
@@ -1493,7 +1570,7 @@ mod tests {
             4096,
             ModelDtype::BFloat16,
             &EosTokenIds::default(),
-            Some(StructuredOutputBackend::Guidance),
+            Some(Pinned(StructuredOutputBackend::Guidance)),
         )
         .expect("translated");
         assert_eq!(backend_of(request), StructuredOutputBackend::Guidance);
@@ -1506,6 +1583,48 @@ mod tests {
         )
         .expect("translated");
         assert_eq!(backend_of(request), StructuredOutputBackend::default());
+
+        // `auto`: vLLM's per-constraint resolution. A Lark grammar goes to
+        // xgrammar unchanged (vLLM 0.30 parses Lark there); a schema with a
+        // feature xgrammar lacks goes to guidance; a choice headed for
+        // xgrammar is lowered to the grammar vLLM's frontend substitutes.
+        let auto = |constraint| {
+            translate_request_with_backend(
+                tokenized_req(vllm::SamplingParams {
+                    constraint: Some(constraint),
+                    ..Default::default()
+                }),
+                4096,
+                ModelDtype::BFloat16,
+                &EosTokenIds::default(),
+                Some(Auto),
+            )
+            .expect("translated")
+            .sampling_params
+            .and_then(|sp| sp.structured_outputs)
+            .expect("structured outputs")
+        };
+        let lark = "start: \"yes\" | \"no\"";
+        let params = auto(vllm::sampling_params::Constraint::Grammar(lark.to_string()));
+        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
+        assert_eq!(
+            params.constraint,
+            StructuredOutputConstraint::Grammar(lark.to_string())
+        );
+        let params = auto(vllm::sampling_params::Constraint::JsonSchema(
+            r#"{"type":"integer","multipleOf":3}"#.to_string(),
+        ));
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
+        let params = auto(vllm::sampling_params::Constraint::Choice(
+            vllm::ChoiceConstraint {
+                choices: vec!["a".to_string(), "b".to_string()],
+            },
+        ));
+        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
+        assert_eq!(
+            params.constraint,
+            StructuredOutputConstraint::Grammar("root ::= \"a\" | \"b\"".to_string())
+        );
     }
 
     #[test]

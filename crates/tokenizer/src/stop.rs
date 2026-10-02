@@ -308,6 +308,26 @@ impl StopSequenceDecoder {
         self.stopped = false;
         self.matched_stop = None;
     }
+
+    /// Un-stop after a string match the caller does not count (vLLM checks
+    /// stop strings only past `min_tokens`). Unlike [`reset`](Self::reset),
+    /// the decode context stays, so the next token decodes with its leading
+    /// space or byte context, and the tail of the matched text that could
+    /// begin a later stop stays jailed, so a stop ending past the boundary
+    /// still matches. The matched text was already reported as the stop and
+    /// is not re-emitted.
+    pub fn resume(&mut self) {
+        if !self.stopped {
+            return;
+        }
+        self.stopped = false;
+        if let Some(matched) = self.matched_stop.take() {
+            self.jail_buffer = matched;
+            let pending = self.pending_match_len();
+            let drain_to = self.jail_buffer.len() - pending;
+            self.jail_buffer.drain(..drain_to);
+        }
+    }
 }
 
 /// Builder for StopSequenceDecoder
@@ -604,6 +624,42 @@ mod tests {
         // Should be able to process again
         let result = decoder.process_token(2).unwrap();
         assert!(matches!(result, SequenceDecoderOutput::Text(_)));
+    }
+
+    #[test]
+    fn resume_keeps_the_decode_context_and_the_matched_tail() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence("world world");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+        // "world": a partial match, held.
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Held
+        );
+        // "world world": the (hidden) stop.
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+        assert_eq!(decoder.matched_stop(), Some("world world"));
+
+        decoder.resume();
+        assert!(!decoder.is_stopped());
+        assert_eq!(decoder.matched_stop(), None);
+        // The next token decodes as " world" (its context is kept) and
+        // completes a stop that began inside the dropped match.
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+        assert_eq!(decoder.matched_stop(), Some("world world"));
+
+        // A full reset starts a new sequence instead: "world", held.
+        decoder.reset();
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Held
+        );
     }
 
     #[test]

@@ -149,6 +149,21 @@ fn read_shm_payload(tensor: &str, handle: &common::ShmHandle) -> Result<Vec<u8>,
                 "multimodal tensor {tensor:?}: TensorData.shm is not a regular file: {name:?}"
             ));
         }
+        // The range comes off the wire: checked against the file before the
+        // buffer is sized by it (a bogus `nbytes` would otherwise abort the
+        // process at allocation, not fail the request).
+        let file_len = u64::try_from(stat.st_size).unwrap_or(0);
+        if handle
+            .offset
+            .checked_add(handle.nbytes)
+            .is_none_or(|end| end > file_len)
+        {
+            return Err(format!(
+                "multimodal tensor {tensor:?}: TensorData.shm range {}+{} exceeds {name:?} \
+                 ({file_len} bytes)",
+                handle.offset, handle.nbytes
+            ));
+        }
         let mut data = vec![0u8; nbytes];
         let mut filled = 0usize;
         while filled < nbytes {
@@ -833,7 +848,27 @@ mod tests {
             })),
         });
         let err = build_mm_features(mm, &[0; 9], ModelDtype::BFloat16).expect_err("short");
-        assert!(err.contains("byte length mismatch"), "{err}");
+        assert!(err.contains("exceeds"), "{err}");
+        assert!(!path.exists(), "a refused payload is still unlinked");
+
+        // A range the wire claims but the file cannot hold is refused before
+        // any buffer is sized by it.
+        for (offset, nbytes) in [(0, 1u64 << 50), (u64::MAX - 1, 4)] {
+            std::fs::write(&path, &file_bytes).expect("write shm file");
+            let mut mm = base_inputs();
+            mm.pixel_values = Some(vllm::TensorData {
+                shape: vec![2, 4],
+                dtype: "float32".to_string(),
+                payload: Some(vllm::tensor_data::Payload::Shm(common::ShmHandle {
+                    name: name.clone(),
+                    offset,
+                    nbytes,
+                    owner_id: String::new(),
+                })),
+            });
+            let err = build_mm_features(mm, &[0; 9], ModelDtype::BFloat16).expect_err("bogus");
+            assert!(err.contains("exceeds"), "{err}");
+        }
         let _ = std::fs::remove_file(&path);
     }
 

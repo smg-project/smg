@@ -170,6 +170,16 @@ UNIMPLEMENTED there, so keep the Python implementation for that. Tuning:
 `SMG_VLLM_SERVICER_DRAIN_SECS` (default 5), `SMG_ZMQ_SOCKET_DIR`,
 `SMG_SERVICER_WORKER_THREADS` (default 4).
 
+Known difference: under `--structured-outputs-config.backend auto` (the
+default) vLLM's frontend validates each constraint with xgrammar and falls
+back to guidance when xgrammar rejects it. Rust mode applies the same static
+rules (JSON-schema features xgrammar lacks go to guidance, a `choice` becomes
+the grammar xgrammar compiles), but it cannot run xgrammar's parser, so a regex
+or grammar that only guidance accepts fails that request at the engine's
+grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
+explicitly when that matters; the engine keeps the backend of its first
+structured request either way, as it does behind vLLM's own frontend.
+
 ### MLX
 
 ```bash

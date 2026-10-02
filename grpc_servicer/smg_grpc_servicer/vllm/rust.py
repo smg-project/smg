@@ -40,7 +40,7 @@ import os
 import signal
 import socket
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 from smg_grpc_servicer import mm_shm
@@ -132,6 +132,12 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
     )
     structured = getattr(vllm_config, "structured_outputs_config", None)
     structured_backend = getattr(structured, "backend", None) if structured is not None else None
+    # The pooler config vLLM's frontend merges into a pooling request's unset
+    # fields (`PoolingParams._merge_default_parameters`); absent on most
+    # generation models.
+    pooler = getattr(model_config, "pooler_config", None)
+    pooler_use_activation = getattr(pooler, "use_activation", None)
+    pooler_dimensions = getattr(pooler, "dimensions", None)
     return {
         "model_path": str(model_config.model),
         "served_model_name": str(served),
@@ -167,6 +173,10 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         ),
         "kv_events_topic": str(getattr(kv_events, "topic", "") or "") if kv_events_enabled else "",
         "shm_namespace_id": mm_shm.shm_namespace_id(),
+        "pooler_use_activation": (
+            bool(pooler_use_activation) if pooler_use_activation is not None else None
+        ),
+        "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
     }
 
 
@@ -452,14 +462,20 @@ def resolve_servicer_impl(
     args: argparse.Namespace | None = None, environ: Mapping[str, str] | None = None
 ) -> str:
     """Which implementation serves this process: ``args.servicer_impl`` when the
-    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else python."""
+    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else python.
+
+    A decision made with the launcher's flag in hand is written back to the
+    environment, so :func:`require_python_impl` (which has no flag) agrees with
+    it when ``--servicer-impl python`` overrides an exported ``rust``."""
+    source = os.environ if environ is None else environ
     value = getattr(args, "servicer_impl", None) if args is not None else None
     if not value:
-        source = os.environ if environ is None else environ
         value = source.get(SERVICER_IMPL_ENV) or "python"
     value = str(value).strip().lower()
     if value not in IMPLS:
         raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
+    if args is not None and isinstance(source, MutableMapping):
+        source[SERVICER_IMPL_ENV] = value
     return value
 
 

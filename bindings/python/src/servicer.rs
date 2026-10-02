@@ -74,6 +74,8 @@ impl PyVllmGrpcServer {
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
         shm_namespace_id = String::new(),
+        pooler_use_activation = None,
+        pooler_dimensions = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -110,6 +112,8 @@ impl PyVllmGrpcServer {
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
         shm_namespace_id: String,
+        pooler_use_activation: Option<bool>,
+        pooler_dimensions: Option<u32>,
     ) -> PyResult<Self> {
         let model = VllmModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -139,6 +143,8 @@ impl PyVllmGrpcServer {
             kv_events_replay_endpoint,
             kv_events_topic,
             shm_namespace_id,
+            pooler_use_activation,
+            pooler_dimensions,
         };
         let config = VllmServicerConfig {
             bind_address,

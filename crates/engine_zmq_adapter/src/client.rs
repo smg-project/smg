@@ -14,10 +14,7 @@ use engine_zmq_client::{
     connector::{EngineCoreClient, TokenSpeedClient},
     protocol::{
         handshake::EngineCoreReadyResponse,
-        vllm::{
-            request::EngineCoreRequest, sampling::EngineCoreSamplingParams,
-            structured_outputs::StructuredOutputBackend,
-        },
+        vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams},
         EngineLoad,
     },
     ConnectedEngine,
@@ -37,10 +34,15 @@ use crate::{
         fan_out_tokenspeed_requests, translate_request_tokenspeed, TokenSpeedGenerateStream,
     },
     vllm::{
-        fan_out_requests, kv_transfer_params, now_secs, ranked_candidate_count,
-        translate_request_with_backend, VllmGenerateStream,
+        fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
+        translate_media, translate_request_with_media, StructuredOutputsBackendConfig,
+        TranslatedMedia, VllmGenerateStream,
     },
 };
+
+/// How long the one-time `get_supported_tasks` utility call may take; the
+/// engine answers it between scheduler steps.
+const SUPPORTED_TASKS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The connector params a refused request must still release: NIXL's
 /// `do_remote_prefill` marks a PD decode leg whose prefill side holds blocks
@@ -88,10 +90,13 @@ pub(crate) struct ZmqConnectionMeta {
     /// (the model id is a repo id, not a local directory). Lives here rather
     /// than on the client so every clone shares the one adoption.
     tokenizer_eos: OnceLock<EosTokenIds>,
-    /// The grammar backend stamped on structured-output requests, resolved
-    /// once from the engine's config by the caller that knows it (the
-    /// servicer); unset keeps the translation's per-constraint default.
-    structured_outputs_backend: OnceLock<StructuredOutputBackend>,
+    /// The engine's structured-output backend config, set once by the caller
+    /// that knows it (the servicer); unset keeps the translation's
+    /// per-constraint default.
+    structured_outputs_backend: OnceLock<StructuredOutputsBackendConfig>,
+    /// The engine's supported tasks (`get_supported_tasks`), fetched on first
+    /// use and kept for the connection, as vLLM's frontend keeps them.
+    supported_tasks: tokio::sync::OnceCell<Arc<[String]>>,
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
@@ -260,6 +265,7 @@ impl ZmqEngineClient {
                 eos,
                 tokenizer_eos: OnceLock::new(),
                 structured_outputs_backend: OnceLock::new(),
+                supported_tasks: tokio::sync::OnceCell::new(),
             }),
         })
     }
@@ -288,8 +294,49 @@ impl ZmqEngineClient {
     /// keeps a single backend per process, chosen by the first request that
     /// needs one, so the caller resolves it once from the engine's
     /// `--structured-outputs-config` and every request carries the same one.
-    pub fn set_structured_outputs_backend(&self, backend: StructuredOutputBackend) {
-        let _ = self.meta.structured_outputs_backend.set(backend);
+    pub fn set_structured_outputs_backend(&self, config: StructuredOutputsBackendConfig) {
+        let _ = self.meta.structured_outputs_backend.set(config);
+    }
+
+    /// The tasks the engine's model runner serves (vLLM's
+    /// `get_supported_tasks` utility call, which its frontend makes once and
+    /// validates every request against), fetched on first use.
+    pub async fn supported_tasks(&self) -> Result<Arc<[String]>, tonic::Status> {
+        let client = self.vllm_client("get_supported_tasks")?;
+        let engine_id = client
+            .engines()
+            .first()
+            .map(|engine| engine.engine_id.clone())
+            .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))?;
+        self.meta
+            .supported_tasks
+            .get_or_try_init(|| async {
+                let value = client
+                    .call_utility(
+                        &engine_id,
+                        "get_supported_tasks",
+                        Vec::new(),
+                        SUPPORTED_TASKS_TIMEOUT,
+                    )
+                    .await
+                    .map_err(utility_status)?;
+                let tasks = value
+                    .as_array()
+                    .and_then(|tasks| {
+                        tasks
+                            .iter()
+                            .map(OpaqueValue::as_str)
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .ok_or_else(|| {
+                        tonic::Status::internal(format!(
+                            "get_supported_tasks answered {value}, not a list of task names"
+                        ))
+                    })?;
+                Ok(tasks.into_iter().map(str::to_string).collect())
+            })
+            .await
+            .cloned()
     }
 
     /// The EOS set attached to requests: the connect-time set, or the adopted
@@ -350,7 +397,7 @@ impl ZmqEngineClient {
     /// dialect only.
     pub async fn generate_vllm_streams(
         &self,
-        req: vllm::GenerateRequest,
+        mut req: vllm::GenerateRequest,
     ) -> Result<Vec<VllmGenerateStream>, tonic::Status> {
         let ZmqBackend::Vllm(client) = &self.backend else {
             return Err(tonic::Status::internal(
@@ -366,14 +413,42 @@ impl ZmqEngineClient {
             .first()
             .map(|e| (e.ready_response.max_model_len, e.ready_response.dtype))
             .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))?;
+        // Media is translated once for all choices (an SHM payload is read,
+        // and unlinked, a single time) and off the runtime: `/dev/shm` reads
+        // and the dtype casts of multi-megabyte tensors would otherwise hold a
+        // worker thread per request, starving token forwarding and health.
+        let media = if has_media(&req) {
+            let (returned, media) = tokio::task::spawn_blocking(move || {
+                let media = translate_media(&mut req, model_dtype);
+                (req, media)
+            })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("multimodal translation failed: {error}"))
+            })?;
+            req = returned;
+            media.map_err(tonic::Status::invalid_argument)?
+        } else {
+            TranslatedMedia::default()
+        };
+        let structured_backend = self.meta.structured_outputs_backend.get().copied();
+        let subs = fan_out_requests(req);
+        let last = subs.len().saturating_sub(1);
+        let mut media = Some(media);
         let mut streams = Vec::new();
-        for (index, sub) in fan_out_requests(req).into_iter().enumerate() {
-            let request = translate_request_with_backend(
+        for (index, sub) in subs.into_iter().enumerate() {
+            // The last choice takes the translated media; the others share it.
+            let sub_media = if index == last {
+                media.take()
+            } else {
+                media.clone()
+            };
+            let request = translate_request_with_media(
                 sub,
+                sub_media.unwrap_or_default(),
                 max_model_len,
-                model_dtype,
                 self.effective_eos(),
-                self.meta.structured_outputs_backend.get().copied(),
+                structured_backend,
             )
             .map_err(tonic::Status::invalid_argument)?;
             // The engine returns the sampled/prompt token's logprob

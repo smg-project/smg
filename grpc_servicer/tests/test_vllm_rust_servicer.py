@@ -54,6 +54,20 @@ def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
         rust.resolve_servicer_impl(environ={"SMG_VLLM_SERVICER_IMPL": "go"})
 
 
+def test_a_launcher_flag_decision_is_written_back_for_the_python_guard():
+    # `--servicer-impl python` with `rust` still exported: the hook picks
+    # Python, and the servicer's guard must see that decision, not the env.
+    environ = {"SMG_VLLM_SERVICER_IMPL": "rust"}
+    args = argparse.Namespace(servicer_impl="python")
+    assert rust.resolve_servicer_impl(args, environ=environ) == "python"
+    assert environ["SMG_VLLM_SERVICER_IMPL"] == "python"
+    rust.require_python_impl(environ=environ)
+    # Without a flag in hand nothing is written.
+    environ = {}
+    assert rust.resolve_servicer_impl(environ=environ) == "python"
+    assert environ == {}
+
+
 def test_python_servicer_refuses_to_start_when_the_flag_asks_for_rust():
     rust.require_python_impl(environ={})
     rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "python"})
@@ -146,6 +160,22 @@ def test_model_info_mirrors_the_python_servicer(monkeypatch):
     assert info["kv_events_endpoint"] == "" and info["kv_events_topic"] == ""
     assert info["structured_outputs_backend"] == "auto"
     assert isinstance(info["shm_namespace_id"], str)
+    # No pooler config on a generation model.
+    assert info["pooler_use_activation"] is None and info["pooler_dimensions"] is None
+
+
+def test_model_info_carries_the_pooler_config():
+    config = _config(
+        runner_type="pooling",
+        pooler_config=SimpleNamespace(use_activation=False, dimensions=256, pooling_type="MEAN"),
+    )
+    info = rust.model_info_from_config(config)
+    assert info["is_generation"] is False
+    assert info["pooler_use_activation"] is False
+    assert info["pooler_dimensions"] == 256
+    config = _config(pooler_config=SimpleNamespace(use_activation=None, dimensions=None))
+    info = rust.model_info_from_config(config)
+    assert info["pooler_use_activation"] is None and info["pooler_dimensions"] is None
 
 
 def test_model_info_reports_the_pd_identity_and_pairing_facts():

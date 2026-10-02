@@ -110,6 +110,11 @@ pub struct VllmModelInfo {
     /// the Router can verify a shared `/dev/shm` before using the SHM tensor
     /// transport under `auto`; empty when unknown.
     pub shm_namespace_id: String,
+    /// The model's pooler config (`--pooler-config`, or the model's own):
+    /// what vLLM's frontend fills into an `Embed` request's unset
+    /// `use_activation` and `dimensions`.
+    pub pooler_use_activation: Option<bool>,
+    pub pooler_dimensions: Option<u32>,
 }
 
 /// How to bind, where the engine dials in, and what to advertise.
@@ -307,10 +312,11 @@ impl VllmServicerServer {
                 // and the server future is dropped (connections closed) after.
                 let graceful = Server::builder()
                     // Router-preprocessed media arrives as multi-megabyte
-                    // inline tensors; h2's default 64 KiB windows would pace
-                    // each such message with a window update per 64 KiB.
-                    // Size the windows and frames for them (grpc-core's BDP
-                    // probing gets the Python servicer there on its own).
+                    // inline tensors; hyper's server defaults (1 MiB stream
+                    // and connection windows, 16 KiB frames) would stall each
+                    // such message on window updates. Size the windows and
+                    // frames for them (grpc-core's BDP probing gets the
+                    // Python servicer there on its own).
                     .initial_stream_window_size(Some(16 * 1024 * 1024))
                     .initial_connection_window_size(Some(64 * 1024 * 1024))
                     .max_frame_size(Some(1024 * 1024))

@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs, io::Cursor, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use engine_zmq_client::{
-    codec::tensor::WireTensor,
+    codec::{tensor::WireTensor, OpaqueValue},
     mock_engine::{
         connect_to_frontend, default_ready_response, EngineInbound, MockEngineInput,
         MockEngineOutput,
@@ -15,7 +15,7 @@ use engine_zmq_client::{
         pooling::{PoolingOutput, PoolingParams},
         request::EngineCoreRequest,
         stats::SchedulerStats,
-        structured_outputs::StructuredOutputBackend,
+        structured_outputs::{StructuredOutputBackend, StructuredOutputConstraint},
     },
     EngineId,
 };
@@ -172,6 +172,35 @@ async fn recv_abort(engine: &mut MockEngineInput) -> Vec<String> {
         EngineInbound::Abort(ids) => ids,
         other => panic!("expected Abort, got {other:?}"),
     }
+}
+
+/// Answer the engine's one-time `get_supported_tasks` utility call, which
+/// the first pooling request of a connection makes before its submit.
+async fn answer_supported_tasks(
+    engine_in: &mut MockEngineInput,
+    engine_out: &mut MockEngineOutput,
+    tasks: &[&str],
+) {
+    let call = match engine_in.recv().await.expect("inbound") {
+        EngineInbound::Utility(call) => call,
+        other => panic!("expected the supported-tasks call, got {other:?}"),
+    };
+    assert_eq!(call.method, "get_supported_tasks");
+    let tasks = tasks.iter().map(|task| OpaqueValue::from(*task)).collect();
+    engine_out
+        .send_utility_reply(0, call.call_id, Ok(OpaqueValue::Array(tasks)))
+        .await
+        .expect("reply");
+}
+
+/// Nothing reaches the engine within a grace period.
+async fn assert_engine_idle(engine_in: &mut MockEngineInput) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), engine_in.recv())
+            .await
+            .is_err(),
+        "nothing should have reached the engine"
+    );
 }
 
 fn chunk_tokens(response: vllm::GenerateResponse) -> Vec<u32> {
@@ -653,6 +682,102 @@ async fn a_refused_decode_leg_notifies_the_engine() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A decode leg refused as a duplicate id sends no rejection notice: the id
+/// names a request that is still live, and the notice would reuse it.
+#[tokio::test]
+async fn a_duplicate_decode_leg_sends_no_rejection_notice() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("pd3", true, Vec::new());
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[1]}"#.to_string());
+    let stream = h
+        .client
+        .generate(request.clone())
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let status = h.client.generate(request).await.expect_err("duplicate id");
+    assert_eq!(status.code(), Code::AlreadyExists);
+    assert_engine_idle(&mut h.engine_in).await;
+    drop(stream);
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["pd3".to_string()]);
+}
+
+/// Router-preprocessed media serves every choice of an `n > 1` request: the
+/// `/dev/shm` payload is read (and unlinked) once, and each engine request
+/// carries the per-item features.
+#[tokio::test]
+async fn shm_media_serves_every_choice_of_a_fan_out() {
+    let mut h = harness(model_info(), None).await;
+    let name = format!(
+        "smg-servicer-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let path = std::path::Path::new("/dev/shm").join(&name);
+    let payload: Vec<u8> = (0..8).flat_map(|v| (v as f32).to_le_bytes()).collect();
+    fs::write(&path, &payload).expect("write shm file");
+    let mut request = generate_request("mm3", true, Vec::new());
+    request.input = Some(vllm::generate_request::Input::Tokenized(
+        vllm::TokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![0; 9],
+        },
+    ));
+    request.sampling_params.as_mut().unwrap().n = 2;
+    request.mm_inputs = Some(vllm::MultimodalInputs {
+        pixel_values: Some(vllm::TensorData {
+            shape: vec![2, 4],
+            dtype: "float32".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Shm(common::ShmHandle {
+                name: name.clone(),
+                offset: 0,
+                nbytes: payload.len() as u64,
+                owner_id: "smg:test".to_string(),
+            })),
+        }),
+        mm_placeholders: vec![
+            vllm::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            },
+            vllm::PlaceholderRange {
+                offset: 6,
+                length: 3,
+            },
+        ],
+        mm_hashes: vec!["h0".to_string(), "h1".to_string()],
+        batched_keys: vec!["pixel_values".to_string()],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    });
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let engine_request = recv_add(&mut h.engine_in).await;
+        let features = engine_request
+            .mm_features
+            .as_ref()
+            .expect("features on every choice");
+        assert_eq!(features.len(), 2);
+        assert_eq!(features[1].mm_position.offset, 6);
+        ids.push(engine_request.request_id.clone());
+    }
+    ids.sort();
+    assert_eq!(ids, vec!["mm3-0".to_string(), "mm3-1".to_string()]);
+    assert!(!path.exists(), "the shm payload is read and unlinked once");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Worker-side media processing is refused up front (the adapter would
 /// otherwise run the request text-only); Router-preprocessed batches,
 /// including extra modality batches, go through to the engine.
@@ -730,6 +855,47 @@ async fn string_stops_wait_for_min_tokens() {
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["mt1".to_string()]);
 }
 
+/// A stop may end just past the `min_tokens` window though it began inside
+/// it, as vLLM searches back by the stop's length: the "world world" matched
+/// at token 2 is dropped, the one ending at token 3 counts.
+#[tokio::test]
+async fn string_stops_may_span_the_min_tokens_boundary() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let mut h = harness(model_info(), Some(tokenizer)).await;
+    let mut request = generate_request("mt2", true, vec!["world world".to_string()]);
+    request.sampling_params.as_mut().unwrap().min_tokens = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    for _ in 0..3 {
+        h.engine_out
+            .send_outputs(&batch("mt2", vec![2], None, None))
+            .await
+            .unwrap();
+    }
+    for _ in 0..3 {
+        assert_eq!(
+            chunk_tokens(stream.message().await.unwrap().unwrap()),
+            vec![2]
+        );
+    }
+    let done = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert_eq!(done.output_ids, vec![2, 2, 2]);
+    assert_eq!(
+        done.matched_stop,
+        Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
+            "world world".to_string()
+        ))
+    );
+    assert!(stream.message().await.unwrap().is_none());
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["mt2".to_string()]);
+}
+
 /// Per-request speculative-decoding counters ride the final output onto the
 /// `Complete`, summed as the Python servicer sums them.
 #[tokio::test]
@@ -769,6 +935,8 @@ async fn spec_decode_counts_reach_the_complete() {
 /// a per-constraint guess: the engine pins one backend at first use.
 #[tokio::test]
 async fn structured_output_backend_follows_the_launcher_config() {
+    use vllm::sampling_params::Constraint;
+
     for (configured, expected) in [
         ("", StructuredOutputBackend::Xgrammar),
         ("guidance", StructuredOutputBackend::Guidance),
@@ -777,8 +945,7 @@ async fn structured_output_backend_follows_the_launcher_config() {
         model.structured_outputs_backend = configured.to_string();
         let mut h = harness(model, None).await;
         let mut request = generate_request("so1", false, Vec::new());
-        request.sampling_params.as_mut().unwrap().constraint =
-            Some(vllm::sampling_params::Constraint::JsonObject(true));
+        request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::JsonObject(true));
         let _stream = h
             .client
             .generate(request)
@@ -795,6 +962,58 @@ async fn structured_output_backend_follows_the_launcher_config() {
         assert_eq!(backend, expected, "configured backend {configured:?}");
         h.server.stop(Duration::from_secs(5)).expect("clean stop");
     }
+
+    // `auto` resolves per constraint as vLLM's frontend does: a Lark grammar
+    // goes to xgrammar unchanged (vLLM 0.30 parses Lark there), a schema with
+    // a feature xgrammar lacks goes to guidance, and a choice is lowered to
+    // the grammar xgrammar compiles. The streams stay open so no abort
+    // interleaves with the engine's inbound requests.
+    let mut h = harness(model_info(), None).await;
+    let lark = "start: \"yes\" | \"no\"";
+    let mut streams = Vec::new();
+    for (id, constraint, expected_backend, expected_constraint) in [
+        (
+            "so2",
+            Constraint::Grammar(lark.to_string()),
+            StructuredOutputBackend::Xgrammar,
+            StructuredOutputConstraint::Grammar(lark.to_string()),
+        ),
+        (
+            "so3",
+            Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
+            StructuredOutputBackend::Guidance,
+            StructuredOutputConstraint::Json(
+                serde_json::json!({"type": "integer", "multipleOf": 3}),
+            ),
+        ),
+        (
+            "so4",
+            Constraint::Choice(vllm::ChoiceConstraint {
+                choices: vec!["a".to_string(), "b".to_string()],
+            }),
+            StructuredOutputBackend::Xgrammar,
+            StructuredOutputConstraint::Grammar("root ::= \"a\" | \"b\"".to_string()),
+        ),
+    ] {
+        let mut request = generate_request(id, true, Vec::new());
+        request.sampling_params.as_mut().unwrap().constraint = Some(constraint);
+        streams.push(
+            h.client
+                .generate(request)
+                .await
+                .expect("generate")
+                .into_inner(),
+        );
+        let engine_request = recv_add(&mut h.engine_in).await;
+        let structured = engine_request
+            .sampling_params
+            .and_then(|sp| sp.structured_outputs)
+            .expect("structured outputs");
+        assert_eq!(structured.backend, expected_backend, "{id}");
+        assert_eq!(structured.constraint, expected_constraint, "{id}");
+    }
+    drop(streams);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// The request id is the Router's cancellation handle, so a live duplicate
@@ -1392,6 +1611,7 @@ async fn embed_answers_from_the_engines_pooling_output() {
         h.client
             .embed(embed_request("emb-1", vec![101, 7592, 2088, 102])),
         async {
+            answer_supported_tasks(&mut h.engine_in, &mut h.engine_out, &["embed"]).await;
             let request = recv_add(&mut h.engine_in).await;
             h.engine_out
                 .send_frames(vec![Bytes::from(unhex(VLLM_EMBED_OUTPUT_INLINE))])
@@ -1462,6 +1682,7 @@ async fn embed_without_tokenized_input_is_invalid() {
     // None of them reached the engine: the next Add is the first valid one.
     let (response, request) =
         tokio::join!(h.client.embed(embed_request("emb-5", vec![1])), async {
+            answer_supported_tasks(&mut h.engine_in, &mut h.engine_out, &["embed"]).await;
             let request = recv_add(&mut h.engine_in).await;
             h.engine_out
                 .send_outputs(&pooled_batch("emb-5", vec![1.0, 2.0]))
@@ -1485,6 +1706,7 @@ async fn abort_rpc_cancels_an_in_flight_embed() {
     let (response, aborted) = tokio::join!(
         h.client.embed(embed_request("emb-6", vec![1, 2, 3])),
         async {
+            answer_supported_tasks(&mut h.engine_in, &mut h.engine_out, &["embed"]).await;
             recv_add(&mut h.engine_in).await;
             aborter
                 .abort(vllm::AbortRequest {
@@ -1497,5 +1719,81 @@ async fn abort_rpc_cancels_an_in_flight_embed() {
     );
     assert_eq!(response.expect_err("aborted").code(), Code::Aborted);
     assert_eq!(aborted, vec!["emb-6".to_string()]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A generation runner serves no pooling task and a pooling runner no
+/// generation task: both refusals are vLLM's frontend's, before the engine
+/// (whose own check would take it down) sees anything. A pooling runner
+/// without the `embed` task is refused with the engine's own task list,
+/// fetched once per connection.
+#[tokio::test]
+async fn embed_and_generate_are_refused_on_the_wrong_runner() {
+    let mut h = harness(model_info(), None).await;
+    let status = h
+        .client
+        .embed(embed_request("emb-7", vec![1]))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "This model does not support pooling");
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let mut h = harness(pooling_model_info(), None).await;
+    let status = h
+        .client
+        .generate(generate_request("g1", false, Vec::new()))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "This model does not support generation");
+    let (status, ()) = tokio::join!(
+        h.client.embed(embed_request("emb-8", vec![1])),
+        answer_supported_tasks(&mut h.engine_in, &mut h.engine_out, &["classify", "render"]),
+    );
+    let status = status.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(
+        status.message(),
+        "Unsupported task: 'embed' Supported tasks: [\"classify\"]"
+    );
+    // Cached: the second refusal makes no engine call.
+    let status = h
+        .client
+        .embed(embed_request("emb-9", vec![1]))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The launcher's pooler config reaches the engine's pooling params the way
+/// vLLM's frontend merges it: an activation turned off and a Matryoshka
+/// dimension ride every `Embed`.
+#[tokio::test]
+async fn embed_params_carry_the_pooler_config() {
+    let mut model = pooling_model_info();
+    model.pooler_use_activation = Some(false);
+    model.pooler_dimensions = Some(3);
+    let mut h = harness(model, None).await;
+    let (response, request) =
+        tokio::join!(h.client.embed(embed_request("emb-10", vec![1, 2])), async {
+            answer_supported_tasks(&mut h.engine_in, &mut h.engine_out, &["embed"]).await;
+            let request = recv_add(&mut h.engine_in).await;
+            h.engine_out
+                .send_outputs(&pooled_batch("emb-10", vec![1.0, 2.0, 3.0]))
+                .await
+                .unwrap();
+            request
+        });
+    let params = request.pooling_params.expect("pooling params");
+    assert_eq!(params.use_activation, Some(false));
+    assert_eq!(params.dimensions, Some(3));
+    assert_eq!(
+        response.expect("embed").into_inner().embedding,
+        vec![1.0, 2.0, 3.0]
+    );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

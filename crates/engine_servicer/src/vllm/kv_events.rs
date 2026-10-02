@@ -232,6 +232,11 @@ enum WireEvent {
         block_hashes: Vec<BlockHash>,
     },
     AllBlocksCleared,
+    /// An event type this relay does not convert (one a newer vLLM added):
+    /// skipped on its own, like the Python relay's unknown types, so the
+    /// batch's other events still go through.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A block hash as the proto's signed 64-bit identity (the Python relay's
@@ -338,6 +343,13 @@ fn convert_event(event: WireEvent, event_id: u64) -> Option<common::KvCacheEvent
             })
         }
         WireEvent::AllBlocksCleared => kv_cache_event::Data::Cleared(common::KvCacheCleared {}),
+        WireEvent::Unknown => {
+            debug!(
+                event_id,
+                "Skipping a KV event of a type this relay does not convert"
+            );
+            return None;
+        }
     };
     Some(common::KvCacheEvent {
         event_id,
@@ -345,9 +357,9 @@ fn convert_event(event: WireEvent, event_id: u64) -> Option<common::KvCacheEvent
     })
 }
 
-/// Golden publisher payloads encoded by the installed vLLM
-/// (`0.30.1rc1.dev559`, msgspec 0.22) via `/tmp/kvevents-golden/gen.py`; the
-/// expected protos in the tests are what its Python relay produced for them.
+/// Golden publisher payloads encoded by vLLM 0.30.1rc1 (msgspec 0.22) with
+/// `crates/engine_servicer/scripts/generate_kv_events_golden.py`, which also
+/// prints the Python relay's conversion of them (the expected protos below).
 #[cfg(test)]
 pub(crate) mod golden {
     use zeromq::ZmqMessage;
@@ -485,8 +497,8 @@ mod tests {
     }
 
     /// The batch array may omit the trailing rank and may grow new fields;
-    /// an event of an unknown type fails the batch as msgspec's typed decoder
-    /// does for the Python relay (which then skips it).
+    /// an event of a type this relay does not convert is skipped on its own
+    /// (consuming its event id), as the Python relay skips unknown types.
     #[test]
     fn batch_layout_tolerates_an_omitted_rank_and_trailing_fields() {
         let short = rmp_serde::to_vec(&(1.5f64, Vec::<u8>::new())).unwrap();
@@ -502,9 +514,23 @@ mod tests {
             .0;
         assert_eq!(batch.data_parallel_rank, Some(2));
 
-        let unknown =
-            rmp_serde::to_vec(&serde_json::json!([1.5, [{"type": "Mystery", "x": 1}]])).unwrap();
-        assert!(rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(&unknown).is_err());
+        let unknown = rmp_serde::to_vec(&serde_json::json!([
+            1.5,
+            [{"type": "Mystery", "x": 1}, {"type": "AllBlocksCleared"}]
+        ]))
+        .unwrap();
+        let batch = rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(&unknown)
+            .unwrap()
+            .0;
+        let mut event_id = 4;
+        let converted = convert_batch(batch, 7, &mut event_id);
+        assert_eq!(event_id, 6, "the skipped event still consumed an id");
+        assert_eq!(converted.events.len(), 1);
+        assert_eq!(converted.events[0].event_id, 6);
+        assert!(matches!(
+            converted.events[0].data,
+            Some(kv_cache_event::Data::Cleared(_))
+        ));
     }
 
     #[test]

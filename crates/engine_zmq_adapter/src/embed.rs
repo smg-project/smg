@@ -7,7 +7,9 @@
 //! check it performs is repeated in [`translate_embed_request`].
 
 use engine_zmq_client::protocol::vllm::{
-    output::EngineCoreFinishReason, pooling::PoolingParams, request::EngineCoreRequest,
+    output::EngineCoreFinishReason,
+    pooling::{PoolerDefaults, PoolingParams, POOLING_TASKS},
+    request::EngineCoreRequest,
 };
 use futures::StreamExt;
 use smg_grpc_client::vllm_proto as vllm;
@@ -58,16 +60,40 @@ impl ZmqEngineClient {
     /// pooled vector. A pooling request has no sampling duties for the
     /// frontend; the engine answers it with exactly one finished output,
     /// which becomes the `EmbedResponse` (`prompt_tokens` is the prompt's
-    /// length, as the Python servicer reports it).
-    pub async fn embed(&self, req: vllm::EmbedRequest) -> Result<vllm::EmbedResponse, Status> {
+    /// length, as the Python servicer reports it). `pooler` is the model's
+    /// pooler config, merged into the params as vLLM's frontend merges it.
+    pub async fn embed(
+        &self,
+        req: vllm::EmbedRequest,
+        pooler: PoolerDefaults,
+    ) -> Result<vllm::EmbedResponse, Status> {
         let client = self.vllm_client("Embed")?;
         let max_model_len = client
             .engines()
             .first()
             .map(|engine| engine.ready_response.max_model_len)
             .ok_or_else(|| Status::unavailable("no connected ZMQ engine"))?;
-        let request = translate_embed_request(req, PoolingParams::embed(), max_model_len)
+        let request = translate_embed_request(req, PoolingParams::embed_for(pooler), max_model_len)
             .map_err(Status::invalid_argument)?;
+        // vLLM's frontend refuses a task the model runner does not serve
+        // (`InputProcessor._validate_params`, in its words); the engine's own
+        // check raises on its busy loop and takes EngineCore down with it.
+        let tasks = self.supported_tasks().await?;
+        let pooling_tasks: Vec<&str> = tasks
+            .iter()
+            .map(String::as_str)
+            .filter(|task| POOLING_TASKS.contains(task))
+            .collect();
+        if pooling_tasks.is_empty() {
+            return Err(Status::invalid_argument(
+                "This model does not support pooling",
+            ));
+        }
+        if !pooling_tasks.contains(&"embed") {
+            return Err(Status::invalid_argument(format!(
+                "Unsupported task: 'embed' Supported tasks: {pooling_tasks:?}"
+            )));
+        }
         let request_id = request.request_id.clone();
         let prompt_tokens = request
             .prompt_token_ids
@@ -116,8 +142,11 @@ mod tests {
     use std::{collections::BTreeSet, time::Duration};
 
     use engine_zmq_client::{
-        codec::tensor::WireTensor,
-        mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
+        codec::{tensor::WireTensor, OpaqueValue},
+        mock_engine::{
+            connect_to_frontend, default_ready_response, EngineInbound, MockEngineInput,
+            MockEngineOutput,
+        },
         protocol::vllm::{
             output::{EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs},
             pooling::PoolingOutput,
@@ -189,13 +218,28 @@ mod tests {
         })
     }
 
-    /// End-to-end over ipc://: the embed request reaches the engine as a
-    /// pooling request, and the engine's finished output comes back as the
-    /// vector; an engine-side abort and a finish without output are errors.
-    #[tokio::test]
-    async fn embed_e2e_submits_pooling_params_and_maps_the_vector() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+    /// Answer the engine's one-time `get_supported_tasks` utility call.
+    async fn answer_supported_tasks(
+        engine_in: &mut MockEngineInput,
+        engine_out: &mut MockEngineOutput,
+        tasks: &[&str],
+    ) {
+        let EngineInbound::Utility(call) = engine_in.recv().await.unwrap() else {
+            panic!("expected the supported-tasks utility call");
+        };
+        assert_eq!(call.method, "get_supported_tasks");
+        assert!(call.args.is_empty());
+        let tasks: Vec<OpaqueValue> = tasks.iter().map(|task| OpaqueValue::from(*task)).collect();
+        engine_out
+            .send_utility_reply(0, call.call_id, Ok(OpaqueValue::Array(tasks)))
+            .await
+            .unwrap();
+    }
+
+    async fn connected(
+        dir: &std::path::Path,
+    ) -> (ZmqEngineClient, MockEngineInput, MockEngineOutput) {
+        let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
         let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
         let (client, engine) = tokio::join!(
             ZmqEngineClient::connect(
@@ -215,11 +259,68 @@ mod tests {
             ),
         );
         let client = client.expect("adapter connect");
-        let (mut engine_in, mut engine_out) = engine.expect("mock engine").split();
+        let (engine_in, engine_out) = engine.expect("mock engine").split();
+        (client, engine_in, engine_out)
+    }
 
+    /// The engine's task list gates the request before anything reaches the
+    /// scheduler: a generation runner has no pooling task, a classifier has
+    /// pooling tasks but not `embed`. Fetched once per connection.
+    #[tokio::test]
+    async fn embed_is_refused_when_the_engine_lacks_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engine_in, mut engine_out) = connected(dir.path()).await;
+        let (status, ()) = tokio::join!(
+            client.embed(embed_request("e1", vec![1]), PoolerDefaults::default()),
+            answer_supported_tasks(&mut engine_in, &mut engine_out, &["generate"]),
+        );
+        let status = status.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "This model does not support pooling");
+        // Cached: no second utility call, the refusal is immediate.
+        let status = client
+            .embed(embed_request("e2", vec![1]), PoolerDefaults::default())
+            .await
+            .expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), engine_in.recv())
+                .await
+                .is_err(),
+            "nothing reached the engine"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engine_in, mut engine_out) = connected(dir.path()).await;
+        let (status, ()) = tokio::join!(
+            client.embed(embed_request("e3", vec![1]), PoolerDefaults::default()),
+            answer_supported_tasks(&mut engine_in, &mut engine_out, &["classify", "render"]),
+        );
+        let status = status.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "Unsupported task: 'embed' Supported tasks: [\"classify\"]"
+        );
+    }
+
+    /// End-to-end over ipc://: the embed request reaches the engine as a
+    /// pooling request, and the engine's finished output comes back as the
+    /// vector; an engine-side abort and a finish without output are errors.
+    #[tokio::test]
+    async fn embed_e2e_submits_pooling_params_and_maps_the_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engine_in, mut engine_out) = connected(dir.path()).await;
+
+        let pooler = PoolerDefaults {
+            use_activation: Some(false),
+            dimensions: Some(2),
+        };
         let (response, request) = tokio::join!(
-            client.embed(embed_request("e1", vec![101, 7592, 102])),
+            client.embed(embed_request("e1", vec![101, 7592, 102]), pooler),
             async {
+                answer_supported_tasks(&mut engine_in, &mut engine_out, &["embed", "classify"])
+                    .await;
                 let EngineInbound::Add(request) = engine_in.recv().await.unwrap() else {
                     panic!("expected Add");
                 };
@@ -236,28 +337,38 @@ mod tests {
         );
         assert_eq!(request.prompt_token_ids, Some(vec![101, 7592, 102]));
         assert!(request.sampling_params.is_none());
-        assert_eq!(request.pooling_params, Some(PoolingParams::embed()));
+        // The pooler config rode into the params.
+        assert_eq!(
+            request.pooling_params,
+            Some(PoolingParams::embed_for(pooler))
+        );
         let response = response.expect("embed");
         assert_eq!(response.embedding, vec![0.5, -0.25]);
         assert_eq!(response.prompt_tokens, 3);
         assert_eq!(response.embedding_dim, 2);
 
-        let (response, ()) = tokio::join!(client.embed(embed_request("e2", vec![1])), async {
-            engine_in.recv().await.unwrap();
-            engine_out
-                .send_outputs(&pooled("e2", EngineCoreFinishReason::Abort, None))
-                .await
-                .unwrap();
-        });
+        let (response, ()) = tokio::join!(
+            client.embed(embed_request("e2", vec![1]), PoolerDefaults::default()),
+            async {
+                engine_in.recv().await.unwrap();
+                engine_out
+                    .send_outputs(&pooled("e2", EngineCoreFinishReason::Abort, None))
+                    .await
+                    .unwrap();
+            }
+        );
         assert_eq!(response.unwrap_err().code(), Code::Aborted);
 
-        let (response, ()) = tokio::join!(client.embed(embed_request("e3", vec![1])), async {
-            engine_in.recv().await.unwrap();
-            engine_out
-                .send_outputs(&pooled("e3", EngineCoreFinishReason::Stop, None))
-                .await
-                .unwrap();
-        });
+        let (response, ()) = tokio::join!(
+            client.embed(embed_request("e3", vec![1]), PoolerDefaults::default()),
+            async {
+                engine_in.recv().await.unwrap();
+                engine_out
+                    .send_outputs(&pooled("e3", EngineCoreFinishReason::Stop, None))
+                    .await
+                    .unwrap();
+            }
+        );
         let status = response.unwrap_err();
         assert_eq!(status.code(), Code::Internal);
         assert!(status.message().contains("without a pooling output"));

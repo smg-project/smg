@@ -106,6 +106,9 @@ pub struct EngineCoreOutput {
 
 /// vLLM's `RequestSpecDecodeMetrics` (a dataclass, so a msgpack map): the
 /// histogram of accepted draft tokens per verify step and the drafted total.
+/// Informational, so the wire decodes it leniently (see
+/// [`WireEngineCoreOutput`]): the per-step detail is optional, and a shape
+/// this struct does not know drops the metrics rather than the batch.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpecDecodeMetrics {
@@ -113,8 +116,21 @@ pub struct SpecDecodeMetrics {
     /// Index `j` counts the verify steps that accepted `j` draft tokens.
     pub histogram: Vec<u64>,
     pub num_draft_tokens: u64,
-    pub per_step_accepted: Vec<u32>,
-    pub per_step_drafted: Vec<u32>,
+    pub per_step_accepted: Option<Vec<u32>>,
+    pub per_step_drafted: Option<Vec<u32>>,
+}
+
+/// Decode `spec_decode_metrics` without failing the frame: an explicit nil,
+/// a renamed or retyped field in a newer vLLM, or any other mismatch yields
+/// `None` for this output; nothing downstream needs the counters.
+fn lenient_spec_decode_metrics<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<SpecDecodeMetrics>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<OpaqueValue>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| rmpv::ext::from_value(value).ok()))
 }
 
 impl SpecDecodeMetrics {
@@ -215,7 +231,7 @@ struct WireEngineCoreOutput {
     /// Updated sampling mask (untyped for now).
     #[serde(default)]
     new_sampling_mask: Option<OpaqueValue>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_spec_decode_metrics")]
     spec_decode_metrics: Option<SpecDecodeMetrics>,
 }
 
@@ -674,6 +690,81 @@ mod tests {
 
     fn encoded_frame(outputs: &EngineCoreOutputs) -> Vec<Bytes> {
         vec![Bytes::from(encode_msgpack(outputs).unwrap())]
+    }
+
+    /// `spec_decode_metrics` is informational: the per-step lists may be nil,
+    /// unknown keys are ignored, and a retyped field drops the metrics for
+    /// that output without failing the batch.
+    #[test]
+    fn spec_decode_metrics_decode_leniently() {
+        use rmpv::Value;
+
+        let metrics = SpecDecodeMetrics {
+            num_spec_tokens: 2,
+            histogram: vec![1, 0, 3],
+            num_draft_tokens: 8,
+            per_step_accepted: Some(vec![0, 2]),
+            per_step_drafted: Some(vec![2, 2]),
+        };
+        let outputs = batch(vec![EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![1],
+            spec_decode_metrics: Some(metrics.clone()),
+            ..Default::default()
+        }]);
+        let decoded = decode_engine_core_outputs(&encoded_frame(&outputs)).unwrap();
+        assert_eq!(
+            decoded.as_request_batch().unwrap().outputs[0].spec_decode_metrics,
+            Some(metrics)
+        );
+
+        // Rewrite the encoded metrics map (the output array's last element).
+        type MapEdit = dyn Fn(&mut Vec<(Value, Value)>);
+        let re_encode = |edit: &MapEdit| {
+            let mut value = decode_value(&encoded_frame(&outputs)[0]).unwrap();
+            let Value::Array(top) = &mut value else {
+                panic!("array")
+            };
+            let Value::Array(items) = &mut top[1] else {
+                panic!("outputs")
+            };
+            let Value::Array(fields) = &mut items[0] else {
+                panic!("output")
+            };
+            let Value::Map(map) = fields.last_mut().unwrap() else {
+                panic!("metrics map")
+            };
+            edit(map);
+            vec![Bytes::from(encode_msgpack(&value).unwrap())]
+        };
+        let nil_steps = re_encode(&|map| {
+            for (key, value) in map.iter_mut() {
+                if key.as_str() == Some("per_step_accepted") {
+                    *value = Value::Nil;
+                }
+            }
+            map.push((Value::from("future_field"), Value::from("x")));
+        });
+        let decoded = decode_engine_core_outputs(&nil_steps).unwrap();
+        let lenient = decoded.as_request_batch().unwrap().outputs[0]
+            .spec_decode_metrics
+            .clone()
+            .expect("metrics kept");
+        assert_eq!(lenient.histogram, vec![1, 0, 3]);
+        assert_eq!(lenient.per_step_accepted, None);
+        assert_eq!(lenient.per_step_drafted, Some(vec![2, 2]));
+
+        let retyped = re_encode(&|map| {
+            for (key, value) in map.iter_mut() {
+                if key.as_str() == Some("histogram") {
+                    *value = Value::from("not a list");
+                }
+            }
+        });
+        let decoded = decode_engine_core_outputs(&retyped).unwrap();
+        let output = &decoded.as_request_batch().unwrap().outputs[0];
+        assert_eq!(output.new_token_ids, vec![1]);
+        assert_eq!(output.spec_decode_metrics, None);
     }
 
     #[test]

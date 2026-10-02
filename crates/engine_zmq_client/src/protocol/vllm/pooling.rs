@@ -52,6 +52,17 @@ pub enum PoolingTask {
     EmbedAndTokenClassify,
 }
 
+/// Every pooling task name (`vllm.tasks.POOLING_TASKS`); what an engine's
+/// `get_supported_tasks` answer is filtered by to find its pooling tasks.
+pub const POOLING_TASKS: [&str; 6] = [
+    "embed",
+    "classify",
+    "token_embed",
+    "token_classify",
+    "plugin",
+    "embed&token_classify",
+];
+
 /// Worker-side late-interaction scoring metadata. Mirrors Python
 /// `LateInteractionParams` (`array_like`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
@@ -94,7 +105,33 @@ pub struct PoolingParams {
     pub output_kind: RequestOutputKind,
 }
 
+/// The model's pooler config fields vLLM's frontend merges into a pooling
+/// request's unset parameters (`PoolingParams._merge_default_parameters`):
+/// `use_activation` and the Matryoshka `dimensions`, from `--pooler-config`
+/// or the model's own pooling config (a sentence-transformers model without
+/// a `Normalize` module turns the activation off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PoolerDefaults {
+    pub use_activation: Option<bool>,
+    pub dimensions: Option<u32>,
+}
+
 impl PoolingParams {
+    /// What vLLM's frontend hands the engine for `PoolingParams(task="embed")`
+    /// on a model with these pooler defaults: they fill the unset
+    /// `use_activation` and `dimensions` (`_merge_default_parameters`), then
+    /// an activation still unset defaults to on (`_set_default_parameters`);
+    /// prefix-cache reads stay enabled for sequence pooling.
+    pub fn embed_for(pooler: PoolerDefaults) -> Self {
+        Self {
+            use_activation: pooler.use_activation.or(Some(true)),
+            dimensions: pooler.dimensions,
+            task: Some(PoolingTask::Embed),
+            skip_reading_prefix_cache: Some(false),
+            ..Self::default()
+        }
+    }
+
     /// What vLLM's frontend hands the engine for an embedding request:
     /// `PoolingParams(task="embed")` after `InputProcessor._validate_params`
     /// ran `verify(model_config)` on it, which turns the activation on
@@ -102,12 +139,7 @@ impl PoolingParams {
     /// (`_merge_default_parameters`). A pooler config overriding
     /// `use_activation` or `dimensions` is the caller's to apply on top.
     pub fn embed() -> Self {
-        Self {
-            use_activation: Some(true),
-            task: Some(PoolingTask::Embed),
-            skip_reading_prefix_cache: Some(false),
-            ..Self::default()
-        }
+        Self::embed_for(PoolerDefaults::default())
     }
 }
 
@@ -205,6 +237,31 @@ mod tests {
         assert_eq!(array[5], Value::from(false)); // requires_token_ids
         assert_eq!(array[6], Value::from(false)); // skip_reading_prefix_cache
         assert_eq!(array[9], Value::from(2)); // output_kind FINAL_ONLY
+    }
+
+    /// The pooler config fills what the request left unset, as vLLM's
+    /// `_merge_default_parameters` does, before the `use_activation` default.
+    #[test]
+    fn embed_params_take_the_pooler_defaults() {
+        assert_eq!(
+            PoolingParams::embed_for(PoolerDefaults::default()),
+            PoolingParams::embed()
+        );
+        let params = PoolingParams::embed_for(PoolerDefaults {
+            use_activation: Some(false),
+            dimensions: Some(256),
+        });
+        assert_eq!(params.use_activation, Some(false));
+        assert_eq!(params.dimensions, Some(256));
+        assert_eq!(params.task, Some(PoolingTask::Embed));
+        assert_eq!(params.skip_reading_prefix_cache, Some(false));
+        // Dimensions alone leave the activation at its default.
+        let params = PoolingParams::embed_for(PoolerDefaults {
+            use_activation: None,
+            dimensions: Some(64),
+        });
+        assert_eq!(params.use_activation, Some(true));
+        assert_eq!(params.dimensions, Some(64));
     }
 
     #[test]

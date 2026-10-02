@@ -34,9 +34,11 @@ pub use client::{
     ZmqEngineClient, ZmqModelInfo, ZmqServerInfo,
 };
 pub use embed::translate_embed_request;
-pub use engine_zmq_client::protocol::vllm::pooling::PoolingParams;
+pub use engine_zmq_client::protocol::vllm::pooling::{PoolerDefaults, PoolingParams};
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sockets::zmq_handshake_address;
 pub use stream::ZmqGenerateStream;
 pub use tokenspeed::TokenSpeedGenerateStream;
-pub use vllm::{structured_outputs_backend_from_config, VllmGenerateStream};
+pub use vllm::{
+    structured_outputs_backend_from_config, StructuredOutputsBackendConfig, VllmGenerateStream,
+};
