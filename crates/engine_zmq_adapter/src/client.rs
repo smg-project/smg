@@ -324,6 +324,18 @@ impl ZmqEngineClient {
         }
     }
 
+    /// The vLLM EngineCore client behind this connection, for RPCs only the
+    /// vLLM wire defines; `operation` names the RPC in the refusal a
+    /// TokenSpeed backend answers.
+    pub(crate) fn vllm_client(&self, operation: &str) -> Result<&EngineCoreClient, tonic::Status> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => Ok(client),
+            ZmqBackend::TokenSpeed(_) => Err(tonic::Status::unimplemented(format!(
+                "{operation} is only available on a vLLM ZMQ backend"
+            ))),
+        }
+    }
+
     /// The first connected engine's handshake `READY` response: the
     /// connection-constant engine facts (context length, dtype, parallel
     /// sizes, KV capacity) a frontend re-exposes as metadata.

@@ -5,14 +5,15 @@
 //! shapes, field order, and `array_like` positional-tuple encoding are the wire
 //! contract with Python `EngineCoreProc` — do not reorder fields.
 //!
-//! Text generation, structured outputs (guided decoding), and multimodal
-//! features are typed fully. Pooling params and prompt embeds are carried as
-//! [`crate::codec::OpaqueValue`] — they serialize as `nil` on supported paths.
+//! Text generation, structured outputs (guided decoding), multimodal features
+//! and pooling (embedding) requests are typed fully. Prompt embeds are carried
+//! as [`crate::codec::OpaqueValue`] — they serialize as `nil` on supported paths.
 
 pub mod logprobs;
 pub mod lora;
 pub mod multimodal;
 pub mod output;
+pub mod pooling;
 pub mod request;
 pub mod sampling;
 pub mod stats;

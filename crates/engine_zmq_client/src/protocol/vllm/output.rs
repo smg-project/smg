@@ -14,10 +14,13 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
-    codec::{decode_msgpack, deserialize_tolerant_seq, OpaqueValue, TrailingTolerant},
+    codec::{
+        decode_msgpack, deserialize_tolerant_seq, tensor::WireTensor, OpaqueValue, TrailingTolerant,
+    },
     error::{Error, Result},
     protocol::vllm::{
         logprobs::{Logprobs, WireLogprobs},
+        pooling::PoolingOutput,
         stats::{PrefillStats, SchedulerStats},
     },
 };
@@ -66,9 +69,9 @@ pub struct EngineCoreEvent {
 /// Engine-core output for a single request. Mirrors Python `EngineCoreOutput`
 /// (`array_like` — field order is the wire contract).
 ///
-/// Logprobs are resolved out of their wire form (aux frames, raw views) by
-/// [`decode_engine_core_outputs`], so this type only ever carries decoded
-/// [`Logprobs`].
+/// Logprobs and the pooling tensor are resolved out of their wire form (aux
+/// frames, raw views) by [`decode_engine_core_outputs`], so this type only
+/// ever carries decoded [`Logprobs`] and a resolved [`PoolingOutput`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EngineCoreOutput {
     pub request_id: String,
@@ -77,7 +80,8 @@ pub struct EngineCoreOutput {
     pub new_logprobs: Option<Logprobs>,
     /// Decoded prompt logprobs for the scored prompt positions.
     pub new_prompt_logprobs_tensors: Option<Logprobs>,
-    pub pooling_output: Option<OpaqueValue>,
+    /// The pooled tensor of a pooling request, set on its finishing output.
+    pub pooling_output: Option<PoolingOutput>,
     pub finish_reason: Option<EngineCoreFinishReason>,
     pub stop_reason: Option<StopReason>,
     pub events: Option<Vec<EngineCoreEvent>>,
@@ -144,7 +148,7 @@ impl Serialize for EngineCoreOutput {
             new_token_ids: &self.new_token_ids,
             new_logprobs: new_logprobs.as_ref(),
             new_prompt_logprobs_tensors: new_prompt_logprobs_tensors.as_ref(),
-            pooling_output: self.pooling_output.as_ref(),
+            pooling_output: self.pooling_output.as_ref().map(PoolingOutput::as_wire),
             finish_reason: self.finish_reason,
             stop_reason: self.stop_reason.as_ref(),
             events: self.events.as_deref(),
@@ -185,7 +189,7 @@ struct WireEngineCoreOutput {
     #[serde(default)]
     new_prompt_logprobs_tensors: Option<Box<WireLogprobs>>,
     #[serde(default)]
-    pooling_output: Option<OpaqueValue>,
+    pooling_output: Option<WireTensor>,
     #[serde(default)]
     finish_reason: Option<EngineCoreFinishReason>,
     #[serde(default)]
@@ -229,7 +233,10 @@ impl WireEngineCoreOutput {
                 .new_prompt_logprobs_tensors
                 .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
                 .transpose()?,
-            pooling_output: self.pooling_output,
+            pooling_output: self
+                .pooling_output
+                .map(|tensor| PoolingOutput::resolve(tensor, frames))
+                .transpose()?,
             finish_reason: self.finish_reason,
             stop_reason: self.stop_reason,
             events: self.events,
@@ -254,7 +261,7 @@ struct WireEngineCoreOutputRef<'a> {
     new_token_ids: &'a [u32],
     new_logprobs: Option<&'a WireLogprobs>,
     new_prompt_logprobs_tensors: Option<&'a WireLogprobs>,
-    pooling_output: Option<&'a OpaqueValue>,
+    pooling_output: Option<&'a WireTensor>,
     finish_reason: Option<EngineCoreFinishReason>,
     stop_reason: Option<&'a StopReason>,
     events: Option<&'a [EngineCoreEvent]>,
@@ -579,9 +586,83 @@ mod tests {
         codec::{
             decode_value, encode_msgpack, hex,
             tensor::{WireArrayData, WireNdArray},
+            unhex,
         },
         protocol::vllm::logprobs::{PositionLogprobs, TokenLogprob},
     };
+
+    /// vLLM's own `MsgpackEncoder` bytes (vLLM 0.30.1rc1) for
+    /// `EngineCoreOutputs(outputs=[EngineCoreOutput(request_id="emb-1",
+    /// new_token_ids=[], pooling_output=tensor([0.25, -1.5, 3.0]),
+    /// finish_reason=STOP)], finished_requests={"emb-1"})`: an 18-field
+    /// output (two past this struct) with the tensor inline as a raw-view ext.
+    const VLLM_POOLING_OUTPUTS_INLINE: &str = "980091dc0012a5656d622d3190c0c093a7666c6f617433329103c70c030000803e0000c0bf0000404000c0c0c0c0c0c0c000c0c0c0c0c0cb415e4c4313f62b42c091a5656d622d31c0c0";
+    /// The same for `emb-2` with a 96-float tensor: over vLLM's 256-byte
+    /// inline threshold, so the primary frame carries aux index 1 instead.
+    const VLLM_POOLING_OUTPUTS_AUX: &str = "980091dc0012a5656d622d3290c0c093a7666c6f6174333291600100c0c0c0c0c0c0c000c0c0c0c0c0cb415e4c4313f6c03dc091a5656d622d32c0c0";
+
+    #[test]
+    fn decode_vllm_pooling_output_inline() {
+        let frame = Bytes::from(unhex(VLLM_POOLING_OUTPUTS_INLINE));
+        let batch = decode_engine_core_outputs(&[frame])
+            .unwrap()
+            .into_request_batch()
+            .expect("request batch");
+        assert_eq!(
+            batch.finished_requests,
+            Some(BTreeSet::from(["emb-1".to_string()]))
+        );
+        let output = &batch.outputs[0];
+        assert_eq!(output.request_id, "emb-1");
+        assert!(output.new_token_ids.is_empty());
+        // Pooling finishes as STOP on the tick that produced the output.
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+        let pooled = output.pooling_output.as_ref().expect("pooling output");
+        assert_eq!(pooled.dtype(), "float32");
+        assert_eq!(pooled.shape(), &[3]);
+        assert_eq!(pooled.to_vector().unwrap(), vec![0.25, -1.5, 3.0]);
+    }
+
+    #[test]
+    fn decode_vllm_pooling_output_from_aux_frame() {
+        let values: Vec<f32> = (0..96).map(|i| i as f32 / 8.0).collect();
+        let aux = Bytes::from(
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let frames = vec![Bytes::from(unhex(VLLM_POOLING_OUTPUTS_AUX)), aux.clone()];
+        let batch = decode_engine_core_outputs(&frames)
+            .unwrap()
+            .into_request_batch()
+            .expect("request batch");
+        let pooled = batch.outputs[0]
+            .pooling_output
+            .as_ref()
+            .expect("pooling output");
+        assert_eq!(pooled.shape(), &[96]);
+        // Zero-copy: the resolved payload aliases the aux frame.
+        assert_eq!(
+            pooled.as_wire().data.as_raw_view().unwrap().as_ptr(),
+            aux.as_ptr()
+        );
+        assert_eq!(pooled.to_vector().unwrap(), values);
+    }
+
+    #[test]
+    fn pooling_output_roundtrips_through_the_mock_send_path() {
+        let outputs = batch(vec![EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            pooling_output: Some(PoolingOutput::new(
+                WireTensor::from_f32(vec![2], vec![1.0, -2.0]).unwrap(),
+            )),
+            finish_reason: Some(EngineCoreFinishReason::Stop),
+            ..Default::default()
+        }]);
+        let decoded = decode_engine_core_outputs(&encoded_frame(&outputs)).unwrap();
+        assert_eq!(decoded, outputs);
+    }
 
     fn batch(outputs: Vec<EngineCoreOutput>) -> EngineCoreOutputs {
         EngineCoreOutputs::RequestBatch(RequestBatchOutputs {

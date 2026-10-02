@@ -19,6 +19,7 @@
 //! grows the paths.
 
 mod admin;
+mod embed;
 mod engine;
 mod generate;
 mod info;

@@ -116,6 +116,15 @@ pub(crate) fn hex(text: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Bytes of a hex string: the golden wire samples captured from vLLM.
+#[cfg(test)]
+pub(crate) fn unhex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digit"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

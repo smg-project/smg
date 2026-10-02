@@ -1,6 +1,8 @@
 use std::{collections::BTreeSet, fs, io::Cursor, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use engine_zmq_client::{
+    codec::tensor::WireTensor,
     mock_engine::{
         connect_to_frontend, default_ready_response, EngineInbound, MockEngineInput,
         MockEngineOutput,
@@ -10,6 +12,7 @@ use engine_zmq_client::{
             EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
             SpecDecodeMetrics, StopReason,
         },
+        pooling::{PoolingOutput, PoolingParams},
         request::EngineCoreRequest,
         stats::SchedulerStats,
         structured_outputs::StructuredOutputBackend,
@@ -881,20 +884,15 @@ async fn info_rpcs_report_config_and_handshake_facts() {
     );
     assert_eq!(loads.version, ready.vllm_version);
 
-    for status in [
-        h.client
-            .embed(vllm::EmbedRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err(),
-        h.client
-            .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err(),
-    ] {
-        assert_eq!(status.code(), Code::Unimplemented);
-    }
+    // With no KV-event publisher configured, the relay is the one RPC that
+    // still answers UNIMPLEMENTED.
+    let status = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unimplemented);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -1327,4 +1325,177 @@ mod flush_cache {
                 .is_err()
         );
     }
+}
+
+// ---- Embed ----
+
+fn embed_request(id: &str, input_ids: Vec<u32>) -> vllm::EmbedRequest {
+    vllm::EmbedRequest {
+        request_id: id.to_string(),
+        tokenized: Some(vllm::TokenizedInput {
+            original_text: String::new(),
+            input_ids,
+        }),
+    }
+}
+
+fn pooling_model_info() -> VllmModelInfo {
+    VllmModelInfo {
+        is_generation: false,
+        model_type: "bert".to_string(),
+        architectures: vec!["BertModel".to_string()],
+        ..model_info()
+    }
+}
+
+/// One finished pooling output for `request_id`, encoded by the Rust side.
+fn pooled_batch(request_id: &str, values: Vec<f32>) -> EngineCoreOutputs {
+    EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+        outputs: vec![EngineCoreOutput {
+            request_id: request_id.to_string(),
+            pooling_output: Some(PoolingOutput::new(
+                WireTensor::from_f32(vec![values.len()], values).unwrap(),
+            )),
+            finish_reason: Some(EngineCoreFinishReason::Stop),
+            ..Default::default()
+        }],
+        finished_requests: Some(BTreeSet::from([request_id.to_string()])),
+        ..Default::default()
+    })
+}
+
+fn unhex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digit"))
+        .collect()
+}
+
+/// vLLM's own `MsgpackEncoder` bytes (vLLM 0.30.1rc1) for the finished
+/// pooling output of request `emb-1`: `tensor([0.25, -1.5, 3.0])` inline as a
+/// raw-view ext, finish reason STOP, as the engine answers an embedding
+/// request.
+const VLLM_EMBED_OUTPUT_INLINE: &str = "980091dc0012a5656d622d3190c0c093a7666c6f617433329103c70c030000803e0000c0bf0000404000c0c0c0c0c0c0c000c0c0c0c0c0cb415e4c4313f62b42c091a5656d622d31c0c0";
+/// The same for `emb-2` with a 96-float tensor, which exceeds vLLM's 256-byte
+/// inline threshold and rides as aux frame 1 (the primary frame carries its
+/// index).
+const VLLM_EMBED_OUTPUT_AUX_FRAME0: &str = "980091dc0012a5656d622d3290c0c093a7666c6f6174333291600100c0c0c0c0c0c0c000c0c0c0c0c0cb415e4c4313f6c03dc091a5656d622d32c0c0";
+
+/// `Embed` submits a pooling request (no sampling params, the verified
+/// `PoolingParams(task="embed")`) and answers from the engine's single
+/// finished output, decoded from vLLM's own wire bytes: an inline tensor and
+/// an aux-frame one.
+#[tokio::test]
+async fn embed_answers_from_the_engines_pooling_output() {
+    let mut h = harness(pooling_model_info(), None).await;
+    let (response, request) = tokio::join!(
+        h.client
+            .embed(embed_request("emb-1", vec![101, 7592, 2088, 102])),
+        async {
+            let request = recv_add(&mut h.engine_in).await;
+            h.engine_out
+                .send_frames(vec![Bytes::from(unhex(VLLM_EMBED_OUTPUT_INLINE))])
+                .await
+                .unwrap();
+            request
+        }
+    );
+    assert_eq!(request.request_id, "emb-1");
+    assert_eq!(request.prompt_token_ids, Some(vec![101, 7592, 2088, 102]));
+    assert!(request.sampling_params.is_none());
+    assert_eq!(request.pooling_params, Some(PoolingParams::embed()));
+    let response = response.expect("embed").into_inner();
+    assert_eq!(response.embedding, vec![0.25, -1.5, 3.0]);
+    assert_eq!(response.prompt_tokens, 4);
+    assert_eq!(response.embedding_dim, 3);
+
+    let values: Vec<f32> = (0..96).map(|i| i as f32 / 8.0).collect();
+    let aux = Bytes::from(
+        values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let (response, ()) = tokio::join!(
+        h.client.embed(embed_request("emb-2", vec![101, 102])),
+        async {
+            recv_add(&mut h.engine_in).await;
+            h.engine_out
+                .send_frames(vec![Bytes::from(unhex(VLLM_EMBED_OUTPUT_AUX_FRAME0)), aux])
+                .await
+                .unwrap();
+        }
+    );
+    let response = response.expect("embed").into_inner();
+    assert_eq!(response.embedding, values);
+    assert_eq!(response.embedding_dim, 96);
+    assert_eq!(response.prompt_tokens, 2);
+    // The registry entry is released with the answer.
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.active_requests, 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Pooling needs the prompt's ids: a request without tokenized input (the
+/// proto's only input form), with an empty one, or without an id is refused
+/// before the engine sees it, as the Python servicer's `ValueError` maps to
+/// INVALID_ARGUMENT.
+#[tokio::test]
+async fn embed_without_tokenized_input_is_invalid() {
+    let mut h = harness(pooling_model_info(), None).await;
+    for request in [
+        vllm::EmbedRequest {
+            request_id: "emb-3".to_string(),
+            tokenized: None,
+        },
+        embed_request("emb-4", Vec::new()),
+        embed_request("", vec![1, 2]),
+    ] {
+        let status = h.client.embed(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{}", status.message());
+    }
+    // None of them reached the engine: the next Add is the first valid one.
+    let (response, request) =
+        tokio::join!(h.client.embed(embed_request("emb-5", vec![1])), async {
+            let request = recv_add(&mut h.engine_in).await;
+            h.engine_out
+                .send_outputs(&pooled_batch("emb-5", vec![1.0, 2.0]))
+                .await
+                .unwrap();
+            request
+        });
+    assert_eq!(request.request_id, "emb-5");
+    assert_eq!(
+        response.expect("embed").into_inner().embedding,
+        vec![1.0, 2.0]
+    );
+}
+
+/// `Abort` ends a waiting `Embed` as it ends a generate stream: the RPC
+/// answers ABORTED and the engine-side request is aborted.
+#[tokio::test]
+async fn abort_rpc_cancels_an_in_flight_embed() {
+    let mut h = harness(pooling_model_info(), None).await;
+    let mut aborter = h.client.clone();
+    let (response, aborted) = tokio::join!(
+        h.client.embed(embed_request("emb-6", vec![1, 2, 3])),
+        async {
+            recv_add(&mut h.engine_in).await;
+            aborter
+                .abort(vllm::AbortRequest {
+                    request_ids: vec!["emb-6".to_string()],
+                })
+                .await
+                .expect("abort");
+            recv_abort(&mut h.engine_in).await
+        }
+    );
+    assert_eq!(response.expect_err("aborted").code(), Code::Aborted);
+    assert_eq!(aborted, vec!["emb-6".to_string()]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

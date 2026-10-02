@@ -10,7 +10,9 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
     codec::OpaqueValue,
-    protocol::vllm::{lora, multimodal::MmFeatures, sampling::EngineCoreSamplingParams},
+    protocol::vllm::{
+        lora, multimodal::MmFeatures, pooling::PoolingParams, sampling::EngineCoreSamplingParams,
+    },
     Error, Result,
 };
 
@@ -70,8 +72,9 @@ pub struct EngineCoreRequest {
     /// Multimodal features, one per input item, sorted by placeholder offset.
     pub mm_features: Option<MmFeatures>,
     pub sampling_params: Option<EngineCoreSamplingParams>,
-    /// Pooling parameters, preserved in the schema but not yet strongly typed.
-    pub pooling_params: Option<OpaqueValue>,
+    /// Pooling (embedding) parameters: set, with `sampling_params` unset, on
+    /// a pooling request.
+    pub pooling_params: Option<PoolingParams>,
     pub arrival_time: f64,
     #[serde(default)]
     pub lora_request: Option<lora::LoraRequest>,
@@ -225,6 +228,33 @@ mod tests {
         assert_eq!(array[4], Value::Nil); // pooling_params
         assert_eq!(array[10], Value::Nil); // prompt_is_token_ids
         assert_eq!(array[11], Value::from(7)); // client_index
+    }
+
+    /// A pooling request carries typed `pooling_params` at position 4 and no
+    /// sampling params; the nested array is byte-identical to vLLM's own
+    /// `msgspec` encoding of the verified `PoolingParams(task="embed")`.
+    #[test]
+    fn pooling_request_nests_vllm_encoded_pooling_params() {
+        let request = EngineCoreRequest {
+            request_id: "emb-1".to_string(),
+            prompt_token_ids: Some(vec![101, 2088, 102]),
+            pooling_params: Some(PoolingParams::embed()),
+            arrival_time: 1.0,
+            ..EngineCoreRequest::default()
+        };
+        let encoded = encode_msgpack(&request).unwrap();
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected array");
+        };
+        assert_eq!(array[3], Value::Nil); // sampling_params
+        let mut nested = Vec::new();
+        rmpv::encode::write_value(&mut nested, &array[4]).unwrap();
+        assert_eq!(
+            nested,
+            b"\x9a\xc3\xc0\xc0\xc0\xa5embed\xc2\xc2\xc0\xc0\x02".to_vec()
+        );
+        let decoded: EngineCoreRequest = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded, request);
     }
 
     #[test]

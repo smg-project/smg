@@ -15,9 +15,11 @@
 //! Beyond the wire translation, this crate also owns the frontend duties the
 //! tokenizer-less EngineCore cannot perform: EOS stop ids
 //! ([`fold_tokenizer_eos_backstop`]), the `max_tokens` default, the `n > 1`
-//! fan-out, and the string-stop resolution helpers in [`stops`].
+//! fan-out, the string-stop resolution helpers in [`stops`], and the pooling
+//! params an `Embed` request carries ([`translate_embed_request`]).
 
 mod client;
+mod embed;
 mod eos;
 mod fanout;
 pub mod multimodal;
@@ -31,6 +33,8 @@ pub use client::{
     connect_for_worker, connect_with_eos, kv_transfer_rejection_params, ZmqDialect,
     ZmqEngineClient, ZmqModelInfo, ZmqServerInfo,
 };
+pub use embed::translate_embed_request;
+pub use engine_zmq_client::protocol::vllm::pooling::PoolingParams;
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sockets::zmq_handshake_address;
 pub use stream::ZmqGenerateStream;

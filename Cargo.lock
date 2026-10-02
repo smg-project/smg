@@ -2214,6 +2214,7 @@ dependencies = [
 name = "engine-servicer"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "engine-zmq-adapter",
  "engine-zmq-client",

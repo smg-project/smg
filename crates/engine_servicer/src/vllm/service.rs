@@ -10,7 +10,7 @@ use smg_grpc_client::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{admin, generate, info, kv_events, requests, tokenizer_bundle, State};
+use super::{admin, embed, generate, info, kv_events, requests, tokenizer_bundle, State};
 use crate::BoxStream;
 
 /// The `VllmEngine` service over the shared state.
@@ -36,12 +36,11 @@ impl VllmEngine for VllmEngineService {
 
     async fn embed(
         &self,
-        _request: Request<vllm::EmbedRequest>,
+        request: Request<vllm::EmbedRequest>,
     ) -> Result<Response<vllm::EmbedResponse>, Status> {
-        Err(Status::unimplemented(
-            "Embed is not served by the Rust vLLM servicer yet; run the Python servicer for \
-             pooling models",
-        ))
+        embed::embed(&self.state, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn health_check(
