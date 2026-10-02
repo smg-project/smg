@@ -69,10 +69,12 @@ class RustMediaBridge:
         source: str,
         sampling_params: Callable[[], Any],
         supported_tasks: tuple[str, ...] = ("generate",),
+        renderer: Any = None,
     ) -> None:
         self._processor = processor
         self._input_processor = input_processor
         self._encoder = encoder
+        self._renderer = renderer
         self._loop = loop
         self._sampling_params = sampling_params
         self._supported_tasks = supported_tasks
@@ -116,7 +118,22 @@ class RustMediaBridge:
             loop=loop,
             source=resolved.source,
             sampling_params=SamplingParams,
+            renderer=renderer,
         )
+
+    def start_warmup(self) -> None:
+        """Run vLLM's multimodal processor warmup in the background, as its
+        own frontend does once the engine process exists: the first requests
+        otherwise pay the processor's JIT and cache priming (seconds of CPU)
+        on the serving path. Queued on the renderer's single-worker executor,
+        so it never overlaps a request."""
+        start = getattr(self._renderer, "start_mm_warmup_in_background", None)
+        if start is None:
+            return
+        try:
+            start()
+        except Exception as e:  # noqa: BLE001 - warmup is an optimisation
+            logger.warning("Multimodal processor warmup not started: %s", e)
 
     # -- the protocol Rust drives ------------------------------------------
 

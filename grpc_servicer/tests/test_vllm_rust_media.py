@@ -158,6 +158,29 @@ def test_probe_reports_the_processors_answer(loop):
         assert answers.get(timeout=5) is expected
 
 
+def test_start_warmup_uses_the_renderers_background_warmup(loop):
+    class Renderer:
+        started = 0
+
+        def start_mm_warmup_in_background(self):
+            self.started += 1
+
+    renderer = Renderer()
+    b = RustMediaBridge(
+        FakeProcessor(),
+        FakeInputProcessor(),
+        FakeEncoder(),
+        loop=loop,
+        source="flag",
+        sampling_params=lambda: "params",
+        renderer=renderer,
+    )
+    b.start_warmup()
+    assert renderer.started == 1
+    # A renderer without the hook (an older vLLM) is left alone.
+    bridge(loop).start_warmup()
+
+
 def test_build_is_off_without_a_mode_or_a_multimodal_model(loop):
     config = SimpleNamespace(model_config=SimpleNamespace(is_multimodal_model=True))
     assert RustMediaBridge.build(config, MmSettings(processor="off"), loop) is None

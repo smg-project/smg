@@ -463,6 +463,8 @@ async def serve_rust(args: argparse.Namespace) -> int:
         )
     )
     logger.info("Launched the headless engine (pid %s)", engine.pid)
+    if media is not None:
+        media.start_warmup()
     return await supervise(
         server, engine, drain_secs=_env_float(DRAIN_SECS_ENV, DEFAULT_DRAIN_SECS)
     )
