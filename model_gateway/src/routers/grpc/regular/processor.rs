@@ -467,10 +467,10 @@ impl ResponseProcessor {
                 id: dispatch.request_id.clone(),
                 finish_reason,
                 prompt_tokens: complete.prompt_tokens(),
-                weight_version: dispatch
-                    .weight_version
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
+                weight_version: response_formatting::effective_weight_version(
+                    complete.weight_version(),
+                    dispatch.weight_version.as_deref(),
+                ),
                 input_token_logprobs,
                 output_token_logprobs,
                 completion_tokens: complete.completion_tokens(),

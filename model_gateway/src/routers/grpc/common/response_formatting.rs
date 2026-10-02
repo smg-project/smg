@@ -43,6 +43,17 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
         .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
 }
 
+/// The version to report on a generate response: what the engine stamped on
+/// this very response beats the dispatch-time label (M2's table, then the
+/// registration label), which beats the historical `"default"`.
+pub(crate) fn effective_weight_version(reported: Option<&str>, dispatch: Option<&str>) -> String {
+    reported
+        .filter(|v| !v.is_empty())
+        .or(dispatch)
+        .unwrap_or("default")
+        .to_string()
+}
+
 /// Tracks per-index completion token counts across streaming chunks.
 ///
 /// Handles the two chunk conventions (`ChunkSemantics`):
@@ -176,6 +187,18 @@ mod tests {
             tracker.total(),
             7,
             "cumulative stream reports it in Complete"
+        );
+    }
+
+    #[test]
+    fn engine_reported_version_beats_dispatch_which_beats_default() {
+        assert_eq!(effective_weight_version(Some("v7"), Some("v3")), "v7");
+        assert_eq!(effective_weight_version(None, Some("v3")), "v3");
+        assert_eq!(effective_weight_version(None, None), "default");
+        assert_eq!(
+            effective_weight_version(Some(""), None),
+            "default",
+            "empty is unset"
         );
     }
 }

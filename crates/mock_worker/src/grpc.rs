@@ -124,6 +124,7 @@ impl TokenSpeedScheduler for MockScheduler {
                     cached_tokens: 0,
                     output_logprobs: None,
                     index: 0,
+                    weight_version: None,
                 })),
             }));
         }
@@ -317,6 +318,7 @@ fn generate_stream(
                                     cached_tokens,
                                     output_logprobs: None,
                                     index: 0,
+                                    weight_version: None,
                                 })),
                             };
                             return Some((Ok(resp), (rx, output_ids, stream_chunks, request_id)));
