@@ -12,10 +12,10 @@ use engine_zmq_client::{
     connector::EngineCoreStream,
     protocol::vllm::{
         logprobs::TokenLogprob,
-        output::{EngineCoreFinishReason, EngineCoreOutput, StopReason},
+        output::{EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics, StopReason},
         request::EngineCoreRequest,
         sampling::EngineCoreSamplingParams,
-        structured_outputs::StructuredOutputsParams,
+        structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
     },
 };
 use futures::Stream;
@@ -324,7 +324,39 @@ impl MappedGenerateStream for VllmGenerateStream {
         );
         self.attach_input_logprobs(&mut response);
         attach_kv_transfer_params(&mut response, &mut self.pending, output.kv_transfer_params);
+        attach_spec_decode_counts(&mut response, &mut self.pending, output.spec_decode_metrics);
         Ok(response)
+    }
+}
+
+/// The terminal `Complete` of this tick, direct or parked behind its chunk.
+fn complete_of<'a>(
+    response: &'a mut vllm::GenerateResponse,
+    pending: &'a mut Option<vllm::GenerateResponse>,
+) -> Option<&'a mut vllm::GenerateComplete> {
+    match response.response.as_mut() {
+        Some(vllm::generate_response::Response::Complete(complete)) => Some(complete),
+        _ => match pending.as_mut().and_then(|parked| parked.response.as_mut()) {
+            Some(vllm::generate_response::Response::Complete(complete)) => Some(complete),
+            _ => None,
+        },
+    }
+}
+
+/// Per-request speculative-decoding counts on the `Complete`, as the Python
+/// servicer reports them (accepted = histogram-weighted sum; drafted total).
+fn attach_spec_decode_counts(
+    response: &mut vllm::GenerateResponse,
+    pending: &mut Option<vllm::GenerateResponse>,
+    metrics: Option<SpecDecodeMetrics>,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    if let Some(complete) = complete_of(response, pending) {
+        complete.spec_accepted_tokens =
+            u32::try_from(metrics.accepted_tokens()).unwrap_or(u32::MAX);
+        complete.spec_draft_tokens = u32::try_from(metrics.num_draft_tokens).unwrap_or(u32::MAX);
     }
 }
 
@@ -340,15 +372,8 @@ fn attach_kv_transfer_params(
     let Some(params) = params else {
         return;
     };
-    let complete = match response.response.as_mut() {
-        Some(vllm::generate_response::Response::Complete(complete)) => Some(complete),
-        _ => match pending.as_mut().and_then(|parked| parked.response.as_mut()) {
-            Some(vllm::generate_response::Response::Complete(complete)) => Some(complete),
-            _ => None,
-        },
-    };
     // vLLM sets them on the finished output only; nothing to carry otherwise.
-    let Some(complete) = complete else {
+    let Some(complete) = complete_of(response, pending) else {
         return;
     };
     complete.kv_transfer_params = params
@@ -410,11 +435,38 @@ pub(crate) fn fan_out_requests(req: vllm::GenerateRequest) -> Vec<vllm::Generate
 
 /// Translate a vLLM-proto generate request into an `EngineCoreRequest`. ZMQ mode
 /// requires pre-tokenized input (SMG tokenizes upstream).
+#[cfg(test)]
 pub(crate) fn translate_request(
     req: vllm::GenerateRequest,
     max_model_len: u64,
     model_dtype: ModelDtype,
     eos: &EosTokenIds,
+) -> Result<EngineCoreRequest, String> {
+    translate_request_with_backend(req, max_model_len, model_dtype, eos, None)
+}
+
+/// The grammar backend vLLM's own frontend would stamp on a request given the
+/// engine's `--structured-outputs-config.backend`: an explicit backend as is;
+/// `auto` resolves to xgrammar, which is what vLLM picks whenever xgrammar
+/// accepts the grammar (its guidance fallback only matters before the engine
+/// pins a backend, which happens on the first structured request).
+pub fn structured_outputs_backend_from_config(name: &str) -> StructuredOutputBackend {
+    match name.trim() {
+        "guidance" => StructuredOutputBackend::Guidance,
+        "outlines" => StructuredOutputBackend::Outlines,
+        "lm-format-enforcer" => StructuredOutputBackend::LmFormatEnforcer,
+        _ => StructuredOutputBackend::Xgrammar,
+    }
+}
+
+/// [`translate_request`] with the grammar backend pinned for the engine
+/// (`None` keeps the per-constraint default of the translation).
+pub(crate) fn translate_request_with_backend(
+    req: vllm::GenerateRequest,
+    max_model_len: u64,
+    model_dtype: ModelDtype,
+    eos: &EosTokenIds,
+    structured_backend: Option<StructuredOutputBackend>,
 ) -> Result<EngineCoreRequest, String> {
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
@@ -460,6 +512,7 @@ pub(crate) fn translate_request(
             default_max_tokens,
             eos,
             kv_transfer_params,
+            structured_backend,
         )),
     };
     Ok(EngineCoreRequest {
@@ -509,6 +562,7 @@ pub(crate) fn translate_sampling(
     default_max_tokens: u32,
     eos: &EosTokenIds,
     kv_transfer_params: Option<serde_json::Value>,
+    structured_backend: Option<StructuredOutputBackend>,
 ) -> EngineCoreSamplingParams {
     // Stopping at EOS is the frontend's duty here: the primary id rides
     // `_eos_token_id`, extra ids merge into `stop_token_ids`, and the union
@@ -564,7 +618,15 @@ pub(crate) fn translate_sampling(
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,
-        structured_outputs: sp.constraint.and_then(translate_constraint),
+        structured_outputs: sp
+            .constraint
+            .and_then(translate_constraint)
+            .map(|mut params| {
+                if let Some(backend) = structured_backend {
+                    params.backend = backend;
+                }
+                params
+            }),
         extra_args: kv_transfer_params
             .map(|params| HashMap::from([("kv_transfer_params".to_string(), params)])),
         ..EngineCoreSamplingParams::default()
@@ -1382,6 +1444,90 @@ mod tests {
         let mut pending = None;
         attach_kv_transfer_params(&mut response, &mut pending, Some(params));
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn structured_output_backend_follows_the_engine_config() {
+        use engine_zmq_client::protocol::vllm::structured_outputs::StructuredOutputBackend;
+
+        assert_eq!(
+            structured_outputs_backend_from_config("guidance"),
+            StructuredOutputBackend::Guidance
+        );
+        assert_eq!(
+            structured_outputs_backend_from_config(" outlines "),
+            StructuredOutputBackend::Outlines
+        );
+        assert_eq!(
+            structured_outputs_backend_from_config("lm-format-enforcer"),
+            StructuredOutputBackend::LmFormatEnforcer
+        );
+        // `auto` (and anything unknown) is what vLLM's frontend settles on.
+        assert_eq!(
+            structured_outputs_backend_from_config("auto"),
+            StructuredOutputBackend::Xgrammar
+        );
+        assert_eq!(
+            structured_outputs_backend_from_config(""),
+            StructuredOutputBackend::Xgrammar
+        );
+
+        let constrained = || {
+            tokenized_req(vllm::SamplingParams {
+                constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
+                ..Default::default()
+            })
+        };
+        let backend_of = |request: EngineCoreRequest| {
+            request
+                .sampling_params
+                .and_then(|sp| sp.structured_outputs)
+                .map(|so| so.backend)
+                .expect("structured outputs")
+        };
+        // Pinned by the caller: every constraint carries the engine's backend.
+        let request = translate_request_with_backend(
+            constrained(),
+            4096,
+            ModelDtype::BFloat16,
+            &EosTokenIds::default(),
+            Some(StructuredOutputBackend::Guidance),
+        )
+        .expect("translated");
+        assert_eq!(backend_of(request), StructuredOutputBackend::Guidance);
+        // Unpinned: the translation's own per-constraint default.
+        let request = translate_request(
+            constrained(),
+            4096,
+            ModelDtype::BFloat16,
+            &EosTokenIds::default(),
+        )
+        .expect("translated");
+        assert_eq!(backend_of(request), StructuredOutputBackend::default());
+    }
+
+    #[test]
+    fn spec_decode_counts_land_on_the_complete() {
+        let metrics = SpecDecodeMetrics {
+            num_spec_tokens: 3,
+            histogram: vec![1, 2, 0, 1],
+            num_draft_tokens: 9,
+            ..Default::default()
+        };
+        // 0*1 + 1*2 + 2*0 + 3*1 accepted draft tokens, as the Python servicer sums.
+        assert_eq!(metrics.accepted_tokens(), 5);
+        let mut response = vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Complete(
+                vllm::GenerateComplete::default(),
+            )),
+        };
+        let mut pending = None;
+        attach_spec_decode_counts(&mut response, &mut pending, Some(metrics));
+        let Some(vllm::generate_response::Response::Complete(complete)) = response.response else {
+            panic!("complete");
+        };
+        assert_eq!(complete.spec_accepted_tokens, 5);
+        assert_eq!(complete.spec_draft_tokens, 9);
     }
 
     #[test]

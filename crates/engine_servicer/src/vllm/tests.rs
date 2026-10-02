@@ -8,10 +8,11 @@ use engine_zmq_client::{
     protocol::vllm::{
         output::{
             EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
-            StopReason,
+            SpecDecodeMetrics, StopReason,
         },
         request::EngineCoreRequest,
         stats::SchedulerStats,
+        structured_outputs::StructuredOutputBackend,
     },
     EngineId,
 };
@@ -663,6 +664,114 @@ async fn media_refs_and_extra_batches_are_refused_not_dropped() {
     let status = h.client.generate(request).await.expect_err("refused");
     assert_eq!(status.code(), Code::Unimplemented);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// vLLM checks string stops only once the output exceeds `min_tokens`, and
+/// the text up to that point never matches: the early "Hello world" is
+/// ignored, the later one ends the choice.
+#[tokio::test]
+async fn string_stops_wait_for_min_tokens() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let mut h = harness(model_info(), Some(tokenizer)).await;
+    let mut request = generate_request("mt1", true, vec!["Hello world".to_string()]);
+    request.sampling_params.as_mut().unwrap().min_tokens = 3;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    for token in [1, 2, 1, 2] {
+        h.engine_out
+            .send_outputs(&batch("mt1", vec![token], None, None))
+            .await
+            .unwrap();
+    }
+    for expected in [1, 2, 1, 2] {
+        assert_eq!(
+            chunk_tokens(stream.message().await.unwrap().unwrap()),
+            vec![expected]
+        );
+    }
+    let done = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert_eq!(done.output_ids, vec![1, 2, 1, 2]);
+    assert_eq!(
+        done.matched_stop,
+        Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
+            "Hello world".to_string()
+        ))
+    );
+    assert!(stream.message().await.unwrap().is_none());
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["mt1".to_string()]);
+}
+
+/// Per-request speculative-decoding counters ride the final output onto the
+/// `Complete`, summed as the Python servicer sums them.
+#[tokio::test]
+async fn spec_decode_counts_reach_the_complete() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("sd1", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut outputs = batch(
+        "sd1",
+        vec![5, 6],
+        Some(EngineCoreFinishReason::Length),
+        None,
+    );
+    if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+        batch.outputs[0].spec_decode_metrics = Some(SpecDecodeMetrics {
+            num_spec_tokens: 3,
+            histogram: vec![1, 2, 0, 1],
+            num_draft_tokens: 9,
+            ..Default::default()
+        });
+    }
+    h.engine_out.send_outputs(&outputs).await.unwrap();
+    let done = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(done.output_ids, vec![5, 6]);
+    assert_eq!(done.spec_accepted_tokens, 5);
+    assert_eq!(done.spec_draft_tokens, 9);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The grammar backend on every structured request is the engine's
+/// configured one (`auto` settles on xgrammar as vLLM's frontend does), not
+/// a per-constraint guess: the engine pins one backend at first use.
+#[tokio::test]
+async fn structured_output_backend_follows_the_launcher_config() {
+    for (configured, expected) in [
+        ("", StructuredOutputBackend::Xgrammar),
+        ("guidance", StructuredOutputBackend::Guidance),
+    ] {
+        let mut model = model_info();
+        model.structured_outputs_backend = configured.to_string();
+        let mut h = harness(model, None).await;
+        let mut request = generate_request("so1", false, Vec::new());
+        request.sampling_params.as_mut().unwrap().constraint =
+            Some(vllm::sampling_params::Constraint::JsonObject(true));
+        let _stream = h
+            .client
+            .generate(request)
+            .await
+            .expect("generate")
+            .into_inner();
+        let engine_request = recv_add(&mut h.engine_in).await;
+        let backend = engine_request
+            .sampling_params
+            .as_ref()
+            .and_then(|sp| sp.structured_outputs.as_ref())
+            .map(|so| so.backend)
+            .expect("structured outputs");
+        assert_eq!(backend, expected, "configured backend {configured:?}");
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
 }
 
 /// The request id is the Router's cancellation handle, so a live duplicate

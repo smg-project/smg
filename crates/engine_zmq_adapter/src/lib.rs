@@ -35,4 +35,4 @@ pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sockets::zmq_handshake_address;
 pub use stream::ZmqGenerateStream;
 pub use tokenspeed::TokenSpeedGenerateStream;
-pub use vllm::VllmGenerateStream;
+pub use vllm::{structured_outputs_backend_from_config, VllmGenerateStream};

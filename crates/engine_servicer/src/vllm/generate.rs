@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     task::{Context, Poll},
 };
 
@@ -114,6 +114,7 @@ async fn submit(
         .sampling_params
         .as_ref()
         .is_some_and(|sp| sp.skip_special_tokens);
+    let min_tokens = req.sampling_params.as_ref().map_or(0, |sp| sp.min_tokens);
     // The same stop/EOS finalization the Router applies on its direct-ZMQ
     // lane: string stops leave the engine request (single-token ones become
     // stop ids) and come back as this servicer's own obligation; the
@@ -139,7 +140,13 @@ async fn submit(
             Some(_) => stop_decoder(state, &stops, skip_special_tokens)?,
             None => None,
         };
-        choices.push(ChoiceStream::new(sub, decoder, streaming));
+        choices.push(ChoiceStream::new(
+            Arc::clone(state),
+            sub,
+            decoder,
+            streaming,
+            min_tokens,
+        ));
     }
     Ok(Box::pin(GenerateStream {
         choices,
@@ -152,6 +159,7 @@ async fn submit(
 /// One choice of a generate request: the ZMQ-mapped stream plus the string
 /// stop matcher the engine cannot run itself.
 struct ChoiceStream {
+    state: Arc<State>,
     /// `None` once this choice ended (terminal response yielded or error).
     /// Dropping it before the engine's own terminal output aborts the
     /// engine-side request.
@@ -165,20 +173,77 @@ struct ChoiceStream {
     streaming: bool,
     /// A frontend-synthesized terminal `Complete` to yield next.
     pending: Option<vllm::GenerateResponse>,
+    /// `min_tokens` of the request and the tokens generated so far: string
+    /// stops are only honoured past the minimum, as vLLM does.
+    min_tokens: u32,
+    generated: u32,
+    /// Whether this request's prompt tokens went into the stats counters.
+    prompt_counted: bool,
 }
 
 impl ChoiceStream {
     fn new(
+        state: Arc<State>,
         inner: VllmGenerateStream,
         decoder: Option<StopSequenceDecoder>,
         streaming: bool,
+        min_tokens: u32,
     ) -> Self {
         Self {
+            state,
             inner: Some(inner),
             decoder,
             streaming,
             pending: None,
+            min_tokens,
+            generated: 0,
+            prompt_counted: false,
         }
+    }
+
+    /// Feed this tick's tokens to the stop matcher, honouring `min_tokens` as
+    /// vLLM does: string stops are only checked once the output exceeds it,
+    /// and the text up to that point is excluded from the search, so a match
+    /// inside it is dropped and the matcher restarts there.
+    fn match_stops(&mut self, token_ids: &[u32]) -> Result<Option<String>, Status> {
+        let Some(decoder) = self.decoder.as_mut() else {
+            self.generated = self
+                .generated
+                .saturating_add(u32::try_from(token_ids.len()).unwrap_or(u32::MAX));
+            return Ok(None);
+        };
+        for &token in token_ids {
+            self.generated = self.generated.saturating_add(1);
+            decoder.process_token(token).map_err(|error| {
+                Status::internal(format!("incremental detokenization failed: {error}"))
+            })?;
+            if !decoder.is_stopped() {
+                continue;
+            }
+            if self.generated <= self.min_tokens {
+                decoder.reset();
+                continue;
+            }
+            // Only string sequences are registered on the decoder, so a stop
+            // always names its matched string.
+            return Ok(Some(decoder.matched_stop().unwrap_or_default().to_string()));
+        }
+        Ok(None)
+    }
+
+    /// Count the prompt once per request (every choice of an `n > 1` fan-out
+    /// reports the same prompt) for the stats line.
+    fn count_prompt(&mut self, prompt_tokens: u32) {
+        if self.prompt_counted || prompt_tokens == 0 {
+            return;
+        }
+        if self.inner.as_ref().is_some_and(|inner| inner.index() == 0) {
+            self.state
+                .stats
+                .prompt_tokens
+                .fetch_add(u64::from(prompt_tokens), Ordering::Relaxed);
+        }
+        self.prompt_counted = true;
     }
 
     /// End this choice on an abort: the `Complete` it was about to yield, the
@@ -227,19 +292,27 @@ impl Stream for ChoiceStream {
             else {
                 // The engine's own terminal `Complete` (or an empty response)
                 // passes through as-is; the engine stream ends after it.
+                if let Some(vllm::generate_response::Response::Complete(complete)) =
+                    item.response.as_ref()
+                {
+                    this.count_prompt(complete.prompt_tokens);
+                }
                 return Poll::Ready(Some(Ok(item)));
             };
-            if let Some(decoder) = this.decoder.as_mut() {
-                if let Err(decode_error) = decoder.process_tokens(&chunk.token_ids) {
+            this.count_prompt(chunk.prompt_tokens);
+            this.state
+                .stats
+                .generation_tokens
+                .fetch_add(chunk.token_ids.len() as u64, Ordering::Relaxed);
+            let matched = match this.match_stops(&chunk.token_ids) {
+                Ok(matched) => matched,
+                Err(status) => {
                     this.inner = None;
-                    return Poll::Ready(Some(Err(Status::internal(format!(
-                        "incremental detokenization failed: {decode_error}"
-                    )))));
+                    return Poll::Ready(Some(Err(status)));
                 }
-                if decoder.is_stopped() {
-                    // Only string sequences are registered on the decoder, so a
-                    // stop always names its matched string.
-                    let matched = decoder.matched_stop().unwrap_or_default().to_string();
+            };
+            {
+                if let Some(matched) = matched {
                     if let Some(inner) = this.inner.as_mut() {
                         // A stop string that is also a single token reaches the
                         // engine as a stop id, so the engine may finish on the

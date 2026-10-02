@@ -13,7 +13,10 @@ use engine_zmq_client::{
     connector::{EngineCoreClient, TokenSpeedClient},
     protocol::{
         handshake::EngineCoreReadyResponse,
-        vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams},
+        vllm::{
+            request::EngineCoreRequest, sampling::EngineCoreSamplingParams,
+            structured_outputs::StructuredOutputBackend,
+        },
         EngineLoad,
     },
     ConnectedEngine,
@@ -33,8 +36,8 @@ use crate::{
         fan_out_tokenspeed_requests, translate_request_tokenspeed, TokenSpeedGenerateStream,
     },
     vllm::{
-        fan_out_requests, kv_transfer_params, now_secs, ranked_candidate_count, translate_request,
-        VllmGenerateStream,
+        fan_out_requests, kv_transfer_params, now_secs, ranked_candidate_count,
+        translate_request_with_backend, VllmGenerateStream,
     },
 };
 
@@ -84,6 +87,10 @@ pub(crate) struct ZmqConnectionMeta {
     /// (the model id is a repo id, not a local directory). Lives here rather
     /// than on the client so every clone shares the one adoption.
     tokenizer_eos: OnceLock<EosTokenIds>,
+    /// The grammar backend stamped on structured-output requests, resolved
+    /// once from the engine's config by the caller that knows it (the
+    /// servicer); unset keeps the translation's per-constraint default.
+    structured_outputs_backend: OnceLock<StructuredOutputBackend>,
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
@@ -251,6 +258,7 @@ impl ZmqEngineClient {
                 model_id,
                 eos,
                 tokenizer_eos: OnceLock::new(),
+                structured_outputs_backend: OnceLock::new(),
             }),
         })
     }
@@ -273,6 +281,14 @@ impl ZmqEngineClient {
             return;
         };
         let _ = self.meta.tokenizer_eos.set(EosTokenIds::from_ids(ids));
+    }
+
+    /// Pin the grammar backend for structured-output requests. vLLM's engine
+    /// keeps a single backend per process, chosen by the first request that
+    /// needs one, so the caller resolves it once from the engine's
+    /// `--structured-outputs-config` and every request carries the same one.
+    pub fn set_structured_outputs_backend(&self, backend: StructuredOutputBackend) {
+        let _ = self.meta.structured_outputs_backend.set(backend);
     }
 
     /// The EOS set attached to requests: the connect-time set, or the adopted
@@ -339,8 +355,14 @@ impl ZmqEngineClient {
             .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))?;
         let mut streams = Vec::new();
         for (index, sub) in fan_out_requests(req).into_iter().enumerate() {
-            let request = translate_request(sub, max_model_len, model_dtype, self.effective_eos())
-                .map_err(tonic::Status::invalid_argument)?;
+            let request = translate_request_with_backend(
+                sub,
+                max_model_len,
+                model_dtype,
+                self.effective_eos(),
+                self.meta.structured_outputs_backend.get().copied(),
+            )
+            .map_err(tonic::Status::invalid_argument)?;
             // The engine returns the sampled/prompt token's logprob
             // plus the requested ranked candidates per position; carry
             // the counts so the stream can shape both `top_logprobs`

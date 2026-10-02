@@ -94,6 +94,34 @@ pub struct EngineCoreOutput {
     pub mm_cache_miss_hashes: Option<Vec<String>>,
     /// Updated sampling mask (untyped for now).
     pub new_sampling_mask: Option<OpaqueValue>,
+    /// Per-request speculative-decoding counters, on the final output only
+    /// (vLLM `--per-request-spec-decode-metrics`).
+    pub spec_decode_metrics: Option<SpecDecodeMetrics>,
+}
+
+/// vLLM's `RequestSpecDecodeMetrics` (a dataclass, so a msgpack map): the
+/// histogram of accepted draft tokens per verify step and the drafted total.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpecDecodeMetrics {
+    pub num_spec_tokens: u32,
+    /// Index `j` counts the verify steps that accepted `j` draft tokens.
+    pub histogram: Vec<u64>,
+    pub num_draft_tokens: u64,
+    pub per_step_accepted: Vec<u32>,
+    pub per_step_drafted: Vec<u32>,
+}
+
+impl SpecDecodeMetrics {
+    /// Accepted draft tokens over the request, as the Python servicer sums
+    /// them (`sum(j * n for j, n in enumerate(histogram))`).
+    pub fn accepted_tokens(&self) -> u64 {
+        self.histogram
+            .iter()
+            .enumerate()
+            .map(|(accepted, steps)| accepted as u64 * steps)
+            .sum()
+    }
 }
 
 impl EngineCoreOutput {
@@ -127,6 +155,7 @@ impl Serialize for EngineCoreOutput {
             num_nans_in_logits: self.num_nans_in_logits,
             mm_cache_miss_hashes: self.mm_cache_miss_hashes.as_deref(),
             new_sampling_mask: self.new_sampling_mask.as_ref(),
+            spec_decode_metrics: self.spec_decode_metrics.as_ref(),
         }
         .serialize(serializer)
     }
@@ -181,6 +210,8 @@ struct WireEngineCoreOutput {
     /// Updated sampling mask (untyped for now).
     #[serde(default)]
     new_sampling_mask: Option<OpaqueValue>,
+    #[serde(default)]
+    spec_decode_metrics: Option<SpecDecodeMetrics>,
 }
 
 impl WireEngineCoreOutput {
@@ -209,6 +240,7 @@ impl WireEngineCoreOutput {
             num_nans_in_logits: self.num_nans_in_logits,
             mm_cache_miss_hashes: self.mm_cache_miss_hashes,
             new_sampling_mask: self.new_sampling_mask,
+            spec_decode_metrics: self.spec_decode_metrics,
         })
     }
 }
@@ -233,6 +265,7 @@ struct WireEngineCoreOutputRef<'a> {
     num_nans_in_logits: u32,
     mm_cache_miss_hashes: Option<&'a [String]>,
     new_sampling_mask: Option<&'a OpaqueValue>,
+    spec_decode_metrics: Option<&'a SpecDecodeMetrics>,
 }
 
 /// Raw Python/msgpack engine-core output envelope. Mirrors Python

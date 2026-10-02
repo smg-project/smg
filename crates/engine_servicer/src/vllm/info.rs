@@ -2,11 +2,72 @@
 //! Metadata comes from the launcher's config (what the Python servicer reads
 //! off vLLM's `ModelConfig`) and from the engine handshake.
 
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
+
 use engine_zmq_adapter::ZmqEngineClient;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
+use tracing::info;
 
 use super::{State, SERVER_TYPE};
+
+/// How often the engine stats line is logged (vLLM's `VLLM_LOG_STATS_INTERVAL`
+/// default).
+pub(super) const STATS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// vLLM's periodic stats line. Its AsyncLLM logs one every interval; the
+/// headless engine has no frontend to do it, so the servicer does, from the
+/// piggybacked scheduler stats and its own token counters. One line marks the
+/// transition to idle, then it stays quiet until there is traffic again.
+pub(super) async fn log_engine_stats(state: Arc<State>) {
+    let mut ticker = tokio::time::interval(STATS_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (mut last_prompt, mut last_generation) = (0u64, 0u64);
+    let mut idle_logged = false;
+    loop {
+        ticker.tick().await;
+        let Some(client) = state.engine.client.get() else {
+            continue;
+        };
+        let prompt = state.stats.prompt_tokens.load(Ordering::Relaxed);
+        let generation = state.stats.generation_tokens.load(Ordering::Relaxed);
+        let prompt_delta = prompt.saturating_sub(last_prompt);
+        let generation_delta = generation.saturating_sub(last_generation);
+        (last_prompt, last_generation) = (prompt, generation);
+        let loads = client.get_loads();
+        let running: i64 = loads
+            .loads
+            .iter()
+            .map(|load| i64::from(load.num_running_reqs))
+            .sum();
+        let waiting: i64 = loads
+            .loads
+            .iter()
+            .map(|load| i64::from(load.num_waiting_reqs))
+            .sum();
+        let kv_usage = loads
+            .loads
+            .iter()
+            .map(|load| load.token_usage)
+            .fold(0.0_f64, f64::max);
+        let idle = prompt_delta == 0 && generation_delta == 0 && running == 0 && waiting == 0;
+        if idle && idle_logged {
+            continue;
+        }
+        idle_logged = idle;
+        let secs = STATS_INTERVAL.as_secs_f64();
+        info!(
+            "Avg prompt throughput: {:.1} tokens/s, Avg generation throughput: {:.1} tokens/s, \
+             Running: {running} reqs, Waiting: {waiting} reqs, GPU KV cache usage: {:.1}%",
+            prompt_delta as f64 / secs,
+            generation_delta as f64 / secs,
+            kv_usage * 100.0
+        );
+    }
+}
 
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
 pub(super) fn health_check(state: &State) -> vllm::HealthCheckResponse {

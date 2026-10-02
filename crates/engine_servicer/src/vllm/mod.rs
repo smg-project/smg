@@ -126,8 +126,16 @@ pub struct VllmServicerConfig {
     pub model: VllmModelInfo,
 }
 
+/// Token counters behind the periodic engine stats line.
+#[derive(Default)]
+pub(super) struct Stats {
+    pub(super) prompt_tokens: AtomicU64,
+    pub(super) generation_tokens: AtomicU64,
+}
+
 pub(super) struct State {
     pub(super) model: VllmModelInfo,
+    pub(super) stats: Stats,
     /// The local tokenizer directory the servicer loaded (`GetTokenizer`
     /// bundles it); `None` when none resolved.
     #[expect(
@@ -239,6 +247,7 @@ impl VllmServicerServer {
         let state = Arc::new(State {
             tokenizer_dir: config.tokenizer_dir.clone(),
             model: config.model,
+            stats: Stats::default(),
             engine: EngineLink::default(),
             tokenizer: OnceLock::new(),
             registry: Mutex::new(HashMap::new()),
@@ -258,6 +267,7 @@ impl VllmServicerServer {
             Arc::new(move || health_state.is_serving()),
         );
         let connect_state = Arc::clone(&state);
+        let stats_state = Arc::clone(&state);
         let VllmServicerConfig {
             bind_address,
             ipc_base_url,
@@ -284,6 +294,11 @@ impl VllmServicerServer {
                     tokenizer_dir,
                     last_error,
                 ));
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the stats log is fire-and-forget; the runtime drop ends it"
+                )]
+                let _stats = tokio::spawn(info::log_engine_stats(stats_state));
                 info!(address = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "vLLM gRPC servicer listening");
                 // Graceful first: stop accepting, let open streams finish. A
                 // connected client's idle keepalive connection would hold a

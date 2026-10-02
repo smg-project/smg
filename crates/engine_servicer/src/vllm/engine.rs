@@ -3,7 +3,9 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use engine_zmq_adapter::{connect_with_eos, EosTokenIds, ZmqEngineClient};
+use engine_zmq_adapter::{
+    connect_with_eos, structured_outputs_backend_from_config, EosTokenIds, ZmqEngineClient,
+};
 use openai_protocol::worker::RuntimeType;
 use tracing::{error, info, warn};
 
@@ -73,6 +75,9 @@ pub(super) async fn connect_engine(
     {
         Ok(client) => {
             client.adopt_tokenizer_eos(state.tokenizer());
+            client.set_structured_outputs_backend(structured_outputs_backend_from_config(
+                &state.model.structured_outputs_backend,
+            ));
             info!(
                 handshake = %handshake_address,
                 engines = engine_count,

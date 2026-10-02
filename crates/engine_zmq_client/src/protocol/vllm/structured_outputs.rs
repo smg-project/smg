@@ -9,10 +9,11 @@ use crate::error::{Error, Result};
 /// Structured-output backend selected for EngineCore grammar compilation.
 ///
 /// Python stores this in `StructuredOutputsParams._backend` after request
-/// validation. This client selects the backend per constraint: structural
-/// tags require xgrammar (the triggered-tags format is not understood by
-/// guidance's legacy structures/triggers parser); everything else lowers to
-/// guidance. Peer-supplied `_backend` values are ignored.
+/// validation and the engine uses it as is. A sender that knows the engine's
+/// configured backend pins it on every request; otherwise this client picks
+/// one per constraint: structural tags require xgrammar (the triggered-tags
+/// format is not understood by guidance's legacy structures/triggers parser);
+/// everything else lowers to guidance.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StructuredOutputBackend {
@@ -60,11 +61,8 @@ pub struct StructuredOutputOptions {
 pub struct StructuredOutputsParams {
     pub constraint: StructuredOutputConstraint,
     pub options: StructuredOutputOptions,
-    /// Structured-output backend, mirroring Python's internal `_backend`.
-    ///
-    /// Peer-supplied values are ignored during deserialization. This matches the
-    /// Python request boundary, where `_backend` is set by validation rather
-    /// than accepted as a request-level backend selector.
+    /// Structured-output backend, mirroring Python's internal `_backend`: the
+    /// one the sender pinned, else the per-constraint default.
     pub backend: StructuredOutputBackend,
 }
 
@@ -96,18 +94,23 @@ impl StructuredOutputsParams {
     }
 
     fn from_constraint(constraint: StructuredOutputConstraint) -> Self {
-        // Structural tags use the triggered-tags format that only xgrammar
-        // compiles; guidance's parser expects the legacy structures/triggers
-        // shape and fails the request at grammar build.
-        let backend = match &constraint {
-            StructuredOutputConstraint::StructuralTag(_) => StructuredOutputBackend::Xgrammar,
-            _ => StructuredOutputBackend::default(),
-        };
+        let backend = default_backend(&constraint);
         Self {
             constraint,
             options: StructuredOutputOptions::default(),
             backend,
         }
+    }
+}
+
+/// The backend a constraint gets when the sender pinned none. Structural tags
+/// use the triggered-tags format that only xgrammar compiles; guidance's
+/// parser expects the legacy structures/triggers shape and fails the request
+/// at grammar build.
+fn default_backend(constraint: &StructuredOutputConstraint) -> StructuredOutputBackend {
+    match constraint {
+        StructuredOutputConstraint::StructuralTag(_) => StructuredOutputBackend::Xgrammar,
+        _ => StructuredOutputBackend::default(),
     }
 }
 
@@ -138,12 +141,11 @@ struct WireStructuredOutputsParams {
     disable_additional_properties: bool,
     whitespace_pattern: Option<String>,
     structural_tag: Option<String>,
-    #[serde(
-        default,
-        rename = "_backend",
-        deserialize_with = "serde_with::rust::deserialize_ignore_any"
-    )]
-    backend: StructuredOutputBackend,
+    /// The backend the sender pinned (vLLM's frontend sets it after
+    /// validation; the engine reads it as is). Absent falls back to the
+    /// per-constraint default.
+    #[serde(default, rename = "_backend")]
+    backend: Option<StructuredOutputBackend>,
 }
 
 /// Borrowed send-side view of [`WireStructuredOutputsParams`]; keeps the wire
@@ -207,18 +209,22 @@ impl TryFrom<WireStructuredOutputsParams> for StructuredOutputsParams {
         }
         insert_constraint!("structural_tag", raw.structural_tag.map(StructuralTag));
 
-        Ok(Self {
-            constraint: constraint.map(|(_, c)| c).ok_or_else(|| {
-                Error::InvalidStructuredOutputsParams {
+        let constraint_ref =
+            constraint
+                .map(|(_, c)| c)
+                .ok_or_else(|| Error::InvalidStructuredOutputsParams {
                     message: "missing structured output constraint".to_string(),
-                }
-            })?,
+                })?;
+        Ok(Self {
             options: StructuredOutputOptions {
                 disable_any_whitespace: raw.disable_any_whitespace,
                 disable_additional_properties: raw.disable_additional_properties,
                 whitespace_pattern: raw.whitespace_pattern,
             },
-            backend: raw.backend,
+            backend: raw
+                .backend
+                .unwrap_or_else(|| default_backend(&constraint_ref)),
+            constraint: constraint_ref,
         })
     }
 }
@@ -278,18 +284,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn structured_outputs_backend_ignores_deserialized_value() {
-        let params: StructuredOutputsParams = serde_json::from_value(serde_json::json!({
+    fn structured_outputs_backend_honours_a_pinned_value() {
+        // A sender that knows the engine's backend pins it; the engine reads
+        // `_backend` as is, so decoding keeps it and re-encoding repeats it.
+        let raw = serde_json::json!({
             "json_object": true,
             "_backend": "xgrammar",
-        }))
-        .unwrap();
-
-        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
+        });
+        let params: StructuredOutputsParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
         assert_eq!(params.constraint, StructuredOutputConstraint::JsonObject);
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["_backend"], "xgrammar");
 
-        let value = serde_json::to_value(params).unwrap();
-        assert_eq!(value["_backend"], "guidance");
+        // Unpinned, the per-constraint default applies.
+        let raw = serde_json::json!({ "json_object": true });
+        let params: StructuredOutputsParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
     }
 
     #[test]
