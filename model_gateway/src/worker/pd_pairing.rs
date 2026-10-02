@@ -297,7 +297,7 @@ mod tests {
         let mut s = spec(
             RuntimeType::Vllm,
             &[
-                ("version", "0.27.1"),
+                ("version", "0.30.0"),
                 ("kv_cache_dtype", "auto"),
                 ("block_size", "16"),
                 ("attention_backend", "FLASH_ATTN"),
@@ -307,7 +307,7 @@ mod tests {
         s.kv_connector = Some("NixlConnector".to_string());
         let pairing = PdPairing::derive(&s);
         assert_eq!(pairing.transport(), Some("nixl"));
-        assert_eq!(pairing.version(), Some("0.27.1"));
+        assert_eq!(pairing.version(), Some("0.30.0"));
         assert_eq!(
             pairing.key(),
             "vllm/nixl/dtype=auto,page=16,attn=flash_attn,model=torch.bfloat16"
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn an_explicit_protocol_is_the_whole_key() {
-        let mut s = spec(RuntimeType::Vllm, &[("version", "0.27.1")]);
+        let mut s = spec(RuntimeType::Vllm, &[("version", "0.30.0")]);
         s.pairing_protocol = Some("blue".to_string());
         assert_eq!(PdPairing::derive(&s).key(), "blue");
         // The label path, which both a worker label and the engine's
@@ -440,7 +440,7 @@ mod tests {
     fn unknown_components_pair_leniently_and_fail_strictly() {
         let known = PdPairing::derive(&spec(
             RuntimeType::Vllm,
-            &[("kv_connector", "NixlConnector"), ("version", "0.27.1")],
+            &[("kv_connector", "NixlConnector"), ("version", "0.30.0")],
         ));
         let silent = PdPairing::derive(&spec(RuntimeType::Vllm, &[]));
         assert!(known.compatible(&silent, PdPairingMode::Lenient));

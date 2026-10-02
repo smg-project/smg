@@ -87,7 +87,7 @@ class FakeRedis:
 def fingerprint(**overrides):
     values = {
         "model": "m",
-        "vllm_version": "0.27.1",
+        "vllm_version": "0.30.0",
         "dtype": "torch.bfloat16",
         "video_backend": "opencv",
         "media_io_kwargs": "{}",

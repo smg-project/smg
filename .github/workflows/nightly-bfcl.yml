@@ -163,9 +163,11 @@ jobs:
               # DeepSeek-V4.1-Flash is ~765GB on disk (552B backbone + 196B int8 Engram,
               # all GPU-resident), so it outgrows a TP=4 half-node and runs SEQUENTIAL
               # on the whole node (the only such leg). SMG: deepseek_v41 tool/reasoning parsers
-              # + native renderer (#2524/#2525/#2527). vLLM: V4.1 is on main only
-              # (vllm-project/vllm#56208 + #56228, 2026-09-10), not in the 0.27.1 CI
-              # pin, so this leg installs a per-commit main wheel (vllm_commit below).
+              # + native renderer (#2524/#2525/#2527). vLLM: V4.1 landed in 0.30.0
+              # (vllm-project/vllm#56208 + #56228 + #56214, 2026-09-10/11), so the CI
+              # pin now has it. This leg still installs the per-commit main wheel it
+              # was validated on (vllm_commit below); moving it onto the release pin
+              # is a separate change that needs a run on this leg.
               {"name": "deepseek-v4.1", "runner": "blackwell", "tp": 8,
                "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",  # sequential: arm B reuses GPU_A (whole node)
                "model": "deepseek-ai/DeepSeek-V4.1-Flash", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-FC",
@@ -180,7 +182,7 @@ jobs:
                # DeepseekV41ForCausalLM — #56228 alone ships the classes unregistered
                # and vLLM rejects the arch at startup. Pinned past the 09-11..09-15 V4.1
                # fixes. Both arms get the same wheel, so the A/B stays engine-identical.
-               # Drop once the CI pin moves to a release with V4.1.
+               # Drop once this leg has run on the 0.30.0 pin, which has V4.1.
                "vllm_commit": "a31ec3a68bbbedd4b5d59490c762bcf32abf1a17",
                "vllm_version": "0.29.1rc1.dev185+ga31ec3a68",
                # 765GB load + first-run JIT kernels on a new arch: generous ceiling.
@@ -192,7 +194,7 @@ jobs:
               # MiniMax-M3 (427B/26B-active VLM MoE, MSA sparse attention). The official
               # MXFP8 checkpoint (~444GB) fits a TP=4 half-node; nvidia/MiniMax-M3-NVFP4
               # (~224GB, ModelOpt 4-bit, small drops vs FP8) is the fallback if headroom
-              # ever bites. Served by the stock CI vLLM pin (0.27.1 has M3, mxfp8 and the
+              # ever bites. Served by the stock CI vLLM pin (0.30.0 has M3, mxfp8 and the
               # minimax_m3 parsers) — no per-commit wheel. Flags per the vLLM recipe
               # (models/MiniMaxAI/MiniMax-M3.yaml): --block-size 128 is mandatory (MSA
               # sparse_block_size) and the mxfp8 variant sets indexer_kv_dtype fp8.
