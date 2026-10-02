@@ -1,0 +1,181 @@
+{
+ "tools-0": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "days": {
+       "type": "integer"
+      },
+      "ratio": {
+       "type": "number"
+      },
+      "metric": {
+       "type": "boolean"
+      },
+      "filters": {
+       "type": "object"
+      },
+      "hours": {
+       "type": "array"
+      },
+      "nothing": {
+       "type": "null"
+      },
+      "either": {
+       "type": [
+        "integer",
+        "string"
+       ]
+      },
+      "choice": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "string"
+        }
+       ]
+      },
+      "maybe": {
+       "type": "integer",
+       "nullable": true
+      }
+     }
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_time",
+    "parameters": {
+     "type": "object"
+    }
+   }
+  },
+  {
+   "name": "unwrapped_tool",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "n": {
+      "type": "integer"
+     }
+    }
+   }
+  }
+ ],
+ "tools-1": [],
+ "tools-2": [
+  {
+   "type": "function",
+   "function": {
+    "name": "set_alarm",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "hour": {
+       "type": "integer"
+      },
+      "enabled": {
+       "type": "boolean"
+      },
+      "label": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  }
+ ],
+ "tools-3": [
+  {
+   "type": "function",
+   "function": {
+    "name": "set_alarm",
+    "description": "Set an alarm.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "hour": {
+       "type": "integer",
+       "description": "The hour the alarm should ring at."
+      },
+      "enabled": {
+       "type": "boolean",
+       "description": "Whether the alarm starts out enabled."
+      },
+      "label": {
+       "type": "string",
+       "nullable": true,
+       "description": "An optional label for the alarm."
+      }
+     },
+     "required": [
+      "hour",
+      "enabled"
+     ]
+    }
+   }
+  }
+ ],
+ "tools-4": [
+  {
+   "type": "function",
+   "function": {
+    "name": "set_alarm",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "count": {
+       "type": "integer"
+      },
+      "ratio": {
+       "type": "number"
+      },
+      "enabled": {
+       "type": "boolean"
+      },
+      "tags": {
+       "type": "array"
+      },
+      "note": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  }
+ ],
+ "tools-5": [
+  {
+   "type": "function",
+   "function": {
+    "name": "set_alarm",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "label": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "object"
+        }
+       ]
+      }
+     }
+    }
+   }
+  }
+ ]
+}

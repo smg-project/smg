@@ -1,0 +1,30 @@
+[package]
+name = "smg-response-template"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust port of the response-template parser in transformers (chat_parsing)"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+readme = "README.md"
+keywords = ["llm", "parser", "response-template"]
+categories = ["parsing", "text-processing"]
+
+[dependencies]
+regex-syntax = "0.8"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+sha2 = "0.11"
+
+[features]
+# Glue for smg's reasoning and tool parsers (`adapter` module).
+adapter = []
+
+[[test]]
+name = "adapter"
+required-features = ["adapter"]
+
+[lints]
+workspace = true

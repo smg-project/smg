@@ -1,0 +1,113 @@
+# Templates transformers 5.17.0 accepts that this crate refuses, with the
+# reason it gives (template id, tab, reason). The load test fails when a
+# template is refused for another reason, or loads although it is listed.
+behaviour/bad-value-parser	content_args: value_parser
+behaviour/close-zero-width	regex: group syntax
+behaviour/content-args-not-dict	content_args: not a dict
+behaviour/kv-lines-empty-sep	content_args: kv_sep
+behaviour/kv-lines-none-sep	content_args: line_sep
+behaviour/negated-class-alternation	regex: alternatives that can end in a negated class of one character
+behaviour/open-and-close-empty	empty match
+behaviour/optional-backreference	regex: backreference inside an optional group
+behaviour/repeats-default-list	shared value
+behaviour/value-parser-not-dict	content_args: value_parser
+behaviour/xml-alternative-key	content_args: tag_pattern group that can be unset
+behaviour/xml-alternative-value	content_args: tag_pattern group that can be unset
+behaviour/xml-bad-tag-pattern	regex: unbalanced parenthesis
+behaviour/xml-optional-value	content_args: tag_pattern group that can be unset
+behaviour/xml-optional-value-parsed	content_args: tag_pattern group that can be unset
+dialect/000	regex: '{' without an atom
+dialect/001	regex: '{' without an atom
+dialect/002	regex: '{' without an atom
+dialect/003	regex: '{' without an atom
+dialect/004	regex: '{' without an atom
+dialect/005	regex: '{' without an atom
+dialect/006	regex: '{' without an atom
+dialect/007	regex: repeated or possessive quantifier
+dialect/009	regex: group syntax
+dialect/010	regex: group syntax
+dialect/011	regex: group syntax
+dialect/012	regex: group syntax
+dialect/013	regex: '[' in a character class
+dialect/014	regex: '&' in a character class
+dialect/016	regex: '~' in a character class
+dialect/017	regex: '|' in a character class
+dialect/018	regex: escape \b
+dialect/019	regex: ']' in a character class
+dialect/020	regex: ']' in a character class
+dialect/022	regex: escape \d
+dialect/023	regex: escape \d
+dialect/024	regex: escape \0
+dialect/025	regex: escape \0
+dialect/026	regex: escape \x
+dialect/027	regex: escape \u
+dialect/028	regex: escape \U
+dialect/034	regex: group name "é"
+dialect/035	regex: group syntax
+dialect/036	regex: group name "n"
+dialect/038	regex: group syntax
+dialect/039	regex: group syntax
+dialect/040	regex: group syntax
+dialect/041	regex: group syntax
+dialect/042	regex: group syntax
+dialect/043	regex: group syntax
+dialect/044	regex: group syntax
+dialect/045	regex: group syntax
+dialect/046	regex: group syntax
+dialect/047	regex: group syntax
+dialect/049	regex: group syntax
+dialect/050	regex: group syntax
+dialect/051	regex: group syntax
+dialect/052	regex: group syntax
+dialect/053	regex: group syntax
+dialect/054	regex: unnamed capturing group
+dialect/055	regex: repeated or possessive quantifier
+dialect/056	regex: '{' without an atom
+dialect/057	regex: '{' without an atom
+dialect/058	regex: escape \N
+dialect/059	regex: escape \N
+dialect/060	regex: escape \p
+dialect/061	regex: escape \p
+dialect/062	regex: escape \p
+dialect/063	regex: escape \g
+dialect/064	regex: escape \g
+dialect/065	regex: escape \K
+dialect/066	regex: escape \G
+dialect/067	regex: escape \X
+dialect/068	regex: escape \h
+dialect/069	regex: escape \R
+dialect/070	regex: escape \m
+dialect/071	regex: escape \M
+dialect/073	regex: escape \B
+dialect/076	regex: escape \z
+dialect/077	regex: escape \A
+dialect/079	regex: group syntax
+dialect/082	regex: unnamed capturing group
+dialect/093	regex: unnamed capturing group
+dialect/094	regex: escape \d
+dialect/095	regex: escape \W
+dialect/096	regex: escape \S
+dialect/097	regex: escape \D
+dialect/098	regex: unnamed capturing group
+dialect/100	regex: group syntax
+dialect/103	regex: look-around
+dialect/104	regex: look-around
+dialect/105	regex: escape \w
+dialect/106	regex: escape \W
+dialect/107	regex: escape \u
+dialect/108	regex: escape \u
+dialect/111	regex: repeat of a group or an assertion
+dialect/112	regex: unnamed capturing group
+dialect/113	regex: repeat of a group or an assertion
+load/anchor-pattern-empty-match	empty match
+load/string-delims-empty	content_args: string_delims
+load/string-delims-shape	content_args: string_delims
+load/tag-pattern-empty-match	empty match
+synthetic/backreference-tag	regex: group syntax
+synthetic/brace-quant	regex: '{' without an atom
+synthetic/lookahead-open	regex: look-around
+synthetic/multiline-caret-open	regex: group syntax
+synthetic/posix-name	regex: '[' in a character class
+synthetic/setop-name	regex: escape \w
+synthetic/transform-aliased	shared value
+synthetic/verbose-open	regex: group syntax

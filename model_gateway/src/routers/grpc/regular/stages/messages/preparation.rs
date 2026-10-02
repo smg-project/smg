@@ -310,6 +310,14 @@ impl MessagePreparationStage {
         } else {
             None
         };
+        utils::reject_json_constraint_for_template(
+            &ctx.components.parser_resolver,
+            &request.model,
+            tool_call_constraint
+                .as_ref()
+                .is_some_and(|c| c.is_json_schema()),
+            false,
+        )?;
 
         // Step 5: Create stop sequence decoder
         let stop_for_decoder = request

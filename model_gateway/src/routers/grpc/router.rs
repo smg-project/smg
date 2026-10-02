@@ -30,7 +30,7 @@ use super::{
     multimodal::{mm_settings, MultimodalComponents},
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::responses,
-    utils::ParserResolver,
+    utils::{ParserResolver, ResponseTemplateParsers},
 };
 use crate::{
     app_context::AppContext,
@@ -108,6 +108,14 @@ impl GrpcRouter {
             .map_err(|e| format!("multimodal components: {e:#}"))?,
         ));
 
+        let response_templates = (!ctx.router_config.disable_response_template).then(|| {
+            Arc::new(ResponseTemplateParsers::new(
+                tokenizer_registry.clone(),
+                reasoning_parser_factory.clone(),
+                tool_parser_factory.clone(),
+            ))
+        });
+
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
             tokenizer_registry: tokenizer_registry.clone(),
@@ -118,6 +126,7 @@ impl GrpcRouter {
                 worker_registry.clone(),
                 ctx.configured_tool_parser.clone(),
                 ctx.configured_reasoning_parser.clone(),
+                response_templates.clone(),
             ),
             multimodal,
         });
@@ -131,6 +140,7 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            response_templates,
             ctx.rate_limit_manager.clone(),
         );
         // Deps for the parser-free endpoints (completion/embeddings/classify).
