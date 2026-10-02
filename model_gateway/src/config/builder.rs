@@ -681,6 +681,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn disable_response_template(mut self, disable: bool) -> Self {
+        self.config.disable_response_template = disable;
+        self
+    }
+
     // ==================== Tokenizer Cache ====================
 
     pub fn tokenizer_cache(mut self, cache: TokenizerCacheConfig) -> Self {

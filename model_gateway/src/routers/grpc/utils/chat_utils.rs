@@ -118,11 +118,11 @@ fn missing_tokenizer_response(model_id: &str, served: bool) -> Response {
 /// the ones that actually pin a worker thread — are offloaded.
 const ENCODE_OFFLOAD_MIN_BYTES: usize = 512;
 
-/// Bounds how many CPU-bound encodes run concurrently on the blocking pool.
-/// tokio's blocking pool is otherwise unbounded (grows to 512 threads), so under
-/// a burst of large prompts the offloaded encodes would oversubscribe the CPU
-/// and starve the very request runtime this offload is meant to protect. Sized
-/// to the host's available parallelism.
+/// Bounds how many CPU-bound encodes and decodes run concurrently on the
+/// blocking pool. tokio's blocking pool is otherwise unbounded (grows to 512
+/// threads), so under a burst of large prompts the offloaded work would
+/// oversubscribe the CPU and starve the very request runtime this offload is
+/// meant to protect. Sized to the host's available parallelism.
 fn encode_permits() -> &'static Semaphore {
     static SEM: OnceLock<Semaphore> = OnceLock::new();
     SEM.get_or_init(|| {
@@ -133,22 +133,24 @@ fn encode_permits() -> &'static Semaphore {
     })
 }
 
-/// Run CPU-bound tokenization off the async worker threads so it cannot stall
-/// the runtime, bounded by [`encode_permits`] so concurrent offloaded encodes
-/// cannot oversubscribe the CPU. Inputs below the threshold run inline to avoid
-/// the offload round-trip dominating.
-async fn offload<F>(len: usize, encode: F) -> anyhow::Result<Encoding>
+/// Run CPU-bound tokenizer work (an encode, or a decode of the prompt) off the
+/// async worker threads so it cannot stall the runtime, bounded by
+/// [`encode_permits`] so concurrent offloaded work cannot oversubscribe the
+/// CPU. `len` is the size of the text in bytes; below the threshold the work
+/// runs inline to avoid the offload round-trip dominating.
+pub(super) async fn offload<T, F>(len: usize, work: F) -> anyhow::Result<T>
 where
-    F: FnOnce() -> anyhow::Result<Encoding> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     if len < ENCODE_OFFLOAD_MIN_BYTES {
-        return encode();
+        return work();
     }
     let _permit = encode_permits()
         .acquire()
         .await
         .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
-    tokio::task::spawn_blocking(encode)
+    tokio::task::spawn_blocking(work)
         .await
         .map_err(|e| anyhow!("tokenization task failed: {e}"))?
 }
