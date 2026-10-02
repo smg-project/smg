@@ -306,6 +306,14 @@ impl VllmServicerServer {
                 // purely graceful shutdown forever, so the drain grace bounds it
                 // and the server future is dropped (connections closed) after.
                 let graceful = Server::builder()
+                    // Router-preprocessed media arrives as multi-megabyte
+                    // inline tensors; h2's default 64 KiB windows would pace
+                    // each such message with a window update per 64 KiB.
+                    // Size the windows and frames for them (grpc-core's BDP
+                    // probing gets the Python servicer there on its own).
+                    .initial_stream_window_size(Some(16 * 1024 * 1024))
+                    .initial_connection_window_size(Some(64 * 1024 * 1024))
+                    .max_frame_size(Some(1024 * 1024))
                     .add_service(
                         VllmEngineServer::new(service)
                             .max_decoding_message_size(usize::MAX)
