@@ -153,6 +153,7 @@ impl BuildStage for MessageRequestBuildingStage {
                     multimodal_inputs: multimodal_data,
                     tool_constraints,
                     require_reasoning,
+                    response_format_tag: None,
                 },
             )
             .map_err(|e| {

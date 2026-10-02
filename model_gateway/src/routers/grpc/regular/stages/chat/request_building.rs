@@ -139,6 +139,7 @@ pub(crate) async fn build_chat_backed_plan(
                 multimodal_inputs: multimodal_data,
                 tool_constraints,
                 require_reasoning,
+                response_format_tag: ctx.state.response_format_tag.take(),
             },
         )
         .map_err(|e| {

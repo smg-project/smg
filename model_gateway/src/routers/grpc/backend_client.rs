@@ -489,3 +489,43 @@ fn mm_variant_mismatch(expected: &str, got: &MultimodalData) -> String {
     };
     format!("multimodal data variant mismatch: {expected} ZMQ backend got {got} data")
 }
+
+#[cfg(test)]
+mod prepared_json_tests {
+    use openai_protocol::common::ResponseFormat;
+
+    use super::*;
+
+    #[test]
+    fn prepared_json_tag_does_not_change_direct_zmq_constraints() {
+        let request = ChatCompletionRequest {
+            response_format: Some(ResponseFormat::JsonObject),
+            ..Default::default()
+        };
+        let output = build_zmq_request(
+            ZmqDialect::Vllm,
+            "test".into(),
+            &request,
+            "prefill".into(),
+            vec![42],
+            GenerateRequestBuildOptions {
+                response_format_tag: Some(r#"{"format":{"type":"any_text"}}"#.into()),
+                ..Default::default()
+            },
+            ZmqBuilders {
+                vllm: VllmEngineClient::build_generate_request_from_chat,
+                tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_chat,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            output
+                .as_vllm()
+                .sampling_params
+                .as_ref()
+                .unwrap()
+                .constraint,
+            Some(vllm_proto::sampling_params::Constraint::JsonSchema(_))
+        ));
+    }
+}

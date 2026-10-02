@@ -632,6 +632,19 @@ impl DeepSeekDsmlParser {
         all_calls
     }
 
+    /// Constrain the final JSON answer after V4.1's prefilled reasoning block.
+    /// The schema is preserved verbatim; extraction remains the gateway's job.
+    pub fn build_v41_json_structural_tag(schema: &Value) -> Value {
+        json!({
+            "type": "structural_tag",
+            "format": {"type": "sequence", "elements": [
+                {"type": "any_text", "excludes": ["</think>"]},
+                {"type": "const_string", "value": "</think>"},
+                {"type": "json_schema", "json_schema": schema}
+            ]}
+        })
+    }
+
     /// The V4.1 tool-call grammar as an xgrammar structural tag, mirroring
     /// vLLM's `deepseek_v41` builder for a forced tool choice
     /// (`tool_choice: required` or a named function): a blank line, the
