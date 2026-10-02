@@ -8,12 +8,15 @@ repository = "https://github.com/smg-project/smg"
 
 [dependencies]
 engine-zmq-adapter.workspace = true
+engine-zmq-client.workspace = true
 smg-grpc-client.workspace = true
 llm-tokenizer.workspace = true
 openai-protocol.workspace = true
 
 chrono.workspace = true
 futures.workspace = true
+rmp-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -24,6 +27,8 @@ tracing-subscriber.workspace = true
 # The tokenizer bundle (`GetTokenizer`): the crates the Router reads it with.
 sha2 = "0.11"
 zip = "8.6"
+# The KV-event relay's SUB socket (vLLM's publisher is plain ZMQ PUB/SUB).
+zeromq.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

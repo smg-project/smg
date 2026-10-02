@@ -10,7 +10,7 @@ use smg_grpc_client::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{generate, info, requests, tokenizer_bundle, State};
+use super::{generate, info, kv_events, requests, tokenizer_bundle, State};
 use crate::BoxStream;
 
 /// The `VllmEngine` service over the shared state.
@@ -101,10 +101,8 @@ impl VllmEngine for VllmEngineService {
 
     async fn subscribe_kv_events(
         &self,
-        _request: Request<common::SubscribeKvEventsRequest>,
+        request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented(
-            "SubscribeKvEvents is not served by the Rust vLLM servicer yet",
-        ))
+        kv_events::subscribe(&self.state.model, request.into_inner()).map(Response::new)
     }
 }

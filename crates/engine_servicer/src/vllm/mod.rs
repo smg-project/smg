@@ -21,6 +21,7 @@
 mod engine;
 mod generate;
 mod info;
+mod kv_events;
 mod requests;
 mod service;
 #[cfg(test)]

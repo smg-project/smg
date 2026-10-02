@@ -1055,3 +1055,107 @@ async fn get_tokenizer_without_a_tokenizer_dir_is_refused() {
     );
     server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// `SubscribeKvEvents` without a publisher is UNIMPLEMENTED with the Python
+/// servicer's message. With one configured, the call resolves before any
+/// event (headers go out eagerly, as the Python relay's initial metadata),
+/// batches arrive under the publisher's sequence numbers, and dropping the
+/// stream closes the subscription on the publisher's side.
+#[tokio::test]
+async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
+    use zeromq::{prelude::*, PubSocket, SocketEvent};
+
+    let mut h = harness(model_info(), None).await;
+    let status = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unimplemented);
+    assert_eq!(status.message(), kv_events::DISABLED_MESSAGE);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let port = pick_unused_port().expect("a free publisher port");
+    let mut publisher = PubSocket::new();
+    let mut monitor = publisher.monitor();
+    publisher
+        .bind(&format!("tcp://127.0.0.1:{port}"))
+        .await
+        .expect("publisher binds");
+    let mut model = model_info();
+    // A bind wildcard, as vLLM's config spells it; the relay resolves it.
+    model.kv_events_endpoint = format!("tcp://*:{port}");
+    model.kv_events_topic = "kv".to_string();
+    let mut h = harness(model, None).await;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.client
+            .subscribe_kv_events(common::SubscribeKvEventsRequest {
+                start_sequence_number: 0,
+            }),
+    )
+    .await
+    .expect("the call resolves before any event is published")
+    .expect("subscribe")
+    .into_inner();
+
+    // The subscription reaches the publisher a moment after the connect;
+    // probe with sequence 0 until a batch comes through.
+    let batch1 = kv_events::golden::bytes(kv_events::golden::BATCH1);
+    let mut first = None;
+    for _ in 0..200 {
+        publisher
+            .send(kv_events::golden::frame(b"kv", 0, &batch1))
+            .await
+            .expect("publish");
+        if let Ok(item) = tokio::time::timeout(Duration::from_millis(50), stream.message()).await {
+            first = Some(item.expect("stream open").expect("a batch"));
+            break;
+        }
+    }
+    let first = first.expect("the subscription went live");
+    assert_eq!(first.sequence_number, 0);
+    assert_eq!(first.events.len(), 4);
+    publisher
+        .send(kv_events::golden::frame(
+            b"kv",
+            1,
+            &kv_events::golden::bytes(kv_events::golden::BATCH2),
+        ))
+        .await
+        .expect("publish");
+    let second = loop {
+        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a batch in time")
+            .expect("stream open")
+            .expect("a batch");
+        if batch.sequence_number != 0 {
+            break batch;
+        }
+    };
+    assert_eq!(second.sequence_number, 1);
+    assert_eq!(second.dp_rank, Some(1));
+    let stored = match &second.events[0].data {
+        Some(common::kv_cache_event::Data::Stored(stored)) => stored,
+        other => panic!("expected a stored event, got {other:?}"),
+    };
+    assert_eq!(stored.parent_block_hash, Some(41));
+    assert_eq!(stored.blocks[0].block_hash, 42);
+    assert_eq!(stored.blocks[0].token_ids, vec![100, 101]);
+
+    drop(stream);
+    let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = monitor.next().await {
+            if matches!(event, SocketEvent::Disconnected(_)) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("the publisher notices the dropped stream in time");
+    assert!(disconnected);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
