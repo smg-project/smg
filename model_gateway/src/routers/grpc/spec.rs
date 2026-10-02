@@ -164,6 +164,8 @@ pub(crate) struct MessagesResponseSpec {
     /// Messages tools pre-converted to Chat tools for parser reuse.
     pub chat_tools: Vec<Tool>,
     pub stop_sequences: Option<Vec<String>>,
+    /// A trailing assistant message with text, continued as a prefill.
+    pub continues_final_assistant: bool,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -181,6 +183,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .map(utils::message_utils::extract_chat_tools)
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
+            continues_final_assistant: utils::message_utils::continues_final_assistant(request),
         }
     }
 }
