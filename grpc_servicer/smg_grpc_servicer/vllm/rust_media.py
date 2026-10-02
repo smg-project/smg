@@ -47,6 +47,18 @@ KIND_INTERNAL = "internal"
 _RETRYABLE_CODES = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.RESOURCE_EXHAUSTED)
 
 
+def lend_buffer(buffer: Any) -> tuple[Any, int, int]:
+    """A tensor-storage buffer (the encoder's zero-copy aux frame, a uint8
+    memoryview) lent to Rust without a copy: the numpy view that keeps the
+    storage alive, its address, and its length. The binding builds against
+    Python's limited API, which has no buffer protocol, so the address
+    crosses explicitly."""
+    import numpy as np
+
+    view = np.ascontiguousarray(np.frombuffer(buffer, dtype=np.uint8))
+    return view, int(view.ctypes.data), int(view.nbytes)
+
+
 class _EngineView:
     """What the processors read off an AsyncLLM: the config and its renderer."""
 
@@ -182,7 +194,7 @@ class RustMediaBridge:
         items: Sequence[tuple[str, str]],
         arrival_time: float,
         want_identity: bool,
-    ) -> tuple[list[int], bytes | None, list[bytes], str | None, bytes | None]:
+    ) -> tuple[list[int], bytes | None, list[tuple[Any, int, int]], str | None, bytes | None]:
         refs = [MediaRefItem(modality=modality, url=url) for modality, url in items]
         validate_schemes(refs, self._processor.accepted_schemes)
         engine_input = await self._processor.process(
@@ -197,11 +209,11 @@ class RustMediaBridge:
             arrival_time=arrival_time,
         )
         mm_features: bytes | None = None
-        aux_frames: list[bytes] = []
+        aux_frames: list[tuple[Any, int, int]] = []
         if core.mm_features:
             buffers = self._encoder.encode(core.mm_features)
             mm_features = bytes(buffers[0])
-            aux_frames = [bytes(buffer) for buffer in buffers[1:]]
+            aux_frames = [lend_buffer(buffer) for buffer in buffers[1:]]
         return (
             list(core.prompt_token_ids),
             mm_features,

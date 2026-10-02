@@ -113,9 +113,11 @@ def test_submit_relays_what_the_input_processor_produced(loop):
     assert kind == "ok"
     prompt_token_ids, mm_features, aux_frames, cache_salt, identity = payload
     assert prompt_token_ids == [1, 2, 2, 2, 3]
-    # The encoder's buffers as bytes: the primary, then the zero-copy frames.
+    # The primary as bytes; the tensor frames lent as (owner, address, nbytes).
     assert mm_features == b"primary"
-    assert aux_frames == [b"aux-1", b"aux-2"]
+    assert [bytes(owner) for owner, _, _ in aux_frames] == [b"aux-1", b"aux-2"]
+    for owner, address, nbytes in aux_frames:
+        assert address == owner.ctypes.data and nbytes == owner.nbytes == 5
     assert cache_salt == "salt"
     assert identity is None
     # The processor saw the request as the Router sent it.

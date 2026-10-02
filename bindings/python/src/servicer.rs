@@ -48,9 +48,12 @@ pub fn init_servicer_tracing(level: Option<&str>) -> PyResult<()> {
 /// `submit(request_id, prompt_token_ids, prompt_text, items, arrival_time,
 /// want_identity, done)` methods that schedule the work on Python's loop
 /// and call `done` from whichever thread finishes it. Calls into Python
-/// only to hand work over; the wait is a Rust channel.
+/// only to hand work over, from a blocking thread: taking the GIL can wait
+/// behind the processor's own Python threads, and that wait must not hold
+/// one of the servicer's few runtime workers. The wait for the result is a
+/// Rust channel.
 struct PythonMediaProcessor {
-    bridge: Py<PyAny>,
+    bridge: Arc<Py<PyAny>>,
     name: String,
     schemes: String,
     source: String,
@@ -64,8 +67,20 @@ impl PythonMediaProcessor {
             schemes: bridge.getattr("schemes")?.extract()?,
             source: bridge.getattr("source")?.extract()?,
             max_inflight: bridge.getattr("max_inflight")?.extract()?,
-            bridge: bridge.clone().unbind(),
+            bridge: Arc::new(bridge.clone().unbind()),
         })
+    }
+
+    /// Run `call` against the bridge on a blocking thread, with the GIL.
+    async fn call_bridge(
+        bridge: Arc<Py<PyAny>>,
+        call: impl FnOnce(Python<'_>, &Py<PyAny>) -> PyResult<()> + Send + 'static,
+    ) -> Result<(), String> {
+        match tokio::task::spawn_blocking(move || Python::attach(|py| call(py, &bridge))).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(join) => Err(format!("media bridge call did not run: {join}")),
+        }
     }
 }
 
@@ -87,22 +102,24 @@ impl MediaProcessor for PythonMediaProcessor {
     }
 
     fn probe(&self) -> BoxFuture<bool> {
-        let (tx, rx) = oneshot::channel();
-        let scheduled = Python::attach(|py| -> PyResult<()> {
-            let done = Py::new(
-                py,
-                ProbeDone {
-                    tx: Mutex::new(Some(tx)),
-                },
-            )?;
-            self.bridge.call_method1(py, "probe", (done,))?;
-            Ok(())
-        });
+        let bridge = Arc::clone(&self.bridge);
         Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            let scheduled = Self::call_bridge(bridge, move |py, bridge| {
+                let done = Py::new(
+                    py,
+                    ProbeDone {
+                        tx: Mutex::new(Some(tx)),
+                    },
+                )?;
+                bridge.call_method1(py, "probe", (done,))?;
+                Ok(())
+            })
+            .await;
             match scheduled {
                 Ok(()) => rx.await.unwrap_or(false),
                 Err(error) => {
-                    tracing::warn!(%error, "media processor probe could not be scheduled");
+                    tracing::warn!(error, "media processor probe could not be scheduled");
                     false
                 }
             }
@@ -110,35 +127,37 @@ impl MediaProcessor for PythonMediaProcessor {
     }
 
     fn process(&self, request: MediaRequest) -> BoxFuture<Result<ProcessedMedia, MediaError>> {
-        let (tx, rx) = oneshot::channel();
-        let scheduled = Python::attach(|py| -> PyResult<()> {
-            let done = Py::new(
-                py,
-                MediaDone {
-                    tx: Mutex::new(Some(tx)),
-                },
-            )?;
-            let items: Vec<(String, String)> = request
-                .items
-                .into_iter()
-                .map(|item| (item.modality, item.url))
-                .collect();
-            self.bridge.call_method1(
-                py,
-                "submit",
-                (
-                    request.request_id,
-                    request.prompt_token_ids,
-                    request.prompt_text,
-                    items,
-                    request.arrival_time,
-                    request.want_identity,
-                    done,
-                ),
-            )?;
-            Ok(())
-        });
+        let bridge = Arc::clone(&self.bridge);
         Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            let scheduled = Self::call_bridge(bridge, move |py, bridge| {
+                let done = Py::new(
+                    py,
+                    MediaDone {
+                        tx: Mutex::new(Some(tx)),
+                    },
+                )?;
+                let items: Vec<(String, String)> = request
+                    .items
+                    .into_iter()
+                    .map(|item| (item.modality, item.url))
+                    .collect();
+                bridge.call_method1(
+                    py,
+                    "submit",
+                    (
+                        request.request_id,
+                        request.prompt_token_ids,
+                        request.prompt_text,
+                        items,
+                        request.arrival_time,
+                        request.want_identity,
+                        done,
+                    ),
+                )?;
+                Ok(())
+            })
+            .await;
             if let Err(error) = scheduled {
                 return Err(MediaError::Internal(format!(
                     "media processor could not take the request: {error}"
@@ -153,13 +172,81 @@ impl MediaProcessor for PythonMediaProcessor {
     }
 }
 
+/// Python's `bytes` copied into Rust-owned bytes; for the small buffers.
 fn bytes_of(value: &Bound<'_, PyBytes>) -> Bytes {
     Bytes::copy_from_slice(value.as_bytes())
 }
 
+/// Memory lent by Python without a copy: `_owner` (a numpy view over the
+/// tensor's storage) keeps it alive for as long as these bytes exist, and
+/// nothing writes to it in the meantime. The buffer protocol is not part of
+/// the limited API this extension builds against, so Python hands over the
+/// address and length itself. Dropped off a Python thread, the owner's
+/// reference is released on the next GIL acquisition.
+struct PyBacked {
+    _owner: Py<PyAny>,
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: the memory is only read, and the Python object that owns it is
+// held for the lifetime of this value; `Py<PyAny>` is itself Send + Sync.
+#[expect(
+    unsafe_code,
+    reason = "a raw pointer into Python-owned memory the owner keeps alive"
+)]
+unsafe impl Send for PyBacked {}
+#[expect(
+    unsafe_code,
+    reason = "a raw pointer into Python-owned memory the owner keeps alive"
+)]
+unsafe impl Sync for PyBacked {}
+
+impl AsRef<[u8]> for PyBacked {
+    #[expect(
+        unsafe_code,
+        reason = "the limited API has no buffer protocol; the owner guarantees the range"
+    )]
+    fn as_ref(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: `ptr`/`len` describe the owner's contiguous storage, which
+        // outlives this value (see the struct doc).
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// An aux frame as Python lends it: the owner, its address, its length.
+type LentFrame = (Py<PyAny>, usize, usize);
+
+/// The `ok` payload: prompt ids, the encoded features, the lent frames, the
+/// cache salt, the serialized identity.
+type OkPayload<'py> = (
+    Vec<u32>,
+    Option<Bound<'py, PyBytes>>,
+    Vec<LentFrame>,
+    Option<String>,
+    Option<Bound<'py, PyBytes>>,
+);
+
+/// A lent frame as zero-copy bytes.
+fn lent_bytes(frame: LentFrame) -> PyResult<Bytes> {
+    let (owner, address, len) = frame;
+    if address == 0 && len > 0 {
+        return Err(PyValueError::new_err("a lent buffer has no address"));
+    }
+    Ok(Bytes::from_owner(PyBacked {
+        _owner: owner,
+        ptr: address as *const u8,
+        len,
+    }))
+}
+
 /// Python's answer to one media request, called once: `("ok",
 /// (prompt_token_ids, mm_features | None, aux_frames, cache_salt | None,
-/// media_identity | None))`, or `(kind, message)` with `kind` one of
+/// media_identity | None))` where each aux frame is `(owner, address,
+/// nbytes)` lent without a copy, or `(kind, message)` with `kind` one of
 /// `invalid`, `unavailable`, `internal`.
 #[pyclass(name = "_MediaDone")]
 struct MediaDone {
@@ -171,17 +258,15 @@ impl MediaDone {
     fn __call__(&self, kind: &str, payload: &Bound<'_, PyAny>) -> PyResult<()> {
         let outcome = match kind {
             "ok" => {
-                let (prompt_token_ids, mm_features, aux_frames, cache_salt, media_identity): (
-                    Vec<u32>,
-                    Option<Bound<'_, PyBytes>>,
-                    Vec<Bound<'_, PyBytes>>,
-                    Option<String>,
-                    Option<Bound<'_, PyBytes>>,
-                ) = payload.extract()?;
+                let (prompt_token_ids, mm_features, aux_frames, cache_salt, media_identity): OkPayload<'_> =
+                    payload.extract()?;
                 Ok(ProcessedMedia {
                     prompt_token_ids,
                     mm_features: mm_features.as_ref().map(bytes_of),
-                    aux_frames: aux_frames.iter().map(bytes_of).collect(),
+                    aux_frames: aux_frames
+                        .into_iter()
+                        .map(lent_bytes)
+                        .collect::<PyResult<_>>()?,
                     cache_salt,
                     media_identity: media_identity.as_ref().map(bytes_of),
                 })

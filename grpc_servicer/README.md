@@ -178,8 +178,9 @@ servicer and the Rust path is never behind vLLM's processors. The Rust server
 hands a request's `media_refs` to the Python bridge
 (`smg_grpc_servicer.vllm.rust_media`), which runs the processor and vLLM's
 input processor on the launcher's asyncio loop and returns the expanded
-prompt and `mm_features` as vLLM's own encoder writes them; Rust relays those
-bytes to the engine untouched. The in-flight cap, the saturation refusal, the
+prompt and `mm_features` as vLLM's own encoder writes them; Rust relays the
+encoded features to the engine untouched and sends the tensor frames straight
+from the memory Python lent it, without a copy. The in-flight cap, the saturation refusal, the
 advertised `mm_processor` / `mm_media_ref_schemes` / `mm_processor_source` and
 the PD prefill leg's `media_identity` behave as on the Python servicer. A Rust
 processor (the Router's own multimodal pipeline, worker-side) can plug into
