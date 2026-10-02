@@ -46,7 +46,11 @@ sglang = ["sglang>=0.5.20"]
 # crash at import time when smg_grpc_servicer.mlx.server runs.
 # transformers<5.13: 5.13.0 regressed AutoTokenizer.register on string keys,
 # which mlx-lm's NewlineTokenizer registration hits at import.
-mlx = ["smg-grpc-proto>=0.4.7", "mlx>=0.22.0", "mlx-lm>=0.22.0", "transformers<5.13"]
+# mlx-lm<0.32: 0.32.0 replaced `SequenceStateMachine` (token-sequence stop
+# transitions, which the MLX servicer builds its stop handling on) with a
+# string-level `TextStateMachine` plus a separate `StopSequences` matcher;
+# lift the bound together with that port.
+mlx = ["smg-grpc-proto>=0.4.7", "mlx>=0.22.0", "mlx-lm>=0.22.0,<0.32", "transformers<5.13"]
 # TokenSpeed itself is installed from source (no PyPI release); these are the
 # extra runtime deps the KV-event bridge needs on top of a TokenSpeed install.
 tokenspeed = ["pyzmq>=25.0.0", "msgspec>=0.18.0"]
