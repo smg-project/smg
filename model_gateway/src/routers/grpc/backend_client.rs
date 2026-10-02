@@ -27,7 +27,7 @@ use crate::{
             finish_tokenspeed_request, finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest,
             ProtoGenerateRequest, ProtoStream,
         },
-        zmq_client::{fold_tokenizer_eos_backstop, ZmqDialect, ZmqEngineClient},
+        zmq_client::{self, fold_tokenizer_eos_backstop, ZmqDialect, ZmqEngineClient},
         MultimodalData,
     },
     worker::RuntimeType,
@@ -167,14 +167,14 @@ impl BackendClient {
     pub async fn get_model_info(&self) -> Result<ModelInfo, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_model_info().await,
-            Self::Zmq(client) => Ok(client.get_model_info()),
+            Self::Zmq(client) => Ok(zmq_client::model_info(client)),
         }
     }
 
     pub async fn get_server_info(&self) -> Result<ServerInfo, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_server_info().await,
-            Self::Zmq(client) => Ok(client.get_server_info()),
+            Self::Zmq(client) => Ok(zmq_client::server_info(client)),
         }
     }
 
@@ -247,7 +247,7 @@ impl BackendClient {
     ) -> Result<ProtoStream, tonic::Status> {
         match self {
             Self::Grpc(client) => client.generate(req).await,
-            Self::Zmq(client) => Ok(ProtoStream::Zmq(client.generate(req).await?)),
+            Self::Zmq(client) => Ok(ProtoStream::Zmq(zmq_client::generate(client, req).await?)),
         }
     }
 

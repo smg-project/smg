@@ -2211,6 +2211,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-zmq-adapter"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "engine-zmq-client",
+ "futures",
+ "llm-tokenizer",
+ "openai-protocol",
+ "rustix",
+ "serde_json",
+ "smg-grpc-client",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "engine-zmq-client"
 version = "0.2.0"
 dependencies = [
@@ -7476,6 +7494,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "data-connector",
+ "engine-zmq-adapter",
  "engine-zmq-client",
  "futures",
  "futures-util",

@@ -95,6 +95,7 @@ smg-mesh.workspace = true
 smg-rl.workspace = true
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
+engine-zmq-adapter.workspace = true
 
 # External dependencies (not in workspace)
 bincode = "1.3"
