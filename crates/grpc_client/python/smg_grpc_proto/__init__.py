@@ -1,4 +1,9 @@
-"""SMG gRPC Proto - Protocol definitions for SGLang, TokenSpeed, vLLM, TRT-LLM, and MLX."""
+"""SMG gRPC Proto.
+
+Protocol definitions for the SMG Worker contract (WorkerControl and
+WorkerInference) and for the SGLang, TokenSpeed, vLLM, TRT-LLM, and MLX
+engine services.
+"""
 
 from importlib import import_module
 from importlib.metadata import version
@@ -20,6 +25,10 @@ _GENERATED_MODULES = {
     "trtllm_service_pb2_grpc",
     "mlx_engine_pb2",
     "mlx_engine_pb2_grpc",
+    "worker_control_pb2",
+    "worker_control_pb2_grpc",
+    "worker_inference_pb2",
+    "worker_inference_pb2_grpc",
 }
 
 __all__ = sorted(_GENERATED_MODULES)

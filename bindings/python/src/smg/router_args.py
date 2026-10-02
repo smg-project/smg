@@ -286,6 +286,7 @@ class RouterArgs:
     prefill_max_inflight_requests_per_worker: int = -1
     prefill_queue_size: int | None = None
     prefill_queue_timeout_secs: int | None = None
+    worker_mode: str = "engine"  # engine (direct) or smg (two-tier Worker)
 
     @staticmethod
     def add_cli_args(
@@ -408,6 +409,12 @@ class RouterArgs:
                 "List of worker URLs. Supports IPv4 and IPv6 addresses"
                 " (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)"
             ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-mode",
+            choices=["engine", "smg"],
+            default=RouterArgs.worker_mode,
+            help="Use the direct engine endpoint or the two-tier SMG Worker service",
         )
         worker_group.add_argument(
             f"--{prefix}upstream-http2",

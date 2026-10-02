@@ -85,14 +85,14 @@ impl BuildStage for HarmonyRequestBuildingStage {
         // Generate request_id based on request type. The Harmony spec owns a
         // handle to the request: the tool loop legitimately re-reads it
         // across iterations (the one deliberate post-build request holder).
-        let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
+        let fresh_id_per_attempt = helpers::fresh_id_per_attempt(clients);
         let (request_id, id_stamp, harmony_spec) = match &ctx.input.request_type {
             RequestType::Chat(request) => {
                 let (id, stamp) = helpers::resolve_request_id_stamp(
                     &ctx.input.request_type,
                     ctx.input.tenant_request_meta.as_ref(),
                     "chatcmpl-",
-                    disaggregated,
+                    fresh_id_per_attempt,
                 );
                 (id, stamp, HarmonyResponseSpec::Chat(request.clone()))
             }
@@ -101,7 +101,7 @@ impl BuildStage for HarmonyRequestBuildingStage {
                     &ctx.input.request_type,
                     ctx.input.tenant_request_meta.as_ref(),
                     "responses-",
-                    disaggregated,
+                    fresh_id_per_attempt,
                 );
                 (id, stamp, HarmonyResponseSpec::Responses(request.clone()))
             }
@@ -302,6 +302,9 @@ fn build_harmony_proto(
             build_vllm(body, request_id, text, token_ids, tool_constraints)?
         }
         (BackendClient::Grpc(GrpcClient::TokenSpeed(_)), body) => {
+            build_tokenspeed(body, request_id, text, token_ids, tool_constraints)?
+        }
+        (BackendClient::Smg(_), body) => {
             build_tokenspeed(body, request_id, text, token_ids, tool_constraints)?
         }
         (BackendClient::Zmq(zmq), body) => match zmq.dialect() {

@@ -131,7 +131,7 @@ impl BuildStage for CompletionRequestBuildingStage {
             ClientSelection::Disaggregated { prefill, .. } => prefill,
         };
 
-        let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
+        let fresh_id_per_attempt = helpers::fresh_id_per_attempt(clients);
         let request_type = &ctx.input.request_type;
         let workers = ctx.state.workers.as_ref();
         let sampling_mask = helpers::SamplingDefaultsMask::from_request_type(request_type);
@@ -153,7 +153,7 @@ impl BuildStage for CompletionRequestBuildingStage {
                     request_type,
                     ctx.input.tenant_request_meta.as_ref(),
                     "cmpl_",
-                    disaggregated,
+                    fresh_id_per_attempt,
                 );
                 let (mut proto_request, baseline) = self.build_proto_request(
                     builder_client,
@@ -176,7 +176,7 @@ impl BuildStage for CompletionRequestBuildingStage {
                     request_type,
                     ctx.input.tenant_request_meta.as_ref(),
                     "cmpl_",
-                    disaggregated,
+                    fresh_id_per_attempt,
                 );
                 let mut requests = Vec::with_capacity(batch_items.len());
                 for (i, item) in batch_items.iter().enumerate() {

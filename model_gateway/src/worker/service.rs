@@ -16,9 +16,12 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::{
-    config::{validate_worker_url, RouterConfig},
+    config::{validate_worker_url, validation::validate_worker_control_url, RouterConfig},
     routers::provider_support,
-    worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
+    worker::{
+        registry::WorkerId, worker::worker_to_info, ConnectionMode, WorkerMode, WorkerRegistry,
+        WorkerType,
+    },
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
 
@@ -30,6 +33,43 @@ fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
     validate_worker_url(url).map_err(|e| WorkerServiceError::BadRequest {
         message: e.to_string(),
     })
+}
+
+/// Validate the endpoints of an incoming worker spec: the inference URL, and
+/// for an SMG Worker its gRPC-only inference and control URLs. A control URL
+/// on an engine worker would be silently ignored, so it is refused.
+fn validate_worker_endpoints_request(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
+    validate_worker_url_request(&spec.url)?;
+    match spec.worker_mode {
+        WorkerMode::Smg => {
+            if ConnectionMode::from_url(&spec.url) != Some(ConnectionMode::Grpc) {
+                return Err(WorkerServiceError::BadRequest {
+                    message: format!(
+                        "worker_mode=smg requires a grpc:// or grpcs:// url: an SMG Worker \
+                         serves WorkerInference over gRPC only; got '{}'",
+                        spec.url
+                    ),
+                });
+            }
+            if let Some(control_url) = spec.control_url.as_deref() {
+                validate_worker_control_url(control_url).map_err(|e| {
+                    WorkerServiceError::BadRequest {
+                        message: e.to_string(),
+                    }
+                })?;
+            }
+        }
+        WorkerMode::Engine => {
+            if let Some(control_url) = spec.control_url.as_deref() {
+                return Err(WorkerServiceError::BadRequest {
+                    message: format!(
+                        "control_url '{control_url}' is only valid with worker_mode=smg"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Error types for worker service operations
@@ -296,7 +336,7 @@ impl WorkerService {
         &self,
         config: WorkerSpec,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
-        validate_worker_url_request(&config.url)?;
+        validate_worker_endpoints_request(&config)?;
         Self::require_provider_router(&config)?;
 
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
@@ -381,6 +421,7 @@ impl WorkerService {
                     worker_id: worker_id_raw.to_string(),
                 })?;
         let url = existing.url().to_string();
+        validate_worker_endpoints_request(&config)?;
         Self::require_provider_router(&config)?;
 
         // A data-parallel router expands one spec into one worker per rank,
@@ -685,6 +726,97 @@ mod tests {
             .expect_err("queue is uninitialized in the test harness");
 
         assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
+    }
+
+    fn smg_worker_spec(url: &str, control_url: Option<&str>) -> WorkerSpec {
+        serde_json::from_value(json!({
+            "url": url,
+            "worker_mode": "smg",
+            "control_url": control_url,
+        }))
+        .expect("worker spec")
+    }
+
+    #[tokio::test]
+    async fn create_worker_rejects_a_non_grpc_control_url() {
+        let service = make_service(Arc::new(WorkerRegistry::new()));
+        for control_url in ["http://10.0.0.5:50051", "10.0.0.5:50051", "ipc:///tmp/ctl"] {
+            let err = service
+                .create_worker(smg_worker_spec("grpc://10.0.0.5:8000", Some(control_url)))
+                .await
+                .expect_err("non-gRPC control URL must be rejected");
+            assert!(
+                matches!(err, WorkerServiceError::BadRequest { ref message } if message.contains("control_url")),
+                "{control_url}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_worker_rejects_an_smg_worker_on_a_non_grpc_url() {
+        let service = make_service(Arc::new(WorkerRegistry::new()));
+        let err = service
+            .create_worker(smg_worker_spec("http://10.0.0.5:8000", None))
+            .await
+            .expect_err("SMG Worker on an HTTP URL must be rejected");
+        assert!(matches!(
+            err,
+            WorkerServiceError::BadRequest { ref message } if message.contains("worker_mode=smg requires a grpc://")
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_worker_rejects_a_control_url_on_an_engine_worker() {
+        let service = make_service(Arc::new(WorkerRegistry::new()));
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "grpc://10.0.0.5:8000",
+            "control_url": "grpc://10.0.0.5:50051",
+        }))
+        .expect("worker spec");
+        let err = service
+            .create_worker(spec)
+            .await
+            .expect_err("control_url without worker_mode=smg must be rejected");
+        assert!(matches!(
+            err,
+            WorkerServiceError::BadRequest { ref message } if message.contains("only valid with worker_mode=smg")
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_worker_accepts_a_grpc_control_url() {
+        let service = make_service(Arc::new(WorkerRegistry::new()));
+        // Validation passes and the request stops at the uninitialized queue.
+        let err = service
+            .create_worker(smg_worker_spec(
+                "grpcs://10.0.0.5:8000",
+                Some("grpc://10.0.0.5:50051"),
+            ))
+            .await
+            .expect_err("queue is uninitialized in the test harness");
+        assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
+    }
+
+    #[tokio::test]
+    async fn replace_worker_validates_the_control_url() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker_id = registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://10.0.0.5:8000").build(),
+            ))
+            .unwrap();
+        let service = make_service(registry);
+        let err = service
+            .replace_worker(
+                worker_id.as_str(),
+                smg_worker_spec("grpc://10.0.0.5:8000", Some("http://10.0.0.5:50051")),
+            )
+            .await
+            .expect_err("non-gRPC control URL must be rejected on replace");
+        assert!(matches!(
+            err,
+            WorkerServiceError::BadRequest { ref message } if message.contains("control_url")
+        ));
     }
 
     #[tokio::test]

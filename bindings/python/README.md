@@ -29,6 +29,9 @@ smg serve --backend vllm --model /path/to/model --port 8080
 # TensorRT-LLM (gRPC only)
 smg serve --backend trtllm --model /path/to/model --port 8080
 
+# Two-tier: a Rust Worker sidecar in front of each engine, engine over ZMQ IPC (vllm or tokenspeed)
+smg serve --backend vllm --model /path/to/model --port 8080 --connection-mode zmq --router-worker-mode smg
+
 # Multiple workers (data parallel)
 smg serve --backend sglang --model-path /path/to/model --port 8080 --dp-size 4
 ```
@@ -37,8 +40,11 @@ smg serve --backend sglang --model-path /path/to/model --port 8080 --dp-size 4
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--backend` | `sglang` | Backend to use: `sglang`, `vllm`, or `trtllm` |
-| `--connection-mode` | `grpc` | Connection mode: `grpc` or `http`. vllm/trtllm only support grpc |
+| `--backend` | `sglang` | Backend to use: `sglang`, `vllm`, `trtllm`, or `tokenspeed` |
+| `--connection-mode` | `grpc` | Connection mode: `grpc`, `http`, or `zmq`. vllm/trtllm support grpc; vllm/tokenspeed also support zmq |
+| `--router-worker-mode` | `engine` | `engine` routes to the engines directly; `smg` runs a Rust Worker sidecar in front of each vllm/tokenspeed engine and routes through it |
+| `--worker-control-base-port` | `41000` | First port for the Worker sidecars (`--router-worker-mode smg`) |
+| `--worker-drain-secs` | `5` | How long a Worker sidecar drains in-flight requests before it stops |
 | `--host` | `127.0.0.1` | Host for the router |
 | `--port` | `8080` | Port for the router |
 | `--dp-size` | `1` | Data parallel size (number of worker replicas) |

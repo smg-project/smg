@@ -22,6 +22,7 @@ tonic.workspace = true
 axum.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+prost-types.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

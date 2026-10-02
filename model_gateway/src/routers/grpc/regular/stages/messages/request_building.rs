@@ -85,12 +85,11 @@ impl BuildStage for MessageRequestBuildingStage {
         };
 
         // Build message request
-        let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
         let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
             &ctx.input.request_type,
             ctx.input.tenant_request_meta.as_ref(),
             "msg_",
-            disaggregated,
+            helpers::fresh_id_per_attempt(clients),
         );
 
         // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.

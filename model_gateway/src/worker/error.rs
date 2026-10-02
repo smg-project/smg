@@ -8,6 +8,12 @@ pub enum WorkerError {
     #[error("Health check failed for worker {url}: {reason}")]
     HealthCheckFailed { url: String, reason: String },
 
+    /// The worker reported that it is draining: it refuses new work now, so
+    /// the readiness machine should take it out of rotation on this probe
+    /// rather than after `failure_threshold` more.
+    #[error("Worker {url} is draining")]
+    Draining { url: String },
+
     #[error("Worker not found: {url}")]
     WorkerNotFound { url: String },
 

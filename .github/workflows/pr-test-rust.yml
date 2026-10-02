@@ -115,7 +115,12 @@ jobs:
         run: |
           pip install crates/grpc_client/python/dist/*.whl
           python - <<'PY'
-          from smg_grpc_proto import sglang_scheduler_pb2, tokenspeed_scheduler_pb2
+          from smg_grpc_proto import (
+              sglang_scheduler_pb2,
+              tokenspeed_scheduler_pb2,
+              worker_control_pb2,
+              worker_inference_pb2,
+          )
 
           fields = tokenspeed_scheduler_pb2.TensorData.DESCRIPTOR.fields_by_name
           assert "data" not in fields
@@ -124,6 +129,11 @@ jobs:
           assert fields["inline"].number == 3
           assert fields["shm"].number == 4
           assert fields["remote"].number == 5
+
+          capabilities = worker_control_pb2.WorkerCapabilities.DESCRIPTOR.fields_by_name
+          assert capabilities["api_major"].number == 1
+          complete = worker_inference_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
+          assert complete["spec_accepted_tokens"].number == 10
 
           print("OK")
           PY

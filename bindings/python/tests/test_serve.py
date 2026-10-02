@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.serve import (
+    _ZMQ_HANDSHAKE_PORT_SPAN,
+    _ZMQ_SIDECAR_STARTUP_TIMEOUT_SECS,
     BACKEND_ARG_ADDERS,
     BACKEND_CHOICES,
     BACKEND_LAUNCHERS,
@@ -669,12 +671,21 @@ class TestZmqHandshakePort:
     def test_reject_collisions_raises_and_names_urls(self):
         # Two ports whose ipc paths derive the same handshake port must be
         # rejected before launch, naming both colliding URLs.
-        base = 30000
-        collider = next(
-            p
-            for p in range(base + 1, base + 20000)
-            if _zmq_handshake_port(_zmq_ipc_url(p)) == _zmq_handshake_port(_zmq_ipc_url(base))
-        )
+        #
+        # Search for *any* colliding pair rather than one that collides with a
+        # fixed base: the ipc path contains the socket dir, which carries the
+        # uid, so which ports collide differs per machine. Scanning more ports
+        # than the 10000-wide band guarantees a pair by pigeonhole.
+        seen: dict[int, int] = {}
+        for port in range(30000, 30000 + _ZMQ_HANDSHAKE_PORT_SPAN + 1):
+            handshake_port = _zmq_handshake_port(_zmq_ipc_url(port))
+            if handshake_port in seen:
+                base, collider = seen[handshake_port], port
+                break
+            seen[handshake_port] = port
+        else:
+            pytest.fail("no handshake-port collision in a range wider than the band")
+
         with pytest.raises(ValueError) as exc:
             _reject_handshake_port_collisions([base, collider])
         assert _zmq_ipc_url(base) in str(exc.value)
@@ -836,7 +847,18 @@ class TestVllmWorkerLauncher:
 
 
 class TestTokenspeedWorkerLauncher:
-    """Test TokenspeedWorkerLauncher (ZMQ direct-backend only)."""
+    """Test TokenSpeed gRPC and ZMQ launch commands."""
+
+    def test_build_grpc_command(self):
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="grpc")
+        cmd = launcher.build_command(args, ["--mem-fraction-static", "0.8"], "0.0.0.0", 31000)
+
+        assert "smg_grpc_servicer.tokenspeed" in cmd
+        assert cmd[cmd.index("--model") + 1] == "/tmp/model"
+        assert cmd[cmd.index("--host") + 1] == "0.0.0.0"
+        assert cmd[cmd.index("--port") + 1] == "31000"
+        assert "--mem-fraction-static" in cmd
 
     def test_build_zmq_command(self):
         launcher = TokenspeedWorkerLauncher()
@@ -956,12 +978,11 @@ class TestTokenspeedWorkerLauncher:
         assert "--grammar-backend=none" in cmd
         assert "xgrammar" not in cmd
 
-    def test_build_command_rejects_non_zmq_modes(self):
+    def test_build_command_rejects_http_mode(self):
         launcher = TokenspeedWorkerLauncher()
-        for mode in ("grpc", "http"):
-            args = argparse.Namespace(model="/tmp/model", connection_mode=mode)
-            with pytest.raises(ValueError, match="only supports --connection-mode zmq"):
-                launcher.build_command(args, [], "127.0.0.1", 31000)
+        args = argparse.Namespace(model="/tmp/model", connection_mode="http")
+        with pytest.raises(ValueError, match="supports grpc and zmq"):
+            launcher.build_command(args, [], "127.0.0.1", 31000)
 
     def test_worker_url_is_ipc(self):
         launcher = TokenspeedWorkerLauncher()
@@ -1239,16 +1260,18 @@ class TestFindAvailablePorts:
 
     def test_skips_unavailable_ports(self):
         # First call: port 31000 unavailable, then 31001 available
-        call_count = 0
-
-        def mock_available(port):
-            nonlocal call_count
-            call_count += 1
+        def mock_available(port, host):
             return port != 31000
 
         with patch("smg.serve._is_port_available", side_effect=mock_available):
             ports = _find_available_ports(31000, 1)
         assert ports[0] == 31001
+
+    def test_probes_the_requested_host(self):
+        """The probe binds the host the processes will bind, not loopback."""
+        with patch("smg.serve._is_port_available", return_value=True) as available:
+            _find_available_ports(31000, 1, "10.0.0.5")
+        available.assert_called_once_with(31000, "10.0.0.5")
 
     def test_ports_are_unique(self):
         with patch("smg.serve._is_port_available", return_value=True):
@@ -1280,6 +1303,19 @@ class TestIsPortAvailable:
         finally:
             s.close()
 
+    def test_hostname_is_resolved_before_binding(self):
+        assert _is_port_available(0, "localhost") is True
+
+    def test_unresolvable_host_fails_loudly(self):
+        import socket
+
+        with patch(
+            "smg.serve.socket.getaddrinfo",
+            side_effect=socket.gaierror(8, "nodename nor servname provided"),
+        ):
+            with pytest.raises(ValueError, match="cannot resolve worker host 'no-such-host'"):
+                _is_port_available(0, "no-such-host")
+
 
 # ---------------------------------------------------------------------------
 # ServeOrchestrator tests
@@ -1295,7 +1331,10 @@ def _make_args(**overrides):
         "worker_host": "127.0.0.1",
         "worker_base_port": 31000,
         "worker_startup_timeout": 10,
+        "worker_control_base_port": 41000,
+        "worker_drain_secs": 5.0,
         "model_path": "/tmp/model",
+        "router_worker_mode": "engine",
         # router args with router_ prefix
         "router_policy": "cache_aware",
         "router_pd_disaggregation": False,
@@ -1365,6 +1404,334 @@ class TestServeOrchestrator:
             "grpc://127.0.0.1:32000",
             "grpc://127.0.0.1:32003",
         ]
+
+    def test_build_router_args_two_tier_uses_sidecar_urls(self):
+        args = _make_args(
+            backend="vllm",
+            model="/tmp/m",
+            data_parallel_size=2,
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("vllm", args, [])
+        orch.workers = [(MagicMock(), 32000), (MagicMock(), 32003)]
+        orch.sidecars = [
+            (MagicMock(), 41000, 32000),
+            (MagicMock(), 41003, 32003),
+        ]
+
+        from types import SimpleNamespace
+
+        router_args = SimpleNamespace(
+            worker_mode="engine",
+            backend="sglang",
+            disable_retries=False,
+            disable_circuit_breaker=False,
+            policy="cache_aware",
+        )
+        with patch("smg.serve.RouterArgs.from_cli_args", return_value=router_args):
+            result = orch._build_router_args()
+
+        assert result.worker_urls == [
+            "grpc://127.0.0.1:41000",
+            "grpc://127.0.0.1:41003",
+        ]
+        assert result.worker_mode == "smg"
+        assert result.backend == "vllm"
+
+    def test_launch_two_tier_sidecars_for_tokenspeed(self):
+        args = _make_args(
+            backend="tokenspeed",
+            model="/tmp/m",
+            data_parallel_size=1,
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("tokenspeed", args, ["--max-num-seqs", "64"])
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert "smg.worker_sidecar" in command
+        assert command[command.index("--bind-address") + 1] == "127.0.0.1:41000"
+        assert command[command.index("--engine-type") + 1] == "tokenspeed"
+        assert command[command.index("--engine-transport") + 1] == "grpc"
+        assert command[command.index("--engine-endpoint") + 1] == ("grpc://127.0.0.1:31000")
+        assert command[command.index("--engine-count") + 1] == "1"
+        assert command[command.index("--max-concurrent-requests") + 1] == "64"
+        assert orch.sidecars == [(proc, 41000, 31000)]
+
+    def test_launch_two_tier_sidecars_bind_the_worker_host(self):
+        """The Worker RPCs are unauthenticated: the sidecar listens on the same
+        interface as the engines and the Router, never on every interface."""
+        args = _make_args(
+            backend="vllm",
+            model="/tmp/m",
+            data_parallel_size=1,
+            worker_host="10.0.0.5",
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("vllm", args, [])
+        orch.workers = [(MagicMock(), 31000)]
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]) as ports:
+            with patch("smg.serve.subprocess.Popen", return_value=MagicMock(pid=1234)) as popen:
+                orch._launch_sidecars()
+
+        ports.assert_called_once_with(41000, 1, "10.0.0.5")
+        command = popen.call_args.args[0]
+        assert command[command.index("--bind-address") + 1] == "10.0.0.5:41000"
+        assert command[command.index("--engine-endpoint") + 1] == "grpc://10.0.0.5:31000"
+        assert "0.0.0.0" not in " ".join(command)
+
+    def test_launch_workers_probes_ports_on_the_worker_host(self):
+        args = _make_args(data_parallel_size=1, worker_host="10.0.0.5")
+        orch = ServeOrchestrator("sglang", args, ["--model-path", "/tmp/model"])
+
+        with patch("smg.serve._find_available_ports", return_value=[31000]) as ports:
+            with patch.object(orch.launcher, "launch", return_value=MagicMock(pid=1234)):
+                orch._launch_workers()
+
+        ports.assert_called_once_with(31000, 1, "10.0.0.5")
+
+    def test_launch_two_tier_sidecar_with_zmq_engine_transport(self):
+        args = _make_args(
+            backend="tokenspeed",
+            model="/tmp/m",
+            data_parallel_size=1,
+            connection_mode="zmq",
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("tokenspeed", args, ["--data-parallel-size", "2"])
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert command[command.index("--engine-transport") + 1] == "zmq"
+        assert command[command.index("--engine-endpoint") + 1] == _zmq_ipc_url(31000)
+        assert command[command.index("--engine-count") + 1] == "2"
+
+    @pytest.mark.parametrize("backend", ["sglang", "trtllm"])
+    @pytest.mark.parametrize("connection_mode", ["grpc", "zmq"])
+    def test_two_tier_supports_only_vllm_and_tokenspeed_engines(self, backend, connection_mode):
+        args = _make_args(connection_mode=connection_mode, router_worker_mode="smg")
+        orch = ServeOrchestrator(backend, args, [])
+        orch.workers = [(MagicMock(), 31000)]
+
+        with pytest.raises(
+            ValueError, match=f"supports vllm and tokenspeed engines, not {backend}"
+        ):
+            orch._launch_sidecars()
+
+    def test_two_tier_rejects_http_engine_transport(self):
+        args = _make_args(
+            backend="vllm", model="/tmp/m", connection_mode="http", router_worker_mode="smg"
+        )
+        orch = ServeOrchestrator("vllm", args, [])
+
+        with pytest.raises(ValueError, match="requires a grpc or zmq engine transport"):
+            orch._validate_two_tier()
+
+    def test_two_tier_is_validated_before_any_engine_launches(self):
+        """A rejected combination must fail before a model is loaded for nothing."""
+        args = _make_args(router_worker_mode="smg")
+        orch = ServeOrchestrator("sglang", args, [])
+
+        with (
+            patch("smg.serve.signal.signal"),
+            patch("smg.serve.atexit.register"),
+            patch.object(orch, "_launch_workers", side_effect=AssertionError("engine launched")),
+            patch.object(orch, "_cleanup_workers"),
+            pytest.raises(ValueError, match="supports vllm and tokenspeed engines, not sglang"),
+        ):
+            orch.run()
+
+    @pytest.mark.parametrize("connection_mode", ["grpc", "zmq"])
+    def test_two_tier_admission_bound_covers_the_engine_group_on_every_transport(
+        self, connection_mode
+    ):
+        """`--max-num-seqs` bounds one engine. An engine-level
+        `--data-parallel-size` puts N engines behind one sidecar over gRPC (one
+        server fronting N engines) exactly as over ZMQ (one socket set)."""
+        args = _make_args(
+            backend="vllm",
+            model="/tmp/m",
+            data_parallel_size=1,
+            connection_mode=connection_mode,
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator(
+            "vllm", args, ["--max-num-seqs", "64", "--data-parallel-size", "2"]
+        )
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert command[command.index("--engine-count") + 1] == "2"
+        assert command[command.index("--max-concurrent-requests") + 1] == "128"
+
+    def test_two_tier_admission_bound_stays_unbounded_without_max_num_seqs(self):
+        args = _make_args(
+            backend="vllm", model="/tmp/m", data_parallel_size=1, router_worker_mode="smg"
+        )
+        orch = ServeOrchestrator("vllm", args, ["--data-parallel-size", "2"])
+        orch.workers = [(MagicMock(), 31000)]
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=MagicMock(pid=1234)) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert command[command.index("--max-concurrent-requests") + 1] == "0"
+
+    def test_wait_sidecars_healthy_uses_grpc_health_not_tcp(self):
+        """The sidecar listener binds before its engine is usable, so readiness
+        must come from grpc.health.v1, which the Rust side gates on the engine
+        transport."""
+        args = _make_args(backend="vllm", model="/tmp/m", router_worker_mode="smg")
+        orch = ServeOrchestrator("vllm", args, [])
+        proc = MagicMock()
+        proc.poll.return_value = None
+        orch.sidecars = [(proc, 41000, 31000)]
+
+        with (
+            patch("smg.serve._grpc_health_check", side_effect=[False, True]) as health,
+            patch("smg.serve.time.sleep"),
+            patch("smg.serve.socket.create_connection") as tcp,
+        ):
+            orch._wait_sidecars_healthy()
+
+        assert health.call_count == 2
+        assert health.call_args.args[:2] == ("127.0.0.1", 41000)
+        tcp.assert_not_called()
+
+    def test_wait_sidecars_healthy_reports_a_sidecar_that_exited(self):
+        args = _make_args(backend="vllm", model="/tmp/m", router_worker_mode="smg")
+        orch = ServeOrchestrator("vllm", args, [])
+        proc = MagicMock()
+        proc.poll.return_value = 1
+        proc.returncode = 1
+        orch.sidecars = [(proc, 41000, 31000)]
+
+        with (
+            patch("smg.serve._grpc_health_check", return_value=False),
+            pytest.raises(RuntimeError, match="exited with code 1"),
+        ):
+            orch._wait_sidecars_healthy()
+
+    def test_wait_sidecars_healthy_reports_an_engine_that_exited(self):
+        """An engine that dies while its sidecar starts fails the launch at once,
+        naming the engine, rather than when the sidecar's handshake budget lapses."""
+        args = _make_args(
+            backend="vllm", model="/tmp/m", connection_mode="zmq", router_worker_mode="smg"
+        )
+        orch = ServeOrchestrator("vllm", args, [])
+        sidecar = MagicMock()
+        sidecar.poll.return_value = None
+        engine = MagicMock(pid=4321)
+        engine.poll.return_value = 137
+        engine.returncode = 137
+        orch.workers = [(engine, 31000)]
+        orch.sidecars = [(sidecar, 41000, 31000)]
+
+        with (
+            patch("smg.serve._grpc_health_check", return_value=False) as health,
+            pytest.raises(
+                RuntimeError,
+                match=r"vllm engine on port 31000 \(pid 4321\) exited with code 137",
+            ),
+        ):
+            orch._wait_sidecars_healthy()
+
+        health.assert_not_called()
+
+    def test_wait_sidecars_healthy_keeps_polling_live_engines(self):
+        args = _make_args(backend="vllm", model="/tmp/m", router_worker_mode="smg")
+        orch = ServeOrchestrator("vllm", args, [])
+        sidecar = MagicMock()
+        sidecar.poll.return_value = None
+        engine = MagicMock()
+        engine.poll.return_value = None
+        orch.workers = [(engine, 31000)]
+        orch.sidecars = [(sidecar, 41000, 31000)]
+
+        with (
+            patch("smg.serve._grpc_health_check", side_effect=[False, True]),
+            patch("smg.serve.time.sleep"),
+        ):
+            orch._wait_sidecars_healthy()
+
+        assert engine.poll.call_count == 2
+
+    @pytest.mark.parametrize(
+        ("connection_mode", "budget"),
+        [("grpc", 10), ("zmq", _ZMQ_SIDECAR_STARTUP_TIMEOUT_SECS)],
+    )
+    def test_wait_sidecars_healthy_budget_per_transport(self, connection_mode, budget):
+        """Over ZMQ the sidecar reports STARTING through the whole model load, so
+        a short --worker-startup-timeout is raised to the handshake budget."""
+        args = _make_args(
+            backend="vllm",
+            model="/tmp/m",
+            connection_mode=connection_mode,
+            router_worker_mode="smg",
+            worker_startup_timeout=10,
+        )
+        orch = ServeOrchestrator("vllm", args, [])
+        sidecar = MagicMock()
+        sidecar.poll.return_value = None
+        engine = MagicMock()
+        engine.poll.return_value = None
+        orch.workers = [(engine, 31000)]
+        orch.sidecars = [(sidecar, 41000, 31000)]
+
+        with (
+            patch("smg.serve.time.monotonic", side_effect=[0, budget - 1, budget]),
+            patch("smg.serve._grpc_health_check", return_value=False) as health,
+            patch("smg.serve.time.sleep"),
+            pytest.raises(TimeoutError, match=f"not healthy within {budget}s"),
+        ):
+            orch._wait_sidecars_healthy()
+
+        assert health.call_count == 1
+
+    def test_sidecar_shutdown_timeout_covers_the_drain_budget(self):
+        """A long `--worker-drain-secs` must not be SIGKILLed mid-drain."""
+        short = ServeOrchestrator("vllm", _make_args(worker_drain_secs=5.0), [])
+        assert short._sidecar_shutdown_timeout() == 30
+        long = ServeOrchestrator("vllm", _make_args(worker_drain_secs=60.0), [])
+        assert long._sidecar_shutdown_timeout() == 130
+
+    def test_cleanup_stops_sidecars_before_engines(self):
+        """Sidecars drain first, within their drain budget, so the engine under
+        them is never torn down under load."""
+        args = _make_args(
+            backend="vllm", model="/tmp/m", router_worker_mode="smg", worker_drain_secs=60.0
+        )
+        orch = ServeOrchestrator("vllm", args, [])
+        engine = MagicMock(pid=1)
+        sidecar = MagicMock(pid=2)
+        orch.workers = [(engine, 31000)]
+        orch.sidecars = [(sidecar, 41000, 31000)]
+        calls = []
+
+        def record(processes, timeout=None):
+            calls.append(([proc for proc, _ in processes], timeout))
+
+        with patch.object(orch, "_terminate_processes", side_effect=record):
+            orch._cleanup_workers()
+
+        assert calls == [([sidecar], 130), ([engine], None)]
 
     def test_build_router_args_zmq_forwards_backend(self):
         """ZMQ workers cannot be runtime-probed: serve's --backend must reach

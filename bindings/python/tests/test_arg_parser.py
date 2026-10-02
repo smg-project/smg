@@ -1238,6 +1238,14 @@ class TestParseRouterArgs:
                 ]
             )
 
+    def test_parse_worker_mode(self):
+        """`--worker-mode` selects the direct engine endpoint or the two-tier Worker."""
+        assert parse_router_args([]).worker_mode == "engine"
+        assert parse_router_args(["--worker-mode", "smg"]).worker_mode == "smg"
+
+        with pytest.raises(SystemExit):
+            parse_router_args(["--worker-mode", "sidecar"])
+
     def test_help_output(self):
         """Test that help output is generated correctly."""
         with pytest.raises(SystemExit) as exc_info:
@@ -1541,6 +1549,7 @@ class TestRouterArgsFieldOrder:
         "prefill_max_inflight_requests_per_worker",
         "prefill_queue_size",
         "prefill_queue_timeout_secs",
+        "worker_mode",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1579,6 +1588,7 @@ class TestRouterArgsFieldOrder:
             "enable_rl",
             "rl_control_timeout_secs",
             "rl_fanout_concurrency",
+            "worker_mode",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

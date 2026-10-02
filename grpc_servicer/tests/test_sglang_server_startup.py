@@ -329,12 +329,17 @@ def test_server_waits_for_scheduler_shutdown(monkeypatch, server_mod):
         terminate_scheduler_processes,
     )
 
+    # The Worker control plane handshake reads the model identity and
+    # embedding flag after the server starts.
     server_args = SimpleNamespace(
         disaggregation_mode="null",
         host="127.0.0.1",
         port=50051,
         ssl_certfile=None,
         ssl_keyfile=None,
+        model_path="/models/m",
+        served_model_name=None,
+        is_embedding=False,
     )
     asyncio.run(server_mod.serve_grpc(server_args, model_info={}))
 
