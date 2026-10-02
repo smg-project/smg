@@ -569,6 +569,18 @@ impl<P: EngineProtocol> Client<P> {
     /// least-loaded engine (see [`ClientInner::select_engine`]).
     /// Dropping the returned stream before it finishes aborts the request.
     pub async fn submit(&self, request: P::Request) -> Result<RequestStream<P>> {
+        self.submit_with_aux(request, Vec::new()).await
+    }
+
+    /// [`submit`](Self::submit) with `aux_frames` appended after the payload:
+    /// vLLM's zero-copy tensor frames, which the payload references by index
+    /// (the payload is frame 0, so the first of these is frame 1). The
+    /// request's own encoding must not reference aux frames of its own.
+    pub async fn submit_with_aux(
+        &self,
+        request: P::Request,
+        extra_aux_frames: Vec<Bytes>,
+    ) -> Result<RequestStream<P>> {
         P::validate(&request)?;
         let request_id = P::request_id(&request).to_string();
         // Register before selecting: registration is the admission gate (it
@@ -590,7 +602,7 @@ impl<P: EngineProtocol> Client<P> {
             }
         };
 
-        let (payload, aux_frames) = match P::encode_add(&request) {
+        let (payload, mut aux_frames) = match P::encode_add(&request) {
             Ok(encoded) => encoded,
             Err(error) => {
                 self.inner.registry.lock().remove_all([&request_id]);
@@ -598,6 +610,7 @@ impl<P: EngineProtocol> Client<P> {
                 return Err(error);
             }
         };
+        aux_frames.extend(extra_aux_frames);
         if let Err(error) = self
             .inner
             .send_to_engine(&engine_id, P::add_frame(), payload, aux_frames)

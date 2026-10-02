@@ -78,7 +78,7 @@ impl VllmEngine for VllmEngineService {
         &self,
         _request: Request<vllm::GetServerInfoRequest>,
     ) -> Result<Response<vllm::GetServerInfoResponse>, Status> {
-        Ok(Response::new(info::server_info(&self.state)))
+        Ok(Response::new(info::server_info(&self.state).await))
     }
 
     async fn get_loads(

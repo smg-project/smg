@@ -1,8 +1,17 @@
-use std::{collections::BTreeSet, fs, io::Cursor, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Cursor,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use engine_zmq_client::{
-    codec::{tensor::WireTensor, OpaqueValue},
+    codec::{decode_msgpack, tensor::WireTensor, OpaqueValue},
     mock_engine::{
         connect_to_frontend, default_ready_response, EngineInbound, MockEngineInput,
         MockEngineOutput,
@@ -13,7 +22,7 @@ use engine_zmq_client::{
             SpecDecodeMetrics, StopReason,
         },
         pooling::{PoolingOutput, PoolingParams},
-        request::EngineCoreRequest,
+        request::{EngineCoreRequest, MmFeaturesPayload},
         stats::SchedulerStats,
         structured_outputs::{StructuredOutputBackend, StructuredOutputConstraint},
     },
@@ -21,6 +30,7 @@ use engine_zmq_client::{
 };
 use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
 use portpicker::pick_unused_port;
+use prost::Message;
 use smg_grpc_client::{
     common_proto as common,
     tokenizer_bundle::{validate_bundle_sha256, with_extracted_bundle, StreamBundle},
@@ -62,6 +72,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmS
         engine_count: 1,
         tokenizer_dir: None,
         model,
+        media_processor: None,
     }
 }
 
@@ -92,9 +103,18 @@ struct Harness {
 }
 
 async fn harness(model: VllmModelInfo, tokenizer: Option<Arc<dyn Tokenizer>>) -> Harness {
+    harness_with(model, tokenizer, None).await
+}
+
+async fn harness_with(
+    model: VllmModelInfo,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    media_processor: Option<Arc<dyn MediaProcessor>>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address();
-    let config = config(dir.path(), &handshake, model);
+    let mut config = config(dir.path(), &handshake, model);
+    config.media_processor = media_processor;
     let server = match tokenizer {
         Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
         None => VllmServicerServer::start(config),
@@ -767,6 +787,7 @@ async fn shm_media_serves_every_choice_of_a_fan_out() {
         let features = engine_request
             .mm_features
             .as_ref()
+            .and_then(MmFeaturesPayload::typed)
             .expect("features on every choice");
         assert_eq!(features.len(), 2);
         assert_eq!(features[1].mm_position.offset, 6);
@@ -778,21 +799,23 @@ async fn shm_media_serves_every_choice_of_a_fan_out() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// Worker-side media processing is refused up front (the adapter would
-/// otherwise run the request text-only); Router-preprocessed batches,
-/// including extra modality batches, go through to the engine.
+/// Without a media processor, references are refused up front in the Python
+/// servicer's words (the adapter would otherwise run the request text-only);
+/// Router-preprocessed batches, including extra modality batches, go
+/// through to the engine.
 #[tokio::test]
 async fn media_refs_are_refused_and_extra_batches_translated() {
     let mut h = harness(model_info(), None).await;
     let mut request = generate_request("mm1", false, Vec::new());
-    request.media_refs = Some(vllm::MediaRefs {
-        items: vec![vllm::MediaRef {
-            modality: common::Modality::Image as i32,
-            url: "https://example.com/x.png".to_string(),
-        }],
-    });
+    request.media_refs = Some(media_refs(&["https://example.com/x.png"]));
     let status = h.client.generate(request).await.expect_err("refused");
-    assert_eq!(status.code(), Code::Unimplemented);
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("--mm-processor"),
+        "{}",
+        status.message()
+    );
+    assert_engine_idle(&mut h.engine_in).await;
 
     // A tensor-less identity batch (a grid-less PD decode leg) rides the
     // cache salt; an empty extra batch is simply nothing to attach.
@@ -1795,5 +1818,369 @@ async fn embed_params_carry_the_pooler_config() {
         response.expect("embed").into_inner().embedding,
         vec![1.0, 2.0, 3.0]
     );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+// ---------------------------------------------------------------------------
+// Worker-side media processing (`media_refs`)
+// ---------------------------------------------------------------------------
+
+fn media_refs(urls: &[&str]) -> vllm::MediaRefs {
+    vllm::MediaRefs {
+        items: urls
+            .iter()
+            .map(|url| vllm::MediaRef {
+                modality: common::Modality::Image as i32,
+                url: url.to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// `mm_features` the way vLLM's encoder writes one image item whose pixel
+/// tensor went to aux frame 1.
+fn encoded_features() -> Bytes {
+    let features = serde_json::json!([{
+        "data": {"pixel_values": {
+            "data": ["bfloat16", [4], 1],
+            "field": ["batched", {"keep_on_cpu": false}],
+        }},
+        "modality": "image",
+        "identifier": "h0",
+        "mm_position": {"offset": 1, "length": 3, "is_embed": null},
+        "mm_hash": "h0",
+    }]);
+    Bytes::from(rmp_serde::to_vec_named(&features).unwrap())
+}
+
+fn processed_media() -> ProcessedMedia {
+    ProcessedMedia {
+        prompt_token_ids: vec![7, 8, 9, 10],
+        mm_features: Some(encoded_features()),
+        aux_frames: vec![Bytes::from_static(&[1, 2, 3, 4, 5, 6, 7, 8])],
+        cache_salt: Some("salt".to_string()),
+        media_identity: None,
+    }
+}
+
+/// A scripted processor: one outcome for every request, the requests it was
+/// handed, an optional delay, and a switchable probe.
+struct MockMediaProcessor {
+    outcome: Mutex<Result<ProcessedMedia, MediaError>>,
+    requests: Mutex<Vec<MediaRequest>>,
+    delay: Duration,
+    probe_ok: AtomicBool,
+    max_inflight: usize,
+}
+
+impl MockMediaProcessor {
+    fn answering(outcome: Result<ProcessedMedia, MediaError>) -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(outcome),
+            requests: Mutex::new(Vec::new()),
+            delay: Duration::ZERO,
+            probe_ok: AtomicBool::new(true),
+            max_inflight: 4,
+        })
+    }
+
+    fn requests(&self) -> Vec<MediaRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl MediaProcessor for MockMediaProcessor {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn schemes(&self) -> &str {
+        "http,https,data"
+    }
+
+    fn source(&self) -> &str {
+        "flag"
+    }
+
+    fn max_inflight(&self) -> usize {
+        self.max_inflight
+    }
+
+    fn probe(&self) -> BoxFuture<bool> {
+        let ok = self.probe_ok.load(Ordering::Acquire);
+        Box::pin(async move { ok })
+    }
+
+    fn process(&self, request: MediaRequest) -> BoxFuture<Result<ProcessedMedia, MediaError>> {
+        self.requests.lock().unwrap().push(request);
+        let outcome = self.outcome.lock().unwrap().clone();
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            outcome
+        })
+    }
+}
+
+/// A request with references is handed to the processor as the Router sent
+/// it; what comes back reaches the engine as is: the expanded prompt, the
+/// encoder's `mm_features` bytes in the payload, its aux frames after it, and
+/// the cache salt.
+#[tokio::test]
+async fn media_refs_are_processed_worker_side_and_relayed_as_encoded() {
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    let mut request = generate_request("mr1", true, Vec::new());
+    request.input = Some(vllm::generate_request::Input::Tokenized(
+        vllm::TokenizedInput {
+            original_text: "describe".to_string(),
+            input_ids: vec![1, 2, 3],
+        },
+    ));
+    request.media_refs = Some(media_refs(&["https://example.com/x.png"]));
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+
+    let frames = h.engine_in.recv_frames().await.expect("add frames");
+    assert_eq!(frames.len(), 3, "type, payload, one aux frame");
+    let engine_request: EngineCoreRequest = decode_msgpack(&frames[1]).expect("add payload");
+    assert_eq!(engine_request.request_id, "mr1");
+    assert_eq!(engine_request.prompt_token_ids, Some(vec![7, 8, 9, 10]));
+    assert_eq!(engine_request.cache_salt.as_deref(), Some("salt"));
+    assert!(engine_request.mm_features.is_some());
+    let primary = encoded_features();
+    assert!(
+        frames[1]
+            .windows(primary.len())
+            .any(|window| window == primary),
+        "the encoder's bytes are relayed verbatim"
+    );
+    assert_eq!(frames[2], Bytes::from_static(&[1, 2, 3, 4, 5, 6, 7, 8]));
+
+    let seen = processor.requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].request_id, "mr1");
+    assert_eq!(seen[0].prompt_token_ids, vec![1, 2, 3]);
+    assert_eq!(seen[0].prompt_text.as_deref(), Some("describe"));
+    assert_eq!(
+        seen[0].items,
+        vec![MediaRefItem {
+            modality: "image".to_string(),
+            url: "https://example.com/x.png".to_string(),
+        }]
+    );
+    assert!(!seen[0].want_identity);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The Python servicer's own refusals, before the processor runs: references
+/// next to preprocessed batches or without tokenized input, an unsupported
+/// modality, an empty reference.
+#[tokio::test]
+async fn malformed_media_refs_are_refused_before_processing() {
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    let mut twice = generate_request("mr2", false, Vec::new());
+    twice.media_refs = Some(media_refs(&["https://example.com/x.png"]));
+    twice.mm_inputs = Some(vllm::MultimodalInputs {
+        mm_hashes: vec!["h1".to_string()],
+        ..Default::default()
+    });
+    let mut text = generate_request("mr3", false, Vec::new());
+    text.input = Some(vllm::generate_request::Input::Text("hi".to_string()));
+    text.media_refs = Some(media_refs(&["https://example.com/x.png"]));
+    let mut audio = generate_request("mr4", false, Vec::new());
+    audio.media_refs = Some(vllm::MediaRefs {
+        items: vec![vllm::MediaRef {
+            modality: common::Modality::Audio as i32,
+            url: "https://example.com/x.wav".to_string(),
+        }],
+    });
+    let mut empty = generate_request("mr5", false, Vec::new());
+    empty.media_refs = Some(media_refs(&[""]));
+    for (request, needle) in [
+        (twice, "cannot be combined"),
+        (text, "requires tokenized input"),
+        (audio, "unsupported modality"),
+        (empty, "empty url"),
+    ] {
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{}", status.message());
+        assert!(status.message().contains(needle), "{}", status.message());
+    }
+    assert!(processor.requests().is_empty());
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A processor's verdict becomes the Python servicer's status: a caller
+/// error INVALID_ARGUMENT, a retryable one UNAVAILABLE (the Router re-selects
+/// a worker), a failure INTERNAL; a refused PD decode leg still notifies the
+/// engine.
+#[tokio::test]
+async fn media_processor_errors_map_to_statuses() {
+    for (outcome, code) in [
+        (
+            MediaError::Invalid("media_refs[0]: unsupported image".to_string()),
+            Code::InvalidArgument,
+        ),
+        (
+            MediaError::Unavailable("sidecar_timeout: no result".to_string()),
+            Code::Unavailable,
+        ),
+        (MediaError::Internal("boom".to_string()), Code::Internal),
+    ] {
+        let processor = MockMediaProcessor::answering(Err(outcome.clone()));
+        let mut h = harness_with(model_info(), None, Some(processor)).await;
+        let mut request = generate_request("mr6", false, Vec::new());
+        request.media_refs = Some(media_refs(&["https://example.com/x.png"]));
+        request.kv_transfer_params_json =
+            Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), code, "{outcome:?}");
+        let notice = recv_add(&mut h.engine_in).await;
+        assert_eq!(notice.request_id, "mr6");
+        assert!(notice.abort_immediately);
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}
+
+/// The in-flight cap as the Python servicer applies it: `max_inflight`
+/// requests process at once, as many again wait, the next is shed with a
+/// retryable refusal.
+#[tokio::test]
+async fn media_processing_is_capped_and_sheds_beyond_the_cap() {
+    let processor = Arc::new(MockMediaProcessor {
+        outcome: Mutex::new(Ok(processed_media())),
+        requests: Mutex::new(Vec::new()),
+        delay: Duration::from_millis(1500),
+        probe_ok: AtomicBool::new(true),
+        max_inflight: 1,
+    });
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    let request = |id: &str| {
+        let mut request = generate_request(id, true, Vec::new());
+        request.media_refs = Some(media_refs(&["https://example.com/x.png"]));
+        request
+    };
+    let mut first_client = h.client.clone();
+    let mut second_client = h.client.clone();
+    // Staggered: one in flight, one waiting, and the third is shed at once.
+    let (first, second, third) = tokio::join!(
+        first_client.generate(request("mr7")),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            second_client.generate(request("mr8")).await
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            h.client.generate(request("mr9")).await
+        },
+    );
+    let status = third.expect_err("shed");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(
+        status.message().contains("saturated"),
+        "{}",
+        status.message()
+    );
+    let _first = first.expect("first admitted");
+    let _second = second.expect("second admitted");
+    let mut ids: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        ids.push(recv_add(&mut h.engine_in).await.request_id);
+    }
+    ids.sort();
+    assert_eq!(ids, vec!["mr7".to_string(), "mr8".to_string()]);
+    assert_eq!(processor.requests().len(), 2);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A PD prefill leg asks the processor for the media identity and returns
+/// it on every `Complete`, so the decode leg is served without pixels.
+#[tokio::test]
+async fn a_pd_prefill_leg_returns_the_media_identity() {
+    let identity = vllm::MediaIdentity {
+        prompt_token_ids: vec![7, 8, 9, 10],
+        mm_inputs: Some(vllm::MultimodalInputs {
+            mm_hashes: vec!["h0".to_string()],
+            modality: common::Modality::Image as i32,
+            ..Default::default()
+        }),
+        extra_mm_inputs: Vec::new(),
+    };
+    let mut processed = processed_media();
+    processed.media_identity = Some(Bytes::from(identity.encode_to_vec()));
+    let processor = MockMediaProcessor::answering(Ok(processed));
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    let mut request = generate_request("mr10", true, Vec::new());
+    request.media_refs = Some(media_refs(&["https://example.com/x.png"]));
+    request.kv_transfer_params_json = Some(r#"{"do_remote_decode":true}"#.to_string());
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(engine_request.prompt_token_ids, Some(vec![7, 8, 9, 10]));
+    assert!(processor.requests()[0].want_identity);
+    h.engine_out
+        .send_outputs(&batch(
+            "mr10",
+            vec![5],
+            Some(EngineCoreFinishReason::Stop),
+            None,
+        ))
+        .await
+        .unwrap();
+    let _chunk = stream.message().await.unwrap().unwrap();
+    let done = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(done.media_identity, Some(identity));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// `GetServerInfo` advertises the processor only while it answers its probe
+/// and the engine takes multimodal input, as the Python servicer does.
+#[tokio::test]
+async fn server_info_advertises_a_serving_media_processor() {
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut vision = model_info();
+    vision.supports_vision = true;
+    let mut h = harness_with(vision.clone(), None, Some(processor.clone())).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_processor, "mock");
+    assert_eq!(info.mm_media_ref_schemes, "http,https,data");
+    assert_eq!(info.mm_processor_source, "flag");
+    processor.probe_ok.store(false, Ordering::Release);
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_processor, "");
+    assert_eq!(info.mm_media_ref_schemes, "");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // A text-only engine never advertises one.
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = harness_with(model_info(), None, Some(processor)).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_processor, "");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

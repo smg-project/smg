@@ -18,12 +18,13 @@ Upstream integration is one check at the top of its ``serve_grpc``::
     if resolve_servicer_impl(args) == "rust":
         raise SystemExit(await serve_rust(args))
 
-Rust mode serves the whole contract but one piece: text generation, PD
-disaggregation (connector KV-transfer params pass through both ways and
-``GetServerInfo`` carries the pairing identity), Router-preprocessed media,
-``Embed``, ``FlushCache``, ``GetTokenizer`` and ``SubscribeKvEvents``.
-Worker-side media processing (``media_refs``) answers UNIMPLEMENTED there;
-the Python implementation stays the default.
+Rust mode serves the whole contract: text generation, PD disaggregation
+(connector KV-transfer params pass through both ways and ``GetServerInfo``
+carries the pairing identity), Router-preprocessed media, worker-side media
+processing (``media_refs``, through the same ``--mm-processor`` backends as
+the Python servicer; see :mod:`smg_grpc_servicer.vllm.rust_media`), ``Embed``,
+``FlushCache``, ``GetTokenizer`` and ``SubscribeKvEvents``. The Python
+implementation stays the default.
 """
 
 from __future__ import annotations
@@ -423,6 +424,19 @@ async def serve_rust(args: argparse.Namespace) -> int:
     data_parallel_size = info["data_parallel_size"]
     handshake_port = _env_int(HANDSHAKE_PORT_ENV) or free_port()
     socket_dir = default_socket_dir()
+    # Worker-side media processing, from the same `--mm-*` settings (flags
+    # when the launcher has them, else the environment) as the Python servicer.
+    from smg_grpc_servicer.vllm.mm_processor import MmSettings
+    from smg_grpc_servicer.vllm.rust_media import RustMediaBridge
+
+    media = RustMediaBridge.build(
+        vllm_config, MmSettings.from_args(args), asyncio.get_running_loop()
+    )
+    logger.info(
+        "Worker-side media processing: %s (source=%s)",
+        media.name if media is not None else "off",
+        media.source if media is not None else "-",
+    )
 
     init_servicer_tracing()
     server = VllmGrpcServer(
@@ -434,6 +448,7 @@ async def serve_rust(args: argparse.Namespace) -> int:
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=data_parallel_size,
         tokenizer_dir=tokenizer_dir,
+        media_processor=media,
         **info,
     )
     logger.info(

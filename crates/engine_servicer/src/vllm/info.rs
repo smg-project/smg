@@ -116,8 +116,24 @@ pub(super) fn model_info(state: &State) -> vllm::GetModelInfoResponse {
     }
 }
 
-/// `GetServerInfo`: this implementation's identity plus the handshake facts.
-pub(super) fn server_info(state: &State) -> vllm::GetServerInfoResponse {
+/// `GetServerInfo`: this implementation's identity plus the handshake facts,
+/// and the media processor while it is serving.
+pub(super) async fn server_info(state: &State) -> vllm::GetServerInfoResponse {
+    let mut info = server_facts(state);
+    // Advertised only while the backend answers and the engine takes
+    // multimodal input (a `--language-model-only` engine must not draw media
+    // references), as the Python servicer advertises it.
+    if let Some(gate) = state.media.as_ref() {
+        if state.model.supports_vision && gate.processor.probe().await {
+            info.mm_processor = gate.processor.name().to_string();
+            info.mm_media_ref_schemes = gate.processor.schemes().to_string();
+            info.mm_processor_source = gate.processor.source().to_string();
+        }
+    }
+    info
+}
+
+fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
     let ready = state
         .engine
         .client

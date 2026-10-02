@@ -15,9 +15,11 @@
 //!
 //! `Embed`, `FlushCache` (a ZMQ utility call), `GetTokenizer` (the tokenizer
 //! directory zipped as the Python servicer zips it) and `SubscribeKvEvents`
-//! (vLLM's ZMQ KV-event publisher relayed) are served too. Not served yet
-//! (answered `UNIMPLEMENTED`): worker-side media processing (`media_refs`),
-//! which stays with the Python servicer's media processors.
+//! (vLLM's ZMQ KV-event publisher relayed) are served too. Worker-side media
+//! processing (`media_refs`) runs through a [`MediaProcessor`] the lifecycle
+//! owner supplies: the binding bridges to the Python servicer's processors,
+//! which run vLLM's own input processor, and the result reaches the engine as
+//! vLLM encoded it.
 
 mod admin;
 mod embed;
@@ -25,6 +27,7 @@ mod engine;
 mod generate;
 mod info;
 mod kv_events;
+mod media;
 mod requests;
 mod service;
 #[cfg(test)]
@@ -44,6 +47,10 @@ use engine::{connect_engine, EngineLink};
 use engine_zmq_adapter::ZmqEngineClient;
 use futures::{FutureExt, StreamExt};
 use llm_tokenizer::traits::Tokenizer;
+use media::MediaGate;
+pub use media::{
+    BoxFuture, MediaError, MediaProcessor, MediaRefItem, MediaRequest, ProcessedMedia,
+};
 use requests::Registry;
 use service::VllmEngineService;
 use smg_grpc_client::vllm_proto::vllm_engine_server::VllmEngineServer;
@@ -118,7 +125,7 @@ pub struct VllmModelInfo {
 }
 
 /// How to bind, where the engine dials in, and what to advertise.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VllmServicerConfig {
     /// `host:port` for the gRPC listener.
     pub bind_address: String,
@@ -134,6 +141,29 @@ pub struct VllmServicerConfig {
     /// requests carrying string stops are refused.
     pub tokenizer_dir: Option<String>,
     pub model: VllmModelInfo,
+    /// Worker-side media processing for `media_refs`; `None` refuses them, as
+    /// the Python servicer does with `--mm-processor off`.
+    pub media_processor: Option<Arc<dyn MediaProcessor>>,
+}
+
+impl std::fmt::Debug for VllmServicerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VllmServicerConfig")
+            .field("bind_address", &self.bind_address)
+            .field("ipc_base_url", &self.ipc_base_url)
+            .field("handshake_address", &self.handshake_address)
+            .field("engine_count", &self.engine_count)
+            .field("tokenizer_dir", &self.tokenizer_dir)
+            .field("model", &self.model)
+            .field(
+                "media_processor",
+                &self
+                    .media_processor
+                    .as_ref()
+                    .map(|processor| processor.name()),
+            )
+            .finish()
+    }
 }
 
 /// Token counters behind the periodic engine stats line.
@@ -159,6 +189,9 @@ pub(super) struct State {
     /// while in-flight streams finish.
     pub(super) serving: AtomicBool,
     pub(super) started: Instant,
+    /// The media processor behind its in-flight cap; `None` refuses
+    /// `media_refs`.
+    pub(super) media: Option<MediaGate>,
 }
 
 impl State {
@@ -260,6 +293,7 @@ impl VllmServicerServer {
             generation: AtomicU64::new(0),
             serving: AtomicBool::new(true),
             started: Instant::now(),
+            media: config.media_processor.map(MediaGate::new),
         });
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));

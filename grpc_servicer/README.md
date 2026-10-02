@@ -158,19 +158,32 @@ vLLM without the hook fails loudly instead of silently running Python. The
 headless engine is launched from the parsed namespace through vLLM's own
 `run_headless`, so both entrypoints above work unchanged.
 
-Rust mode needs the `smg` wheel (for the binding) and serves the contract the
-Python servicer serves, with one exception: text generation, PD disaggregation
+Rust mode needs the `smg` wheel (for the binding) and serves the whole
+contract the Python servicer serves: text generation, PD disaggregation
 (`--kv-transfer-config`: connector params pass through both ways and
 `GetServerInfo` carries the pairing identity), Router-preprocessed media
-(inline and `/dev/shm` tensors), `Embed`, `FlushCache`, `GetTokenizer` (which
-answers FAILED_PRECONDITION when the launcher could not resolve a local
-tokenizer directory) and `SubscribeKvEvents` (`--kv-events-config` with the ZMQ
-publisher). Worker-side
-media processing (`media_refs`, the in-process and Redis processors) answers
-UNIMPLEMENTED there, so keep the Python implementation for that. Tuning:
-`SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
+(inline and `/dev/shm` tensors), worker-side media processing (`media_refs`,
+below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
+FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
+directory) and `SubscribeKvEvents` (`--kv-events-config` with the ZMQ
+publisher). Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
 `SMG_VLLM_SERVICER_DRAIN_SECS` (default 5), `SMG_ZMQ_SOCKET_DIR`,
 `SMG_SERVICER_WORKER_THREADS` (default 4).
+
+Worker-side media processing uses the same `--mm-processor` /
+`SMG_VLLM_MM_PROCESSOR` setting and backends as the Python servicer
+(`inprocess`: vLLM's MediaConnector and the engine's renderer; `redis`: the
+sidecar), so the media is fetched and processed by vLLM's own code on either
+servicer and the Rust path is never behind vLLM's processors. The Rust server
+hands a request's `media_refs` to the Python bridge
+(`smg_grpc_servicer.vllm.rust_media`), which runs the processor and vLLM's
+input processor on the launcher's asyncio loop and returns the expanded
+prompt and `mm_features` as vLLM's own encoder writes them; Rust relays those
+bytes to the engine untouched. The in-flight cap, the saturation refusal, the
+advertised `mm_processor` / `mm_media_ref_schemes` / `mm_processor_source` and
+the PD prefill leg's `media_identity` behave as on the Python servicer. A Rust
+processor (the Router's own multimodal pipeline, worker-side) can plug into
+the same seam later; the engine-side contract does not change.
 
 Known difference: under `--structured-outputs-config.backend auto` (the
 default) vLLM's frontend validates each constraint with xgrammar and falls

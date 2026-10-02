@@ -35,8 +35,8 @@ use crate::{
     },
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
-        translate_media, translate_request_with_media, StructuredOutputsBackendConfig,
-        TranslatedMedia, VllmGenerateStream,
+        translate_media, translate_request_with_media, translated_from_processed, ProcessedMedia,
+        StructuredOutputsBackendConfig, TranslatedMedia, VllmGenerateStream,
     },
 };
 
@@ -397,7 +397,19 @@ impl ZmqEngineClient {
     /// dialect only.
     pub async fn generate_vllm_streams(
         &self,
+        req: vllm::GenerateRequest,
+    ) -> Result<Vec<VllmGenerateStream>, tonic::Status> {
+        self.generate_vllm_streams_with_media(req, None).await
+    }
+
+    /// [`generate_vllm_streams`](Self::generate_vllm_streams) for a request
+    /// whose `media_refs` a worker-side processor already turned into engine
+    /// features: `processed` is attached in place of the request's own
+    /// multimodal batches (it must carry none).
+    pub async fn generate_vllm_streams_with_media(
+        &self,
         mut req: vllm::GenerateRequest,
+        processed: Option<ProcessedMedia>,
     ) -> Result<Vec<VllmGenerateStream>, tonic::Status> {
         let ZmqBackend::Vllm(client) = &self.backend else {
             return Err(tonic::Status::internal(
@@ -417,7 +429,9 @@ impl ZmqEngineClient {
         // and unlinked, a single time) and off the runtime: `/dev/shm` reads
         // and the dtype casts of multi-megabyte tensors would otherwise hold a
         // worker thread per request, starving token forwarding and health.
-        let media = if has_media(&req) {
+        let media = if let Some(processed) = processed {
+            translated_from_processed(&req, processed).map_err(tonic::Status::invalid_argument)?
+        } else if has_media(&req) {
             let (returned, media) = tokio::task::spawn_blocking(move || {
                 let media = translate_media(&mut req, model_dtype);
                 (req, media)
@@ -442,10 +456,14 @@ impl ZmqEngineClient {
                 media.take()
             } else {
                 media.clone()
-            };
+            }
+            .unwrap_or_default();
+            // Worker-processed tensors ride as aux frames; each choice's
+            // message carries them (shared bytes, not copies).
+            let aux_frames = sub_media.aux_frames.clone();
             let request = translate_request_with_media(
                 sub,
-                sub_media.unwrap_or_default(),
+                sub_media,
                 max_model_len,
                 self.effective_eos(),
                 structured_backend,
@@ -466,7 +484,10 @@ impl ZmqEngineClient {
                 .and_then(|ids| ids.first().copied());
             // Sub-streams submitted before a mid-loop failure are dropped with
             // the error, which auto-aborts their engine-side requests.
-            let stream = client.submit(request).await.map_err(zmq_status)?;
+            let stream = client
+                .submit_with_aux(request, aux_frames)
+                .await
+                .map_err(zmq_status)?;
             streams.push(VllmGenerateStream::new(
                 stream,
                 index as u32,

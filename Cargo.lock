@@ -2222,6 +2222,7 @@ dependencies = [
  "llm-tokenizer",
  "openai-protocol",
  "portpicker",
+ "prost",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -7828,6 +7829,7 @@ dependencies = [
 name = "smg-python"
 version = "1.11.0"
 dependencies = [
+ "bytes",
  "engine-servicer",
  "once_cell",
  "pyo3",
@@ -7841,6 +7843,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tool-parser",
+ "tracing",
 ]
 
 [[package]]

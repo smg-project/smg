@@ -60,6 +60,34 @@ pub struct ReasoningParserKwargs {
     pub chat_template_kwargs: HashMap<String, serde_json::Value>,
 }
 
+/// `mm_features` as this client sends it: built here from Router-preprocessed
+/// tensors (`Typed`), or produced by vLLM's own input processor and relayed
+/// as the msgpack its encoder wrote (`Raw`; tensors over vLLM's zero-copy
+/// threshold then ride the request's aux frames, see
+/// [`EngineCoreClient::submit_with_aux`](crate::connector::EngineCoreClient::submit_with_aux)).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MmFeaturesPayload {
+    Typed(MmFeatures),
+    Raw(OpaqueValue),
+}
+
+impl From<MmFeatures> for MmFeaturesPayload {
+    fn from(features: MmFeatures) -> Self {
+        Self::Typed(features)
+    }
+}
+
+impl MmFeaturesPayload {
+    /// The features when this client built them.
+    pub fn typed(&self) -> Option<&MmFeatures> {
+        match self {
+            Self::Typed(features) => Some(features),
+            Self::Raw(_) => None,
+        }
+    }
+}
+
 /// Engine-core add-request payload sent from frontend to engine.
 ///
 /// This is a msgspec `array_like=True` struct: it serializes as a positional
@@ -70,7 +98,7 @@ pub struct EngineCoreRequest {
     pub request_id: String,
     pub prompt_token_ids: Option<Vec<u32>>,
     /// Multimodal features, one per input item, sorted by placeholder offset.
-    pub mm_features: Option<MmFeatures>,
+    pub mm_features: Option<MmFeaturesPayload>,
     pub sampling_params: Option<EngineCoreSamplingParams>,
     /// Pooling (embedding) parameters: set, with `sampling_params` unset, on
     /// a pooling request.

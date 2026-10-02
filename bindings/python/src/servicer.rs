@@ -2,15 +2,27 @@
 //!
 //! Rust owns the listener, the engine link, and the request path; Python
 //! launches the headless engine, starts and stops this server, and announces
-//! draining. Nothing request-sensitive crosses into Python.
+//! draining. The one request-time crossing is worker-side media processing:
+//! a request's `media_refs` go to a Python object that runs the Python
+//! servicer's own processors (vLLM's input processor behind them), and what
+//! it produces comes back as bytes the engine reads directly.
 
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use engine_servicer::{ServicerError, VllmModelInfo, VllmServicerConfig, VllmServicerServer};
+use bytes::Bytes;
+use engine_servicer::{
+    BoxFuture, MediaError, MediaProcessor, MediaRequest, ProcessedMedia, ServicerError,
+    VllmModelInfo, VllmServicerConfig, VllmServicerServer,
+};
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
     prelude::*,
+    types::PyBytes,
 };
+use tokio::sync::oneshot;
 
 fn to_py_err(error: ServicerError) -> PyErr {
     match error {
@@ -28,6 +40,188 @@ fn to_py_err(error: ServicerError) -> PyErr {
 #[pyo3(signature = (level = None))]
 pub fn init_servicer_tracing(level: Option<&str>) -> PyResult<()> {
     engine_servicer::init_tracing(level).map_err(to_py_err)
+}
+
+/// The worker-side media processor behind a Python object (see
+/// `smg_grpc_servicer.vllm.rust_media.RustMediaBridge`): `name`, `schemes`,
+/// `source` and `max_inflight` attributes, and `probe(done)` /
+/// `submit(request_id, prompt_token_ids, prompt_text, items, arrival_time,
+/// want_identity, done)` methods that schedule the work on Python's loop
+/// and call `done` from whichever thread finishes it. Calls into Python
+/// only to hand work over; the wait is a Rust channel.
+struct PythonMediaProcessor {
+    bridge: Py<PyAny>,
+    name: String,
+    schemes: String,
+    source: String,
+    max_inflight: usize,
+}
+
+impl PythonMediaProcessor {
+    fn new(bridge: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            name: bridge.getattr("name")?.extract()?,
+            schemes: bridge.getattr("schemes")?.extract()?,
+            source: bridge.getattr("source")?.extract()?,
+            max_inflight: bridge.getattr("max_inflight")?.extract()?,
+            bridge: bridge.clone().unbind(),
+        })
+    }
+}
+
+impl MediaProcessor for PythonMediaProcessor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn schemes(&self) -> &str {
+        &self.schemes
+    }
+
+    fn source(&self) -> &str {
+        &self.source
+    }
+
+    fn max_inflight(&self) -> usize {
+        self.max_inflight
+    }
+
+    fn probe(&self) -> BoxFuture<bool> {
+        let (tx, rx) = oneshot::channel();
+        let scheduled = Python::attach(|py| -> PyResult<()> {
+            let done = Py::new(
+                py,
+                ProbeDone {
+                    tx: Mutex::new(Some(tx)),
+                },
+            )?;
+            self.bridge.call_method1(py, "probe", (done,))?;
+            Ok(())
+        });
+        Box::pin(async move {
+            match scheduled {
+                Ok(()) => rx.await.unwrap_or(false),
+                Err(error) => {
+                    tracing::warn!(%error, "media processor probe could not be scheduled");
+                    false
+                }
+            }
+        })
+    }
+
+    fn process(&self, request: MediaRequest) -> BoxFuture<Result<ProcessedMedia, MediaError>> {
+        let (tx, rx) = oneshot::channel();
+        let scheduled = Python::attach(|py| -> PyResult<()> {
+            let done = Py::new(
+                py,
+                MediaDone {
+                    tx: Mutex::new(Some(tx)),
+                },
+            )?;
+            let items: Vec<(String, String)> = request
+                .items
+                .into_iter()
+                .map(|item| (item.modality, item.url))
+                .collect();
+            self.bridge.call_method1(
+                py,
+                "submit",
+                (
+                    request.request_id,
+                    request.prompt_token_ids,
+                    request.prompt_text,
+                    items,
+                    request.arrival_time,
+                    request.want_identity,
+                    done,
+                ),
+            )?;
+            Ok(())
+        });
+        Box::pin(async move {
+            if let Err(error) = scheduled {
+                return Err(MediaError::Internal(format!(
+                    "media processor could not take the request: {error}"
+                )));
+            }
+            rx.await.unwrap_or_else(|_| {
+                Err(MediaError::Unavailable(
+                    "media processor dropped the request".to_string(),
+                ))
+            })
+        })
+    }
+}
+
+fn bytes_of(value: &Bound<'_, PyBytes>) -> Bytes {
+    Bytes::copy_from_slice(value.as_bytes())
+}
+
+/// Python's answer to one media request, called once: `("ok",
+/// (prompt_token_ids, mm_features | None, aux_frames, cache_salt | None,
+/// media_identity | None))`, or `(kind, message)` with `kind` one of
+/// `invalid`, `unavailable`, `internal`.
+#[pyclass(name = "_MediaDone")]
+struct MediaDone {
+    tx: Mutex<Option<oneshot::Sender<Result<ProcessedMedia, MediaError>>>>,
+}
+
+#[pymethods]
+impl MediaDone {
+    fn __call__(&self, kind: &str, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+        let outcome = match kind {
+            "ok" => {
+                let (prompt_token_ids, mm_features, aux_frames, cache_salt, media_identity): (
+                    Vec<u32>,
+                    Option<Bound<'_, PyBytes>>,
+                    Vec<Bound<'_, PyBytes>>,
+                    Option<String>,
+                    Option<Bound<'_, PyBytes>>,
+                ) = payload.extract()?;
+                Ok(ProcessedMedia {
+                    prompt_token_ids,
+                    mm_features: mm_features.as_ref().map(bytes_of),
+                    aux_frames: aux_frames.iter().map(bytes_of).collect(),
+                    cache_salt,
+                    media_identity: media_identity.as_ref().map(bytes_of),
+                })
+            }
+            "invalid" => Err(MediaError::Invalid(payload.extract()?)),
+            "unavailable" => Err(MediaError::Unavailable(payload.extract()?)),
+            _ => Err(MediaError::Internal(payload.extract()?)),
+        };
+        let sender = self
+            .tx
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("media completion poisoned"))?
+            .take();
+        // A request whose caller gave up has no receiver; nothing to report.
+        if let Some(sender) = sender {
+            let _ = sender.send(outcome);
+        }
+        Ok(())
+    }
+}
+
+/// Python's answer to a probe, called once with whether the processor serves.
+#[pyclass(name = "_ProbeDone")]
+struct ProbeDone {
+    tx: Mutex<Option<oneshot::Sender<bool>>>,
+}
+
+#[pymethods]
+impl ProbeDone {
+    fn __call__(&self, serving: bool) -> PyResult<()> {
+        let sender = self
+            .tx
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("probe completion poisoned"))?
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(serving);
+        }
+        Ok(())
+    }
 }
 
 /// Rust-owned `vllm.grpc.engine.VllmEngine` server over a same-host vLLM
@@ -76,6 +270,7 @@ impl PyVllmGrpcServer {
         shm_namespace_id = String::new(),
         pooler_use_activation = None,
         pooler_dimensions = None,
+        media_processor = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -114,7 +309,12 @@ impl PyVllmGrpcServer {
         shm_namespace_id: String,
         pooler_use_activation: Option<bool>,
         pooler_dimensions: Option<u32>,
+        media_processor: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let media_processor = media_processor
+            .map(|bridge| PythonMediaProcessor::new(&bridge))
+            .transpose()?
+            .map(|processor| Arc::new(processor) as Arc<dyn MediaProcessor>);
         let model = VllmModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
@@ -153,6 +353,7 @@ impl PyVllmGrpcServer {
             engine_count,
             tokenizer_dir,
             model,
+            media_processor,
         };
         let inner = py
             .detach(|| VllmServicerServer::start(config))

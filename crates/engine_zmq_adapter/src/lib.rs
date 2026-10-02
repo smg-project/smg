@@ -40,5 +40,6 @@ pub use sockets::zmq_handshake_address;
 pub use stream::ZmqGenerateStream;
 pub use tokenspeed::TokenSpeedGenerateStream;
 pub use vllm::{
-    structured_outputs_backend_from_config, StructuredOutputsBackendConfig, VllmGenerateStream,
+    structured_outputs_backend_from_config, ProcessedMedia, StructuredOutputsBackendConfig,
+    VllmGenerateStream,
 };

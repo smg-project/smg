@@ -7,14 +7,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use engine_zmq_client::{
-    codec::dtype::ModelDtype,
+    codec::{decode_value, dtype::ModelDtype},
     connector::EngineCoreStream,
     protocol::vllm::{
         logprobs::TokenLogprob,
-        multimodal::MmFeatures,
         output::{EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics, StopReason},
-        request::EngineCoreRequest,
+        request::{EngineCoreRequest, MmFeaturesPayload},
         sampling::EngineCoreSamplingParams,
         structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
     },
@@ -477,13 +477,44 @@ pub fn structured_outputs_backend_from_config(name: &str) -> StructuredOutputsBa
     StructuredOutputsBackendConfig::Pinned(backend)
 }
 
-/// A request's multimodal batches translated once, for every choice of the
-/// request: the per-item features, or the identity salt of a tensor-less
-/// payload. Cloning shares the tensor bytes.
+/// A request's media translated once, for every choice of the request: the
+/// per-item features (built here, or relayed from a worker-side processor
+/// with the aux frames its encoder split off), or the identity salt of a
+/// tensor-less payload. Cloning shares the tensor bytes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TranslatedMedia {
-    pub(crate) mm_features: Option<MmFeatures>,
+    pub(crate) mm_features: Option<MmFeaturesPayload>,
+    pub(crate) aux_frames: Vec<Bytes>,
     pub(crate) cache_salt: Option<String>,
+}
+
+/// Media processed worker-side by vLLM's own input processor (the servicer's
+/// `media_refs` path): the request's `mm_features` as vLLM's `MsgpackEncoder`
+/// wrote them, relayed to the engine as is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProcessedMedia {
+    /// The encoder's primary buffer for `mm_features`; `None` when the
+    /// processed request carries no features.
+    pub mm_features: Option<Bytes>,
+    /// The encoder's aux buffers in order: tensors over the zero-copy
+    /// threshold, referenced from the primary buffer by index (1-based).
+    pub aux_frames: Vec<Bytes>,
+    pub cache_salt: Option<String>,
+}
+
+impl ProcessedMedia {
+    fn into_translated(self) -> Result<TranslatedMedia, String> {
+        let mm_features = self
+            .mm_features
+            .map(|bytes| decode_value(&bytes).map(MmFeaturesPayload::Raw))
+            .transpose()
+            .map_err(|error| format!("processed mm_features are not msgpack: {error}"))?;
+        Ok(TranslatedMedia {
+            mm_features,
+            aux_frames: self.aux_frames,
+            cache_salt: self.cache_salt,
+        })
+    }
 }
 
 /// Whether the request carries multimodal batches to translate.
@@ -528,9 +559,26 @@ pub(crate) fn translate_media(
         has_kv_transfer,
     )?;
     Ok(TranslatedMedia {
-        mm_features,
+        mm_features: mm_features.map(MmFeaturesPayload::Typed),
+        aux_frames: Vec::new(),
         cache_salt,
     })
+}
+
+/// The media of a request whose `media_refs` a worker-side processor already
+/// turned into engine features, in place of translating its batches.
+pub(crate) fn translated_from_processed(
+    req: &vllm::GenerateRequest,
+    processed: ProcessedMedia,
+) -> Result<TranslatedMedia, String> {
+    if has_media(req) {
+        return Err(
+            "a request with worker-processed media cannot also carry preprocessed \
+                    multimodal inputs"
+                .to_string(),
+        );
+    }
+    processed.into_translated()
 }
 
 /// [`translate_request`] with the grammar backend configured for the engine
@@ -567,6 +615,7 @@ pub(crate) fn translate_request_with_media(
     };
     let TranslatedMedia {
         mm_features,
+        aux_frames: _,
         cache_salt,
     } = media;
     let data_parallel_rank = req
@@ -723,6 +772,14 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
         if !temperature.is_finite() || temperature < 0.0 {
             return Err(format!(
                 "temperature must be a finite non-negative number, got {temperature}"
+            ));
+        }
+        // vLLM's `_verify_greedy_sampling`: greedy decoding (temperature
+        // below its sampling epsilon) cannot yield distinct choices.
+        if temperature < 1e-5 && sp.n > 1 {
+            return Err(format!(
+                "n must be 1 when using greedy sampling, got {}.",
+                sp.n
             ));
         }
     }
@@ -2077,6 +2134,15 @@ mod tests {
                 "logprobs",
                 vllm::SamplingParams {
                     logprobs: Some(-2),
+                    ..Default::default()
+                },
+            ),
+            // vLLM's `_verify_greedy_sampling`: no distinct choices at temperature 0.
+            (
+                "n must be 1 when using greedy sampling, got 2.",
+                vllm::SamplingParams {
+                    temperature: Some(0.0),
+                    n: 2,
                     ..Default::default()
                 },
             ),

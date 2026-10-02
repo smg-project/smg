@@ -22,6 +22,7 @@ use tokio::sync::oneshot;
 use tonic::Status;
 
 use super::{
+    media::process_media_refs,
     requests::{register, Registration},
     State,
 };
@@ -103,20 +104,16 @@ async fn submit(
             "This model does not support generation",
         ));
     }
-    // Refused here rather than dropped on translation: a request the engine
-    // would run without its media must fail, not answer text-only.
-    if req
-        .media_refs
-        .as_ref()
-        .is_some_and(|refs| !refs.items.is_empty())
-    {
-        return Err(Status::unimplemented(
-            "media_refs: worker-side media processing is not available on the Rust servicer; \
-             have the Router preprocess media (`--mm-processing router`) or use the Python \
-             servicer",
-        ));
-    }
     let request_id = req.request_id.clone();
+    // Register before anything slow: an `Abort` landing while the media is
+    // processed must find the entry, and a duplicate id is refused up front.
+    let (registration, cancel) = register(state, &request_id)?;
+    // Worker-side media: the request's references become engine features
+    // and its prompt the expanded one, before the frontend duties below.
+    let (processed_media, media_identity) = match process_media_refs(state, &mut req).await? {
+        Some((media, identity)) => (Some(media), identity.map(Arc::new)),
+        None => (None, None),
+    };
     let streaming = req.stream;
     let skip_special_tokens = req
         .sampling_params
@@ -137,10 +134,9 @@ async fn submit(
     fold_tokenizer_eos_backstop(&mut req, tokenizer);
     let decoder = stop_decoder(state, &stops, skip_special_tokens)?;
 
-    // Register before submitting: an `Abort` landing in the gap must find
-    // the entry, or the engine keeps generating behind an accepted abort.
-    let (registration, cancel) = register(state, &request_id)?;
-    let subs = client.generate_vllm_streams(req).await?;
+    let subs = client
+        .generate_vllm_streams_with_media(req, processed_media)
+        .await?;
     let mut choices = SelectAll::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
@@ -154,6 +150,7 @@ async fn submit(
             decoder,
             streaming,
             min_tokens,
+            media_identity.clone(),
         ));
     }
     Ok(Box::pin(GenerateStream {
@@ -187,6 +184,9 @@ struct ChoiceStream {
     generated: u32,
     /// Whether this request's prompt tokens went into the stats counters.
     prompt_counted: bool,
+    /// A PD prefill leg's account of the media it processed, stamped on
+    /// every `Complete` of the request for the decode leg.
+    media_identity: Option<Arc<vllm::MediaIdentity>>,
 }
 
 impl ChoiceStream {
@@ -196,8 +196,10 @@ impl ChoiceStream {
         decoder: Option<StopSequenceDecoder>,
         streaming: bool,
         min_tokens: u32,
+        media_identity: Option<Arc<vllm::MediaIdentity>>,
     ) -> Self {
         Self {
+            media_identity,
             state,
             inner: Some(inner),
             decoder,
@@ -261,10 +263,22 @@ impl ChoiceStream {
     fn abort(&mut self) -> Option<vllm::GenerateResponse> {
         if let Some(complete) = self.pending.take() {
             self.inner = None;
-            return Some(complete);
+            return Some(self.stamped(complete));
         }
         let mut inner = self.inner.take()?;
-        Some(inner.complete_aborted())
+        let complete = inner.complete_aborted();
+        Some(self.stamped(complete))
+    }
+
+    /// A terminal response with the request's media identity on it, when
+    /// there is one; anything else passes through.
+    fn stamped(&self, mut response: vllm::GenerateResponse) -> vllm::GenerateResponse {
+        if let (Some(identity), Some(vllm::generate_response::Response::Complete(complete))) =
+            (self.media_identity.as_deref(), response.response.as_mut())
+        {
+            complete.media_identity = Some(identity.clone());
+        }
+        response
     }
 }
 
@@ -280,7 +294,7 @@ impl Stream for ChoiceStream {
                 // The frontend ended this choice: drop the engine stream so the
                 // engine-side request is aborted, then deliver the Complete.
                 this.inner = None;
-                return Poll::Ready(Some(Ok(complete)));
+                return Poll::Ready(Some(Ok(this.stamped(complete))));
             }
             let Some(inner) = this.inner.as_mut() else {
                 return Poll::Ready(None);
@@ -306,7 +320,7 @@ impl Stream for ChoiceStream {
                 {
                     this.count_prompt(complete.prompt_tokens);
                 }
-                return Poll::Ready(Some(Ok(item)));
+                return Poll::Ready(Some(Ok(this.stamped(item))));
             };
             this.count_prompt(chunk.prompt_tokens);
             this.state
