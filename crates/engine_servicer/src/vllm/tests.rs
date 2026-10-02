@@ -646,9 +646,11 @@ async fn a_refused_decode_leg_notifies_the_engine() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// What the adapter would silently drop is refused up front.
+/// Worker-side media processing is refused up front (the adapter would
+/// otherwise run the request text-only); Router-preprocessed batches,
+/// including extra modality batches, go through to the engine.
 #[tokio::test]
-async fn media_refs_and_extra_batches_are_refused_not_dropped() {
+async fn media_refs_are_refused_and_extra_batches_translated() {
     let mut h = harness(model_info(), None).await;
     let mut request = generate_request("mm1", false, Vec::new());
     request.media_refs = Some(vllm::MediaRefs {
@@ -659,10 +661,24 @@ async fn media_refs_and_extra_batches_are_refused_not_dropped() {
     });
     let status = h.client.generate(request).await.expect_err("refused");
     assert_eq!(status.code(), Code::Unimplemented);
+
+    // A tensor-less identity batch (a grid-less PD decode leg) rides the
+    // cache salt; an empty extra batch is simply nothing to attach.
     let mut request = generate_request("mm2", false, Vec::new());
+    request.mm_inputs = Some(vllm::MultimodalInputs {
+        mm_hashes: vec!["h1".to_string(), "h2".to_string()],
+        ..Default::default()
+    });
     request.extra_mm_inputs = vec![vllm::MultimodalInputs::default()];
-    let status = h.client.generate(request).await.expect_err("refused");
-    assert_eq!(status.code(), Code::Unimplemented);
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert!(engine_request.mm_features.is_none());
+    assert_eq!(engine_request.cache_salt.as_deref(), Some("mm:h1,h2"));
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

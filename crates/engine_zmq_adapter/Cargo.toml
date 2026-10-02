@@ -13,6 +13,7 @@ llm-tokenizer.workspace = true
 openai-protocol.workspace = true
 
 bytes.workspace = true
+half.workspace = true
 rustix = { version = "1", features = ["fs", "process"] }
 futures.workspace = true
 serde_json.workspace = true

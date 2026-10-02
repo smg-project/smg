@@ -481,18 +481,19 @@ pub(crate) fn translate_request_with_backend(
         }
     };
     // Per-item mm features: the split the Python servicer performs before the
-    // engine happens here instead (the ZMQ path bypasses it).
-    let mm_features = req
+    // engine happens here instead (the ZMQ path bypasses it). Every batch of
+    // the request (`mm_inputs` plus `extra_mm_inputs`) goes in.
+    let batches: Vec<vllm::MultimodalInputs> = req
         .mm_inputs
-        .map(|mm| {
-            multimodal::build_mm_features(
-                mm,
-                prompt_token_ids.as_deref().unwrap_or(&[]),
-                model_dtype,
-            )
-        })
-        .transpose()?
-        .filter(|features| !features.is_empty());
+        .into_iter()
+        .chain(req.extra_mm_inputs)
+        .collect();
+    let (mm_features, cache_salt) = multimodal::translate_batches(
+        batches,
+        prompt_token_ids.as_deref().unwrap_or(&[]),
+        model_dtype,
+        kv_transfer_params.is_some(),
+    )?;
     let data_parallel_rank = req
         .data_parallel_rank
         .map(|rank| u32::try_from(rank).map_err(|_| format!("invalid data_parallel_rank: {rank}")))
@@ -522,6 +523,7 @@ pub(crate) fn translate_request_with_backend(
         sampling_params,
         arrival_time: now_secs(),
         data_parallel_rank,
+        cache_salt,
         ..EngineCoreRequest::default()
     })
 }

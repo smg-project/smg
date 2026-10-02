@@ -45,6 +45,7 @@ from typing import Any
 from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.vllm.kv_transfer import pairing_fields, resolve_pd_connector
+from smg_grpc_servicer.vllm.mm_salt import engine_accepts_mm_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +138,10 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         "is_generation": getattr(model_config, "runner_type", "generate") == "generate",
         "max_context_length": int(model_config.max_model_len),
         "vocab_size": int(model_config.get_vocab_size()),
-        # Media processing stays with the Python servicer for now.
-        "supports_vision": False,
+        # vLLM's own answer, as the Python servicer reports it: Router-
+        # preprocessed media reaches the engine over the same wire; only
+        # worker-side media processing (media_refs) stays with Python.
+        "supports_vision": _supports_vision(model_config),
         "model_type": str(getattr(hf_config, "model_type", None) or ""),
         "architectures": [str(a) for a in (getattr(model_config, "architectures", None) or [])],
         "eos_token_ids": eos_token_ids(model_config),
@@ -164,6 +167,14 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         "kv_events_topic": str(getattr(kv_events, "topic", "") or "") if kv_events_enabled else "",
         "shm_namespace_id": mm_shm.shm_namespace_id(),
     }
+
+
+def _supports_vision(model_config: Any) -> bool:
+    try:
+        return bool(engine_accepts_mm_inputs(model_config))
+    except Exception:  # an unexpected config shape must not take the servicer down
+        logger.warning("Could not determine multimodal support; reporting supports_vision=false")
+        return False
 
 
 def resolve_tokenizer_dir(tokenizer: str, revision: str | None = None) -> str | None:

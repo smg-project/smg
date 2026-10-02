@@ -2240,6 +2240,7 @@ dependencies = [
  "bytes",
  "engine-zmq-client",
  "futures",
+ "half",
  "llm-tokenizer",
  "openai-protocol",
  "rustix",

@@ -127,6 +127,7 @@ def test_model_info_mirrors_the_python_servicer(monkeypatch):
     assert info["is_generation"] is True
     assert info["max_context_length"] == 4096
     assert info["vocab_size"] == 1024
+    # A text model: vLLM's own multimodal check says no.
     assert info["supports_vision"] is False
     assert info["model_type"] == "qwen3"
     assert info["architectures"] == ["Qwen3ForCausalLM"]
@@ -163,6 +164,14 @@ def test_model_info_reports_the_pd_identity_and_pairing_facts():
     assert info["block_size"] == 16
     assert info["attention_backend"] == "FLASH_ATTN"
     assert info["model_dtype"] == "torch.bfloat16"
+
+
+def test_model_info_reports_vision_from_vllms_own_check():
+    config = _config(supports_multimodal_inputs=True, is_multimodal_model=True)
+    assert rust.model_info_from_config(config)["supports_vision"] is True
+    # `--language-model-only` drops the encoder: vLLM says no, so do we.
+    config = _config(supports_multimodal_inputs=False, is_multimodal_model=True)
+    assert rust.model_info_from_config(config)["supports_vision"] is False
 
 
 def test_model_info_reports_kv_events_and_the_structured_backend():

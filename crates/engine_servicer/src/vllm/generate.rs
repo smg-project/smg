@@ -103,11 +103,6 @@ async fn submit(
              servicer",
         ));
     }
-    if !req.extra_mm_inputs.is_empty() {
-        return Err(Status::unimplemented(
-            "extra_mm_inputs (a second modality batch) is not supported on the Rust servicer yet",
-        ));
-    }
     let request_id = req.request_id.clone();
     let streaming = req.stream;
     let skip_special_tokens = req
