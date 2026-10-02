@@ -510,6 +510,10 @@ pub(crate) fn init_metrics() {
         "smg_mm_processing_total",
         "Multimodal requests by processing location (router/worker) and resolution reason"
     );
+    describe_counter!(
+        "smg_responses_stream_failures_total",
+        "Responses streams that ended with a response.failed terminal, by model and reason"
+    );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
@@ -906,6 +910,19 @@ impl Metrics {
     }
 
     /// Record where a multimodal request's media is processed and why.
+    /// Count a Responses stream whose terminal event was `response.failed`.
+    ///
+    /// `reason` is a bounded label (`stream_error`, `server_error`, `other`).
+    pub fn record_responses_stream_failure(model_id: &str, reason: &'static str) {
+        let model = intern_model_label(model_id);
+        counter!(
+            "smg_responses_stream_failures_total",
+            "model" => model,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
     pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
         let model = intern_model_label(model_id);
         counter!(

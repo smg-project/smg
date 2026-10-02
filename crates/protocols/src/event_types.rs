@@ -7,6 +7,7 @@ pub enum ResponseEvent {
     InProgress,
     Completed,
     Incomplete,
+    Failed,
 }
 
 impl ResponseEvent {
@@ -14,6 +15,7 @@ impl ResponseEvent {
     pub const IN_PROGRESS: &'static str = "response.in_progress";
     pub const COMPLETED: &'static str = "response.completed";
     pub const INCOMPLETE: &'static str = "response.incomplete";
+    pub const FAILED: &'static str = "response.failed";
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -21,6 +23,7 @@ impl ResponseEvent {
             Self::InProgress => Self::IN_PROGRESS,
             Self::Completed => Self::COMPLETED,
             Self::Incomplete => Self::INCOMPLETE,
+            Self::Failed => Self::FAILED,
         }
     }
 }
@@ -644,10 +647,37 @@ pub fn is_response_event(event_type: &str) -> bool {
             | ResponseEvent::IN_PROGRESS
             | ResponseEvent::COMPLETED
             | ResponseEvent::INCOMPLETE
+            | ResponseEvent::FAILED
     )
 }
 
 /// Check if an item type string is a function call variant
 pub fn is_function_call_type(item_type: &str) -> bool {
     item_type == ItemType::FUNCTION_CALL || item_type == ItemType::FUNCTION_TOOL_CALL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_is_a_lifecycle_event() {
+        assert_eq!(ResponseEvent::Failed.as_str(), "response.failed");
+        assert_eq!(ResponseEvent::FAILED, ResponseEvent::Failed.as_str());
+        assert!(is_response_event(ResponseEvent::FAILED));
+    }
+
+    #[test]
+    fn every_lifecycle_variant_round_trips_through_the_predicate() {
+        for event in [
+            ResponseEvent::Created,
+            ResponseEvent::InProgress,
+            ResponseEvent::Completed,
+            ResponseEvent::Incomplete,
+            ResponseEvent::Failed,
+        ] {
+            assert!(is_response_event(event.as_str()), "{event}");
+        }
+        assert!(!is_response_event("response.output_item.added"));
+    }
 }

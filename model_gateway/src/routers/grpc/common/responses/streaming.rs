@@ -26,13 +26,16 @@ use uuid::Uuid;
 use super::utils::generation_failure_error;
 #[cfg(test)]
 use crate::routers::common::sse::sse_channel;
-use crate::routers::{
-    common::{
-        openai_bridge::{self, descriptor, ResponseFormat},
-        sse::{SseReceiver, SseSender},
+use crate::{
+    observability::metrics::Metrics,
+    routers::{
+        common::{
+            openai_bridge::{self, descriptor, ResponseFormat},
+            sse::{SseReceiver, SseSender},
+        },
+        error,
+        grpc::harmony::responses::ToolResult,
     },
-    error,
-    grpc::harmony::responses::ToolResult,
 };
 
 /// Item-id-prefix discriminator for non-format kinds. Format-driven items
@@ -82,6 +85,21 @@ struct ToolCallStreamItem {
     name: String,
     arguments: String,
     added_emitted: bool,
+}
+
+/// The bounded `reason` label for the stream-failure counter.
+///
+/// The gateway emits two error codes on this path: `stream_error` when the
+/// backend stream could not be read, and `server_error` when the engine
+/// reported a failed generation (also the case when the finish reason alone
+/// says so and no error object was built). Anything else counts as `other`
+/// so a client-visible code can never widen the label set.
+fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
+    match error.and_then(|e| e.get("code")).and_then(|c| c.as_str()) {
+        Some("stream_error") => "stream_error",
+        Some("server_error") | None => "server_error",
+        Some(_) => "other",
+    }
 }
 
 /// OpenAI-compatible event emitter for /v1/responses streaming
@@ -413,7 +431,7 @@ impl ResponseStreamEventEmitter {
 
         json!({
             "type": if failed {
-                "response.failed"
+                ResponseEvent::FAILED
             } else if truncated {
                 ResponseEvent::INCOMPLETE
             } else {
@@ -440,14 +458,22 @@ impl ResponseStreamEventEmitter {
         self.close_tool_call_items(tx).await?;
         let mut event = self.emit_completed(usage);
         if let Some(error) = error {
-            event["type"] = json!("response.failed");
+            event["type"] = json!(ResponseEvent::FAILED);
             event["response"]["status"] = json!("failed");
             event["response"]["error"] = error.clone();
             if let Some(response) = event["response"].as_object_mut() {
                 response.remove("incomplete_details");
             }
         }
-        self.send_event(&event, tx).await
+        let failed = event["type"] == ResponseEvent::FAILED;
+        self.send_event(&event, tx).await?;
+        if failed {
+            // Counted only once the terminal reached the client: a stream that
+            // dies before its terminal is not a delivered failure, and the
+            // completed/incomplete terminals never count here.
+            Metrics::record_responses_stream_failure(&self.model, failure_reason(error));
+        }
+        Ok(())
     }
 
     /// Convert tool entries to JSON values using the shared bridge builder.
