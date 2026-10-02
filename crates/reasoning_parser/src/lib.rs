@@ -7,6 +7,7 @@ pub use parsers::{
     BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, DeepSeekV41Parser, Glm45Parser,
     HyV4Parser, InklingParser, KimiK3Parser, KimiParser, MiniMaxParser, MinimaxM3Parser,
     NanoV3Parser, PassthroughParser, Qwen3Parser, QwenThinkingParser, Step3Parser,
+    TemplateReasoningParser,
 };
 pub use traits::{
     ParseError, ParserConfig, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE,

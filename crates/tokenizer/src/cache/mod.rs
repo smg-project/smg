@@ -282,6 +282,10 @@ impl Tokenizer for CachedTokenizer {
         self
     }
 
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.inner.response_template()
+    }
+
     fn apply_chat_template(
         &self,
         messages: &[serde_json::Value],
@@ -762,5 +766,14 @@ mod tests {
         let _ = flat.encode(&rendered.text, false).unwrap();
         let _ = flat.encode(&rendered.text, false).unwrap();
         assert_eq!(flat.cache_stats().map(|s| s.hits), Some(1));
+    }
+
+    #[test]
+    fn cached_tokenizer_retains_response_template() {
+        let expected = serde_json::json!({"sentinel": "retained-through-cache"});
+        let inner = MockTokenizer::new().with_response_template(expected.clone());
+        let cached = CachedTokenizer::new(Arc::new(inner), CacheConfig::default());
+
+        assert_eq!(cached.response_template(), Some(&expected));
     }
 }
