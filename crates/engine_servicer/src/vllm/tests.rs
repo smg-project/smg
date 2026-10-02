@@ -888,11 +888,6 @@ async fn info_rpcs_report_config_and_handshake_facts() {
             .map(|_| ())
             .unwrap_err(),
         h.client
-            .flush_cache(common::FlushCacheRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err(),
-        h.client
             .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
             .await
             .map(|_| ())
@@ -1158,4 +1153,178 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
     .expect("the publisher notices the dropped stream in time");
     assert!(disconnected);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// `FlushCache`, under the Python servicer's `admin.flush_cache` contract.
+mod flush_cache {
+    use std::time::Instant;
+
+    use engine_zmq_client::{codec::OpaqueValue, protocol::vllm::request::UtilityCall};
+
+    use super::*;
+
+    const RESET_CALL: &str = "reset_prefix_cache";
+
+    async fn recv_utility(engine: &mut MockEngineInput) -> UtilityCall {
+        match engine.recv().await.expect("inbound") {
+            EngineInbound::Utility(call) => call,
+            other => panic!("expected Utility, got {other:?}"),
+        }
+    }
+
+    fn request(timeout_s: f32) -> common::FlushCacheRequest {
+        common::FlushCacheRequest { timeout_s }
+    }
+
+    /// Answer every reset the servicer issues with `answer` until it stops
+    /// asking; returns how many it issued.
+    async fn answer_resets(
+        engine_in: &mut MockEngineInput,
+        engine_out: &mut MockEngineOutput,
+        answer: bool,
+    ) -> usize {
+        let mut answered = 0;
+        while let Ok(Ok(EngineInbound::Utility(call))) =
+            tokio::time::timeout(Duration::from_secs(1), engine_in.recv()).await
+        {
+            engine_out
+                .send_utility_reply(0, call.call_id, Ok(OpaqueValue::from(answer)))
+                .await
+                .expect("reply");
+            answered += 1;
+        }
+        answered
+    }
+
+    /// The RPC is vLLM's `reset_prefix_cache(False, False)` as a utility call;
+    /// `true` from the engine is the Python servicer's success response.
+    #[tokio::test]
+    async fn resets_the_prefix_cache_through_a_utility_call() {
+        let mut h = harness(model_info(), None).await;
+        let (response, call) = tokio::join!(h.client.flush_cache(request(0.0)), async {
+            let call = recv_utility(&mut h.engine_in).await;
+            h.engine_out
+                .send_utility_reply(0, call.call_id, Ok(OpaqueValue::from(true)))
+                .await
+                .unwrap();
+            call
+        });
+        assert_eq!(call.method, RESET_CALL);
+        assert_eq!(
+            call.args,
+            vec![OpaqueValue::from(false), OpaqueValue::from(false)]
+        );
+        assert_eq!(call.client_index, 0);
+        let response = response.expect("flush").into_inner();
+        assert!(response.success);
+        assert_eq!(
+            response.message,
+            "Local KV prefix cache flushed successfully"
+        );
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
+    /// `timeout_s == 0` is one attempt: an engine still holding KV blocks
+    /// answers `false`, which is the refusal response (OK status), not a retry.
+    #[tokio::test]
+    async fn an_immediate_attempt_reports_a_refusal() {
+        let mut h = harness(model_info(), None).await;
+        let (response, ()) = tokio::join!(h.client.flush_cache(request(0.0)), async {
+            let call = recv_utility(&mut h.engine_in).await;
+            h.engine_out
+                .send_utility_reply(0, call.call_id, Ok(OpaqueValue::from(false)))
+                .await
+                .unwrap();
+        });
+        let response = response.expect("a refusal is not an error").into_inner();
+        assert!(!response.success);
+        assert_eq!(
+            response.message,
+            "KV prefix cache reset refused; requests may be in flight"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), h.engine_in.recv())
+                .await
+                .is_err(),
+            "no retry after an immediate attempt"
+        );
+    }
+
+    /// A positive `timeout_s` retries every 100 ms while the engine refuses,
+    /// then fails as DEADLINE_EXCEEDED; an engine that never answers runs out
+    /// the same budget.
+    #[tokio::test]
+    async fn retries_until_the_deadline_then_times_out() {
+        let mut h = harness(model_info(), None).await;
+        let started = Instant::now();
+        let (status, attempts) = tokio::join!(
+            h.client.flush_cache(request(0.45)),
+            answer_resets(&mut h.engine_in, &mut h.engine_out, false)
+        );
+        let status = status.expect_err("deadline");
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert_eq!(
+            status.message(),
+            "Flush cache timed out; the engine may still complete an issued reset"
+        );
+        assert!(attempts >= 2, "{attempts}");
+        assert!(started.elapsed() >= Duration::from_millis(450));
+
+        let started = Instant::now();
+        let status = h
+            .client
+            .flush_cache(request(0.2))
+            .await
+            .expect_err("deadline");
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        // The unanswered call did reach the engine.
+        assert_eq!(recv_utility(&mut h.engine_in).await.method, RESET_CALL);
+    }
+
+    /// An engine-side failure is INTERNAL carrying the engine's message, as
+    /// the Python servicer reports an exception from the reset.
+    #[tokio::test]
+    async fn an_engine_failure_is_internal() {
+        let mut h = harness(model_info(), None).await;
+        let failure = "Call to reset_prefix_cache method failed: boom";
+        let (status, ()) = tokio::join!(h.client.flush_cache(request(0.0)), async {
+            let call = recv_utility(&mut h.engine_in).await;
+            h.engine_out
+                .send_utility_reply(0, call.call_id, Err(failure.to_string()))
+                .await
+                .unwrap();
+        });
+        let status = status.expect_err("engine failure");
+        assert_eq!(status.code(), Code::Internal);
+        assert!(
+            status.message().starts_with("Flush cache failed: "),
+            "{status:?}"
+        );
+        assert!(status.message().ends_with(failure), "{status:?}");
+    }
+
+    /// A negative or non-finite `timeout_s` is refused before the engine is
+    /// asked.
+    #[tokio::test]
+    async fn rejects_an_invalid_timeout() {
+        let mut h = harness(model_info(), None).await;
+        for timeout_s in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let status = h
+                .client
+                .flush_cache(request(timeout_s))
+                .await
+                .expect_err("invalid timeout_s");
+            assert_eq!(status.code(), Code::InvalidArgument, "{timeout_s}");
+            assert_eq!(
+                status.message(),
+                "timeout_s must be finite and non-negative"
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), h.engine_in.recv())
+                .await
+                .is_err()
+        );
+    }
 }

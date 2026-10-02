@@ -10,7 +10,7 @@
 
 use bytes::Bytes;
 
-use crate::Result;
+use crate::{codec::OpaqueValue, Result};
 
 pub mod handshake;
 pub mod tokenspeed;
@@ -46,6 +46,16 @@ pub enum WaveEvent {
     Start(u64),
 }
 
+/// An engine's answer to a utility RPC (vLLM `call_utility`), matched to the
+/// waiting caller by `call_id`. Protocols without utility RPCs never produce
+/// one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UtilityReply {
+    pub call_id: i64,
+    /// The returned value, or the engine's failure message.
+    pub outcome: std::result::Result<OpaqueValue, String>,
+}
+
 /// A single per-request output decoded from one engine tick. Lets the
 /// engine-neutral connector route outputs to their request streams without
 /// knowing the concrete protocol payload.
@@ -74,6 +84,8 @@ pub struct EngineBatch<O> {
     /// Wave-control notification from a lockstep engine group (`None` on every
     /// ordinary tick).
     pub wave: Option<WaveEvent>,
+    /// A utility RPC reply (`None` on every ordinary tick).
+    pub utility: Option<UtilityReply>,
 }
 
 impl<O> Default for EngineBatch<O> {
@@ -84,6 +96,7 @@ impl<O> Default for EngineBatch<O> {
             finished_request_ids: Vec::new(),
             load: None,
             wave: None,
+            utility: None,
         }
     }
 }

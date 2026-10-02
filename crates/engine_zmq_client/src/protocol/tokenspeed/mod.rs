@@ -166,6 +166,7 @@ impl EngineProtocol for TokenSpeedProtocol {
             finished_request_ids,
             load,
             wave: None,
+            utility: None,
         })
     }
 }

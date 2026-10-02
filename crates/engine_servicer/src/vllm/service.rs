@@ -10,7 +10,7 @@ use smg_grpc_client::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{generate, info, kv_events, requests, tokenizer_bundle, State};
+use super::{admin, generate, info, kv_events, requests, tokenizer_bundle, State};
 use crate::BoxStream;
 
 /// The `VllmEngine` service over the shared state.
@@ -53,12 +53,11 @@ impl VllmEngine for VllmEngineService {
 
     async fn flush_cache(
         &self,
-        _request: Request<common::FlushCacheRequest>,
+        request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented(
-            "FlushCache is not served by the Rust vLLM servicer yet (the ZMQ engine client has \
-             no utility RPC path)",
-        ))
+        admin::flush_cache(&self.state, request)
+            .await
+            .map(Response::new)
     }
 
     async fn abort(

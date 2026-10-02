@@ -135,12 +135,52 @@ impl EngineCoreRequest {
     // follow-up.
 }
 
+/// A utility RPC to one engine (`EngineCoreRequestType::Utility`): the
+/// positional tuple vLLM's client sends, `(client_index, call_id, method,
+/// args)`. The engine runs `getattr(EngineCore, method)(*args)` and answers
+/// with a [`UtilityOutput`](super::output::UtilityOutput) carrying the same
+/// `call_id`.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
+pub struct UtilityCall {
+    /// Which of the frontend's output sockets gets the reply; this client has
+    /// one.
+    pub client_index: u32,
+    /// Correlates the reply. vLLM reserves negative ids for notices an engine
+    /// sends unprompted, so callers issue positive ones.
+    pub call_id: i64,
+    pub method: String,
+    pub args: Vec<OpaqueValue>,
+}
+
 #[cfg(test)]
 mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::{decode_value, encode_msgpack};
+    use crate::codec::{decode_msgpack, decode_value, encode_msgpack, hex};
+
+    /// Golden bytes from vLLM's own encoder (`vllm.v1.serial_utils.MsgpackEncoder`,
+    /// vLLM 0.30.1rc1): `encode((0, 0x0123456789ABCDEF, "reset_prefix_cache",
+    /// (False, False)))`, the tuple `AsyncMPClient._call_utility_async` sends.
+    #[test]
+    fn utility_call_encodes_as_vllm_client_does() {
+        let call = UtilityCall {
+            client_index: 0,
+            call_id: 0x0123_4567_89AB_CDEF,
+            method: "reset_prefix_cache".to_string(),
+            args: vec![Value::from(false), Value::from(false)],
+        };
+        let golden = hex("9400cf0123456789abcdefb272657365745f7072656669785f636163686592c2c2");
+        assert_eq!(encode_msgpack(&call).unwrap(), golden);
+        assert_eq!(decode_msgpack::<UtilityCall>(&golden).unwrap(), call);
+
+        // A small id takes msgpack's positive fixint, as msgspec encodes it.
+        let first = UtilityCall { call_id: 1, ..call };
+        assert_eq!(
+            encode_msgpack(&first).unwrap(),
+            hex("940001b272657365745f7072656669785f636163686592c2c2")
+        );
+    }
 
     #[test]
     fn request_type_frames_roundtrip() {

@@ -1,8 +1,9 @@
 // Ported from the Apache-2.0 reference `vllm-engine-core-client`
 // (vllm-project/vllm): protocol/output.rs.
 //
-// `utility_output` is carried as OpaqueValue (typed utility RPC deferred); the
-// semantic classification into RequestBatch / Utility / DpControl is preserved.
+// The semantic classification into RequestBatch / Utility / DpControl is
+// preserved; `utility_output` is typed (`UtilityOutput`) so replies route to
+// their callers.
 
 use std::collections::BTreeSet;
 
@@ -281,9 +282,9 @@ struct WireEngineCoreOutputs {
     scheduler_stats: Option<Box<SchedulerStats>>,
     #[serde(default)]
     timestamp: f64,
-    /// Utility RPC result (untyped for now).
+    /// A utility RPC reply, tolerant of fields a newer engine appends.
     #[serde(default)]
-    utility_output: Option<OpaqueValue>,
+    utility_output: Option<TrailingTolerant<UtilityOutput>>,
     #[serde(default)]
     finished_requests: Option<BTreeSet<String>>,
     /// In DP mode, signals that the current wave finished and engines are paused.
@@ -312,12 +313,67 @@ pub struct RequestBatchOutputs {
     pub finished_requests: Option<BTreeSet<String>>,
 }
 
-/// A utility RPC result (untyped payload for now).
-#[derive(Debug, Clone, PartialEq, Default)]
+/// The value a utility method returned, in vLLM's `UtilityResult` wire form
+/// `[type_info, value]`: `type_info` is `nil` unless the engine runs with
+/// `VLLM_ALLOW_INSECURE_SERIALIZATION` (pickled custom types, not decoded
+/// here).
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
+pub struct UtilityResult {
+    pub type_info: OpaqueValue,
+    pub value: OpaqueValue,
+}
+
+/// An engine's answer to a [`UtilityCall`](super::request::UtilityCall).
+/// Mirrors Python `UtilityOutput` (`array_like`): a set `failure_message`
+/// means the method raised and `result` is `None`.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
+pub struct UtilityOutput {
+    pub call_id: i64,
+    #[serde(default)]
+    pub failure_message: Option<String>,
+    #[serde(default)]
+    pub result: Option<UtilityResult>,
+}
+
+impl UtilityOutput {
+    /// The reply an engine sends for `call_id` (the mock engine's side).
+    pub fn from_outcome(call_id: i64, outcome: std::result::Result<OpaqueValue, String>) -> Self {
+        match outcome {
+            Ok(value) => Self {
+                call_id,
+                failure_message: None,
+                result: Some(UtilityResult {
+                    type_info: OpaqueValue::Nil,
+                    value,
+                }),
+            },
+            Err(message) => Self {
+                call_id,
+                failure_message: Some(message),
+                result: None,
+            },
+        }
+    }
+
+    /// The call's outcome as vLLM's client resolves it: the failure message
+    /// when set, else the returned value.
+    pub fn into_outcome(self) -> std::result::Result<OpaqueValue, String> {
+        match (self.failure_message, self.result) {
+            (Some(message), _) => Err(message),
+            (None, Some(result)) => Ok(result.value),
+            (None, None) => {
+                Err("utility reply carried neither a result nor a failure message".to_string())
+            }
+        }
+    }
+}
+
+/// A utility RPC reply, multiplexed on the output wire like a batch.
+#[derive(Debug, Clone, PartialEq)]
 pub struct UtilityCallOutput {
     pub engine_index: u32,
     pub timestamp: f64,
-    pub output: Option<OpaqueValue>,
+    pub output: UtilityOutput,
 }
 
 /// A DP wave-control notification.
@@ -378,45 +434,52 @@ impl WireEngineCoreOutputs {
     /// Classify into the semantic enum, resolving per-request wire logprobs
     /// against the aux `frames`.
     fn into_semantic(self, frames: &[Bytes]) -> Result<EngineCoreOutputs> {
-        let value = self;
-        let has_request_payload = !value.outputs.is_empty()
-            || value.scheduler_stats.is_some()
-            || value.finished_requests.is_some();
+        let Self {
+            engine_index,
+            outputs,
+            scheduler_stats,
+            timestamp,
+            utility_output,
+            finished_requests,
+            wave_complete,
+            start_wave,
+        } = self;
+        let has_request_payload =
+            !outputs.is_empty() || scheduler_stats.is_some() || finished_requests.is_some();
 
         match (
             has_request_payload,
-            &value.utility_output,
-            &value.wave_complete,
-            &value.start_wave,
+            utility_output,
+            wave_complete,
+            start_wave,
         ) {
             (true, None, None, None) => Ok(RequestBatchOutputs {
-                engine_index: value.engine_index,
-                outputs: value
-                    .outputs
+                engine_index,
+                outputs: outputs
                     .into_iter()
                     .map(|output| output.resolve(frames))
                     .collect::<Result<Vec<_>>>()?,
-                scheduler_stats: value.scheduler_stats,
-                timestamp: value.timestamp,
-                finished_requests: value.finished_requests,
+                scheduler_stats,
+                timestamp,
+                finished_requests,
             }
             .into()),
-            (false, Some(_), None, None) => Ok(UtilityCallOutput {
-                engine_index: value.engine_index,
-                timestamp: value.timestamp,
-                output: value.utility_output,
+            (false, Some(TrailingTolerant(output)), None, None) => Ok(UtilityCallOutput {
+                engine_index,
+                timestamp,
+                output,
             }
             .into()),
             (false, None, Some(wave), None) => Ok(DpControlOutput {
-                engine_index: value.engine_index,
-                timestamp: value.timestamp,
-                control: DpControlMessage::WaveComplete(*wave),
+                engine_index,
+                timestamp,
+                control: DpControlMessage::WaveComplete(wave),
             }
             .into()),
             (false, None, None, Some(wave)) => Ok(DpControlOutput {
-                engine_index: value.engine_index,
-                timestamp: value.timestamp,
-                control: DpControlMessage::StartWave(*wave),
+                engine_index,
+                timestamp,
+                control: DpControlMessage::StartWave(wave),
             }
             .into()),
             _ => Err(Error::Decode {
@@ -435,7 +498,7 @@ struct WireEngineCoreOutputsRef<'a> {
     outputs: &'a [EngineCoreOutput],
     scheduler_stats: Option<&'a SchedulerStats>,
     timestamp: f64,
-    utility_output: Option<&'a OpaqueValue>,
+    utility_output: Option<&'a UtilityOutput>,
     finished_requests: Option<&'a BTreeSet<String>>,
     wave_complete: Option<u64>,
     start_wave: Option<u64>,
@@ -465,7 +528,7 @@ impl<'a> From<&'a EngineCoreOutputs> for WireEngineCoreOutputsRef<'a> {
             EngineCoreOutputs::Utility(utility) => Self {
                 engine_index: utility.engine_index,
                 timestamp: utility.timestamp,
-                utility_output: utility.output.as_ref(),
+                utility_output: Some(&utility.output),
                 ..empty
             },
             EngineCoreOutputs::DpControl(control) => {
@@ -514,7 +577,7 @@ mod tests {
     use super::*;
     use crate::{
         codec::{
-            decode_value, encode_msgpack,
+            decode_value, encode_msgpack, hex,
             tensor::{WireArrayData, WireNdArray},
         },
         protocol::vllm::logprobs::{PositionLogprobs, TokenLogprob},
@@ -660,12 +723,90 @@ mod tests {
 
     #[test]
     fn classify_utility() {
+        let output = UtilityOutput::from_outcome(42, Ok(rmpv::Value::from(true)));
         let wire = WireEngineCoreOutputs {
-            utility_output: Some(rmpv::Value::from(42u32)),
+            engine_index: 1,
+            utility_output: Some(TrailingTolerant(output.clone())),
             ..Default::default()
         };
-        let classified = wire.into_semantic(&[]).unwrap();
-        assert!(matches!(classified, EngineCoreOutputs::Utility(_)));
+        assert_eq!(
+            wire.into_semantic(&[]).unwrap(),
+            EngineCoreOutputs::Utility(UtilityCallOutput {
+                engine_index: 1,
+                timestamp: 0.0,
+                output,
+            })
+        );
+    }
+
+    /// Golden replies from vLLM's own encoder (`vllm.v1.serial_utils.MsgpackEncoder`,
+    /// vLLM 0.30.1rc1): `EngineCoreOutputs(engine_index=1, timestamp=1.5,
+    /// utility_output=UtilityOutput(0x0123456789ABCDEF, result=UtilityResult(True)))`,
+    /// then the failure and `UtilityResult(None)` shapes.
+    #[test]
+    fn decode_utility_replies_as_vllm_encodes_them() {
+        let call_id = 0x0123_4567_89AB_CDEF;
+        let ok = hex("980190c0cb3ff800000000000093cf0123456789abcdefc092c0c3c0c0c0");
+        assert_eq!(
+            decode_engine_core_outputs(&[Bytes::from(ok)]).unwrap(),
+            EngineCoreOutputs::Utility(UtilityCallOutput {
+                engine_index: 1,
+                timestamp: 1.5,
+                output: UtilityOutput {
+                    call_id,
+                    failure_message: None,
+                    result: Some(UtilityResult {
+                        type_info: rmpv::Value::Nil,
+                        value: rmpv::Value::from(true),
+                    }),
+                },
+            })
+        );
+
+        let failed = hex(
+            "980090c0cb400400000000000093cf0123456789abcdefd92e43616c6c20746f2072657365745f70\
+             72656669785f6361636865206d6574686f64206661696c65643a20626f6f6dc0c0c0c0",
+        );
+        let EngineCoreOutputs::Utility(reply) =
+            decode_engine_core_outputs(&[Bytes::from(failed)]).unwrap()
+        else {
+            panic!("expected a utility reply");
+        };
+        assert_eq!(reply.output.call_id, call_id);
+        assert_eq!(
+            reply.output.into_outcome(),
+            Err("Call to reset_prefix_cache method failed: boom".to_string())
+        );
+
+        let none = hex("980090c0cb400400000000000093cf0123456789abcdefc092c0c0c0c0c0");
+        let EngineCoreOutputs::Utility(reply) =
+            decode_engine_core_outputs(&[Bytes::from(none)]).unwrap()
+        else {
+            panic!("expected a utility reply");
+        };
+        assert_eq!(reply.output.into_outcome(), Ok(rmpv::Value::Nil));
+    }
+
+    /// Our encoding decodes back, including a reserved negative call id (the
+    /// notices vLLM sends unprompted on `-1`/`-2` must not fail the message).
+    #[test]
+    fn utility_replies_roundtrip_including_negative_call_ids() {
+        let notice = rmpv::Value::Array(vec![rmpv::Value::from(1), rmpv::Value::from(0)]);
+        for output in [
+            UtilityOutput::from_outcome(7, Ok(rmpv::Value::from(false))),
+            UtilityOutput::from_outcome(-1, Ok(notice)),
+            UtilityOutput::from_outcome(3, Err("Server shutting down".to_string())),
+        ] {
+            let outputs = EngineCoreOutputs::Utility(UtilityCallOutput {
+                engine_index: 2,
+                timestamp: 4.0,
+                output,
+            });
+            assert_eq!(
+                decode_engine_core_outputs(&encoded_frame(&outputs)).unwrap(),
+                outputs
+            );
+        }
     }
 
     #[test]
@@ -693,7 +834,10 @@ mod tests {
                 new_token_ids: vec![7],
                 ..Default::default()
             }],
-            utility_output: Some(rmpv::Value::from(1u32)),
+            utility_output: Some(TrailingTolerant(UtilityOutput::from_outcome(
+                1,
+                Ok(rmpv::Value::Nil),
+            ))),
             ..Default::default()
         };
         let error = wire.into_semantic(&[]).unwrap_err();

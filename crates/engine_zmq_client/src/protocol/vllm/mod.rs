@@ -31,7 +31,7 @@ use crate::{
             request::{EngineCoreRequest, EngineCoreRequestType},
             stats::SchedulerStats,
         },
-        EngineBatch, EngineLoad, EngineOutput, EngineProtocol, WaveEvent,
+        EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
     },
 };
 
@@ -106,9 +106,8 @@ impl EngineProtocol for VllmProtocol {
     }
 
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
-        // vLLM multiplexes request batches, utility RPCs, and DP control on one
-        // wire struct; only request batches carry per-request outputs (utility
-        // results surface as an empty batch the dispatcher ignores).
+        // vLLM multiplexes request batches, utility replies, and DP control on
+        // one wire struct; each lands in its own slot of the batch.
         match decode_engine_core_outputs(frames)? {
             EngineCoreOutputs::RequestBatch(batch) => Ok(EngineBatch {
                 engine_index: batch.engine_index,
@@ -119,6 +118,7 @@ impl EngineProtocol for VllmProtocol {
                     .unwrap_or_default(),
                 load: batch.scheduler_stats.map(|stats| EngineLoad::from(*stats)),
                 wave: None,
+                utility: None,
             }),
             EngineCoreOutputs::DpControl(control) => Ok(EngineBatch {
                 engine_index: control.engine_index,
@@ -128,7 +128,14 @@ impl EngineProtocol for VllmProtocol {
                 }),
                 ..EngineBatch::default()
             }),
-            EngineCoreOutputs::Utility(_) => Ok(EngineBatch::default()),
+            EngineCoreOutputs::Utility(reply) => Ok(EngineBatch {
+                engine_index: reply.engine_index,
+                utility: Some(UtilityReply {
+                    call_id: reply.output.call_id,
+                    outcome: reply.output.into_outcome(),
+                }),
+                ..EngineBatch::default()
+            }),
         }
     }
 }

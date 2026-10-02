@@ -18,6 +18,7 @@
 //! (`media_refs`). Those stay with the Python servicer until the ZMQ client
 //! grows the paths.
 
+mod admin;
 mod engine;
 mod generate;
 mod info;

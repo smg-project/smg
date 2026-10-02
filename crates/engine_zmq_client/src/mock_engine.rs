@@ -17,12 +17,12 @@ use zeromq::{
 };
 
 use crate::{
-    codec::{decode_msgpack, dtype::ModelDtype, encode_msgpack},
+    codec::{decode_msgpack, dtype::ModelDtype, encode_msgpack, OpaqueValue},
     protocol::{
         handshake::{EngineCoreReadyResponse, HandshakeInitMessage, ReadyMessage},
         vllm::{
-            output::EngineCoreOutputs,
-            request::{EngineCoreRequest, EngineCoreRequestType},
+            output::{EngineCoreOutputs, UtilityCallOutput, UtilityOutput},
+            request::{EngineCoreRequest, EngineCoreRequestType, UtilityCall},
         },
     },
     transport::EngineId,
@@ -100,8 +100,9 @@ pub enum EngineInbound {
         wave: u64,
         exclude_engine_index: Option<u32>,
     },
-    /// Any other request type byte (Utility), unhandled here.
-    Other(u8),
+    /// A utility RPC (`EngineCoreRequestType::Utility`); answer it with
+    /// [`MockEngineOutput::send_utility_reply`].
+    Utility(UtilityCall),
 }
 
 /// The request-receiving half of a mock engine (frontend -> engine).
@@ -138,7 +139,9 @@ impl MockEngineInput {
                     exclude_engine_index,
                 })
             }
-            Some(other) => Ok(EngineInbound::Other(other as u8)),
+            Some(EngineCoreRequestType::Utility) => {
+                Ok(EngineInbound::Utility(decode_msgpack(payload)?))
+            }
             None => Err(Error::UnexpectedHandshakeMessage {
                 message: format!("unknown request type frame {:?}", type_frame.as_ref()),
             }),
@@ -173,6 +176,22 @@ impl MockEngineOutput {
         self.send_frames(vec![Bytes::from(encode_msgpack(outputs)?)])
             .await
     }
+
+    /// Answer a utility call as `EngineCoreProc` does: the method's return
+    /// value, or the failure message of the exception it raised.
+    pub async fn send_utility_reply(
+        &mut self,
+        engine_index: u32,
+        call_id: i64,
+        outcome: std::result::Result<OpaqueValue, String>,
+    ) -> Result<()> {
+        self.send_outputs(&EngineCoreOutputs::Utility(UtilityCallOutput {
+            engine_index,
+            timestamp: 0.0,
+            output: UtilityOutput::from_outcome(call_id, outcome),
+        }))
+        .await
+    }
 }
 
 /// One mock engine's frontend-facing sockets after a completed handshake.
@@ -204,6 +223,18 @@ impl MockEngine {
     /// Push a raw multi-frame output. Convenience for sequential test drivers.
     pub async fn send_output(&mut self, frames: Vec<Bytes>) -> Result<()> {
         self.output.send_frames(frames).await
+    }
+
+    /// Answer a utility call. Convenience for sequential test drivers.
+    pub async fn send_utility_reply(
+        &mut self,
+        engine_index: u32,
+        call_id: i64,
+        outcome: std::result::Result<OpaqueValue, String>,
+    ) -> Result<()> {
+        self.output
+            .send_utility_reply(engine_index, call_id, outcome)
+            .await
     }
 }
 

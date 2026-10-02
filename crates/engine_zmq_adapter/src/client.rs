@@ -9,6 +9,7 @@ use std::{
 };
 
 use engine_zmq_client::{
+    codec::OpaqueValue,
     connect_handshake,
     connector::{EngineCoreClient, TokenSpeedClient},
     protocol::{
@@ -498,6 +499,33 @@ impl ZmqEngineClient {
         }
     }
 
+    /// vLLM's `reset_prefix_cache(reset_running_requests=False,
+    /// reset_connector=False)` on every connected rank, as the Python
+    /// servicer's `admin.py` issues it per rank: `true` only when every rank
+    /// reset. The wait is bounded by `timeout` (DEADLINE_EXCEEDED); an engine
+    /// failure is INTERNAL, a dead engine UNAVAILABLE. TokenSpeed has no such
+    /// RPC on the ZMQ wire.
+    pub async fn reset_prefix_cache(&self, timeout: Duration) -> Result<bool, tonic::Status> {
+        let ZmqBackend::Vllm(client) = &self.backend else {
+            return Err(tonic::Status::unimplemented(
+                "FlushCache is not available on a TokenSpeed ZMQ backend",
+            ));
+        };
+        let args = vec![OpaqueValue::from(false), OpaqueValue::from(false)];
+        let calls = client.engines().iter().map(|engine| {
+            client.call_utility(
+                &engine.engine_id,
+                "reset_prefix_cache",
+                args.clone(),
+                timeout,
+            )
+        });
+        let results = futures::future::try_join_all(calls)
+            .await
+            .map_err(utility_status)?;
+        Ok(results.iter().all(|result| result.as_bool() == Some(true)))
+    }
+
     /// Latest per-rank load for one engine index, if the backend carries it.
     /// vLLM piggybacks it on every batch; TokenSpeed does not (always `None`).
     fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
@@ -596,16 +624,29 @@ pub(crate) fn zmq_status(error: engine_zmq_client::Error) -> tonic::Status {
     }
 }
 
+/// A utility call's error as a status: the wait expiring is the caller's
+/// deadline, everything else is the engine failing.
+fn utility_status(error: engine_zmq_client::Error) -> tonic::Status {
+    match error {
+        engine_zmq_client::Error::UtilityTimeout { .. } => {
+            tonic::Status::deadline_exceeded(error.to_string())
+        }
+        other => zmq_status(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
 
     use engine_zmq_client::{
-        mock_engine::{connect_to_frontend, default_ready_response},
+        mock_engine::{connect_to_frontend, default_ready_response, EngineInbound, MockEngine},
+        protocol::vllm::request::UtilityCall,
         EngineId,
     };
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
     use openai_protocol::worker::RuntimeType;
+    use tonic::Code;
 
     use super::*;
     use crate::{eos::EosTokenIds, sockets::ZMQ_CONNECT_TIMEOUT};
@@ -683,5 +724,145 @@ mod tests {
             error.to_string().contains("no engine implementation"),
             "{error}"
         );
+    }
+
+    /// `count` mock ranks behind one vLLM-dialect client, kept alive so they
+    /// can answer utility calls.
+    async fn connected_ranks(dir: &Path, count: usize) -> (ZmqEngineClient, Vec<MockEngine>) {
+        let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let ranks = (0..count as u32).map(|rank| {
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(rank),
+                default_ready_response(),
+            )
+        });
+        let (client, engines) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                count,
+                "org/repo".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::Vllm,
+                Duration::from_secs(10)
+            ),
+            futures::future::join_all(ranks),
+        );
+        let engines = engines
+            .into_iter()
+            .map(|engine| engine.expect("mock engine"))
+            .collect();
+        (client.expect("adapter connect"), engines)
+    }
+
+    /// Answer each rank's next utility call with its entry in `answers`,
+    /// returning the calls received.
+    async fn answer_reset(
+        engines: &mut [MockEngine],
+        answers: &[Result<bool, &str>],
+    ) -> Vec<UtilityCall> {
+        let mut calls = Vec::new();
+        for (index, (engine, answer)) in engines.iter_mut().zip(answers).enumerate() {
+            let EngineInbound::Utility(call) = engine.recv().await.expect("inbound") else {
+                panic!("expected a utility call");
+            };
+            let outcome = answer.map(OpaqueValue::from).map_err(str::to_string);
+            engine
+                .send_utility_reply(index as u32, call.call_id, outcome)
+                .await
+                .expect("reply");
+            calls.push(call);
+        }
+        calls
+    }
+
+    /// FlushCache's engine half: `reset_prefix_cache(False, False)` goes to
+    /// every rank and succeeds only when every rank reset.
+    #[tokio::test]
+    async fn reset_prefix_cache_needs_every_rank_to_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 2).await;
+        let (result, calls) = tokio::join!(
+            client.reset_prefix_cache(Duration::from_secs(5)),
+            answer_reset(&mut engines, &[Ok(true), Ok(false)])
+        );
+        assert!(!result.unwrap());
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            assert_eq!(call.method, "reset_prefix_cache");
+            assert_eq!(
+                call.args,
+                vec![OpaqueValue::from(false), OpaqueValue::from(false)]
+            );
+        }
+        let (result, _) = tokio::join!(
+            client.reset_prefix_cache(Duration::from_secs(5)),
+            answer_reset(&mut engines, &[Ok(true), Ok(true)])
+        );
+        assert!(result.unwrap());
+    }
+
+    /// The wait expiring is the caller's deadline; an engine failure is the
+    /// engine's, with its message.
+    #[tokio::test]
+    async fn reset_prefix_cache_maps_timeouts_and_failures_to_statuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        let status = client
+            .reset_prefix_cache(Duration::from_millis(200))
+            .await
+            .expect_err("no answer");
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        // The unanswered call did reach the engine; drain it.
+        assert!(matches!(
+            engines[0].recv().await.unwrap(),
+            EngineInbound::Utility(_)
+        ));
+
+        let (status, _) = tokio::join!(
+            client.reset_prefix_cache(Duration::from_secs(5)),
+            answer_reset(
+                &mut engines,
+                &[Err("Call to reset_prefix_cache method failed: boom")]
+            )
+        );
+        let status = status.expect_err("engine failure");
+        assert_eq!(status.code(), Code::Internal);
+        assert!(status.message().contains("boom"), "{status:?}");
+    }
+
+    /// TokenSpeed has no prefix-cache reset on the ZMQ wire.
+    #[tokio::test]
+    async fn reset_prefix_cache_is_unimplemented_for_tokenspeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let _engine = engine.expect("mock engine");
+        let status = client
+            .expect("adapter connect")
+            .reset_prefix_cache(Duration::from_secs(1))
+            .await
+            .expect_err("tokenspeed");
+        assert_eq!(status.code(), Code::Unimplemented);
     }
 }

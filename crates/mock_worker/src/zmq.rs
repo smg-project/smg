@@ -12,10 +12,12 @@ use std::{
 };
 
 use engine_zmq_client::{
+    codec::OpaqueValue,
     mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
     protocol::vllm::{
         output::{
             EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
+            UtilityCallOutput, UtilityOutput,
         },
         stats::SchedulerStats,
     },
@@ -133,8 +135,22 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
                 // group, so it never pauses and has no wave to start.
                 tracing::debug!("zmq engine {engine_index} ignoring start of wave {wave}");
             }
-            Ok(EngineInbound::Other(byte)) => {
-                tracing::debug!("zmq engine {engine_index} ignoring request type {byte}");
+            Ok(EngineInbound::Utility(call)) => {
+                // The mock holds no KV blocks, so a prefix-cache reset always
+                // succeeds; no other EngineCore method exists here.
+                let outcome = if call.method == "reset_prefix_cache" {
+                    Ok(OpaqueValue::from(true))
+                } else {
+                    Err(format!(
+                        "Call to {} method failed: the mock engine has no such method",
+                        call.method
+                    ))
+                };
+                let _ = out_tx.send(EngineCoreOutputs::Utility(UtilityCallOutput {
+                    engine_index,
+                    timestamp: 0.0,
+                    output: UtilityOutput::from_outcome(call.call_id, outcome),
+                }));
             }
             Err(error) => {
                 tracing::info!("zmq engine {engine_index} input closed: {error}");
