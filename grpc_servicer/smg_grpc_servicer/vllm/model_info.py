@@ -88,7 +88,10 @@ def supports_vision(model_config: Any) -> bool:
     try:
         return bool(engine_accepts_mm_inputs(model_config))
     except Exception:  # an unexpected config shape must not take the servicer down
-        logger.warning("Could not determine multimodal support; reporting supports_vision=false")
+        logger.warning(
+            "Could not determine multimodal support; reporting supports_vision=false",
+            exc_info=True,
+        )
         return False
 
 
@@ -122,6 +125,9 @@ def server_facts(vllm_config: Any) -> dict[str, Any]:
     kv_config = getattr(vllm_config, "kv_transfer_config", None)
     kv_connector, kv_engine_id, kv_role = "", "", ""
     if kv_config is not None:
+        # The effective PD engine_id; with DP the engine cores serve
+        # `{id}_dp{rank}` and the router derives the suffix from the rank it
+        # pins per request.
         kv_connector, kv_engine_id = resolve_pd_connector(kv_config)
         kv_role = getattr(kv_config, "kv_role", None) or ""
     return {

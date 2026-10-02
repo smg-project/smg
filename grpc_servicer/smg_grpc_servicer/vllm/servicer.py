@@ -652,10 +652,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             GetServerInfoResponse protobuf
         """
         facts = server_facts(self.engine.vllm_config)
-        # Effective PD engine_id; with DP the engine cores serve
-        # `{id}_dp{rank}` and the router derives the suffix from the rank it
-        # pins per request.
-
         mm_processor = ""
         mm_media_ref_schemes = ""
         # A --language-model-only engine accepts no multimodal inputs, so it

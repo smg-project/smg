@@ -9,10 +9,14 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from smg_grpc_proto import vllm_engine_pb2
-from smg_grpc_servicer.vllm.media_refs import MediaRefItem
-from smg_grpc_servicer.vllm.mm_processor import MmProcessorUnavailable, MmSettings
-from smg_grpc_servicer.vllm.rust_media import RustMediaBridge
+
+pytest.importorskip("smg_grpc_proto")
+pytest.importorskip("msgspec")  # the processor module pulls in the sidecar protocol
+pytest.importorskip("numpy")  # lend_buffer's views
+from smg_grpc_proto import vllm_engine_pb2  # noqa: E402
+from smg_grpc_servicer.vllm.media_refs import MediaRefItem  # noqa: E402
+from smg_grpc_servicer.vllm.mm_processor import MmProcessorUnavailable, MmSettings  # noqa: E402
+from smg_grpc_servicer.vllm.rust_media import RustMediaBridge  # noqa: E402
 
 
 @pytest.fixture

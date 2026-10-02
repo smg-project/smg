@@ -62,74 +62,43 @@ pub(super) async fn generate(
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
-    // A PD decode leg refused before admission must still release the blocks
-    // its prefill side pinned, as vLLM's own frontend does. Armed until
-    // admission: a caller that gives up on the way (a media fetch can take
-    // seconds) drops this future, and the notice must still go out, as the
-    // Python servicer shields it through cancellation.
-    let mut notice = kv_transfer_rejection_params(&req).map(|params| RejectionNotice {
-        client: client.clone(),
-        request_id: req.request_id.clone(),
-        params: Some(params),
-        rank: req
-            .data_parallel_rank
-            .and_then(|rank| u32::try_from(rank).ok()),
-    });
-    match submit(state, client, req).await {
-        Ok(stream) => {
-            if let Some(notice) = notice.as_mut() {
-                notice.disarm();
-            }
-            Ok(stream)
-        }
-        Err(status) => {
-            let Some(mut notice) = notice else {
-                return Err(status);
-            };
-            let params = notice.disarm();
-            // A duplicate id names a request that is still live; a notice
-            // under that id would reuse it (and, past an `n > 1` fan-out,
-            // get in and free the live leg's blocks).
-            if status.code() == tonic::Code::AlreadyExists {
-                return Err(status);
-            }
-            if let Some(params) = params {
-                client
-                    .notify_kv_transfer_rejected(&notice.request_id, params, notice.rank)
-                    .await;
-            }
-            Err(status)
-        }
-    }
+    submit(state, client, req).await
 }
 
-/// The rejection notice a refused PD decode leg owes its prefill side, sent
-/// on drop unless disarmed: a refusal sends it inline, a caller that gives up
-/// before admission sends it from here.
+/// The rejection notice a refused PD decode leg owes its prefill side, so the
+/// connector releases the blocks that side pinned: what vLLM's own frontend
+/// sends, an immediately aborted one-token request under the refused id.
 struct RejectionNotice {
     client: ZmqEngineClient,
     request_id: String,
-    params: Option<serde_json::Value>,
+    params: serde_json::Value,
     rank: Option<u32>,
 }
 
 impl RejectionNotice {
-    fn disarm(&mut self) -> Option<serde_json::Value> {
-        self.params.take()
+    fn owed_by(client: &ZmqEngineClient, req: &vllm::GenerateRequest) -> Option<Self> {
+        kv_transfer_rejection_params(req).map(|params| Self {
+            client: client.clone(),
+            request_id: req.request_id.clone(),
+            params,
+            rank: req
+                .data_parallel_rank
+                .and_then(|rank| u32::try_from(rank).ok()),
+        })
     }
-}
 
-impl Drop for RejectionNotice {
-    fn drop(&mut self) {
-        let Some(params) = self.params.take() else {
-            return;
-        };
-        let client = self.client.clone();
-        let request_id = std::mem::take(&mut self.request_id);
-        let rank = self.rank;
+    /// Send the notice, detached: the refusal does not wait on the engine,
+    /// and a caller that already gave up has no future left to carry it.
+    fn send(self) {
+        let Self {
+            client,
+            request_id,
+            params,
+            rank,
+        } = self;
         #[expect(
             clippy::disallowed_methods,
-            reason = "the notice outlives the cancelled request; it ends with the engine's answer"
+            reason = "the notice outlives the refused request's future; it ends once the add is out"
         )]
         tokio::spawn(async move {
             client
@@ -139,12 +108,36 @@ impl Drop for RejectionNotice {
     }
 }
 
+/// Sends the notice it holds when dropped. Armed through admission, where a
+/// caller that gives up (a media fetch can take seconds) drops the request's
+/// future: the notice still goes out, as the Python servicer shields it
+/// through cancellation. `disarm` hands the notice back unsent.
+struct ArmedNotice(Option<RejectionNotice>);
+
+impl ArmedNotice {
+    fn disarm(&mut self) -> Option<RejectionNotice> {
+        self.0.take()
+    }
+}
+
+impl Drop for ArmedNotice {
+    fn drop(&mut self) {
+        if let Some(notice) = self.0.take() {
+            notice.send();
+        }
+    }
+}
+
 /// Resolve the frontend duties and submit the request's choices.
 async fn submit(
     state: &Arc<State>,
     client: &ZmqEngineClient,
     mut req: vllm::GenerateRequest,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
+    // A PD decode leg refused before admission still owes its prefill side
+    // the notice: armed from the first refusal below until the engine can
+    // hold the request.
+    let mut notice = ArmedNotice(RejectionNotice::owed_by(client, &req));
     // A pooling runner serves no generation task; vLLM's frontend refuses
     // this before the engine sees it, in these words.
     if !state.model.is_generation {
@@ -155,7 +148,12 @@ async fn submit(
     let request_id = req.request_id.clone();
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
-    let (registration, cancel) = register(state, &request_id)?;
+    let (registration, cancel) = register(state, &request_id).inspect_err(|_| {
+        // The id names a request that is still live; a notice under it would
+        // reuse it (and, past an `n > 1` fan-out, get in and free the live
+        // leg's blocks).
+        notice.disarm();
+    })?;
     // Worker-side media: the request's references become engine features
     // and its prompt the expanded one, before the frontend duties below.
     let (processed_media, media_identity) = match process_media_refs(state, &mut req).await? {
@@ -182,9 +180,25 @@ async fn submit(
     fold_tokenizer_eos_backstop(&mut req, tokenizer);
     let decoder = stop_decoder(state, &stops, skip_special_tokens)?;
 
-    let subs = client
+    // Admission ends here: the add is on the wire before `submit_with_aux`
+    // returns, and an `n > 1` fan-out has live subs while later ones are
+    // added. A caller that gives up from now on may leave the engine holding
+    // the request, which a notice under its id would reuse, so the guard
+    // comes off; a refusal below leaves the engine without the request (a
+    // fan-out's earlier subs are aborted with the error) and still owes one.
+    let owed = notice.disarm();
+    let subs = match client
         .generate_vllm_streams_with_media(req, processed_media)
-        .await?;
+        .await
+    {
+        Ok(subs) => subs,
+        Err(status) => {
+            if let Some(notice) = owed {
+                notice.send();
+            }
+            return Err(status);
+        }
+    };
     let mut choices = SelectAll::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.

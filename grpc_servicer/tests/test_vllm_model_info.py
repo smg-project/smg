@@ -5,6 +5,7 @@ fails here before either servicer answers it wrong."""
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 
 from smg_grpc_proto import vllm_engine_pb2
@@ -17,6 +18,7 @@ def _model_config(**overrides):
         served_model_name="served",
         tokenizer="org/m-tok",
         runner_type="generate",
+        is_multimodal_model=False,
         max_model_len=4096,
         get_vocab_size=lambda: 1024,
         hf_config=SimpleNamespace(
@@ -36,8 +38,11 @@ def _model_config(**overrides):
     return config
 
 
-def test_model_facts_build_the_proto_as_they_are():
-    facts = model_info.model_facts(_model_config())
+def test_model_facts_build_the_proto_as_they_are(caplog):
+    with caplog.at_level(logging.WARNING, logger=model_info.__name__):
+        facts = model_info.model_facts(_model_config())
+    # A text model: vLLM's own check said no, not the fallback below.
+    assert not [r for r in caplog.records if "supports_vision" in r.getMessage()]
     response = vllm_engine_pb2.GetModelInfoResponse(
         max_req_input_len=facts["max_context_length"], **facts
     )
@@ -79,6 +84,17 @@ def test_model_facts_degrade_like_the_python_servicer_did():
     assert facts["pad_token_id"] == 3 and facts["bos_token_id"] == 0
     assert facts["default_sampling_params_json"] == ""
     vllm_engine_pb2.GetModelInfoResponse(**facts)
+
+
+def test_supports_vision_records_why_it_fell_back(caplog):
+    # A config shape the check cannot read: vision is reported off (the Router
+    # then sends this worker no mm payloads), and the cause is in the log.
+    config = _model_config()
+    del config.is_multimodal_model
+    with caplog.at_level(logging.WARNING, logger=model_info.__name__):
+        assert model_info.supports_vision(config) is False
+    record = next(r for r in caplog.records if "supports_vision=false" in r.getMessage())
+    assert record.exc_info is not None and record.exc_info[0] is AttributeError
 
 
 def test_eos_sets_distinguish_advertised_from_stopped_on():

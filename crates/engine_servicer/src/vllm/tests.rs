@@ -2295,3 +2295,50 @@ async fn a_cancelled_decode_leg_still_notifies_the_engine() {
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// A PD decode leg refused past its media stage (here: by the engine wire's
+/// sampling validation) still owes the notice: the engine never held it.
+#[tokio::test]
+async fn a_decode_leg_refused_after_its_media_still_notifies_the_engine() {
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = harness_with(model_info(), None, Some(processor)).await;
+    let mut request = media_request("mr20");
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+    if let Some(params) = request.sampling_params.as_mut() {
+        params.top_p = 2.0;
+    }
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let notice = recv_add(&mut h.engine_in).await;
+    assert_eq!(notice.request_id, "mr20");
+    assert!(notice.abort_immediately);
+    // The notice's own stream is dropped once the add is out (the engine
+    // finishes that request by itself), which sends its abort; nothing else
+    // follows: one notice, no retry under the refused id.
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["mr20".to_string()]);
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Once admitted, a decode leg whose caller leaves is aborted, not refused:
+/// the engine holds it, and a notice under its id would reuse it.
+#[tokio::test]
+async fn a_caller_leaving_an_admitted_decode_leg_sends_no_notice() {
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = harness_with(model_info(), None, Some(processor)).await;
+    let mut request = media_request("mr21");
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+    let stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("admitted")
+        .into_inner();
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "mr21");
+    drop(stream);
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["mr21".to_string()]);
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}

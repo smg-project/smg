@@ -61,19 +61,23 @@ def lend_buffer(buffer: Any) -> Any:
     return view
 
 
-def _grpc_code_for(exc: BaseException) -> grpc.StatusCode:
-    """The Python servicer's exception-to-status mapping, which needs vLLM's
-    exception types; without vLLM installed (the launcher's engine-free
-    tests) a `ValueError` is the caller's and anything else is internal."""
-    try:
-        from smg_grpc_servicer.vllm.errors import grpc_code_for
-    except ImportError:
+# The Python servicer's exception-to-status mapping, resolved once: it needs
+# vLLM's exception types, and a vLLM that moved them fails here, at launch,
+# as it fails the Python servicer. Only an absent vLLM (the launcher's
+# engine-free tests) falls back: a `ValueError` is the caller's, anything
+# else is internal.
+try:
+    from smg_grpc_servicer.vllm.errors import grpc_code_for as _grpc_code_for
+except ModuleNotFoundError as _missing:
+    if _missing.name != "vllm":
+        raise
+
+    def _grpc_code_for(exc: BaseException) -> grpc.StatusCode:
         return (
             grpc.StatusCode.INVALID_ARGUMENT
             if isinstance(exc, ValueError)
             else grpc.StatusCode.INTERNAL
         )
-    return grpc_code_for(exc)
 
 
 class _EngineView:

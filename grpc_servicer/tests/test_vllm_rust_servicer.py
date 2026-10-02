@@ -110,6 +110,7 @@ def _config(**overrides):
         served_model_name=["served-a", "served-b"],
         tokenizer="org/m-tok",
         runner_type="generate",
+        is_multimodal_model=False,
         max_model_len=4096,
         get_vocab_size=lambda: 1024,
         hf_config=SimpleNamespace(
