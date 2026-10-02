@@ -10,7 +10,7 @@ use smg_grpc_client::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{generate, info, requests, State};
+use super::{generate, info, requests, tokenizer_bundle, State};
 use crate::BoxStream;
 
 /// The `VllmEngine` service over the shared state.
@@ -94,10 +94,9 @@ impl VllmEngine for VllmEngineService {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented(
-            "GetTokenizer is not served by the Rust vLLM servicer yet; point the Router at the \
-             tokenizer directly",
-        ))
+        tokenizer_bundle::get_tokenizer(&self.state)
+            .await
+            .map(Response::new)
     }
 
     async fn subscribe_kv_events(

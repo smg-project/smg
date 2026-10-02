@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, fs, io::Cursor, sync::Arc, time::Duration};
 
 use engine_zmq_client::{
     mock_engine::{
@@ -19,12 +19,16 @@ use engine_zmq_client::{
 use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
 use portpicker::pick_unused_port;
 use smg_grpc_client::{
-    common_proto as common, vllm_proto as vllm, vllm_proto::vllm_engine_client::VllmEngineClient,
+    common_proto as common,
+    tokenizer_bundle::{validate_bundle_sha256, with_extracted_bundle, StreamBundle},
+    vllm_proto as vllm,
+    vllm_proto::vllm_engine_client::VllmEngineClient,
 };
 use tonic::{transport::Channel, Code};
 use tonic_health::pb::{
     health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
 };
+use zip::{CompressionMethod, ZipArchive};
 
 use super::*;
 use crate::ServicerError;
@@ -889,11 +893,6 @@ async fn info_rpcs_report_config_and_handshake_facts() {
             .map(|_| ())
             .unwrap_err(),
         h.client
-            .get_tokenizer(common::GetTokenizerRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err(),
-        h.client
             .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
             .await
             .map(|_| ())
@@ -902,4 +901,157 @@ async fn info_rpcs_report_config_and_handshake_facts() {
         assert_eq!(status.code(), Code::Unimplemented);
     }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Representative tokenizer files plus ones the Python builder excludes.
+/// `tokenizer.json` is incompressible and larger than a chunk, so the bundle
+/// streams as several.
+fn write_tokenizer_dir(dir: &std::path::Path) -> Vec<(&'static str, Vec<u8>)> {
+    let mut seed = 0x9E37_79B9_u32;
+    let noise: Vec<u8> = (0..2 * tokenizer_bundle::CHUNK_SIZE)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        })
+        .collect();
+    let files = vec![
+        ("tokenizer.json", noise),
+        (
+            "tokenizer_config.json",
+            br#"{"model_max_length": 4096}"#.to_vec(),
+        ),
+        (
+            "special_tokens_map.json",
+            br#"{"eos_token": "<|im_end|>"}"#.to_vec(),
+        ),
+        ("chat_template.jinja", b"{{ messages }}".to_vec()),
+        ("model.safetensors", vec![0; 64]),
+        ("README.md", b"excluded".to_vec()),
+    ];
+    for (name, content) in &files {
+        fs::write(dir.join(name), content).unwrap();
+    }
+    fs::create_dir(dir.join("original")).unwrap();
+    fs::write(dir.join("original/tokenizer.model"), b"nested, excluded").unwrap();
+    files
+}
+
+/// `GetTokenizer` streams the Python builder's selection as a Deflate zip in
+/// `CHUNK_SIZE` frames with the fingerprint on the last one, and the Router's
+/// own bundle loader (sha256 check, zip validation, extraction) accepts it.
+#[tokio::test]
+async fn get_tokenizer_streams_a_bundle_the_router_loader_accepts() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer_dir = dir.path().join("tokenizer");
+    fs::create_dir(&tokenizer_dir).unwrap();
+    let files = write_tokenizer_dir(&tokenizer_dir);
+    let mut config = config(dir.path(), &handshake_address(), model_info());
+    config.tokenizer_dir = Some(tokenizer_dir.to_string_lossy().into_owned());
+    // The bundle comes off the configured directory; no engine is needed.
+    let server = VllmServicerServer::start(config).expect("servicer starts");
+    let mut client = VllmEngineClient::connect(format!("http://{}", server.address()))
+        .await
+        .unwrap();
+
+    let mut stream = client
+        .get_tokenizer(common::GetTokenizerRequest::default())
+        .await
+        .expect("get_tokenizer")
+        .into_inner();
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.message().await.unwrap() {
+        chunks.push(chunk);
+    }
+    let (last, full) = chunks.split_last().expect("at least one chunk");
+    assert!(!full.is_empty(), "the bundle should span several chunks");
+    for chunk in full {
+        assert_eq!(chunk.data.len(), tokenizer_bundle::CHUNK_SIZE);
+        assert!(chunk.sha256.is_empty());
+    }
+    assert!(!last.data.is_empty() && last.data.len() <= tokenizer_bundle::CHUNK_SIZE);
+    assert_eq!(last.sha256.len(), 64);
+
+    // Reassembled as the Router does, then its own validation and extraction.
+    let bundle = StreamBundle {
+        sha256: last.sha256.clone(),
+        compressed_data: chunks
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect(),
+    };
+    validate_bundle_sha256(&bundle).expect("fingerprint matches");
+    let mut archive = ZipArchive::new(Cursor::new(bundle.compressed_data.as_slice())).unwrap();
+    let names: Vec<String> = (0..archive.len())
+        .map(|index| {
+            let entry = archive.by_index(index).unwrap();
+            assert!(entry.is_file());
+            assert_eq!(entry.compression(), CompressionMethod::Deflated);
+            entry.name().to_string()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "chat_template.jinja",
+        ]
+    );
+    let extracted = with_extracted_bundle(&bundle, |extracted| {
+        Ok(files
+            .iter()
+            .map(|(name, _)| fs::read(extracted.join(name)).ok())
+            .collect::<Vec<_>>())
+    })
+    .expect("extracts");
+    for ((name, content), got) in files.iter().zip(extracted) {
+        let expected = names.iter().any(|n| n == name).then(|| content.clone());
+        assert_eq!(got, expected, "{name}");
+    }
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Without a tokenizer directory the RPC is refused as on the Python
+/// servicer; a configured directory with nothing to bundle is its
+/// `FileNotFoundError`, an internal error.
+#[tokio::test]
+async fn get_tokenizer_without_a_tokenizer_dir_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = VllmServicerServer::start(config(dir.path(), &handshake_address(), model_info()))
+        .expect("servicer starts");
+    let mut client = VllmEngineClient::connect(format!("http://{}", server.address()))
+        .await
+        .unwrap();
+    let status = client
+        .get_tokenizer(common::GetTokenizerRequest::default())
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "Tokenizer path is not configured on this server."
+    );
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    let mut config = config(dir.path(), &handshake_address(), model_info());
+    config.tokenizer_dir = Some(missing.to_string_lossy().into_owned());
+    let server = VllmServicerServer::start(config).expect("servicer starts");
+    let mut client = VllmEngineClient::connect(format!("http://{}", server.address()))
+        .await
+        .unwrap();
+    let status = client
+        .get_tokenizer(common::GetTokenizerRequest::default())
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Internal);
+    assert_eq!(
+        status.message(),
+        format!("No tokenizer files found in {}", missing.display())
+    );
+    server.stop(Duration::from_secs(5)).expect("clean stop");
 }

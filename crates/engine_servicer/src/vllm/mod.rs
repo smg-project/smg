@@ -25,6 +25,7 @@ mod requests;
 mod service;
 #[cfg(test)]
 mod tests;
+mod tokenizer_bundle;
 
 use std::{
     collections::HashMap,
@@ -138,10 +139,6 @@ pub(super) struct State {
     pub(super) stats: Stats,
     /// The local tokenizer directory the servicer loaded (`GetTokenizer`
     /// bundles it); `None` when none resolved.
-    #[expect(
-        dead_code,
-        reason = "read by GetTokenizer, which lands with the tokenizer bundle"
-    )]
     pub(super) tokenizer_dir: Option<String>,
     pub(super) engine: EngineLink,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
