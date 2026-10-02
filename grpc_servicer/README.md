@@ -162,8 +162,10 @@ Rust mode needs the `smg` wheel (for the binding) and serves the contract the
 Python servicer serves, with one exception: text generation, PD disaggregation
 (`--kv-transfer-config`: connector params pass through both ways and
 `GetServerInfo` carries the pairing identity), Router-preprocessed media
-(inline and `/dev/shm` tensors), `Embed`, `FlushCache`, `GetTokenizer` and
-`SubscribeKvEvents` (`--kv-events-config` with the ZMQ publisher). Worker-side
+(inline and `/dev/shm` tensors), `Embed`, `FlushCache`, `GetTokenizer` (which
+answers FAILED_PRECONDITION when the launcher could not resolve a local
+tokenizer directory) and `SubscribeKvEvents` (`--kv-events-config` with the ZMQ
+publisher). Worker-side
 media processing (`media_refs`, the in-process and Redis processors) answers
 UNIMPLEMENTED there, so keep the Python implementation for that. Tuning:
 `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
