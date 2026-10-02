@@ -220,6 +220,15 @@ fn convert_user_message(
                                 "tool_call_id": tr.tool_use_id,
                                 "content": extract_tool_result_text(tr)
                             }));
+                            // A tool result may carry images (a screenshot a
+                            // browser or shell tool returned). They join the
+                            // user content here, in block order, so the model
+                            // sees them; `media_plan_messages` lists them at
+                            // the same position, which keeps the plan aligned
+                            // with the placeholders this message renders.
+                            user_parts.extend(
+                                tool_result_image_blocks(tr).map(|_| json!({"type": "image"})),
+                            );
                         }
                         _ => {}
                     }
@@ -239,6 +248,23 @@ fn convert_user_message(
             result.extend(tool_msgs);
         }
     }
+}
+
+/// The image blocks inside a ToolResult block's content, in order.
+///
+/// Shared with media detection so the plan and the rendered content agree on
+/// which images a tool result contributes and where they stand.
+pub(crate) fn tool_result_image_blocks(
+    tool_result: &messages::ToolResultBlock,
+) -> impl Iterator<Item = &messages::ImageBlock> {
+    let blocks = match &tool_result.content {
+        Some(ToolResultContent::Blocks(blocks)) => blocks.as_slice(),
+        Some(ToolResultContent::String(_)) | None => &[],
+    };
+    blocks.iter().filter_map(|block| match block {
+        messages::ToolResultContentBlock::Image(image) => Some(image),
+        _ => None,
+    })
 }
 
 /// Extract text content from a ToolResult block.
@@ -898,5 +924,77 @@ mod tests {
             other: serde_json::Map::new(),
         };
         assert_eq!(get_history_tool_calls_count_messages(&request), 2);
+    }
+
+    #[test]
+    fn test_tool_result_images_join_user_content_in_block_order() {
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![
+                InputContentBlock::ToolResult(messages::ToolResultBlock {
+                    tool_use_id: "tu_1".to_string(),
+                    content: Some(ToolResultContent::Blocks(vec![
+                        messages::ToolResultContentBlock::Text(TextBlock {
+                            text: "screenshot taken".to_string(),
+                            cache_control: None,
+                            citations: None,
+                        }),
+                        messages::ToolResultContentBlock::Image(messages::ImageBlock {
+                            source: messages::ImageSource::Base64 {
+                                media_type: "image/png".to_string(),
+                                data: "AAAA".to_string(),
+                            },
+                            cache_control: None,
+                        }),
+                    ])),
+                    is_error: None,
+                    cache_control: None,
+                }),
+                InputContentBlock::Text(TextBlock {
+                    text: "what do you see".to_string(),
+                    cache_control: None,
+                    citations: None,
+                }),
+            ]),
+        }];
+
+        let result = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+
+        // The user content carries the tool result's image ahead of the text
+        // that followed it; the tool message keeps the result's text.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["role"], "user");
+        let parts = result[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], json!({"type": "image"}));
+        assert_eq!(parts[1]["text"], "what do you see");
+        assert_eq!(result[1]["role"], "tool");
+        assert_eq!(result[1]["tool_call_id"], "tu_1");
+        assert_eq!(result[1]["content"], "screenshot taken");
+    }
+
+    #[test]
+    fn test_tool_result_image_blocks_skips_text_only_results() {
+        let text_only = messages::ToolResultBlock {
+            tool_use_id: "tu_1".to_string(),
+            content: Some(ToolResultContent::String("4".to_string())),
+            is_error: None,
+            cache_control: None,
+        };
+        assert_eq!(tool_result_image_blocks(&text_only).count(), 0);
+
+        let empty = messages::ToolResultBlock {
+            tool_use_id: "tu_2".to_string(),
+            content: None,
+            is_error: None,
+            cache_control: None,
+        };
+        assert_eq!(tool_result_image_blocks(&empty).count(), 0);
     }
 }
