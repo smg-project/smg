@@ -2,6 +2,7 @@
 //! client surface, plus the connect entry points and metadata reads.
 
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -10,7 +11,11 @@ use std::{
 use engine_zmq_client::{
     connect_handshake,
     connector::{EngineCoreClient, TokenSpeedClient},
-    protocol::{handshake::EngineCoreReadyResponse, EngineLoad},
+    protocol::{
+        handshake::EngineCoreReadyResponse,
+        vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams},
+        EngineLoad,
+    },
     ConnectedEngine,
 };
 use futures::stream::SelectAll;
@@ -27,8 +32,23 @@ use crate::{
     tokenspeed::{
         fan_out_tokenspeed_requests, translate_request_tokenspeed, TokenSpeedGenerateStream,
     },
-    vllm::{fan_out_requests, ranked_candidate_count, translate_request, VllmGenerateStream},
+    vllm::{
+        fan_out_requests, kv_transfer_params, now_secs, ranked_candidate_count, translate_request,
+        VllmGenerateStream,
+    },
 };
+
+/// The connector params a refused request must still release: NIXL's
+/// `do_remote_prefill` marks a PD decode leg whose prefill side holds blocks
+/// for it until told otherwise. `None` for every other request.
+pub fn kv_transfer_rejection_params(req: &vllm::GenerateRequest) -> Option<serde_json::Value> {
+    let params = kv_transfer_params(req).ok().flatten()?;
+    params
+        .get("do_remote_prefill")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        .then_some(params)
+}
 
 /// The engine protocol a ZMQ backend speaks — a closed set: the transport has
 /// an adapter for exactly these two engines. Resolved once at connect time and
@@ -346,6 +366,44 @@ impl ZmqEngineClient {
             ));
         }
         Ok(streams)
+    }
+
+    /// vLLM's pre-admission rejection notice
+    /// (`AsyncLLM.notify_kv_transfer_request_rejected`): an immediately
+    /// aborted one-token request carrying the refused request's connector
+    /// params, so the connector's `request_finished` hook runs and the
+    /// prefill side frees the blocks it pinned for this decode. Failures are
+    /// logged, not returned: the caller is already failing the request.
+    pub async fn notify_kv_transfer_rejected(
+        &self,
+        request_id: &str,
+        params: serde_json::Value,
+        data_parallel_rank: Option<u32>,
+    ) {
+        let ZmqBackend::Vllm(client) = &self.backend else {
+            return;
+        };
+        let request = EngineCoreRequest {
+            request_id: request_id.to_string(),
+            prompt_token_ids: Some(vec![0]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens: 1,
+                extra_args: Some(HashMap::from([("kv_transfer_params".to_string(), params)])),
+                ..EngineCoreSamplingParams::default()
+            }),
+            arrival_time: now_secs(),
+            data_parallel_rank,
+            abort_immediately: true,
+            ..EngineCoreRequest::default()
+        };
+        // The engine finishes the request by itself; its stream is dropped.
+        if let Err(error) = client.submit(request).await {
+            tracing::warn!(
+                request_id,
+                %error,
+                "could not notify the engine of a rejected KV-transfer request"
+            );
+        }
     }
 
     /// Submit a vLLM-proto generate request to a vLLM backend and return a

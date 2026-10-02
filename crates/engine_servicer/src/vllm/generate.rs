@@ -4,6 +4,7 @@
 //! `Abort` RPC can end.
 
 use std::{
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -11,7 +12,8 @@ use std::{
 };
 
 use engine_zmq_adapter::{
-    fold_tokenizer_eos_backstop, stops::take_vllm_string_stops, VllmGenerateStream,
+    fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
+    VllmGenerateStream, ZmqEngineClient,
 };
 use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::{StopSequenceDecoder, StopSequenceDecoderBuilder};
@@ -53,11 +55,58 @@ pub(super) fn stop_decoder(
 /// Handle one `Generate` request against the connected engine.
 pub(super) async fn generate(
     state: &Arc<State>,
-    mut req: vllm::GenerateRequest,
+    req: vllm::GenerateRequest,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
     let client = state.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
+    }
+    // A PD decode leg refused before admission must still release the blocks
+    // its prefill side pinned, as vLLM's own frontend does.
+    let rejection = kv_transfer_rejection_params(&req).map(|params| {
+        (
+            req.request_id.clone(),
+            params,
+            req.data_parallel_rank
+                .and_then(|rank| u32::try_from(rank).ok()),
+        )
+    });
+    match submit(state, client, req).await {
+        Ok(stream) => Ok(stream),
+        Err(status) => {
+            if let Some((request_id, params, rank)) = rejection {
+                client
+                    .notify_kv_transfer_rejected(&request_id, params, rank)
+                    .await;
+            }
+            Err(status)
+        }
+    }
+}
+
+/// Resolve the frontend duties and submit the request's choices.
+async fn submit(
+    state: &Arc<State>,
+    client: &ZmqEngineClient,
+    mut req: vllm::GenerateRequest,
+) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
+    // Refused here rather than dropped on translation: a request the engine
+    // would run without its media must fail, not answer text-only.
+    if req
+        .media_refs
+        .as_ref()
+        .is_some_and(|refs| !refs.items.is_empty())
+    {
+        return Err(Status::unimplemented(
+            "media_refs: worker-side media processing is not available on the Rust servicer; \
+             have the Router preprocess media (`--mm-processing router`) or use the Python \
+             servicer",
+        ));
+    }
+    if !req.extra_mm_inputs.is_empty() {
+        return Err(Status::unimplemented(
+            "extra_mm_inputs (a second modality batch) is not supported on the Rust servicer yet",
+        ));
     }
     let request_id = req.request_id.clone();
     let streaming = req.stream;
@@ -95,7 +144,7 @@ pub(super) async fn generate(
     Ok(Box::pin(GenerateStream {
         choices,
         cancel,
-        cancelled: false,
+        aborted: None,
         _registration: registration,
     }))
 }
@@ -130,6 +179,18 @@ impl ChoiceStream {
             streaming,
             pending: None,
         }
+    }
+
+    /// End this choice on an abort: the `Complete` it was about to yield, the
+    /// engine's parked one, or a synthesized `abort` one; `None` once it has
+    /// already ended. Dropping the engine stream aborts the engine side.
+    fn abort(&mut self) -> Option<vllm::GenerateResponse> {
+        if let Some(complete) = self.pending.take() {
+            self.inner = None;
+            return Some(complete);
+        }
+        let mut inner = self.inner.take()?;
+        Some(inner.complete_aborted())
     }
 }
 
@@ -211,7 +272,9 @@ impl Stream for ChoiceStream {
 struct GenerateStream {
     choices: SelectAll<ChoiceStream>,
     cancel: oneshot::Receiver<()>,
-    cancelled: bool,
+    /// Set once aborted: the terminal `Complete` of every choice still open
+    /// at that point, yielded before the stream ends.
+    aborted: Option<VecDeque<vllm::GenerateResponse>>,
     _registration: Registration,
 }
 
@@ -220,18 +283,25 @@ impl Stream for GenerateStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.cancelled {
-            return Poll::Ready(None);
+        loop {
+            if let Some(aborted) = this.aborted.as_mut() {
+                return Poll::Ready(aborted.pop_front().map(Ok));
+            }
+            // Either an `Abort` fired the sender or shutdown dropped the
+            // registry: both end the request as the Python servicer does, with
+            // each open choice's `Complete(finish_reason = "abort")`. Dropping
+            // the choices aborts the engine side.
+            if Pin::new(&mut this.cancel).poll(cx).is_ready() {
+                let aborted = this
+                    .choices
+                    .iter_mut()
+                    .filter_map(ChoiceStream::abort)
+                    .collect();
+                this.choices.clear();
+                this.aborted = Some(aborted);
+                continue;
+            }
+            return Pin::new(&mut this.choices).poll_next(cx);
         }
-        // Either an `Abort` fired the sender or shutdown dropped the registry:
-        // both end the request. Dropping the choices aborts the engine side.
-        if Pin::new(&mut this.cancel).poll(cx).is_ready() {
-            this.cancelled = true;
-            this.choices.clear();
-            return Poll::Ready(Some(Err(Status::cancelled(
-                "request aborted on the servicer",
-            ))));
-        }
-        Pin::new(&mut this.choices).poll_next(cx)
     }
 }

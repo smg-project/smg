@@ -1,15 +1,16 @@
 """The Rust request path of the vLLM gRPC servicer, behind one flag.
 
-Upstream vLLM's gRPC server (``vllm serve --grpc`` /
+Upstream vLLM's gRPC server (``vllm serve <model> --grpc`` /
 ``python -m vllm.entrypoints.grpc_server``) imports this package's servicer
 classes and hosts them on an AsyncLLM. Setting ``SMG_VLLM_SERVICER_IMPL=rust``
 (or ``--servicer-impl rust`` when the launcher exposes it) keeps that same
 entrypoint but hands the process to :func:`serve_rust` before an AsyncLLM or
-a Python gRPC server exists: the engine runs headless (``vllm serve
---headless``) and dials a same-host ZMQ handshake, and the
-``vllm.grpc.engine.VllmEngine`` contract is served by the Rust
-:class:`smg.servicer.VllmGrpcServer` on a Rust-owned thread. Python keeps the
-lifecycle only. The Router cannot tell the two implementations apart.
+a Python gRPC server exists: the ``vllm.grpc.engine.VllmEngine`` contract is
+served by the Rust :class:`smg.servicer.VllmGrpcServer` on a Rust-owned
+thread, and the engine runs headless in a spawned child, launched through
+vLLM's own ``run_headless`` from the launcher's parsed namespace, dialing the
+servicer's same-host ZMQ handshake. Python keeps the lifecycle only. The
+Router cannot tell the two implementations apart.
 
 Upstream integration is one check at the top of its ``serve_grpc``::
 
@@ -17,26 +18,32 @@ Upstream integration is one check at the top of its ``serve_grpc``::
     if resolve_servicer_impl(args) == "rust":
         raise SystemExit(await serve_rust(args))
 
-Rust mode serves text generation. ``Embed``, ``FlushCache``, ``GetTokenizer``,
-``SubscribeKvEvents`` and worker-side media processing answer UNIMPLEMENTED
-there; the Python implementation stays the default.
+Rust mode serves text generation, including PD disaggregation (connector
+KV-transfer params pass through both ways and ``GetServerInfo`` carries the
+pairing identity). ``Embed``, ``FlushCache``, ``GetTokenizer``,
+``SubscribeKvEvents`` and worker-side media processing (``media_refs``)
+answer UNIMPLEMENTED there; the Python implementation stays the default.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
+import glob
+import importlib.util
 import json
 import logging
+import multiprocessing
 import os
 import signal
 import socket
 import subprocess
-import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
+from smg_grpc_servicer.vllm.kv_transfer import pairing_fields, resolve_pd_connector
 
 logger = logging.getLogger(__name__)
 
@@ -47,67 +54,10 @@ IMPLS = ("python", "rust")
 DEFAULT_DRAIN_SECS = 5.0
 ENGINE_TERMINATE_SECS = 30.0
 _POLL_SECS = 0.5
-
-# Flags of the gRPC launcher itself; they never reach the engine. Each takes a value.
-LAUNCHER_FLAGS = ("--host", "--port", "--servicer-impl")
-# Flags the headless launch owns (a user copy would conflict with ours).
-HEADLESS_OWNED_FLAGS = (
-    "--model",
-    "--data-parallel-size",
-    "--data-parallel-size-local",
-    "--data-parallel-address",
-    "--data-parallel-rpc-port",
-)
-_BOOLEAN_FLAGS = frozenset({"--headless"})
+# What upstream's gRPC entrypoint references when it carries the switch.
+HOOK_SYMBOL = "resolve_servicer_impl"
 # The `GetModelInfo.default_sampling_params_json` keys the Python servicer reports.
 _SAMPLING_DEFAULT_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty")
-
-
-def strip_flags(argv: Sequence[str], flags: Sequence[str]) -> list[str]:
-    """``argv`` without ``flags`` and their values (``--flag v`` or ``--flag=v``)."""
-    drop = set(flags) | _BOOLEAN_FLAGS
-    kept: list[str] = []
-    skip_value = False
-    for token in argv:
-        if skip_value:
-            skip_value = False
-            continue
-        name, has_value, _ = token.partition("=")
-        if name in drop:
-            skip_value = not has_value and name not in _BOOLEAN_FLAGS
-            continue
-        kept.append(token)
-    return kept
-
-
-def headless_engine_command(
-    model: str,
-    engine_argv: Sequence[str],
-    *,
-    handshake_port: int,
-    data_parallel_size: int,
-    python: str | None = None,
-) -> list[str]:
-    """The ``vllm serve --headless`` launch whose EngineCore(s) dial the
-    servicer's ZMQ handshake: every data-parallel engine is local to this node,
-    and the handshake port is the one the Rust server bound."""
-    return [
-        python or sys.executable,
-        "-m",
-        "vllm.entrypoints.cli.main",
-        "serve",
-        model,
-        "--headless",
-        "--data-parallel-size",
-        str(data_parallel_size),
-        "--data-parallel-size-local",
-        str(data_parallel_size),
-        "--data-parallel-address",
-        "127.0.0.1",
-        "--data-parallel-rpc-port",
-        str(handshake_port),
-        *engine_argv,
-    ]
 
 
 def _ids(value: Any) -> list[int]:
@@ -154,12 +104,21 @@ def default_sampling_params_json(model_config: Any) -> str:
 
 def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
     """`VllmGrpcServer` keyword arguments from vLLM's own config, so
-    `GetModelInfo` reports what the Python servicer would."""
+    `GetModelInfo` and `GetServerInfo` report what the Python servicer would."""
     model_config = vllm_config.model_config
     hf_config = getattr(model_config, "hf_config", None)
     served = getattr(model_config, "served_model_name", None) or model_config.model
     if isinstance(served, (list, tuple)):
         served = served[0] if served else model_config.model
+    # PD identity and pairing facts, read off the same config fields as the
+    # Python servicer's GetServerInfo.
+    kv_config = getattr(vllm_config, "kv_transfer_config", None)
+    kv_connector, kv_engine_id = ("", "")
+    kv_role = ""
+    if kv_config is not None:
+        kv_connector, kv_engine_id = resolve_pd_connector(kv_config)
+        kv_role = getattr(kv_config, "kv_role", None) or ""
+    pairing = pairing_fields(vllm_config)
     return {
         "model_path": str(model_config.model),
         "served_model_name": str(served),
@@ -177,6 +136,13 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         "default_sampling_params_json": default_sampling_params_json(model_config),
         "data_parallel_size": int(vllm_config.parallel_config.data_parallel_size),
         "pairing_protocol": pairing_protocol_from_env(),
+        "kv_connector": str(kv_connector or ""),
+        "kv_role": str(kv_role),
+        "kv_engine_id": str(kv_engine_id or ""),
+        "kv_cache_dtype": str(pairing.get("kv_cache_dtype", "")),
+        "attention_backend": str(pairing.get("attention_backend", "")),
+        "model_dtype": str(pairing.get("model_dtype", "")),
+        "block_size": int(pairing.get("block_size", 0)),
     }
 
 
@@ -217,6 +183,105 @@ def default_socket_dir() -> str:
     return os.environ.get("SMG_ZMQ_SOCKET_DIR") or f"/tmp/smg-zmq-{os.getuid()}"
 
 
+# ---------------------------------------------------------------------------
+# Headless engine: upstream's own launch, from the parsed namespace
+# ---------------------------------------------------------------------------
+
+
+def _fill_frontend_defaults(ns: argparse.Namespace) -> None:
+    """``run_headless`` reads a few frontend fields (``reasoning_parser_plugin``,
+    ...) that only the ``vllm serve`` parser defines; a bare
+    ``python -m vllm.entrypoints.grpc_server`` namespace gets their defaults."""
+    try:
+        from vllm.entrypoints.launchers.cli_args import FrontendArgs
+    except ImportError:
+        try:  # older layout
+            from vllm.entrypoints.openai.cli_args import FrontendArgs
+        except ImportError:
+            return
+    if not dataclasses.is_dataclass(FrontendArgs):
+        return
+    for field in dataclasses.fields(FrontendArgs):
+        if hasattr(ns, field.name):
+            continue
+        if field.default is not dataclasses.MISSING:
+            setattr(ns, field.name, field.default)
+        elif field.default_factory is not dataclasses.MISSING:
+            setattr(ns, field.name, field.default_factory())
+        else:
+            setattr(ns, field.name, None)
+
+
+def headless_namespace(
+    args: argparse.Namespace, *, handshake_port: int, data_parallel_size: int
+) -> argparse.Namespace:
+    """The launcher's parsed namespace re-aimed at ``vllm serve --headless``.
+
+    Every engine argument stays exactly as parsed (there is no argv round
+    trip, so the ``vllm serve <model> --grpc`` and ``python -m`` entrypoints
+    both work); the data-parallel group is pinned to this host and to the
+    handshake port the Rust server bound, with every engine local."""
+    ns = argparse.Namespace(**vars(args))
+    _fill_frontend_defaults(ns)
+    ns.model_tag = None  # `args.model` already carries the positional
+    ns.grpc = False
+    ns.headless = True
+    ns.api_server_count = 0
+    ns.data_parallel_size = data_parallel_size
+    ns.data_parallel_size_local = data_parallel_size
+    ns.data_parallel_address = "127.0.0.1"
+    ns.data_parallel_rpc_port = handshake_port
+    ns.data_parallel_start_rank = None
+    ns.data_parallel_hybrid_lb = False
+    ns.data_parallel_external_lb = False
+    return ns
+
+
+def _run_headless(ns: argparse.Namespace) -> None:
+    """Child target: vLLM's own headless launch (`vllm serve --headless`)."""
+    from vllm.entrypoints.cli.serve import run_headless
+
+    run_headless(ns)
+
+
+class EngineProcess:
+    """A ``Popen``-shaped view of the spawned headless-engine process, so the
+    lifecycle loop and :func:`terminate_engine` need no second code path."""
+
+    def __init__(self, process: Any):
+        self._process = process
+
+    @property
+    def pid(self) -> int | None:
+        return self._process.pid
+
+    def poll(self) -> int | None:
+        return self._process.exitcode
+
+    def terminate(self) -> None:
+        self._process.terminate()
+
+    def kill(self) -> None:
+        self._process.kill()
+
+    def wait(self, timeout: float | None = None) -> int:
+        self._process.join(timeout)
+        code = self._process.exitcode
+        if code is None:
+            raise subprocess.TimeoutExpired("headless engine", timeout or 0)
+        return code
+
+
+def launch_headless_engine(ns: argparse.Namespace) -> EngineProcess:
+    """Start the headless engine in a spawned child: a fresh interpreter that
+    inherits no Rust thread and never consults the servicer switch again
+    (it enters ``run_headless`` directly, not ``serve_grpc``)."""
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_run_headless, args=(ns,), name="smg-headless-engine")
+    process.start()
+    return EngineProcess(process)
+
+
 def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> None:
     """SIGTERM the headless engine (it tears down its own workers), then kill."""
     if engine.poll() is not None:
@@ -228,6 +293,11 @@ def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> Non
         logger.warning("Headless engine did not exit within %.0fs; killing it", timeout)
         engine.kill()
         engine.wait()
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
 
 
 async def supervise(
@@ -270,7 +340,7 @@ async def supervise(
                 break
             try:
                 await asyncio.wait_for(stop_event.wait(), poll_secs)
-            except TimeoutError:
+            except asyncio.TimeoutError:  # noqa: UP041 -- distinct from the builtin before 3.11
                 pass
     finally:
         try:
@@ -288,16 +358,17 @@ async def supervise(
     return exit_code
 
 
-async def serve_rust(args: argparse.Namespace, engine_argv: Sequence[str] | None = None) -> int:
-    """Serve this process's gRPC contract from Rust: launch the headless engine
-    and the Rust server, then supervise both. ``args`` is the upstream
-    launcher's namespace (``--host``/``--port`` + ``AsyncEngineArgs``);
-    ``engine_argv`` defaults to this process's argv, which is what the headless
-    engine re-parses. Returns the process exit code."""
+async def serve_rust(args: argparse.Namespace) -> int:
+    """Serve this process's gRPC contract from Rust: start the Rust server,
+    launch the headless engine from the same parsed namespace, and supervise
+    both. ``args`` is the upstream launcher's namespace (``--host``/``--port``
+    plus ``AsyncEngineArgs``, and the frontend fields under ``vllm serve``).
+    Returns the process exit code."""
     from smg.servicer import VllmGrpcServer, init_servicer_tracing
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.usage.usage_lib import UsageContext
 
+    configure_logging()
     engine_args = AsyncEngineArgs.from_cli_args(args)
     vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
     info = model_info_from_config(vllm_config)
@@ -310,14 +381,14 @@ async def serve_rust(args: argparse.Namespace, engine_argv: Sequence[str] | None
     data_parallel_size = info["data_parallel_size"]
     handshake_port = _env_int(HANDSHAKE_PORT_ENV) or free_port()
     socket_dir = default_socket_dir()
-    if engine_argv is None:
-        engine_argv = sys.argv[1:]
 
-    configure_logging()
     init_servicer_tracing()
     server = VllmGrpcServer(
-        bind_address=f"{args.host}:{args.port}",
-        ipc_base_url=f"ipc://{socket_dir}/servicer-{args.port}",
+        # `vllm serve` leaves host unset and upstream binds all interfaces then.
+        bind_address=f"{getattr(args, 'host', None) or '0.0.0.0'}:{args.port}",
+        # Per process, not per requested port: `--port 0` launchers would
+        # otherwise share one path and unlink each other's sockets.
+        ipc_base_url=f"ipc://{socket_dir}/servicer-{os.getpid()}",
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=data_parallel_size,
         tokenizer_dir=tokenizer_dir,
@@ -329,17 +400,20 @@ async def serve_rust(args: argparse.Namespace, engine_argv: Sequence[str] | None
         handshake_port,
         data_parallel_size,
     )
-    command = headless_engine_command(
-        args.model,
-        strip_flags(engine_argv, LAUNCHER_FLAGS + HEADLESS_OWNED_FLAGS),
-        handshake_port=handshake_port,
-        data_parallel_size=data_parallel_size,
+    engine = launch_headless_engine(
+        headless_namespace(
+            args, handshake_port=handshake_port, data_parallel_size=data_parallel_size
+        )
     )
-    logger.info("Launching headless engine: %s", " ".join(command))
-    engine = subprocess.Popen(command)
+    logger.info("Launched the headless engine (pid %s)", engine.pid)
     return await supervise(
         server, engine, drain_secs=_env_float(DRAIN_SECS_ENV, DEFAULT_DRAIN_SECS)
     )
+
+
+# ---------------------------------------------------------------------------
+# The switch
+# ---------------------------------------------------------------------------
 
 
 def resolve_servicer_impl(
@@ -355,6 +429,62 @@ def resolve_servicer_impl(
     if value not in IMPLS:
         raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
     return value
+
+
+def require_python_impl(environ: Mapping[str, str] | None = None) -> None:
+    """Refuse to start the Python servicer when the flag asks for Rust. A
+    launcher that gets this far has no hook (or ignored it); a silent fallback
+    would report Rust coverage that never ran."""
+    impl = resolve_servicer_impl(environ=environ)
+    if impl != "python":
+        raise RuntimeError(
+            f"{SERVICER_IMPL_ENV}={impl}, but this process is starting the Python "
+            "servicer: the installed vLLM gRPC entrypoint does not consult "
+            "smg_grpc_servicer.vllm.resolve_servicer_impl. Add the hook to its "
+            "serve_grpc, or unset the flag."
+        )
+
+
+def upstream_hook_installed(vllm_root: str | None = None) -> bool:
+    """Whether the installed vLLM's gRPC entrypoint consults this package's
+    flag. Scans the launcher source without importing vLLM, so a launcher
+    (``smg serve``, the e2e harness) can refuse a Rust lane up front instead
+    of starting workers that would run Python."""
+    roots: list[str] = []
+    if vllm_root is not None:
+        roots = [vllm_root]
+    else:
+        try:
+            spec = importlib.util.find_spec("vllm")
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None:
+            roots = list(spec.submodule_search_locations or [])
+    for root in roots:
+        launcher = os.path.join(root, "entrypoints", "launchers", "grpc_server.py")
+        if os.path.isfile(launcher):
+            candidates = [launcher]
+        else:  # the launcher moved; scan the entrypoints tree
+            candidates = glob.glob(os.path.join(root, "entrypoints", "**", "*.py"), recursive=True)
+        for path in candidates:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    if HOOK_SYMBOL in handle.read():
+                        return True
+            except OSError:
+                continue
+    return False
+
+
+def require_upstream_hook() -> None:
+    """Fail a Rust lane whose vLLM would ignore the flag."""
+    if not upstream_hook_installed():
+        raise RuntimeError(
+            f"{SERVICER_IMPL_ENV}=rust needs a vLLM whose gRPC entrypoint consults "
+            "smg_grpc_servicer.vllm.resolve_servicer_impl; this installation's does not, "
+            "so its workers would silently run the Python servicer. Install a vLLM with "
+            "the hook (see grpc_servicer/README.md) or select the python implementation."
+        )
 
 
 def _env_float(name: str, default: float) -> float:

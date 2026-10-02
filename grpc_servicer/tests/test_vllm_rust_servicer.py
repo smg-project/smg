@@ -3,14 +3,17 @@
 
 Everything vLLM-shaped is lazy in the module, so these run without vLLM:
 ``serve_rust`` gets stub ``vllm`` modules, a fake Rust server class and a fake
-engine process; the lifecycle loop gets fake handles.
+engine launch; the lifecycle loop gets fake handles.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
+import os
+import subprocess
 import sys
 import types
 from types import SimpleNamespace
@@ -51,41 +54,40 @@ def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
         rust.resolve_servicer_impl(environ={"SMG_VLLM_SERVICER_IMPL": "go"})
 
 
-def test_strip_flags_handles_value_and_equals_forms():
-    argv = [
-        "--host",
-        "0.0.0.0",
-        "--port=50051",
-        "--servicer-impl",
-        "rust",
-        "--model",
-        "org/m",
-        "--max-model-len",
-        "4096",
-        "--data-parallel-size=2",
-        "--headless",
-        "--tensor-parallel-size",
-        "2",
-    ]
-    kept = rust.strip_flags(argv, rust.LAUNCHER_FLAGS + rust.HEADLESS_OWNED_FLAGS)
-    assert kept == ["--max-model-len", "4096", "--tensor-parallel-size", "2"]
+def test_python_servicer_refuses_to_start_when_the_flag_asks_for_rust():
+    rust.require_python_impl(environ={})
+    rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "python"})
+    with pytest.raises(RuntimeError, match="does not consult"):
+        rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "rust"})
 
 
-def test_headless_engine_command_pins_local_dp_and_handshake():
-    cmd = rust.headless_engine_command(
-        "org/m",
-        ["--max-model-len", "4096"],
-        handshake_port=23456,
-        data_parallel_size=2,
-        python="py",
+def test_upstream_hook_is_detected_in_the_launcher_source(tmp_path):
+    launcher = tmp_path / "vllm" / "entrypoints" / "launchers"
+    launcher.mkdir(parents=True)
+    launcher.joinpath("grpc_server.py").write_text("async def serve_grpc(args):\n    pass\n")
+    assert rust.upstream_hook_installed(vllm_root=str(tmp_path / "vllm")) is False
+    launcher.joinpath("grpc_server.py").write_text(
+        "from smg_grpc_servicer.vllm import resolve_servicer_impl, serve_rust\n"
     )
-    assert cmd[:5] == ["py", "-m", "vllm.entrypoints.cli.main", "serve", "org/m"]
-    assert "--headless" in cmd
-    assert cmd[cmd.index("--data-parallel-size") + 1] == "2"
-    assert cmd[cmd.index("--data-parallel-size-local") + 1] == "2"
-    assert cmd[cmd.index("--data-parallel-address") + 1] == "127.0.0.1"
-    assert cmd[cmd.index("--data-parallel-rpc-port") + 1] == "23456"
-    assert cmd[-2:] == ["--max-model-len", "4096"]
+    assert rust.upstream_hook_installed(vllm_root=str(tmp_path / "vllm")) is True
+    # A moved launcher is found anywhere under entrypoints/.
+    launcher.joinpath("grpc_server.py").unlink()
+    (tmp_path / "vllm" / "entrypoints" / "serve_grpc.py").write_text("resolve_servicer_impl\n")
+    assert rust.upstream_hook_installed(vllm_root=str(tmp_path / "vllm")) is True
+    assert rust.upstream_hook_installed(vllm_root=str(tmp_path / "nowhere")) is False
+
+
+def test_require_upstream_hook_names_the_fix(monkeypatch):
+    monkeypatch.setattr(rust, "upstream_hook_installed", lambda: False)
+    with pytest.raises(RuntimeError, match="resolve_servicer_impl"):
+        rust.require_upstream_hook()
+    monkeypatch.setattr(rust, "upstream_hook_installed", lambda: True)
+    rust.require_upstream_hook()
+
+
+# ---------------------------------------------------------------------------
+# Model / server info
+# ---------------------------------------------------------------------------
 
 
 def _config(**overrides):
@@ -136,6 +138,27 @@ def test_model_info_mirrors_the_python_servicer(monkeypatch):
     assert json.loads(info["default_sampling_params_json"]) == {"temperature": 0.6, "top_p": 0.95}
     assert info["data_parallel_size"] == 2
     assert info["pairing_protocol"] == "nixl"
+    # No KV connector configured: the PD identity is empty, as in Python.
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == ("", "", "")
+    assert info["block_size"] == 0 and info["model_dtype"] == ""
+
+
+def test_model_info_reports_the_pd_identity_and_pairing_facts():
+    config = _config(dtype="torch.bfloat16")
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="NixlConnector", kv_role="kv_producer", engine_id="eng-a"
+    )
+    config.cache_config = SimpleNamespace(cache_dtype="auto", block_size=16)
+    config.attention_config = SimpleNamespace(backend=SimpleNamespace(name="FLASH_ATTN"))
+    info = rust.model_info_from_config(config)
+    assert info["kv_connector"] == "NixlConnector"
+    assert info["kv_role"] == "kv_producer"
+    assert info["kv_engine_id"] == "eng-a"
+    # The same labels the Python servicer's GetServerInfo derives.
+    assert info["kv_cache_dtype"] == "auto"
+    assert info["block_size"] == 16
+    assert info["attention_backend"] == "FLASH_ATTN"
+    assert info["model_dtype"] == "torch.bfloat16"
 
 
 def test_model_info_with_scalar_eos_and_no_generation_config():
@@ -151,6 +174,132 @@ def test_model_info_with_scalar_eos_and_no_generation_config():
     assert info["eos_token_ids"] == [2]
     assert info["served_model_name"] == "org/m"
     assert info["default_sampling_params_json"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Headless engine launch
+# ---------------------------------------------------------------------------
+
+
+def _stub_frontend_args(monkeypatch):
+    @dataclasses.dataclass
+    class FrontendArgs:
+        host: str | None = None
+        port: int = 8000
+        reasoning_parser_plugin: str = ""
+        middleware: list = dataclasses.field(default_factory=list)
+
+    _install(monkeypatch, "vllm")
+    _install(monkeypatch, "vllm.entrypoints")
+    _install(monkeypatch, "vllm.entrypoints.launchers")
+    _install(monkeypatch, "vllm.entrypoints.launchers.cli_args", FrontendArgs=FrontendArgs)
+
+
+def test_headless_namespace_is_built_from_the_parsed_args_not_argv(monkeypatch):
+    """The `python -m vllm.entrypoints.grpc_server` namespace: engine args
+    stay as parsed, the frontend fields it lacks get defaults, and the
+    data-parallel group is pinned to this host and the handshake port."""
+    _stub_frontend_args(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["vllm", "serve", "org/m", "--grpc", "--port", "50051"])
+    args = argparse.Namespace(host="127.0.0.1", port=50051, model="org/m", max_model_len=4096)
+    ns = rust.headless_namespace(args, handshake_port=24321, data_parallel_size=2)
+    assert ns.model == "org/m" and ns.model_tag is None
+    assert ns.max_model_len == 4096
+    assert ns.headless is True and ns.grpc is False and ns.api_server_count == 0
+    assert ns.data_parallel_size == 2 and ns.data_parallel_size_local == 2
+    assert ns.data_parallel_address == "127.0.0.1"
+    assert ns.data_parallel_rpc_port == 24321
+    assert ns.data_parallel_start_rank is None
+    assert ns.data_parallel_hybrid_lb is False and ns.data_parallel_external_lb is False
+    # Frontend defaults filled for `run_headless`; parsed values untouched.
+    assert ns.reasoning_parser_plugin == "" and ns.middleware == []
+    assert ns.host == "127.0.0.1" and ns.port == 50051
+    # The launcher's own namespace is not mutated.
+    assert not hasattr(args, "headless")
+
+
+def test_headless_namespace_from_the_vllm_serve_grpc_form(monkeypatch):
+    """`vllm serve org/m --grpc`: the positional is already on `args.model`;
+    `--grpc` is cleared so the child never re-enters the gRPC path, and every
+    frontend field is already present."""
+    _stub_frontend_args(monkeypatch)
+    args = argparse.Namespace(
+        model_tag="org/m",
+        model="org/m",
+        grpc=True,
+        headless=False,
+        api_server_count=None,
+        host=None,
+        port=8000,
+        reasoning_parser_plugin="",
+        middleware=[],
+        tensor_parallel_size=2,
+    )
+    ns = rust.headless_namespace(args, handshake_port=24321, data_parallel_size=1)
+    assert ns.grpc is False and ns.headless is True and ns.model_tag is None
+    assert ns.model == "org/m" and ns.tensor_parallel_size == 2
+    assert ns.api_server_count == 0
+    assert ns.data_parallel_rpc_port == 24321 and ns.data_parallel_size_local == 1
+
+
+def test_engine_process_is_popen_shaped():
+    class Proc:
+        pid = 4242
+        exitcode = None
+        events: list[str] = []
+
+        def terminate(self):
+            self.events.append("terminate")
+
+        def kill(self):
+            self.events.append("kill")
+
+        def join(self, timeout=None):
+            self.events.append(f"join:{timeout}")
+
+    proc = Proc()
+    engine = rust.EngineProcess(proc)
+    assert engine.pid == 4242 and engine.poll() is None
+    with pytest.raises(subprocess.TimeoutExpired):
+        engine.wait(timeout=0.1)
+    proc.exitcode = 0
+    assert engine.wait() == 0 and engine.poll() == 0
+    engine.terminate()
+    engine.kill()
+    assert proc.events == ["join:0.1", "join:None", "terminate", "kill"]
+
+
+def test_launch_headless_engine_spawns_a_fresh_interpreter(monkeypatch):
+    recorded: dict = {}
+
+    class Process:
+        def __init__(self, target, args, name):
+            recorded["target"] = target
+            recorded["args"] = args
+            recorded["name"] = name
+            self.pid = 7
+            self.exitcode = None
+
+        def start(self):
+            recorded["started"] = True
+
+    monkeypatch.setattr(
+        rust.multiprocessing,
+        "get_context",
+        lambda method: recorded.setdefault("method", method) and SimpleNamespace(Process=Process),
+    )
+    ns = argparse.Namespace(model="org/m")
+    engine = rust.launch_headless_engine(ns)
+    assert recorded["method"] == "spawn"
+    assert recorded["target"] is rust._run_headless
+    assert recorded["args"] == (ns,)
+    assert recorded["started"] is True
+    assert engine.pid == 7
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
 
 
 class FakeServer:
@@ -172,6 +321,7 @@ class FakeServer:
 class FakeEngine:
     def __init__(self, *_args, **_kwargs):
         self.returncode = None
+        self.pid = 99
         self.events: list[str] = []
 
     def poll(self):
@@ -252,9 +402,10 @@ def test_configure_logging_gives_the_package_a_handler(monkeypatch):
 
 
 def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, tmp_path):
-    """The upstream hook hands `serve_rust` its parsed namespace: the Rust server
-    binds the launcher's host/port and dials nothing itself, the headless engine
-    gets the same engine args plus the handshake, and both are supervised."""
+    """The upstream hook hands `serve_rust` its parsed namespace: the Rust
+    server binds the launcher's host/port, the headless engine is launched
+    from that same namespace (plus the handshake), and both are supervised.
+    argv is never consulted, so the `vllm serve <model> --grpc` form works."""
     recorded: dict = {}
 
     class AsyncEngineArgs:
@@ -263,7 +414,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
             recorded["engine_args_from"] = args
             return SimpleNamespace(create_engine_config=lambda usage_context: _config())
 
-    _install(monkeypatch, "vllm")
+    _stub_frontend_args(monkeypatch)
     _install(monkeypatch, "vllm.engine.arg_utils", AsyncEngineArgs=AsyncEngineArgs)
     _install(monkeypatch, "vllm.usage.usage_lib", UsageContext=SimpleNamespace(OPENAI_API_SERVER=1))
     _install(monkeypatch, "smg")
@@ -273,15 +424,16 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
         VllmGrpcServer=FakeServer,
         init_servicer_tracing=lambda: recorded.setdefault("tracing", True),
     )
-    popen_calls: list[list[str]] = []
+    launched: list[argparse.Namespace] = []
 
-    def fake_popen(cmd, *args, **kwargs):
-        popen_calls.append(list(cmd))
+    def fake_launch(ns):
+        launched.append(ns)
         return FakeEngine()
 
-    monkeypatch.setattr(rust.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(rust, "launch_headless_engine", fake_launch)
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
     monkeypatch.setattr(rust, "free_port", lambda: 24321)
+    monkeypatch.setattr(sys, "argv", ["vllm", "serve", "org/m", "--grpc", "--port", "50051"])
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     monkeypatch.setenv("SMG_VLLM_SERVICER_DRAIN_SECS", "0")
 
@@ -291,26 +443,29 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
 
     monkeypatch.setattr(rust, "supervise", fake_supervise)
 
-    args = argparse.Namespace(host="127.0.0.1", port=50051, model="org/m")
-    argv = ["--host", "127.0.0.1", "--port", "50051", "--model", "org/m", "--max-model-len", "4096"]
-    assert asyncio.run(rust.serve_rust(args, argv)) == 0
+    args = argparse.Namespace(
+        model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096
+    )
+    assert asyncio.run(rust.serve_rust(args)) == 0
 
     server, engine, drain_secs = recorded["supervised"]
     assert isinstance(server, FakeServer) and isinstance(engine, FakeEngine)
     assert drain_secs == 0.0
     assert recorded["tracing"] is True
+    assert recorded["engine_args_from"] is args
     kwargs = server.kwargs
-    assert kwargs["bind_address"] == "127.0.0.1:50051"
-    assert kwargs["ipc_base_url"] == f"ipc://{tmp_path}/servicer-50051"
+    # `vllm serve` leaves host unset; upstream binds every interface then.
+    assert kwargs["bind_address"] == "0.0.0.0:50051"
+    assert kwargs["ipc_base_url"] == f"ipc://{tmp_path}/servicer-{os.getpid()}"
     assert kwargs["handshake_address"] == "tcp://127.0.0.1:24321"
     assert kwargs["engine_count"] == 2
     assert kwargs["tokenizer_dir"] == str(tmp_path)
     assert kwargs["served_model_name"] == "served-a"
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
+    assert kwargs["kv_connector"] == ""
 
-    (cmd,) = popen_calls
-    assert cmd[1:5] == ["-m", "vllm.entrypoints.cli.main", "serve", "org/m"]
-    assert cmd[cmd.index("--data-parallel-rpc-port") + 1] == "24321"
-    assert cmd[cmd.index("--data-parallel-size") + 1] == "2"
-    assert cmd[-2:] == ["--max-model-len", "4096"]
-    assert "--host" not in cmd and "--port" not in cmd
+    (ns,) = launched
+    assert ns.model == "org/m" and ns.model_tag is None and ns.grpc is False
+    assert ns.headless is True and ns.max_model_len == 4096
+    assert ns.data_parallel_rpc_port == 24321
+    assert ns.data_parallel_size == 2 and ns.data_parallel_size_local == 2

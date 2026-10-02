@@ -19,6 +19,7 @@ from .constants import (
     DEFAULT_HOST,
     DEFAULT_STARTUP_TIMEOUT,
     ENV_SHOW_WORKER_LOGS,
+    ENV_VLLM_SERVICER_IMPL,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
     MM_PROCESSING_WORKER,
@@ -551,9 +552,14 @@ class Worker:
         # The vLLM gRPC servicer implementation is a flag inside the smg
         # servicer package, read by upstream's entrypoint; the command stays.
         if self.engine == "vllm" and self.mode == ConnectionMode.GRPC:
-            impl = get_vllm_servicer_impl()
-            if impl == "rust":
-                env["SMG_VLLM_SERVICER_IMPL"] = impl
+            if get_vllm_servicer_impl() == "rust":
+                # A vLLM without the hook would run Python while the lane
+                # reports Rust coverage; refuse to start such a worker.
+                _require_rust_servicer_hook()
+                env["SMG_VLLM_SERVICER_IMPL"] = "rust"
+            else:
+                # The lane setting is authoritative over an inherited value.
+                env.pop("SMG_VLLM_SERVICER_IMPL", None)
 
         if (
             self.engine == "vllm"
@@ -722,6 +728,17 @@ class Worker:
             f"gRPC worker {self.model_id} on port {self.port} "
             f"did not become healthy within {timeout}s"
         )
+
+
+def _require_rust_servicer_hook() -> None:
+    """Fail the Rust lane up front when the installed vLLM cannot select it."""
+    try:
+        from smg_grpc_servicer.vllm.rust import require_upstream_hook
+    except ImportError as error:
+        raise RuntimeError(
+            f"{ENV_VLLM_SERVICER_IMPL}=rust needs the smg-grpc-servicer package"
+        ) from error
+    require_upstream_hook()
 
 
 def start_workers(

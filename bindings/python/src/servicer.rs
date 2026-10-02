@@ -62,6 +62,13 @@ impl PyVllmGrpcServer {
         default_sampling_params_json = String::new(),
         data_parallel_size = 1,
         pairing_protocol = String::new(),
+        kv_connector = String::new(),
+        kv_role = String::new(),
+        kv_engine_id = String::new(),
+        kv_cache_dtype = String::new(),
+        attention_backend = String::new(),
+        model_dtype = String::new(),
+        block_size = 0,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -86,6 +93,13 @@ impl PyVllmGrpcServer {
         default_sampling_params_json: String,
         data_parallel_size: i32,
         pairing_protocol: String,
+        kv_connector: String,
+        kv_role: String,
+        kv_engine_id: String,
+        kv_cache_dtype: String,
+        attention_backend: String,
+        model_dtype: String,
+        block_size: i32,
     ) -> PyResult<Self> {
         let model = VllmModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -103,6 +117,13 @@ impl PyVllmGrpcServer {
             default_sampling_params_json,
             data_parallel_size,
             pairing_protocol,
+            kv_connector,
+            kv_role,
+            kv_engine_id,
+            kv_cache_dtype,
+            attention_backend,
+            model_dtype,
+            block_size,
         };
         let config = VllmServicerConfig {
             bind_address,

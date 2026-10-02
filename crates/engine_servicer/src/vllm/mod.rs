@@ -9,9 +9,14 @@
 //! the decoded output with the model's tokenizer. Everything else is the ZMQ
 //! client's existing translation; the Router sees the vLLM proto either way.
 //!
+//! PD disaggregation works as on the Python servicer: connector KV-transfer
+//! params pass through to the engine and back, and `GetServerInfo` carries
+//! the connector, role, engine id and pairing facts the Router matches on.
+//!
 //! Not served yet (answered `UNIMPLEMENTED`): `Embed`, `FlushCache`,
-//! `GetTokenizer`, `SubscribeKvEvents`, and worker-side media processing.
-//! Those stay with the Python servicer until the ZMQ client grows the paths.
+//! `GetTokenizer`, `SubscribeKvEvents`, and worker-side media processing
+//! (`media_refs`). Those stay with the Python servicer until the ZMQ client
+//! grows the paths.
 
 mod engine;
 mod generate;
@@ -32,7 +37,7 @@ use std::{
 
 use engine::{connect_engine, EngineLink};
 use engine_zmq_adapter::ZmqEngineClient;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use llm_tokenizer::traits::Tokenizer;
 use requests::Registry;
 use service::VllmEngineService;
@@ -72,6 +77,20 @@ pub struct VllmModelInfo {
     pub data_parallel_size: i32,
     /// `GetServerInfo.pairing_protocol` (`SMG_PAIRING_PROTOCOL`).
     pub pairing_protocol: String,
+    /// PD disaggregation identity off `kv_transfer_config`: the connector
+    /// (`NixlConnector`, ...), this engine's role and its engine id; empty
+    /// when the engine runs without a KV connector.
+    pub kv_connector: String,
+    pub kv_role: String,
+    pub kv_engine_id: String,
+    /// PD pairing facts the Router matches before a handoff: requested KV
+    /// cache dtype and attention backend (empty when auto), and the model
+    /// dtype / block size the handshake confirms (these two are fallbacks
+    /// until it does).
+    pub kv_cache_dtype: String,
+    pub attention_backend: String,
+    pub model_dtype: String,
+    pub block_size: i32,
 }
 
 /// How to bind, where the engine dials in, and what to advertise.
@@ -256,7 +275,17 @@ impl VllmServicerServer {
                     )
                     .add_service(HealthServer::new(health))
                     .serve_with_incoming_shutdown(
-                        TcpListenerStream::new(listener),
+                        // tonic sets TCP_NODELAY only on listeners it owns; on
+                        // this one Nagle would coalesce per-token frames into
+                        // bursts whenever a connection is lightly loaded.
+                        TcpListenerStream::new(listener).map(|conn| {
+                            if let Ok(stream) = &conn {
+                                if let Err(error) = stream.set_nodelay(true) {
+                                    warn!(%error, "could not set TCP_NODELAY on an accepted connection");
+                                }
+                            }
+                            conn
+                        }),
                         shutdown.clone().map(|_| ()),
                     );
                 let forced = async move {

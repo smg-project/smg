@@ -46,6 +46,23 @@ pub(crate) fn record_error(slot: &SharedError, message: String) {
     }
 }
 
+/// Worker threads for a servicer runtime, overridable with
+/// `SMG_SERVICER_WORKER_THREADS`. The per-token work here is small (decode a
+/// batch, fan it out, encode a frame), and a runtime sized to the machine
+/// (tokio's default: one worker per hardware thread, 144 on a large host)
+/// turns every engine output batch into a cross-thread wake-up storm: at 512
+/// concurrent streams it burned about 18 cores where four threads burn under
+/// one, at the same throughput.
+const DEFAULT_WORKER_THREADS: usize = 4;
+const WORKER_THREADS_ENV: &str = "SMG_SERVICER_WORKER_THREADS";
+
+fn parse_worker_threads(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&threads| threads > 0)
+        .unwrap_or(DEFAULT_WORKER_THREADS)
+}
+
 /// A gRPC server on a dedicated runtime thread: `start` returns once the
 /// listener is bound (so the address is known and probes get a refusal, not a
 /// hang, from then on), the service future runs until `stop` or exit, and
@@ -90,6 +107,10 @@ impl ServerThread {
             .name(name.to_string())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(parse_worker_threads(
+                        std::env::var(WORKER_THREADS_ENV).ok().as_deref(),
+                    ))
+                    .thread_name("smg-servicer-rt")
                     .enable_all()
                     .build()
                 {
@@ -225,4 +246,18 @@ pub fn init_tracing(level: Option<&str>) -> Result<(), ServicerError> {
         let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod worker_threads_tests {
+    use super::{parse_worker_threads, DEFAULT_WORKER_THREADS};
+
+    #[test]
+    fn worker_threads_default_and_override() {
+        assert_eq!(parse_worker_threads(None), DEFAULT_WORKER_THREADS);
+        assert_eq!(parse_worker_threads(Some(" 8 ")), 8);
+        // Zero and garbage fall back to the default rather than panicking.
+        assert_eq!(parse_worker_threads(Some("0")), DEFAULT_WORKER_THREADS);
+        assert_eq!(parse_worker_threads(Some("many")), DEFAULT_WORKER_THREADS);
+    }
 }

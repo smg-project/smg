@@ -28,7 +28,8 @@ mod tokenspeed;
 mod vllm;
 
 pub use client::{
-    connect_for_worker, connect_with_eos, ZmqDialect, ZmqEngineClient, ZmqModelInfo, ZmqServerInfo,
+    connect_for_worker, connect_with_eos, kv_transfer_rejection_params, ZmqDialect,
+    ZmqEngineClient, ZmqModelInfo, ZmqServerInfo,
 };
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sockets::zmq_handshake_address;

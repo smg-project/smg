@@ -132,18 +132,39 @@ impl VllmGenerateStream {
     /// had reported `stop` with that string. The engine-side request is
     /// aborted when the stream is dropped, so the caller drops it next.
     pub fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse {
-        let mut pending = None;
-        let finish = Some((
+        self.complete_with_finish(
             "stop".to_string(),
             Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
                 matched,
             )),
-        ));
-        // No new tokens on a frontend stop, so `emit_tick` yields the
+        )
+    }
+
+    /// End this choice as aborted: the engine's own parked `Complete` when it
+    /// already finished, else the terminal `Complete` the Python servicer
+    /// yields after an `Abort` RPC (`finish_reason = "abort"`).
+    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
+        if let Some(parked) = self.pending.take() {
+            return parked;
+        }
+        self.complete_with_finish("abort".to_string(), None)
+    }
+
+    fn complete_with_finish(
+        &mut self,
+        finish_reason: String,
+        matched: Option<vllm::generate_complete::MatchedStop>,
+    ) -> vllm::GenerateResponse {
+        let mut pending = None;
+        // No new tokens on a frontend finish, so `emit_tick` yields the
         // `Complete` directly and parks nothing.
-        let mut response = self
-            .state
-            .emit_tick(self.index, Vec::new(), None, finish, &mut pending);
+        let mut response = self.state.emit_tick(
+            self.index,
+            Vec::new(),
+            None,
+            Some((finish_reason, matched)),
+            &mut pending,
+        );
         self.attach_input_logprobs(&mut response);
         response
     }
@@ -302,8 +323,50 @@ impl MappedGenerateStream for VllmGenerateStream {
             &mut self.pending,
         );
         self.attach_input_logprobs(&mut response);
+        attach_kv_transfer_params(&mut response, &mut self.pending, output.kv_transfer_params);
         Ok(response)
     }
+}
+
+/// Put the connector's returned KV-transfer params (a PD prefill's handoff
+/// details) on the terminal `Complete`, direct or parked behind this tick's
+/// chunk: the JSON field verbatim, plus the legacy typed mirror when they
+/// carry a valid host/port, as the Python servicer reports them.
+fn attach_kv_transfer_params(
+    response: &mut vllm::GenerateResponse,
+    pending: &mut Option<vllm::GenerateResponse>,
+    params: Option<serde_json::Value>,
+) {
+    let Some(params) = params else {
+        return;
+    };
+    let complete = match response.response.as_mut() {
+        Some(vllm::generate_response::Response::Complete(complete)) => Some(complete),
+        _ => match pending.as_mut().and_then(|parked| parked.response.as_mut()) {
+            Some(vllm::generate_response::Response::Complete(complete)) => Some(complete),
+            _ => None,
+        },
+    };
+    // vLLM sets them on the finished output only; nothing to carry otherwise.
+    let Some(complete) = complete else {
+        return;
+    };
+    complete.kv_transfer_params = params
+        .get("remote_host")
+        .and_then(serde_json::Value::as_str)
+        .filter(|host| !host.is_empty())
+        .zip(
+            params
+                .get("remote_port")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|port| (1..=65535).contains(port))
+                .and_then(|port| u32::try_from(port).ok()),
+        )
+        .map(|(remote_host, remote_port)| vllm::KvTransferParams {
+            remote_host: remote_host.to_string(),
+            remote_port,
+        });
+    complete.kv_transfer_params_json = Some(params.to_string());
 }
 
 impl Stream for VllmGenerateStream {
@@ -353,6 +416,9 @@ pub(crate) fn translate_request(
     model_dtype: ModelDtype,
     eos: &EosTokenIds,
 ) -> Result<EngineCoreRequest, String> {
+    // Connector params ride `SamplingParams.extra_args`, where vLLM's own
+    // frontend puts them, so a request carrying them always gets params.
+    let kv_transfer_params = kv_transfer_params(&req)?;
     let prompt_token_ids = match req.input {
         Some(vllm::generate_request::Input::Tokenized(tokenized)) => Some(tokenized.input_ids),
         Some(vllm::generate_request::Input::Text(_)) => {
@@ -387,23 +453,62 @@ pub(crate) fn translate_request(
     if let Some(sp) = req.sampling_params.as_ref() {
         validate_sampling(sp, sp.max_tokens.unwrap_or(default_max_tokens))?;
     }
+    let sampling_params = match (req.sampling_params, kv_transfer_params.is_some()) {
+        (None, false) => None,
+        (sp, _) => Some(translate_sampling(
+            sp.unwrap_or_default(),
+            default_max_tokens,
+            eos,
+            kv_transfer_params,
+        )),
+    };
     Ok(EngineCoreRequest {
         request_id: req.request_id,
         prompt_token_ids,
         mm_features,
-        sampling_params: req
-            .sampling_params
-            .map(|sp| translate_sampling(sp, default_max_tokens, eos)),
+        sampling_params,
         arrival_time: now_secs(),
         data_parallel_rank,
         ..EngineCoreRequest::default()
     })
 }
 
+/// Connector KV-transfer params for PD disaggregation, read as the Python
+/// servicer reads them: the JSON field verbatim (preferred), else the legacy
+/// typed host/port pair. The engine's connector interprets them; here they
+/// only have to be a JSON object.
+pub(crate) fn kv_transfer_params(
+    req: &vllm::GenerateRequest,
+) -> Result<Option<serde_json::Value>, String> {
+    if let Some(json) = req.kv_transfer_params_json.as_deref() {
+        let params: serde_json::Value = serde_json::from_str(json)
+            .map_err(|error| format!("invalid kv_transfer_params_json: {error}"))?;
+        if !params.is_object() {
+            return Err("kv_transfer_params_json must be a JSON object".to_string());
+        }
+        return Ok(Some(params));
+    }
+    if let Some(legacy) = req.kv_transfer_params.as_ref() {
+        if legacy.remote_host.is_empty() || !(1..=65535).contains(&legacy.remote_port) {
+            return Err(
+                "invalid kv_transfer_params: remote_host must be set and remote_port \
+                        must be in [1, 65535]"
+                    .to_string(),
+            );
+        }
+        return Ok(Some(serde_json::json!({
+            "remote_host": legacy.remote_host,
+            "remote_port": legacy.remote_port,
+        })));
+    }
+    Ok(None)
+}
+
 pub(crate) fn translate_sampling(
     sp: vllm::SamplingParams,
     default_max_tokens: u32,
     eos: &EosTokenIds,
+    kv_transfer_params: Option<serde_json::Value>,
 ) -> EngineCoreSamplingParams {
     // Stopping at EOS is the frontend's duty here: the primary id rides
     // `_eos_token_id`, extra ids merge into `stop_token_ids`, and the union
@@ -460,6 +565,8 @@ pub(crate) fn translate_sampling(
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,
         structured_outputs: sp.constraint.and_then(translate_constraint),
+        extra_args: kv_transfer_params
+            .map(|params| HashMap::from([("kv_transfer_params".to_string(), params)])),
         ..EngineCoreSamplingParams::default()
     }
 }
@@ -1146,6 +1253,135 @@ mod tests {
             request.sampling_params.as_ref().unwrap().prompt_logprobs,
             Some(2)
         );
+    }
+
+    #[test]
+    fn kv_transfer_params_prefer_json_then_the_legacy_pair() {
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        assert_eq!(kv_transfer_params(&req).unwrap(), None);
+
+        req.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: "10.0.0.1".to_string(),
+            remote_port: 5600,
+        });
+        assert_eq!(
+            kv_transfer_params(&req).unwrap(),
+            Some(serde_json::json!({"remote_host": "10.0.0.1", "remote_port": 5600}))
+        );
+        // The JSON field wins over the legacy pair.
+        req.kv_transfer_params_json = Some(r#"{"do_remote_decode":true}"#.to_string());
+        assert_eq!(
+            kv_transfer_params(&req).unwrap(),
+            Some(serde_json::json!({"do_remote_decode": true}))
+        );
+        // Malformed params are the caller's error, as on the Python servicer.
+        req.kv_transfer_params_json = Some("[1]".to_string());
+        assert!(kv_transfer_params(&req)
+            .unwrap_err()
+            .contains("JSON object"));
+        req.kv_transfer_params_json = Some("{".to_string());
+        assert!(kv_transfer_params(&req).unwrap_err().contains("invalid"));
+        req.kv_transfer_params_json = None;
+        req.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: String::new(),
+            remote_port: 5600,
+        });
+        assert!(kv_transfer_params(&req)
+            .unwrap_err()
+            .contains("remote_host"));
+    }
+
+    #[test]
+    fn kv_transfer_params_ride_the_sampling_extra_args() {
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        req.kv_transfer_params_json = Some(r#"{"do_remote_decode":true}"#.to_string());
+        let request = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .expect("translated");
+        let extra = request
+            .sampling_params
+            .as_ref()
+            .and_then(|sp| sp.extra_args.as_ref())
+            .expect("extra_args");
+        assert_eq!(
+            extra["kv_transfer_params"],
+            serde_json::json!({"do_remote_decode": true})
+        );
+        // A request without sampling params still carries them.
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        req.sampling_params = None;
+        req.kv_transfer_params_json = Some(r#"{"do_remote_decode":true}"#.to_string());
+        let request = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .expect("translated");
+        assert!(request
+            .sampling_params
+            .and_then(|sp| sp.extra_args)
+            .is_some_and(|extra| extra.contains_key("kv_transfer_params")));
+    }
+
+    #[test]
+    fn returned_kv_transfer_params_land_on_the_complete() {
+        let params = serde_json::json!({
+            "do_remote_prefill": true,
+            "remote_block_ids": [1, 2],
+            "remote_host": "10.0.0.1",
+            "remote_port": 5600,
+        });
+        // Direct Complete.
+        let mut response = vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Complete(
+                vllm::GenerateComplete::default(),
+            )),
+        };
+        let mut pending = None;
+        attach_kv_transfer_params(&mut response, &mut pending, Some(params.clone()));
+        let Some(vllm::generate_response::Response::Complete(complete)) = response.response else {
+            panic!("complete");
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(complete.kv_transfer_params_json.as_deref().unwrap()).unwrap();
+        assert_eq!(json, params);
+        let legacy = complete.kv_transfer_params.unwrap();
+        assert_eq!(
+            (legacy.remote_host.as_str(), legacy.remote_port),
+            ("10.0.0.1", 5600)
+        );
+
+        // Complete parked behind the finish tick's chunk.
+        let mut response = vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk::default(),
+            )),
+        };
+        let mut pending = Some(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Complete(
+                vllm::GenerateComplete::default(),
+            )),
+        });
+        attach_kv_transfer_params(
+            &mut response,
+            &mut pending,
+            Some(serde_json::json!({"remote_engine_id": "eng-a"})),
+        );
+        let Some(vllm::generate_response::Response::Complete(parked)) = pending.unwrap().response
+        else {
+            panic!("parked complete");
+        };
+        assert_eq!(
+            parked.kv_transfer_params_json.as_deref(),
+            Some(r#"{"remote_engine_id":"eng-a"}"#)
+        );
+        // No host/port: no legacy mirror.
+        assert!(parked.kv_transfer_params.is_none());
+
+        // A non-finish chunk carries nothing.
+        let mut response = vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk::default(),
+            )),
+        };
+        let mut pending = None;
+        attach_kv_transfer_params(&mut response, &mut pending, Some(params));
+        assert!(pending.is_none());
     }
 
     #[test]

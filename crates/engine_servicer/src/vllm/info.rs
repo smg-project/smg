@@ -66,18 +66,32 @@ pub(super) fn server_info(state: &State) -> vllm::GetServerInfoResponse {
         .map(|ready| i32::try_from(ready.data_parallel_size).unwrap_or(i32::MAX))
         .filter(|&size| size > 0)
         .unwrap_or_else(|| state.model.data_parallel_size.max(1));
+    let model = &state.model;
+    // Block size: the handshake's resolved figure once the engine is up, the
+    // launcher's config value before that. Model dtype: the launcher's label
+    // (`torch.bfloat16`, the spelling the Python servicer reports and PD
+    // pairing compares), the handshake's short form only as a fallback.
+    let block_size = ready
+        .map(|ready| i32::try_from(ready.block_size).unwrap_or(i32::MAX))
+        .filter(|&size| size > 0)
+        .unwrap_or(model.block_size);
+    let model_dtype = Some(model.model_dtype.clone())
+        .filter(|dtype| !dtype.is_empty())
+        .or_else(|| ready.map(|ready| ready.dtype.as_str().to_string()))
+        .unwrap_or_default();
     vllm::GetServerInfoResponse {
         active_requests: state.active_requests(),
         uptime_seconds: state.started.elapsed().as_secs_f64(),
         server_type: SERVER_TYPE.to_string(),
         data_parallel_size,
-        pairing_protocol: state.model.pairing_protocol.clone(),
-        block_size: ready
-            .map(|ready| i32::try_from(ready.block_size).unwrap_or(i32::MAX))
-            .unwrap_or_default(),
-        model_dtype: ready
-            .map(|ready| ready.dtype.as_str().to_string())
-            .unwrap_or_default(),
+        kv_connector: model.kv_connector.clone(),
+        kv_role: model.kv_role.clone(),
+        kv_engine_id: model.kv_engine_id.clone(),
+        kv_cache_dtype: model.kv_cache_dtype.clone(),
+        attention_backend: model.attention_backend.clone(),
+        pairing_protocol: model.pairing_protocol.clone(),
+        block_size,
+        model_dtype,
         ..Default::default()
     }
 }
@@ -95,7 +109,8 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
         .map(|tokens| i32::try_from(tokens).unwrap_or(i32::MAX))
         .unwrap_or_default();
     let snapshot = client.get_loads();
-    let loads = snapshot
+    let mut dp_rank_count = snapshot.dp_rank_count;
+    let mut loads: Vec<vllm::SchedulerLoad> = snapshot
         .loads
         .into_iter()
         .map(|load| vllm::SchedulerLoad {
@@ -109,10 +124,34 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
             ..Default::default()
         })
         .collect();
+    if loads.is_empty() {
+        // No output batch has carried a snapshot yet. The Python servicer
+        // reports a zero-filled entry per rank, and the Router reads an
+        // empty list as no report at all.
+        let ranks = ready
+            .and_then(|ready| usize::try_from(ready.data_parallel_size).ok())
+            .filter(|&ranks| ranks > 0)
+            .or_else(|| usize::try_from(state.model.data_parallel_size).ok())
+            .unwrap_or(1)
+            .max(1);
+        loads = (0..ranks)
+            .map(|rank| vllm::SchedulerLoad {
+                dp_rank: i32::try_from(rank).unwrap_or(i32::MAX),
+                max_running_requests,
+                max_total_num_tokens,
+                ..Default::default()
+            })
+            .collect();
+        dp_rank_count = loads.len().try_into().unwrap_or_default();
+    }
     Ok(vllm::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
-        version: "1".to_string(),
-        dp_rank_count: snapshot.dp_rank_count,
+        // The engine's version, as the Python servicer reports vLLM's.
+        version: ready
+            .map(|ready| ready.vllm_version.clone())
+            .filter(|version| !version.is_empty())
+            .unwrap_or_else(|| "1".to_string()),
+        dp_rank_count,
         loads,
     })
 }

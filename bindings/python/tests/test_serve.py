@@ -782,14 +782,19 @@ class TestVllmWorkerLauncher:
         assert env["SMG_VLLM_SERVICER_IMPL"] == "rust"
         assert env["CUDA_VISIBLE_DEVICES"] == "3"
 
-    def test_python_servicer_leaves_the_worker_env_alone(self):
+    def test_python_servicer_clears_an_inherited_rust_flag(self):
+        """The CLI flag is authoritative: a `SMG_VLLM_SERVICER_IMPL=rust`
+        exported in the operator's shell must not survive `--servicer-impl
+        python` (the default) into the worker's environment."""
         launcher = VllmWorkerLauncher()
         for connection_mode, impl in [("grpc", "python"), ("http", "rust")]:
             args = argparse.Namespace(
                 model="/tmp/model", connection_mode=connection_mode, servicer_impl=impl
             )
-            env = launcher.gpu_env(args, 0, {"CUDA_VISIBLE_DEVICES": "0"})
+            inherited = {"CUDA_VISIBLE_DEVICES": "0", "SMG_VLLM_SERVICER_IMPL": "rust"}
+            env = launcher.gpu_env(args, 0, inherited)
             assert "SMG_VLLM_SERVICER_IMPL" not in env
+            assert env["CUDA_VISIBLE_DEVICES"] == "0"
 
     def test_build_zmq_command_defaults_to_single_engine(self):
         launcher = VllmWorkerLauncher()

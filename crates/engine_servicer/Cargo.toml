@@ -23,6 +23,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 portpicker = "0.1"
 tempfile = "3"

@@ -2221,6 +2221,7 @@ dependencies = [
  "llm-tokenizer",
  "openai-protocol",
  "portpicker",
+ "serde_json",
  "smg-grpc-client",
  "tempfile",
  "thiserror 2.0.20",

@@ -275,6 +275,9 @@ class VllmWorkerLauncher(WorkerLauncher):
             and getattr(args, "servicer_impl", "python") == "rust"
         ):
             env["SMG_VLLM_SERVICER_IMPL"] = "rust"
+        else:
+            # The flag is authoritative: an inherited value must not outlive it.
+            env.pop("SMG_VLLM_SERVICER_IMPL", None)
         return env
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
@@ -829,6 +832,18 @@ def _import_backend_args(backend: str, parser: argparse.ArgumentParser) -> None:
     BACKEND_ARG_ADDERS[backend](parser)
 
 
+def _require_rust_servicer_hook() -> None:
+    """Fail fast when the installed vLLM cannot select the Rust servicer."""
+    try:
+        from smg_grpc_servicer.vllm.rust import require_upstream_hook
+    except ImportError as error:
+        raise RuntimeError(
+            "servicer-impl rust needs the smg-grpc-servicer package importable by this "
+            "interpreter (it carries the Rust request path)"
+        ) from error
+    require_upstream_hook()
+
+
 def parse_serve_args(
     argv: list[str] | None = None,
 ) -> tuple[str, argparse.Namespace, list[str]]:
@@ -862,13 +877,18 @@ def parse_serve_args(
             "connection-mode zmq is only supported for the vllm and tokenspeed "
             f"backends, not {backend}"
         )
-    if getattr(serve_router_args, "servicer_impl", "python") == "rust" and (
-        backend != "vllm" or serve_router_args.connection_mode != "grpc"
-    ):
-        pre_parser.error(
-            "servicer-impl rust is only available for --backend vllm with "
-            f"--connection-mode grpc, not {backend}/{serve_router_args.connection_mode}"
-        )
+    if getattr(serve_router_args, "servicer_impl", "python") == "rust":
+        if backend != "vllm" or serve_router_args.connection_mode != "grpc":
+            pre_parser.error(
+                "servicer-impl rust is only available for --backend vllm with "
+                f"--connection-mode grpc, not {backend}/{serve_router_args.connection_mode}"
+            )
+        # The flag is read by upstream vLLM's gRPC entrypoint; a vLLM without
+        # the hook would start Python workers while reporting Rust ones.
+        try:
+            _require_rust_servicer_hook()
+        except RuntimeError as error:
+            pre_parser.error(str(error))
 
     # Pass 2: full parser with backend-specific args; resolve so backend can override
     parser = argparse.ArgumentParser(

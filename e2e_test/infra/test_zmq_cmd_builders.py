@@ -75,7 +75,13 @@ def test_rust_servicer_impl_is_a_worker_env_flag(monkeypatch):
     """``E2E_VLLM_SERVICER_IMPL=rust`` keeps upstream's gRPC entrypoint as the
     worker command and selects the Rust path through the servicer package's
     flag in the worker environment, so every test case runs unchanged."""
+    import infra.worker as worker_module
     from infra.constants import ENV_VLLM_SERVICER_IMPL
+
+    hook_checks: list[bool] = []
+    monkeypatch.setattr(
+        worker_module, "_require_rust_servicer_hook", lambda: hook_checks.append(True)
+    )
 
     w = Worker(
         model_id=_VLLM_MODEL,
@@ -97,7 +103,31 @@ def test_rust_servicer_impl_is_a_worker_env_flag(monkeypatch):
     assert "--impl" not in cmd
     assert cmd[cmd.index("--max-model-len") + 1] == "2048"
     assert w._build_env()["SMG_VLLM_SERVICER_IMPL"] == "rust"
+    # The Rust lane is only built once the installed vLLM is known to carry
+    # the hook; without it the workers would silently run Python.
+    assert hook_checks == [True]
+
+    # The lane setting wins over a flag inherited from the operator's shell.
+    monkeypatch.delenv(ENV_VLLM_SERVICER_IMPL, raising=False)
+    monkeypatch.setenv("SMG_VLLM_SERVICER_IMPL", "rust")
+    assert "SMG_VLLM_SERVICER_IMPL" not in w._build_env()
 
     monkeypatch.setenv(ENV_VLLM_SERVICER_IMPL, "go")
     with pytest.raises(ValueError, match=ENV_VLLM_SERVICER_IMPL):
+        w._build_env()
+
+
+def test_rust_lane_refuses_a_vllm_without_the_hook(monkeypatch):
+    import infra.worker as worker_module
+    from infra.constants import ENV_VLLM_SERVICER_IMPL
+
+    def no_hook():
+        raise RuntimeError("no hook")
+
+    monkeypatch.setattr(worker_module, "_require_rust_servicer_hook", no_hook)
+    monkeypatch.setenv(ENV_VLLM_SERVICER_IMPL, "rust")
+    w = Worker(
+        model_id=_VLLM_MODEL, engine="vllm", port=50111, gpu_ids=[0], mode=ConnectionMode.GRPC
+    )
+    with pytest.raises(RuntimeError, match="no hook"):
         w._build_env()

@@ -551,8 +551,12 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         })
         .await
         .expect("abort");
-    let status = stream.message().await.expect_err("stream is cancelled");
-    assert_eq!(status.code(), Code::Cancelled);
+    // Ends as on the Python servicer: a terminal `abort` Complete with the
+    // output so far, then the stream closes; the engine side is aborted.
+    let aborted = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(aborted.finish_reason, "abort");
+    assert_eq!(aborted.output_ids, vec![10]);
+    assert!(stream.message().await.unwrap().is_none());
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r4".to_string()]);
     // An unknown id is a no-op, not an error (idempotent cleanup).
     h.client
@@ -561,6 +565,104 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         })
         .await
         .expect("abort of unknown ids");
+}
+
+/// PD disaggregation rides through as on the Python servicer: the request's
+/// connector params reach the engine's sampling params, and the finished
+/// output's params come back on the `Complete` (JSON plus the legacy mirror).
+#[tokio::test]
+async fn kv_transfer_params_pass_through_both_ways() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("pd1", false, Vec::new());
+    request.kv_transfer_params_json = Some(r#"{"do_remote_decode":true}"#.to_string());
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    let extra = engine_request
+        .sampling_params
+        .as_ref()
+        .and_then(|sp| sp.extra_args.as_ref())
+        .expect("extra_args carry the connector params");
+    assert_eq!(
+        extra.get("kv_transfer_params"),
+        Some(&serde_json::json!({"do_remote_decode": true}))
+    );
+
+    let mut outputs = batch("pd1", vec![7], Some(EngineCoreFinishReason::Length), None);
+    if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+        batch.outputs[0].kv_transfer_params = Some(serde_json::json!({
+            "do_remote_prefill": true,
+            "remote_block_ids": [1, 2],
+            "remote_engine_id": "eng-a",
+            "remote_host": "10.0.0.1",
+            "remote_port": 5600,
+        }));
+    }
+    h.engine_out.send_outputs(&outputs).await.unwrap();
+    let finished = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(finished.finish_reason, "length");
+    let returned: serde_json::Value = serde_json::from_str(
+        finished
+            .kv_transfer_params_json
+            .as_deref()
+            .expect("json params"),
+    )
+    .unwrap();
+    assert_eq!(returned["remote_engine_id"], "eng-a");
+    assert_eq!(returned["remote_block_ids"], serde_json::json!([1, 2]));
+    let legacy = finished.kv_transfer_params.expect("legacy mirror");
+    assert_eq!(legacy.remote_host, "10.0.0.1");
+    assert_eq!(legacy.remote_port, 5600);
+    assert!(stream.message().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A PD decode leg refused before admission (here: string stops with no
+/// tokenizer) still tells the engine, so the connector releases the blocks
+/// the prefill side pinned: vLLM's immediately aborted one-token request.
+#[tokio::test]
+async fn a_refused_decode_leg_notifies_the_engine() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("pd2", false, vec!["STOP".to_string()]);
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    let notice = recv_add(&mut h.engine_in).await;
+    assert_eq!(notice.request_id, "pd2");
+    assert!(notice.abort_immediately);
+    assert_eq!(notice.prompt_token_ids.as_deref(), Some(&[0][..]));
+    let params = notice.sampling_params.expect("sampling params");
+    assert_eq!(params.max_tokens, 1);
+    assert_eq!(
+        params.extra_args.expect("extra_args")["kv_transfer_params"]["remote_block_ids"],
+        serde_json::json!([3])
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// What the adapter would silently drop is refused up front.
+#[tokio::test]
+async fn media_refs_and_extra_batches_are_refused_not_dropped() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("mm1", false, Vec::new());
+    request.media_refs = Some(vllm::MediaRefs {
+        items: vec![vllm::MediaRef {
+            modality: common::Modality::Image as i32,
+            url: "https://example.com/x.png".to_string(),
+        }],
+    });
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::Unimplemented);
+    let mut request = generate_request("mm2", false, Vec::new());
+    request.extra_mm_inputs = vec![vllm::MultimodalInputs::default()];
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::Unimplemented);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// The request id is the Router's cancellation handle, so a live duplicate
@@ -589,7 +691,13 @@ async fn duplicate_in_flight_request_ids_are_refused() {
 /// shape the Router's discovery step reads off the Python servicer.
 #[tokio::test]
 async fn info_rpcs_report_config_and_handshake_facts() {
-    let mut h = harness(model_info(), None).await;
+    let mut model = model_info();
+    model.kv_connector = "NixlConnector".to_string();
+    model.kv_role = "kv_producer".to_string();
+    model.kv_engine_id = "eng-a".to_string();
+    model.kv_cache_dtype = "auto".to_string();
+    model.model_dtype = "torch.bfloat16".to_string();
+    let mut h = harness(model, None).await;
     let info = h
         .client
         .get_model_info(vllm::GetModelInfoRequest::default())
@@ -616,8 +724,31 @@ async fn info_rpcs_report_config_and_handshake_facts() {
     assert_eq!(server.server_type, SERVER_TYPE);
     assert_eq!(server.data_parallel_size, 1);
     assert_eq!(server.block_size, i32::try_from(ready.block_size).unwrap());
-    assert_eq!(server.model_dtype, ready.dtype.as_str());
+    // The launcher's dtype label wins (the spelling PD pairing compares).
+    assert_eq!(server.model_dtype, "torch.bfloat16");
     assert_eq!(server.active_requests, 0);
+    // PD identity and pairing facts, off the launcher's config.
+    assert_eq!(server.kv_connector, "NixlConnector");
+    assert_eq!(server.kv_role, "kv_producer");
+    assert_eq!(server.kv_engine_id, "eng-a");
+    assert_eq!(server.kv_cache_dtype, "auto");
+
+    // Before any output batch, loads are zero-filled per rank (the Router
+    // reads an empty list as no report), stamped with the engine's version.
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 1);
+    assert_eq!(loads.loads.len(), 1);
+    assert_eq!(loads.loads[0].num_running_reqs, 0);
+    assert_eq!(
+        loads.loads[0].max_running_requests,
+        i32::try_from(ready.max_num_seqs).unwrap()
+    );
+    assert_eq!(loads.version, ready.vllm_version);
 
     for status in [
         h.client

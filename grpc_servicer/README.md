@@ -151,12 +151,21 @@ if resolve_servicer_impl(args) == "rust":
 ```
 
 `smg serve --backend vllm --connection-mode grpc --servicer-impl rust` sets
-the flag in each worker's environment. Rust mode needs the `smg` wheel (for
-the binding) and serves text generation; `Embed`, `FlushCache`,
-`GetTokenizer`, `SubscribeKvEvents` and worker-side media processing answer
-UNIMPLEMENTED there, so keep the Python implementation for those. Tuning:
-`SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
-`SMG_VLLM_SERVICER_DRAIN_SECS` (default 5), `SMG_ZMQ_SOCKET_DIR`.
+the flag in each worker's environment, after checking that the installed
+vLLM carries the hook (`smg_grpc_servicer.vllm.rust.upstream_hook_installed`);
+the Python servicer itself refuses to start when the flag asks for Rust, so a
+vLLM without the hook fails loudly instead of silently running Python. The
+headless engine is launched from the parsed namespace through vLLM's own
+`run_headless`, so both entrypoints above work unchanged.
+
+Rust mode needs the `smg` wheel (for the binding) and serves text generation,
+including PD disaggregation (`--kv-transfer-config`: connector params pass
+through both ways and `GetServerInfo` carries the pairing identity). `Embed`,
+`FlushCache`, `GetTokenizer`, `SubscribeKvEvents` and worker-side media
+processing (`media_refs`) answer UNIMPLEMENTED there, so keep the Python
+implementation for those. Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT`
+(default: a free port), `SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
+`SMG_ZMQ_SOCKET_DIR`.
 
 ### MLX
 
