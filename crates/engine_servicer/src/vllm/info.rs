@@ -92,6 +92,7 @@ pub(super) fn server_info(state: &State) -> vllm::GetServerInfoResponse {
         pairing_protocol: model.pairing_protocol.clone(),
         block_size,
         model_dtype,
+        shm_namespace_id: model.shm_namespace_id.clone(),
         ..Default::default()
     }
 }

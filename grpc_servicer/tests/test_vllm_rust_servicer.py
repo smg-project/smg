@@ -141,6 +141,10 @@ def test_model_info_mirrors_the_python_servicer(monkeypatch):
     # No KV connector configured: the PD identity is empty, as in Python.
     assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == ("", "", "")
     assert info["block_size"] == 0 and info["model_dtype"] == ""
+    # No KV-event publisher configured, backend unset, and the host's shm id.
+    assert info["kv_events_endpoint"] == "" and info["kv_events_topic"] == ""
+    assert info["structured_outputs_backend"] == "auto"
+    assert isinstance(info["shm_namespace_id"], str)
 
 
 def test_model_info_reports_the_pd_identity_and_pairing_facts():
@@ -159,6 +163,29 @@ def test_model_info_reports_the_pd_identity_and_pairing_facts():
     assert info["block_size"] == 16
     assert info["attention_backend"] == "FLASH_ATTN"
     assert info["model_dtype"] == "torch.bfloat16"
+
+
+def test_model_info_reports_kv_events_and_the_structured_backend():
+    config = _config()
+    config.structured_outputs_config = SimpleNamespace(backend="xgrammar")
+    config.kv_events_config = SimpleNamespace(
+        enable_kv_cache_events=True,
+        publisher="zmq",
+        endpoint="tcp://*:5557",
+        replay_endpoint="tcp://*:5558",
+        topic="kv",
+    )
+    info = rust.model_info_from_config(config)
+    assert info["structured_outputs_backend"] == "xgrammar"
+    assert info["kv_events_endpoint"] == "tcp://*:5557"
+    assert info["kv_events_replay_endpoint"] == "tcp://*:5558"
+    assert info["kv_events_topic"] == "kv"
+    # A non-ZMQ publisher (or disabled events) leaves the relay off.
+    config.kv_events_config.publisher = "null"
+    assert rust.model_info_from_config(config)["kv_events_endpoint"] == ""
+    config.kv_events_config.publisher = "zmq"
+    config.kv_events_config.enable_kv_cache_events = False
+    assert rust.model_info_from_config(config)["kv_events_endpoint"] == ""
 
 
 def test_model_info_with_scalar_eos_and_no_generation_config():

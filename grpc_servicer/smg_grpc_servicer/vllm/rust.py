@@ -42,6 +42,7 @@ import subprocess
 from collections.abc import Mapping
 from typing import Any
 
+from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.vllm.kv_transfer import pairing_fields, resolve_pd_connector
 
@@ -119,6 +120,16 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         kv_connector, kv_engine_id = resolve_pd_connector(kv_config)
         kv_role = getattr(kv_config, "kv_role", None) or ""
     pairing = pairing_fields(vllm_config)
+    # KV-event publishing, as the Python servicer resolves it: only vLLM's ZMQ
+    # publisher can be relayed; anything else leaves SubscribeKvEvents off.
+    kv_events = getattr(vllm_config, "kv_events_config", None)
+    kv_events_enabled = (
+        kv_events is not None
+        and bool(getattr(kv_events, "enable_kv_cache_events", False))
+        and getattr(kv_events, "publisher", None) == "zmq"
+    )
+    structured = getattr(vllm_config, "structured_outputs_config", None)
+    structured_backend = getattr(structured, "backend", None) if structured is not None else None
     return {
         "model_path": str(model_config.model),
         "served_model_name": str(served),
@@ -143,6 +154,15 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         "attention_backend": str(pairing.get("attention_backend", "")),
         "model_dtype": str(pairing.get("model_dtype", "")),
         "block_size": int(pairing.get("block_size", 0)),
+        "structured_outputs_backend": str(structured_backend or "auto"),
+        "kv_events_endpoint": str(getattr(kv_events, "endpoint", "") or "")
+        if kv_events_enabled
+        else "",
+        "kv_events_replay_endpoint": (
+            str(getattr(kv_events, "replay_endpoint", "") or "") if kv_events_enabled else ""
+        ),
+        "kv_events_topic": str(getattr(kv_events, "topic", "") or "") if kv_events_enabled else "",
+        "shm_namespace_id": mm_shm.shm_namespace_id(),
     }
 
 

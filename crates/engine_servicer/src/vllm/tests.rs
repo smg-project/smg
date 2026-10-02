@@ -697,6 +697,7 @@ async fn info_rpcs_report_config_and_handshake_facts() {
     model.kv_engine_id = "eng-a".to_string();
     model.kv_cache_dtype = "auto".to_string();
     model.model_dtype = "torch.bfloat16".to_string();
+    model.shm_namespace_id = "boot:42".to_string();
     let mut h = harness(model, None).await;
     let info = h
         .client
@@ -732,6 +733,7 @@ async fn info_rpcs_report_config_and_handshake_facts() {
     assert_eq!(server.kv_role, "kv_producer");
     assert_eq!(server.kv_engine_id, "eng-a");
     assert_eq!(server.kv_cache_dtype, "auto");
+    assert_eq!(server.shm_namespace_id, "boot:42");
 
     // Before any output batch, loads are zero-filled per rank (the Router
     // reads an empty list as no report), stamped with the engine's version.

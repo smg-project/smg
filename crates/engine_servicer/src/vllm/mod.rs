@@ -91,6 +91,20 @@ pub struct VllmModelInfo {
     pub attention_backend: String,
     pub model_dtype: String,
     pub block_size: i32,
+    /// `--structured-outputs-config.backend` ("auto" when unset): the
+    /// grammar backend the engine's structured-output manager must use.
+    pub structured_outputs_backend: String,
+    /// vLLM's KV-event publisher (`--kv-events-config`, ZMQ publisher only):
+    /// the PUB endpoint, the optional replay endpoint, and the topic. Empty
+    /// endpoint means events are not enabled and `SubscribeKvEvents` is
+    /// UNIMPLEMENTED.
+    pub kv_events_endpoint: String,
+    pub kv_events_replay_endpoint: String,
+    pub kv_events_topic: String,
+    /// This host's `/dev/shm` identity (`<boot_id>:<st_dev>`), advertised so
+    /// the Router can verify a shared `/dev/shm` before using the SHM tensor
+    /// transport under `auto`; empty when unknown.
+    pub shm_namespace_id: String,
 }
 
 /// How to bind, where the engine dials in, and what to advertise.
@@ -114,6 +128,13 @@ pub struct VllmServicerConfig {
 
 pub(super) struct State {
     pub(super) model: VllmModelInfo,
+    /// The local tokenizer directory the servicer loaded (`GetTokenizer`
+    /// bundles it); `None` when none resolved.
+    #[expect(
+        dead_code,
+        reason = "read by GetTokenizer, which lands with the tokenizer bundle"
+    )]
+    pub(super) tokenizer_dir: Option<String>,
     pub(super) engine: EngineLink,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused, EOS still comes from config).
@@ -216,6 +237,7 @@ impl VllmServicerServer {
             return Err(invalid("model_path must not be empty"));
         }
         let state = Arc::new(State {
+            tokenizer_dir: config.tokenizer_dir.clone(),
             model: config.model,
             engine: EngineLink::default(),
             tokenizer: OnceLock::new(),

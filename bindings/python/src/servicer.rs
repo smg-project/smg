@@ -69,6 +69,11 @@ impl PyVllmGrpcServer {
         attention_backend = String::new(),
         model_dtype = String::new(),
         block_size = 0,
+        structured_outputs_backend = String::new(),
+        kv_events_endpoint = String::new(),
+        kv_events_replay_endpoint = String::new(),
+        kv_events_topic = String::new(),
+        shm_namespace_id = String::new(),
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -100,6 +105,11 @@ impl PyVllmGrpcServer {
         attention_backend: String,
         model_dtype: String,
         block_size: i32,
+        structured_outputs_backend: String,
+        kv_events_endpoint: String,
+        kv_events_replay_endpoint: String,
+        kv_events_topic: String,
+        shm_namespace_id: String,
     ) -> PyResult<Self> {
         let model = VllmModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -124,6 +134,11 @@ impl PyVllmGrpcServer {
             attention_backend,
             model_dtype,
             block_size,
+            structured_outputs_backend,
+            kv_events_endpoint,
+            kv_events_replay_endpoint,
+            kv_events_topic,
+            shm_namespace_id,
         };
         let config = VllmServicerConfig {
             bind_address,
