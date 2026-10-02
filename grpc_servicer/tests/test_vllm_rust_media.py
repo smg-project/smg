@@ -129,6 +129,7 @@ def test_submit_relays_what_the_input_processor_produced(loop):
 
 
 def test_a_pd_prefill_leg_gets_the_media_identity(loop):
+    pytest.importorskip("torch")  # the identity module builds grid tensors with it
     kind, payload = submit(bridge(loop), want_identity=True)
     assert kind == "ok"
     identity = vllm_engine_pb2.MediaIdentity.FromString(payload[4])

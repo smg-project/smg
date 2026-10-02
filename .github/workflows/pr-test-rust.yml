@@ -258,10 +258,12 @@ jobs:
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
           cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
           # msgspec and pydantic gate the sidecar-protocol, fake-redis and
-          # limit-options tests. Modules gated on zmq or vllm still skip here
-          # (-rs lists them): the zmq ones import engine servicers that need
-          # torch, and the vllm cases run on the vLLM e2e lane.
-          pip install ./crates/grpc_client/python msgspec pydantic
+          # limit-options tests; numpy gates the Rust servicer's media bridge
+          # tests (it lends tensor buffers as numpy views). Modules gated on
+          # zmq or vllm still skip here (-rs lists them): the zmq ones import
+          # engine servicers that need torch, and the vllm cases run on the
+          # vLLM e2e lane.
+          pip install ./crates/grpc_client/python msgspec pydantic numpy
           pytest -q grpc_servicer/tests -rs
 
       - name: Run CI tooling unit tests

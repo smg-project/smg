@@ -26,8 +26,6 @@ from typing import Any
 
 import grpc
 
-from smg_grpc_servicer.vllm.errors import grpc_code_for
-from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import MediaRefItem, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
     MODE_INPROCESS,
@@ -61,6 +59,21 @@ def lend_buffer(buffer: Any) -> Any:
     view = np.ascontiguousarray(np.frombuffer(buffer, dtype=np.uint8))
     view.setflags(write=False)
     return view
+
+
+def _grpc_code_for(exc: BaseException) -> grpc.StatusCode:
+    """The Python servicer's exception-to-status mapping, which needs vLLM's
+    exception types; without vLLM installed (the launcher's engine-free
+    tests) a `ValueError` is the caller's and anything else is internal."""
+    try:
+        from smg_grpc_servicer.vllm.errors import grpc_code_for
+    except ImportError:
+        return (
+            grpc.StatusCode.INVALID_ARGUMENT
+            if isinstance(exc, ValueError)
+            else grpc.StatusCode.INTERNAL
+        )
+    return grpc_code_for(exc)
 
 
 class _EngineView:
@@ -243,6 +256,13 @@ class RustMediaBridge:
         """The PD prefill leg's media identity, serialized; an optimisation
         with a fallback (the decode leg reprocesses), so a shape it cannot
         read must not fail a served request."""
+        # Imported here: the identity module needs torch, and this module
+        # must import on the launcher's engine-free path.
+        from smg_grpc_servicer.vllm.media_identity import (
+            build_media_identity,
+            media_identity_supported,
+        )
+
         if not media_identity_supported():
             logger.warning(
                 "Request %s: the installed smg-grpc-proto has no media_identity; "
@@ -273,7 +293,7 @@ class RustMediaBridge:
             logger.warning("Media processing unavailable for request %s: %s", request_id, e)
             done(KIND_UNAVAILABLE, str(e))
         except Exception as e:  # noqa: BLE001 - every failure must reach the caller
-            code = grpc_code_for(e)
+            code = _grpc_code_for(e)
             if code is grpc.StatusCode.INTERNAL:
                 logger.exception("Media processing failed for request %s", request_id)
                 done(KIND_INTERNAL, str(e))
