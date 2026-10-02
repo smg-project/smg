@@ -8,7 +8,6 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 import asyncio
 import hashlib
 import itertools
-import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from datetime import datetime, timezone
@@ -37,7 +36,6 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
-from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
@@ -48,10 +46,8 @@ from smg_grpc_servicer.vllm.kv_events import (
     stream_kv_events,
 )
 from smg_grpc_servicer.vllm.kv_transfer import (
-    pairing_fields,
     params_from_request,
     params_to_response_fields,
-    resolve_pd_connector,
 )
 from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
@@ -68,8 +64,8 @@ from smg_grpc_servicer.vllm.mm_salt import (
     mm_identity_cache_salt,
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
+from smg_grpc_servicer.vllm.model_info import model_facts, server_facts
 
-from ..pd_pairing import pairing_protocol_from_env
 from .mm_keys import (
     batches_missing_pixels,
     describes_media_twice,
@@ -82,25 +78,6 @@ from .mm_keys import (
 
 logger = init_logger(__name__)
 attach_vllm_logging()
-SAMPLING_DEFAULT_KEYS = (
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "repetition_penalty",
-)
-
-
-def _filtered_sampling_defaults(params: dict | None) -> dict:
-    if not params:
-        return {}
-    return {
-        key: params[key]
-        for key in SAMPLING_DEFAULT_KEYS
-        if key in params and params[key] is not None
-    }
-
-
 try:
     from vllm.version import __version__ as VLLM_VERSION
 except Exception:  # pragma: no cover - version lookup is best-effort
@@ -654,39 +631,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetModelInfoResponse protobuf
         """
-        model_config = self.engine.model_config
-        hf_config = model_config.hf_config
-
-        # eos_token_id can be int or list[int]
-        eos = getattr(hf_config, "eos_token_id", None)
-        if isinstance(eos, int):
-            eos_token_ids = [eos]
-        elif isinstance(eos, list):
-            eos_token_ids = eos
-        else:
-            eos_token_ids = []
-
-        sampling_defaults = _filtered_sampling_defaults(
-            model_config.get_diff_sampling_param() or {}
-        )
-
+        facts = model_facts(self.engine.model_config)
         return vllm_engine_pb2.GetModelInfoResponse(
-            model_path=model_config.model,
-            is_generation=model_config.runner_type == "generate",
-            max_context_length=model_config.max_model_len,
-            vocab_size=model_config.get_vocab_size(),
-            supports_vision=engine_accepts_mm_inputs(model_config),
-            served_model_name=model_config.served_model_name or model_config.model,
-            tokenizer_path=model_config.tokenizer or "",
-            model_type=getattr(hf_config, "model_type", "") or "",
-            architectures=model_config.architectures or [],
-            eos_token_ids=eos_token_ids,
-            pad_token_id=getattr(hf_config, "pad_token_id", None) or 0,
-            bos_token_id=getattr(hf_config, "bos_token_id", None) or 0,
-            max_req_input_len=model_config.max_model_len,
-            default_sampling_params_json=(
-                json.dumps(sampling_defaults, separators=(",", ":")) if sampling_defaults else ""
-            ),
+            max_req_input_len=facts["max_context_length"], **facts
         )
 
     async def GetServerInfo(
@@ -704,17 +651,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetServerInfoResponse protobuf
         """
-        kv_connector = ""
-        kv_role = ""
-        kv_engine_id = ""
-        parallel = self.engine.vllm_config.parallel_config
-        kv_transfer_config = self.engine.vllm_config.kv_transfer_config
-        if kv_transfer_config is not None:
-            kv_connector, kv_engine_id = resolve_pd_connector(kv_transfer_config)
-            kv_role = kv_transfer_config.kv_role or ""
-            # Effective PD engine_id; with DP the engine cores serve
-            # `{id}_dp{rank}` and the router derives the suffix from the rank it
-            # pins per request.
+        facts = server_facts(self.engine.vllm_config)
+        # Effective PD engine_id; with DP the engine cores serve
+        # `{id}_dp{rank}` and the router derives the suffix from the rank it
+        # pins per request.
 
         mm_processor = ""
         mm_media_ref_schemes = ""
@@ -730,15 +670,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             mm_media_ref_schemes = self._mm_processor.schemes
 
         info = vllm_engine_pb2.GetServerInfoResponse(
-            kv_connector=kv_connector,
-            kv_role=kv_role,
-            kv_engine_id=kv_engine_id,
-            data_parallel_size=parallel.data_parallel_size,
-            shm_namespace_id=mm_shm.shm_namespace_id(),
             mm_processor=mm_processor,
             mm_media_ref_schemes=mm_media_ref_schemes,
-            pairing_protocol=pairing_protocol_from_env(),
-            **pairing_fields(self.engine.vllm_config),
+            **facts,
         )
         # Where the processor mode came from, for the gateway's /workers; a
         # proto package predating the field simply leaves it out.

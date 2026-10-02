@@ -34,7 +34,6 @@ import asyncio
 import dataclasses
 import glob
 import importlib.util
-import json
 import logging
 import multiprocessing
 import os
@@ -44,10 +43,11 @@ import subprocess
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
-from smg_grpc_servicer import mm_shm
-from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
-from smg_grpc_servicer.vllm.kv_transfer import pairing_fields, resolve_pd_connector
-from smg_grpc_servicer.vllm.mm_salt import engine_accepts_mm_inputs
+from smg_grpc_servicer.vllm.model_info import (
+    eos_token_ids_with_generation_config,
+    model_facts,
+    server_facts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,69 +60,15 @@ ENGINE_TERMINATE_SECS = 30.0
 _POLL_SECS = 0.5
 # What upstream's gRPC entrypoint references when it carries the switch.
 HOOK_SYMBOL = "resolve_servicer_impl"
-# The `GetModelInfo.default_sampling_params_json` keys the Python servicer reports.
-_SAMPLING_DEFAULT_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty")
-
-
-def _ids(value: Any) -> list[int]:
-    if isinstance(value, bool) or value is None:
-        return []
-    if isinstance(value, int):
-        return [value] if value >= 0 else []
-    if isinstance(value, (list, tuple)):
-        return [v for v in value if isinstance(v, int) and not isinstance(v, bool) and v >= 0]
-    return []
-
-
-def eos_token_ids(model_config: Any) -> list[int]:
-    """EOS ids in the order the Rust side expects: the model config's first
-    (the primary id EngineCore stops on), then the generation config's extras."""
-    hf_config = getattr(model_config, "hf_config", None)
-    ids = _ids(getattr(hf_config, "eos_token_id", None))
-    try_get = getattr(model_config, "try_get_generation_config", None)
-    if callable(try_get):
-        try:
-            generation = try_get() or {}
-        except Exception:  # a missing or malformed generation config is not fatal
-            generation = {}
-        for extra in _ids(generation.get("eos_token_id")):
-            if extra not in ids:
-                ids.append(extra)
-    return ids
-
-
-def default_sampling_params_json(model_config: Any) -> str:
-    """The generation-config sampling defaults the Python servicer advertises."""
-    get_diff = getattr(model_config, "get_diff_sampling_param", None)
-    if not callable(get_diff):
-        return ""
-    try:
-        diff = get_diff() or {}
-    except Exception:
-        return ""
-    filtered = {
-        key: diff[key] for key in _SAMPLING_DEFAULT_KEYS if key in diff and diff[key] is not None
-    }
-    return json.dumps(filtered, sort_keys=True) if filtered else ""
 
 
 def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
-    """`VllmGrpcServer` keyword arguments from vLLM's own config, so
-    `GetModelInfo` and `GetServerInfo` report what the Python servicer would."""
+    """`VllmGrpcServer` keyword arguments from vLLM's own config: the facts
+    both servicers advertise (`model_facts`, `server_facts`), plus the inputs
+    only the Rust servicer needs up front because no Python runs on its
+    request path."""
     model_config = vllm_config.model_config
-    hf_config = getattr(model_config, "hf_config", None)
-    served = getattr(model_config, "served_model_name", None) or model_config.model
-    if isinstance(served, (list, tuple)):
-        served = served[0] if served else model_config.model
-    # PD identity and pairing facts, read off the same config fields as the
-    # Python servicer's GetServerInfo.
-    kv_config = getattr(vllm_config, "kv_transfer_config", None)
-    kv_connector, kv_engine_id = ("", "")
-    kv_role = ""
-    if kv_config is not None:
-        kv_connector, kv_engine_id = resolve_pd_connector(kv_config)
-        kv_role = getattr(kv_config, "kv_role", None) or ""
-    pairing = pairing_fields(vllm_config)
+    facts = {**model_facts(model_config), **server_facts(vllm_config)}
     # KV-event publishing, as the Python servicer resolves it: only vLLM's ZMQ
     # publisher can be relayed; anything else leaves SubscribeKvEvents off.
     kv_events = getattr(vllm_config, "kv_events_config", None)
@@ -140,31 +86,16 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
     pooler_use_activation = getattr(pooler, "use_activation", None)
     pooler_dimensions = getattr(pooler, "dimensions", None)
     return {
-        "model_path": str(model_config.model),
-        "served_model_name": str(served),
-        "tokenizer_path": str(getattr(model_config, "tokenizer", None) or model_config.model),
-        "is_generation": getattr(model_config, "runner_type", "generate") == "generate",
-        "max_context_length": int(model_config.max_model_len),
-        "vocab_size": int(model_config.get_vocab_size()),
-        # vLLM's own answer, as the Python servicer reports it: Router-
-        # preprocessed media reaches the engine over the same wire; only
-        # worker-side media processing (media_refs) stays with Python.
-        "supports_vision": _supports_vision(model_config),
-        "model_type": str(getattr(hf_config, "model_type", None) or ""),
-        "architectures": [str(a) for a in (getattr(model_config, "architectures", None) or [])],
-        "eos_token_ids": eos_token_ids(model_config),
-        "pad_token_id": int(getattr(hf_config, "pad_token_id", None) or 0),
-        "bos_token_id": int(getattr(hf_config, "bos_token_id", None) or 0),
-        "default_sampling_params_json": default_sampling_params_json(model_config),
-        "data_parallel_size": int(vllm_config.parallel_config.data_parallel_size),
-        "pairing_protocol": pairing_protocol_from_env(),
-        "kv_connector": str(kv_connector or ""),
-        "kv_role": str(kv_role),
-        "kv_engine_id": str(kv_engine_id or ""),
-        "kv_cache_dtype": str(pairing.get("kv_cache_dtype", "")),
-        "attention_backend": str(pairing.get("attention_backend", "")),
-        "model_dtype": str(pairing.get("model_dtype", "")),
-        "block_size": int(pairing.get("block_size", 0)),
+        **facts,
+        # The Rust servicer stops on the full set vLLM's frontend assembles
+        # (the generation config's extras included) and advertises that set.
+        "eos_token_ids": eos_token_ids_with_generation_config(model_config),
+        # The pairing fields are absent when the config does not carry them;
+        # the binding takes every keyword.
+        "kv_cache_dtype": str(facts.get("kv_cache_dtype", "")),
+        "attention_backend": str(facts.get("attention_backend", "")),
+        "model_dtype": str(facts.get("model_dtype", "")),
+        "block_size": int(facts.get("block_size", 0) or 0),
         "structured_outputs_backend": str(structured_backend or "auto"),
         "kv_events_endpoint": str(getattr(kv_events, "endpoint", "") or "")
         if kv_events_enabled
@@ -173,20 +104,11 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
             str(getattr(kv_events, "replay_endpoint", "") or "") if kv_events_enabled else ""
         ),
         "kv_events_topic": str(getattr(kv_events, "topic", "") or "") if kv_events_enabled else "",
-        "shm_namespace_id": mm_shm.shm_namespace_id(),
         "pooler_use_activation": (
             bool(pooler_use_activation) if pooler_use_activation is not None else None
         ),
         "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
     }
-
-
-def _supports_vision(model_config: Any) -> bool:
-    try:
-        return bool(engine_accepts_mm_inputs(model_config))
-    except Exception:  # an unexpected config shape must not take the servicer down
-        logger.warning("Could not determine multimodal support; reporting supports_vision=false")
-        return False
 
 
 def resolve_tokenizer_dir(tokenizer: str, revision: str | None = None) -> str | None:
