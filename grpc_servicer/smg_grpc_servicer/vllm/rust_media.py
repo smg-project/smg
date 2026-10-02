@@ -201,7 +201,10 @@ class RustMediaBridge:
             prompt_token_ids, prompt_text, refs, arrival_time, request_id=request_id
         )
         identity = self._identity(request_id, engine_input) if want_identity else None
-        core = await self._input_processor.process_inputs_async(
+        # Inline on the loop, as AsyncLLM runs it for a rendered engine input:
+        # no blocking work is left at this point, and a thread hop here costs
+        # two GIL handoffs per request behind the busy processor thread.
+        core = self._input_processor.process_inputs(
             request_id,
             engine_input,
             self._sampling_params(),

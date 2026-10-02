@@ -62,9 +62,7 @@ class FakeInputProcessor:
     def __init__(self):
         self.calls = []
 
-    async def process_inputs_async(
-        self, request_id, engine_input, params, supported_tasks, arrival_time=None
-    ):
+    def process_inputs(self, request_id, engine_input, params, supported_tasks, arrival_time=None):
         self.calls.append((request_id, engine_input, params, supported_tasks, arrival_time))
         return SimpleNamespace(
             prompt_token_ids=[1, 2, 2, 2, 3], mm_features=["one item"], cache_salt="salt"
