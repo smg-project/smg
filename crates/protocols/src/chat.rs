@@ -6,10 +6,11 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, is_false, is_true, validate_json_schema_shape,
-        validate_stop, CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall,
-        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
-        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
+        default_true, deserialize_null_as_false, deserialize_null_as_true, is_false, is_true,
+        validate_json_schema_shape, validate_stop, CachePartition, ChatLogProbs, ContentPart,
+        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
+        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
+        Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -316,19 +317,34 @@ pub struct ChatCompletionRequest {
     pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub no_stop_trim: bool,
 
     /// Ignore end-of-sequence tokens during generation
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub ignore_eos: bool,
 
     /// Continue generating from final assistant message
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub continue_final_message: bool,
 
     /// Skip special tokens during detokenization
-    #[serde(default = "default_true")]
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_as_true"
+    )]
     pub skip_special_tokens: bool,
 
     /// Path to LoRA adapter(s) for model customization
@@ -338,18 +354,30 @@ pub struct ChatCompletionRequest {
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Separate reasoning content from final answer (O1-style models)
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
+    )]
     pub separate_reasoning: bool,
 
     /// Stream reasoning tokens during generation
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
+    )]
     pub stream_reasoning: bool,
 
     /// Chat template kwargs
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub return_hidden_states: bool,
 
     /// Random seed for sampling for deterministic outputs
@@ -1191,5 +1219,68 @@ mod tests {
         }))
         .unwrap();
         assert!(bare.cache_partition().is_empty());
+    }
+
+    #[test]
+    fn extension_bools_accept_explicit_null_as_their_default() {
+        let base = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let mut all_null = base.clone();
+        for field in [
+            "no_stop_trim",
+            "ignore_eos",
+            "continue_final_message",
+            "skip_special_tokens",
+            "separate_reasoning",
+            "stream_reasoning",
+            "return_hidden_states",
+        ] {
+            all_null[field] = Value::Null;
+        }
+
+        // A client that serializes an unset option as null gets the default,
+        // the same request an absent key produces.
+        let nulled: ChatCompletionRequest =
+            serde_json::from_value(all_null).expect("null means the field's default");
+        let absent: ChatCompletionRequest = serde_json::from_value(base).unwrap();
+        assert_eq!(nulled.no_stop_trim, absent.no_stop_trim);
+        assert_eq!(nulled.ignore_eos, absent.ignore_eos);
+        assert_eq!(nulled.continue_final_message, absent.continue_final_message);
+        assert_eq!(nulled.skip_special_tokens, absent.skip_special_tokens);
+        assert_eq!(nulled.separate_reasoning, absent.separate_reasoning);
+        assert_eq!(nulled.stream_reasoning, absent.stream_reasoning);
+        assert_eq!(nulled.return_hidden_states, absent.return_hidden_states);
+        assert!(!nulled.no_stop_trim);
+        assert!(!nulled.ignore_eos);
+        assert!(!nulled.continue_final_message);
+        assert!(!nulled.return_hidden_states);
+        assert!(nulled.skip_special_tokens);
+        assert!(nulled.separate_reasoning);
+        assert!(nulled.stream_reasoning);
+    }
+
+    #[test]
+    fn extension_bools_keep_explicit_values() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "continue_final_message": true,
+            "skip_special_tokens": false,
+            "separate_reasoning": false,
+            "stream_reasoning": false,
+            "return_hidden_states": true,
+        }))
+        .unwrap();
+        assert!(request.no_stop_trim);
+        assert!(request.ignore_eos);
+        assert!(request.continue_final_message);
+        assert!(!request.skip_special_tokens);
+        assert!(!request.separate_reasoning);
+        assert!(!request.stream_reasoning);
+        assert!(request.return_hidden_states);
     }
 }

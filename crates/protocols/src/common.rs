@@ -64,6 +64,18 @@ where
     Option::<bool>::deserialize(deserializer).map(|opt| opt.unwrap_or(false))
 }
 
+/// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
+///
+/// Use with `#[serde(default = "default_true", deserialize_with = "deserialize_null_as_true")]`
+/// on extension fields that default to `true`, so a client that serializes an
+/// unset option as `null` gets the default instead of a rejected request.
+pub fn deserialize_null_as_true<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<bool>::deserialize(deserializer).map(|opt| opt.unwrap_or(true))
+}
+
 // ============================================================================
 // GenerationRequest Trait
 // ============================================================================
