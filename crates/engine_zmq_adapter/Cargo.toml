@@ -2,7 +2,7 @@
 name = "engine-zmq-adapter"
 version = "0.1.0"
 edition = "2021"
-description = "The vLLM/TokenSpeed gRPC-proto surface over the same-host ZMQ engine wire"
+description = "Each engine's own gRPC-proto surface over the same-host ZMQ engine wire"
 license = "Apache-2.0"
 repository = "https://github.com/smg-project/smg"
 

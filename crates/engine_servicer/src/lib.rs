@@ -2,8 +2,9 @@
 //! `smg_grpc_servicer` package serves today, implemented in Rust over the
 //! same-host ZMQ engine adapter (`engine-zmq-adapter`).
 //!
-//! The Router keeps speaking the engine's own proto (`vllm_engine.proto`), so
-//! it cannot tell this servicer from the Python one. What changes is the node:
+//! The Router keeps speaking the engine's own proto (`vllm_engine.proto` for
+//! vLLM; each further ZMQ engine's servicer serves its own), so it cannot
+//! tell this servicer from the Python one. What changes is the node:
 //! the Python frontend leaves the request path, and the engine is reached the
 //! way the direct-ZMQ lane already reaches it. Python keeps the lifecycle only
 //! — it launches the headless engine and drives the server through the PyO3

@@ -1,12 +1,14 @@
-//! The vLLM/TokenSpeed gRPC-proto surface over the same-host ZMQ engine wire.
+//! Each engine's own gRPC-proto surface over the same-host ZMQ engine wire.
 //!
 //! [`ZmqEngineClient`] presents each engine's own gRPC proto request/response
 //! types (the contract `smg-grpc-client` speaks to a Python servicer) but talks
-//! ZMQ directly to a colocated vLLM EngineCore or TokenSpeed scheduler via
-//! `engine-zmq-client`, bypassing the Python frontend. It consumes the exact
-//! `vllm::GenerateRequest` the proto builders produce and emits
-//! `vllm::GenerateResponse` built from `EngineCoreOutput`, so a consumer's
-//! proto request-execution path is reused unchanged.
+//! ZMQ directly to the colocated engine via `engine-zmq-client`, bypassing the
+//! Python frontend: vLLM's EngineCore and TokenSpeed's scheduler today, with
+//! each further ZMQ engine (SGLang next) adding its protocol module and
+//! translation here. It consumes the exact proto requests the builders
+//! produce (`vllm::GenerateRequest` for vLLM) and emits the matching proto
+//! responses built from the engine's outputs, so a consumer's proto
+//! request-execution path is reused unchanged.
 //!
 //! Two consumers share it: the gateway's direct-ZMQ worker lane, and the Rust
 //! engine servicer (`engine-servicer`), which serves the same proto over gRPC

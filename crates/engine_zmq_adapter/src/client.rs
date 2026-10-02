@@ -1,5 +1,6 @@
-//! [`ZmqEngineClient`]: the connected engine behind the vLLM/TokenSpeed gRPC
-//! client surface, plus the connect entry points and metadata reads.
+//! [`ZmqEngineClient`]: the connected engine behind each engine's gRPC client
+//! surface (vLLM and TokenSpeed today), plus the connect entry points and
+//! metadata reads.
 
 use std::{
     collections::HashMap,

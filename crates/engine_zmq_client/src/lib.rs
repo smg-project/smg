@@ -10,7 +10,8 @@
 //!
 //! - [`codec`] — engine-agnostic wire primitives: msgpack positional-tuple
 //!   serde, numpy dtype handling, and the zero-copy tensor aux-frame codec.
-//! - `protocol` — per-engine protocol modules (vLLM EngineCore first).
+//! - `protocol` — per-engine protocol modules (vLLM EngineCore and TokenSpeed
+//!   today; each further ZMQ engine, SGLang next, adds its own).
 //! - `transport` — the ZMQ socket topology (SMG binds; engines connect in).
 //! - `connector` — request submission, streaming output, and DP wave handling.
 //!

@@ -1,11 +1,14 @@
-//! Python lifecycle binding for the Rust vLLM gRPC servicer.
+//! Python lifecycle bindings for the Rust engine servicers.
 //!
-//! Rust owns the listener, the engine link, and the request path; Python
-//! launches the headless engine, starts and stops this server, and announces
-//! draining. The one request-time crossing is worker-side media processing:
-//! a request's `media_refs` go to a Python object that runs the Python
-//! servicer's own processors (vLLM's input processor behind them), and what
-//! it produces comes back as bytes the engine reads directly.
+//! One binding per engine servicer, each over that engine's same-host ZMQ
+//! wire; `VllmGrpcServer` is the first, and the servicers for the other ZMQ
+//! engines bind the same way as their protocols land. Rust owns the
+//! listener, the engine link, and the request path; Python launches the
+//! headless engine, starts and stops the server, and announces draining. The
+//! one request-time crossing is worker-side media processing: a request's
+//! `media_refs` go to a Python object that runs the engine's own processors
+//! (the Python servicer's, with vLLM's input processor behind them), and
+//! what it produces comes back as bytes the engine reads directly.
 
 use std::{
     sync::{Arc, Mutex},

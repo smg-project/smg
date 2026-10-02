@@ -1,6 +1,6 @@
-"""Rust engine servicers exposed to Python.
+"""Rust engine servicers exposed to Python, one class per engine servicer.
 
-:class:`VllmGrpcServer` serves ``vllm.grpc.engine.VllmEngine`` (the contract
+:class:`VllmGrpcServer`, the first, serves ``vllm.grpc.engine.VllmEngine`` (the contract
 the Router already speaks to the Python servicer) over a same-host vLLM
 EngineCore, from a Rust-owned thread. Python owns the lifecycle only: launch
 the headless engine, construct the server, poll ``engine_ready`` /
