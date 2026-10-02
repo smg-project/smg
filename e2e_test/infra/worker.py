@@ -26,6 +26,7 @@ from .constants import (
     WorkerType,
     get_mm_processing,
     get_runtime,
+    get_vllm_servicer_impl,
     get_zmq_engine_count,
     sglang_transfer_backend,
     vllm_kv_backend,
@@ -547,6 +548,12 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
+        # The vLLM gRPC servicer implementation is a flag inside the smg
+        # servicer package, read by upstream's entrypoint; the command stays.
+        if self.engine == "vllm" and self.mode == ConnectionMode.GRPC:
+            impl = get_vllm_servicer_impl()
+            if impl == "rust":
+                env["SMG_VLLM_SERVICER_IMPL"] = impl
 
         if (
             self.engine == "vllm"

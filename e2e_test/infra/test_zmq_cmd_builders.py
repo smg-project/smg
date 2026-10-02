@@ -69,3 +69,35 @@ def test_grpc_worker_still_uses_grpc_url():
         mode=ConnectionMode.GRPC,
     )
     assert w.base_url == "grpc://127.0.0.1:50111"
+
+
+def test_rust_servicer_impl_is_a_worker_env_flag(monkeypatch):
+    """``E2E_VLLM_SERVICER_IMPL=rust`` keeps upstream's gRPC entrypoint as the
+    worker command and selects the Rust path through the servicer package's
+    flag in the worker environment, so every test case runs unchanged."""
+    from infra.constants import ENV_VLLM_SERVICER_IMPL
+
+    w = Worker(
+        model_id=_VLLM_MODEL,
+        engine="vllm",
+        port=50111,
+        gpu_ids=[0],
+        mode=ConnectionMode.GRPC,
+    )
+    spec = {"vllm_args": ["--max-model-len", "2048"]}
+
+    monkeypatch.delenv(ENV_VLLM_SERVICER_IMPL, raising=False)
+    monkeypatch.delenv("SMG_VLLM_SERVICER_IMPL", raising=False)
+    assert "vllm.entrypoints.grpc_server" in w._build_vllm_grpc_cmd("/models/llama", 1, spec)
+    assert "SMG_VLLM_SERVICER_IMPL" not in w._build_env()
+
+    monkeypatch.setenv(ENV_VLLM_SERVICER_IMPL, "rust")
+    cmd = w._build_vllm_grpc_cmd("/models/llama", 1, spec)
+    assert "vllm.entrypoints.grpc_server" in cmd
+    assert "--impl" not in cmd
+    assert cmd[cmd.index("--max-model-len") + 1] == "2048"
+    assert w._build_env()["SMG_VLLM_SERVICER_IMPL"] == "rust"
+
+    monkeypatch.setenv(ENV_VLLM_SERVICER_IMPL, "go")
+    with pytest.raises(ValueError, match=ENV_VLLM_SERVICER_IMPL):
+        w._build_env()

@@ -770,6 +770,27 @@ class TestVllmWorkerLauncher:
         for arg in backend_args:
             assert arg in cmd
 
+    def test_rust_servicer_is_a_worker_env_flag_not_a_command(self):
+        """servicer-impl rust keeps upstream's gRPC entrypoint as the command and
+        selects the Rust path through the servicer package's flag in the env."""
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="grpc", servicer_impl="rust")
+        cmd = launcher.build_command(args, ["--max-model-len", "4096"], "0.0.0.0", 32000)
+        assert "vllm.entrypoints.grpc_server" in cmd
+        assert "--impl" not in cmd and "--servicer-impl" not in cmd
+        env = launcher.gpu_env(args, 0, {"CUDA_VISIBLE_DEVICES": "3"})
+        assert env["SMG_VLLM_SERVICER_IMPL"] == "rust"
+        assert env["CUDA_VISIBLE_DEVICES"] == "3"
+
+    def test_python_servicer_leaves_the_worker_env_alone(self):
+        launcher = VllmWorkerLauncher()
+        for connection_mode, impl in [("grpc", "python"), ("http", "rust")]:
+            args = argparse.Namespace(
+                model="/tmp/model", connection_mode=connection_mode, servicer_impl=impl
+            )
+            env = launcher.gpu_env(args, 0, {"CUDA_VISIBLE_DEVICES": "0"})
+            assert "SMG_VLLM_SERVICER_IMPL" not in env
+
     def test_build_zmq_command_defaults_to_single_engine(self):
         launcher = VllmWorkerLauncher()
         args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")

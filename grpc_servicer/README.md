@@ -121,6 +121,43 @@ cap is answered as a 400 `media_too_large` instead of being pushed, and a result
 Redis refuses is reported to the worker at once; a sidecar timeout is not
 retried by the router, since the worker already spent the whole budget on it.
 
+#### Rust request path (`SMG_VLLM_SERVICER_IMPL=rust`)
+
+The same `vllm.grpc.engine.VllmEngine` contract can be served from Rust, with
+Python keeping only the lifecycle. The switch is a flag inside this package,
+not a second server: upstream vLLM's gRPC entrypoint asks the package which
+implementation to run before it builds an AsyncLLM, and hands the process to
+`smg_grpc_servicer.vllm.serve_rust` when the answer is `rust`. That function
+launches the engine headless (`vllm serve --headless`), which dials a
+same-host ZMQ handshake, and serves the gRPC contract from
+`smg.servicer.VllmGrpcServer` on a Rust-owned thread. The Router cannot tell
+the two apart.
+
+```bash
+# Python (default): upstream's gRPC server, AsyncLLM in-process.
+python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
+
+# Rust request path, same entrypoint.
+SMG_VLLM_SERVICER_IMPL=rust python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
+```
+
+The upstream hook is the first thing in its `serve_grpc`:
+
+```python
+from smg_grpc_servicer.vllm import resolve_servicer_impl, serve_rust
+
+if resolve_servicer_impl(args) == "rust":
+    raise SystemExit(await serve_rust(args))
+```
+
+`smg serve --backend vllm --connection-mode grpc --servicer-impl rust` sets
+the flag in each worker's environment. Rust mode needs the `smg` wheel (for
+the binding) and serves text generation; `Embed`, `FlushCache`,
+`GetTokenizer`, `SubscribeKvEvents` and worker-side media processing answer
+UNIMPLEMENTED there, so keep the Python implementation for those. Tuning:
+`SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
+`SMG_VLLM_SERVICER_DRAIN_SECS` (default 5), `SMG_ZMQ_SOCKET_DIR`.
+
 ### MLX
 
 ```bash

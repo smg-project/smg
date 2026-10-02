@@ -265,6 +265,18 @@ class SglangWorkerLauncher(WorkerLauncher):
 class VllmWorkerLauncher(WorkerLauncher):
     """Launcher for vLLM inference workers."""
 
+    def gpu_env(self, args: argparse.Namespace, dp_rank: int, env: dict | None = None) -> dict:
+        env = super().gpu_env(args, dp_rank, env)
+        # The servicer implementation is a flag inside the smg servicer package
+        # (`SMG_VLLM_SERVICER_IMPL`), read by upstream vLLM's gRPC entrypoint
+        # before it builds an AsyncLLM; the worker command line stays upstream's.
+        if (
+            getattr(args, "connection_mode", "grpc") == "grpc"
+            and getattr(args, "servicer_impl", "python") == "rust"
+        ):
+            env["SMG_VLLM_SERVICER_IMPL"] = "rust"
+        return env
+
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         return getattr(args, "tensor_parallel_size", 1)
 
@@ -755,6 +767,18 @@ def add_serve_args(parser: argparse.ArgumentParser) -> None:
             "only supported for the vllm backend"
         ),
     )
+    group.add_argument(
+        "--servicer-impl",
+        default="python",
+        choices=["python", "rust"],
+        help=(
+            "gRPC servicer implementation for vllm workers (default: python). "
+            "rust keeps the same vLLM gRPC contract but serves it from Rust over "
+            "a same-host ZMQ engine connection, selected through "
+            "SMG_VLLM_SERVICER_IMPL in the worker's environment; requires "
+            "--backend vllm --connection-mode grpc"
+        ),
+    )
     # Router host/port - may be overridden by backend (e.g. sglang)
     group.add_argument(
         "--host",
@@ -837,6 +861,13 @@ def parse_serve_args(
         pre_parser.error(
             "connection-mode zmq is only supported for the vllm and tokenspeed "
             f"backends, not {backend}"
+        )
+    if getattr(serve_router_args, "servicer_impl", "python") == "rust" and (
+        backend != "vllm" or serve_router_args.connection_mode != "grpc"
+    ):
+        pre_parser.error(
+            "servicer-impl rust is only available for --backend vllm with "
+            f"--connection-mode grpc, not {backend}/{serve_router_args.connection_mode}"
         )
 
     # Pass 2: full parser with backend-specific args; resolve so backend can override

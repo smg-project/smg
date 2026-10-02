@@ -6,7 +6,17 @@ engine-free submodules (media_refs, mm_processor, mm_tensors) import without it.
 
 import logging
 
-__all__ = ["VllmEngineServicer", "VllmHealthServicer", "attach_vllm_logging"]
+__all__ = [
+    "SERVICER_IMPL_ENV",
+    "VllmEngineServicer",
+    "VllmHealthServicer",
+    "attach_vllm_logging",
+    "resolve_servicer_impl",
+    "serve_rust",
+]
+
+# The flag that selects the Rust request path; see `smg_grpc_servicer.vllm.rust`.
+SERVICER_IMPL_ENV = "SMG_VLLM_SERVICER_IMPL"
 
 
 def attach_vllm_logging() -> None:
@@ -21,6 +31,10 @@ def attach_vllm_logging() -> None:
 
 
 def __getattr__(name: str):
+    if name in ("resolve_servicer_impl", "serve_rust"):
+        from smg_grpc_servicer.vllm import rust
+
+        return getattr(rust, name)
     if name == "VllmEngineServicer":
         from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
 

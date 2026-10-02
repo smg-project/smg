@@ -66,6 +66,9 @@ ENV_CONNECTION_MODE = (
 ENV_ZMQ_ENGINE_COUNT = (
     "E2E_ZMQ_ENGINE_COUNT"  # DP engines per ZMQ worker (grouped vLLM launch; empty = 1)
 )
+ENV_VLLM_SERVICER_IMPL = (
+    "E2E_VLLM_SERVICER_IMPL"  # vLLM gRPC servicer implementation: python (default) or rust
+)
 ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
@@ -180,6 +183,29 @@ def get_mm_processing() -> str | None:
         raise ValueError(
             f"{ENV_MM_PROCESSING}={value!r} is not a valid processing location; "
             f"use {MM_PROCESSING_WORKER!r} or leave it unset"
+        )
+    return value
+
+
+VLLM_SERVICER_IMPLS = ("python", "rust")
+
+
+def get_vllm_servicer_impl() -> str:
+    """Which implementation serves the vLLM gRPC contract on gRPC lanes.
+
+    Set ``E2E_VLLM_SERVICER_IMPL=rust`` to run vLLM gRPC workers with the
+    Rust servicer: the worker command stays upstream's gRPC entrypoint and the
+    flag travels to it as ``SMG_VLLM_SERVICER_IMPL`` in the worker's
+    environment. The Router and every test case stay the same. Unset/blank
+    means python.
+    """
+    value = os.environ.get(ENV_VLLM_SERVICER_IMPL, "").strip().lower()
+    if not value:
+        return "python"
+    if value not in VLLM_SERVICER_IMPLS:
+        raise ValueError(
+            f"{ENV_VLLM_SERVICER_IMPL}={value!r} is not a valid servicer impl; "
+            f"use one of {VLLM_SERVICER_IMPLS}"
         )
     return value
 
