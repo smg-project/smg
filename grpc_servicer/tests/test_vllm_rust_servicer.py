@@ -518,6 +518,28 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert isinstance(server, FakeServer) and isinstance(engine, FakeEngine)
     assert drain_secs == 0.0
     assert recorded["tracing"] is True
+
+    # A launch that fails stops the already-bound server before propagating.
+    servers: list[FakeServer] = []
+
+    def recording_server(**kwargs):
+        servers.append(FakeServer(**kwargs))
+        return servers[-1]
+
+    _install(
+        monkeypatch,
+        "smg.servicer",
+        VllmGrpcServer=recording_server,
+        init_servicer_tracing=lambda: None,
+    )
+
+    def failing_launch(ns):
+        raise RuntimeError("engine would not start")
+
+    monkeypatch.setattr(rust, "launch_headless_engine", failing_launch)
+    with pytest.raises(RuntimeError, match="engine would not start"):
+        asyncio.run(rust.serve_rust(args))
+    assert servers[0].events == ["serving:False", "stop:5.0"]
     assert recorded["engine_args_from"] is args
     kwargs = server.kwargs
     # `vllm serve` leaves host unset; upstream binds every interface then.

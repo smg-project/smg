@@ -21,7 +21,7 @@ use bytes::Bytes;
 use engine_zmq_adapter::ProcessedMedia as EngineMedia;
 use prost::Message;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
 use super::State;
@@ -96,8 +96,9 @@ impl MediaError {
 pub trait MediaProcessor: Send + Sync + 'static {
     /// The backend's advertised name (`mm_processor`), e.g. `inprocess`.
     fn name(&self) -> &str;
-    /// The URL schemes it fetches (`mm_media_ref_schemes`), comma-separated.
-    fn schemes(&self) -> &str;
+    /// The URL schemes it fetches (`mm_media_ref_schemes`), comma-separated;
+    /// read after [`probe`](Self::probe), since a sidecar announces its own.
+    fn schemes(&self) -> String;
     /// Where the mode came from (`mm_processor_source`): `flag`, `env`,
     /// `default`.
     fn source(&self) -> &str;
@@ -115,7 +116,7 @@ pub trait MediaProcessor: Send + Sync + 'static {
 /// past their callers' patience.
 pub(crate) struct MediaGate {
     pub(super) processor: Arc<dyn MediaProcessor>,
-    inflight: Semaphore,
+    inflight: Arc<Semaphore>,
     waiting: AtomicUsize,
     limit: usize,
 }
@@ -125,23 +126,41 @@ impl MediaGate {
         let limit = processor.max_inflight().max(1);
         Self {
             processor,
-            inflight: Semaphore::new(limit),
+            inflight: Arc::new(Semaphore::new(limit)),
             waiting: AtomicUsize::new(0),
             limit,
         }
     }
 
-    async fn acquire(&self) -> Result<SemaphorePermit<'_>, Status> {
-        if self.waiting.load(Ordering::Acquire) >= self.limit {
+    /// A slot, or the saturation refusal. The waiter count is checked and
+    /// taken in one step, and given back on every exit, a cancelled wait
+    /// included: a caller that gives up while queued must not leave a
+    /// phantom waiter behind, or enough of them would refuse every request
+    /// for the life of the process.
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit, Status> {
+        let admitted = self
+            .waiting
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                (waiting < self.limit).then_some(waiting + 1)
+            });
+        if admitted.is_err() {
             return Err(Status::unavailable(format!(
                 "worker is saturated: {} multimodal requests in flight and as many waiting",
                 self.limit
             )));
         }
-        self.waiting.fetch_add(1, Ordering::AcqRel);
-        let permit = self.inflight.acquire().await;
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        let _waiting = Waiting(&self.waiting);
+        let permit = Arc::clone(&self.inflight).acquire_owned().await;
         permit.map_err(|_| Status::unavailable("media processing is shutting down"))
+    }
+}
+
+/// Counts a waiter down when it leaves the queue, however it leaves.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -226,12 +245,25 @@ pub(super) async fn process_media_refs(
         want_identity: req.kv_transfer_params_json.is_some() || req.kv_transfer_params.is_some(),
     };
     let permit = gate.acquire().await?;
-    let processed = gate
-        .processor
-        .process(request)
+    // The processor runs in its own task holding the slot: a caller that
+    // gives up mid-fetch does not stop the work behind the bridge, so the
+    // slot comes back when that work ends, not when the caller stops
+    // waiting, and the cap bounds the work actually in flight.
+    let processor = Arc::clone(&gate.processor);
+    let (tx, rx) = oneshot::channel();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the slot must outlive a caller that gives up; the task ends when the processor answers"
+    )]
+    tokio::spawn(async move {
+        let outcome = processor.process(request).await;
+        drop(permit);
+        let _ = tx.send(outcome);
+    });
+    let processed = rx
         .await
+        .map_err(|_| Status::internal("media processing ended without a result"))?
         .map_err(MediaError::into_status)?;
-    drop(permit);
     // The expanded prompt replaces the anchors the Router sent.
     if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() {
         tokenized.input_ids = processed.prompt_token_ids;

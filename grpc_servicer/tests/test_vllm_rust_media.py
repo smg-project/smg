@@ -111,11 +111,11 @@ def test_submit_relays_what_the_input_processor_produced(loop):
     assert kind == "ok"
     prompt_token_ids, mm_features, aux_frames, cache_salt, identity = payload
     assert prompt_token_ids == [1, 2, 2, 2, 3]
-    # The primary as bytes; the tensor frames lent as (owner, address, nbytes).
+    # The primary as bytes; the tensor frames lent as read-only numpy views.
     assert mm_features == b"primary"
-    assert [bytes(owner) for owner, _, _ in aux_frames] == [b"aux-1", b"aux-2"]
-    for owner, address, nbytes in aux_frames:
-        assert address == owner.ctypes.data and nbytes == owner.nbytes == 5
+    assert [bytes(view) for view in aux_frames] == [b"aux-1", b"aux-2"]
+    for view in aux_frames:
+        assert view.flags.c_contiguous and not view.flags.writeable and view.nbytes == 5
     assert cache_salt == "salt"
     assert identity is None
     # The processor saw the request as the Router sent it.
@@ -151,11 +151,16 @@ def test_failures_are_classified_like_the_python_servicers_statuses(loop):
     assert processor.calls == []
 
 
-def test_probe_reports_the_processors_answer(loop):
+def test_probe_reports_the_processors_answer_and_current_schemes(loop):
     for probe, expected in [(True, True), (False, False), (RuntimeError("down"), False)]:
         answers: queue.Queue = queue.Queue()
-        bridge(loop, FakeProcessor(probe=probe)).probe(answers.put)
-        assert answers.get(timeout=5) is expected
+        processor = FakeProcessor(probe=probe)
+        b = bridge(loop, processor)
+        # A sidecar announces its schemes on probe; the bridge reports them live.
+        processor.schemes = "http,https,data,file"
+        b.probe(lambda serving, schemes: answers.put((serving, schemes)))
+        assert answers.get(timeout=5) == (expected, "http,https,data,file")
+        assert b.schemes == "http,https,data,file"
 
 
 def test_start_warmup_uses_the_renderers_background_warmup(loop):
@@ -165,20 +170,29 @@ def test_start_warmup_uses_the_renderers_background_warmup(loop):
         def start_mm_warmup_in_background(self):
             self.started += 1
 
+    class InProcess(FakeProcessor):
+        name = "inprocess"
+
+    def with_renderer(processor, renderer):
+        return RustMediaBridge(
+            processor,
+            FakeInputProcessor(),
+            FakeEncoder(),
+            loop=loop,
+            source="flag",
+            sampling_params=lambda: "params",
+            renderer=renderer,
+        )
+
     renderer = Renderer()
-    b = RustMediaBridge(
-        FakeProcessor(),
-        FakeInputProcessor(),
-        FakeEncoder(),
-        loop=loop,
-        source="flag",
-        sampling_params=lambda: "params",
-        renderer=renderer,
-    )
-    b.start_warmup()
+    with_renderer(InProcess(), renderer).start_warmup()
     assert renderer.started == 1
+    # The sidecar runs the processor: nothing in this process to warm up.
+    renderer = Renderer()
+    with_renderer(FakeProcessor(), renderer).start_warmup()
+    assert renderer.started == 0
     # A renderer without the hook (an older vLLM) is left alone.
-    bridge(loop).start_warmup()
+    with_renderer(InProcess(), object()).start_warmup()
 
 
 def test_build_is_off_without_a_mode_or_a_multimodal_model(loop):

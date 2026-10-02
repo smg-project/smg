@@ -19,6 +19,7 @@ futures.workspace = true
 prost.workspace = true
 rmp-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -33,7 +34,6 @@ zip = "8.6"
 zeromq.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 portpicker = "0.1"
 tempfile = "3"

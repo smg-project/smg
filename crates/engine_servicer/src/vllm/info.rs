@@ -126,7 +126,7 @@ pub(super) async fn server_info(state: &State) -> vllm::GetServerInfoResponse {
     if let Some(gate) = state.media.as_ref() {
         if state.model.supports_vision && gate.processor.probe().await {
             info.mm_processor = gate.processor.name().to_string();
-            info.mm_media_ref_schemes = gate.processor.schemes().to_string();
+            info.mm_media_ref_schemes = gate.processor.schemes();
             info.mm_processor_source = gate.processor.source().to_string();
         }
     }

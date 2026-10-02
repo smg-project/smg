@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -1868,6 +1868,8 @@ fn processed_media() -> ProcessedMedia {
 struct MockMediaProcessor {
     outcome: Mutex<Result<ProcessedMedia, MediaError>>,
     requests: Mutex<Vec<MediaRequest>>,
+    /// When each request's processing began.
+    started: Mutex<Vec<Instant>>,
     delay: Duration,
     probe_ok: AtomicBool,
     max_inflight: usize,
@@ -1875,17 +1877,30 @@ struct MockMediaProcessor {
 
 impl MockMediaProcessor {
     fn answering(outcome: Result<ProcessedMedia, MediaError>) -> Arc<Self> {
+        Self::slow(outcome, Duration::ZERO, 4)
+    }
+
+    fn slow(
+        outcome: Result<ProcessedMedia, MediaError>,
+        delay: Duration,
+        max_inflight: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             outcome: Mutex::new(outcome),
             requests: Mutex::new(Vec::new()),
-            delay: Duration::ZERO,
+            started: Mutex::new(Vec::new()),
+            delay,
             probe_ok: AtomicBool::new(true),
-            max_inflight: 4,
+            max_inflight,
         })
     }
 
     fn requests(&self) -> Vec<MediaRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn started(&self) -> Vec<Instant> {
+        self.started.lock().unwrap().clone()
     }
 }
 
@@ -1894,8 +1909,8 @@ impl MediaProcessor for MockMediaProcessor {
         "mock"
     }
 
-    fn schemes(&self) -> &str {
-        "http,https,data"
+    fn schemes(&self) -> String {
+        "http,https,data".to_string()
     }
 
     fn source(&self) -> &str {
@@ -1913,6 +1928,7 @@ impl MediaProcessor for MockMediaProcessor {
 
     fn process(&self, request: MediaRequest) -> BoxFuture<Result<ProcessedMedia, MediaError>> {
         self.requests.lock().unwrap().push(request);
+        self.started.lock().unwrap().push(Instant::now());
         let outcome = self.outcome.lock().unwrap().clone();
         let delay = self.delay;
         Box::pin(async move {
@@ -2054,13 +2070,7 @@ async fn media_processor_errors_map_to_statuses() {
 /// retryable refusal.
 #[tokio::test]
 async fn media_processing_is_capped_and_sheds_beyond_the_cap() {
-    let processor = Arc::new(MockMediaProcessor {
-        outcome: Mutex::new(Ok(processed_media())),
-        requests: Mutex::new(Vec::new()),
-        delay: Duration::from_millis(1500),
-        probe_ok: AtomicBool::new(true),
-        max_inflight: 1,
-    });
+    let processor = MockMediaProcessor::slow(Ok(processed_media()), Duration::from_millis(1500), 1);
     let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
     let request = |id: &str| {
         let mut request = generate_request(id, true, Vec::new());
@@ -2182,5 +2192,106 @@ async fn server_info_advertises_a_serving_media_processor() {
         .unwrap()
         .into_inner();
     assert_eq!(info.mm_processor, "");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+fn media_request(id: &str) -> vllm::GenerateRequest {
+    let mut request = generate_request(id, true, Vec::new());
+    request.media_refs = Some(media_refs(&["https://example.com/x.png"]));
+    request
+}
+
+/// A caller that gives up while queued behind the cap leaves no phantom
+/// waiter behind: the next request is admitted, not shed.
+#[tokio::test]
+async fn a_cancelled_wait_frees_its_place_in_the_queue() {
+    let processor = MockMediaProcessor::slow(Ok(processed_media()), Duration::from_millis(1500), 1);
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    let mut first_client = h.client.clone();
+    let mut second_client = h.client.clone();
+    let (first, (), third) = tokio::join!(
+        first_client.generate(media_request("mr14")),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Queued behind the one slot, then abandoned mid-wait.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(100),
+                second_client.generate(media_request("mr15")),
+            )
+            .await;
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            h.client.generate(media_request("mr16")).await
+        },
+    );
+    let _first = first.expect("first admitted");
+    let _third = third.expect("admitted once the cancelled waiter left the queue");
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(recv_add(&mut h.engine_in).await.request_id);
+    }
+    ids.sort();
+    assert_eq!(ids, vec!["mr14".to_string(), "mr16".to_string()]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A caller that gives up mid-processing does not free the slot early: the
+/// processor finishes first, so the cap bounds the work actually in flight.
+#[tokio::test]
+async fn an_abandoned_request_keeps_its_slot_until_the_processor_finishes() {
+    let processor = MockMediaProcessor::slow(Ok(processed_media()), Duration::from_millis(1200), 1);
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    let mut first_client = h.client.clone();
+    let ((), second) = tokio::join!(
+        async {
+            // Abandoned at 200 ms; the processor runs on until 1200 ms.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(200),
+                first_client.generate(media_request("mr17")),
+            )
+            .await;
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            h.client.generate(media_request("mr18")).await
+        },
+    );
+    let _second = second.expect("admitted");
+    let started = processor.started();
+    assert_eq!(started.len(), 2);
+    assert!(
+        started[1].duration_since(started[0]) >= Duration::from_millis(1100),
+        "the second request waited for the abandoned slot: {:?}",
+        started[1].duration_since(started[0])
+    );
+    // Only the request whose caller stayed reached the engine.
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "mr18");
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A PD decode leg abandoned while its media is still being fetched sends
+/// the rejection notice all the same, as the Python servicer shields it
+/// through cancellation.
+#[tokio::test]
+async fn a_cancelled_decode_leg_still_notifies_the_engine() {
+    let processor = MockMediaProcessor::slow(Ok(processed_media()), Duration::from_millis(1500), 4);
+    let mut h = harness_with(model_info(), None, Some(processor)).await;
+    let mut request = media_request("mr19");
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+    let _ = tokio::time::timeout(Duration::from_millis(200), h.client.generate(request)).await;
+    let notice = recv_add(&mut h.engine_in).await;
+    assert_eq!(notice.request_id, "mr19");
+    assert!(notice.abort_immediately);
+    assert_eq!(
+        notice
+            .sampling_params
+            .expect("sampling params")
+            .extra_args
+            .expect("extra_args")["kv_transfer_params"]["remote_block_ids"],
+        serde_json::json!([3])
+    );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

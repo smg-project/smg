@@ -457,11 +457,18 @@ async def serve_rust(args: argparse.Namespace) -> int:
         handshake_port,
         data_parallel_size,
     )
-    engine = launch_headless_engine(
-        headless_namespace(
-            args, handshake_port=handshake_port, data_parallel_size=data_parallel_size
+    try:
+        engine = launch_headless_engine(
+            headless_namespace(
+                args, handshake_port=handshake_port, data_parallel_size=data_parallel_size
+            )
         )
-    )
+    except BaseException:
+        # The server owns the port and a runtime thread; a launch that fails
+        # must not leave them to the process exit.
+        server.set_serving(False)
+        await asyncio.to_thread(server.stop, 5.0)
+        raise
     logger.info("Launched the headless engine (pid %s)", engine.pid)
     if media is not None:
         media.start_warmup()

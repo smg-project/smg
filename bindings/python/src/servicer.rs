@@ -55,7 +55,9 @@ pub fn init_servicer_tracing(level: Option<&str>) -> PyResult<()> {
 struct PythonMediaProcessor {
     bridge: Arc<Py<PyAny>>,
     name: String,
-    schemes: String,
+    /// The schemes the backend accepts, as of its last probe (a sidecar
+    /// announces its own set when it answers).
+    schemes: Arc<Mutex<String>>,
     source: String,
     max_inflight: usize,
 }
@@ -64,7 +66,7 @@ impl PythonMediaProcessor {
     fn new(bridge: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
             name: bridge.getattr("name")?.extract()?,
-            schemes: bridge.getattr("schemes")?.extract()?,
+            schemes: Arc::new(Mutex::new(bridge.getattr("schemes")?.extract()?)),
             source: bridge.getattr("source")?.extract()?,
             max_inflight: bridge.getattr("max_inflight")?.extract()?,
             bridge: Arc::new(bridge.clone().unbind()),
@@ -89,8 +91,11 @@ impl MediaProcessor for PythonMediaProcessor {
         &self.name
     }
 
-    fn schemes(&self) -> &str {
-        &self.schemes
+    fn schemes(&self) -> String {
+        self.schemes
+            .lock()
+            .map(|schemes| schemes.clone())
+            .unwrap_or_default()
     }
 
     fn source(&self) -> &str {
@@ -103,6 +108,7 @@ impl MediaProcessor for PythonMediaProcessor {
 
     fn probe(&self) -> BoxFuture<bool> {
         let bridge = Arc::clone(&self.bridge);
+        let schemes = Arc::clone(&self.schemes);
         Box::pin(async move {
             let (tx, rx) = oneshot::channel();
             let scheduled = Self::call_bridge(bridge, move |py, bridge| {
@@ -117,7 +123,15 @@ impl MediaProcessor for PythonMediaProcessor {
             })
             .await;
             match scheduled {
-                Ok(()) => rx.await.unwrap_or(false),
+                Ok(()) => match rx.await {
+                    Ok((serving, announced)) => {
+                        if let (Some(announced), Ok(mut schemes)) = (announced, schemes.lock()) {
+                            *schemes = announced;
+                        }
+                        serving
+                    }
+                    Err(_) => false,
+                },
                 Err(error) => {
                     tracing::warn!(error, "media processor probe could not be scheduled");
                     false
@@ -177,12 +191,12 @@ fn bytes_of(value: &Bound<'_, PyBytes>) -> Bytes {
     Bytes::copy_from_slice(value.as_bytes())
 }
 
-/// Memory lent by Python without a copy: `_owner` (a numpy view over the
-/// tensor's storage) keeps it alive for as long as these bytes exist, and
-/// nothing writes to it in the meantime. The buffer protocol is not part of
-/// the limited API this extension builds against, so Python hands over the
-/// address and length itself. Dropped off a Python thread, the owner's
-/// reference is released on the next GIL acquisition.
+/// Memory lent by Python without a copy: `_owner` (a read-only numpy view
+/// over the request's own tensor storage) keeps it alive for as long as these
+/// bytes exist, and nothing writes to it in the meantime. The buffer protocol
+/// is not part of the limited API this extension builds against, so the
+/// range is read off the view itself. Dropped off a Python thread, the
+/// owner's reference is released on the next GIL acquisition.
 struct PyBacked {
     _owner: Py<PyAny>,
     ptr: *const u8,
@@ -217,27 +231,36 @@ impl AsRef<[u8]> for PyBacked {
     }
 }
 
-/// An aux frame as Python lends it: the owner, its address, its length.
-type LentFrame = (Py<PyAny>, usize, usize);
-
-/// The `ok` payload: prompt ids, the encoded features, the lent frames, the
-/// cache salt, the serialized identity.
+/// The `ok` payload: prompt ids, the encoded features, the lent frames (one
+/// numpy view each), the cache salt, the serialized identity.
 type OkPayload<'py> = (
     Vec<u32>,
     Option<Bound<'py, PyBytes>>,
-    Vec<LentFrame>,
+    Vec<Bound<'py, PyAny>>,
     Option<String>,
     Option<Bound<'py, PyBytes>>,
 );
 
-/// A lent frame as zero-copy bytes.
-fn lent_bytes(frame: LentFrame) -> PyResult<Bytes> {
-    let (owner, address, len) = frame;
+/// A lent frame as zero-copy bytes. The range is read off the view itself,
+/// never taken from the caller: an address that did not belong to `owner`
+/// would be read out of bounds on a runtime thread. The view must be
+/// C-contiguous and read-only (the latter is the owner's promise that no
+/// Python write races the send).
+fn lent_bytes(owner: Bound<'_, PyAny>) -> PyResult<Bytes> {
+    let flags = owner.getattr("flags")?;
+    if !flags.getattr("c_contiguous")?.extract::<bool>()? {
+        return Err(PyValueError::new_err("a lent buffer must be C-contiguous"));
+    }
+    if flags.getattr("writeable")?.extract::<bool>()? {
+        return Err(PyValueError::new_err("a lent buffer must be read-only"));
+    }
+    let address: usize = owner.getattr("ctypes")?.getattr("data")?.extract()?;
+    let len: usize = owner.getattr("nbytes")?.extract()?;
     if address == 0 && len > 0 {
         return Err(PyValueError::new_err("a lent buffer has no address"));
     }
     Ok(Bytes::from_owner(PyBacked {
-        _owner: owner,
+        _owner: owner.unbind(),
         ptr: address as *const u8,
         len,
     }))
@@ -245,9 +268,9 @@ fn lent_bytes(frame: LentFrame) -> PyResult<Bytes> {
 
 /// Python's answer to one media request, called once: `("ok",
 /// (prompt_token_ids, mm_features | None, aux_frames, cache_salt | None,
-/// media_identity | None))` where each aux frame is `(owner, address,
-/// nbytes)` lent without a copy, or `(kind, message)` with `kind` one of
-/// `invalid`, `unavailable`, `internal`.
+/// media_identity | None))` where each aux frame is a read-only numpy view
+/// lent without a copy, or `(kind, message)` with `kind` one of `invalid`,
+/// `unavailable`, `internal`.
 #[pyclass(name = "_MediaDone")]
 struct MediaDone {
     tx: Mutex<Option<oneshot::Sender<Result<ProcessedMedia, MediaError>>>>,
@@ -288,22 +311,27 @@ impl MediaDone {
     }
 }
 
-/// Python's answer to a probe, called once with whether the processor serves.
+/// What a probe answers: whether the processor serves and, when it knows
+/// them, the schemes it accepts now.
+type ProbeAnswer = (bool, Option<String>);
+
+/// Python's answer to a probe, called once.
 #[pyclass(name = "_ProbeDone")]
 struct ProbeDone {
-    tx: Mutex<Option<oneshot::Sender<bool>>>,
+    tx: Mutex<Option<oneshot::Sender<ProbeAnswer>>>,
 }
 
 #[pymethods]
 impl ProbeDone {
-    fn __call__(&self, serving: bool) -> PyResult<()> {
+    #[pyo3(signature = (serving, schemes = None))]
+    fn __call__(&self, serving: bool, schemes: Option<String>) -> PyResult<()> {
         let sender = self
             .tx
             .lock()
             .map_err(|_| PyRuntimeError::new_err("probe completion poisoned"))?
             .take();
         if let Some(sender) = sender {
-            let _ = sender.send(serving);
+            let _ = sender.send((serving, schemes));
         }
         Ok(())
     }

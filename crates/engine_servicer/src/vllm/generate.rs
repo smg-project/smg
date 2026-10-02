@@ -63,31 +63,79 @@ pub(super) async fn generate(
         return Err(Status::invalid_argument("request_id is required"));
     }
     // A PD decode leg refused before admission must still release the blocks
-    // its prefill side pinned, as vLLM's own frontend does.
-    let rejection = kv_transfer_rejection_params(&req).map(|params| {
-        (
-            req.request_id.clone(),
-            params,
-            req.data_parallel_rank
-                .and_then(|rank| u32::try_from(rank).ok()),
-        )
+    // its prefill side pinned, as vLLM's own frontend does. Armed until
+    // admission: a caller that gives up on the way (a media fetch can take
+    // seconds) drops this future, and the notice must still go out, as the
+    // Python servicer shields it through cancellation.
+    let mut notice = kv_transfer_rejection_params(&req).map(|params| RejectionNotice {
+        client: client.clone(),
+        request_id: req.request_id.clone(),
+        params: Some(params),
+        rank: req
+            .data_parallel_rank
+            .and_then(|rank| u32::try_from(rank).ok()),
     });
     match submit(state, client, req).await {
-        Ok(stream) => Ok(stream),
+        Ok(stream) => {
+            if let Some(notice) = notice.as_mut() {
+                notice.disarm();
+            }
+            Ok(stream)
+        }
         Err(status) => {
+            let Some(mut notice) = notice else {
+                return Err(status);
+            };
+            let params = notice.disarm();
             // A duplicate id names a request that is still live; a notice
             // under that id would reuse it (and, past an `n > 1` fan-out,
             // get in and free the live leg's blocks).
             if status.code() == tonic::Code::AlreadyExists {
                 return Err(status);
             }
-            if let Some((request_id, params, rank)) = rejection {
+            if let Some(params) = params {
                 client
-                    .notify_kv_transfer_rejected(&request_id, params, rank)
+                    .notify_kv_transfer_rejected(&notice.request_id, params, notice.rank)
                     .await;
             }
             Err(status)
         }
+    }
+}
+
+/// The rejection notice a refused PD decode leg owes its prefill side, sent
+/// on drop unless disarmed: a refusal sends it inline, a caller that gives up
+/// before admission sends it from here.
+struct RejectionNotice {
+    client: ZmqEngineClient,
+    request_id: String,
+    params: Option<serde_json::Value>,
+    rank: Option<u32>,
+}
+
+impl RejectionNotice {
+    fn disarm(&mut self) -> Option<serde_json::Value> {
+        self.params.take()
+    }
+}
+
+impl Drop for RejectionNotice {
+    fn drop(&mut self) {
+        let Some(params) = self.params.take() else {
+            return;
+        };
+        let client = self.client.clone();
+        let request_id = std::mem::take(&mut self.request_id);
+        let rank = self.rank;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the notice outlives the cancelled request; it ends with the engine's answer"
+        )]
+        tokio::spawn(async move {
+            client
+                .notify_kv_transfer_rejected(&request_id, params, rank)
+                .await;
+        });
     }
 }
 

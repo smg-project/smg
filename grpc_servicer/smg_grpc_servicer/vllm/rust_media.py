@@ -30,6 +30,7 @@ from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import MediaRefItem, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
+    MODE_INPROCESS,
     MODE_OFF,
     MmProcessorUnavailable,
     MmSettings,
@@ -47,16 +48,19 @@ KIND_INTERNAL = "internal"
 _RETRYABLE_CODES = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.RESOURCE_EXHAUSTED)
 
 
-def lend_buffer(buffer: Any) -> tuple[Any, int, int]:
+def lend_buffer(buffer: Any) -> Any:
     """A tensor-storage buffer (the encoder's zero-copy aux frame, a uint8
-    memoryview) lent to Rust without a copy: the numpy view that keeps the
-    storage alive, its address, and its length. The binding builds against
-    Python's limited API, which has no buffer protocol, so the address
-    crosses explicitly."""
+    memoryview) lent to Rust without a copy: a read-only, C-contiguous numpy
+    view that keeps the storage alive; Rust reads the range off the view. The
+    storage is the request's own (vLLM's processor built it for this request
+    and nothing else refers to it), which is what makes lending it sound. The
+    binding builds against Python's limited API, which has no buffer protocol,
+    hence the view rather than the buffer itself."""
     import numpy as np
 
     view = np.ascontiguousarray(np.frombuffer(buffer, dtype=np.uint8))
-    return view, int(view.ctypes.data), int(view.nbytes)
+    view.setflags(write=False)
+    return view
 
 
 class _EngineView:
@@ -91,9 +95,14 @@ class RustMediaBridge:
         self._sampling_params = sampling_params
         self._supported_tasks = supported_tasks
         self.name: str = processor.name
-        self.schemes: str = processor.schemes
         self.source: str = source
         self.max_inflight: int = int(processor.max_inflight)
+
+    @property
+    def schemes(self) -> str:
+        """The schemes the processor accepts now; a sidecar announces its own
+        set when probed, so this is read after each probe."""
+        return self._processor.schemes
 
     @classmethod
     def build(
@@ -139,8 +148,11 @@ class RustMediaBridge:
         otherwise pay the processor's JIT and cache priming (seconds of CPU)
         on the serving path. Queued on the renderer's single-worker executor,
         so it never overlaps a request."""
+        if self.name != MODE_INPROCESS:
+            return  # the sidecar runs the processor; nothing here would use the warmup
         start = getattr(self._renderer, "start_mm_warmup_in_background", None)
         if start is None:
+            logger.debug("renderer has no start_mm_warmup_in_background; skipping the warmup")
             return
         try:
             start()
@@ -149,8 +161,9 @@ class RustMediaBridge:
 
     # -- the protocol Rust drives ------------------------------------------
 
-    def probe(self, done: Callable[[bool], None]) -> None:
-        """Ask the processor whether it serves; ``done(bool)`` answers."""
+    def probe(self, done: Callable[[bool, str], None]) -> None:
+        """Ask the processor whether it serves; ``done(serving, schemes)``
+        answers with the schemes it accepts as of this probe."""
 
         def finish(future: Future) -> None:
             try:
@@ -158,7 +171,7 @@ class RustMediaBridge:
             except Exception as e:  # noqa: BLE001 - a failing probe means "not serving"
                 logger.warning("media processor probe failed: %s", e)
                 serving = False
-            done(serving)
+            done(serving, self.schemes)
 
         self._schedule(self._processor.probe(), finish)
 
@@ -194,7 +207,7 @@ class RustMediaBridge:
         items: Sequence[tuple[str, str]],
         arrival_time: float,
         want_identity: bool,
-    ) -> tuple[list[int], bytes | None, list[tuple[Any, int, int]], str | None, bytes | None]:
+    ) -> tuple[list[int], bytes | None, list[Any], str | None, bytes | None]:
         refs = [MediaRefItem(modality=modality, url=url) for modality, url in items]
         validate_schemes(refs, self._processor.accepted_schemes)
         engine_input = await self._processor.process(
@@ -212,7 +225,7 @@ class RustMediaBridge:
             arrival_time=arrival_time,
         )
         mm_features: bytes | None = None
-        aux_frames: list[tuple[Any, int, int]] = []
+        aux_frames: list[Any] = []
         if core.mm_features:
             buffers = self._encoder.encode(core.mm_features)
             mm_features = bytes(buffers[0])
