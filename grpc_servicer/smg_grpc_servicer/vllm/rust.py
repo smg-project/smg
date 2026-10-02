@@ -18,11 +18,12 @@ Upstream integration is one check at the top of its ``serve_grpc``::
     if resolve_servicer_impl(args) == "rust":
         raise SystemExit(await serve_rust(args))
 
-Rust mode serves text generation, including PD disaggregation (connector
-KV-transfer params pass through both ways and ``GetServerInfo`` carries the
-pairing identity). ``Embed``, ``FlushCache``, ``GetTokenizer``,
-``SubscribeKvEvents`` and worker-side media processing (``media_refs``)
-answer UNIMPLEMENTED there; the Python implementation stays the default.
+Rust mode serves the whole contract but one piece: text generation, PD
+disaggregation (connector KV-transfer params pass through both ways and
+``GetServerInfo`` carries the pairing identity), Router-preprocessed media,
+``Embed``, ``FlushCache``, ``GetTokenizer`` and ``SubscribeKvEvents``.
+Worker-side media processing (``media_refs``) answers UNIMPLEMENTED there;
+the Python implementation stays the default.
 """
 
 from __future__ import annotations

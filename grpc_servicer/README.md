@@ -158,14 +158,17 @@ vLLM without the hook fails loudly instead of silently running Python. The
 headless engine is launched from the parsed namespace through vLLM's own
 `run_headless`, so both entrypoints above work unchanged.
 
-Rust mode needs the `smg` wheel (for the binding) and serves text generation,
-including PD disaggregation (`--kv-transfer-config`: connector params pass
-through both ways and `GetServerInfo` carries the pairing identity). `Embed`,
-`FlushCache`, `GetTokenizer`, `SubscribeKvEvents` and worker-side media
-processing (`media_refs`) answer UNIMPLEMENTED there, so keep the Python
-implementation for those. Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT`
-(default: a free port), `SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
-`SMG_ZMQ_SOCKET_DIR`.
+Rust mode needs the `smg` wheel (for the binding) and serves the contract the
+Python servicer serves, with one exception: text generation, PD disaggregation
+(`--kv-transfer-config`: connector params pass through both ways and
+`GetServerInfo` carries the pairing identity), Router-preprocessed media
+(inline and `/dev/shm` tensors), `Embed`, `FlushCache`, `GetTokenizer` and
+`SubscribeKvEvents` (`--kv-events-config` with the ZMQ publisher). Worker-side
+media processing (`media_refs`, the in-process and Redis processors) answers
+UNIMPLEMENTED there, so keep the Python implementation for that. Tuning:
+`SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
+`SMG_VLLM_SERVICER_DRAIN_SECS` (default 5), `SMG_ZMQ_SOCKET_DIR`,
+`SMG_SERVICER_WORKER_THREADS` (default 4).
 
 ### MLX
 

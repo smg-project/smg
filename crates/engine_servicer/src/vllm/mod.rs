@@ -13,10 +13,11 @@
 //! params pass through to the engine and back, and `GetServerInfo` carries
 //! the connector, role, engine id and pairing facts the Router matches on.
 //!
-//! Not served yet (answered `UNIMPLEMENTED`): `Embed`, `FlushCache`,
-//! `GetTokenizer`, `SubscribeKvEvents`, and worker-side media processing
-//! (`media_refs`). Those stay with the Python servicer until the ZMQ client
-//! grows the paths.
+//! `Embed`, `FlushCache` (a ZMQ utility call), `GetTokenizer` (the tokenizer
+//! directory zipped as the Python servicer zips it) and `SubscribeKvEvents`
+//! (vLLM's ZMQ KV-event publisher relayed) are served too. Not served yet
+//! (answered `UNIMPLEMENTED`): worker-side media processing (`media_refs`),
+//! which stays with the Python servicer's media processors.
 
 mod admin;
 mod embed;
