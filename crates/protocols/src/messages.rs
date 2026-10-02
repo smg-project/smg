@@ -721,6 +721,9 @@ pub struct CustomTool {
     pub cache_control: Option<CacheControl>,
 }
 
+// The maps keep the client's key order: the schema is rendered into the
+// prompt, so a reordered schema changes the prompt (and its prefix-cache key)
+// from one request to the next.
 /// JSON Schema for tool input
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -728,13 +731,13 @@ pub struct InputSchema {
     #[serde(rename = "type")]
     pub schema_type: String,
 
-    pub properties: Option<HashMap<String, Value>>,
+    pub properties: Option<Map<String, Value>>,
 
     pub required: Option<Vec<String>>,
 
     /// Additional properties can be stored here
     #[serde(flatten)]
-    pub additional: HashMap<String, Value>,
+    pub additional: Map<String, Value>,
 }
 
 /// Bash tool for computer use
@@ -2074,7 +2077,7 @@ mod tests {
                 schema_type: "object".to_string(),
                 properties: None,
                 required: None,
-                additional: HashMap::new(),
+                additional: Map::new(),
             },
             defer_loading: None,
             cache_control: None,
@@ -2498,6 +2501,51 @@ mod tests {
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[1].role, Role::System); // preserved in place
+    }
+
+    #[test]
+    fn tool_input_schema_keeps_the_clients_key_order() {
+        // More keys than a hash map would keep in order by chance.
+        let names = [
+            "zeta", "alpha", "mu", "beta", "omega", "delta", "kappa", "gamma",
+        ];
+        let properties: Map<String, Value> = names
+            .iter()
+            .map(|name| (name.to_string(), json!({"type": "string"})))
+            .collect();
+        let schema = json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["mu", "alpha"],
+            "title": "Lookup",
+            "additionalProperties": false,
+            "$defs": {}
+        });
+        let body = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "lookup", "input_schema": schema}]
+        });
+        let req: CreateMessageRequest = serde_json::from_value(body).unwrap();
+        let Some(Tool::Custom(tool)) = req.tools.as_ref().and_then(|tools| tools.first()) else {
+            panic!("expected a custom tool");
+        };
+        let keys: Vec<&str> = tool
+            .input_schema
+            .properties
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, names);
+        // Serialized again, as for a passthrough upstream, the schema is the
+        // client's, byte for byte.
+        assert_eq!(
+            serde_json::to_string(&tool.input_schema).unwrap(),
+            serde_json::to_string(&schema).unwrap()
+        );
     }
 
     #[test]
