@@ -439,6 +439,12 @@ message GetServerInfoResponse {
   // --mm-processor), "env" (SMG_VLLM_MM_PROCESSOR) or "default"; "" when
   // mm_processor is empty. Flattened into the `mm_processor_source` label.
   string mm_processor_source = 18;
+
+  // Whether the engine rescales and normalizes pixels on device
+  // (`mm_device_do_normalize`, where the model supports it). It then takes
+  // the pixels' own `uint8` bytes and would normalize anything else twice.
+  // Flattened into the `mm_device_do_normalize` worker label.
+  bool mm_device_do_normalize = 19;
 }
 
 // =====================

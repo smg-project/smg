@@ -64,7 +64,11 @@ from smg_grpc_servicer.vllm.mm_salt import (
     mm_identity_cache_salt,
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
-from smg_grpc_servicer.vllm.model_info import model_facts, server_facts
+from smg_grpc_servicer.vllm.model_info import (
+    mm_device_do_normalize,
+    model_facts,
+    server_facts,
+)
 
 from .mm_keys import (
     batches_missing_pixels,
@@ -674,6 +678,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # proto package predating the field simply leaves it out.
         if mm_processor and "mm_processor_source" in info.DESCRIPTOR.fields_by_name:
             info.mm_processor_source = self._mm_settings.source
+        # Whether pixels are normalized on device, so the Router sends this
+        # engine raw pixels; likewise absent from an older proto package.
+        if "mm_device_do_normalize" in info.DESCRIPTOR.fields_by_name:
+            info.mm_device_do_normalize = mm_device_do_normalize(self.engine.vllm_config)
         return info
 
     async def GetLoads(

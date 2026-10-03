@@ -12,12 +12,14 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use llm_multimodal::{
-    MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart, Modality,
-    ModelMetadata, ModelRegistry, MultiModalError, VisionProcessorRegistry,
+    configure_parallelism, MediaConnector, MediaConnectorConfig, MediaConnectorError,
+    MediaContentPart, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
+    VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::vllm_proto as vllm;
+use tracing::warn;
 
 use super::{
     assemble::{assemble_vllm_batches_with, VllmAssembly},
@@ -35,10 +37,6 @@ const CONFIG_KEY: &str = "worker";
 
 /// The URL schemes the pipeline fetches: what the Router forwards by reference.
 pub const SCHEMES: &str = "http,https,data";
-
-/// Specs whose vision processors honour `do_rescale=false` and
-/// `do_normalize=false`, and so can emit raw pixels.
-const RAW_PIXEL_SPECS: &[&str] = &["qwen_vl", "qwen3_vl"];
 
 /// How pixels are written for the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,11 +121,27 @@ pub struct WorkerMediaPipeline {
 impl WorkerMediaPipeline {
     /// Load the model's configs, resolve its spec and check the pixel format
     /// against it. Fails for a model the pipeline does not support, and for
-    /// `RawU8` on a processor that cannot emit raw pixels.
+    /// `RawU8` on a processor that produces normalized floats, not pixels.
     pub async fn new(
         settings: WorkerMediaSettings,
         tokenizer: Arc<dyn TokenizerTrait>,
     ) -> anyhow::Result<Self> {
+        // The servicer runs requests concurrently already, so each request's
+        // preprocessing stays on its own thread unless an operator sized a pool.
+        let parallelism = if std::env::var_os(POOL_THREADS_ENV).is_some() {
+            Parallelism::default_pool()
+        } else {
+            Parallelism::Inline
+        };
+        if let Err(in_force) = configure_parallelism(parallelism) {
+            if in_force != parallelism {
+                warn!(
+                    ?in_force,
+                    ?parallelism,
+                    "multimodal preprocessing parallelism was configured before this pipeline"
+                );
+            }
+        }
         let config_registry = Arc::new(MultimodalConfigRegistry::new());
         let loaded = config_registry
             .get_or_load(CONFIG_KEY, &settings.model_dir)
@@ -150,23 +164,18 @@ impl WorkerMediaPipeline {
                     )
                 })?
         };
+        let vision_processor_registry = Arc::new(VisionProcessorRegistry::with_defaults());
         if settings.pixel_format == PixelFormat::RawU8 {
+            let model_type = loaded.config.get("model_type").and_then(|v| v.as_str());
+            let emits_pixel_bytes = vision_processor_registry
+                .find(&settings.model_id, model_type)
+                .is_some_and(|processor| processor.emits_pixel_bytes());
             anyhow::ensure!(
-                RAW_PIXEL_SPECS.contains(&spec_name),
-                "the {spec_name} processor cannot emit the raw pixels an engine that normalizes \
-                 on device takes; start the engine with --mm-device-do-normalize=false or use \
-                 --mm-processor inprocess"
+                emits_pixel_bytes,
+                "the {spec_name} processor produces normalized floats, not the raw pixels an \
+                 engine that normalizes on device takes; start the engine with \
+                 --mm-device-do-normalize=false or use --mm-processor inprocess"
             );
-            // Raw pixels are the processors' own output with both steps off;
-            // the registry hands out this config on every request.
-            let mut raw = (*loaded).clone();
-            for config in std::iter::once(&mut raw.preprocessor_config)
-                .chain(raw.video_preprocessor_config.as_mut())
-            {
-                config.do_rescale = Some(false);
-                config.do_normalize = Some(false);
-            }
-            config_registry.insert(CONFIG_KEY.to_string(), Arc::new(raw));
         }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -183,7 +192,7 @@ impl WorkerMediaPipeline {
         .context("building the media connector")?;
         let components = MultimodalComponents {
             media_connector: Arc::new(connector),
-            vision_processor_registry: Arc::new(VisionProcessorRegistry::with_defaults()),
+            vision_processor_registry,
             model_registry,
             config_registry,
             pixel_cache: pixel_cache_with_budget(mm_settings().pixel_cache_mb.value),
@@ -194,17 +203,14 @@ impl WorkerMediaPipeline {
             processing: MmProcessingMode::Worker,
             inflight: None,
         };
-        let encoder_dtype = match settings.pixel_format {
-            PixelFormat::RawU8 => "uint8".to_string(),
-            PixelFormat::Normalized => settings.encoder_dtype,
-        };
         Ok(Self {
             components,
             model_id: settings.model_id,
             model_dir: settings.model_dir,
             tokenizer,
             assembly: VllmAssembly {
-                encoder_dtype,
+                encoder_dtype: settings.encoder_dtype,
+                device_normalizes: settings.pixel_format == PixelFormat::RawU8,
                 // In-process: the batches never leave this process as protos.
                 shm_enabled: false,
                 shm_min_bytes: usize::MAX,

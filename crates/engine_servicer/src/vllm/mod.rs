@@ -123,6 +123,10 @@ pub struct VllmModelInfo {
     /// `use_activation` and `dimensions`.
     pub pooler_use_activation: Option<bool>,
     pub pooler_dimensions: Option<u32>,
+    /// Whether the engine rescales and normalizes pixels on device (vLLM's
+    /// `mm_device_do_normalize`, where the model supports it): advertised so
+    /// the Router sends such an engine the pixels' own bytes.
+    pub mm_device_do_normalize: bool,
 }
 
 /// How to bind, where the engine dials in, and what to advertise.

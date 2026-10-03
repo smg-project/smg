@@ -46,6 +46,7 @@ from typing import Any
 
 from smg_grpc_servicer.vllm.model_info import (
     eos_token_ids_with_generation_config,
+    mm_device_do_normalize,
     model_facts,
     server_facts,
 )
@@ -109,6 +110,7 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
             bool(pooler_use_activation) if pooler_use_activation is not None else None
         ),
         "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
+        "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
     }
 
 
@@ -135,12 +137,11 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         if os.path.isfile(os.path.join(model_path, "config.json"))
         else tokenizer_dir or model_path
     )
-    mm_config = getattr(model_config, "multimodal_config", None)
     dtype = str(getattr(model_config, "dtype", "") or "").removeprefix("torch.")
     return {
         "model_dir": model_dir,
         "model_id": model_path,
-        "raw_pixels": bool(getattr(mm_config, "mm_device_do_normalize", False)),
+        "raw_pixels": mm_device_do_normalize(vllm_config),
         "encoder_dtype": dtype or "float32",
         "max_inflight": settings.max_inflight,
         "max_items": settings.max_items,

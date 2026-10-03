@@ -11,10 +11,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use llm_multimodal::{
-    EncoderFieldLayouts, FieldLayout, Modality, ModelSpecificValue, PlaceholderRange,
-    PreprocessedEncoderInputs,
+    EncoderFieldLayouts, EncoderInputView, FieldLayout, Modality, ModelSpecificValue,
+    PlaceholderRange, PreprocessedEncoderInputs,
 };
-use ndarray::ArrayViewD;
 use smg_grpc_client::common_proto as common;
 use tracing::{info, warn};
 
@@ -22,12 +21,12 @@ use super::{
     capability::ensure_backend_supports_modalities,
     log_mm_timing_enabled,
     serialize::{
-        model_specific_to_tensor_bytes, serialize_array_as_tokenspeed_tensor,
-        serialize_encoder_input, serialize_model_specific, slice_array_axis0,
+        model_specific_to_tensor_bytes, serialize_encoder_input, serialize_model_specific,
+        serialize_tokenspeed_encoder_input,
     },
     transport::{
-        mm_encoder_input_dtype, mm_vllm_encoder_input_dtype, resolve_mm_shm_enabled,
-        resolve_mm_shm_min_bytes,
+        mm_encoder_input_dtype, mm_vllm_device_normalizes, mm_vllm_encoder_input_dtype,
+        resolve_mm_shm_enabled, resolve_mm_shm_min_bytes,
     },
     MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate, PromptBinding,
 };
@@ -215,9 +214,12 @@ fn assemble_vllm_batches(
 /// media names them directly (inline, in the engine's dtype).
 #[derive(Debug, Clone)]
 pub(super) struct VllmAssembly {
-    /// The dtype the primary tensor is written in (`float32`, `bfloat16`,
-    /// `float16`, or `uint8` for raw pixels).
+    /// The float dtype the primary tensor is written in (`float32`,
+    /// `bfloat16`, `float16`).
     pub encoder_dtype: String,
+    /// The engine rescales and normalizes pixels on device: it takes the
+    /// pixels' own `uint8` bytes and would normalize floats twice.
+    pub device_normalizes: bool,
     pub shm_enabled: bool,
     pub shm_min_bytes: usize,
 }
@@ -226,6 +228,7 @@ impl VllmAssembly {
     fn for_selection(workers: Option<&WorkerSelection>) -> Self {
         Self {
             encoder_dtype: mm_vllm_encoder_input_dtype(workers),
+            device_normalizes: mm_vllm_device_normalizes(workers),
             shm_enabled: resolve_mm_shm_enabled(workers, false),
             shm_min_bytes: resolve_mm_shm_min_bytes(workers),
         }
@@ -304,12 +307,38 @@ fn assemble_sglang(
     })
 }
 
+/// The dtype the primary tensor is written in: the engine's own float dtype,
+/// or the pixels' own bytes for an engine that normalizes on device. A
+/// preprocessor that produces normalized floats has no bytes to give such an
+/// engine, which is a deployment mismatch, said once.
+fn vllm_pixel_dtype<'a>(
+    preprocessed: &PreprocessedEncoderInputs,
+    assembly: &'a VllmAssembly,
+) -> &'a str {
+    if !assembly.device_normalizes {
+        return &assembly.encoder_dtype;
+    }
+    if preprocessed.encoder_input.pixel_norm().is_some() {
+        return "uint8";
+    }
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        warn!(
+            "the engine normalizes pixels on device but this model's preprocessor produces \
+             normalized floats, which the engine will normalize again; start the engine with \
+             --mm-device-do-normalize=false"
+        );
+    });
+    &assembly.encoder_dtype
+}
+
 fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
     assembly: &VllmAssembly,
 ) -> Result<VllmMultimodalData> {
+    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly);
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
-        serialize_encoder_input(&intermediate.preprocessed, &assembly.encoder_dtype);
+        serialize_encoder_input(&intermediate.preprocessed, dtype);
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let (modality, mm_hashes) = match &intermediate.media {
         MediaBatch::Images(images) => (
@@ -494,7 +523,7 @@ fn assemble_tokenspeed_with_options(
                     return Err(error);
                 }
             };
-            serialize_array_as_tokenspeed_tensor(
+            serialize_tokenspeed_encoder_input(
                 &item_encoder_input,
                 &encoder_input_dtype,
                 shm_enabled,
@@ -779,13 +808,14 @@ fn encoder_input_for_item<'a>(
     preprocessed: &'a PreprocessedEncoderInputs,
     layout: &FieldLayout,
     item_index: usize,
-) -> Result<ArrayViewD<'a, f32>> {
+) -> Result<EncoderInputView<'a>> {
+    let input = preprocessed.encoder_input.view();
     match layout {
-        FieldLayout::Batched => slice_array_axis0(&preprocessed.encoder_input, item_index, 1),
+        FieldLayout::Batched => input.slice_axis0(item_index, 1),
         FieldLayout::Flat { sizes_key } => {
             let sizes = tensor_sizes_from_model_specific(&preprocessed.model_specific, sizes_key)?;
             let (start, len) = item_span(&sizes, item_index)?;
-            slice_array_axis0(&preprocessed.encoder_input, start, len)
+            input.slice_axis0(start, len)
         }
     }
 }
@@ -1037,7 +1067,8 @@ mod tests {
                 IxDyn(&[4, 2]),
                 vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             feature_token_counts: vec![2, 2],
             item_sizes: vec![(1, 1), (1, 1)],
             model_specific,
@@ -1154,7 +1185,8 @@ mod tests {
         PrecomputedMultimodalIntermediate {
             preprocessed: PreprocessedEncoderInputs {
                 encoder_input: ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 2.0, 3.0, 4.0])
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 feature_token_counts: vec![2],
                 item_sizes: vec![(1, 1)],
                 model_specific,
@@ -1266,7 +1298,9 @@ mod tests {
         );
 
         let preprocessed = PreprocessedEncoderInputs {
-            encoder_input: ArrayD::from_shape_vec(IxDyn(&[4, 2]), vec![1.0; 8]).unwrap(),
+            encoder_input: ArrayD::from_shape_vec(IxDyn(&[4, 2]), vec![1.0; 8])
+                .unwrap()
+                .into(),
             feature_token_counts: vec![2, 2],
             item_sizes: vec![(1, 1), (1, 1)],
             model_specific,
@@ -1392,7 +1426,8 @@ mod tests {
                 IxDyn(&[4, 2]),
                 vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             feature_token_counts: vec![2, 2],
             item_sizes: vec![(1, 1), (1, 1)],
             model_specific,
@@ -1505,7 +1540,8 @@ mod tests {
         PrecomputedMultimodalIntermediate {
             preprocessed: PreprocessedEncoderInputs {
                 encoder_input: ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 2.0, 3.0, 4.0])
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 feature_token_counts: vec![2],
                 item_sizes: vec![(1, 1)],
                 model_specific,
@@ -1608,7 +1644,8 @@ mod tests {
                 IxDyn(&[4, 2]),
                 vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             feature_token_counts: vec![2, 2],
             item_sizes: vec![(2, 2), (2, 2)],
             model_specific,
@@ -1701,7 +1738,9 @@ mod tests {
     #[test]
     fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
         let one_item_inputs = || PreprocessedEncoderInputs {
-            encoder_input: ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![1.0]).unwrap(),
+            encoder_input: ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![1.0])
+                .unwrap()
+                .into(),
             feature_token_counts: vec![1],
             item_sizes: vec![(1, 1)],
             model_specific: HashMap::new(),
@@ -1815,7 +1854,8 @@ mod tests {
                 IxDyn(&[2, 3, 4]),
                 (0..24).map(|value| value as f32).collect(),
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             feature_token_counts: vec![1, 1],
             item_sizes: vec![(3, 4), (3, 2)],
             model_specific,
@@ -1831,7 +1871,7 @@ mod tests {
         let second = encoder_input_for_item(&preprocessed, &layouts.encoder_input, 1).unwrap();
         assert_eq!(second.shape(), &[1, 3, 4]);
         assert_eq!(
-            second.iter().copied().collect::<Vec<_>>(),
+            second.to_owned().flat_f32().into_owned(),
             (12..24).map(|v| v as f32).collect::<Vec<_>>()
         );
 

@@ -118,6 +118,19 @@ def model_facts(model_config: Any) -> dict[str, Any]:
     }
 
 
+def mm_device_do_normalize(vllm_config: Any) -> bool:
+    """Whether the engine rescales and normalizes pixels on device: vLLM's
+    ``mm_device_do_normalize`` as its model config resolved it (off where the
+    model class does not support it). Such an engine takes the pixels' own
+    ``uint8`` bytes and would normalize anything else twice, so both servicers
+    advertise it and whoever preprocesses sends raw pixels."""
+    model_config = vllm_config.model_config
+    if not getattr(model_config, "is_multimodal_model", False):
+        return False
+    mm_config = getattr(model_config, "multimodal_config", None)
+    return bool(getattr(mm_config, "mm_device_do_normalize", False))
+
+
 def server_facts(vllm_config: Any) -> dict[str, Any]:
     """`GetServerInfo`'s config-derived fields, keyed as the proto names them:
     the PD identity and pairing facts, the data-parallel size, this host's

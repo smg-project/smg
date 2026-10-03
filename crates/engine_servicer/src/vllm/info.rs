@@ -170,6 +170,7 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         block_size,
         model_dtype,
         shm_namespace_id: model.shm_namespace_id.clone(),
+        mm_device_do_normalize: model.mm_device_do_normalize,
         ..Default::default()
     }
 }

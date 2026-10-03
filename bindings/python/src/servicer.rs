@@ -528,6 +528,7 @@ impl PyVllmGrpcServer {
         shm_namespace_id = String::new(),
         pooler_use_activation = None,
         pooler_dimensions = None,
+        mm_device_do_normalize = false,
         media_processor = None,
         smg_media_processor = None,
     ))]
@@ -568,6 +569,7 @@ impl PyVllmGrpcServer {
         shm_namespace_id: String,
         pooler_use_activation: Option<bool>,
         pooler_dimensions: Option<u32>,
+        mm_device_do_normalize: bool,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
@@ -614,6 +616,7 @@ impl PyVllmGrpcServer {
             shm_namespace_id,
             pooler_use_activation,
             pooler_dimensions,
+            mm_device_do_normalize,
         };
         let mut config = VllmServicerConfig {
             bind_address,
