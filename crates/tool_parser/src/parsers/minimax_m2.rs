@@ -475,18 +475,15 @@ impl ToolParser for MinimaxM2Parser {
                                 parameters: "{}".to_string(),
                             });
                             self.streamed_args_for_tool[tool_id].push_str("{}");
-                        } else if !current_streamed.ends_with('}') {
-                            // Count opening and closing braces to check if JSON is complete
-                            let open_braces = current_streamed.matches('{').count();
-                            let close_braces = current_streamed.matches('}').count();
-                            if open_braces > close_braces {
-                                calls.push(ToolCallItem {
-                                    tool_index: tool_id,
-                                    name: None,
-                                    parameters: "}".to_string(),
-                                });
-                                self.streamed_args_for_tool[tool_id].push('}');
-                            }
+                        } else {
+                            // Parameter fragments leave the outer object open.
+                            // Braces inside values do not close that object.
+                            calls.push(ToolCallItem {
+                                tool_index: tool_id,
+                                name: None,
+                                parameters: "}".to_string(),
+                            });
+                            self.streamed_args_for_tool[tool_id].push('}');
                         }
                     }
 
