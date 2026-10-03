@@ -544,7 +544,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         );
 
         Ok(PreprocessedEncoderInputs {
-            encoder_input: encoder_input.into_dyn(),
+            encoder_input: encoder_input.into(),
             feature_token_counts,
             item_sizes,
             model_specific,

@@ -331,7 +331,7 @@ mod tests {
         for p in 0..patches {
             for y in 0..ph {
                 for x in 0..pw {
-                    let px = [0, 1, 2].map(|c| result.encoder_input[[p, c, y, x]]);
+                    let px = [0, 1, 2].map(|c| result.encoder_input.as_f32()[[p, c, y, x]]);
                     // mean = std = 0.5, so 255 -> +1.0 and 0 -> -1.0.
                     assert!(
                         (px[0] - 1.0).abs() < 1e-3 && px[1] < -0.99 && px[2] < -0.99,

@@ -153,7 +153,7 @@ fn run_golden_test(mode: &str, image_name: &str) {
         .preprocess(&[image], &config)
         .expect("Processing failed");
 
-    let diff = max_diff(&golden, &result.encoder_input);
+    let diff = max_diff(&golden, &result.encoder_input.as_f32());
     println!("{mode} - {image_name} image - Max difference: {diff:.6}");
     println!("Golden shape: {:?}", golden.shape());
     println!("Rust shape: {:?}", result.encoder_input.shape());
@@ -811,7 +811,8 @@ fn run_phi3_vision_golden_test(image_name: &str) {
     // Convert rust ArrayD to Array5 for comparison
     let rust_pixels = result
         .encoder_input
-        .clone()
+        .as_f32()
+        .into_owned()
         .into_dimensionality::<ndarray::Ix5>()
         .expect("Failed to convert to Ix5");
 
@@ -1012,7 +1013,8 @@ fn run_phi4_vision_golden_test(image_name: &str) {
     // Compare pixel values
     let rust_pixels = result
         .encoder_input
-        .clone()
+        .as_f32()
+        .into_owned()
         .into_dimensionality::<ndarray::Ix5>()
         .expect("Failed to convert to Ix5");
 

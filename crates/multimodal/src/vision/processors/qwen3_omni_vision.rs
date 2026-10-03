@@ -267,6 +267,7 @@ mod tests {
 
         assert!(output
             .encoder_input
+            .as_f32()
             .iter()
             .all(|value| (*value + 1.0).abs() < 1e-6));
     }

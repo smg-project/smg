@@ -1453,8 +1453,8 @@ mod tests {
             assert_eq!(merged.encoder_input_shape(), batched.encoder_input_shape());
             assert_eq!(merged.feature_token_counts, batched.feature_token_counts);
             assert_eq!(merged.item_sizes, batched.item_sizes);
-            let merged_values = merged.encoder_input.as_slice_memory_order().unwrap();
-            let batched_values = batched.encoder_input.as_slice_memory_order().unwrap();
+            let merged_values = merged.encoder_input.flat_f32().into_owned();
+            let batched_values = batched.encoder_input.flat_f32().into_owned();
             for (idx, (&got, &want)) in merged_values.iter().zip(batched_values.iter()).enumerate()
             {
                 assert_eq!(
@@ -1589,7 +1589,7 @@ mod tests {
         let result = processor
             .preprocess(std::slice::from_ref(&image), &config)
             .unwrap();
-        let actual = result.encoder_input.as_slice_memory_order().unwrap();
+        let actual = result.encoder_input.flat_f32().into_owned();
 
         let resized = resize_bicubic_pil(&image, target_w as u32, target_h as u32);
         let tensor = to_tensor_and_normalize(
@@ -1735,8 +1735,8 @@ mod tests {
             .preprocess_video_rgb(&rgb_frames, &config)
             .unwrap();
 
-        let a = dynamic.encoder_input.as_slice_memory_order().unwrap();
-        let b = rgb.encoder_input.as_slice_memory_order().unwrap();
+        let a = dynamic.encoder_input.flat_f32().into_owned();
+        let b = rgb.encoder_input.flat_f32().into_owned();
         assert_eq!(
             a.len(),
             b.len(),
@@ -1794,8 +1794,8 @@ mod tests {
             .preprocess_video_rgb(&rgb_frames, &config)
             .unwrap();
 
-        let a = dynamic.encoder_input.as_slice_memory_order().unwrap();
-        let b = rgb.encoder_input.as_slice_memory_order().unwrap();
+        let a = dynamic.encoder_input.flat_f32().into_owned();
+        let b = rgb.encoder_input.flat_f32().into_owned();
         assert_eq!(a.len(), b.len());
         for (idx, (&got, &want)) in a.iter().zip(b.iter()).enumerate() {
             assert_eq!(
@@ -1908,7 +1908,7 @@ mod tests {
         let frames = vec![create_pattern_frame(3), create_pattern_frame(101)];
 
         let result = processor.preprocess_video(&frames, &config).unwrap();
-        let actual = result.encoder_input.as_slice_memory_order().unwrap();
+        let actual = result.encoder_input.flat_f32().into_owned();
 
         let tensors = frames
             .iter()
@@ -1975,11 +1975,8 @@ mod tests {
         rgb_keys.sort();
         assert_eq!(dynamic_keys, rgb_keys);
 
-        let dynamic_values = dynamic_result
-            .encoder_input
-            .as_slice_memory_order()
-            .unwrap();
-        let rgb_values = rgb_result.encoder_input.as_slice_memory_order().unwrap();
+        let dynamic_values = dynamic_result.encoder_input.flat_f32().into_owned();
+        let rgb_values = rgb_result.encoder_input.flat_f32().into_owned();
         for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
             assert_eq!(
                 got.to_bits(),
@@ -2025,11 +2022,8 @@ mod tests {
             dynamic_result.encoder_input.shape(),
             rgb_result.encoder_input.shape()
         );
-        let dynamic_values = dynamic_result
-            .encoder_input
-            .as_slice_memory_order()
-            .unwrap();
-        let rgb_values = rgb_result.encoder_input.as_slice_memory_order().unwrap();
+        let dynamic_values = dynamic_result.encoder_input.flat_f32().into_owned();
+        let rgb_values = rgb_result.encoder_input.flat_f32().into_owned();
         for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
             assert_eq!(
                 got.to_bits(),

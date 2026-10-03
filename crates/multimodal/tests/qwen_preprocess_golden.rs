@@ -103,8 +103,8 @@ fn check_case(processor: &dyn VisionPreProcessor, config: &PreProcessorConfig, c
 
     let expected =
         u64::from_str_radix(&case.fnv1a_patch_u8, 16).expect("invalid golden FNV-1a fingerprint");
-    let values = result
-        .encoder_input
+    let encoder_f32 = result.encoder_input.as_f32();
+    let values = encoder_f32
         .as_slice_memory_order()
         .expect("Qwen encoder input must be contiguous");
     assert_eq!(
@@ -140,8 +140,8 @@ fn check_video_case(
 
     let expected = u64::from_str_radix(&case.fnv1a_patch_u8, 16)
         .expect("invalid video golden FNV-1a fingerprint");
-    let values = result
-        .encoder_input
+    let encoder_f32 = result.encoder_input.as_f32();
+    let values = encoder_f32
         .as_slice_memory_order()
         .expect("Qwen video encoder input must be contiguous");
     assert_eq!(

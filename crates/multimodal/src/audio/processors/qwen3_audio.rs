@@ -272,6 +272,7 @@ impl Qwen3AudioProcessor {
         let output = self.preprocess_decoded_clips(vec![decoded])?;
         output
             .encoder_input
+            .into_f32()
             .into_dimensionality::<ndarray::Ix3>()
             .map_err(|error| TransformError::ShapeError(error.to_string()))?
             .index_axis_move(ndarray::Axis(0), 0)

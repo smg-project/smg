@@ -157,8 +157,8 @@ fn inkling_audio_preprocess_matches_checked_in_golden() {
             case.name
         );
 
-        let values = result
-            .encoder_input
+        let encoder_f32 = result.encoder_input.as_f32();
+        let values = encoder_f32
             .as_slice_memory_order()
             .expect("Inkling audio encoder input must be contiguous");
         assert_eq!(
@@ -206,8 +206,8 @@ fn inkling_vision_preprocess_matches_checked_in_golden() {
             case.name
         );
 
-        let values = result
-            .encoder_input
+        let encoder_f32 = result.encoder_input.as_f32();
+        let values = encoder_f32
             .as_slice_memory_order()
             .expect("Inkling vision encoder input must be contiguous");
         assert_eq!(
