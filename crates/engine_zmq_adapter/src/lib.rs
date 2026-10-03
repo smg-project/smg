@@ -40,7 +40,7 @@ pub use engine_zmq_client::protocol::vllm::pooling::{PoolerDefaults, PoolingPara
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sockets::zmq_handshake_address;
 pub use stream::ZmqGenerateStream;
-pub use tokenspeed::TokenSpeedGenerateStream;
+pub use tokenspeed::{to_tokenspeed_response, TokenSpeedGenerateStream};
 pub use vllm::{
     structured_outputs_backend_from_config, ProcessedMedia, StructuredOutputsBackendConfig,
     VllmGenerateStream,

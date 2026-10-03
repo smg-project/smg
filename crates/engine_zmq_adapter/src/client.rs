@@ -588,6 +588,21 @@ impl ZmqEngineClient {
         &self,
         req: tokenspeed_proto::GenerateRequest,
     ) -> Result<ZmqGenerateStream, tonic::Status> {
+        let mut streams = SelectAll::new();
+        for stream in self.generate_tokenspeed_streams(req).await? {
+            streams.push(stream);
+        }
+        Ok(ZmqGenerateStream::TokenSpeed(streams))
+    }
+
+    /// [`Self::generate_vllm_streams`] for a TokenSpeed backend: the `n > 1`
+    /// fan-out submitted to the engine, each sub tagged with its proto
+    /// `index`, left unmerged so a caller can end one choice without the
+    /// others (the gRPC servicer matches string stops per choice).
+    pub async fn generate_tokenspeed_streams(
+        &self,
+        req: tokenspeed_proto::GenerateRequest,
+    ) -> Result<Vec<TokenSpeedGenerateStream>, tonic::Status> {
         let ZmqBackend::TokenSpeed(client) = &self.backend else {
             return Err(tonic::Status::internal(
                 "vLLM ZMQ backend expects a vLLM generate request",
@@ -595,14 +610,14 @@ impl ZmqEngineClient {
         };
         // Sub-streams submitted before a mid-loop failure are dropped with the
         // error, which auto-aborts their engine-side requests.
-        let mut streams = SelectAll::new();
+        let mut streams = Vec::new();
         for (index, sub) in fan_out_tokenspeed_requests(req).into_iter().enumerate() {
             let request =
                 translate_request_tokenspeed(sub).map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
             streams.push(TokenSpeedGenerateStream::new(stream, index as u32));
         }
-        Ok(ZmqGenerateStream::TokenSpeed(streams))
+        Ok(streams)
     }
 
     /// Local liveness: false once the connection observed `ENGINE_CORE_DEAD` or

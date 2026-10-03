@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use llm_tokenizer::traits::Tokenizer;
-use smg_grpc_client::vllm_proto as vllm;
+use smg_grpc_client::{tokenspeed_proto, vllm_proto as vllm};
 use tracing::{debug, warn};
 
 /// Convert single-token stop strings into `stop_token_ids` entries so the engine
@@ -66,6 +66,17 @@ pub fn encode_single_token_stops(
             ),
         }
     }
+}
+
+/// [`take_vllm_string_stops`] for a TokenSpeed request: the same split, on
+/// the TokenSpeed proto's sampling params.
+pub fn take_tokenspeed_string_stops(
+    params: &mut tokenspeed_proto::SamplingParams,
+    tokenizer: Option<&Arc<dyn Tokenizer>>,
+) -> Vec<String> {
+    let stops = std::mem::take(&mut params.stop);
+    encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+    stops
 }
 
 /// Take the string stops off a vLLM request's sampling params: single-token

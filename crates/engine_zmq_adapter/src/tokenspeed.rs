@@ -48,6 +48,119 @@ impl TokenSpeedGenerateStream {
             pending: None,
         }
     }
+
+    /// The choice index this stream stamps on its responses.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// Whether the engine already finished this choice and its terminal
+    /// `Complete` is parked behind the chunk just yielded (the finish tick
+    /// carried new tokens). A frontend that matched a stop on that chunk must
+    /// not synthesize its own `Complete`: the accumulated state has already
+    /// been drained into the parked one.
+    pub fn has_parked_complete(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// End this choice now on a frontend-matched string stop: the terminal
+    /// `Complete` built from the accumulated state, exactly as if the engine
+    /// had reported `stop` with that string. The engine-side request is
+    /// aborted when the stream is dropped, so the caller drops it next.
+    pub fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse {
+        self.complete_with_finish(
+            "stop".to_string(),
+            Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
+                matched,
+            )),
+        )
+    }
+
+    /// End this choice as aborted: the engine's own parked `Complete` when it
+    /// already finished, else the terminal `Complete` the Python servicer
+    /// yields after an `Abort` RPC (`finish_reason = "abort"`).
+    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
+        if let Some(parked) = self.pending.take() {
+            return parked;
+        }
+        self.complete_with_finish("abort".to_string(), None)
+    }
+
+    fn complete_with_finish(
+        &mut self,
+        finish_reason: String,
+        matched: Option<vllm::generate_complete::MatchedStop>,
+    ) -> vllm::GenerateResponse {
+        let mut pending = None;
+        // No new tokens on a frontend finish, so `emit_tick` yields the
+        // `Complete` directly and parks nothing.
+        self.state.emit_tick(
+            self.index,
+            Vec::new(),
+            None,
+            Some((finish_reason, matched)),
+            &mut pending,
+        )
+    }
+}
+
+/// A vLLM-proto response of a TokenSpeed stream as the TokenSpeed proto the
+/// `TokenSpeedScheduler` service answers with, under `request_id` (the
+/// vLLM proto carries none): the two carry the same chunk and completion
+/// fields (TokenSpeed's `OutputLogProbs` has no prompt side, and the ZMQ wire
+/// reports no speculative counters).
+pub fn to_tokenspeed_response(
+    request_id: &str,
+    response: vllm::GenerateResponse,
+) -> tokenspeed_proto::GenerateResponse {
+    use tokenspeed_proto::generate_response::Response as TsResponse;
+    use vllm::generate_response::Response;
+    let logprobs = |logprobs: Option<vllm::OutputLogProbs>| {
+        logprobs.map(|lp| tokenspeed_proto::OutputLogProbs {
+            token_logprobs: lp.token_logprobs,
+            token_ids: lp.token_ids,
+            top_logprobs: lp
+                .top_logprobs
+                .into_iter()
+                .map(|top| tokenspeed_proto::TopLogProbs {
+                    values: top.values,
+                    token_ids: top.token_ids,
+                })
+                .collect(),
+        })
+    };
+    let mapped = response.response.map(|inner| match inner {
+        Response::Chunk(chunk) => TsResponse::Chunk(tokenspeed_proto::GenerateStreamChunk {
+            token_ids: chunk.token_ids,
+            prompt_tokens: chunk.prompt_tokens,
+            completion_tokens: chunk.completion_tokens,
+            cached_tokens: chunk.cached_tokens,
+            output_logprobs: logprobs(chunk.output_logprobs),
+            index: chunk.index,
+        }),
+        Response::Complete(complete) => {
+            use tokenspeed_proto::generate_complete::MatchedStop as TsMatchedStop;
+            use vllm::generate_complete::MatchedStop;
+            TsResponse::Complete(tokenspeed_proto::GenerateComplete {
+                output_ids: complete.output_ids,
+                finish_reason: complete.finish_reason,
+                prompt_tokens: complete.prompt_tokens,
+                completion_tokens: complete.completion_tokens,
+                cached_tokens: complete.cached_tokens,
+                output_logprobs: logprobs(complete.output_logprobs),
+                matched_stop: complete.matched_stop.map(|matched| match matched {
+                    MatchedStop::MatchedTokenId(id) => TsMatchedStop::MatchedTokenId(id),
+                    MatchedStop::MatchedStopStr(text) => TsMatchedStop::MatchedStopStr(text),
+                }),
+                index: complete.index,
+                ..Default::default()
+            })
+        }
+    });
+    tokenspeed_proto::GenerateResponse {
+        request_id: request_id.to_string(),
+        response: mapped,
+    }
 }
 
 impl MappedGenerateStream for TokenSpeedGenerateStream {
