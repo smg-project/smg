@@ -126,11 +126,16 @@ fn normalization_lut(
         .map(|values| [values[0], values[1], values[2]])
         .unwrap_or(default_std);
     let do_normalize = config.do_normalize.unwrap_or(true);
-    let scale: [f32; 3] = if do_normalize {
-        std::array::from_fn(|channel| 1.0 / (255.0 * std[channel] as f32))
-    } else {
-        [1.0 / 255.0; 3]
-    };
+    let do_rescale = config.do_rescale.unwrap_or(true);
+    // HF order: rescale (x / 255) then normalize ((x - mean) / std), each
+    // step only when its flag is on. Both off leaves the raw 0..255 values,
+    // what an engine that normalizes on device takes.
+    let scale: [f32; 3] = std::array::from_fn(|channel| match (do_rescale, do_normalize) {
+        (true, true) => 1.0 / (255.0 * std[channel] as f32),
+        (true, false) => 1.0 / 255.0,
+        (false, true) => 1.0 / std[channel] as f32,
+        (false, false) => 1.0,
+    });
     let bias: [f32; 3] = if do_normalize {
         std::array::from_fn(|channel| -(mean[channel] as f32) / std[channel] as f32)
     } else {
