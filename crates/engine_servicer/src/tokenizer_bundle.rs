@@ -18,11 +18,10 @@ use tonic::Status;
 use tracing::{info, warn};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
-use super::State;
 use crate::BoxStream;
 
 /// Bytes per streamed chunk (the Python servicers' `CHUNK_SIZE`).
-pub(super) const CHUNK_SIZE: usize = 64 * 1024;
+pub(crate) const CHUNK_SIZE: usize = 64 * 1024;
 
 /// Exact file names, in bundle order (the Python `TOKENIZER_FILES`).
 const TOKENIZER_FILES: [&str; 13] = [
@@ -142,8 +141,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// `GetTokenizer`: refused without a tokenizer directory (the Python
 /// servicer's precondition); otherwise bundle it off the runtime and stream.
-pub(super) async fn get_tokenizer(state: &State) -> Result<BoxStream<GetTokenizerChunk>, Status> {
-    let Some(dir) = state.tokenizer_dir.clone() else {
+pub(crate) async fn get_tokenizer(
+    tokenizer_dir: Option<String>,
+) -> Result<BoxStream<GetTokenizerChunk>, Status> {
+    let Some(dir) = tokenizer_dir else {
         return Err(Status::failed_precondition(
             "Tokenizer path is not configured on this server.",
         ));

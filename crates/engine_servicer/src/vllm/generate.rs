@@ -16,42 +16,17 @@ use engine_zmq_adapter::{
     VllmGenerateStream, ZmqEngineClient,
 };
 use futures::{stream::SelectAll, Stream};
-use llm_tokenizer::stop::{StopSequenceDecoder, StopSequenceDecoderBuilder};
+use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
 use tokio::sync::oneshot;
 use tonic::Status;
 
-use super::{
-    media::process_media_refs,
-    requests::{register, Registration},
-    State,
+use super::{media::process_media_refs, State};
+use crate::{
+    requests::Registration,
+    stop_match::{stop_decoder, StopMatcher},
+    BoxStream,
 };
-use crate::BoxStream;
-
-/// The string-stop matcher for a request, or `None` when it carries no
-/// string stops. Visible (included-in-output) stops only change the text
-/// the Router trims; the servicer only needs the match itself.
-pub(super) fn stop_decoder(
-    state: &State,
-    stops: &[String],
-    skip_special_tokens: bool,
-) -> Result<Option<StopSequenceDecoder>, Status> {
-    if stops.is_empty() {
-        return Ok(None);
-    }
-    let Some(tokenizer) = state.tokenizer() else {
-        return Err(Status::failed_precondition(
-            "string `stop` sequences need the model tokenizer, which this servicer could not \
-             load; start it with a local tokenizer directory",
-        ));
-    };
-    let mut builder = StopSequenceDecoderBuilder::new(Arc::clone(tokenizer))
-        .skip_special_tokens(skip_special_tokens);
-    for stop in stops {
-        builder = builder.stop_sequence(stop.clone());
-    }
-    Ok(Some(builder.build()))
-}
 
 /// Handle one `Generate` request against the connected engine.
 pub(super) async fn generate(
@@ -148,7 +123,7 @@ async fn submit(
     let request_id = req.request_id.clone();
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
-    let (registration, cancel) = register(state, &request_id).inspect_err(|_| {
+    let (registration, cancel) = state.registry.register(&request_id).inspect_err(|_| {
         // The id names a request that is still live; a notice under it would
         // reuse it (and, past an `n > 1` fan-out, get in and free the live
         // leg's blocks).
@@ -178,7 +153,7 @@ async fn submit(
         .unwrap_or_default();
     client.adopt_tokenizer_eos(tokenizer);
     fold_tokenizer_eos_backstop(&mut req, tokenizer);
-    let decoder = stop_decoder(state, &stops, skip_special_tokens)?;
+    let decoder = stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?;
 
     // Admission ends here: the add is on the wire before `submit_with_aux`
     // returns, and an `n > 1` fan-out has live subs while later ones are
@@ -203,7 +178,7 @@ async fn submit(
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
         let decoder = match &decoder {
-            Some(_) => stop_decoder(state, &stops, skip_special_tokens)?,
+            Some(_) => stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?,
             None => None,
         };
         choices.push(ChoiceStream::new(
@@ -232,18 +207,14 @@ struct ChoiceStream {
     /// engine-side request.
     inner: Option<VllmGenerateStream>,
     /// Decodes the output incrementally and matches the request's string
-    /// stops; `None` when the request carries none.
-    decoder: Option<StopSequenceDecoder>,
+    /// stops, honouring `min_tokens`.
+    stops: StopMatcher,
     /// Whether the client asked for incremental chunks. A non-streaming
     /// request receives only the terminal `Complete`, as from the Python
     /// servicer (`output_kind=FINAL_ONLY`).
     streaming: bool,
     /// A frontend-synthesized terminal `Complete` to yield next.
     pending: Option<vllm::GenerateResponse>,
-    /// `min_tokens` of the request and the tokens generated so far: string
-    /// stops are only honoured past the minimum, as vLLM does.
-    min_tokens: u32,
-    generated: u32,
     /// Whether this request's prompt tokens went into the stats counters.
     prompt_counted: bool,
     /// A PD prefill leg's account of the media it processed, stamped on
@@ -264,44 +235,11 @@ impl ChoiceStream {
             media_identity,
             state,
             inner: Some(inner),
-            decoder,
+            stops: StopMatcher::new(decoder, min_tokens),
             streaming,
             pending: None,
-            min_tokens,
-            generated: 0,
             prompt_counted: false,
         }
-    }
-
-    /// Feed this tick's tokens to the stop matcher, honouring `min_tokens` as
-    /// vLLM does: string stops are only checked once the output exceeds it,
-    /// so a match inside that window is dropped; the matcher keeps its decode
-    /// context and the matched text's tail, so a stop that ends past the
-    /// window still matches (vLLM searches back by the stop's length).
-    fn match_stops(&mut self, token_ids: &[u32]) -> Result<Option<String>, Status> {
-        let Some(decoder) = self.decoder.as_mut() else {
-            self.generated = self
-                .generated
-                .saturating_add(u32::try_from(token_ids.len()).unwrap_or(u32::MAX));
-            return Ok(None);
-        };
-        for &token in token_ids {
-            self.generated = self.generated.saturating_add(1);
-            decoder.process_token(token).map_err(|error| {
-                Status::internal(format!("incremental detokenization failed: {error}"))
-            })?;
-            if !decoder.is_stopped() {
-                continue;
-            }
-            if self.generated <= self.min_tokens {
-                decoder.resume();
-                continue;
-            }
-            // Only string sequences are registered on the decoder, so a stop
-            // always names its matched string.
-            return Ok(Some(decoder.matched_stop().unwrap_or_default().to_string()));
-        }
-        Ok(None)
     }
 
     /// Count the prompt once per request (every choice of an `n > 1` fan-out
@@ -389,7 +327,7 @@ impl Stream for ChoiceStream {
                 .stats
                 .generation_tokens
                 .fetch_add(chunk.token_ids.len() as u64, Ordering::Relaxed);
-            let matched = match this.match_stops(&chunk.token_ids) {
+            let matched = match this.stops.feed(&chunk.token_ids) {
                 Ok(matched) => matched,
                 Err(status) => {
                     this.inner = None;

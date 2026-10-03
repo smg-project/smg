@@ -7,7 +7,7 @@ use engine_zmq_adapter::PoolerDefaults;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 
-use super::{requests::register, State};
+use super::State;
 
 /// Handle one `Embed` request against the connected engine.
 pub(super) async fn embed(
@@ -32,7 +32,7 @@ pub(super) async fn embed(
     // Registered like a generate stream, so an `Abort` (or the drain on
     // shutdown) ends the wait: dropping the in-flight call drops its engine
     // stream, which aborts the engine-side request.
-    let (_registration, cancel) = register(state, &req.request_id)?;
+    let (_registration, cancel) = state.registry.register(&req.request_id)?;
     let request_id = req.request_id.clone();
     tokio::select! {
         result = client.embed(req, pooler) => result,

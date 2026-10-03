@@ -2223,6 +2223,7 @@ dependencies = [
  "openai-protocol",
  "portpicker",
  "prost",
+ "prost-types",
  "rmp-serde",
  "serde",
  "serde_json",

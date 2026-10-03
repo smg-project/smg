@@ -11,9 +11,15 @@
 //! binding — which is why the server runs on its own thread and reports back
 //! through plain flags instead of a Python-visible runtime.
 
+mod engine_link;
 mod error;
 mod health;
+mod kv_events;
+mod requests;
 mod server;
+mod stop_match;
+mod tokenizer_bundle;
+pub mod tokenspeed;
 pub mod vllm;
 
 use std::pin::Pin;
@@ -22,6 +28,7 @@ pub use error::ServicerError;
 use futures::Stream;
 pub use server::init_tracing;
 pub(crate) use server::{lock, record_error, ServerThread, SharedError, Shutdown};
+pub use tokenspeed::{TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer};
 use tonic::Status;
 pub use vllm::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRefItem, MediaRequest,

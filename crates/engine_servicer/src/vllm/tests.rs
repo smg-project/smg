@@ -44,7 +44,7 @@ use tonic_health::pb::{
 use zip::{CompressionMethod, ZipArchive};
 
 use super::*;
-use crate::ServicerError;
+use crate::{kv_events, tokenizer_bundle, ServicerError};
 
 fn model_info() -> VllmModelInfo {
     VllmModelInfo {
@@ -1308,7 +1308,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
         .map(|_| ())
         .unwrap_err();
     assert_eq!(status.code(), Code::Unimplemented);
-    assert_eq!(status.message(), kv_events::DISABLED_MESSAGE);
+    assert_eq!(status.message(), kv_events::VLLM_DISABLED_MESSAGE);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
     let port = pick_unused_port().expect("a free publisher port");

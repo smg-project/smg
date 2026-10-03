@@ -10,8 +10,8 @@ use smg_grpc_client::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{admin, embed, generate, info, kv_events, requests, tokenizer_bundle, State};
-use crate::BoxStream;
+use super::{admin, embed, generate, info, State};
+use crate::{kv_events, tokenizer_bundle, BoxStream};
 
 /// The `VllmEngine` service over the shared state.
 #[derive(Clone)]
@@ -63,7 +63,9 @@ impl VllmEngine for VllmEngineService {
         &self,
         request: Request<vllm::AbortRequest>,
     ) -> Result<Response<vllm::AbortResponse>, Status> {
-        requests::abort(&self.state, &request.into_inner().request_ids)?;
+        self.state
+            .registry
+            .abort(&request.into_inner().request_ids)?;
         Ok(Response::new(vllm::AbortResponse::default()))
     }
 
@@ -92,7 +94,7 @@ impl VllmEngine for VllmEngineService {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(&self.state)
+        tokenizer_bundle::get_tokenizer(self.state.tokenizer_dir.clone())
             .await
             .map(Response::new)
     }
@@ -101,6 +103,14 @@ impl VllmEngine for VllmEngineService {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        kv_events::subscribe(&self.state.model, request.into_inner()).map(Response::new)
+        let model = &self.state.model;
+        if model.kv_events_endpoint.is_empty() {
+            return Err(Status::unimplemented(kv_events::VLLM_DISABLED_MESSAGE));
+        }
+        Ok(Response::new(kv_events::subscribe(
+            &model.kv_events_endpoint,
+            model.kv_events_topic.clone(),
+            request.into_inner(),
+        )))
     }
 }

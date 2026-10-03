@@ -1,18 +1,17 @@
-//! The link to the engine: `None` while the ZMQ handshake runs, then the
-//! client or the reason it failed. Health is gated on it.
+//! Loading the tokenizer and connecting the headless scheduler(s), in the
+//! background of a server that is already listening. Failures gate health
+//! and surface as the last error; nothing here retries, the lifecycle owner
+//! restarts the pair.
 
 use std::sync::Arc;
 
-use engine_zmq_adapter::{connect_with_eos, structured_outputs_backend_from_config, EosTokenIds};
+use engine_zmq_adapter::{connect_with_eos, EosTokenIds};
 use openai_protocol::worker::RuntimeType;
 use tracing::{error, info, warn};
 
 use super::State;
 use crate::{record_error, SharedError};
 
-/// Load the tokenizer and connect the engine, in the background of a server
-/// that is already listening. Failures gate health and surface as the last
-/// error; nothing here retries, the lifecycle owner restarts the pair.
 pub(super) async fn connect_engine(
     state: Arc<State>,
     ipc_base_url: String,
@@ -39,7 +38,6 @@ pub(super) async fn connect_engine(
             None
         }
     };
-    // A pre-seeded tokenizer wins; `set` is a no-op then.
     let _ = state.tokenizer.set(tokenizer);
 
     let eos = if state.model.eos_token_ids.is_empty() {
@@ -50,7 +48,7 @@ pub(super) async fn connect_engine(
     match connect_with_eos(
         &ipc_base_url,
         state.model.model_path.clone(),
-        RuntimeType::Vllm,
+        RuntimeType::TokenSpeed,
         Some(&handshake_address),
         engine_count,
         eos,
@@ -59,18 +57,15 @@ pub(super) async fn connect_engine(
     {
         Ok(client) => {
             client.adopt_tokenizer_eos(state.tokenizer());
-            client.set_structured_outputs_backend(structured_outputs_backend_from_config(
-                &state.model.structured_outputs_backend,
-            ));
             info!(
                 handshake = %handshake_address,
                 engines = engine_count,
-                "vLLM engine connected"
+                "TokenSpeed scheduler connected"
             );
             let _ = state.engine.client.set(client);
         }
         Err(connect_error) => {
-            let message = format!("vLLM engine connection failed: {connect_error}");
+            let message = format!("TokenSpeed scheduler connection failed: {connect_error}");
             error!(%message);
             state.engine.fail(message.clone());
             record_error(&last_error, message);

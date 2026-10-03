@@ -26,24 +26,20 @@ mod embed;
 mod engine;
 mod generate;
 mod info;
-mod kv_events;
 mod media;
-mod requests;
 mod service;
 #[cfg(test)]
 mod tests;
-mod tokenizer_bundle;
 
 use std::{
-    collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
 
-use engine::{connect_engine, EngineLink};
+use engine::connect_engine;
 use engine_zmq_adapter::ZmqEngineClient;
 use futures::{FutureExt, StreamExt};
 use llm_tokenizer::traits::Tokenizer;
@@ -52,7 +48,6 @@ pub use media::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRefItem, MediaRequest,
     ProcessedMedia,
 };
-use requests::Registry;
 use service::VllmEngineService;
 use smg_grpc_client::vllm_proto::vllm_engine_server::VllmEngineServer;
 use tokio::net::TcpListener;
@@ -61,7 +56,10 @@ use tonic::{transport::Server, Status};
 use tonic_health::pb::health_server::HealthServer;
 use tracing::{info, warn};
 
-use crate::{health::HealthReporter, lock, ServerThread, ServicerError, Shutdown};
+use crate::{
+    engine_link::EngineLink, health::HealthReporter, requests::RequestRegistry, ServerThread,
+    ServicerError, Shutdown,
+};
 
 pub(crate) const SERVICE_NAME: &str = "vllm.grpc.engine.VllmEngine";
 /// `GetServerInfo.server_type` for this implementation.
@@ -188,8 +186,7 @@ pub(super) struct State {
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused, EOS still comes from config).
     pub(super) tokenizer: OnceLock<Option<Arc<dyn Tokenizer>>>,
-    pub(super) registry: Registry,
-    pub(super) generation: AtomicU64,
+    pub(super) registry: Arc<RequestRegistry>,
     /// Cleared by the lifecycle owner to drain: health flips to NOT_SERVING
     /// while in-flight streams finish.
     pub(super) serving: AtomicBool,
@@ -238,10 +235,7 @@ impl State {
     }
 
     pub(super) fn active_requests(&self) -> u32 {
-        self.registry
-            .lock()
-            .map(|registry| u32::try_from(registry.len()).unwrap_or(u32::MAX))
-            .unwrap_or(0)
+        self.registry.len()
     }
 }
 
@@ -294,8 +288,7 @@ impl VllmServicerServer {
             stats: Stats::default(),
             engine: EngineLink::default(),
             tokenizer: OnceLock::new(),
-            registry: Mutex::new(HashMap::new()),
-            generation: AtomicU64::new(0),
+            registry: Arc::new(RequestRegistry::default()),
             serving: AtomicBool::new(true),
             started: Instant::now(),
             media: config.media_processor.map(MediaGate::new),
@@ -425,12 +418,7 @@ impl VllmServicerServer {
         self.set_serving(false);
         // Fire every registered cancellation so streams end before the
         // listener closes, then let the thread wind down.
-        {
-            let mut registry = lock(&self.state.registry)?;
-            for (_, (_, cancel)) in registry.drain() {
-                let _ = cancel.send(());
-            }
-        }
+        self.state.registry.cancel_all()?;
         self.thread.stop(timeout)
     }
 }

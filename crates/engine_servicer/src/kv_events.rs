@@ -26,26 +26,31 @@ use zeromq::{
     SocketOptions, SubSocket, ZmqError, ZmqMessage,
 };
 
-use super::VllmModelInfo;
 use crate::BoxStream;
 
-/// The Python servicer's refusal when vLLM runs without a ZMQ publisher.
-pub(super) const DISABLED_MESSAGE: &str = "KV cache events not enabled. Start vLLM with \
+/// The Python vLLM servicer's refusal when vLLM runs without a ZMQ publisher.
+pub(crate) const VLLM_DISABLED_MESSAGE: &str = "KV cache events not enabled. Start vLLM with \
      --kv-events-config '{\"enable_kv_cache_events\": true, \"publisher\": \"zmq\"}'";
 
-/// Handle one `SubscribeKvEvents` call: UNIMPLEMENTED without a publisher,
-/// else a relay of rank 0's publisher.
-pub(super) fn subscribe(
-    model: &VllmModelInfo,
+/// The Python TokenSpeed servicer's refusal without a publisher.
+pub(crate) const TOKENSPEED_DISABLED_MESSAGE: &str = "KV cache events not enabled. Start \
+     TokenSpeed with --kv-events-config '{\"enable_kv_cache_events\": true, \"publisher\": \
+     \"zmq\"}'";
+
+/// Handle one `SubscribeKvEvents` call against a configured publisher: a
+/// relay of rank 0's publisher at `kv_events_endpoint`. Both engines publish
+/// the same batch shape (`[ts, events, rank]`, the rank named
+/// `data_parallel_rank` by vLLM and `attn_dp_rank` by TokenSpeed; positional
+/// on the wire).
+pub(crate) fn subscribe(
+    kv_events_endpoint: &str,
+    topic: String,
     request: common::SubscribeKvEventsRequest,
-) -> Result<BoxStream<common::KvEventBatch>, Status> {
-    if model.kv_events_endpoint.is_empty() {
-        return Err(Status::unimplemented(DISABLED_MESSAGE));
-    }
+) -> BoxStream<common::KvEventBatch> {
     // For DP attention each rank publishes on port + rank with independent
     // sequence counters; subscribing to several on one socket interleaves
     // them and breaks gap detection. Subscribe to rank 0 only for now.
-    let endpoint = endpoint_for_rank(&model.kv_events_endpoint, 0);
+    let endpoint = endpoint_for_rank(kv_events_endpoint, 0);
     if request.start_sequence_number != 0 {
         // As on the Python relay: no replay, the stream starts at the
         // publisher's current position and the Router dedups by sequence.
@@ -54,14 +59,14 @@ pub(super) fn subscribe(
             "SubscribeKvEvents: replay is not supported; streaming live events"
         );
     }
-    Ok(relay(endpoint, model.kv_events_topic.clone()))
+    relay(endpoint, topic)
 }
 
 /// Resolve a KV-events PUB endpoint to a connectable SUB address: bind
 /// wildcards become loopback, and under data parallelism rank `dp_rank`
 /// publishes on `base_port + dp_rank` (tcp only; ipc/inproc get no port
 /// arithmetic).
-pub(super) fn endpoint_for_rank(endpoint: &str, dp_rank: u32) -> String {
+pub(crate) fn endpoint_for_rank(endpoint: &str, dp_rank: u32) -> String {
     let resolved = endpoint
         .replace('*', "127.0.0.1")
         .replace("0.0.0.0", "127.0.0.1");
