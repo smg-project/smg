@@ -19,6 +19,7 @@ from infra import (
     cleanup_pool,
     get_connection_mode_override,
     get_runtime,
+    get_tokenspeed_servicer_impl,
     get_zmq_engine_count,
 )
 
@@ -230,6 +231,31 @@ def _filter_tokenspeed_dp_items(
     return kept, deselected
 
 
+def _filter_tokenspeed_rust_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for a TokenSpeed lane whose gRPC
+    workers run the Rust servicer.
+
+    The Rust servicer reaches the scheduler over the msgpack wire, which
+    carries generate and abort only: no PD/EPD bootstrap fields and no
+    control messages. The PD/EPD and multi-worker topologies and the admin
+    operations (flush cache, profiling) stay with the Python servicer, so
+    their cases are dropped here rather than failing on a known gap.
+    """
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        param = _setup_backend_param(item)
+        pd_topology = param is not None and param not in _ZMQ_LOCAL_WIRES
+        admin_ops = "test_admin_ops.py" in item.nodeid
+        if pd_topology or _is_multi_worker(item) or admin_ops:
+            deselected.append(item)
+        else:
+            kept.append(item)
+    return kept, deselected
+
+
 def _filter_env_items(
     items: list[pytest.Item],
     engine: str | None,
@@ -316,6 +342,8 @@ def _format_selection_line(stats: dict) -> str:
     parts.append(f"{stats['by_zmq']} by zmq-dedup")
     if stats["by_tokenspeed_dp"]:
         parts.append(f"{stats['by_tokenspeed_dp']} by tokenspeed-dp")
+    if stats.get("by_tokenspeed_rust"):
+        parts.append(f"{stats['by_tokenspeed_rust']} by tokenspeed-rust-servicer")
     return (
         f"{header}: selected {stats['selected']} of {stats['collected']} collected "
         f"({', '.join(parts)})"
@@ -372,6 +400,7 @@ def pytest_collection_modifyitems(
         "by_tier": 0,
         "by_zmq": 0,
         "by_tokenspeed_dp": 0,
+        "by_tokenspeed_rust": 0,
     }
 
     if any([engine, vendor, gpu_tier]):
@@ -383,6 +412,13 @@ def pytest_collection_modifyitems(
         if deselected:
             config.hook.pytest_deselected(items=deselected)
         items[:] = selected
+
+    if get_runtime() == "tokenspeed" and get_tokenspeed_servicer_impl() == "rust":
+        kept, deselected = _filter_tokenspeed_rust_items(items)
+        stats["by_tokenspeed_rust"] = len(deselected)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = kept
 
     if get_connection_mode_override() == ConnectionMode.ZMQ:
         kept, deselected = _filter_zmq_items(items)

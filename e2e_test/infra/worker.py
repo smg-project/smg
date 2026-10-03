@@ -25,8 +25,10 @@ from .constants import (
     MM_PROCESSING_WORKER,
     ConnectionMode,
     WorkerType,
+    get_gpu_offset,
     get_mm_processing,
     get_runtime,
+    get_tokenspeed_servicer_impl,
     get_vllm_mm_processor,
     get_vllm_servicer_impl,
     get_zmq_engine_count,
@@ -562,6 +564,14 @@ class Worker:
                 # The lane setting is authoritative over an inherited value.
                 env.pop("SMG_VLLM_SERVICER_IMPL", None)
 
+        # The TokenSpeed servicer implementation is likewise a flag inside the
+        # smg servicer package, read by its own entrypoint; the command stays.
+        if self.engine == "tokenspeed" and self.mode == ConnectionMode.GRPC:
+            if get_tokenspeed_servicer_impl() == "rust":
+                env["SMG_TOKENSPEED_SERVICER_IMPL"] = "rust"
+            else:
+                env.pop("SMG_TOKENSPEED_SERVICER_IMPL", None)
+
         if (
             self.engine == "vllm"
             and self.mode == ConnectionMode.GRPC
@@ -782,6 +792,8 @@ def start_workers(
     Returns:
         List of started Worker instances.
     """
+    # The lane's GPU slice: every worker shifts by E2E_GPU_OFFSET.
+    gpu_offset += get_gpu_offset()
     if log_dir is None:
         log_dir = os.environ.get("E2E_LOG_DIR")
 
