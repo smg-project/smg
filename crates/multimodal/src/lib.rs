@@ -31,6 +31,7 @@ pub use types::{
     VideoSource,
 };
 // Re-export vision processing components
+pub use vision::execution::{configure_parallelism, parallelism, Parallelism};
 pub use vision::{
     DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
     VisionPreProcessor, VisionProcessorRegistry,

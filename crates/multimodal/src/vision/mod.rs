@@ -32,7 +32,7 @@
 //! let result = processor.preprocess(&images, &config)?;
 //! ```
 
-pub(crate) mod execution;
+pub mod execution;
 pub mod preprocessor_config;
 pub mod processor;
 pub mod processors;
