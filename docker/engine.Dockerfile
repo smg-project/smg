@@ -2,6 +2,7 @@
 #
 # Build args:
 #   BASE_IMAGE_REF  - full image:tag to start FROM
+#   ENGINE_BASE_STAGE - engine-base, or tokenspeed-nightly-base for CI carriers
 #   ENGINE          - engine name: vllm | sglang | trtllm | tgl | tokenspeed
 #   BACKEND         - SMG_DEFAULT_BACKEND value (defaults to ENGINE; tgl overrides to sglang)
 #   ENGINE_REPO     - if set, engine source is cloned and install-<ENGINE>.sh runs
@@ -17,6 +18,7 @@
 #                -f docker/engine.Dockerfile .
 
 ARG BASE_IMAGE_REF
+ARG ENGINE_BASE_STAGE=engine-base
 
 # ── sources stage: clone repos, stage install scripts ────────────────────────
 FROM alpine:3.19 AS sources
@@ -43,8 +45,21 @@ RUN apk add --no-cache git \
        fi
 COPY scripts/installation/ /tmp/scripts/
 
+FROM ${BASE_IMAGE_REF} AS engine-base
+
+# The nightly carrier installs TokenSpeed into a venv. Use that interpreter for
+# both SMG installation and runtime, and expose the carrier's CUDA toolkit.
+FROM engine-base AS tokenspeed-nightly-base
+ENV VIRTUAL_ENV=/opt/smg-ci/.venv \
+    CUDA_HOME=/usr/local/cuda-13.0 \
+    PATH=/opt/smg-ci/.venv/bin:/usr/local/cuda-13.0/bin:/root/.cargo/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/usr/local/cuda-13.0/extras/CUPTI/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}} \
+    CPATH=/usr/local/cuda-13.0/include:/usr/local/cuda-13.0/include/cccl${CPATH:+:${CPATH}} \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda-13.0/include:/usr/local/cuda-13.0/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}} \
+    C_INCLUDE_PATH=/usr/local/cuda-13.0/include:/usr/local/cuda-13.0/include/cccl${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
+
 # ── final stage: install SMG + conditionally install engine ──────────────────
-FROM ${BASE_IMAGE_REF}
+FROM ${ENGINE_BASE_STAGE}
 
 ARG ENGINE=sglang
 ARG BACKEND
