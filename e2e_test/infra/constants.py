@@ -72,6 +72,7 @@ ENV_VLLM_SERVICER_IMPL = (
 ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
+ENV_VLLM_MM_PROCESSOR = "E2E_VLLM_MM_PROCESSOR"  # Worker-lane processor — see get_vllm_mm_processor
 ENV_STARTUP_TIMEOUT = "E2E_STARTUP_TIMEOUT"
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
@@ -188,6 +189,27 @@ def get_mm_processing() -> str | None:
 
 
 VLLM_SERVICER_IMPLS = ("python", "rust")
+VLLM_MM_PROCESSORS = ("inprocess", "smg")
+
+
+def get_vllm_mm_processor() -> str:
+    """The processor the worker lane launches vLLM gRPC workers with
+    (``SMG_VLLM_MM_PROCESSOR``): ``inprocess`` (vLLM's own, the default) or
+    ``smg`` (smg's pipeline inside the Rust servicer, so it needs
+    ``E2E_VLLM_SERVICER_IMPL=rust``). A set-but-unrecognized value raises.
+    """
+    value = os.environ.get(ENV_VLLM_MM_PROCESSOR, "").strip().lower() or "inprocess"
+    if value not in VLLM_MM_PROCESSORS:
+        raise ValueError(
+            f"{ENV_VLLM_MM_PROCESSOR}={value!r} is not a valid processor; "
+            f"use one of {VLLM_MM_PROCESSORS}"
+        )
+    if value == "smg" and get_vllm_servicer_impl() != "rust":
+        raise ValueError(
+            f"{ENV_VLLM_MM_PROCESSOR}=smg needs {ENV_VLLM_SERVICER_IMPL}=rust: smg's pipeline "
+            "runs inside the Rust servicer"
+        )
+    return value
 
 
 def get_vllm_servicer_impl() -> str:

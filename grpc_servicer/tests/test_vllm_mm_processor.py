@@ -191,6 +191,13 @@ class TestBuildProcessor:
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess"}
         assert mm_processor.build_mm_processor(self._Engine(multimodal=False), env=env) is None
 
+    def test_smg_mode_is_the_rust_servicers(self):
+        # The mode parses (the launcher's flag takes it) but the Python servicer
+        # has no such processor: refused with the pointer to the Rust one.
+        assert mm_processor.MmSettings(processor="smg").resolve(env={}).processor == "smg"
+        with pytest.raises(ValueError, match="Rust servicer"):
+            mm_processor.build_mm_processor(self._Engine(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
+
     def test_invalid_item_cap_is_rejected_before_construction(self):
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEM_BYTES": "0"}
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEM_BYTES"):

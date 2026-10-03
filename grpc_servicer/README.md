@@ -40,7 +40,8 @@ vllm serve meta-llama/Llama-2-7b-hf --grpc
 
 By default the smg router fetches and preprocesses images itself and sends
 pixel tensors. A vLLM gRPC worker can instead accept media references (URLs)
-and run vLLM's own multimodal processor:
+and run vLLM's own multimodal processor (or, on the Rust request path, smg's
+own pipeline with `--mm-processor smg`; see below):
 
 ```bash
 vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc --mm-processor inprocess \
@@ -171,20 +172,35 @@ publisher). Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
 `SMG_SERVICER_WORKER_THREADS` (default 4).
 
 Worker-side media processing uses the same `--mm-processor` /
-`SMG_VLLM_MM_PROCESSOR` setting and backends as the Python servicer
-(`inprocess`: vLLM's MediaConnector and the engine's renderer; `redis`: the
-sidecar), so the media is fetched and processed by vLLM's own code on either
-servicer and the Rust path is never behind vLLM's processors. The Rust server
-hands a request's `media_refs` to the Python bridge
-(`smg_grpc_servicer.vllm.rust_media`), which runs the processor and vLLM's
-input processor on the launcher's asyncio loop and returns the expanded
-prompt and `mm_features` as vLLM's own encoder writes them; Rust relays the
-encoded features to the engine untouched and sends the tensor frames straight
-from the memory Python lent it, without a copy. The in-flight cap, the saturation refusal, the
-advertised `mm_processor` / `mm_media_ref_schemes` / `mm_processor_source` and
-the PD prefill leg's `media_identity` behave as on the Python servicer. A Rust
-processor (the Router's own multimodal pipeline, worker-side) can plug into
-the same seam later; the engine-side contract does not change.
+`SMG_VLLM_MM_PROCESSOR` setting as the Python servicer, with one more choice:
+
+- `inprocess` (vLLM's MediaConnector and the engine's renderer) and `redis`
+  (the sidecar) are the Python servicer's backends, so the media is fetched and
+  processed by vLLM's own code on either servicer. The Rust server hands a
+  request's `media_refs` to the Python bridge
+  (`smg_grpc_servicer.vllm.rust_media`), which runs the processor and vLLM's
+  input processor on the launcher's asyncio loop and returns the expanded
+  prompt and `mm_features` as vLLM's own encoder writes them; Rust relays the
+  encoded features to the engine untouched and sends the tensor frames
+  straight from the memory Python lent it, without a copy.
+- `smg` is smg's own media pipeline, the one the Router runs for
+  `--mm-processing router`, run inside the Rust servicer with no Python on the
+  request path: fetch, decode, preprocess, placeholder expansion, and the
+  batches a Router-preprocessed request would carry, translated for the engine
+  the same way. It serves the model families that pipeline supports
+  (`crates/multimodal`), takes `http`, `https` and `data` references, and
+  reads the model's `config.json` and preprocessor configs from the tokenizer
+  directory the launcher resolved. An engine that normalizes pixels on device
+  (vLLM's `mm_device_do_normalize`, on by default for the Qwen-VL family)
+  takes raw `uint8` pixels, and the pipeline writes those for it; a model
+  whose processor cannot emit raw pixels is refused at startup under that
+  setting (start the engine with `--mm-device-do-normalize=false` or use
+  `inprocess`). The Python servicer refuses `smg`: it has no such processor.
+
+The in-flight cap, the saturation refusal, the advertised `mm_processor` /
+`mm_media_ref_schemes` / `mm_processor_source` and the PD prefill leg's
+`media_identity` behave as on the Python servicer whichever processor runs;
+the engine-side contract does not change.
 
 Known difference: under `--structured-outputs-config.backend auto` (the
 default) vLLM's frontend validates each constraint with xgrammar and falls

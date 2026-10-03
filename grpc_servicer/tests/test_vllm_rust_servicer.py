@@ -133,6 +133,39 @@ def _config(**overrides):
     )
 
 
+def test_smg_media_options_follow_the_engine_config(tmp_path):
+    from smg_grpc_servicer.vllm.mm_processor import MmSettings
+
+    settings = MmSettings(processor="smg", max_inflight=3, max_items=2, max_item_bytes=10).resolve(
+        env={}
+    )
+    config = _config(
+        is_multimodal_model=True,
+        dtype="torch.bfloat16",
+        multimodal_config=SimpleNamespace(mm_device_do_normalize=True),
+    )
+    assert rust.smg_media_options(config, settings, str(tmp_path)) == {
+        "model_dir": str(tmp_path),
+        "model_id": "org/m",
+        "raw_pixels": True,
+        "encoder_dtype": "bfloat16",
+        "max_inflight": 3,
+        "max_items": 2,
+        "max_item_bytes": 10,
+        "source": "flag",
+    }
+    # A local model directory with its config is the pipeline's config source.
+    (tmp_path / "config.json").write_text("{}")
+    config.model_config.model = str(tmp_path)
+    options = rust.smg_media_options(config, settings, None)
+    assert options["model_dir"] == str(tmp_path) and options["model_id"] == str(tmp_path)
+    # An engine that normalizes on the CPU takes normalized pixels in its dtype.
+    config.model_config.multimodal_config = SimpleNamespace(mm_device_do_normalize=False)
+    assert rust.smg_media_options(config, settings, None)["raw_pixels"] is False
+    # A text model takes no media: the mode is ignored, as the Python processors ignore it.
+    assert rust.smg_media_options(_config(), settings, None) is None
+
+
 def test_model_info_mirrors_the_python_servicer(monkeypatch):
     monkeypatch.setenv("SMG_PAIRING_PROTOCOL", " nixl ")
     info = rust.model_info_from_config(_config())

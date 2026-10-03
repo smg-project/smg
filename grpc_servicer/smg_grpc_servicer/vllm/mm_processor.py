@@ -62,7 +62,9 @@ ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
 MODE_OFF = "off"
 MODE_INPROCESS = "inprocess"
 MODE_REDIS = "redis"
-VALID_MODES = (MODE_OFF, MODE_INPROCESS, MODE_REDIS)
+# smg's own media pipeline, inside the Rust servicer only.
+MODE_SMG = "smg"
+VALID_MODES = (MODE_OFF, MODE_INPROCESS, MODE_REDIS, MODE_SMG)
 
 DEFAULT_MAX_INFLIGHT = 64
 DEFAULT_MAX_ITEM_BYTES = 32 * 1024 * 1024
@@ -781,6 +783,12 @@ def build_mm_processor(
     mode = resolved.processor
     if mode == MODE_OFF:
         return None
+    if mode == MODE_SMG:
+        raise ValueError(
+            f"{PROCESSOR_FLAG}={MODE_SMG} is smg's own media pipeline, which runs inside the "
+            "Rust servicer (--servicer-impl rust / SMG_VLLM_SERVICER_IMPL=rust); the Python "
+            f"servicer serves {MODE_INPROCESS} or {MODE_REDIS}"
+        )
     model_config = getattr(engine, "model_config", None)
     if model_config is None or not getattr(model_config, "is_multimodal_model", False):
         logger.warning("mm_processor=%s ignored: the served model is not multimodal", mode)

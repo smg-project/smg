@@ -22,9 +22,10 @@ Rust mode serves the whole contract: text generation, PD disaggregation
 (connector KV-transfer params pass through both ways and ``GetServerInfo``
 carries the pairing identity), Router-preprocessed media, worker-side media
 processing (``media_refs``, through the same ``--mm-processor`` backends as
-the Python servicer; see :mod:`smg_grpc_servicer.vllm.rust_media`), ``Embed``,
-``FlushCache``, ``GetTokenizer`` and ``SubscribeKvEvents``. The Python
-implementation stays the default.
+the Python servicer, see :mod:`smg_grpc_servicer.vllm.rust_media`, or through
+smg's own pipeline with ``--mm-processor smg``, see :func:`smg_media_options`),
+``Embed``, ``FlushCache``, ``GetTokenizer`` and ``SubscribeKvEvents``. The
+Python implementation stays the default.
 """
 
 from __future__ import annotations
@@ -108,6 +109,43 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
             bool(pooler_use_activation) if pooler_use_activation is not None else None
         ),
         "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
+    }
+
+
+def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[str, Any] | None:
+    """What the binding builds smg's own media pipeline from (``--mm-processor
+    smg``): the model's config directory and id, the pixel format the engine
+    takes, its dtype, and the ``--mm-*`` caps. ``None`` when the served model
+    takes no media, in which case the mode is ignored as the Python processors
+    ignore it.
+
+    An engine that normalizes pixels on device (vLLM's ``mm_device_do_normalize``,
+    the default where the model supports it) takes raw ``uint8`` pixels and
+    would normalize anything else twice; the pipeline writes raw pixels then.
+    """
+    model_config = vllm_config.model_config
+    if not getattr(model_config, "is_multimodal_model", False):
+        logger.warning(
+            "mm_processor=%s ignored: the served model is not multimodal", settings.processor
+        )
+        return None
+    model_path = str(model_config.model)
+    model_dir = (
+        model_path
+        if os.path.isfile(os.path.join(model_path, "config.json"))
+        else tokenizer_dir or model_path
+    )
+    mm_config = getattr(model_config, "multimodal_config", None)
+    dtype = str(getattr(model_config, "dtype", "") or "").removeprefix("torch.")
+    return {
+        "model_dir": model_dir,
+        "model_id": model_path,
+        "raw_pixels": bool(getattr(mm_config, "mm_device_do_normalize", False)),
+        "encoder_dtype": dtype or "float32",
+        "max_inflight": settings.max_inflight,
+        "max_items": settings.max_items,
+        "max_item_bytes": settings.max_item_bytes,
+        "source": settings.source,
     }
 
 
@@ -347,17 +385,22 @@ async def serve_rust(args: argparse.Namespace) -> int:
     handshake_port = _env_int(HANDSHAKE_PORT_ENV) or free_port()
     socket_dir = default_socket_dir()
     # Worker-side media processing, from the same `--mm-*` settings (flags
-    # when the launcher has them, else the environment) as the Python servicer.
-    from smg_grpc_servicer.vllm.mm_processor import MmSettings
+    # when the launcher has them, else the environment) as the Python servicer:
+    # the Python processors behind a bridge, or smg's own pipeline in Rust.
+    from smg_grpc_servicer.vllm.mm_processor import MODE_SMG, MmSettings
     from smg_grpc_servicer.vllm.rust_media import RustMediaBridge
 
-    media = RustMediaBridge.build(
-        vllm_config, MmSettings.from_args(args), asyncio.get_running_loop()
-    )
+    mm_settings = MmSettings.from_args(args).resolve()
+    media = None
+    smg_media = None
+    if mm_settings.processor == MODE_SMG:
+        smg_media = smg_media_options(vllm_config, mm_settings, tokenizer_dir)
+    else:
+        media = RustMediaBridge.build(vllm_config, mm_settings, asyncio.get_running_loop())
     logger.info(
         "Worker-side media processing: %s (source=%s)",
-        media.name if media is not None else "off",
-        media.source if media is not None else "-",
+        MODE_SMG if smg_media is not None else media.name if media is not None else "off",
+        mm_settings.source if (smg_media is not None or media is not None) else "-",
     )
 
     init_servicer_tracing()
@@ -371,6 +414,7 @@ async def serve_rust(args: argparse.Namespace) -> int:
         engine_count=data_parallel_size,
         tokenizer_dir=tokenizer_dir,
         media_processor=media,
+        smg_media_processor=smg_media,
         **info,
     )
     logger.info(

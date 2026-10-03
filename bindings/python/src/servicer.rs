@@ -5,10 +5,13 @@
 //! engines bind the same way as their protocols land. Rust owns the
 //! listener, the engine link, and the request path; Python launches the
 //! headless engine, starts and stops the server, and announces draining. The
-//! one request-time crossing is worker-side media processing: a request's
-//! `media_refs` go to a Python object that runs the engine's own processors
-//! (the Python servicer's, with vLLM's input processor behind them), and
-//! what it produces comes back as bytes the engine reads directly.
+//! one request-time crossing is worker-side media processing, when the
+//! Python processor is chosen: a request's `media_refs` go to a Python object
+//! that runs the engine's own processors (the Python servicer's, with vLLM's
+//! input processor behind them), and what it produces comes back as bytes
+//! the engine reads directly. The other choice, smg's own pipeline
+//! ([`SmgMediaProcessor`]), never crosses: it is the Router's media pipeline
+//! run in this process.
 
 use std::{
     sync::{Arc, Mutex},
@@ -17,14 +20,21 @@ use std::{
 
 use bytes::Bytes;
 use engine_servicer::{
-    BoxFuture, MediaError, MediaProcessor, MediaRequest, ProcessedMedia, ServicerError,
-    VllmModelInfo, VllmServicerConfig, VllmServicerServer,
+    BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
+    ServicerError, VllmModelInfo, VllmServicerConfig, VllmServicerServer,
 };
+use llm_multimodal::Modality;
+use prost::Message;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
     prelude::*,
-    types::PyBytes,
+    types::{PyBytes, PyDict},
 };
+use smg::routers::grpc::worker_media::{
+    PixelFormat, WorkerMediaError, WorkerMediaItem, WorkerMediaPipeline, WorkerMediaSettings,
+    SCHEMES,
+};
+use smg_grpc_client::vllm_proto as vllm;
 use tokio::sync::oneshot;
 
 fn to_py_err(error: ServicerError) -> PyErr {
@@ -286,15 +296,25 @@ impl MediaDone {
             "ok" => {
                 let (prompt_token_ids, mm_features, aux_frames, cache_salt, media_identity): OkPayload<'_> =
                     payload.extract()?;
+                let media_identity = media_identity
+                    .map(|bytes| vllm::MediaIdentity::decode(bytes.as_bytes()))
+                    .transpose()
+                    .map_err(|error| {
+                        PyValueError::new_err(format!(
+                            "media identity could not be decoded: {error}"
+                        ))
+                    })?;
                 Ok(ProcessedMedia {
                     prompt_token_ids,
-                    mm_features: mm_features.as_ref().map(bytes_of),
-                    aux_frames: aux_frames
-                        .into_iter()
-                        .map(lent_bytes)
-                        .collect::<PyResult<_>>()?,
-                    cache_salt,
-                    media_identity: media_identity.as_ref().map(bytes_of),
+                    features: MediaFeatures::Encoded {
+                        mm_features: mm_features.as_ref().map(bytes_of),
+                        aux_frames: aux_frames
+                            .into_iter()
+                            .map(lent_bytes)
+                            .collect::<PyResult<_>>()?,
+                        cache_salt,
+                    },
+                    media_identity,
                 })
             }
             "invalid" => Err(MediaError::Invalid(payload.extract()?)),
@@ -338,6 +358,128 @@ impl ProbeDone {
         }
         Ok(())
     }
+}
+
+/// smg's own media pipeline as the worker-side processor (`--mm-processor
+/// smg`): the Router's fetch, decode, preprocess and placeholder expansion,
+/// run in this process, answering in the Router's batch shape. No Python on
+/// the request path.
+struct SmgMediaProcessor {
+    pipeline: Arc<WorkerMediaPipeline>,
+    source: String,
+    max_inflight: usize,
+}
+
+impl MediaProcessor for SmgMediaProcessor {
+    fn name(&self) -> &str {
+        "smg"
+    }
+
+    fn schemes(&self) -> String {
+        SCHEMES.to_string()
+    }
+
+    fn source(&self) -> &str {
+        &self.source
+    }
+
+    fn max_inflight(&self) -> usize {
+        self.max_inflight
+    }
+
+    fn probe(&self) -> BoxFuture<bool> {
+        // In-process and stateless between requests: serving whenever up.
+        Box::pin(async { true })
+    }
+
+    fn process(&self, request: MediaRequest) -> BoxFuture<Result<ProcessedMedia, MediaError>> {
+        let pipeline = Arc::clone(&self.pipeline);
+        Box::pin(async move {
+            let items = request
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let modality = match item.modality.as_str() {
+                        "image" => Modality::Image,
+                        "video" => Modality::Video,
+                        other => {
+                            return Err(MediaError::Invalid(format!(
+                                "media_refs[{index}]: unsupported modality {other}"
+                            )))
+                        }
+                    };
+                    Ok(WorkerMediaItem {
+                        modality,
+                        url: item.url.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let output = pipeline
+                .process(request.prompt_token_ids, &items, request.want_identity)
+                .await
+                .map_err(|error| match error {
+                    WorkerMediaError::Invalid(message) => MediaError::Invalid(message),
+                    WorkerMediaError::Unavailable(message) => MediaError::Unavailable(message),
+                    WorkerMediaError::Internal(message) => MediaError::Internal(message),
+                })?;
+            Ok(ProcessedMedia {
+                prompt_token_ids: output.prompt_token_ids,
+                features: MediaFeatures::Batches(output.batches),
+                media_identity: output.identity,
+            })
+        })
+    }
+}
+
+/// The settings the launcher passes as `smg_media_processor`, by key; the
+/// pipeline itself is built off the GIL once the tokenizer is loaded.
+struct NativeMediaOptions {
+    settings: WorkerMediaSettings,
+    source: String,
+    max_inflight: usize,
+}
+
+fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOptions> {
+    let item = |key: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
+        Ok(options.get_item(key)?.filter(|value| !value.is_none()))
+    };
+    let string =
+        |key: &str| -> PyResult<Option<String>> { item(key)?.map(|v| v.extract()).transpose() };
+    let count =
+        |key: &str| -> PyResult<Option<usize>> { item(key)?.map(|v| v.extract()).transpose() };
+    let required = |key: &str| -> PyResult<String> {
+        string(key)?
+            .ok_or_else(|| PyValueError::new_err(format!("smg_media_processor needs {key:?}")))
+    };
+    let raw_pixels = item("raw_pixels")?
+        .map(|v| v.extract::<bool>())
+        .transpose()?
+        .unwrap_or(false);
+    let allowed_domains: Option<Vec<String>> =
+        item("allowed_domains")?.map(|v| v.extract()).transpose()?;
+    let fetch_timeout_ms: u64 = item("fetch_timeout_ms")?
+        .map(|v| v.extract())
+        .transpose()?
+        .unwrap_or(10_000);
+    Ok(NativeMediaOptions {
+        settings: WorkerMediaSettings {
+            model_dir: required("model_dir")?,
+            model_id: required("model_id")?,
+            pixel_format: if raw_pixels {
+                PixelFormat::RawU8
+            } else {
+                PixelFormat::Normalized
+            },
+            encoder_dtype: string("encoder_dtype")?.unwrap_or_else(|| "float32".to_string()),
+            max_items: count("max_items")?,
+            max_item_bytes: count("max_item_bytes")?,
+            allowed_domains,
+            fetch_timeout: Duration::from_millis(fetch_timeout_ms),
+        },
+        source: string("source")?.unwrap_or_else(|| "default".to_string()),
+        max_inflight: count("max_inflight")?.unwrap_or(4).max(1),
+    })
 }
 
 /// Rust-owned `vllm.grpc.engine.VllmEngine` server over a same-host vLLM
@@ -387,6 +529,7 @@ impl PyVllmGrpcServer {
         pooler_use_activation = None,
         pooler_dimensions = None,
         media_processor = None,
+        smg_media_processor = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -426,11 +569,21 @@ impl PyVllmGrpcServer {
         pooler_use_activation: Option<bool>,
         pooler_dimensions: Option<u32>,
         media_processor: Option<Bound<'_, PyAny>>,
+        smg_media_processor: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
+        if media_processor.is_some() && smg_media_processor.is_some() {
+            return Err(PyValueError::new_err(
+                "media_processor (the Python processors) and smg_media_processor (smg's \
+                 pipeline) are two choices for one slot; pass one",
+            ));
+        }
         let media_processor = media_processor
             .map(|bridge| PythonMediaProcessor::new(&bridge))
             .transpose()?
             .map(|processor| Arc::new(processor) as Arc<dyn MediaProcessor>);
+        let native = smg_media_processor
+            .map(|options| native_media_options(&options))
+            .transpose()?;
         let model = VllmModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
@@ -462,7 +615,7 @@ impl PyVllmGrpcServer {
             pooler_use_activation,
             pooler_dimensions,
         };
-        let config = VllmServicerConfig {
+        let mut config = VllmServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
@@ -471,9 +624,49 @@ impl PyVllmGrpcServer {
             model,
             media_processor,
         };
-        let inner = py
-            .detach(|| VllmServicerServer::start(config))
-            .map_err(to_py_err)?;
+        let inner = py.detach(|| -> PyResult<VllmServicerServer> {
+            let Some(native) = native else {
+                return VllmServicerServer::start(config).map_err(to_py_err);
+            };
+            // The pipeline needs the tokenizer the servicer would load after
+            // the engine connects; load it here and hand the same one over.
+            let dir = config.tokenizer_dir.clone().ok_or_else(|| {
+                PyValueError::new_err("the smg media processor needs tokenizer_dir")
+            })?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    PyRuntimeError::new_err(format!("media pipeline setup runtime: {error}"))
+                })?;
+            let (tokenizer, pipeline) = runtime.block_on(async {
+                let tokenizer = llm_tokenizer::factory::create_tokenizer_async(&dir)
+                    .await
+                    .map_err(|error| {
+                        PyRuntimeError::new_err(format!(
+                            "loading the tokenizer from {dir} for the smg media processor: {error:#}"
+                        ))
+                    })?;
+                let pipeline = WorkerMediaPipeline::new(native.settings, Arc::clone(&tokenizer))
+                    .await
+                    .map_err(|error| {
+                        PyValueError::new_err(format!("smg media processor: {error:#}"))
+                    })?;
+                Ok::<_, PyErr>((tokenizer, pipeline))
+            })?;
+            tracing::info!(
+                spec = pipeline.spec_name(),
+                pixel_format = ?pipeline.pixel_format(),
+                max_inflight = native.max_inflight,
+                "smg media processor ready"
+            );
+            config.media_processor = Some(Arc::new(SmgMediaProcessor {
+                pipeline: Arc::new(pipeline),
+                source: native.source,
+                max_inflight: native.max_inflight,
+            }));
+            VllmServicerServer::start_with_tokenizer(config, tokenizer).map_err(to_py_err)
+        })?;
         Ok(Self { inner })
     }
 

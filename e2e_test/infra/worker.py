@@ -27,6 +27,7 @@ from .constants import (
     WorkerType,
     get_mm_processing,
     get_runtime,
+    get_vllm_mm_processor,
     get_vllm_servicer_impl,
     get_zmq_engine_count,
     sglang_transfer_backend,
@@ -568,7 +569,7 @@ class Worker:
         ):
             # The worker advertises mm_processor and the gateway, left in auto
             # mode, forwards media references instead of preprocessed tensors.
-            env["SMG_VLLM_MM_PROCESSOR"] = "inprocess"
+            env["SMG_VLLM_MM_PROCESSOR"] = get_vllm_mm_processor()
 
         if self.engine == "tokenspeed" and self.worker_type in (
             WorkerType.ENCODE,

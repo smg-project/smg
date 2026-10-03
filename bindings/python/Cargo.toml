@@ -21,6 +21,19 @@ features = ["grpc-client", "jemalloc-stats", "providers"]
 [dependencies.engine-servicer]
 workspace = true
 
+[dependencies.llm-multimodal]
+workspace = true
+default-features = false
+
+[dependencies.llm-tokenizer]
+workspace = true
+
+[dependencies.prost]
+workspace = true
+
+[dependencies.smg-grpc-client]
+workspace = true
+
 [dependencies.bytes]
 workspace = true
 
