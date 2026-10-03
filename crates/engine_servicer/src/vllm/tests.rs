@@ -2213,6 +2213,24 @@ async fn a_pd_prefill_leg_returns_the_media_identity() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Device-side pixel normalization is a fact of the engine's config,
+/// advertised whether or not this worker processes media itself: the Router
+/// preprocessing for it needs it to send raw pixels.
+#[tokio::test]
+async fn server_info_advertises_device_side_normalization() {
+    let mut model = model_info();
+    model.mm_device_do_normalize = true;
+    let mut h = harness_with(model, None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.mm_device_do_normalize);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `GetServerInfo` advertises the processor only while it answers its probe
 /// and the engine takes multimodal input, as the Python servicer does.
 #[tokio::test]

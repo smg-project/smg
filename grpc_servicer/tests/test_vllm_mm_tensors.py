@@ -112,6 +112,7 @@ def test_the_accepted_names_match_the_wire_vocabulary():
         "float32",
         "bfloat16",
         "float16",
+        "uint8",
         "int64",
         "uint32",
     }
