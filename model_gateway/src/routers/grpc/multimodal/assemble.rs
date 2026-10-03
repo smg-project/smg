@@ -207,13 +207,43 @@ fn assemble_vllm_batches(
     intermediate: MultimodalIntermediate,
     workers: Option<&WorkerSelection>,
 ) -> Result<VllmMultimodalData> {
+    assemble_vllm_batches_with(intermediate, &VllmAssembly::for_selection(workers))
+}
+
+/// The wire choices of a vLLM assembly: the Router resolves them from the
+/// worker selection and its transport settings; a worker processing its own
+/// media names them directly (inline, in the engine's dtype).
+#[derive(Debug, Clone)]
+pub(super) struct VllmAssembly {
+    /// The dtype the primary tensor is written in (`float32`, `bfloat16`,
+    /// `float16`, or `uint8` for raw pixels).
+    pub encoder_dtype: String,
+    pub shm_enabled: bool,
+    pub shm_min_bytes: usize,
+}
+
+impl VllmAssembly {
+    fn for_selection(workers: Option<&WorkerSelection>) -> Self {
+        Self {
+            encoder_dtype: mm_vllm_encoder_input_dtype(workers),
+            shm_enabled: resolve_mm_shm_enabled(workers, false),
+            shm_min_bytes: resolve_mm_shm_min_bytes(workers),
+        }
+    }
+}
+
+/// [`assemble_vllm_batches`] with the wire choices given.
+pub(super) fn assemble_vllm_batches_with(
+    intermediate: MultimodalIntermediate,
+    assembly: &VllmAssembly,
+) -> Result<VllmMultimodalData> {
     let mut batches = intermediate.into_batches().into_iter();
     let first = batches
         .next()
         .context("multimodal intermediate is missing its first batch")?;
-    let mut data = assemble_vllm(first, workers)?;
+    let mut data = assemble_vllm(first, assembly)?;
     data.extra_batches = batches
-        .map(|batch| assemble_vllm(batch, workers))
+        .map(|batch| assemble_vllm(batch, assembly))
         .collect::<Result<Vec<_>>>()?;
     Ok(data)
 }
@@ -276,12 +306,10 @@ fn assemble_sglang(
 
 fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
-    workers: Option<&WorkerSelection>,
+    assembly: &VllmAssembly,
 ) -> Result<VllmMultimodalData> {
-    let (pixel_values, pixel_values_shape, pixel_values_dtype) = serialize_encoder_input(
-        &intermediate.preprocessed,
-        &mm_vllm_encoder_input_dtype(workers),
-    );
+    let (pixel_values, pixel_values_shape, pixel_values_dtype) =
+        serialize_encoder_input(&intermediate.preprocessed, &assembly.encoder_dtype);
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let (modality, mm_hashes) = match &intermediate.media {
         MediaBatch::Images(images) => (
@@ -319,8 +347,8 @@ fn assemble_vllm(
         keep_on_cpu_keys: intermediate.keep_on_cpu_keys,
         encoder_input_key: intermediate.encoder_input_key,
         modality,
-        shm_enabled: resolve_mm_shm_enabled(workers, false),
-        shm_min_bytes: resolve_mm_shm_min_bytes(workers),
+        shm_enabled: assembly.shm_enabled,
+        shm_min_bytes: assembly.shm_min_bytes,
         // vLLM workers cannot pull RDMA payloads yet.
         rdma_enabled: false,
         extra_batches: Vec::new(),

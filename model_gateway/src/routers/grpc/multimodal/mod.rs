@@ -57,6 +57,7 @@ mod refs;
 mod serialize;
 mod settings;
 mod transport;
+pub mod worker;
 
 pub(crate) use assemble::{
     assemble_multimodal_data, assemble_multimodal_data_after_encode,

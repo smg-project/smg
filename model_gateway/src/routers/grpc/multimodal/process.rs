@@ -81,13 +81,13 @@ pub(crate) async fn process_multimodal_plan(
     for part in plan.into_parts() {
         tracker
             .push_part(part)
-            .map_err(|e| anyhow::anyhow!("Failed to push content part: {e}"))?;
+            .context("Failed to push content part")?;
     }
 
     let tracker_output: TrackerOutput = tracker
         .finalize()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to finalize multimodal tracker: {e}"))?;
+        .context("Failed to finalize multimodal tracker")?;
 
     let images: Vec<Arc<ImageFrame>> = tracker_output
         .data

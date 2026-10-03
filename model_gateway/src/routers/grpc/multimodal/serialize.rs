@@ -201,6 +201,21 @@ fn serialize_array_as_dtype(
     encoder_input: &ArrayViewD<'_, f32>,
     dtype: &str,
 ) -> (Vec<u8>, Vec<u32>, String) {
+    if dtype.trim().eq_ignore_ascii_case("uint8") {
+        // Raw pixels (preprocessed with rescale and normalize off) are whole
+        // numbers in 0..=255 already; the rounding and clamp are a guard.
+        let data: Vec<u8> = match encoder_input.as_slice() {
+            Some(values) => values
+                .iter()
+                .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+                .collect(),
+            None => encoder_input
+                .iter()
+                .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+                .collect(),
+        };
+        return (data, array_shape(encoder_input), "uint8".to_string());
+    }
     match canonical_float_dtype(dtype).as_deref() {
         Some("float32") => {
             let (data, shape) = serialize_array(encoder_input);

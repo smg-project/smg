@@ -1002,7 +1002,7 @@ fn collect_tokenspeed_tensor_shm_handles(
 /// leg: hashes, placeholders and the M-RoPE grid tensors (a few ints per item,
 /// inline payloads only, since an SHM segment is unreadable after the prefill
 /// send). A hash-less batch carries no identity worth keeping.
-fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInputs> {
+pub(crate) fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInputs> {
     if mm.mm_hashes.is_empty() {
         return None;
     }
