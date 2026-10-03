@@ -2355,6 +2355,27 @@ async fn a_cancelled_decode_leg_still_notifies_the_engine() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// vLLM refuses `n > 1` under greedy sampling on the request as a whole;
+/// the fan-out hands each choice `n = 1`, so the check runs before it, and
+/// nothing reaches the engine.
+#[tokio::test]
+async fn greedy_sampling_with_several_choices_is_refused_before_the_fan_out() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("g2", false, Vec::new());
+    if let Some(params) = request.sampling_params.as_mut() {
+        params.n = 2;
+        params.temperature = Some(0.0);
+    }
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(
+        status.message(),
+        "n must be 1 when using greedy sampling, got 2."
+    );
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A PD decode leg refused past its media stage (here: by the engine wire's
 /// sampling validation) still owes the notice: the engine never held it.
 #[tokio::test]

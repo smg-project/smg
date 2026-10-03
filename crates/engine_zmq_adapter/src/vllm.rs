@@ -815,6 +815,19 @@ pub(crate) fn translate_sampling(
 /// checks run here, and a bad request is an `invalid_argument` to its caller
 /// rather than an outage. Zero `top_p`/`repetition_penalty` are the proto's
 /// "unset" and are normalized to 1.0 by the translation, so they pass.
+/// vLLM's `_verify_greedy_sampling`: greedy decoding (temperature below its
+/// sampling epsilon) cannot yield distinct choices. Checked on the request's
+/// own `n`, before the fan-out hands each choice `n = 1`.
+pub(crate) fn refuse_greedy_choices(sp: &vllm::SamplingParams) -> Result<(), String> {
+    if sp.temperature.is_some_and(|temperature| temperature < 1e-5) && sp.n > 1 {
+        return Err(format!(
+            "n must be 1 when using greedy sampling, got {}.",
+            sp.n
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> Result<(), String> {
     if let Some(temperature) = sp.temperature {
         if !temperature.is_finite() || temperature < 0.0 {
@@ -822,14 +835,7 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
                 "temperature must be a finite non-negative number, got {temperature}"
             ));
         }
-        // vLLM's `_verify_greedy_sampling`: greedy decoding (temperature
-        // below its sampling epsilon) cannot yield distinct choices.
-        if temperature < 1e-5 && sp.n > 1 {
-            return Err(format!(
-                "n must be 1 when using greedy sampling, got {}.",
-                sp.n
-            ));
-        }
+        refuse_greedy_choices(sp)?;
     }
     if sp.top_p != 0.0 && !(sp.top_p > 0.0 && sp.top_p <= 1.0) {
         return Err(format!("top_p must be in (0, 1], got {}", sp.top_p));
