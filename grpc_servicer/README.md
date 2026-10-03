@@ -168,8 +168,11 @@ below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
 FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
 directory) and `SubscribeKvEvents` (`--kv-events-config` with the ZMQ
 publisher). Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
-`SMG_VLLM_SERVICER_DRAIN_SECS` (default 5), `SMG_ZMQ_SOCKET_DIR`,
-`SMG_SERVICER_WORKER_THREADS` (default 4).
+`SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
+`SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800: how long the servicer
+waits for the engine's handshake; an engine's first start on a host
+JIT-compiles and autotunes kernels, and a dead engine fails fast regardless),
+`SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS` (default 4).
 
 Worker-side media processing uses the same `--mm-processor` /
 `SMG_VLLM_MM_PROCESSOR` setting as the Python servicer, with one more choice:
@@ -223,6 +226,20 @@ python -m smg_grpc_servicer.mlx --model meta-llama/Llama-2-7b-hf --host 0.0.0.0 
 ```bash
 python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0.0.0.0 --port 50051
 ```
+
+This is the process `ts serve` spawns for its gRPC worker. With
+`SMG_TOKENSPEED_SERVICER_IMPL=rust` the same process serves the
+`tokenspeed.grpc.scheduler.TokenSpeedScheduler` contract from Rust
+(`smg.servicer.TokenSpeedGrpcServer`, which needs the `smg` wheel): the
+launcher computes the model and server facts from TokenSpeed's own config,
+runs the scheduler(s) headless in a spawned child over the msgpack ZMQ wire,
+and supervises both. What that wire does not carry is reported, not emulated:
+`FlushCache` and profiling answer UNIMPLEMENTED, ranked `top_logprobs` and
+prompt logprobs are refused, and PD/EPD disaggregation stays with the Python
+implementation. Tuning: `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
+free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
+`SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800, as for vLLM
+above), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS` (default 4).
 
 ### SGLang
 
