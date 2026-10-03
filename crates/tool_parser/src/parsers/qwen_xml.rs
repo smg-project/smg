@@ -149,14 +149,14 @@ impl QwenXmlParser {
             return Ok(None);
         }
 
-        let param_types = helpers::param_types_for_function(tools, &function_name);
+        let param_types = helpers::ParamTypes::for_function(tools, &function_name);
         let mut parameters = serde_json::Map::new();
 
         for cap in self.xml_param_pattern.captures_iter(content) {
             if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                 let key = key_match.as_str().trim().to_string();
                 let value = value_match.as_str();
-                let json_value = coerce_value(value, param_types.get(&key).map(String::as_str));
+                let json_value = coerce_value(value, param_types.get(&key));
                 parameters.insert(key, json_value);
             }
         }
@@ -180,7 +180,7 @@ impl QwenXmlParser {
         parameter_end: usize,
     ) -> Vec<ToolCallItem> {
         let mut calls: Vec<ToolCallItem> = vec![];
-        let param_types = helpers::param_types_for_function(tools, &self.current_function_name);
+        let param_types = helpers::ParamTypes::for_function(tools, &self.current_function_name);
 
         // Leave parameters from subsequent coalesced calls for their own iteration.
         let mut new_params = serde_json::Map::new();
@@ -191,7 +191,7 @@ impl QwenXmlParser {
             if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                 let key = key_match.as_str().trim().to_string();
                 let value = value_match.as_str();
-                let json_value = coerce_value(value, param_types.get(&key).map(String::as_str));
+                let json_value = coerce_value(value, param_types.get(&key));
                 new_params.insert(key, json_value);
             }
         }
