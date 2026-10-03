@@ -12,9 +12,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use llm_multimodal::{
-    configure_parallelism, MediaConnector, MediaConnectorConfig, MediaConnectorError,
-    MediaContentPart, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
-    VisionProcessorRegistry, POOL_THREADS_ENV,
+    configure_parallelism, vision::PreProcessorConfig, MediaConnector, MediaConnectorConfig,
+    MediaConnectorError, MediaContentPart, Modality, ModelMetadata, ModelRegistry, MultiModalError,
+    Parallelism, VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -23,7 +23,7 @@ use tracing::warn;
 
 use super::{
     assemble::{assemble_vllm_batches_with, VllmAssembly},
-    config::{MultimodalComponents, MultimodalConfigRegistry},
+    config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
     mm_settings,
     pixel_cache::pixel_cache_with_budget,
     plan::{prepare_placeholder_tokens, validate_rendered_media_anchors, MediaPlan},
@@ -62,6 +62,10 @@ pub struct WorkerMediaSettings {
     /// The engine's dtype (`bfloat16`, `float16`, `float32`); normalized
     /// pixels are written in it directly, so nothing downstream casts them.
     pub encoder_dtype: String,
+    /// The engine's `mm_processor_kwargs`, laid over the preprocessor
+    /// configs as its own processor would take them. A key the config has
+    /// no field for is refused at construction.
+    pub processor_kwargs: serde_json::Map<String, serde_json::Value>,
     /// Media items a request may carry per modality; `None` keeps the model
     /// spec's limits.
     pub max_items: Option<usize>,
@@ -142,10 +146,19 @@ impl WorkerMediaPipeline {
                 );
             }
         }
+        super::report_jpeg_decoder();
         let config_registry = Arc::new(MultimodalConfigRegistry::new());
         let loaded = config_registry
             .get_or_load(CONFIG_KEY, &settings.model_dir)
             .await?;
+        let loaded = match apply_processor_kwargs(&loaded, &settings.processor_kwargs)? {
+            Some(overridden) => {
+                let overridden = Arc::new(overridden);
+                config_registry.insert(CONFIG_KEY.to_string(), overridden.clone());
+                overridden
+            }
+            None => loaded,
+        };
         let model_registry = Arc::new(ModelRegistry::default());
         let spec_name = {
             let adapter = RegistryTokenizer(tokenizer.as_ref());
@@ -355,6 +368,52 @@ fn data_url_payload_bytes(url: &str) -> Option<usize> {
 /// Whose fault a pipeline failure is, from the typed error in its chain: a
 /// fetch that timed out or could not connect is the network's (retryable),
 /// a bad reference or undecodable media the caller's, anything else ours.
+/// The model's configs with `kwargs` laid over each preprocessor config, or
+/// `None` when there are none. A key the config has no field for is refused:
+/// the engine's own processor would have honoured it, this pipeline cannot.
+fn apply_processor_kwargs(
+    loaded: &MultimodalModelConfig,
+    kwargs: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<Option<MultimodalModelConfig>> {
+    if kwargs.is_empty() {
+        return Ok(None);
+    }
+    let known = match serde_json::to_value(PreProcessorConfig::default()) {
+        Ok(serde_json::Value::Object(fields)) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let mut unknown: Vec<&str> = kwargs
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !known.contains_key(*key))
+        .collect();
+    unknown.sort_unstable();
+    anyhow::ensure!(
+        unknown.is_empty(),
+        "the smg media processor does not take mm_processor_kwargs {unknown:?}; drop them or \
+         use --mm-processor inprocess"
+    );
+    let overlay = |config: &PreProcessorConfig| -> anyhow::Result<PreProcessorConfig> {
+        let mut value =
+            serde_json::to_value(config).context("serializing the preprocessor config")?;
+        if let serde_json::Value::Object(fields) = &mut value {
+            for (key, kwarg) in kwargs {
+                fields.insert(key.clone(), kwarg.clone());
+            }
+        }
+        serde_json::from_value(value)
+            .context("mm_processor_kwargs do not fit the preprocessor config")
+    };
+    let mut overridden = loaded.clone();
+    overridden.preprocessor_config = overlay(&loaded.preprocessor_config)?;
+    overridden.video_preprocessor_config = loaded
+        .video_preprocessor_config
+        .as_ref()
+        .map(overlay)
+        .transpose()?;
+    Ok(Some(overridden))
+}
+
 fn classify(error: anyhow::Error) -> WorkerMediaError {
     let message = format!("{error:#}");
     for cause in error.chain() {
@@ -417,5 +476,64 @@ mod tests {
         assert!(matches!(classify(scheme), WorkerMediaError::Invalid(_)));
         let other = anyhow::anyhow!("preprocess failed");
         assert!(matches!(classify(other), WorkerMediaError::Internal(_)));
+    }
+}
+
+#[cfg(test)]
+mod processor_kwargs_tests {
+    use super::*;
+
+    fn kwargs(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map,
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    #[test]
+    fn processor_kwargs_lay_over_every_preprocessor_config() {
+        let loaded = MultimodalModelConfig {
+            config: serde_json::json!({"model_type": "qwen3_vl"}),
+            preprocessor_config: PreProcessorConfig {
+                max_pixels: Some(10),
+                ..Default::default()
+            },
+            video_preprocessor_config: Some(PreProcessorConfig::default()),
+        };
+        assert!(apply_processor_kwargs(&loaded, &serde_json::Map::new())
+            .unwrap()
+            .is_none());
+
+        let overridden = apply_processor_kwargs(
+            &loaded,
+            &kwargs(serde_json::json!({"max_pixels": 20, "min_pixels": 4})),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(overridden.preprocessor_config.max_pixels, Some(20));
+        assert_eq!(overridden.preprocessor_config.min_pixels, Some(4));
+        assert_eq!(
+            overridden.video_preprocessor_config.unwrap().max_pixels,
+            Some(20)
+        );
+    }
+
+    /// A knob the engine's processor takes and this pipeline has no field
+    /// for would silently change the pixels; it is refused by name.
+    #[test]
+    fn unknown_processor_kwargs_are_refused_by_name() {
+        let loaded = MultimodalModelConfig {
+            config: serde_json::json!({"model_type": "qwen3_vl"}),
+            preprocessor_config: PreProcessorConfig::default(),
+            video_preprocessor_config: None,
+        };
+        let error = apply_processor_kwargs(
+            &loaded,
+            &kwargs(serde_json::json!({"fps": 2, "max_pixels": 1, "num_frames": 8})),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(r#"["fps", "num_frames"]"#), "{message}");
+        assert!(message.contains("--mm-processor inprocess"), "{message}");
     }
 }

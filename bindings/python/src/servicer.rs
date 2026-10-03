@@ -458,6 +458,15 @@ fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOpti
         .unwrap_or(false);
     let allowed_domains: Option<Vec<String>> =
         item("allowed_domains")?.map(|v| v.extract()).transpose()?;
+    let processor_kwargs = match string("processor_kwargs_json")? {
+        Some(json) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+            .map_err(|error| {
+                PyValueError::new_err(format!(
+                    "smg_media_processor processor_kwargs_json is not a JSON object: {error}"
+                ))
+            })?,
+        None => serde_json::Map::new(),
+    };
     let fetch_timeout_ms: u64 = item("fetch_timeout_ms")?
         .map(|v| v.extract())
         .transpose()?
@@ -472,6 +481,7 @@ fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOpti
                 PixelFormat::Normalized
             },
             encoder_dtype: string("encoder_dtype")?.unwrap_or_else(|| "float32".to_string()),
+            processor_kwargs,
             max_items: count("max_items")?,
             max_item_bytes: count("max_item_bytes")?,
             allowed_domains,

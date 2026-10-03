@@ -149,6 +149,7 @@ def test_smg_media_options_follow_the_engine_config(tmp_path):
         "model_id": "org/m",
         "raw_pixels": True,
         "encoder_dtype": "bfloat16",
+        "processor_kwargs_json": None,
         "max_inflight": 3,
         "max_items": 2,
         "max_item_bytes": 10,
@@ -162,8 +163,23 @@ def test_smg_media_options_follow_the_engine_config(tmp_path):
     # An engine that normalizes on the CPU takes normalized pixels in its dtype.
     config.model_config.multimodal_config = SimpleNamespace(mm_device_do_normalize=False)
     assert rust.smg_media_options(config, settings, None)["raw_pixels"] is False
+    # The engine's processor kwargs ride along, less where its own processor runs.
+    config.model_config.mm_processor_kwargs = {"max_pixels": 1000, "device": "cuda"}
+    assert (
+        rust.smg_media_options(config, settings, None)["processor_kwargs_json"]
+        == '{"max_pixels": 1000}'
+    )
     # A text model takes no media: the mode is ignored, as the Python processors ignore it.
     assert rust.smg_media_options(_config(), settings, None) is None
+
+
+def test_model_info_advertises_device_side_normalization():
+    assert rust.model_info_from_config(_config())["mm_device_do_normalize"] is False
+    config = _config(
+        is_multimodal_model=True,
+        multimodal_config=SimpleNamespace(mm_device_do_normalize=True),
+    )
+    assert rust.model_info_from_config(config)["mm_device_do_normalize"] is True
 
 
 def test_model_info_mirrors_the_python_servicer(monkeypatch):

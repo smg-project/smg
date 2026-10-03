@@ -35,6 +35,7 @@ import asyncio
 import dataclasses
 import glob
 import importlib.util
+import json
 import logging
 import multiprocessing
 import os
@@ -124,6 +125,10 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     An engine that normalizes pixels on device (vLLM's ``mm_device_do_normalize``,
     the default where the model supports it) takes raw ``uint8`` pixels and
     would normalize anything else twice; the pipeline writes raw pixels then.
+    The engine's ``mm_processor_kwargs`` go along as overrides of the
+    preprocessor config (less ``device``, which only says where vLLM's own
+    processor would run); a knob the pipeline has no field for is refused
+    at launch rather than silently ignored.
     """
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
@@ -138,11 +143,19 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         else tokenizer_dir or model_path
     )
     dtype = str(getattr(model_config, "dtype", "") or "").removeprefix("torch.")
+    processor_kwargs = {
+        key: value
+        for key, value in (getattr(model_config, "mm_processor_kwargs", None) or {}).items()
+        if key != "device"
+    }
     return {
         "model_dir": model_dir,
         "model_id": model_path,
         "raw_pixels": mm_device_do_normalize(vllm_config),
         "encoder_dtype": dtype or "float32",
+        "processor_kwargs_json": (
+            json.dumps(processor_kwargs, sort_keys=True) if processor_kwargs else None
+        ),
         "max_inflight": settings.max_inflight,
         "max_items": settings.max_items,
         "max_item_bytes": settings.max_item_bytes,
