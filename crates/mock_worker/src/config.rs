@@ -71,7 +71,7 @@ impl Config {
                 "--zmq-handshake" => cfg.zmq_handshake = Some(value(&mut args, &flag)?),
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
-                    cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--model" => cfg.model_id = value(&mut args, &flag)?,
                 "--tokenizer" => cfg.tokenizer_path = value(&mut args, &flag)?,
@@ -104,7 +104,7 @@ impl Config {
                 }
                 "--block-size" => cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?,
                 "--prefix-cache" => {
-                    cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
@@ -112,7 +112,7 @@ impl Config {
         }
 
         if cfg.tokenizer_path.is_empty() {
-            cfg.tokenizer_path = cfg.model_id.clone();
+            cfg.tokenizer_path.clone_from(&cfg.model_id);
         }
         // `--output-tokens` doubles as the realistic engine's default output
         // length when a request omits `max_tokens`.
