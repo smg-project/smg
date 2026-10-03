@@ -17,9 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use bytes::Bytes;
-use engine_zmq_adapter::ProcessedMedia as EngineMedia;
-use prost::Message;
+pub use engine_zmq_adapter::ProcessedMedia as MediaFeatures;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
@@ -53,16 +51,14 @@ pub struct MediaRequest {
 }
 
 /// What a processor produced: the prompt with its placeholders expanded, the
-/// engine's `mm_features` as vLLM's `MsgpackEncoder` wrote them (the primary
-/// buffer, plus the aux tensor frames it split off), the cache salt, and,
-/// when asked, the serialized `MediaIdentity` proto.
+/// engine-side features in the shape its pipeline makes them (vLLM's own
+/// encoding of `mm_features`, or the Router's batches for smg's pipeline),
+/// and, when asked, the identity a PD prefill leg returns.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProcessedMedia {
     pub prompt_token_ids: Vec<u32>,
-    pub mm_features: Option<Bytes>,
-    pub aux_frames: Vec<Bytes>,
-    pub cache_salt: Option<String>,
-    pub media_identity: Option<Bytes>,
+    pub features: MediaFeatures,
+    pub media_identity: Option<vllm::MediaIdentity>,
 }
 
 /// Why a processor refused or failed a request, mapped to the status the
@@ -215,7 +211,7 @@ fn parse_media_refs(refs: &vllm::MediaRefs) -> Result<Vec<MediaRefItem>, Status>
 pub(super) async fn process_media_refs(
     state: &State,
     req: &mut vllm::GenerateRequest,
-) -> Result<Option<(EngineMedia, Option<vllm::MediaIdentity>)>, Status> {
+) -> Result<Option<(MediaFeatures, Option<vllm::MediaIdentity>)>, Status> {
     let Some(refs) = req.media_refs.take().filter(|refs| !refs.items.is_empty()) else {
         return Ok(None);
     };
@@ -268,19 +264,5 @@ pub(super) async fn process_media_refs(
     if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() {
         tokenized.input_ids = processed.prompt_token_ids;
     }
-    let identity = processed
-        .media_identity
-        .map(vllm::MediaIdentity::decode)
-        .transpose()
-        .map_err(|error| {
-            Status::internal(format!("media identity could not be decoded: {error}"))
-        })?;
-    Ok(Some((
-        EngineMedia {
-            mm_features: processed.mm_features,
-            aux_frames: processed.aux_frames,
-            cache_salt: processed.cache_salt,
-        },
-        identity,
-    )))
+    Ok(Some((processed.features, processed.media_identity)))
 }

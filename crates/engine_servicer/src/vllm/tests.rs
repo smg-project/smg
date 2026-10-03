@@ -17,6 +17,7 @@ use engine_zmq_client::{
         MockEngineOutput,
     },
     protocol::vllm::{
+        multimodal::MmKwargValue,
         output::{
             EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
             SpecDecodeMetrics, StopReason,
@@ -30,7 +31,6 @@ use engine_zmq_client::{
 };
 use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
 use portpicker::pick_unused_port;
-use prost::Message;
 use smg_grpc_client::{
     common_proto as common,
     tokenizer_bundle::{validate_bundle_sha256, with_extracted_bundle, StreamBundle},
@@ -1856,9 +1856,11 @@ fn encoded_features() -> Bytes {
 fn processed_media() -> ProcessedMedia {
     ProcessedMedia {
         prompt_token_ids: vec![7, 8, 9, 10],
-        mm_features: Some(encoded_features()),
-        aux_frames: vec![Bytes::from_static(&[1, 2, 3, 4, 5, 6, 7, 8])],
-        cache_salt: Some("salt".to_string()),
+        features: MediaFeatures::Encoded {
+            mm_features: Some(encoded_features()),
+            aux_frames: vec![Bytes::from_static(&[1, 2, 3, 4, 5, 6, 7, 8])],
+            cache_salt: Some("salt".to_string()),
+        },
         media_identity: None,
     }
 }
@@ -1936,6 +1938,63 @@ impl MediaProcessor for MockMediaProcessor {
             outcome
         })
     }
+}
+
+/// A processor that answers in the Router's batch shape (smg's own pipeline)
+/// has its batches translated for the engine as a Router request's are: one
+/// typed feature per item, the pixels in the dtype the pipeline wrote (raw
+/// `uint8` here), and the expanded prompt.
+#[tokio::test]
+async fn media_processed_as_router_batches_is_translated_for_the_engine() {
+    let batch = vllm::MultimodalInputs {
+        pixel_values: Some(vllm::TensorData {
+            shape: vec![1, 4],
+            dtype: "uint8".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Inline(vec![9, 8, 7, 6])),
+        }),
+        mm_placeholders: vec![vllm::PlaceholderRange {
+            offset: 1,
+            length: 2,
+        }],
+        mm_hashes: vec!["h0".to_string()],
+        batched_keys: vec!["pixel_values".to_string()],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    };
+    let processor = MockMediaProcessor::answering(Ok(ProcessedMedia {
+        prompt_token_ids: vec![7, 8, 8, 10],
+        features: MediaFeatures::Batches(vec![batch]),
+        media_identity: None,
+    }));
+    let mut h = harness_with(model_info(), None, Some(processor)).await;
+    let mut request = media_request("mr22");
+    request.stream = false;
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(engine_request.prompt_token_ids, Some(vec![7, 8, 8, 10]));
+    let Some(MmFeaturesPayload::Typed(features)) = engine_request.mm_features else {
+        panic!(
+            "expected typed features, got {:?}",
+            engine_request.mm_features
+        );
+    };
+    assert_eq!(features.len(), 1);
+    assert_eq!(features[0].mm_hash.as_deref(), Some("h0"));
+    assert_eq!(features[0].mm_position.offset, 1);
+    assert_eq!(features[0].mm_position.length, 2);
+    let item = features[0].data.as_ref().expect("item kwargs");
+    let tensor = match item["pixel_values"].data.as_ref().expect("pixel data") {
+        MmKwargValue::Tensor(tensor) => tensor,
+        other => panic!("expected a tensor, got {other:?}"),
+    };
+    assert_eq!(tensor.dtype, "uint8");
+    assert_eq!(tensor.shape, vec![4]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// A request with references is handed to the processor as the Router sent
@@ -2124,7 +2183,7 @@ async fn a_pd_prefill_leg_returns_the_media_identity() {
         extra_mm_inputs: Vec::new(),
     };
     let mut processed = processed_media();
-    processed.media_identity = Some(Bytes::from(identity.encode_to_vec()));
+    processed.media_identity = Some(identity.clone());
     let processor = MockMediaProcessor::answering(Ok(processed));
     let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
     let mut request = generate_request("mr10", true, Vec::new());

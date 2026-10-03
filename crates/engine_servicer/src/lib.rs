@@ -24,8 +24,8 @@ pub use server::init_tracing;
 pub(crate) use server::{lock, record_error, ServerThread, SharedError, Shutdown};
 use tonic::Status;
 pub use vllm::{
-    BoxFuture, MediaError, MediaProcessor, MediaRefItem, MediaRequest, ProcessedMedia,
-    VllmModelInfo, VllmServicerConfig, VllmServicerServer,
+    BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRefItem, MediaRequest,
+    ProcessedMedia, VllmModelInfo, VllmServicerConfig, VllmServicerServer,
 };
 
 /// A boxed response stream, the shape tonic's generated traits take.

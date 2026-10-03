@@ -33,7 +33,7 @@ struct Decoded {
 impl Decoded {
     fn elem_size(&self) -> Result<usize, String> {
         match self.dtype.as_str() {
-            "bool" => Ok(1),
+            "bool" | "uint8" | "int8" => Ok(1),
             "float16" | "bfloat16" => Ok(2),
             "float32" | "uint32" | "int32" => Ok(4),
             "int64" | "float64" => Ok(8),
@@ -631,6 +631,30 @@ mod tests {
             );
             assert!(!item.contains_key("pixel_values"));
             assert_eq!(tensor_of(&item["patches"]).shape, vec![1, 4]);
+        }
+    }
+
+    /// Raw pixels from a worker-side pipeline arrive as `uint8` (the engine
+    /// normalizes them on device) and are forwarded in that dtype, split per
+    /// item like any batched tensor.
+    #[test]
+    fn uint8_pixels_pass_through_in_their_own_dtype() {
+        let mut mm = base_inputs();
+        mm.pixel_values = Some(inline_tensor(
+            vec![2, 4],
+            "uint8",
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+        ));
+        let features = build_mm_features(mm, &[0; 9], ModelDtype::BFloat16).expect("built");
+        assert_eq!(features.len(), 2);
+        let item = features[1].data.as_ref().expect("item present");
+        let tensor = tensor_of(&item["pixel_values"]);
+        assert_eq!(tensor.dtype, "uint8");
+        // Batched tensors are handed over per item with the batch dim removed.
+        assert_eq!(tensor.shape, vec![4]);
+        match &tensor.data {
+            WireArrayData::RawView(bytes) => assert_eq!(bytes.as_ref(), &[4, 5, 6, 7]),
+            other @ WireArrayData::AuxIndex(_) => panic!("expected a raw view, got {other:?}"),
         }
     }
 

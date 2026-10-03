@@ -431,7 +431,21 @@ impl ZmqEngineClient {
         // and the dtype casts of multi-megabyte tensors would otherwise hold a
         // worker thread per request, starving token forwarding and health.
         let media = if let Some(processed) = processed {
-            translated_from_processed(&req, processed).map_err(tonic::Status::invalid_argument)?
+            if processed.is_batches() {
+                let (returned, media) = tokio::task::spawn_blocking(move || {
+                    let media = translated_from_processed(&req, processed, model_dtype);
+                    (req, media)
+                })
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!("multimodal translation failed: {error}"))
+                })?;
+                req = returned;
+                media.map_err(tonic::Status::invalid_argument)?
+            } else {
+                translated_from_processed(&req, processed, model_dtype)
+                    .map_err(tonic::Status::invalid_argument)?
+            }
         } else if has_media(&req) {
             let (returned, media) = tokio::task::spawn_blocking(move || {
                 let media = translate_media(&mut req, model_dtype);

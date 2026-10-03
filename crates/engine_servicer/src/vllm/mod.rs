@@ -49,7 +49,8 @@ use futures::{FutureExt, StreamExt};
 use llm_tokenizer::traits::Tokenizer;
 use media::MediaGate;
 pub use media::{
-    BoxFuture, MediaError, MediaProcessor, MediaRefItem, MediaRequest, ProcessedMedia,
+    BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRefItem, MediaRequest,
+    ProcessedMedia,
 };
 use requests::Registry;
 use service::VllmEngineService;
@@ -254,9 +255,9 @@ impl VllmServicerServer {
     }
 
     /// [`Self::start`] with the tokenizer supplied instead of loaded from
-    /// `tokenizer_dir`.
-    #[cfg(test)]
-    pub(crate) fn start_with_tokenizer(
+    /// `tokenizer_dir`: for a lifecycle owner that already loaded it (a
+    /// media processor that needs it before the engine connects).
+    pub fn start_with_tokenizer(
         config: VllmServicerConfig,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, ServicerError> {
