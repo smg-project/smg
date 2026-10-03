@@ -132,13 +132,13 @@ async fn run(
     let media = MediaBatch::Images(
         ids.iter()
             .map(|&id| {
-                Arc::new(ImageFrame {
-                    image: image::DynamicImage::new_rgb8(id, 1),
-                    raw_bytes: Default::default(),
-                    detail: Default::default(),
-                    source: ImageSource::InlineBytes,
-                    hash: id.to_string(),
-                })
+                Arc::new(ImageFrame::new(
+                    image::DynamicImage::new_rgb8(id, 1),
+                    Default::default(),
+                    Default::default(),
+                    ImageSource::InlineBytes,
+                    id.to_string(),
+                ))
             })
             .collect(),
     );

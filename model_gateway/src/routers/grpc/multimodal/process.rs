@@ -169,7 +169,7 @@ pub(crate) async fn process_multimodal_plan(
             MediaBatch::Images(images) => {
                 debug!(
                     image_count = images.len(),
-                    item_sizes = ?images.iter().map(|f| (f.image.width(), f.image.height())).collect::<Vec<_>>(),
+                    item_sizes = ?images.iter().map(|f| f.size()).collect::<Vec<_>>(),
                     "Fetched images for multimodal processing"
                 );
             }
@@ -476,10 +476,17 @@ async fn preprocess_modality(
                 .ok_or_else(|| {
                     anyhow::anyhow!("No vision processor found for model: {model_id_owned}")
                 })?;
-            // Extract DynamicImages inside the blocking closure so the expensive
-            // clone happens off the tokio async runtime.
-            let raw_images: Vec<image::DynamicImage> =
-                images.iter().map(|frame| frame.image.clone()).collect();
+            // Decoded (and cloned) inside the blocking closure, off the async
+            // runtime.
+            let raw_images: Vec<image::DynamicImage> = images
+                .iter()
+                .map(|frame| {
+                    frame
+                        .image()
+                        .cloned()
+                        .map_err(llm_multimodal::MultiModalError::Media)
+                })
+                .collect::<Result<_, _>>()?;
             processor
                 .preprocess(&raw_images, &pp_config)
                 .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
@@ -642,7 +649,15 @@ async fn preprocess_image_batch(
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
     tokio::task::spawn_blocking(move || {
-        let raw_images: Vec<image::DynamicImage> = images.iter().map(|f| f.image.clone()).collect();
+        let raw_images: Vec<image::DynamicImage> = images
+            .iter()
+            .map(|frame| {
+                frame
+                    .image()
+                    .cloned()
+                    .map_err(llm_multimodal::MultiModalError::Media)
+            })
+            .collect::<Result<_, _>>()?;
         let processor = registry
             .find(&model_id, model_type.as_deref())
             .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;

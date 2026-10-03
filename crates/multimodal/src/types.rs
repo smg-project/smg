@@ -1,10 +1,11 @@
 use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
 
 use image::{DynamicImage, RgbImage};
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::audio::DecodedAudio;
+use crate::{audio::DecodedAudio, error::MediaConnectorError, media::decode_image_bytes};
 
 /// Supported multimodal modalities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -130,14 +131,20 @@ pub enum VideoSource {
     File { path: PathBuf },
 }
 
-/// Concrete image payload captured by the media connector.
+/// Concrete image payload captured by the media connector: the encoded bytes
+/// with their identity and size, decoded on first use, so a request whose
+/// pixels are already cached never pays for the decode.
 #[derive(Debug, Clone)]
 pub struct ImageFrame {
-    pub image: DynamicImage,
+    decoded: OnceCell<DynamicImage>,
+    /// Width and height the decode produces, from the header and the cap.
+    size: ImageSize,
+    /// The long-side cap the decode applies; `size` already reflects it.
+    max_long_side_pixel: Option<u32>,
     pub raw_bytes: bytes::Bytes,
     pub detail: ImageDetail,
     pub source: ImageSource,
-    /// Blake3 hex-digest of raw_bytes, computed at decode time.
+    /// Blake3 hex-digest of `raw_bytes` and the resolution cap.
     pub hash: String,
 }
 
@@ -388,6 +395,7 @@ impl AudioClip {
 }
 
 impl ImageFrame {
+    /// A frame from pixels already decoded.
     pub fn new(
         image: DynamicImage,
         raw_bytes: bytes::Bytes,
@@ -395,8 +403,11 @@ impl ImageFrame {
         source: ImageSource,
         hash: String,
     ) -> Self {
+        let size = ImageSize::new(image.width(), image.height());
         Self {
-            image,
+            decoded: OnceCell::with_value(image),
+            size,
+            max_long_side_pixel: None,
             raw_bytes,
             detail,
             source,
@@ -404,8 +415,32 @@ impl ImageFrame {
         }
     }
 
-    pub fn data(&self) -> &DynamicImage {
-        &self.image
+    /// A frame from encoded bytes whose header gave `size` (after the cap);
+    /// the pixels are decoded, and capped, when first asked for.
+    pub fn encoded(
+        raw_bytes: bytes::Bytes,
+        detail: ImageDetail,
+        source: ImageSource,
+        hash: String,
+        size: ImageSize,
+        max_long_side_pixel: Option<u32>,
+    ) -> Self {
+        Self {
+            decoded: OnceCell::new(),
+            size,
+            max_long_side_pixel,
+            raw_bytes,
+            detail,
+            source,
+            hash,
+        }
+    }
+
+    /// The decoded pixels, decoding on the first call. A body its header did
+    /// not vouch for fails here, as the caller's input.
+    pub fn image(&self) -> Result<&DynamicImage, MediaConnectorError> {
+        self.decoded
+            .get_or_try_init(|| decode_image_bytes(&self.raw_bytes, self.max_long_side_pixel))
     }
 
     pub fn raw_bytes(&self) -> &[u8] {
@@ -417,7 +452,7 @@ impl ImageFrame {
     }
 
     pub fn size(&self) -> ImageSize {
-        ImageSize::new(self.image.width(), self.image.height())
+        ImageSize::new(self.size.width, self.size.height)
     }
 }
 
