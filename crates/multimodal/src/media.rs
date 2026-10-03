@@ -167,16 +167,13 @@ impl MediaConnector {
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         match source {
             MediaSource::Url(url) => self.fetch_http_image(url, cfg).await,
-            MediaSource::DataUrl(data_url) => self.fetch_data_url(data_url, cfg).await,
-            MediaSource::InlineBytes(bytes) => {
-                self.decode_image(
-                    bytes.into(),
-                    cfg.detail,
-                    cfg.max_long_side_pixel,
-                    ImageSource::InlineBytes,
-                )
-                .await
-            }
+            MediaSource::DataUrl(data_url) => Self::fetch_data_url(data_url, cfg),
+            MediaSource::InlineBytes(bytes) => Self::decode_image(
+                bytes.into(),
+                cfg.detail,
+                cfg.max_long_side_pixel,
+                ImageSource::InlineBytes,
+            ),
             MediaSource::File(path) => self.fetch_file(path, cfg).await,
         }
     }
@@ -235,7 +232,7 @@ impl MediaConnector {
 
         let resp = resp.error_for_status()?;
         let bytes = collect_http_body_with_limit(resp, image_max_input_bytes(), "image").await?;
-        self.decode_image(
+        Self::decode_image(
             bytes,
             cfg.detail,
             cfg.max_long_side_pixel,
@@ -243,11 +240,9 @@ impl MediaConnector {
                 url: parsed.to_string(),
             },
         )
-        .await
     }
 
-    async fn fetch_data_url(
-        &self,
+    fn fetch_data_url(
         data_url: String,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
@@ -263,13 +258,12 @@ impl MediaConnector {
 
         let data = data.trim();
         let decoded = decode_base64_with_limit(data, image_max_input_bytes(), "image")?;
-        self.decode_image(
+        Self::decode_image(
             decoded.into(),
             cfg.detail,
             cfg.max_long_side_pixel,
             ImageSource::DataUrl,
         )
-        .await
     }
 
     async fn fetch_video_data_url(
@@ -331,13 +325,12 @@ impl MediaConnector {
         }
 
         let bytes = read_file_with_limit(&canonical, image_max_input_bytes(), "image").await?;
-        self.decode_image(
+        Self::decode_image(
             bytes,
             cfg.detail,
             cfg.max_long_side_pixel,
             ImageSource::File { path: canonical },
         )
-        .await
     }
 
     async fn fetch_http_video(
@@ -454,8 +447,7 @@ impl MediaConnector {
         Ok(())
     }
 
-    async fn decode_image(
-        &self,
+    fn decode_image(
         bytes: Bytes,
         detail: ImageDetail,
         max_long_side_pixel: Option<u32>,

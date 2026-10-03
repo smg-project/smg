@@ -46,14 +46,14 @@ impl Parallelism {
             .and_then(NonZeroUsize::new);
         let threads = from_env.unwrap_or_else(|| {
             let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-            NonZeroUsize::new(cores.min(DEFAULT_POOL_THREADS).max(1)).unwrap_or(NonZeroUsize::MIN)
+            NonZeroUsize::new(cores.clamp(1, DEFAULT_POOL_THREADS)).unwrap_or(NonZeroUsize::MIN)
         });
         Self::Pool(threads)
     }
 }
 
 static PARALLELISM: OnceLock<Parallelism> = OnceLock::new();
-static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 
 /// Choose where preprocessing runs, once per process, before the first
 /// preprocessing call. Returns the mode already in force when it differs
@@ -77,23 +77,20 @@ pub fn parallelism() -> Parallelism {
     *PARALLELISM.get_or_init(Parallelism::default_pool)
 }
 
-fn pool(threads: NonZeroUsize) -> &'static rayon::ThreadPool {
+/// The pool, built on first use; `None` when its threads could not be
+/// created, in which case tasks run inline on the calling thread.
+fn pool(threads: NonZeroUsize) -> Option<&'static rayon::ThreadPool> {
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads.get())
             .thread_name(|index| format!("{POOL_THREAD_NAME_PREFIX}{index}"))
             .build()
-            .unwrap_or_else(|error| {
-                // Thread creation failed outright: a pool of one thread is
-                // still a pool; the alternative is no preprocessing at all.
-                tracing::warn!(%error, "could not build the preprocessing pool; using one thread");
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .thread_name(|index| format!("{POOL_THREAD_NAME_PREFIX}{index}"))
-                    .build()
-                    .expect("a one-thread pool builds")
+            .map_err(|error| {
+                tracing::warn!(%error, "could not build the preprocessing pool; running inline");
             })
+            .ok()
     })
+    .as_ref()
 }
 
 /// Spawns the tasks of one [`scope`]: onto the pool, or inline in order.
@@ -117,7 +114,7 @@ impl<'scope> Spawner<'_, 'scope> {
             SpawnerInner::Pool(scope) => scope.spawn(move |scope| {
                 task(&Spawner {
                     inner: SpawnerInner::Pool(scope),
-                })
+                });
             }),
             SpawnerInner::Inline(_) => task(&Spawner {
                 inner: SpawnerInner::Inline(PhantomData),
@@ -133,14 +130,18 @@ where
     OP: FnOnce(&Spawner<'_, 'scope>) -> R + Send,
     R: Send,
 {
-    match parallelism() {
-        Parallelism::Inline => operation(&Spawner {
-            inner: SpawnerInner::Inline(PhantomData),
-        }),
-        Parallelism::Pool(threads) => pool(threads).scope(|scope| {
+    let pool = match parallelism() {
+        Parallelism::Inline => None,
+        Parallelism::Pool(threads) => pool(threads),
+    };
+    match pool {
+        Some(pool) => pool.scope(|scope| {
             operation(&Spawner {
                 inner: SpawnerInner::Pool(scope),
             })
+        }),
+        None => operation(&Spawner {
+            inner: SpawnerInner::Inline(PhantomData),
         }),
     }
 }

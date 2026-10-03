@@ -9,7 +9,13 @@
 //! ([`EncoderInput::write_as`]), and a cache of preprocessed inputs holds
 //! bytes, a quarter of the floats, valid for every destination.
 
-use std::{borrow::Cow, collections::HashMap, fmt, mem::size_of, str::FromStr};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt,
+    mem::{size_of, size_of_val},
+    str::FromStr,
+};
 
 use anyhow::{Context, Result as AnyhowResult};
 use ndarray::{Array, ArrayD, ArrayViewD, Axis, Dimension, Slice};
@@ -262,10 +268,7 @@ impl EncoderInput {
                 Some(slice) => Cow::Borrowed(slice),
                 None => Cow::Owned(array.iter().copied().collect()),
             },
-            Self::U8 { .. } => match self.as_f32() {
-                Cow::Owned(array) => Cow::Owned(array.into_raw_vec_and_offset().0),
-                Cow::Borrowed(_) => unreachable!("bytes always materialize into an owned array"),
-            },
+            Self::U8 { .. } => Cow::Owned(self.as_f32().into_owned().into_raw_vec_and_offset().0),
         }
     }
 
@@ -527,7 +530,7 @@ fn fill_rows<T: Copy + Send + Sync, S: Copy + Send + Sync>(
     fill: impl Fn(&mut [T], &[S]) + Sync,
 ) {
     let rows = if row == 0 { 0 } else { src.len() / row };
-    let tasks = execution::task_count(out.len() * size_of::<T>(), rows, 32);
+    let tasks = execution::task_count(size_of_val(out), rows, 32);
     if tasks <= 1 {
         fill(out, src);
         return;

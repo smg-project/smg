@@ -6,8 +6,9 @@ use std::num::NonZeroUsize;
 
 use image::{DynamicImage, Rgb, RgbImage};
 use llm_multimodal::{
-    configure_parallelism, vision::execution::POOL_THREAD_NAME_PREFIX, Parallelism,
-    PreProcessorConfig, VisionPreProcessor,
+    configure_parallelism,
+    vision::{execution::POOL_THREAD_NAME_PREFIX, processors::Qwen2VLProcessor},
+    Parallelism, PreProcessorConfig, VisionPreProcessor,
 };
 
 fn thread_names() -> Vec<String> {
@@ -33,7 +34,7 @@ fn inline_mode_preprocesses_without_creating_threads() {
         "this test must own the process's mode"
     );
     let before = thread_names();
-    let processor = llm_multimodal::vision::processors::Qwen2VLProcessor::new();
+    let processor = Qwen2VLProcessor::new();
     let config = PreProcessorConfig::default();
     let out = processor
         .preprocess(&[large_image()], &config)
