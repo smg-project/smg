@@ -454,6 +454,9 @@ class FakeEngine:
     def kill(self) -> None:
         self.events.append("kill")
 
+    def kill_descendants(self) -> int:
+        return 0  # the straggler sweep finds nothing behind a fake
+
 
 def _run_supervise(server, engine, *, before, drain_secs=0.0):
     async def run():

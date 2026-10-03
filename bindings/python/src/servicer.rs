@@ -53,7 +53,9 @@ fn to_py_err(error: ServicerError) -> PyErr {
 fn startup_timeout(secs: Option<f64>) -> PyResult<Duration> {
     match secs {
         None => Ok(DEFAULT_ENGINE_STARTUP_TIMEOUT),
-        Some(secs) if secs.is_finite() && secs > 0.0 => Ok(Duration::from_secs_f64(secs)),
+        Some(secs) if secs > 0.0 => Duration::try_from_secs_f64(secs).map_err(|error| {
+            PyValueError::new_err(format!("engine_startup_timeout_secs {secs}: {error}"))
+        }),
         Some(secs) => Err(PyValueError::new_err(format!(
             "engine_startup_timeout_secs must be positive, got {secs}"
         ))),

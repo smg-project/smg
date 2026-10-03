@@ -96,38 +96,69 @@ def _alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    with open(f"/proc/{pid}/stat") as stat:  # a zombie is as dead as we need
-        return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
+    try:
+        with open(f"/proc/{pid}/stat") as stat:  # a zombie is as dead as we need
+            return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False
 
 
-def test_kill_reaches_the_engine_process_group(tmp_path):
-    """The headless child is a session leader (``new_session``), so killing the
-    engine kills the workers it spawned, not just the launcher."""
-    pid_file = tmp_path / "worker.pid"
-    launcher = subprocess.Popen(
-        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; wait"],
-        start_new_session=True,
-    )
-    deadline = time.monotonic() + 10
+def _worker_pid(pid_file, deadline_secs: float = 10) -> int:
+    deadline = time.monotonic() + deadline_secs
     while not pid_file.exists() or not pid_file.read_text().strip():
         assert time.monotonic() < deadline, "the launcher never spawned its worker"
         time.sleep(0.05)
-    worker_pid = int(pid_file.read_text())
-    engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
+    return int(pid_file.read_text())
 
-    engine.kill()
 
-    assert engine.wait(timeout=10) == -signal.SIGKILL
-    deadline = time.monotonic() + 10
-    while _alive(worker_pid):
-        assert time.monotonic() < deadline, "the worker outlived the engine kill"
+def _wait_dead(pid: int, what: str, deadline_secs: float = 10) -> None:
+    deadline = time.monotonic() + deadline_secs
+    while _alive(pid):
+        assert time.monotonic() < deadline, f"the {what} outlived the engine cleanup"
         time.sleep(0.05)
 
 
-def test_kill_of_a_child_outside_its_own_group_is_a_plain_kill(tmp_path):
-    """Before the child reaches ``new_session`` it shares this group: only the
-    child itself is killed."""
+def test_kill_reaches_the_workers_the_engine_spawned(tmp_path):
+    """A kill of the headless engine also kills the workers it spawned, while
+    everything stays in the launcher's process group."""
+    pid_file = tmp_path / "worker.pid"
+    launcher = subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_file}; wait"])
+    worker_pid = _worker_pid(pid_file)
+    engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
+    assert os.getpgid(launcher.pid) == os.getpgid(0)
+    assert engine.poll() is None  # tracks the worker
+
+    engine.kill()
+
+    assert engine.wait(timeout=10) == -signal.SIGKILL
+    _wait_dead(worker_pid, "worker")
+
+
+def test_cleanup_after_the_engine_exited_kills_the_workers_it_left(tmp_path):
+    """An engine that crashed leaves re-parented workers; terminate_engine
+    kills the ones it had seen while the engine was alive."""
+    pid_file = tmp_path / "worker.pid"
+    launcher = subprocess.Popen(
+        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; sleep 2; exit 3"]
+    )
+    worker_pid = _worker_pid(pid_file)
+    engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
+    assert engine.poll() is None  # tracks the worker while the launcher lives
+    assert engine.wait(timeout=10) == 3
+    assert _alive(worker_pid)
+
+    rust_lifecycle.terminate_engine(engine)
+
+    _wait_dead(worker_pid, "orphaned worker")
+
+
+def test_a_recycled_pid_is_not_killed(tmp_path):
+    """Only a tracked process whose start time still matches is signalled."""
     launcher = subprocess.Popen(["sleep", "300"])
     engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
-    engine.kill()
-    assert engine.wait(timeout=10) == -signal.SIGKILL
+    engine.track()
+    engine._descendants[launcher.pid] = "not-its-start-time"
+    assert engine.kill_descendants() == 0
+    assert _alive(launcher.pid)
+    launcher.kill()
+    launcher.wait()

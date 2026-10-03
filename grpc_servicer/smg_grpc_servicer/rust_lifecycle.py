@@ -14,6 +14,7 @@ import os
 import signal
 import socket
 import subprocess
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ ENGINE_TERMINATE_SECS = 30.0
 # A dead engine never waits this long: ``supervise`` polls the engine process.
 DEFAULT_STARTUP_TIMEOUT_SECS = 1800.0
 _POLL_SECS = 0.5
+TRACK_INTERVAL_SECS = 2.0  # how often the supervisor's poll refreshes the engine's descendants
 
 # What makes a directory a tokenizer directory to the Rust tokenizer loader.
 TOKENIZER_FILE_GLOBS = (
@@ -96,36 +98,67 @@ def default_socket_dir() -> str:
 
 class EngineProcess:
     """A ``Popen``-shaped view of the spawned headless-engine process, so the
-    lifecycle loop and :func:`terminate_engine` need no second code path."""
+    lifecycle loop and :func:`terminate_engine` need no second code path.
+
+    The engine stays in the launcher's process group: whoever supervises the
+    launcher (``ts serve``, ``vllm serve``, the e2e harness) cleans up by
+    group and must keep reaching the engine's workers. What a group cannot
+    cover is a launcher that dies before its workers do (killed partway
+    through its own teardown, or crashed at startup): the workers are
+    re-parented and would keep the GPU. So the engine's descendants are
+    tracked while it runs, and a kill, or the cleanup after it exited on its
+    own, reaches every one that is still the process it was.
+    """
 
     def __init__(self, process: Any):
         self._process = process
+        self._descendants: dict[int, str] = {}  # pid -> start time, against PID reuse
+        self._tracked_at = 0.0
 
     @property
     def pid(self) -> int | None:
         return self._process.pid
 
     def poll(self) -> int | None:
-        return self._process.exitcode
+        code = self._process.exitcode
+        if code is None and time.monotonic() - self._tracked_at >= TRACK_INTERVAL_SECS:
+            self.track()
+        return code
+
+    def track(self) -> None:
+        """Record the engine's current descendants (one pass over ``/proc``)."""
+        pid = self.pid
+        if pid is None:
+            return
+        self._tracked_at = time.monotonic()
+        for child in _descendants(pid):
+            start = _start_time(child)
+            if start is not None:
+                self._descendants[child] = start
 
     def terminate(self) -> None:
+        self.track()
         self._process.terminate()
 
     def kill(self) -> None:
-        pid = self.pid
-        try:
-            leader = pid is not None and os.getpgid(pid) == pid
-        except OSError:
-            leader = False
-        if leader:
-            # The child made itself a session leader (``new_session``): the
-            # engine's worker processes share its group and go with it.
-            try:
-                os.killpg(pid, signal.SIGKILL)
-                return
-            except OSError:
-                pass
+        self.track()
         self._process.kill()
+        self.kill_descendants()
+
+    def kill_descendants(self) -> int:
+        """SIGKILL every tracked descendant that is still the same process;
+        returns how many were signalled."""
+        killed = 0
+        for child, start in list(self._descendants.items()):
+            del self._descendants[child]
+            if _start_time(child) != start:
+                continue
+            try:
+                os.kill(child, signal.SIGKILL)
+                killed += 1
+            except ProcessLookupError:
+                pass
+        return killed
 
     def wait(self, timeout: float | None = None) -> int:
         self._process.join(timeout)
@@ -135,27 +168,56 @@ class EngineProcess:
         return code
 
 
-def new_session() -> None:
-    """Make the calling headless-engine child a session leader, so a kill of
-    its process group reaches the worker processes the engine spawns (an
-    engine killed mid-start must not leave a worker holding the GPU)."""
+def _descendants(pid: int) -> list[int]:
+    """Every live descendant of ``pid``, from one pass over ``/proc`` (the
+    per-task ``children`` files are not available on every kernel)."""
+    parent_of: dict[int, int] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as handle:
+                parent_of[int(entry)] = int(handle.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    found: list[int] = []
+    pending = [pid]
+    while pending:
+        parent = pending.pop()
+        for child, child_parent in parent_of.items():
+            if child_parent == parent and child not in found:
+                found.append(child)
+                pending.append(child)
+    return found
+
+
+def _start_time(pid: int) -> str | None:
+    """The process's start time from ``/proc/<pid>/stat`` (``None`` once it is
+    gone), so a recycled PID is never mistaken for the process we recorded."""
     try:
-        os.setsid()
-    except OSError:  # already a leader
-        pass
+        with open(f"/proc/{pid}/stat") as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+    except OSError:
+        return None
+    return fields[19]
 
 
 def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> None:
-    """SIGTERM the headless engine (it tears down its own workers), then kill."""
-    if engine.poll() is not None:
-        return
-    engine.terminate()
-    try:
-        engine.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        logger.warning("Headless engine did not exit within %.0fs; killing it", timeout)
-        engine.kill()
-        engine.wait()
+    """SIGTERM the headless engine (it tears down its own workers), then kill;
+    workers that outlived it either way are killed too."""
+    if engine.poll() is None:
+        engine.terminate()
+        try:
+            engine.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning("Headless engine did not exit within %.0fs; killing it", timeout)
+            engine.kill()
+            engine.wait()
+    stragglers = engine.kill_descendants()
+    if stragglers:
+        logger.warning(
+            "Killed %d engine worker process(es) that outlived the headless engine", stragglers
+        )
 
 
 async def supervise(

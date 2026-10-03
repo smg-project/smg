@@ -365,9 +365,6 @@ fn data_url_payload_bytes(url: &str) -> Option<usize> {
     }
 }
 
-/// Whose fault a pipeline failure is, from the typed error in its chain: a
-/// fetch that timed out or could not connect is the network's (retryable),
-/// a bad reference or undecodable media the caller's, anything else ours.
 /// The model's configs with `kwargs` laid over each preprocessor config, or
 /// `None` when there are none. A key the config has no field for is refused:
 /// the engine's own processor would have honoured it, this pipeline cannot.
@@ -414,6 +411,9 @@ fn apply_processor_kwargs(
     Ok(Some(overridden))
 }
 
+/// Whose fault a pipeline failure is, from the typed error in its chain: a
+/// fetch that timed out or could not connect is the network's (retryable),
+/// a bad reference or undecodable media the caller's, anything else ours.
 fn classify(error: anyhow::Error) -> WorkerMediaError {
     let message = format!("{error:#}");
     for cause in error.chain() {

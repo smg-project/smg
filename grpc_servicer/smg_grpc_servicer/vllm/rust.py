@@ -48,7 +48,6 @@ from smg_grpc_servicer.rust_lifecycle import (
     EngineProcess,
     default_socket_dir,
     free_port,
-    new_session,
     resolve_tokenizer_dir,
     supervise,
 )
@@ -225,7 +224,6 @@ def headless_namespace(
 
 def _run_headless(ns: argparse.Namespace) -> None:
     """Child target: vLLM's own headless launch (`vllm serve --headless`)."""
-    new_session()
     from vllm.entrypoints.cli.serve import run_headless
 
     run_headless(ns)

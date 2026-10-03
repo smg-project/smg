@@ -36,7 +36,6 @@ from smg_grpc_servicer.rust_lifecycle import (
     default_socket_dir,
     env_float,
     free_port,
-    new_session,
     resolve_tokenizer_dir,
     supervise,
 )
@@ -187,7 +186,6 @@ def headless_server_args(server_args: Any, *, handshake_port: int) -> Any:
 
 def _run_headless(server_args: Any) -> None:
     """Child target: TokenSpeed's own headless launch."""
-    new_session()
     from tokenspeed.runtime.entrypoints.engine import launch_scheduler_headless
 
     launch_scheduler_headless(server_args)
