@@ -178,11 +178,11 @@ impl Glm4MoeParser {
 
         for capture in self.arg_extractor.captures_iter(args_text) {
             let key = capture.get(1).map_or("", |m| m.as_str()).trim();
-            let value_str = capture.get(2).map_or("", |m| m.as_str()).trim();
+            let value_str = capture.get(2).map_or("", |m| m.as_str());
 
             let value =
                 helpers::coerce_by_schema_type(value_str, param_types.get(key).map(String::as_str))
-                    .unwrap_or_else(|| infer_value(value_str));
+                    .unwrap_or_else(|| infer_value(value_str.trim()));
 
             arguments.insert(key.to_string(), value);
         }
@@ -589,5 +589,68 @@ mod tests {
         let args: Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
         assert_eq!(args["limit"], Value::String("4".to_string()));
         assert_eq!(args["count"], Value::Number(5.into()));
+    }
+
+    #[tokio::test]
+    async fn test_declared_strings_preserve_whitespace() {
+        let tools = tool_with_props(serde_json::json!({
+            "code": {"type": "string"},
+            "needle": {"type": "string"},
+            "blank": {"type": "string"},
+            "quoted": {"type": "string"},
+            "count": {"type": "integer"},
+        }));
+        let args_text = concat!(
+            "<arg_key>code</arg_key><arg_value>    return 1\n</arg_value>",
+            "<arg_key>needle</arg_key><arg_value>    total = 1\n</arg_value>",
+            "<arg_key>blank</arg_key><arg_value> \t\n</arg_value>",
+            "<arg_key>quoted</arg_key><arg_value> \"    return 1\\n\" </arg_value>",
+            "<arg_key>count</arg_key><arg_value> 42\n</arg_value>",
+            "<arg_key>unknown</arg_key><arg_value> legacy text\n</arg_value>",
+        );
+        let expected = serde_json::json!({
+            "code": "    return 1\n",
+            "needle": "    total = 1\n",
+            "blank": " \t\n",
+            "quoted": "    return 1\n",
+            "count": 42,
+            "unknown": "legacy text",
+        });
+
+        for (make_parser, name_separator) in [
+            (Glm4MoeParser::glm45 as fn() -> Glm4MoeParser, "\n"),
+            (Glm4MoeParser::glm47 as fn() -> Glm4MoeParser, ""),
+        ] {
+            let text = format!("<tool_call>f{name_separator}{args_text}</tool_call>");
+            let (_, calls) = make_parser()
+                .parse_complete_with_tools(&text, &tools)
+                .await
+                .unwrap();
+            assert_eq!(calls.len(), 1);
+            let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(args, expected);
+
+            // Keep the model's opening special token intact; split the argument
+            // text into small chunks, including inside values and closing tags.
+            let mut parser = make_parser();
+            let start = "<tool_call>".len();
+            let result = parser
+                .parse_incremental(&text[..start], &tools)
+                .await
+                .unwrap();
+            assert!(result.calls.is_empty());
+            let mut arguments = String::new();
+            for chunk in text.as_bytes()[start..].chunks(7) {
+                let result = parser
+                    .parse_incremental(std::str::from_utf8(chunk).unwrap(), &tools)
+                    .await
+                    .unwrap();
+                for call in result.calls {
+                    arguments.push_str(&call.parameters);
+                }
+            }
+            let args: Value = serde_json::from_str(&arguments).unwrap();
+            assert_eq!(args, expected);
+        }
     }
 }
