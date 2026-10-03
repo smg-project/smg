@@ -21,7 +21,8 @@ use std::{
 use bytes::Bytes;
 use engine_servicer::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
-    ServicerError, VllmModelInfo, VllmServicerConfig, VllmServicerServer,
+    ServicerError, TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer,
+    VllmModelInfo, VllmServicerConfig, VllmServicerServer,
 };
 use llm_multimodal::Modality;
 use prost::Message;
@@ -701,6 +702,169 @@ impl PyVllmGrpcServer {
     }
 
     /// The last fatal error (engine connect or server exit), if any.
+    #[getter]
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.inner.last_error().map_err(to_py_err)
+    }
+
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once.
+    fn set_serving(&self, serving: bool) {
+        self.inner.set_serving(serving);
+    }
+
+    /// Stop the server: open streams are cancelled, connections get most of
+    /// `timeout_secs` to close, then the listener thread is joined.
+    #[pyo3(signature = (timeout_secs = 5.0))]
+    fn stop(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
+        if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_secs must be finite and positive",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// Rust-owned `tokenspeed.grpc.scheduler.TokenSpeedScheduler` server over
+/// same-host headless TokenSpeed scheduler(s) on the msgpack ZMQ wire. The
+/// Python launcher keeps the lifecycle: it starts the scheduler(s) dialing
+/// `handshake_address`, polls this object, and stops it.
+#[pyclass(name = "TokenSpeedGrpcServer")]
+pub struct PyTokenSpeedGrpcServer {
+    inner: TokenSpeedServicerServer,
+}
+
+#[pymethods]
+impl PyTokenSpeedGrpcServer {
+    #[new]
+    #[pyo3(signature = (
+        bind_address,
+        ipc_base_url,
+        handshake_address,
+        model_path,
+        *,
+        engine_count = 1,
+        tokenizer_dir = None,
+        served_model_name = None,
+        tokenizer_path = None,
+        model_type = String::new(),
+        architectures = None,
+        max_context_length = 0,
+        max_req_input_len = 0,
+        vocab_size = 0,
+        eos_token_ids = None,
+        pad_token_id = 0,
+        bos_token_id = 0,
+        weight_version = String::new(),
+        default_sampling_params_json = String::new(),
+        supports_vision = false,
+        supports_multimodal = false,
+        supported_modalities = None,
+        model_dtype = String::new(),
+        multimodal_encoder_dtype = String::new(),
+        server_args_json = String::new(),
+        scheduler_info_json = String::new(),
+        tokenspeed_version = String::new(),
+        max_running_requests = 0,
+        data_parallel_size = 1,
+        kv_events_endpoint = String::new(),
+        kv_events_topic = String::new(),
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        bind_address: String,
+        ipc_base_url: String,
+        handshake_address: String,
+        model_path: String,
+        engine_count: usize,
+        tokenizer_dir: Option<String>,
+        served_model_name: Option<String>,
+        tokenizer_path: Option<String>,
+        model_type: String,
+        architectures: Option<Vec<String>>,
+        max_context_length: i32,
+        max_req_input_len: i32,
+        vocab_size: i32,
+        eos_token_ids: Option<Vec<u32>>,
+        pad_token_id: i32,
+        bos_token_id: i32,
+        weight_version: String,
+        default_sampling_params_json: String,
+        supports_vision: bool,
+        supports_multimodal: bool,
+        supported_modalities: Option<Vec<i32>>,
+        model_dtype: String,
+        multimodal_encoder_dtype: String,
+        server_args_json: String,
+        scheduler_info_json: String,
+        tokenspeed_version: String,
+        max_running_requests: i32,
+        data_parallel_size: i32,
+        kv_events_endpoint: String,
+        kv_events_topic: String,
+    ) -> PyResult<Self> {
+        let model = TokenSpeedModelInfo {
+            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
+            model_path,
+            model_type,
+            architectures: architectures.unwrap_or_default(),
+            max_context_length,
+            max_req_input_len,
+            vocab_size,
+            eos_token_ids: eos_token_ids.unwrap_or_default(),
+            pad_token_id,
+            bos_token_id,
+            weight_version,
+            default_sampling_params_json,
+            supports_vision,
+            supports_multimodal,
+            supported_modalities: supported_modalities.unwrap_or_default(),
+            model_dtype,
+            multimodal_encoder_dtype,
+            server_args_json,
+            scheduler_info_json,
+            tokenspeed_version,
+            max_running_requests,
+            data_parallel_size,
+            kv_events_endpoint,
+            kv_events_topic,
+        };
+        let config = TokenSpeedServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            tokenizer_dir,
+            model,
+        };
+        let inner = py
+            .detach(|| TokenSpeedServicerServer::start(config))
+            .map_err(to_py_err)?;
+        Ok(Self { inner })
+    }
+
+    /// The bound `ip:port`.
+    #[getter]
+    fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.inner.running()
+    }
+
+    /// Whether the scheduler handshake completed; health is NOT_SERVING
+    /// until it has.
+    #[getter]
+    fn engine_ready(&self) -> bool {
+        self.inner.engine_ready()
+    }
+
+    /// The last fatal error (scheduler connect or server exit), if any.
     #[getter]
     fn last_error(&self) -> PyResult<Option<String>> {
         self.inner.last_error().map_err(to_py_err)

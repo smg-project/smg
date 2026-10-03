@@ -13,7 +13,7 @@ use smg::*;
 use smg_auth as auth;
 
 mod servicer;
-use servicer::{init_servicer_tracing, PyVllmGrpcServer};
+use servicer::{init_servicer_tracing, PyTokenSpeedGrpcServer, PyVllmGrpcServer};
 
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
@@ -1733,6 +1733,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRedisConfig>()?;
     m.add_class::<Router>()?;
     m.add_class::<PyVllmGrpcServer>()?;
+    m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;

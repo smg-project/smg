@@ -14,8 +14,14 @@ runs smg's own media pipeline inside the server with no Python on the path.
 The launcher that does all of that is ``serve_rust`` in
 ``smg_grpc_servicer.vllm.rust``, reached by setting
 ``SMG_VLLM_SERVICER_IMPL=rust`` on upstream vLLM's gRPC entrypoint.
+
+:class:`TokenSpeedGrpcServer` serves ``tokenspeed.grpc.scheduler.TokenSpeedScheduler``
+over same-host headless TokenSpeed scheduler(s) on their msgpack ZMQ wire, with the
+same lifecycle shape; its launcher is ``serve_rust`` in
+``smg_grpc_servicer.tokenspeed.rust``, reached by setting
+``SMG_TOKENSPEED_SERVICER_IMPL=rust`` on ``python -m smg_grpc_servicer.tokenspeed``.
 """
 
-from smg.smg_rs import VllmGrpcServer, init_servicer_tracing
+from smg.smg_rs import TokenSpeedGrpcServer, VllmGrpcServer, init_servicer_tracing
 
-__all__ = ["VllmGrpcServer", "init_servicer_tracing"]
+__all__ = ["TokenSpeedGrpcServer", "VllmGrpcServer", "init_servicer_tracing"]
