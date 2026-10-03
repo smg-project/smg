@@ -33,6 +33,7 @@ from infra import (
     Gateway,
     Runtime,
     WorkerType,
+    effective_startup_timeout,
     get_connection_mode_override,
     get_runtime,
     launch_cloud_gateway,
@@ -137,7 +138,9 @@ def _gateway_readiness_timeout(
     """
     if connection_mode != ConnectionMode.ZMQ:
         return base_timeout
-    startup_timeout = get_model_spec(model_id).get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+    startup_timeout = effective_startup_timeout(
+        get_model_spec(model_id).get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+    )
     return max(base_timeout, startup_timeout)
 
 
@@ -592,7 +595,9 @@ def _setup_pd(
             # a user launching a fleet does.
             # One deadline for the fleet, and a failed load still counts toward
             # the session's fail-fast budget as it does on the sequential path.
-            deadline = time.monotonic() + spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            deadline = time.monotonic() + effective_startup_timeout(
+                spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            )
             try:
                 for worker in all_workers:
                     worker.wait_ready(max(1, int(deadline - time.monotonic())))

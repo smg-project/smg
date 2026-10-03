@@ -76,7 +76,9 @@ ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
 ENV_VLLM_MM_PROCESSOR = "E2E_VLLM_MM_PROCESSOR"  # Worker-lane processor — see get_vllm_mm_processor
-ENV_STARTUP_TIMEOUT = "E2E_STARTUP_TIMEOUT"
+ENV_STARTUP_TIMEOUT = (
+    "E2E_STARTUP_TIMEOUT"  # Floor on every startup wait — see effective_startup_timeout
+)
 ENV_GPU_OFFSET = "E2E_GPU_OFFSET"  # First GPU index a lane's workers take — see get_gpu_offset
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
@@ -287,6 +289,28 @@ def get_gpu_offset() -> int:
     if offset < 0:
         raise ValueError(f"{ENV_GPU_OFFSET}={value!r} must be a non-negative integer")
     return offset
+
+
+def get_startup_timeout() -> int | None:
+    """``E2E_STARTUP_TIMEOUT`` in seconds, or ``None`` when unset/blank."""
+    value = os.environ.get(ENV_STARTUP_TIMEOUT, "").strip()
+    if not value:
+        return None
+    timeout = int(value)
+    if timeout <= 0:
+        raise ValueError(f"{ENV_STARTUP_TIMEOUT}={value!r} must be a positive number of seconds")
+    return timeout
+
+
+def effective_startup_timeout(spec_timeout: int) -> int:
+    """A model's startup wait (its spec's ``startup_timeout`` or the default),
+    raised to ``E2E_STARTUP_TIMEOUT`` when that is larger. The per-model bound
+    assumes warm caches; on a fresh host an engine's first start JIT-compiles
+    and autotunes kernels for minutes, which the env floor covers for every
+    wait that gates on a loaded model (worker health, ZMQ gateway readiness).
+    An explicitly larger per-model bound is never shrunk.
+    """
+    return max(spec_timeout, get_startup_timeout() or 0)
 
 
 ENV_VLLM_KV_BACKEND = "E2E_VLLM_KV_BACKEND"

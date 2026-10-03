@@ -25,6 +25,7 @@ from .constants import (
     MM_PROCESSING_WORKER,
     ConnectionMode,
     WorkerType,
+    effective_startup_timeout,
     get_gpu_offset,
     get_mm_processing,
     get_runtime,
@@ -815,7 +816,7 @@ def start_workers(
                 f"launcher (vllm or tokenspeed); got engine={engine!r}"
             )
         gpus_per_worker *= zmq_engine_count
-    timeout = spec.get("startup_timeout", timeout)
+    timeout = effective_startup_timeout(spec.get("startup_timeout", timeout))
 
     # Detect IB device for PD workers
     has_pd = worker_type in (WorkerType.PREFILL, WorkerType.DECODE)
