@@ -78,6 +78,14 @@ pub trait VisionPreProcessor: Send + Sync {
         false
     }
 
+    /// Whether this processor produces the image's own bytes
+    /// ([`EncoderInput::U8`](crate::encoder_inputs::EncoderInput::U8)), so
+    /// a destination that normalizes on device can be served raw pixels
+    /// exactly; `false` means it produces normalized floats.
+    fn emits_pixel_bytes(&self) -> bool {
+        false
+    }
+
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 

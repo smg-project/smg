@@ -12,7 +12,7 @@
 use std::{borrow::Cow, collections::HashMap, fmt, mem::size_of, str::FromStr};
 
 use anyhow::{Context, Result as AnyhowResult};
-use ndarray::{Array, ArrayD, Axis, Dimension};
+use ndarray::{Array, ArrayD, ArrayViewD, Axis, Dimension, Slice};
 
 use crate::{types::FieldLayout, vision::execution};
 
@@ -200,6 +200,19 @@ impl EncoderInput {
         self.len() == 0
     }
 
+    /// Bytes per element as stored.
+    pub fn element_size(&self) -> usize {
+        match self {
+            Self::F32(_) => size_of::<f32>(),
+            Self::U8 { .. } => size_of::<u8>(),
+        }
+    }
+
+    /// Bytes as stored.
+    pub fn nbytes(&self) -> usize {
+        self.len() * self.element_size()
+    }
+
     /// The normalization bytes carry; `None` for floats, already normalized.
     pub fn pixel_norm(&self) -> Option<PixelNorm> {
         match self {
@@ -256,109 +269,30 @@ impl EncoderInput {
         }
     }
 
-    /// The input as little-endian bytes of `dtype`, in row-major order.
-    ///
-    /// Bytes to a float dtype go through the normalization table once;
-    /// floats to a narrower dtype are rounded to nearest even. `Uint8` from
-    /// bytes is the bytes themselves; from floats it is the rounded, clamped
-    /// value, for a caller that knows its floats are whole numbers.
-    pub fn write_as(&self, dtype: EncoderDtype) -> Vec<u8> {
-        let row = row_len(self.shape());
+    /// This input, borrowed: what the per-destination writers take.
+    pub fn view(&self) -> EncoderInputView<'_> {
         match self {
-            Self::U8 { patches, norm } => {
-                let standard = patches.as_standard_layout();
-                let src = standard.as_slice().unwrap_or(&[]);
-                let block = norm.channel_block.max(1);
-                match dtype {
-                    EncoderDtype::Uint8 => src.to_vec(),
-                    EncoderDtype::Float32 => {
-                        let table = norm.table_f32();
-                        let mut out = vec![0u8; src.len() * 4];
-                        fill_rows_bytes(&mut out, src, row, 4, |dst, src| {
-                            for (i, (d, &v)) in
-                                dst.as_chunks_mut::<4>().0.iter_mut().zip(src).enumerate()
-                            {
-                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
-                            }
-                        });
-                        out
-                    }
-                    EncoderDtype::BFloat16 | EncoderDtype::Float16 => {
-                        let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
-                            f32_to_bf16_bits
-                        } else {
-                            f32_to_f16_bits
-                        };
-                        let table = norm.table_u16(convert);
-                        let mut out = vec![0u8; src.len() * 2];
-                        fill_rows_bytes(&mut out, src, row, 2, |dst, src| {
-                            for (i, (d, &v)) in
-                                dst.as_chunks_mut::<2>().0.iter_mut().zip(src).enumerate()
-                            {
-                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
-                            }
-                        });
-                        out
-                    }
-                }
-            }
-            Self::F32(array) => {
-                let standard = array.as_standard_layout();
-                let src = standard.as_slice().unwrap_or(&[]);
-                match dtype {
-                    EncoderDtype::Float32 => {
-                        let mut out = vec![0u8; src.len() * 4];
-                        fill_rows_bytes(&mut out, src, row, 4, |dst, src| {
-                            for (d, &v) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
-                                *d = v.to_le_bytes();
-                            }
-                        });
-                        out
-                    }
-                    EncoderDtype::BFloat16 | EncoderDtype::Float16 => {
-                        let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
-                            f32_to_bf16_bits
-                        } else {
-                            f32_to_f16_bits
-                        };
-                        let mut out = vec![0u8; src.len() * 2];
-                        fill_rows_bytes(&mut out, src, row, 2, |dst, src| {
-                            for (d, &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
-                                *d = convert(v).to_le_bytes();
-                            }
-                        });
-                        out
-                    }
-                    EncoderDtype::Uint8 => src
-                        .iter()
-                        .map(|&v| v.round().clamp(0.0, 255.0) as u8)
-                        .collect(),
-                }
-            }
+            Self::F32(array) => EncoderInputView::F32(array.view()),
+            Self::U8 { patches, norm } => EncoderInputView::U8 {
+                patches: patches.view(),
+                norm: *norm,
+            },
         }
+    }
+
+    /// [`EncoderInputView::write_as`] for the whole input.
+    pub fn write_as(&self, dtype: EncoderDtype) -> Vec<u8> {
+        self.view().write_as(dtype)
+    }
+
+    /// [`EncoderInputView::write_into`] for the whole input.
+    pub fn write_into(&self, dtype: EncoderDtype, out: &mut [u8]) -> Result<(), String> {
+        self.view().write_into(dtype, out)
     }
 
     /// Rows `[start, start + len)` along the first axis, as an owned input.
     pub fn slice_axis0(&self, start: usize, len: usize) -> AnyhowResult<Self> {
-        let rows = self.shape().first().copied().unwrap_or(0);
-        anyhow::ensure!(
-            start.checked_add(len).is_some_and(|end| end <= rows),
-            "rows {start}..{} are out of bounds for {rows} rows",
-            start.saturating_add(len)
-        );
-        Ok(match self {
-            Self::F32(array) => Self::F32(
-                array
-                    .slice_axis(Axis(0), (start..start + len).into())
-                    .to_owned(),
-            ),
-            Self::U8 { patches, norm } => Self::U8 {
-                patches: patches
-                    .slice_axis(Axis(0), (start..start + len).into())
-                    .to_owned(),
-                norm: *norm,
-            },
-        })
+        Ok(self.view().slice_axis0(start, len)?.to_owned())
     }
 
     /// Stack inputs along the first axis. Bytes stack with bytes of the same
@@ -403,6 +337,173 @@ impl EncoderInput {
                 })
             }
         }
+    }
+}
+
+/// A borrowed [`EncoderInput`]: the whole, or rows of it. Per-destination
+/// materialization lives here so an item sliced out of a batch is written
+/// without first being copied.
+#[derive(Debug, Clone)]
+pub enum EncoderInputView<'a> {
+    F32(ArrayViewD<'a, f32>),
+    U8 {
+        patches: ArrayViewD<'a, u8>,
+        norm: PixelNorm,
+    },
+}
+
+impl<'a> EncoderInputView<'a> {
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            Self::F32(array) => array.shape(),
+            Self::U8 { patches, .. } => patches.shape(),
+        }
+    }
+
+    pub fn ndim(&self) -> usize {
+        self.shape().len()
+    }
+
+    /// Elements in all.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(array) => array.len(),
+            Self::U8 { patches, .. } => patches.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The normalization bytes carry; `None` for floats, already normalized.
+    pub fn pixel_norm(&self) -> Option<PixelNorm> {
+        match self {
+            Self::F32(_) => None,
+            Self::U8 { norm, .. } => Some(*norm),
+        }
+    }
+
+    /// An owned copy, in the same form.
+    pub fn to_owned(&self) -> EncoderInput {
+        match self {
+            Self::F32(array) => EncoderInput::F32(array.to_owned()),
+            Self::U8 { patches, norm } => EncoderInput::U8 {
+                patches: patches.to_owned(),
+                norm: *norm,
+            },
+        }
+    }
+
+    /// Rows `[start, start + len)` along the first axis, still borrowed.
+    pub fn slice_axis0(&self, start: usize, len: usize) -> AnyhowResult<Self> {
+        let rows = self.shape().first().copied().unwrap_or(0);
+        anyhow::ensure!(
+            start.checked_add(len).is_some_and(|end| end <= rows),
+            "rows {start}..{} are out of bounds for {rows} rows",
+            start.saturating_add(len)
+        );
+        let range = Slice::from(start..start + len);
+        Ok(match self {
+            Self::F32(array) => Self::F32(array.clone().slice_axis_move(Axis(0), range)),
+            Self::U8 { patches, norm } => Self::U8 {
+                patches: patches.clone().slice_axis_move(Axis(0), range),
+                norm: *norm,
+            },
+        })
+    }
+
+    /// The input as little-endian bytes of `dtype`, in row-major order.
+    ///
+    /// Bytes to a float dtype go through the normalization table once;
+    /// floats to a narrower dtype are rounded to nearest even. `Uint8` from
+    /// bytes is the bytes themselves; from floats it is the rounded, clamped
+    /// value, for a caller that knows its floats are whole numbers.
+    pub fn write_as(&self, dtype: EncoderDtype) -> Vec<u8> {
+        let mut out = vec![0u8; self.len() * dtype.element_size()];
+        // The buffer is sized by this input and dtype, the one error case.
+        let _ = self.write_into(dtype, &mut out);
+        out
+    }
+
+    /// [`write_as`](Self::write_as) into a buffer the caller owns (a
+    /// shared-memory mapping), which must hold exactly `len() *
+    /// dtype.element_size()` bytes.
+    pub fn write_into(&self, dtype: EncoderDtype, out: &mut [u8]) -> Result<(), String> {
+        let expected = self.len() * dtype.element_size();
+        if out.len() != expected {
+            return Err(format!(
+                "encoder input buffer holds {} bytes, {expected} needed for {dtype}",
+                out.len()
+            ));
+        }
+        let row = row_len(self.shape());
+        match self {
+            Self::U8 { patches, norm } => {
+                let standard = patches.as_standard_layout();
+                let src = standard.as_slice().unwrap_or(&[]);
+                let block = norm.channel_block.max(1);
+                match dtype {
+                    EncoderDtype::Uint8 => out.copy_from_slice(src),
+                    EncoderDtype::Float32 => {
+                        let table = norm.table_f32();
+                        fill_rows_bytes(out, src, row, 4, |dst, src| {
+                            for (i, (d, &v)) in
+                                dst.as_chunks_mut::<4>().0.iter_mut().zip(src).enumerate()
+                            {
+                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
+                            }
+                        });
+                    }
+                    EncoderDtype::BFloat16 | EncoderDtype::Float16 => {
+                        let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
+                            f32_to_bf16_bits
+                        } else {
+                            f32_to_f16_bits
+                        };
+                        let table = norm.table_u16(convert);
+                        fill_rows_bytes(out, src, row, 2, |dst, src| {
+                            for (i, (d, &v)) in
+                                dst.as_chunks_mut::<2>().0.iter_mut().zip(src).enumerate()
+                            {
+                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
+                            }
+                        });
+                    }
+                }
+            }
+            Self::F32(array) => {
+                let standard = array.as_standard_layout();
+                let src = standard.as_slice().unwrap_or(&[]);
+                match dtype {
+                    EncoderDtype::Float32 => {
+                        fill_rows_bytes(out, src, row, 4, |dst, src| {
+                            for (d, &v) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                                *d = v.to_le_bytes();
+                            }
+                        });
+                    }
+                    EncoderDtype::BFloat16 | EncoderDtype::Float16 => {
+                        let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
+                            f32_to_bf16_bits
+                        } else {
+                            f32_to_f16_bits
+                        };
+                        fill_rows_bytes(out, src, row, 2, |dst, src| {
+                            for (d, &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+                                *d = convert(v).to_le_bytes();
+                            }
+                        });
+                    }
+                    EncoderDtype::Uint8 => {
+                        for (d, &v) in out.iter_mut().zip(src) {
+                            *d = v.round().clamp(0.0, 255.0) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
