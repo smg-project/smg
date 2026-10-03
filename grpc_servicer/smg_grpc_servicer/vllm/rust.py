@@ -47,6 +47,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     EngineProcess,
     default_socket_dir,
     free_port,
+    resolve_tokenizer_dir,
     supervise,
 )
 from smg_grpc_servicer.rust_lifecycle import env_float as _env_float
@@ -163,33 +164,6 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         "max_item_bytes": settings.max_item_bytes,
         "source": settings.source,
     }
-
-
-def resolve_tokenizer_dir(tokenizer: str, revision: str | None = None) -> str | None:
-    """A local directory holding ``tokenizer`` (a path, or a Hub id resolved
-    through the local cache first); ``None`` when none can be found, in which
-    case the Rust servicer refuses requests carrying string stops."""
-    if os.path.isdir(tokenizer):
-        return tokenizer
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        logger.warning("huggingface_hub is not installed; cannot resolve tokenizer %r", tokenizer)
-        return None
-    patterns = ["*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]
-    last_error: Exception | None = None
-    for local_files_only in (True, False):
-        try:
-            return snapshot_download(
-                tokenizer,
-                revision=revision,
-                allow_patterns=patterns,
-                local_files_only=local_files_only,
-            )
-        except Exception as error:  # cache miss, offline, or an unknown repo
-            last_error = error
-    logger.warning("Could not resolve tokenizer %r to a local directory: %s", tokenizer, last_error)
-    return None
 
 
 # ---------------------------------------------------------------------------

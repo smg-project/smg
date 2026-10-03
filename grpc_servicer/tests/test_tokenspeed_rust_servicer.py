@@ -211,7 +211,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
         "server_facts",
         lambda args: {"server_args_json": "{}", "data_parallel_size": 2},
     )
-    monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda args: str(tmp_path))
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
     monkeypatch.setattr(rust, "free_port", lambda: 24321)
     monkeypatch.setattr(rust, "default_socket_dir", lambda: str(tmp_path / "sockets"))
 

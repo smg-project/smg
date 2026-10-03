@@ -35,6 +35,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     default_socket_dir,
     env_float,
     free_port,
+    resolve_tokenizer_dir,
     supervise,
 )
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
@@ -199,20 +200,10 @@ def launch_headless_scheduler(server_args: Any) -> EngineProcess:
     return EngineProcess(process)
 
 
-def resolve_tokenizer_dir(server_args: Any) -> str | None:
-    """A local directory holding the tokenizer; ``None`` when none can be
-    found, in which case the servicer refuses string stops."""
+def tokenizer_dir_for(server_args: Any) -> str | None:
+    """The local tokenizer directory for the served model, or ``None``."""
     tokenizer = getattr(server_args, "tokenizer", None) or getattr(server_args, "model", "")
-    if tokenizer and os.path.isdir(str(tokenizer)):
-        return str(tokenizer)
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        return None
-    try:
-        return str(snapshot_download(str(tokenizer), local_files_only=True))
-    except Exception:  # noqa: BLE001 -- any failure means "not local"
-        return None
+    return resolve_tokenizer_dir(str(tokenizer), getattr(server_args, "revision", None))
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +225,7 @@ async def serve_rust(server_args: Any) -> int:
     port = int(getattr(server_args, "port", 0) or 0)
     facts = {**model_facts(server_args), **server_facts(server_args)}
     engine_count = facts["data_parallel_size"]
-    tokenizer_dir = resolve_tokenizer_dir(server_args)
+    tokenizer_dir = tokenizer_dir_for(server_args)
     if tokenizer_dir is None:
         logger.warning(
             "No local tokenizer directory for %s; string stops will be refused",

@@ -8,6 +8,7 @@ server. Nothing here knows which engine it supervises.
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
 import os
 import signal
@@ -20,6 +21,58 @@ logger = logging.getLogger(__name__)
 DEFAULT_DRAIN_SECS = 5.0
 ENGINE_TERMINATE_SECS = 30.0
 _POLL_SECS = 0.5
+
+# What makes a directory a tokenizer directory to the Rust tokenizer loader.
+TOKENIZER_FILE_GLOBS = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "tiktoken.model",
+    "*.tiktoken",
+    "vocab.json",
+)
+# The files worth fetching for one: the tokenizer and its configs, never weights.
+TOKENIZER_DOWNLOAD_PATTERNS = ["*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]
+
+
+def holds_tokenizer(directory: str) -> bool:
+    """Whether ``directory`` holds a tokenizer file the Rust loader reads."""
+    return any(glob.glob(os.path.join(directory, pattern)) for pattern in TOKENIZER_FILE_GLOBS)
+
+
+def resolve_tokenizer_dir(tokenizer: str, revision: str | None = None) -> str | None:
+    """A local directory holding ``tokenizer`` (a path, or a Hub id resolved
+    through the local cache first, then the Hub); ``None`` when none can be
+    found, in which case the Rust servicer refuses requests carrying string
+    stops.
+
+    The cache is only trusted once it holds a tokenizer file: the engine
+    downloads the same repo in parallel, and a snapshot it has started to
+    populate (its ``config.json`` is there, its ``tokenizer.json`` not yet)
+    satisfies a local-only lookup while loading nothing."""
+    if os.path.isdir(tokenizer):
+        return tokenizer
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        logger.warning("huggingface_hub is not installed; cannot resolve tokenizer %r", tokenizer)
+        return None
+    last_error: Exception | None = None
+    for local_files_only in (True, False):
+        try:
+            directory = snapshot_download(
+                tokenizer,
+                revision=revision,
+                allow_patterns=TOKENIZER_DOWNLOAD_PATTERNS,
+                local_files_only=local_files_only,
+            )
+        except Exception as error:  # cache miss, offline, or an unknown repo
+            last_error = error
+            continue
+        if holds_tokenizer(directory):
+            return directory
+        last_error = FileNotFoundError(f"{directory} holds no tokenizer file")
+    logger.warning("Could not resolve tokenizer %r to a local directory: %s", tokenizer, last_error)
+    return None
 
 
 def env_float(name: str, default: float) -> float:
