@@ -35,7 +35,8 @@ use smg::{
     config::RouterConfig,
     mesh_discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
     service_discovery::{
-        start_service_discovery_with_client, ServiceDiscoveryConfig, POD_UID_LABEL,
+        start_service_discovery_with_client, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
+        DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
     },
     worker::BasicWorkerBuilder,
 };
@@ -392,10 +393,13 @@ async fn zombie_worker_removed_and_manual_worker_kept() {
     let app_context = test_context().await;
 
     // A worker registered for a pod that no longer exists (e.g. by a
-    // registration workflow that outlived its pod) — carries the pod-uid
-    // label, so the reconciler owns it.
+    // registration workflow that outlived its pod). It carries the Kubernetes
+    // provider label, which is what makes it the reconciler's to remove; the
+    // Pod UID label is only the compatibility label it also wrote.
     let zombie = Arc::new(
         BasicWorkerBuilder::new("http://127.0.0.1:19")
+            .label(DISCOVERY_PROVIDER_LABEL, "kubernetes")
+            .label(DISCOVERY_ID_LABEL, "uid-ghost:19")
             .label(POD_UID_LABEL, "uid-ghost")
             .build(),
     );
