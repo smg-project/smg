@@ -529,7 +529,7 @@ fn fill_rows<T: Copy + Send + Sync, S: Copy + Send + Sync>(
     row: usize,
     fill: impl Fn(&mut [T], &[S]) + Sync,
 ) {
-    let rows = if row == 0 { 0 } else { src.len() / row };
+    let rows = src.len().checked_div(row).unwrap_or(0);
     let tasks = execution::task_count(size_of_val(out), rows, 32);
     if tasks <= 1 {
         fill(out, src);
@@ -558,7 +558,7 @@ fn fill_rows_bytes<S: Copy + Send + Sync>(
     width: usize,
     fill: impl Fn(&mut [u8], &[S]) + Sync,
 ) {
-    let rows = if row == 0 { 0 } else { src.len() / row };
+    let rows = src.len().checked_div(row).unwrap_or(0);
     let tasks = execution::task_count(out.len(), rows, 32);
     if tasks <= 1 {
         fill(out, src);
