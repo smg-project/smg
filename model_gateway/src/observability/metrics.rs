@@ -510,6 +510,10 @@ pub(crate) fn init_metrics() {
         "smg_mm_processing_total",
         "Multimodal requests by processing location (router/worker) and resolution reason"
     );
+    describe_gauge!(
+        "smg_mm_turbojpeg_available",
+        "1 when JPEGs decode through libjpeg-turbo (PIL's pixels), 0 through the pure-Rust fallback"
+    );
     describe_counter!(
         "smg_responses_stream_failures_total",
         "Responses streams that ended with a response.failed terminal, by model and reason"
@@ -907,6 +911,10 @@ impl Metrics {
     /// Record a SHM tensor write that failed and fell back to inline, for `runtime`.
     pub fn record_mm_shm_write_failure(runtime: &'static str) {
         counter!("smg_mm_shm_write_failures_total", "runtime" => runtime).increment(1);
+    }
+
+    pub fn set_mm_turbojpeg_available(available: bool) {
+        gauge!("smg_mm_turbojpeg_available").set(if available { 1.0 } else { 0.0 });
     }
 
     /// Record where a multimodal request's media is processed and why.

@@ -204,3 +204,24 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     /// the default name.
     pub encoder_input_key: Option<String>,
 }
+
+/// Say once which JPEG decoder this process has, and publish it: without
+/// libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a few
+/// levels, an embedding shift against an engine that decodes with PIL.
+pub(crate) fn report_jpeg_decoder() {
+    use crate::observability::metrics::Metrics;
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let available = llm_multimodal::jpeg_turbo::turbojpeg_available();
+        Metrics::set_mm_turbojpeg_available(available);
+        if available {
+            tracing::info!("JPEG decode uses libjpeg-turbo with PIL's defaults");
+        } else {
+            tracing::warn!(
+                "libturbojpeg not found: JPEGs decode with the pure-Rust decoder, whose pixels \
+                 differ from PIL's by a few levels; install libjpeg-turbo for exact parity with \
+                 an engine that decodes with PIL"
+            );
+        }
+    });
+}

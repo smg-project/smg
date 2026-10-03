@@ -271,6 +271,7 @@ impl MultimodalComponents {
         let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
             .context("Failed to create MediaConnector")?;
 
+        super::report_jpeg_decoder();
         let processing = settings.processing.value;
         tracing::info!(
             mode = %processing,
