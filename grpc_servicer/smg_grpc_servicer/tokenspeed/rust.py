@@ -31,10 +31,12 @@ from typing import Any
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
+    DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
     default_socket_dir,
     env_float,
     free_port,
+    new_session,
     resolve_tokenizer_dir,
     supervise,
 )
@@ -46,6 +48,7 @@ logger = logging.getLogger(__name__)
 SERVICER_IMPL_ENV = "SMG_TOKENSPEED_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_SECS"
+STARTUP_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS"
 IMPLS = ("python", "rust")
 
 
@@ -184,6 +187,7 @@ def headless_server_args(server_args: Any, *, handshake_port: int) -> Any:
 
 def _run_headless(server_args: Any) -> None:
     """Child target: TokenSpeed's own headless launch."""
+    new_session()
     from tokenspeed.runtime.entrypoints.engine import launch_scheduler_headless
 
     launch_scheduler_headless(server_args)
@@ -237,6 +241,9 @@ async def serve_rust(server_args: Any) -> int:
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=engine_count,
         tokenizer_dir=tokenizer_dir,
+        engine_startup_timeout_secs=env_float(
+            STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS
+        ),
         **facts,
     )
     logger.info(

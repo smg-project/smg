@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DRAIN_SECS = 5.0
 ENGINE_TERMINATE_SECS = 30.0
+# Bound on the engine's ZMQ handshake. An engine's start includes model load,
+# kernel JIT and graph capture; a cold kernel cache has taken over ten minutes.
+# A dead engine never waits this long: ``supervise`` polls the engine process.
+DEFAULT_STARTUP_TIMEOUT_SECS = 1800.0
 _POLL_SECS = 0.5
 
 # What makes a directory a tokenizer directory to the Rust tokenizer loader.
@@ -108,6 +112,19 @@ class EngineProcess:
         self._process.terminate()
 
     def kill(self) -> None:
+        pid = self.pid
+        try:
+            leader = pid is not None and os.getpgid(pid) == pid
+        except OSError:
+            leader = False
+        if leader:
+            # The child made itself a session leader (``new_session``): the
+            # engine's worker processes share its group and go with it.
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                return
+            except OSError:
+                pass
         self._process.kill()
 
     def wait(self, timeout: float | None = None) -> int:
@@ -116,6 +133,16 @@ class EngineProcess:
         if code is None:
             raise subprocess.TimeoutExpired("headless engine", timeout or 0)
         return code
+
+
+def new_session() -> None:
+    """Make the calling headless-engine child a session leader, so a kill of
+    its process group reaches the worker processes the engine spawns (an
+    engine killed mid-start must not leave a worker holding the GPU)."""
+    try:
+        os.setsid()
+    except OSError:  # already a leader
+        pass
 
 
 def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> None:

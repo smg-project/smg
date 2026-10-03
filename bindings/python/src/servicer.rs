@@ -22,7 +22,7 @@ use bytes::Bytes;
 use engine_servicer::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
     ServicerError, TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer,
-    VllmModelInfo, VllmServicerConfig, VllmServicerServer,
+    VllmModelInfo, VllmServicerConfig, VllmServicerServer, DEFAULT_ENGINE_STARTUP_TIMEOUT,
 };
 use llm_multimodal::Modality;
 use prost::Message;
@@ -45,6 +45,18 @@ fn to_py_err(error: ServicerError) -> PyErr {
         ServicerError::Startup(_) | ServicerError::Poisoned | ServicerError::ThreadPanicked => {
             PyRuntimeError::new_err(error.to_string())
         }
+    }
+}
+
+/// The engine startup bound from the launcher's seconds; `None` is the crate
+/// default.
+fn startup_timeout(secs: Option<f64>) -> PyResult<Duration> {
+    match secs {
+        None => Ok(DEFAULT_ENGINE_STARTUP_TIMEOUT),
+        Some(secs) if secs.is_finite() && secs > 0.0 => Ok(Duration::from_secs_f64(secs)),
+        Some(secs) => Err(PyValueError::new_err(format!(
+            "engine_startup_timeout_secs must be positive, got {secs}"
+        ))),
     }
 }
 
@@ -542,6 +554,7 @@ impl PyVllmGrpcServer {
         mm_device_do_normalize = false,
         media_processor = None,
         smg_media_processor = None,
+        engine_startup_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -583,6 +596,7 @@ impl PyVllmGrpcServer {
         mm_device_do_normalize: bool,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
+        engine_startup_timeout_secs: Option<f64>,
     ) -> PyResult<Self> {
         if media_processor.is_some() && smg_media_processor.is_some() {
             return Err(PyValueError::new_err(
@@ -637,6 +651,7 @@ impl PyVllmGrpcServer {
             tokenizer_dir,
             model,
             media_processor,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
         };
         let inner = py.detach(|| -> PyResult<VllmServicerServer> {
             let Some(native) = native else {
@@ -770,6 +785,7 @@ impl PyTokenSpeedGrpcServer {
         data_parallel_size = 1,
         kv_events_endpoint = String::new(),
         kv_events_topic = String::new(),
+        engine_startup_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -804,6 +820,7 @@ impl PyTokenSpeedGrpcServer {
         data_parallel_size: i32,
         kv_events_endpoint: String,
         kv_events_topic: String,
+        engine_startup_timeout_secs: Option<f64>,
     ) -> PyResult<Self> {
         let model = TokenSpeedModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -839,6 +856,7 @@ impl PyTokenSpeedGrpcServer {
             engine_count,
             tokenizer_dir,
             model,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
         };
         let inner = py
             .detach(|| TokenSpeedServicerServer::start(config))

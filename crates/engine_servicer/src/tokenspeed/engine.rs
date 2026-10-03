@@ -3,7 +3,7 @@
 //! and surface as the last error; nothing here retries, the lifecycle owner
 //! restarts the pair.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{connect_with_eos, EosTokenIds};
 use openai_protocol::worker::RuntimeType;
@@ -17,6 +17,7 @@ pub(super) async fn connect_engine(
     ipc_base_url: String,
     handshake_address: String,
     engine_count: usize,
+    startup_timeout: Duration,
     tokenizer_dir: Option<String>,
     last_error: SharedError,
 ) {
@@ -52,6 +53,7 @@ pub(super) async fn connect_engine(
         Some(&handshake_address),
         engine_count,
         eos,
+        startup_timeout,
     )
     .await
     {

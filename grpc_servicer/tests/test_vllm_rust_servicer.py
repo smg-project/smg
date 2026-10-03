@@ -19,6 +19,7 @@ import types
 from types import SimpleNamespace
 
 import pytest
+from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.vllm import rust
 
 
@@ -598,6 +599,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert kwargs["handshake_address"] == "tcp://127.0.0.1:24321"
     assert kwargs["engine_count"] == 2
     assert kwargs["tokenizer_dir"] == str(tmp_path)
+    assert kwargs["engine_startup_timeout_secs"] == rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS
     assert kwargs["served_model_name"] == "served-a"
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
     assert kwargs["kv_connector"] == ""

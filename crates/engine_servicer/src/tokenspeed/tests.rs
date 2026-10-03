@@ -3,7 +3,10 @@
 //! and answers with `BatchTokenIDOutSlim` batches, as the headless scheduler
 //! does.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use engine_zmq_client::{
@@ -66,6 +69,7 @@ fn config(
         engine_count: 1,
         tokenizer_dir: None,
         model,
+        engine_startup_timeout: Duration::from_secs(10),
     }
 }
 
@@ -245,6 +249,13 @@ fn config_is_validated_before_binding() {
             "model",
             TokenSpeedServicerConfig {
                 model: TokenSpeedModelInfo::default(),
+                ..good.clone()
+            },
+        ),
+        (
+            "startup timeout",
+            TokenSpeedServicerConfig {
+                engine_startup_timeout: Duration::ZERO,
                 ..good.clone()
             },
         ),
@@ -811,4 +822,36 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
         .expect_err("no tokenizer dir");
     assert_eq!(bundle.code(), Code::FailedPrecondition);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A scheduler that never dials in fails the link at the configured bound (not
+/// a fixed one: a cold kernel cache makes a real start exceed ten minutes), the
+/// server stays up to report it, and `stop` releases the handshake port.
+#[tokio::test]
+async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address();
+    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
+        engine_startup_timeout: Duration::from_millis(300),
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let error = loop {
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(error.contains("timed out"), "{error}");
+    assert!(!server.engine_ready());
+    assert!(
+        server.running(),
+        "the server keeps answering after the link failed"
+    );
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    let port = handshake.rsplit(':').next().unwrap();
+    std::net::TcpListener::bind(format!("127.0.0.1:{port}")).expect("handshake port released");
 }

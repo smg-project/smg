@@ -44,9 +44,11 @@ from typing import Any
 
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
+    DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
     default_socket_dir,
     free_port,
+    new_session,
     resolve_tokenizer_dir,
     supervise,
 )
@@ -63,6 +65,7 @@ logger = logging.getLogger(__name__)
 SERVICER_IMPL_ENV = "SMG_VLLM_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_VLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_SECS"
+STARTUP_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS"
 IMPLS = ("python", "rust")
 # What upstream's gRPC entrypoint references when it carries the switch.
 HOOK_SYMBOL = "resolve_servicer_impl"
@@ -222,6 +225,7 @@ def headless_namespace(
 
 def _run_headless(ns: argparse.Namespace) -> None:
     """Child target: vLLM's own headless launch (`vllm serve --headless`)."""
+    new_session()
     from vllm.entrypoints.cli.serve import run_headless
 
     run_headless(ns)
@@ -294,6 +298,9 @@ async def serve_rust(args: argparse.Namespace) -> int:
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=data_parallel_size,
         tokenizer_dir=tokenizer_dir,
+        engine_startup_timeout_secs=_env_float(
+            STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS
+        ),
         media_processor=media,
         smg_media_processor=smg_media,
         **info,

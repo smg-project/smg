@@ -73,6 +73,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmS
         tokenizer_dir: None,
         model,
         media_processor: None,
+        engine_startup_timeout: Duration::from_secs(10),
     }
 }
 
@@ -253,11 +254,15 @@ fn start_rejects_malformed_config() {
         engine_count: 0,
         ..good.clone()
     };
+    let zero_timeout = VllmServicerConfig {
+        engine_startup_timeout: Duration::ZERO,
+        ..good.clone()
+    };
     let no_model = VllmServicerConfig {
         model: VllmModelInfo::default(),
         ..good
     };
-    for config in [bad_ipc, bad_handshake, no_engines, no_model] {
+    for config in [bad_ipc, bad_handshake, no_engines, zero_timeout, no_model] {
         assert!(matches!(
             VllmServicerServer::start(config),
             Err(ServicerError::InvalidConfig(_))
@@ -2439,4 +2444,35 @@ async fn a_caller_leaving_an_admitted_decode_leg_sends_no_notice() {
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["mr21".to_string()]);
     assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// An engine that never dials in fails the link at the configured bound, the
+/// server stays up to report it, and `stop` releases the handshake port.
+#[tokio::test]
+async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address();
+    let server = VllmServicerServer::start(VllmServicerConfig {
+        engine_startup_timeout: Duration::from_millis(300),
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let error = loop {
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(error.contains("timed out"), "{error}");
+    assert!(!server.engine_ready());
+    assert!(
+        server.running(),
+        "the server keeps answering after the link failed"
+    );
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    let port = handshake.rsplit(':').next().unwrap();
+    std::net::TcpListener::bind(format!("127.0.0.1:{port}")).expect("handshake port released");
 }

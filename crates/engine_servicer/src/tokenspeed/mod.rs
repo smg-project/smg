@@ -100,6 +100,9 @@ pub struct TokenSpeedServicerConfig {
     /// requests carrying string stops are refused.
     pub tokenizer_dir: Option<String>,
     pub model: TokenSpeedModelInfo,
+    /// Bound on the scheduler's startup handshake; see
+    /// [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
+    pub engine_startup_timeout: Duration,
 }
 
 pub(super) struct State {
@@ -197,6 +200,9 @@ impl TokenSpeedServicerServer {
         if config.engine_count == 0 {
             return Err(invalid("engine_count must be positive"));
         }
+        if config.engine_startup_timeout.is_zero() {
+            return Err(invalid("engine_startup_timeout must be positive"));
+        }
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
@@ -228,6 +234,7 @@ impl TokenSpeedServicerServer {
             handshake_address,
             engine_count,
             tokenizer_dir,
+            engine_startup_timeout,
             ..
         } = config;
         let thread = ServerThread::start(
@@ -243,6 +250,7 @@ impl TokenSpeedServicerServer {
                     ipc_base_url,
                     handshake_address,
                     engine_count,
+                    engine_startup_timeout,
                     tokenizer_dir,
                     last_error,
                 ));

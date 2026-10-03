@@ -139,6 +139,7 @@ pub async fn connect_for_worker(
         handshake_override,
         engine_count,
         eos,
+        ZMQ_CONNECT_TIMEOUT,
     )
     .await
 }
@@ -147,7 +148,9 @@ pub async fn connect_for_worker(
 /// data-plane sockets under `base_url`, clear stale socket files, and complete
 /// the handshake. For a frontend that already knows the model's EOS ids from
 /// the engine's own config (the Rust gRPC servicer) and has no model dir to
-/// read them from.
+/// read them from. `startup_timeout` bounds the handshake: the gateway's
+/// connector passes [`ZMQ_CONNECT_TIMEOUT`]; a servicer that launches its own
+/// engine passes what that engine's start may take.
 pub async fn connect_with_eos(
     base_url: &str,
     model_id: String,
@@ -155,6 +158,7 @@ pub async fn connect_with_eos(
     handshake_override: Option<&str>,
     engine_count: usize,
     eos: EosTokenIds,
+    startup_timeout: Duration,
 ) -> Result<ZmqEngineClient, String> {
     let (handshake, input, output) = zmq_socket_addresses(base_url, handshake_override)?;
     ensure_ipc_socket_dir(base_url).await?;
@@ -179,7 +183,7 @@ pub async fn connect_with_eos(
         model_id,
         eos,
         runtime,
-        ZMQ_CONNECT_TIMEOUT,
+        startup_timeout,
     )
     .await
     .map_err(|e| format!("Failed to connect ZMQ engine: {e}"))
