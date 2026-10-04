@@ -61,6 +61,11 @@ tokenspeed = ["pyzmq>=25.0.0", "msgspec>=0.18.0"]
 [project.entry-points."sglang.srt.plugins"]
 smg-zmq = "smg_grpc_servicer.sglang.zmq_plugin:register"
 
+# vLLM loads this while it builds the engine CLI; it adds `--servicer-impl`
+# to the `vllm serve --grpc` parser (see smg_grpc_servicer/vllm/plugin.py).
+[project.entry-points."vllm.general_plugins"]
+smg-servicer = "smg_grpc_servicer.vllm.plugin:register"
+
 [project.urls]
 Homepage = "https://github.com/smg-project/smg"
 Repository = "https://github.com/smg-project/smg"

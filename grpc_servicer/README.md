@@ -126,23 +126,30 @@ retried by the router, since the worker already spent the whole budget on it.
 
 The same `vllm.grpc.engine.VllmEngine` contract can be served from Rust, with
 Python keeping only the lifecycle. The switch is a flag inside this package,
-not a second server: upstream vLLM's gRPC entrypoint asks the package which
-implementation to run before it builds an AsyncLLM, and hands the process to
-`smg_grpc_servicer.vllm.serve_rust` when the answer is `rust`. That function
-launches the engine headless (`vllm serve --headless`), which dials a
-same-host ZMQ handshake, and serves the gRPC contract from
-`smg.servicer.VllmGrpcServer` on a Rust-owned thread. The Router cannot tell
-the two apart.
+not a second server, and it needs no vLLM change: vLLM's gRPC launcher imports
+this package's servicer classes before it defines `serve_grpc`, and that
+import installs the switch over `serve_grpc` (`launcher_switch.py`), so the
+launcher asks the package which implementation to run before it builds an
+AsyncLLM and hands the process to `smg_grpc_servicer.vllm.serve_rust` when
+the answer is `rust`. That function launches the engine headless (`vllm serve
+--headless`), which dials a same-host ZMQ handshake, and serves the gRPC
+contract from `smg.servicer.VllmGrpcServer` on a Rust-owned thread. The
+Router cannot tell the two apart.
 
 ```bash
 # Python (default): upstream's gRPC server, AsyncLLM in-process.
-python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
+vllm serve Qwen/Qwen3-0.6B --grpc --port 50051
 
-# Rust request path, same entrypoint.
+# Rust request path, same entrypoint. The flag is this package's: vLLM loads
+# it as a general plugin while it builds the parser (smg_grpc_servicer/vllm/plugin.py).
+vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl rust
+
+# The environment form works for every launcher, including the deprecated module entry.
 SMG_VLLM_SERVICER_IMPL=rust python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
 ```
 
-The upstream hook is the first thing in its `serve_grpc`:
+What the switch runs ahead of `serve_grpc` is the check a launcher could also
+carry in its own source:
 
 ```python
 from smg_grpc_servicer.vllm import resolve_servicer_impl, serve_rust
@@ -153,9 +160,10 @@ if resolve_servicer_impl(args) == "rust":
 
 `smg serve --backend vllm --connection-mode grpc --servicer-impl rust` sets
 the flag in each worker's environment, after checking that the installed
-vLLM carries the hook (`smg_grpc_servicer.vllm.rust.upstream_hook_installed`);
-the Python servicer itself refuses to start when the flag asks for Rust, so a
-vLLM without the hook fails loudly instead of silently running Python. The
+vLLM's launcher will consult it (`smg_grpc_servicer.vllm.rust.upstream_hook_installed`:
+it imports this package at module level, or carries the check itself); the
+Python servicer refuses to start when the flag asks for Rust, so a launcher
+that reaches it anyway fails loudly instead of silently running Python. The
 headless engine is launched from the parsed namespace through vLLM's own
 `run_headless`, so both entrypoints above work unchanged.
 
