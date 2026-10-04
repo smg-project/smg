@@ -64,7 +64,9 @@ def make_signal_handler(stop: threading.Event, faulted: threading.Event, started
     """SIGTERM/SIGINT stop the supervise loop; SIGQUIT is SGLang reporting a
     crashed rank. While the ranks are still starting, the main thread sits in
     a blocking pipe read that Python retries after a handler returns (PEP
-    475), so the handler raises instead and ``launch`` cleans up at once."""
+    475), so the handler raises instead and ``launch`` cleans up at once.
+    Only the first signal raises: a second one, landing while ``launch`` is
+    already cleaning up, would otherwise unwind the cleanup itself."""
 
     def on_signal(signum, _frame):
         if signum == signal.SIGQUIT:
@@ -72,8 +74,9 @@ def make_signal_handler(stop: threading.Event, faulted: threading.Event, started
             faulted.set()
         else:
             logger.info("headless scheduler: received signal %d; stopping", signum)
+        first = not stop.is_set()
         stop.set()
-        if not started.is_set():
+        if first and not started.is_set():
             raise Interrupted(signum)
 
     return on_signal

@@ -226,3 +226,19 @@ def test_signal_handler_interrupts_startup_and_only_flags_afterwards():
     started.set()
     handler(signal.SIGQUIT, None)  # after startup: flag the fault, let the loop exit
     assert faulted.is_set()
+
+
+def test_signal_handler_raises_only_on_the_first_signal():
+    """A second signal during an interrupted startup (an impatient Ctrl-C, a
+    second rank's SIGQUIT) must not unwind the cleanup already under way."""
+    import signal
+    import threading
+
+    from smg_grpc_servicer.sglang.headless import Interrupted, make_signal_handler
+
+    stop, faulted, started = threading.Event(), threading.Event(), threading.Event()
+    handler = make_signal_handler(stop, faulted, started)
+    with pytest.raises(Interrupted):
+        handler(signal.SIGINT, None)
+    handler(signal.SIGQUIT, None)
+    assert stop.is_set() and faulted.is_set()
