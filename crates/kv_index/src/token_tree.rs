@@ -1399,9 +1399,24 @@ impl TokenTree {
         // and counts its tokens.
         for (node, matched) in path.iter().zip(&stamped) {
             // The match stamped this very tenant on this node a moment ago (the
-            // common hit: the request routes to the worker it matched), so it
-            // is attached and there is nothing to credit or re-stamp.
-            if matched.as_ref().is_some_and(|t| Arc::ptr_eq(t, &tenant_id)) {
+            // common hit: the request routes to the worker it matched). While
+            // it is still attached there is nothing to re-stamp or credit: the
+            // stamp already is this request's `ts` and `touch_any_tenant` did
+            // the `last_tenant` refresh, so only the LFU hit that the replay's
+            // `touch_tenant` would have counted is still owed. A read-locked
+            // lookup confirms the attachment; if an eviction took the tenant
+            // off this node in between, fall through so the replay re-attaches
+            // and credits it exactly as the two-pass version did. An eviction
+            // that lands after this check is indistinguishable from one that
+            // lands right after the request returns.
+            if matched.as_ref().is_some_and(|t| Arc::ptr_eq(t, &tenant_id))
+                && node
+                    .tenant_last_access_time
+                    .contains_key(tenant_id.as_ref())
+            {
+                if track_lfu {
+                    node.hit_count.fetch_add(1, Ordering::Relaxed);
+                }
                 continue;
             }
             // Credit the live length under the `tokens` read guard: a
@@ -4205,5 +4220,100 @@ mod tests {
         fine.insert_tokens(&seq, "w1");
         // Default 16: aligned to 592.
         assert_eq!(fine.match_prefix_with_counts(&seq).matched_token_count, 592);
+    }
+
+    /// The nodes a page-aligned sequence descends through, root excluded.
+    fn path_nodes(tree: &TokenTree, tokens: &[TokenId]) -> Vec<NodeRef> {
+        let mut nodes = Vec::new();
+        let mut current = Arc::clone(&tree.root);
+        let mut remaining = &tokens[..align_to_page(tokens.len(), tree.page_size)];
+        while remaining.len() >= tree.page_size {
+            let key = page_key_of(remaining, tree.page_size);
+            let child = Arc::clone(current.children.get(&key).expect("edge").value());
+            let len = child.tokens.read().len();
+            remaining = &remaining[len..];
+            nodes.push(Arc::clone(&child));
+            current = child;
+        }
+        nodes
+    }
+
+    fn hit_counts(nodes: &[NodeRef]) -> Vec<u64> {
+        nodes
+            .iter()
+            .map(|node| node.hit_count.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Under LFU the fused call must count hits exactly like match-then-insert:
+    /// every full-match node gets one hit from the match and one from the
+    /// insert replay, whether the request routes to the tenant it matched or
+    /// to another one.
+    #[test]
+    fn test_match_and_insert_with_lfu_hit_counts_match_two_pass() {
+        let short = make_tokens(1, 2);
+        let long = make_tokens(1, 3); // splits `short` into a 2-page node + 1-page child
+
+        let fused = TokenTree::with_config(PAGE_SIZE, EvictionPolicy::Lfu);
+        let two_pass = TokenTree::with_config(PAGE_SIZE, EvictionPolicy::Lfu);
+        for tree in [&fused, &two_pass] {
+            tree.insert_tokens(&short, "w1");
+            tree.insert_tokens(&long, "w1");
+        }
+        assert_eq!(path_nodes(&fused, &long).len(), 2);
+
+        // Routed back to the matched tenant, then routed elsewhere.
+        for route in ["w1", "w2"] {
+            fused.match_and_insert_with(&long, |_| Some(route));
+            two_pass.match_prefix_with_counts(&long);
+            two_pass.insert_tokens(&long, route);
+            assert_eq!(
+                hit_counts(&path_nodes(&fused, &long)),
+                hit_counts(&path_nodes(&two_pass, &long)),
+                "route to {route}"
+            );
+            assert_eq!(
+                fused.get_tenant_token_counts(),
+                two_pass.get_tenant_token_counts()
+            );
+        }
+        // The 2-page node: 2 inserts + 2 per request; its child: 1 insert + 2
+        // per request. One hit from the match and one from the replay each time.
+        assert_eq!(hit_counts(&path_nodes(&fused, &long)), vec![6, 5]);
+    }
+
+    /// A tenant removed from the path between the match and the insert replay
+    /// (an eviction racing the request) is re-attached and credited by the
+    /// replay, as it was when the insert re-walked the tree.
+    #[test]
+    fn test_match_and_insert_with_reattaches_after_eviction_during_select() {
+        let tokens = make_tokens(1, 3);
+        let tree = TokenTree::new();
+        tree.insert_tokens(&tokens, "w1");
+        tree.insert_tokens(&tokens, "w2"); // the node outlives w1's removal
+        let w1 = intern_tenant("w1");
+
+        let result = tree.match_and_insert_with(&tokens, |matched| {
+            assert_eq!(matched.matched_token_count, tokens.len());
+            // Between the match (which stamped a tenant on every path node)
+            // and the replay: strip w1 from the whole tree.
+            tree.remove_tenant_all(&w1);
+            Some("w1")
+        });
+        assert_eq!(result.matched_token_count, tokens.len());
+
+        for node in path_nodes(&tree, &tokens) {
+            assert!(
+                node.tenant_last_access_time.contains_key("w1"),
+                "replay must re-attach the evicted tenant"
+            );
+        }
+        let counts = tree.get_tenant_token_counts();
+        assert_eq!(
+            counts.get("w1"),
+            Some(&tokens.len()),
+            "replay must re-credit the path"
+        );
+        assert_eq!(counts.get("w2"), Some(&tokens.len()));
     }
 }
