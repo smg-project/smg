@@ -22,6 +22,11 @@ same lifecycle shape; its launcher is ``serve_rust`` in
 ``SMG_TOKENSPEED_SERVICER_IMPL=rust`` on ``python -m smg_grpc_servicer.tokenspeed``.
 """
 
-from smg.smg_rs import TokenSpeedGrpcServer, VllmGrpcServer, init_servicer_tracing
+from smg.smg_rs import (
+    SglangGrpcServer,
+    TokenSpeedGrpcServer,
+    VllmGrpcServer,
+    init_servicer_tracing,
+)
 
-__all__ = ["TokenSpeedGrpcServer", "VllmGrpcServer", "init_servicer_tracing"]
+__all__ = ["SglangGrpcServer", "TokenSpeedGrpcServer", "VllmGrpcServer", "init_servicer_tracing"]

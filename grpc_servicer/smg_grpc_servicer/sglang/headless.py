@@ -21,6 +21,7 @@ import signal
 import sys
 import threading
 import time
+from typing import Any
 
 from smg_grpc_servicer.sglang.zmq_msgpack import MAX_ENGINE_INDEX
 from smg_grpc_servicer.sglang.zmq_plugin import ENGINE_INDEX_ENV, HANDSHAKE_ENV
@@ -83,19 +84,27 @@ def make_signal_handler(stop: threading.Event, faulted: threading.Event, started
 
 
 def launch(ours: argparse.Namespace, server_argv: list[str]) -> int:
-    os.environ[HANDSHAKE_ENV] = ours.zmq_handshake_address
-    os.environ[ENGINE_INDEX_ENV] = str(ours.zmq_engine_index)
+    from sglang.srt.server_args import prepare_server_args
+
+    return run(prepare_server_args(server_argv), ours.zmq_handshake_address, ours.zmq_engine_index)
+
+
+def run(server_args: Any, handshake_address: str, engine_index: int = 0) -> int:
+    """Run the scheduler ranks headless on prepared server args until they
+    exit or a signal arrives; returns the process exit code. The Rust servicer
+    calls this in a spawned child with the args SGLang's entrypoint parsed."""
+    os.environ[HANDSHAKE_ENV] = handshake_address
+    os.environ[ENGINE_INDEX_ENV] = str(engine_index)
 
     from sglang.srt.entrypoints.engine import Engine, _set_envs_and_config
     from sglang.srt.managers.scheduler import run_scheduler_process
     from sglang.srt.plugins import load_plugins
     from sglang.srt.runtime_context import publish
-    from sglang.srt.server_args import PortArgs, prepare_server_args
+    from sglang.srt.server_args import PortArgs
     from sglang.srt.utils import configure_logger, kill_process_tree
 
     from smg_grpc_servicer.sglang.scheduler_launcher import terminate_scheduler_processes
 
-    server_args = prepare_server_args(server_argv)
     configure_logger(server_args)
     server_args.resolve_once()
     _set_envs_and_config(server_args)
@@ -128,8 +137,8 @@ def launch(ours: argparse.Namespace, server_argv: list[str]) -> int:
         logger.info(
             "headless scheduler ready: %d rank process(es); SMG's handshake is %s (engine index %d)",
             len(procs),
-            ours.zmq_handshake_address,
-            ours.zmq_engine_index,
+            handshake_address,
+            engine_index,
         )
         while not stop.is_set():
             for proc in procs:

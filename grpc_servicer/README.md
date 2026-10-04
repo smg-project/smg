@@ -268,6 +268,21 @@ resubscribes with zero. A zero cursor rebuilds knowledge from subsequent live
 events; it is not a complete cache snapshot. An empty replay is conservatively
 reset because it cannot distinguish an idle publisher from a restarted one.
 
+#### Rust request path (`SMG_SGLANG_SERVICER_IMPL=rust`)
+
+`sglang.launch_server --grpc-mode` hands the process to this package's
+`serve_grpc`. With `SMG_SGLANG_SERVICER_IMPL=rust` that entry serves the
+`sglang.grpc.scheduler.SglangScheduler` contract from Rust
+(`smg.servicer.SglangGrpcServer`, which needs the `smg` wheel) instead: the
+scheduler runs headless in a spawned child over the msgpack ZMQ wire below,
+the Rust server speaks the gRPC contract on top of it, and Python keeps the
+lifecycle only. The Router cannot tell the two implementations apart. What
+the wire does not carry is reported, not emulated: `Embed`, `FlushCache`,
+profiling, LoRA loading and `SubscribeKvEvents` answer UNIMPLEMENTED, prompt
+logprobs, hidden states and multimodal inputs are refused, and PD/EPD
+disaggregation stays with the Python implementation. SGLang's HTTP sidecar
+(metrics and profiling endpoints) is not started on this path.
+
 #### Headless over ZMQ (no SGLang change)
 
 SMG can drive SGLang's scheduler directly over ZMQ, the same same-host lane it
