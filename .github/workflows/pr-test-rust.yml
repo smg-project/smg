@@ -566,9 +566,11 @@ jobs:
               - 'crates/reasoning_parser/**'
               - 'crates/multimodal/**'
               - 'crates/grpc_client/**'
-              # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes, which gate
-              # on this filter.
+              # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes and the
+              # Rust-servicer lane, which gate on this filter.
               - 'crates/engine_zmq_client/**'
+              - 'crates/engine_zmq_adapter/**'
+              - 'crates/engine_servicer/**'
               - 'crates/mock_worker/**'
               - 'grpc_servicer/**'
               - 'e2e_test/chat_completions/**'
