@@ -157,6 +157,48 @@ opt-level = 2
 [profile.release.package.regex-automata]
 opt-level = 2
 
+# The compute-heavy crates: image preprocessing (resize kernels, patch
+# gather, wire serialization, base64 and hashing of inline images), the
+# tokenizer path (encode, per-token decode, stop-sequence scan) and the
+# cache-aware routing trees. Built for size they run 25-50% slower; the
+# binary grows by about 1.5 MB (measured in the PR that added these).
+[profile.release.package.llm-multimodal]
+opt-level = 3
+
+[profile.release.package.image]
+opt-level = 3
+
+[profile.release.package.zune-jpeg]
+opt-level = 3
+
+[profile.release.package.png]
+opt-level = 3
+
+[profile.release.package.fast_image_resize]
+opt-level = 3
+
+[profile.release.package.base64]
+opt-level = 3
+
+[profile.release.package.blake3]
+opt-level = 3
+
+[profile.release.package.llm-tokenizer]
+opt-level = 3
+
+[profile.release.package.tokenizers]
+opt-level = 3
+
+[profile.release.package.aho-corasick]
+opt-level = 3
+
+[profile.release.package.onig_sys]
+opt-level = 3
+
+# The cache-aware routing trees, walked on every request.
+[profile.release.package.kv-index]
+opt-level = 3
+
 [profile.ci]
 inherits = "release"
 opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
