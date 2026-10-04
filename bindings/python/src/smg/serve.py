@@ -275,7 +275,12 @@ class SglangWorkerLauncher(WorkerLauncher):
         ``--port`` seeds SGLang's derived control-plane ports, so co-located
         workers get distinct clusters.
         """
-        if _backend_arg_int(backend_args, "--dp-size", 1) > 1:
+        # SGLang accepts both spellings of its DP flag.
+        engine_dp = max(
+            _backend_arg_int(backend_args, "--dp-size", 1),
+            _backend_arg_int(backend_args, "--data-parallel-size", 1),
+        )
+        if engine_dp > 1:
             raise ValueError(
                 "--dp-size > 1 is not supported over the SGLang ZMQ wire yet; "
                 "use --connection-mode grpc for data parallelism"

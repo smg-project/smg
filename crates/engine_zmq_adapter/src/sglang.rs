@@ -198,8 +198,15 @@ pub(crate) fn translate_request_sglang(
             "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
         );
     }
+    if req.return_logprob && req.logprob_start_len >= 0 {
+        return Err(
+            "prompt logprobs (logprob_start_len >= 0) are not supported over the SGLang ZMQ \
+             backend"
+                .to_string(),
+        );
+    }
     if !req.token_ids_logprob.is_empty() {
-        return Err("prompt logprobs are not supported over the SGLang ZMQ backend".to_string());
+        return Err("token_ids_logprob is not supported over the SGLang ZMQ backend".to_string());
     }
     if req.return_hidden_states {
         return Err("hidden states are not supported over the SGLang ZMQ backend".to_string());
@@ -380,6 +387,17 @@ mod tests {
         })
         .is_err());
         assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+            return_logprob: true,
+            logprob_start_len: 0,
+            ..base.clone()
+        })
+        .is_err());
+        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+            token_ids_logprob: vec![5],
+            ..base.clone()
+        })
+        .is_err());
+        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
             lora_id: "adapter".into(),
             ..base.clone()
         })
@@ -397,8 +415,11 @@ mod tests {
             ..base.clone()
         })
         .is_err());
+        // Output logprobs only: `-1` is the builders' "no prompt logprobs"
+        // (the proto default of 0 would ask for them from the first token).
         let ok = translate_request_sglang(sglang_proto::GenerateRequest {
             return_logprob: true,
+            logprob_start_len: -1,
             stream: true,
             require_reasoning: true,
             ..base
@@ -527,6 +548,7 @@ mod tests {
                 ..Default::default()
             }),
             return_logprob: true,
+            logprob_start_len: -1,
             stream: true,
             ..Default::default()
         };

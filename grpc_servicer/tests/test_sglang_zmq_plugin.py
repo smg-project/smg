@@ -204,3 +204,19 @@ def test_hooks_follow_the_registry_calling_convention(monkeypatch):
         HookRegistry.reset()
         if zmq_plugin._state.context is not None:
             zmq_plugin._state.context.term()
+
+
+def test_signal_handler_interrupts_startup_and_only_flags_afterwards():
+    import signal
+    import threading
+
+    from smg_grpc_servicer.sglang.headless import Interrupted, make_signal_handler
+
+    stop, faulted, started = threading.Event(), threading.Event(), threading.Event()
+    handler = make_signal_handler(stop, faulted, started)
+    with pytest.raises(Interrupted) as raised:
+        handler(signal.SIGTERM, None)
+    assert raised.value.signum == signal.SIGTERM and stop.is_set() and not faulted.is_set()
+    started.set()
+    handler(signal.SIGQUIT, None)  # after startup: flag the fault, let the loop exit
+    assert faulted.is_set()

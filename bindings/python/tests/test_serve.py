@@ -736,8 +736,9 @@ class TestSglangWorkerLauncher:
         assert "--mem-fraction-static" in cmd and "--grpc-mode" not in cmd
         # DP over the SGLang ZMQ wire is not wired yet: refuse rather than
         # start ranks the gateway will not await.
-        with pytest.raises(ValueError, match="dp-size"):
-            launcher.build_command(args, ["--dp-size", "2"], "127.0.0.1", 31000)
+        for flag in ("--dp-size", "--data-parallel-size"):
+            with pytest.raises(ValueError, match="dp-size"):
+                launcher.build_command(args, [flag, "2"], "127.0.0.1", 31000)
 
     def test_worker_url_grpc_mode(self):
         launcher = SglangWorkerLauncher()

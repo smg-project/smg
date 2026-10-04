@@ -10,10 +10,16 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
-    worker::{sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL},
+    worker::{
+        sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL,
+        UNKNOWN_MODEL_ID,
+    },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
-        steps::util::{grpc_base_url, http_base_url},
+        steps::{
+            local::create_worker::resolve_model_id,
+            util::{grpc_base_url, http_base_url},
+        },
     },
 };
 
@@ -305,6 +311,13 @@ async fn fetch_grpc_metadata(
     Ok((labels, runtime_type.to_string()))
 }
 
+/// The gateway's model directory, when this worker serves that model: a
+/// worker with no identity of its own takes the gateway's (as registration
+/// does), one declaring a different model keeps its own defaults.
+fn zmq_model_dir(router_model: Option<String>, declared_model: &str) -> Option<String> {
+    router_model.filter(|path| declared_model == UNKNOWN_MODEL_ID || declared_model == path)
+}
+
 /// Labels for a ZMQ worker from the gateway's local model directory: the
 /// sampling defaults in `generation_config.json`, when the directory is local
 /// and the model ships one. A Hub id or a model without the file yields none.
@@ -443,16 +456,19 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             // A ZMQ engine reports its geometry at the handshake, which runs
             // after this step; the one fact worth having earlier is the
             // model's own sampling defaults, read from the local model
-            // directory the gateway was started with (where its EOS backstop
-            // reads too). The runtime stays `None`: the handshake is shared
-            // across engines, so it cannot be probed here and the configured
-            // or detected runtime is preserved.
+            // directory the gateway was started with, for a worker that
+            // serves that model (one registered for another model, by spec
+            // or label, must not inherit them). The runtime stays `None`: the
+            // handshake is shared across engines, so it cannot be probed here
+            // and the configured or detected runtime is preserved.
             ConnectionMode::Zmq => {
-                let model_dir = context
+                let router_model = context
                     .data
                     .app_context
                     .as_ref()
                     .and_then(|app| app.router_config.model_path.clone());
+                let model_dir =
+                    zmq_model_dir(router_model, resolve_model_id(config, &config.labels));
                 Ok((zmq_local_labels(model_dir.as_deref()).await, None))
             }
         }
@@ -498,6 +514,17 @@ mod tests {
             defaults.get("max_new_tokens").is_none(),
             "length limits are not sampling defaults"
         );
+        // Only a worker serving the gateway's model takes its defaults.
+        assert_eq!(
+            zmq_model_dir(Some("/m/a".into()), UNKNOWN_MODEL_ID).as_deref(),
+            Some("/m/a")
+        );
+        assert_eq!(
+            zmq_model_dir(Some("/m/a".into()), "/m/a").as_deref(),
+            Some("/m/a")
+        );
+        assert_eq!(zmq_model_dir(Some("/m/a".into()), "org/other"), None);
+        assert_eq!(zmq_model_dir(None, UNKNOWN_MODEL_ID), None);
         // No directory, a Hub id, or a model without the file: no label.
         assert!(zmq_local_labels(None).await.is_empty());
         assert!(zmq_local_labels(Some("Qwen/Qwen3-0.6B")).await.is_empty());

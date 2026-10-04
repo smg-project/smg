@@ -52,6 +52,33 @@ def split_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     return ours, rest
 
 
+class Interrupted(Exception):
+    """A stop signal arrived while the ranks were still starting."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def make_signal_handler(stop: threading.Event, faulted: threading.Event, started: threading.Event):
+    """SIGTERM/SIGINT stop the supervise loop; SIGQUIT is SGLang reporting a
+    crashed rank. While the ranks are still starting, the main thread sits in
+    a blocking pipe read that Python retries after a handler returns (PEP
+    475), so the handler raises instead and ``launch`` cleans up at once."""
+
+    def on_signal(signum, _frame):
+        if signum == signal.SIGQUIT:
+            logger.error("headless scheduler: a scheduler rank failed; stopping")
+            faulted.set()
+        else:
+            logger.info("headless scheduler: received signal %d; stopping", signum)
+        stop.set()
+        if not started.is_set():
+            raise Interrupted(signum)
+
+    return on_signal
+
+
 def launch(ours: argparse.Namespace, server_argv: list[str]) -> int:
     os.environ[HANDSHAKE_ENV] = ours.zmq_handshake_address
     os.environ[ENGINE_INDEX_ENV] = str(ours.zmq_engine_index)
@@ -78,15 +105,8 @@ def launch(ours: argparse.Namespace, server_argv: list[str]) -> int:
 
     stop = threading.Event()
     faulted = threading.Event()  # a rank raised (SGLang signals its parent with SIGQUIT)
-
-    def on_signal(signum, _frame):
-        if signum == signal.SIGQUIT:
-            logger.error("headless scheduler: a scheduler rank failed; stopping")
-            faulted.set()
-        else:
-            logger.info("headless scheduler: received signal %d; stopping", signum)
-        stop.set()
-
+    started = threading.Event()
+    on_signal = make_signal_handler(stop, faulted, started)
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGQUIT, on_signal)
@@ -101,6 +121,7 @@ def launch(ours: argparse.Namespace, server_argv: list[str]) -> int:
         )
         procs = list(procs or [])
         init.wait_for_ready()
+        started.set()
         logger.info(
             "headless scheduler ready: %d rank process(es); SMG's handshake is %s (engine index %d)",
             len(procs),
@@ -119,6 +140,8 @@ def launch(ours: argparse.Namespace, server_argv: list[str]) -> int:
                     stop.set()
                     break
             time.sleep(0.5)
+    except Interrupted as interrupted:
+        exit_code = 128 + interrupted.signum
     finally:
         terminate_scheduler_processes(procs)
         kill_process_tree(os.getpid(), include_parent=False)

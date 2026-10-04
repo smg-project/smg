@@ -340,7 +340,10 @@ fn take_kv_transfer_metadata(
 /// Kubernetes service discovery creates a spec without model cards, so its
 /// canonical ID comes from the backend's `served_model_name`. Router aliases
 /// are deliberately absent from this function and cannot change discovery.
-fn resolve_model_id<'a>(config: &'a WorkerSpec, labels: &'a HashMap<String, String>) -> &'a str {
+pub(super) fn resolve_model_id<'a>(
+    config: &'a WorkerSpec,
+    labels: &'a HashMap<String, String>,
+) -> &'a str {
     config
         .models
         .primary()
