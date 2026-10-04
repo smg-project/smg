@@ -12,7 +12,8 @@ import time
 import pytest
 
 # The wire rides on pyzmq and msgspec and is pinned against SGLang's own
-# structs; the plain unit-test job has none of them and skips this module.
+# structs. The plain unit-test job installs msgspec but neither pyzmq nor
+# SGLang and skips this module; the SGLang ZMQ e2e lane runs it.
 msgspec = pytest.importorskip("msgspec")
 zmq = pytest.importorskip("zmq")
 sglang_io = pytest.importorskip("sglang.srt.managers.io_struct")

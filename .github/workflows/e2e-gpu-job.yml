@@ -93,7 +93,7 @@ on:
         required: false
         type: boolean
         default: false
-        description: "Also run grpc_servicer/tests here, where the importorskip('vllm') cases meet a real vLLM; set on one vLLM lane"
+        description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
 
 jobs:
   run:
@@ -179,12 +179,13 @@ jobs:
           pip install wheel/*.whl
           bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
 
-      # The servicer's vLLM-gated unit tests (importorskip("vllm")) only meet a
-      # real vLLM here; the CPU unit-test job skips them. One lane opts in.
-      - name: Run vLLM-gated servicer unit tests
+      # The servicer's engine-gated unit tests (importorskip("vllm"),
+      # importorskip("sglang") for the SGLang ZMQ wire pins) only meet a real
+      # engine here; the CPU unit-test job skips them. One lane per engine opts in.
+      - name: Run engine-gated servicer unit tests
         if: inputs.servicer_unit_tests
         run: |
-          python3 -c "import vllm, msgspec"  # the gates these tests importorskip on
+          python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
           pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
           pytest -q grpc_servicer/tests -p no:cacheprovider -rs
 

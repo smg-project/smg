@@ -5,8 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-# The plugin's wire module imports pyzmq and msgspec (SGLang's own deps); the
-# plain unit-test job has neither and skips this module.
+# The plugin's wire module imports pyzmq and msgspec (SGLang's own deps). The
+# plain unit-test job installs msgspec but not pyzmq and skips this module;
+# the SGLang ZMQ e2e lane runs it.
 pytest.importorskip("msgspec")
 pytest.importorskip("zmq")
 from smg_grpc_servicer.sglang import zmq_plugin  # noqa: E402

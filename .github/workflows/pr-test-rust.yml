@@ -753,6 +753,9 @@ jobs:
       connection_mode: zmq
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      # The SGLang wire pins (grpc_servicer/tests/test_sglang_zmq_*) need a
+      # real SGLang plus pyzmq and msgspec; this is the lane that has them.
+      servicer_unit_tests: ${{ matrix.engine == 'sglang' }}
     secrets: inherit
 
   e2e-2gpu-chat-zmq-dp:
