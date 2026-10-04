@@ -93,12 +93,12 @@ on:
         required: false
         type: boolean
         default: false
+        description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
       servicer_impl:
         description: "Which SGLang gRPC servicer the workers run (rust or python); empty keeps the engine default"
         required: false
         type: string
         default: ""
-        description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
 
 jobs:
   run:
