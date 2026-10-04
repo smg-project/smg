@@ -543,7 +543,7 @@ class MsgpackSendSocket:
         # Requests whose outputs this side could not relay: SMG was told, the
         # scheduler was not; the receiver's next drain aborts them there.
         self.pending_aborts: deque[str] = deque()
-        self._relay_failures_logged: set[str] = set()
+        self._relay_failures_logged: set[tuple[str, str]] = set()
 
     def attach(
         self,
@@ -567,15 +567,15 @@ class MsgpackSendSocket:
             return self._load_cache[1]
         try:
             load = self._load_probe()
-        except Exception as exc:  # the load tail is best-effort
+            tail = dict(
+                num_running=int(load.num_running_reqs),
+                num_waiting=int(load.num_waiting_reqs),
+                kv_used_tokens=int(load.num_used_tokens),
+                kv_total_tokens=int(load.max_total_num_tokens),
+            )
+        except Exception as exc:  # the load tail is best-effort: never fail an output over it
             logger.warning("zmq msgpack: load snapshot failed: %s", exc)
             return {}
-        tail = dict(
-            num_running=int(load.num_running_reqs),
-            num_waiting=int(load.num_waiting_reqs),
-            kv_used_tokens=int(load.num_used_tokens),
-            kv_total_tokens=int(load.max_total_num_tokens),
-        )
         self._load_cache = (now, tail)
         return tail
 
@@ -602,7 +602,7 @@ class MsgpackSendSocket:
         for an abort in the scheduler, which would otherwise keep decoding
         for clients that already got an error (``pending_aborts``, read by
         the receiver's next drain). The traceback is logged once per output
-        type; a failure that repeats every step logs one line."""
+        and exception type; a failure that repeats every step logs one line."""
         try:
             self._relay(output, recv_obj)
         except Exception as exc:
@@ -610,13 +610,15 @@ class MsgpackSendSocket:
             if not rids and getattr(output, "rid", None):
                 rids = [output.rid]
             kind = type(output).__name__
-            if kind not in self._relay_failures_logged:
-                self._relay_failures_logged.add(kind)
+            key = (kind, type(exc).__name__)
+            if key not in self._relay_failures_logged:
+                self._relay_failures_logged.add(key)
                 logger.exception(
-                    "zmq msgpack: could not relay a %s for %s (later failures of this "
+                    "zmq msgpack: could not relay a %s for %s (later %s failures of this "
                     "type log one line)",
                     kind,
                     rids,
+                    key[1],
                 )
             else:
                 logger.warning("zmq msgpack: could not relay a %s for %s: %s", kind, rids, exc)
@@ -783,7 +785,7 @@ class MsgpackRecvSocket:
         # Requests the sender ended on SMG's side (an output it could not
         # relay) still run here: free them, the way an ABORT frame would.
         received: list = []
-        while self._pending_aborts:
+        while self._pending_aborts and (max_recv < 0 or len(received) < max_recv):
             received.append(AbortReq(rid=self._pending_aborts.popleft()))
         while max_recv < 0 or len(received) < max_recv:
             try:
