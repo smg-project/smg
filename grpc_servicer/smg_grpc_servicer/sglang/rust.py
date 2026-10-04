@@ -256,9 +256,9 @@ async def serve_rust(server_args: Any) -> int:
     facts = {**model_facts(server_args), **server_facts(server_args)}
     engine_count = facts["data_parallel_size"]
     if engine_count > 1:
-        logger.warning(
-            "dp_size=%d on the Rust path: each rank dials the servicer with its own identity; "
-            "this layout has not been exercised end to end",
+        logger.info(
+            "dp_size=%d on the Rust path: each rank dials the servicer with its own identity "
+            "and control calls fan out per rank",
             engine_count,
         )
     tokenizer_dir = tokenizer_dir_for(server_args)

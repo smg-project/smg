@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use engine_zmq_client::{
-    codec::{decode_msgpack, encode_msgpack},
+    codec::{decode_msgpack, encode_msgpack, OpaqueValue},
     mock_engine::{connect_to_frontend, default_ready_response, MockEngineInput, MockEngineOutput},
     protocol::sglang::{
-        output::{BatchTokenIDSlimOutput, MatchedStop},
-        request::{SglangRequestType, TokenizedGenerateReqInput},
+        output::{BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop},
+        request::{SglangRequestType, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
     },
     EngineId,
 };
@@ -675,17 +675,253 @@ async fn info_rpcs_report_launcher_facts_and_handshake_figures() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// What the wire does not carry is reported, not emulated.
+/// A control call as the mock scheduler sees it: `[CONTROL, (call_id,
+/// method, args)]`.
+async fn recv_control(engine: &mut MockEngineInput) -> (i64, String, Vec<OpaqueValue>) {
+    let frames = engine.recv_frames().await.unwrap();
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Control)
+    );
+    decode_msgpack(frames[1].as_ref()).unwrap()
+}
+
+async fn reply_control(
+    engine_out: &mut MockEngineOutput,
+    call_id: i64,
+    success: bool,
+    message: Option<&str>,
+) {
+    let reply = ControlReplySlim {
+        call_id,
+        success,
+        message: message.map(str::to_string),
+        engine_index: 0,
+    };
+    engine_out
+        .send_frames(vec![Bytes::from(encode_msgpack(&reply).unwrap())])
+        .await
+        .unwrap();
+}
+
+/// `FlushCache`, `StartProfile` and `StopProfile` are the scheduler's own
+/// control requests, carried by the plugin's control call and answered under
+/// the call id; the answer is the scheduler's `success`/`message`.
 #[tokio::test]
-async fn control_rpcs_report_the_wire_gap() {
+async fn flush_cache_and_profiling_reach_the_scheduler() {
     let mut h = harness(model_info()).await;
-    let flush = h
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (flushed, ()) = tokio::join!(
+        h.client
+            .flush_cache(common::FlushCacheRequest { timeout_s: 0.0 }),
+        async {
+            let (call_id, method, args) = recv_control(engine_in).await;
+            assert_eq!(method, "flush_cache");
+            assert_eq!(args, vec![OpaqueValue::F64(0.0)]);
+            reply_control(engine_out, call_id, true, None).await;
+        }
+    );
+    let flushed = flushed.unwrap().into_inner();
+    assert!(flushed.success);
+    assert_eq!(flushed.message, "Cache flushed successfully");
+
+    let (started, ()) = tokio::join!(
+        h.client.start_profile(common::StartProfileRequest {
+            output_dir: Some("/tmp/traces".to_string()),
+            num_steps: Some(3),
+            activities: vec!["CPU".to_string()],
+            profile_by_stage: false,
+            ..Default::default()
+        }),
+        async {
+            let (call_id, method, args) = recv_control(engine_in).await;
+            assert_eq!(method, "start_profile");
+            let options = args[0].as_map().unwrap();
+            let get = |key: &str| {
+                options
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some(key))
+                    .map(|(_, v)| v.clone())
+            };
+            assert_eq!(get("output_dir"), Some(OpaqueValue::from("/tmp/traces")));
+            assert_eq!(get("num_steps"), Some(OpaqueValue::from(3i64)));
+            assert_eq!(get("profile_by_stage"), Some(OpaqueValue::Boolean(false)));
+            assert!(get("profile_id").is_some_and(|id| id.as_str().is_some_and(|s| !s.is_empty())));
+            // Unset options are left to the scheduler side's defaults.
+            assert_eq!(get("with_stack"), None);
+            reply_control(engine_out, call_id, false, Some("profiler already running")).await;
+        }
+    );
+    let started = started.unwrap().into_inner();
+    assert!(!started.success);
+    assert_eq!(started.message, "profiler already running");
+
+    let (stopped, ()) = tokio::join!(
+        h.client.stop_profile(common::StopProfileRequest {}),
+        async {
+            let (call_id, method, args) = recv_control(engine_in).await;
+            assert_eq!(method, "stop_profile");
+            assert!(args.is_empty());
+            reply_control(engine_out, call_id, true, None).await;
+        }
+    );
+    let stopped = stopped.unwrap().into_inner();
+    assert!(stopped.success);
+    assert_eq!(stopped.message, "Stop profiling succeeded");
+    // A negative timeout is refused before anything reaches the scheduler.
+    let bad = h
         .client
-        .flush_cache(common::FlushCacheRequest::default())
+        .flush_cache(common::FlushCacheRequest { timeout_s: -1.0 })
         .await;
-    assert_eq!(flush.err().map(|s| s.code()), Some(Code::Unimplemented));
-    let embed = h.client.embed(sg::EmbedRequest::default()).await;
-    assert_eq!(embed.err().map(|s| s.code()), Some(Code::Unimplemented));
+    assert_eq!(bad.err().map(|s| s.code()), Some(Code::InvalidArgument));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+fn embed_request(id: &str) -> sg::EmbedRequest {
+    sg::EmbedRequest {
+        request_id: id.to_string(),
+        tokenized: Some(sg::TokenizedInput {
+            input_ids: vec![1, 2, 3],
+            original_text: "hi".to_string(),
+        }),
+        ..Default::default()
+    }
+}
+
+/// `Embed` rides the `ADD` frame as the scheduler's embedding request and is
+/// answered by its one finished output; a scheduler abort is the caller's
+/// error, and a generation model refuses up front.
+#[tokio::test]
+async fn embed_returns_the_schedulers_vector() {
+    let mut h = harness(SglangModelInfo {
+        is_generation: false,
+        ..model_info()
+    })
+    .await;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (embedded, ()) = tokio::join!(h.client.embed(embed_request("e1")), async {
+        let frames = engine_in.recv_frames().await.unwrap();
+        assert_eq!(
+            SglangRequestType::from_frame(frames[0].as_ref()),
+            Some(SglangRequestType::Add)
+        );
+        let request: TokenizedEmbeddingReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+        assert_eq!(request.rid, "e1");
+        assert_eq!(request.input_ids, vec![1, 2, 3]);
+        assert_eq!(request.input_text.as_deref(), Some("hi"));
+        assert_eq!(request.sampling_params.max_new_tokens, Some(0));
+        let batch = BatchEmbeddingSlimOutput {
+            rids: vec!["e1".to_string()],
+            embeddings: vec![vec![0.25, -0.5]],
+            prompt_tokens: vec![3],
+            cached_tokens: vec![0],
+            finished_reasons: vec!["stop".to_string()],
+            finished_messages: vec![None],
+            finished_status: vec![None],
+            ..Default::default()
+        };
+        engine_out
+            .send_frames(vec![Bytes::from(encode_msgpack(&batch).unwrap())])
+            .await
+            .unwrap();
+    });
+    let embedded = embedded.unwrap().into_inner();
+    assert_eq!(embedded.embedding, vec![0.25, -0.5]);
+    assert_eq!(embedded.embedding_dim, 2);
+    assert_eq!(embedded.prompt_tokens, 3);
+
+    let (refused, ()) = tokio::join!(h.client.embed(embed_request("e2")), async {
+        let _ = engine_in.recv_frames().await.unwrap();
+        let batch = BatchEmbeddingSlimOutput {
+            rids: vec!["e2".to_string()],
+            embeddings: vec![Vec::new()],
+            prompt_tokens: vec![0],
+            cached_tokens: vec![0],
+            finished_reasons: vec!["abort".to_string()],
+            finished_messages: vec![Some("input too long".to_string())],
+            finished_status: vec![Some(400)],
+            ..Default::default()
+        };
+        engine_out
+            .send_frames(vec![Bytes::from(encode_msgpack(&batch).unwrap())])
+            .await
+            .unwrap();
+    });
+    let refused = refused.err().unwrap();
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(refused.message().contains("input too long"));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let mut generation = harness(model_info()).await;
+    let refused = generation.client.embed(embed_request("e3")).await;
+    assert_eq!(refused.err().map(|s| s.code()), Some(Code::InvalidArgument));
+    generation
+        .server
+        .stop(Duration::from_secs(5))
+        .expect("clean stop");
+}
+
+/// Prompt logprobs and the reasoning-token count ride the appended slim
+/// columns: the prompt logprobs go out once, on the first token-bearing
+/// chunk, and again on the `Complete`; the reasoning count is on every
+/// response.
+#[tokio::test]
+async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
+    let mut h = harness(model_info()).await;
+    let request = sg::GenerateRequest {
+        return_logprob: true,
+        logprob_start_len: 0,
+        top_logprobs_num: 1,
+        require_reasoning: true,
+        ..generate_request("p1", true, Vec::new())
+    };
+    let mut stream = h.client.generate(request).await.unwrap().into_inner();
+    let sent = recv_add(&mut h.engine_in).await;
+    assert!(sent.return_logprob && sent.logprob_start_len == 0 && sent.require_reasoning);
+    let first = BatchTokenIDSlimOutput {
+        reasoning_tokens: vec![1],
+        input_token_logprobs_val: vec![vec![None, Some(-0.7), Some(-1.1)]],
+        input_token_logprobs_idx: vec![vec![1, 2, 3]],
+        input_top_logprobs_val: vec![vec![vec![], vec![-0.7], vec![-1.1]]],
+        input_top_logprobs_idx: vec![vec![vec![], vec![2], vec![3]]],
+        ..batch("p1", vec![10], 1, None, None)
+    };
+    send(&mut h.engine_out, &first).await;
+    let chunk1 = chunk(stream.message().await.unwrap().unwrap());
+    assert_eq!(chunk1.reasoning_tokens, 1);
+    let input = chunk1
+        .input_logprobs
+        .expect("prompt logprobs on the first chunk");
+    assert_eq!(input.token_ids, vec![1, 2, 3]);
+    assert_eq!(input.token_logprobs[0].value, None);
+    assert_eq!(input.token_logprobs[1].value, Some(-0.7));
+    assert_eq!(input.top_logprobs.len(), 3);
+    assert_eq!(input.top_logprobs[1].token_ids, vec![2]);
+    let last = BatchTokenIDSlimOutput {
+        reasoning_tokens: vec![2],
+        ..batch("p1", vec![11], 2, Some("stop"), None)
+    };
+    send(&mut h.engine_out, &last).await;
+    let chunk2 = chunk(stream.message().await.unwrap().unwrap());
+    assert!(
+        chunk2.input_logprobs.is_none(),
+        "prompt logprobs go out once"
+    );
+    assert_eq!(chunk2.reasoning_tokens, 2);
+    let done = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(done.reasoning_tokens, 2);
+    assert_eq!(
+        done.input_logprobs.map(|input| input.token_ids),
+        Some(vec![1, 2, 3])
+    );
+    assert!(stream.message().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// What neither servicer serves is reported, not emulated.
+#[tokio::test]
+async fn unserved_rpcs_report_the_gap() {
+    let mut h = harness(model_info()).await;
     let lora = h
         .client
         .load_lo_ra_adapter(sg::LoadLoRaAdapterRequest::default())

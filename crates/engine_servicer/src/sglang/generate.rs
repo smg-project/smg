@@ -77,17 +77,24 @@ struct ChoiceStream {
 }
 
 impl ChoiceStream {
+    /// The SGLang-proto response, with the scheduler's reasoning-token count
+    /// for this choice (the vLLM-proto intermediate has no slot for it).
     fn convert(&self, response: vllm::GenerateResponse) -> sg::GenerateResponse {
-        to_sglang_response(&self.request_id, response)
+        let reasoning_tokens = self
+            .inner
+            .as_ref()
+            .map_or(0, SglangGenerateStream::reasoning_tokens);
+        to_sglang_response(&self.request_id, response, reasoning_tokens)
     }
 
     /// End this choice on an abort: the engine's parked `Complete` or a
     /// synthesized `abort` one; `None` once it has already ended. Dropping the
     /// engine stream aborts the engine side.
     fn abort(&mut self) -> Option<sg::GenerateResponse> {
-        let mut inner = self.inner.take()?;
-        let complete = inner.complete_aborted();
-        Some(self.convert(complete))
+        let complete = self.inner.as_mut()?.complete_aborted();
+        let response = self.convert(complete);
+        self.inner = None;
+        Some(response)
     }
 }
 

@@ -1,7 +1,6 @@
 //! `sglang.grpc.scheduler.SglangScheduler` over the shared state: each RPC
-//! delegates to its handler module. The msgpack wire carries generate and
-//! abort only, so the scheduler's control RPCs (`FlushCache`, profiling, LoRA
-//! loading), `Embed` and the KV-event relay answer UNIMPLEMENTED here.
+//! delegates to its handler module. What the Python servicer does not serve
+//! either (LoRA loading, the KV-event relay) answers UNIMPLEMENTED here.
 
 use std::sync::Arc;
 
@@ -11,12 +10,14 @@ use smg_grpc_client::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{generate, info, State};
+use super::{admin, embed, generate, info, State};
 use crate::{tokenizer_bundle, BoxStream};
 
-/// What the msgpack wire has no message for.
+/// What neither servicer serves: the msgpack wire has no adapter-loading
+/// message, and the Python servicer does not implement these RPCs either.
 const NO_CONTROL_WIRE: &str = "is not available through the Rust SGLang servicer: the \
-                               scheduler's msgpack wire carries generate and abort only";
+                               scheduler's msgpack wire carries no LoRA loading message \
+                               (the Python servicer does not serve it either)";
 
 #[derive(Clone)]
 pub(super) struct SglangService {
@@ -44,9 +45,11 @@ impl SglangScheduler for SglangService {
 
     async fn embed(
         &self,
-        _request: Request<sg::EmbedRequest>,
+        request: Request<sg::EmbedRequest>,
     ) -> Result<Response<sg::EmbedResponse>, Status> {
-        Err(no_control_wire("Embed"))
+        embed::embed(&self.state, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn health_check(
@@ -104,23 +107,27 @@ impl SglangScheduler for SglangService {
 
     async fn flush_cache(
         &self,
-        _request: Request<common::FlushCacheRequest>,
+        request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        Err(no_control_wire("FlushCache"))
+        admin::flush_cache(&self.state, request)
+            .await
+            .map(Response::new)
     }
 
     async fn start_profile(
         &self,
-        _request: Request<common::StartProfileRequest>,
+        request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(no_control_wire("StartProfile"))
+        admin::start_profile(&self.state, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn stop_profile(
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(no_control_wire("StopProfile"))
+        admin::stop_profile(&self.state).await.map(Response::new)
     }
 
     async fn get_tokenizer(

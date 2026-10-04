@@ -15,19 +15,24 @@ use engine_zmq_client::{
     connector::{EngineCoreClient, SglangClient, TokenSpeedClient},
     protocol::{
         handshake::EngineCoreReadyResponse,
+        sglang::request::SglangRequest,
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams},
         EngineLoad,
     },
     ConnectedEngine,
 };
-use futures::stream::SelectAll;
+use futures::{stream::SelectAll, StreamExt};
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto as vllm};
 
 use crate::{
     eos::EosTokenIds,
-    sglang::{fan_out_sglang_requests, translate_request_sglang, SglangGenerateStream},
+    sglang::{
+        aggregate_control, control_outcome, fan_out_sglang_requests,
+        translate_embed_request_sglang, translate_request_sglang, SglangGenerateStream,
+        SglangProfileStart,
+    },
     sockets::{
         ensure_ipc_socket_dir, unlink_stale_socket, zmq_socket_addresses, ZMQ_CONNECT_TIMEOUT,
     },
@@ -400,6 +405,18 @@ impl ZmqEngineClient {
         }
     }
 
+    /// The SGLang scheduler client behind this connection, for what only the
+    /// SGLang wire defines; `operation` names it in the refusal any other
+    /// backend answers.
+    pub(crate) fn sglang_client(&self, operation: &str) -> Result<&SglangClient, tonic::Status> {
+        match &self.backend {
+            ZmqBackend::Sglang(client) => Ok(client),
+            ZmqBackend::Vllm(_) | ZmqBackend::TokenSpeed(_) => Err(tonic::Status::unimplemented(
+                format!("{operation} is only available on an SGLang ZMQ backend"),
+            )),
+        }
+    }
+
     /// The first connected engine's handshake `READY` response: the
     /// connection-constant engine facts (context length, dtype, parallel
     /// sizes, KV capacity) a frontend re-exposes as metadata.
@@ -662,10 +679,121 @@ impl ZmqEngineClient {
         let mut streams = Vec::new();
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
             let request = translate_request_sglang(sub).map_err(tonic::Status::invalid_argument)?;
-            let stream = client.submit(request).await.map_err(zmq_status)?;
+            let stream = client
+                .submit(SglangRequest::Generate(request))
+                .await
+                .map_err(zmq_status)?;
             streams.push(SglangGenerateStream::new(stream, index as u32));
         }
         Ok(streams)
+    }
+
+    /// Submit an SGLang-proto embed request to an SGLang scheduler and await
+    /// its pooled vector: the scheduler answers an embedding request with one
+    /// finished output. A scheduler abort is the caller's error when it
+    /// carries SGLang's 400, as a generate abort is.
+    pub async fn embed_sglang(
+        &self,
+        req: sglang_proto::EmbedRequest,
+    ) -> Result<sglang_proto::EmbedResponse, tonic::Status> {
+        let client = self.sglang_client("Embed")?;
+        let request =
+            translate_embed_request_sglang(req).map_err(tonic::Status::invalid_argument)?;
+        let request_id = request.rid.clone();
+        // Dropped before the finishing output (an error below, or the caller
+        // giving up), the stream aborts the scheduler-side request.
+        let mut stream = client
+            .submit(SglangRequest::Embed(request))
+            .await
+            .map_err(zmq_status)?;
+        while let Some(output) = stream.next().await {
+            let output = output.map_err(zmq_status)?;
+            let Some(reason) = output.finish_reason.as_deref() else {
+                continue;
+            };
+            if reason == "abort" {
+                let message = format!(
+                    "the scheduler aborted the request: {}",
+                    output
+                        .finish_message
+                        .as_deref()
+                        .unwrap_or("no reason reported")
+                );
+                return Err(match output.finish_status {
+                    Some(400) => tonic::Status::invalid_argument(message),
+                    Some(503) => tonic::Status::unavailable(message),
+                    _ => tonic::Status::internal(message),
+                });
+            }
+            let embedding = output.embedding.unwrap_or_default();
+            return Ok(sglang_proto::EmbedResponse {
+                embedding_dim: u32::try_from(embedding.len()).unwrap_or(u32::MAX),
+                embedding,
+                prompt_tokens: output.prompt_tokens,
+            });
+        }
+        Err(tonic::Status::internal(format!(
+            "Embed request {request_id} did not produce a result"
+        )))
+    }
+
+    /// One control call on every connected scheduler rank (the plugin
+    /// dispatches it to the scheduler's own handler), each rank's
+    /// `(success, message)` in engine order. The wait is per rank
+    /// (DEADLINE_EXCEEDED); a dead engine is UNAVAILABLE.
+    async fn control_sglang(
+        &self,
+        method: &str,
+        args: Vec<OpaqueValue>,
+        wait: Duration,
+    ) -> Result<Vec<(bool, String)>, tonic::Status> {
+        let client = self.sglang_client(method)?;
+        let calls = client
+            .engines()
+            .iter()
+            .map(|engine| client.call_utility(&engine.engine_id, method, args.clone(), wait));
+        let replies = futures::future::try_join_all(calls)
+            .await
+            .map_err(utility_status)?;
+        Ok(replies.iter().map(control_outcome).collect())
+    }
+
+    /// SGLang's `FlushCacheReqInput(timeout_s)` on every rank: the scheduler
+    /// flushes at once when idle, or waits up to `timeout_s` for idle when
+    /// positive; `wait` bounds the reply. Aggregated as the Python servicer
+    /// aggregates its per-rank communicator results.
+    pub async fn flush_cache_sglang(
+        &self,
+        timeout_s: f32,
+        wait: Duration,
+    ) -> Result<(bool, String), tonic::Status> {
+        let results = self
+            .control_sglang(
+                "flush_cache",
+                vec![OpaqueValue::F64(f64::from(timeout_s))],
+                wait,
+            )
+            .await?;
+        Ok(aggregate_control(&results, "Cache flushed successfully"))
+    }
+
+    /// SGLang's `ProfileReq` on every rank: start with the given options, or
+    /// stop (`None`) and export the traces.
+    pub async fn profile_sglang(
+        &self,
+        start: Option<SglangProfileStart>,
+        wait: Duration,
+    ) -> Result<(bool, String), tonic::Status> {
+        let (method, args, ok_message) = match start {
+            Some(start) => (
+                "start_profile",
+                vec![start.into_opaque()],
+                "Start profiling succeeded",
+            ),
+            None => ("stop_profile", Vec::new(), "Stop profiling succeeded"),
+        };
+        let results = self.control_sglang(method, args, wait).await?;
+        Ok(aggregate_control(&results, ok_message))
     }
 
     /// Local liveness: false once the connection observed `ENGINE_CORE_DEAD` or
@@ -847,6 +975,9 @@ fn utility_status(error: engine_zmq_client::Error) -> tonic::Status {
     match error {
         engine_zmq_client::Error::UtilityTimeout { .. } => {
             tonic::Status::deadline_exceeded(error.to_string())
+        }
+        engine_zmq_client::Error::UtilityUnsupported { .. } => {
+            tonic::Status::unimplemented(error.to_string())
         }
         other => zmq_status(other),
     }

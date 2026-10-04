@@ -5,6 +5,8 @@
 //! two implementations apart; Python keeps the lifecycle, launching the
 //! headless scheduler and driving this server through the binding.
 
+mod admin;
+mod embed;
 mod engine;
 mod generate;
 mod info;

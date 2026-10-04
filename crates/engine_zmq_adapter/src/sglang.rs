@@ -8,10 +8,11 @@
 //! batch decoded here).
 
 use engine_zmq_client::{
+    codec::OpaqueValue,
     connector::SglangStream,
     protocol::sglang::{
         output::{MatchedStop, SglangOutput},
-        request::TokenizedGenerateReqInput,
+        request::{TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
         sampling::SamplingParams as SglangSamplingParams,
     },
 };
@@ -36,6 +37,13 @@ pub struct SglangGenerateStream {
     /// Terminal `Complete` held back when the finish tick also carried new
     /// tokens: the tick's delta goes out as a `Chunk` first.
     pending: Option<vllm::GenerateResponse>,
+    /// The scheduler's running count of reasoning tokens for this choice
+    /// (hybrid-reasoning models; 0 otherwise). The vLLM-proto intermediate
+    /// has no slot for it, so the SGLang-proto mapping reads it from here.
+    reasoning_tokens: u32,
+    /// Whether the prompt logprobs went out on a chunk already (the proto
+    /// carries them in the first token-bearing chunk only).
+    input_logprobs_emitted: bool,
 }
 
 impl SglangGenerateStream {
@@ -45,6 +53,48 @@ impl SglangGenerateStream {
             state: StreamState::default(),
             index,
             pending: None,
+            reasoning_tokens: 0,
+            input_logprobs_emitted: false,
+        }
+    }
+
+    /// Reasoning tokens the scheduler has counted for this choice so far.
+    pub fn reasoning_tokens(&self) -> u32 {
+        self.reasoning_tokens
+    }
+
+    /// Attach the accumulated prompt logprobs: once on the first token-bearing
+    /// chunk and on every `Complete`, including one parked in `pending`. The
+    /// scheduler reports them with the prefill tick, before any sampled token.
+    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
+        if self.state.prompt_logprobs.is_empty() {
+            return;
+        }
+        let state = &self.state;
+        let build = || vllm::InputLogProbs {
+            token_logprobs: state.prompt_logprobs.clone(),
+            token_ids: state.prompt_token_ids.clone(),
+            top_logprobs: state.prompt_top_logprobs.clone(),
+        };
+        if let Some(vllm::generate_response::Response::Complete(parked)) = self
+            .pending
+            .as_mut()
+            .and_then(|pending| pending.response.as_mut())
+        {
+            parked.input_logprobs = Some(build());
+        }
+        match response.response.as_mut() {
+            Some(vllm::generate_response::Response::Chunk(chunk))
+                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
+            {
+                chunk.input_logprobs = Some(build());
+                self.input_logprobs_emitted = true;
+            }
+            Some(vllm::generate_response::Response::Chunk(_)) => {}
+            Some(vllm::generate_response::Response::Complete(complete)) => {
+                complete.input_logprobs = Some(build());
+            }
+            None => {}
         }
     }
 
@@ -60,39 +110,55 @@ impl SglangGenerateStream {
         let mut pending = None;
         // No new tokens on a frontend finish, so `emit_tick` yields the
         // `Complete` directly and parks nothing.
-        self.state.emit_tick(
+        let mut response = self.state.emit_tick(
             self.index,
             Vec::new(),
             None,
             Some(("abort".to_string(), None)),
             &mut pending,
-        )
+        );
+        self.attach_input_logprobs(&mut response);
+        response
     }
 }
 
 /// A vLLM-proto response of an SGLang stream as the SGLang proto the
 /// `SglangScheduler` service answers with, under `request_id` (the vLLM proto
-/// carries none). The two share the chunk and completion fields this wire
-/// fills; what it does not carry (reasoning-token counts, prompt logprobs,
-/// hidden states, speculative counters) stays at the proto defaults.
+/// carries none) and the stream's `reasoning_tokens` (which it has no slot
+/// for). The two share the chunk and completion fields this wire fills; what
+/// it does not carry (hidden states, speculative counters) stays at the proto
+/// defaults, as it does on the Python servicer.
 pub fn to_sglang_response(
     request_id: &str,
     response: vllm::GenerateResponse,
+    reasoning_tokens: u32,
 ) -> sglang_proto::GenerateResponse {
     use sglang_proto::generate_response::Response as SgResponse;
     use vllm::generate_response::Response;
+    let top = |top: Vec<vllm::TopLogProbs>| -> Vec<sglang_proto::TopLogProbs> {
+        top.into_iter()
+            .map(|top| sglang_proto::TopLogProbs {
+                values: top.values,
+                token_ids: top.token_ids,
+            })
+            .collect()
+    };
     let logprobs = |logprobs: Option<vllm::OutputLogProbs>| {
         logprobs.map(|lp| sglang_proto::OutputLogProbs {
             token_logprobs: lp.token_logprobs,
             token_ids: lp.token_ids,
-            top_logprobs: lp
-                .top_logprobs
+            top_logprobs: top(lp.top_logprobs),
+        })
+    };
+    let input_logprobs = |logprobs: Option<vllm::InputLogProbs>| {
+        logprobs.map(|lp| sglang_proto::InputLogProbs {
+            token_logprobs: lp
+                .token_logprobs
                 .into_iter()
-                .map(|top| sglang_proto::TopLogProbs {
-                    values: top.values,
-                    token_ids: top.token_ids,
-                })
+                .map(|entry| sglang_proto::InputTokenLogProb { value: entry.value })
                 .collect(),
+            token_ids: lp.token_ids,
+            top_logprobs: top(lp.top_logprobs),
         })
     };
     let mapped = response.response.map(|inner| match inner {
@@ -101,7 +167,9 @@ pub fn to_sglang_response(
             prompt_tokens: chunk.prompt_tokens,
             completion_tokens: chunk.completion_tokens,
             cached_tokens: chunk.cached_tokens,
+            reasoning_tokens,
             output_logprobs: logprobs(chunk.output_logprobs),
+            input_logprobs: input_logprobs(chunk.input_logprobs),
             index: chunk.index,
             ..Default::default()
         }),
@@ -114,7 +182,9 @@ pub fn to_sglang_response(
                 prompt_tokens: complete.prompt_tokens,
                 completion_tokens: complete.completion_tokens,
                 cached_tokens: complete.cached_tokens,
+                reasoning_tokens,
                 output_logprobs: logprobs(complete.output_logprobs),
+                input_logprobs: input_logprobs(complete.input_logprobs),
                 matched_stop: complete.matched_stop.map(|matched| match matched {
                     MatchedStop::MatchedTokenId(id) => SgMatchedStop::MatchedTokenId(id),
                     MatchedStop::MatchedStopStr(text) => SgMatchedStop::MatchedStopStr(text),
@@ -157,6 +227,35 @@ impl MappedGenerateStream for SglangGenerateStream {
         }
         state.completion_tokens = output.completion_tokens;
         state.output_ids.extend(output.output_ids.iter().copied());
+        self.reasoning_tokens = output.reasoning_tokens;
+        // Prompt logprobs ride the prefill tick (once per request; chunked
+        // prefill may split them), in SGLang's shape: no value for the first
+        // prompt token, ranked candidates per position when asked.
+        if !output.input_logprobs_val.is_empty() {
+            state
+                .prompt_logprobs
+                .extend(
+                    output
+                        .input_logprobs_val
+                        .iter()
+                        .map(|lp| vllm::InputTokenLogProb {
+                            value: lp.map(|lp| lp as f32),
+                        }),
+                );
+            state
+                .prompt_token_ids
+                .extend(output.input_logprobs_idx.iter().copied());
+            state.prompt_top_logprobs.extend(
+                output
+                    .input_top_logprobs_val
+                    .iter()
+                    .zip(&output.input_top_logprobs_idx)
+                    .map(|(values, token_ids)| vllm::TopLogProbs {
+                        values: values.iter().map(|&lp| lp as f32).collect(),
+                        token_ids: token_ids.clone(),
+                    }),
+            );
+        }
 
         // Ranked candidates per position, as the scheduler reports them (the
         // gRPC servicer forwards the same lists unchanged).
@@ -221,13 +320,15 @@ impl MappedGenerateStream for SglangGenerateStream {
                 }),
             )
         });
-        Ok(state.emit_tick(
+        let mut response = state.emit_tick(
             self.index,
             output.output_ids,
             chunk_logprobs,
             finish,
             &mut self.pending,
-        ))
+        );
+        self.attach_input_logprobs(&mut response);
+        Ok(response)
     }
 }
 
@@ -263,10 +364,11 @@ pub(crate) fn fan_out_sglang_requests(
 
 /// Translate an SGLang proto `GenerateRequest` into the scheduler's
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
-/// tokenizes upstream), and the slim output carries output logprobs only
-/// (sampled token and ranked candidates): prompt logprobs, hidden states,
-/// multimodal payloads, LoRA and custom logit processing are refused rather
-/// than silently dropped.
+/// tokenizes upstream). The slim output carries sampled and prompt logprobs
+/// with their ranked candidates; what it has no columns for (hidden states,
+/// per-token-id logprobs, which the Python servicer drops silently) and what
+/// the wire does not carry (multimodal payloads, PD bootstrap fields) is
+/// refused rather than silently dropped.
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
 ) -> Result<TokenizedGenerateReqInput, String> {
@@ -279,44 +381,19 @@ pub(crate) fn translate_request_sglang(
             "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
         );
     }
-    if req.return_logprob && req.logprob_start_len >= 0 {
-        return Err(
-            "prompt logprobs (logprob_start_len >= 0) are not supported over the SGLang ZMQ \
-             backend"
-                .to_string(),
-        );
-    }
     if !req.token_ids_logprob.is_empty() {
         return Err("token_ids_logprob is not supported over the SGLang ZMQ backend".to_string());
     }
     if req.return_hidden_states {
         return Err("hidden states are not supported over the SGLang ZMQ backend".to_string());
     }
-    // Slots past the emitted prefix stay at the scheduler's defaults; refuse
-    // rather than silently run on the base model, without the processor, or
-    // without the PD bootstrap the request asked for.
+    // The bootstrap slots stay at the scheduler's defaults on this wire;
+    // refuse rather than run without the PD bootstrap the request asked for.
     if req.disaggregated_params.is_some() {
         return Err(
             "PD disaggregation (disaggregated_params) is not supported over the SGLang ZMQ \
              backend"
                 .to_string(),
-        );
-    }
-    if !req.lora_id.is_empty() {
-        return Err("LoRA adapters are not supported over the SGLang ZMQ backend yet".to_string());
-    }
-    if !req.custom_logit_processor.is_empty() {
-        return Err(
-            "custom logit processors are not supported over the SGLang ZMQ backend".to_string(),
-        );
-    }
-    if req
-        .sampling_params
-        .as_ref()
-        .is_some_and(|sp| sp.custom_params.is_some())
-    {
-        return Err(
-            "custom sampling params are not supported over the SGLang ZMQ backend".to_string(),
         );
     }
     Ok(TokenizedGenerateReqInput {
@@ -330,9 +407,168 @@ pub(crate) fn translate_request_sglang(
         logprob_start_len: req.logprob_start_len,
         top_logprobs_num: u32::try_from(req.top_logprobs_num).unwrap_or(0),
         stream: req.stream,
+        // Forwarded as the Python servicer forwards them: the scheduler
+        // resolves the adapter id and runs the processor it was started with.
+        lora_id: (!req.lora_id.is_empty()).then_some(req.lora_id),
+        custom_logit_processor: (!req.custom_logit_processor.is_empty())
+            .then_some(req.custom_logit_processor),
         require_reasoning: req.require_reasoning,
         ..TokenizedGenerateReqInput::default()
     })
+}
+
+/// Translate an SGLang proto `EmbedRequest` into the scheduler's
+/// `TokenizedEmbeddingReqInput`, as the Python servicer does: the tokenized
+/// prompt with `max_new_tokens = 0` (the scheduler pools, nothing samples),
+/// token type ids for cross-encoder inputs. Multimodal payloads are refused.
+pub(crate) fn translate_embed_request_sglang(
+    req: sglang_proto::EmbedRequest,
+) -> Result<TokenizedEmbeddingReqInput, String> {
+    if req.request_id.is_empty() {
+        return Err("request_id is required".to_string());
+    }
+    let Some(tokenized) = req.tokenized else {
+        return Err("EmbedRequest requires tokenized input".to_string());
+    };
+    if tokenized.input_ids.is_empty() {
+        return Err("the prompt cannot be empty".to_string());
+    }
+    if req.mm_inputs.is_some() {
+        return Err(
+            "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
+        );
+    }
+    let mut sampling_params = req
+        .sampling_params
+        .map(translate_sampling_sglang)
+        .unwrap_or_default();
+    sampling_params.max_new_tokens = Some(0);
+    Ok(TokenizedEmbeddingReqInput {
+        rid: req.request_id,
+        input_text: (!tokenized.original_text.is_empty()).then_some(tokenized.original_text),
+        input_ids: tokenized.input_ids,
+        sampling_params,
+        token_type_ids: req.token_type_ids,
+        dimensions: None,
+    })
+}
+
+/// A `StartProfile` request for the scheduler, as the Python servicer builds
+/// its `ProfileReq`; `None`s keep the scheduler side's defaults (its
+/// `SGLANG_PROFILE_*` environment).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SglangProfileStart {
+    pub output_dir: Option<String>,
+    pub start_step: Option<i64>,
+    pub num_steps: Option<i64>,
+    pub activities: Vec<String>,
+    pub with_stack: Option<bool>,
+    pub record_shapes: Option<bool>,
+    pub profile_by_stage: bool,
+    pub profile_id: String,
+}
+
+impl SglangProfileStart {
+    /// The call's one argument: a map of the set options.
+    pub(crate) fn into_opaque(self) -> OpaqueValue {
+        let mut entries: Vec<(OpaqueValue, OpaqueValue)> = Vec::new();
+        let mut put = |key: &str, value: OpaqueValue| {
+            entries.push((OpaqueValue::from(key), value));
+        };
+        if let Some(dir) = self.output_dir {
+            put("output_dir", OpaqueValue::from(dir));
+        }
+        if let Some(step) = self.start_step {
+            put("start_step", OpaqueValue::from(step));
+        }
+        if let Some(steps) = self.num_steps {
+            put("num_steps", OpaqueValue::from(steps));
+        }
+        if !self.activities.is_empty() {
+            put(
+                "activities",
+                OpaqueValue::Array(self.activities.into_iter().map(OpaqueValue::from).collect()),
+            );
+        }
+        if let Some(with_stack) = self.with_stack {
+            put("with_stack", OpaqueValue::Boolean(with_stack));
+        }
+        if let Some(record_shapes) = self.record_shapes {
+            put("record_shapes", OpaqueValue::Boolean(record_shapes));
+        }
+        put(
+            "profile_by_stage",
+            OpaqueValue::Boolean(self.profile_by_stage),
+        );
+        put("profile_id", OpaqueValue::from(self.profile_id));
+        OpaqueValue::Map(entries)
+    }
+}
+
+/// A control reply's `success` and `message` (the plugin's
+/// `ControlReplySlim` as a utility outcome).
+pub(crate) fn control_outcome(value: &OpaqueValue) -> (bool, String) {
+    let mut success = false;
+    let mut message = String::new();
+    for (key, value) in value.as_map().into_iter().flatten() {
+        match key.as_str() {
+            Some("success") => success = value.as_bool().unwrap_or(false),
+            Some("message") => message = value.as_str().unwrap_or_default().to_string(),
+            _ => {}
+        }
+    }
+    (success, message)
+}
+
+/// Per-rank control replies as one answer, as the Python servicer aggregates
+/// its communicator results: every rank must succeed, failures report their
+/// messages joined.
+pub(crate) fn aggregate_control(results: &[(bool, String)], ok_message: &str) -> (bool, String) {
+    if results.is_empty() {
+        return (false, "No response from scheduler".to_string());
+    }
+    let failures: Vec<&str> = results
+        .iter()
+        .filter(|(success, _)| !success)
+        .map(|(_, message)| {
+            if message.is_empty() {
+                "failed"
+            } else {
+                message.as_str()
+            }
+        })
+        .collect();
+    if failures.is_empty() {
+        (true, ok_message.to_string())
+    } else {
+        (false, failures.join(" | "))
+    }
+}
+
+/// A proto `Struct` (SGLang's `custom_params`) as the msgpack value the
+/// scheduler's `SamplingParams.custom_params` dict decodes from.
+fn struct_to_opaque(value: prost_types::Struct) -> OpaqueValue {
+    OpaqueValue::Map(
+        value
+            .fields
+            .into_iter()
+            .map(|(key, value)| (OpaqueValue::from(key), value_to_opaque(value)))
+            .collect(),
+    )
+}
+
+fn value_to_opaque(value: prost_types::Value) -> OpaqueValue {
+    use prost_types::value::Kind;
+    match value.kind {
+        None | Some(Kind::NullValue(_)) => OpaqueValue::Nil,
+        Some(Kind::NumberValue(number)) => OpaqueValue::F64(number),
+        Some(Kind::StringValue(text)) => OpaqueValue::from(text),
+        Some(Kind::BoolValue(flag)) => OpaqueValue::Boolean(flag),
+        Some(Kind::StructValue(fields)) => struct_to_opaque(fields),
+        Some(Kind::ListValue(list)) => {
+            OpaqueValue::Array(list.values.into_iter().map(value_to_opaque).collect())
+        }
+    }
 }
 
 /// Map the proto sampling params onto SGLang's own struct, in its API-input
@@ -373,6 +609,7 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
                 .map(|(token, bias)| (token, f64::from(bias)))
                 .collect()
         }),
+        custom_params: sp.custom_params.map(struct_to_opaque),
         ..SglangSamplingParams::default()
     };
     match sp.constraint {
@@ -482,18 +719,7 @@ mod tests {
         })
         .is_err());
         assert!(translate_request_sglang(sglang_proto::GenerateRequest {
-            return_logprob: true,
-            logprob_start_len: 0,
-            ..base.clone()
-        })
-        .is_err());
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
             token_ids_logprob: vec![5],
-            ..base.clone()
-        })
-        .is_err());
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
-            lora_id: "adapter".into(),
             ..base.clone()
         })
         .is_err());
@@ -502,19 +728,44 @@ mod tests {
             ..base.clone()
         })
         .is_err());
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+        // Forwarded as the Python servicer forwards them.
+        let forwarded = translate_request_sglang(sglang_proto::GenerateRequest {
+            lora_id: "adapter".into(),
             custom_logit_processor: "proc".into(),
-            ..base.clone()
-        })
-        .is_err());
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
             sampling_params: Some(sglang_proto::SamplingParams {
-                custom_params: Some(prost_types::Struct::default()),
+                custom_params: Some(prost_types::Struct {
+                    fields: [(
+                        "k".to_string(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::NumberValue(2.0)),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                }),
                 ..Default::default()
             }),
             ..base.clone()
         })
-        .is_err());
+        .unwrap();
+        assert_eq!(forwarded.lora_id.as_deref(), Some("adapter"));
+        assert_eq!(forwarded.custom_logit_processor.as_deref(), Some("proc"));
+        assert_eq!(
+            forwarded.sampling_params.custom_params,
+            Some(OpaqueValue::Map(vec![(
+                OpaqueValue::from("k"),
+                OpaqueValue::F64(2.0)
+            )]))
+        );
+        // Prompt logprobs ride the wire now.
+        let prompt = translate_request_sglang(sglang_proto::GenerateRequest {
+            return_logprob: true,
+            logprob_start_len: 0,
+            top_logprobs_num: 2,
+            ..base.clone()
+        })
+        .unwrap();
+        assert!(prompt.return_logprob && prompt.logprob_start_len == 0);
         // Output logprobs only: `-1` is the builders' "no prompt logprobs"
         // (the proto default of 0 would ask for them from the first token).
         let ok = translate_request_sglang(sglang_proto::GenerateRequest {
@@ -628,6 +879,7 @@ mod tests {
                 finished_status: vec![None],
                 output_top_logprobs_val: vec![vec![vec![-1.25, -2.0]]],
                 output_top_logprobs_idx: vec![vec![vec![11, 12]]],
+                ..Default::default()
             };
             for batch in [chunk, done] {
                 output
