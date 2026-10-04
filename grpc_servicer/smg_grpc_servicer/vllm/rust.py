@@ -3,7 +3,8 @@
 Upstream vLLM's gRPC server (``vllm serve <model> --grpc`` /
 ``python -m vllm.entrypoints.grpc_server``) imports this package's servicer
 classes and hosts them on an AsyncLLM. Setting ``SMG_VLLM_SERVICER_IMPL=rust``
-(or ``--servicer-impl rust`` when the launcher exposes it) keeps that same
+(or ``--servicer-impl rust``, a flag this package adds to ``vllm serve``'s
+parser as a vLLM general plugin, see :mod:`smg_grpc_servicer.vllm.plugin`) keeps that same
 entrypoint but hands the process to :func:`serve_rust` before an AsyncLLM or
 a Python gRPC server exists: the ``vllm.grpc.engine.VllmEngine`` contract is
 served by the Rust :class:`smg.servicer.VllmGrpcServer` on a Rust-owned
@@ -12,7 +13,11 @@ vLLM's own ``run_headless`` from the launcher's parsed namespace, dialing the
 servicer's same-host ZMQ handshake. Python keeps the lifecycle only. The
 Router cannot tell the two implementations apart.
 
-Upstream integration is one check at the top of its ``serve_grpc``::
+The switch runs ahead of the launcher's ``serve_grpc`` without a vLLM
+change: the launcher imports this package's servicer classes at module
+level, and that import installs the switch over ``serve_grpc`` (see
+:mod:`smg_grpc_servicer.vllm.launcher_switch`). A launcher that carries the
+check in its own source instead works the same::
 
     from smg_grpc_servicer.vllm import resolve_servicer_impl, serve_rust
     if resolve_servicer_impl(args) == "rust":
@@ -31,6 +36,7 @@ Python implementation stays the default.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import dataclasses
 import glob
@@ -370,10 +376,13 @@ def require_python_impl(environ: Mapping[str, str] | None = None) -> None:
 
 
 def upstream_hook_installed(vllm_root: str | None = None) -> bool:
-    """Whether the installed vLLM's gRPC entrypoint consults this package's
-    flag. Scans the launcher source without importing vLLM, so a launcher
-    (``smg serve``, the e2e harness) can refuse a Rust lane up front instead
-    of starting workers that would run Python."""
+    """Whether the installed vLLM's gRPC entrypoint will consult this
+    package's flag: it carries the check in its own source, or it imports
+    this package's servicer modules at module level, where the switch
+    installs itself (:mod:`smg_grpc_servicer.vllm.launcher_switch`). Scans
+    the launcher source without importing vLLM, so a launcher (``smg serve``,
+    the e2e harness) can refuse a Rust lane up front instead of starting
+    workers that would run Python."""
     roots: list[str] = []
     if vllm_root is not None:
         roots = [vllm_root]
@@ -393,10 +402,46 @@ def upstream_hook_installed(vllm_root: str | None = None) -> bool:
         for path in candidates:
             try:
                 with open(path, encoding="utf-8") as handle:
-                    if HOOK_SYMBOL in handle.read():
-                        return True
+                    source = handle.read()
             except OSError:
                 continue
+            if HOOK_SYMBOL in source or _imports_servicer_at_module_level(source):
+                return True
+    return False
+
+
+_SWITCH_MODULES = (
+    "smg_grpc_servicer.vllm.servicer",
+    "smg_grpc_servicer.vllm.health_servicer",
+)
+
+
+def _imports_servicer_at_module_level(source: str) -> bool:
+    """Whether a launcher imports a switch-installing module of this package
+    at module level (directly or inside a top-level ``try``/``if``). An import
+    inside ``serve_grpc`` would run too late: the switch binds over the next
+    call, not the running one."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    statements = list(tree.body)
+    while statements:
+        node = statements.pop()
+        if isinstance(node, ast.ImportFrom) and node.module in _SWITCH_MODULES:
+            return True
+        if isinstance(node, ast.Import) and any(
+            alias.name in _SWITCH_MODULES for alias in node.names
+        ):
+            return True
+        if isinstance(node, (ast.Try, ast.If, ast.With)):
+            for field in ("body", "orelse", "finalbody", "handlers"):
+                for child in getattr(node, field, []) or []:
+                    statements.extend(
+                        getattr(child, "body", [child])
+                        if isinstance(child, ast.ExceptHandler)
+                        else [child]
+                    )
     return False
 
 
@@ -404,10 +449,11 @@ def require_upstream_hook() -> None:
     """Fail a Rust lane whose vLLM would ignore the flag."""
     if not upstream_hook_installed():
         raise RuntimeError(
-            f"{SERVICER_IMPL_ENV}=rust needs a vLLM whose gRPC entrypoint consults "
-            "smg_grpc_servicer.vllm.resolve_servicer_impl; this installation's does not, "
-            "so its workers would silently run the Python servicer. Install a vLLM with "
-            "the hook (see grpc_servicer/README.md) or select the python implementation."
+            f"{SERVICER_IMPL_ENV}=rust needs a vLLM whose gRPC launcher consults this "
+            "package's flag: one that imports smg_grpc_servicer.vllm.servicer at module "
+            "level (where the switch installs itself) or carries the check in its own "
+            "serve_grpc. This installation's launcher does neither, so its workers would "
+            "run the Python servicer; see grpc_servicer/README.md or select python."
         )
 
 

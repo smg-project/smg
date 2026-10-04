@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -94,10 +95,109 @@ def test_upstream_hook_is_detected_in_the_launcher_source(tmp_path):
 
 def test_require_upstream_hook_names_the_fix(monkeypatch):
     monkeypatch.setattr(rust, "upstream_hook_installed", lambda: False)
-    with pytest.raises(RuntimeError, match="resolve_servicer_impl"):
+    with pytest.raises(RuntimeError, match="consults this package's flag"):
         rust.require_upstream_hook()
     monkeypatch.setattr(rust, "upstream_hook_installed", lambda: True)
     rust.require_upstream_hook()
+
+
+def test_launcher_switch_binds_serve_grpc_during_the_launchers_import(monkeypatch):
+    """vLLM's launcher imports this package before it defines serve_grpc; that
+    import hooks the module so the first attribute access after the import
+    (the CLI's `from ... import serve_grpc`) binds the switch, in the module
+    dict too, where the launcher's own main() reads it."""
+    from smg_grpc_servicer.vllm import launcher_switch
+
+    name = "vllm.entrypoints.launchers.grpc_server"
+    module = types.ModuleType(name)
+    monkeypatch.setitem(sys.modules, name, module)
+    assert launcher_switch.install_launcher_switch() == [name]
+    calls = []
+
+    async def serve_grpc(args):
+        calls.append(args)
+        return "python ran"
+
+    module.__dict__["serve_grpc"] = serve_grpc  # the launcher's own `async def`, after our import
+    switched = module.serve_grpc
+    assert switched is not serve_grpc and module.__dict__["serve_grpc"] is switched
+    assert switched.__name__ == "serve_grpc"
+    python_args = argparse.Namespace(servicer_impl="python")
+    assert asyncio.run(switched(python_args)) == "python ran" and calls == [python_args]
+    rust_calls = []
+
+    async def fake_serve_rust(args):
+        rust_calls.append(args)
+        return 7
+
+    monkeypatch.setattr(rust, "serve_rust", fake_serve_rust)
+    with pytest.raises(SystemExit) as exit_:
+        asyncio.run(switched(argparse.Namespace(servicer_impl="rust")))
+    assert exit_.value.code == 7 and len(rust_calls) == 1
+    # Idempotent, and stable across accesses and re-installs.
+    assert launcher_switch.install_launcher_switch() == [name]
+    assert module.serve_grpc is switched
+    # A launcher that imported this package after defining serve_grpc is rebound at once.
+    late = types.ModuleType("vllm.entrypoints.grpc_server")
+    late.__dict__["serve_grpc"] = serve_grpc
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.grpc_server", late)
+    assert set(launcher_switch.install_launcher_switch()) == {name, "vllm.entrypoints.grpc_server"}
+    assert late.__dict__["serve_grpc"] is not serve_grpc
+
+
+def test_launcher_import_of_this_package_satisfies_the_hook_check(tmp_path):
+    launcher = tmp_path / "vllm" / "entrypoints" / "launchers"
+    launcher.mkdir(parents=True)
+    path = launcher / "grpc_server.py"
+    # Upstream's shape: the servicer imports inside a module-level try.
+    path.write_text(
+        "try:\n"
+        "    import grpc\n"
+        "    from smg_grpc_servicer.vllm.health_servicer import VllmHealthServicer\n"
+        "    from smg_grpc_servicer.vllm.servicer import VllmEngineServicer\n"
+        "except ImportError as e:\n"
+        "    raise ImportError('gRPC mode requires smg-grpc-servicer') from e\n"
+        "async def serve_grpc(args):\n"
+        "    pass\n"
+    )
+    assert rust.upstream_hook_installed(vllm_root=str(tmp_path / "vllm")) is True
+    # Imported only inside serve_grpc, the switch would bind too late.
+    path.write_text(
+        "async def serve_grpc(args):\n"
+        "    from smg_grpc_servicer.vllm.servicer import VllmEngineServicer\n"
+    )
+    assert rust.upstream_hook_installed(vllm_root=str(tmp_path / "vllm")) is False
+
+
+def test_plugin_adds_the_servicer_impl_flag_to_grpc_parsers():
+    """vLLM loads this package's general plugin while it builds the serve
+    parser; the flag joins any parser that defines --grpc, as it parses."""
+    pytest.importorskip("vllm")
+    from smg_grpc_servicer.vllm import plugin
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    plugin.register()
+    plugin.register()  # idempotent: one wrap of the parse step
+    parser = FlexibleArgumentParser(prog="vllm serve")
+    parser.add_argument("--grpc", action="store_true")
+    args = parser.parse_args(["--grpc", "--servicer-impl", "rust"])
+    assert (args.grpc, args.servicer_impl) == (True, "rust")
+    assert parser.parse_args(["--grpc"]).servicer_impl is None
+    assert "--servicer-impl" in parser.format_help()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--grpc", "--servicer-impl", "go"])
+    # The parsed flag decides ahead of the environment.
+    assert rust.resolve_servicer_impl(args, environ={"SMG_VLLM_SERVICER_IMPL": "python"}) == "rust"
+    # Parsers without --grpc (vllm bench, offline LLM args) are untouched.
+    plain = FlexibleArgumentParser(prog="vllm bench")
+    plain.add_argument("--model")
+    assert not hasattr(plain.parse_args(["--model", "m"]), "servicer_impl")
+
+
+def test_plugin_entry_point_is_declared():
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    assert 'smg-servicer = "smg_grpc_servicer.vllm.plugin:register"' in pyproject
+    assert '[project.entry-points."vllm.general_plugins"]' in pyproject
 
 
 # ---------------------------------------------------------------------------

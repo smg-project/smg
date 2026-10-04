@@ -49,6 +49,10 @@ from smg_grpc_servicer.vllm.kv_transfer import (
     params_from_request,
     params_to_response_fields,
 )
+
+# The launcher imports this module before it defines serve_grpc: the moment
+# the servicer switch has to be in place (see launcher_switch).
+from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
 from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
@@ -79,6 +83,8 @@ from .mm_keys import (
     modality_name,
     primary_encoder_key,
 )
+
+install_launcher_switch()
 
 logger = init_logger(__name__)
 attach_vllm_logging()
