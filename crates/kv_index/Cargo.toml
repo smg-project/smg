@@ -35,5 +35,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 name = "throughput_bench"
 harness = false
 
+[[bench]]
+name = "match_insert"
+harness = false
+
 [lints]
 workspace = true
