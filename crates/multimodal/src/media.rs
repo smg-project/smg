@@ -661,7 +661,12 @@ async fn collect_http_body_with_limit(
         return Err(MediaConnectorError::PayloadTooLarge { media, limit });
     }
 
-    let mut body = BytesMut::new();
+    // A declared length is within the cap (checked above), so the body fits
+    // one allocation; without it the buffer grows as chunks arrive.
+    let mut body = match response.content_length() {
+        Some(length) => BytesMut::with_capacity(length as usize),
+        None => BytesMut::new(),
+    };
     while let Some(chunk) = response.chunk().await? {
         checked_payload_length(body.len(), chunk.len(), limit, media)?;
         body.extend_from_slice(&chunk);
