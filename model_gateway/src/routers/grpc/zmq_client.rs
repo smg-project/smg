@@ -26,11 +26,10 @@ pub(crate) async fn generate(
     match req {
         ProtoGenerateRequest::Vllm(req) => client.generate_vllm(*req).await,
         ProtoGenerateRequest::TokenSpeed(req) => client.generate_tokenspeed(*req).await,
-        ProtoGenerateRequest::Sglang(_)
-        | ProtoGenerateRequest::Trtllm(_)
-        | ProtoGenerateRequest::Mlx(_) => Err(tonic::Status::internal(
-            "ZMQ backends serve vLLM and TokenSpeed requests only",
-        )),
+        ProtoGenerateRequest::Sglang(req) => client.generate_sglang(*req).await,
+        ProtoGenerateRequest::Trtllm(_) | ProtoGenerateRequest::Mlx(_) => Err(
+            tonic::Status::internal("ZMQ backends serve vLLM, TokenSpeed and SGLang requests only"),
+        ),
     }
 }
 
@@ -39,6 +38,7 @@ pub(crate) fn model_info(client: &ZmqEngineClient) -> ModelInfo {
     match client.model_info() {
         ZmqModelInfo::Vllm(info) => ModelInfo::Vllm(info),
         ZmqModelInfo::TokenSpeed(info) => ModelInfo::TokenSpeed(info),
+        ZmqModelInfo::Sglang(info) => ModelInfo::Sglang(info),
     }
 }
 
@@ -47,12 +47,13 @@ pub(crate) fn server_info(client: &ZmqEngineClient) -> ServerInfo {
     match client.server_info() {
         ZmqServerInfo::Vllm(info) => ServerInfo::Vllm(info),
         ZmqServerInfo::TokenSpeed(info) => ServerInfo::TokenSpeed(info),
+        ZmqServerInfo::Sglang(info) => ServerInfo::Sglang(info),
     }
 }
 
 /// Request-time EOS backstop for the tokenizer-less EngineCore, dispatched on
-/// the wrapper's variant: only a vLLM request takes it (TokenSpeed's scheduler
-/// stops at EOS itself). See `engine_zmq_adapter::fold_tokenizer_eos_backstop`.
+/// the wrapper's variant: only a vLLM request takes it (TokenSpeed's and
+/// SGLang's schedulers stop at EOS themselves). See `engine_zmq_adapter::fold_tokenizer_eos_backstop`.
 pub(crate) fn fold_tokenizer_eos_backstop(
     request: &mut ProtoGenerateRequest,
     tokenizer: Option<&Arc<dyn Tokenizer>>,

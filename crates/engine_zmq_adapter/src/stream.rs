@@ -1,10 +1,13 @@
-//! Shared streaming machinery: the per-request token accounting both dialects
+//! Shared streaming machinery: the per-request token accounting the dialects
 //! accumulate, the mapped-stream trait, and the merged per-choice stream.
 
 use futures::{stream::SelectAll, Stream, StreamExt};
 use smg_grpc_client::vllm_proto as vllm;
 
-use crate::{client::zmq_status, tokenspeed::TokenSpeedGenerateStream, vllm::VllmGenerateStream};
+use crate::{
+    client::zmq_status, sglang::SglangGenerateStream, tokenspeed::TokenSpeedGenerateStream,
+    vllm::VllmGenerateStream,
+};
 
 /// Streaming generate output over ZMQ, presented as vLLM-proto
 /// `GenerateResponse`. One sub-stream per fanned-out engine request (n>1);
@@ -19,6 +22,8 @@ pub enum ZmqGenerateStream {
     Vllm(SelectAll<VllmGenerateStream>),
     /// TokenSpeed outputs.
     TokenSpeed(SelectAll<TokenSpeedGenerateStream>),
+    /// SGLang outputs.
+    Sglang(SelectAll<SglangGenerateStream>),
 }
 
 impl ZmqGenerateStream {
@@ -27,6 +32,7 @@ impl ZmqGenerateStream {
         match self {
             Self::Vllm(streams) => streams.next().await,
             Self::TokenSpeed(streams) => streams.next().await,
+            Self::Sglang(streams) => streams.next().await,
         }
     }
 
@@ -39,7 +45,7 @@ impl ZmqGenerateStream {
     pub fn mark_completed(&mut self) {}
 }
 
-/// Accumulated per-request token counts shared by both stream mappers.
+/// Accumulated per-request token counts shared by the stream mappers.
 #[derive(Default)]
 pub(crate) struct StreamState {
     pub(crate) output_ids: Vec<u32>,

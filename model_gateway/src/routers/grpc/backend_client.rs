@@ -13,8 +13,9 @@ use openai_protocol::{
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
 };
 use smg_grpc_client::{
-    common_proto, tokenizer_bundle::StreamBundle, tokenspeed_proto, vllm_proto,
-    SglangSchedulerClient, TokenSpeedSchedulerClient, VllmEngineClient,
+    common_proto, sglang_proto, tokenizer_bundle::StreamBundle, tokenspeed_proto, vllm_proto,
+    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
+    VllmEngineClient,
 };
 
 use crate::{
@@ -33,20 +34,21 @@ use crate::{
     worker::RuntimeType,
 };
 
-/// A backend connection: gRPC (any engine) or direct ZMQ (vLLM EngineCore or
-/// TokenSpeed).
+/// A backend connection: gRPC (any engine) or direct ZMQ (vLLM EngineCore,
+/// TokenSpeed or SGLang).
 #[derive(Clone)]
 pub enum BackendClient {
     Grpc(GrpcClient),
     Zmq(ZmqEngineClient),
 }
 
-/// The native request builders of both ZMQ dialects for one request kind — the
+/// The native request builders of the ZMQ dialects for one request kind — the
 /// only thing that differs between the ZMQ build surfaces, so the dialect
 /// dispatch itself lives once in [`build_zmq_request`]/[`build_zmq_plain_request`].
-struct ZmqBuilders<V, T> {
+struct ZmqBuilders<V, T, S> {
     vllm: V,
     tokenspeed: T,
+    sglang: S,
 }
 
 /// A vLLM builder for a request kind carrying multimodal inputs and tool
@@ -70,6 +72,16 @@ type TokenSpeedMmBuilder<B> = fn(
     Option<(String, String)>,
 ) -> Result<tokenspeed_proto::GenerateRequest, String>;
 
+/// The SGLang counterpart of [`VllmMmBuilder`]; its builders take the
+/// multimodal inputs and constraints bundled as options.
+type SglangMmBuilder<B> = fn(
+    String,
+    &B,
+    String,
+    Vec<u32>,
+    SglangGenerateRequestOptions,
+) -> Result<sglang_proto::GenerateRequest, String>;
+
 /// A vLLM builder for a request kind with neither multimodal inputs nor tool
 /// constraints (completion, plain generate); `T` is the builder's text
 /// parameter.
@@ -79,6 +91,10 @@ type VllmPlainBuilder<B, T> =
 /// The TokenSpeed counterpart of [`VllmPlainBuilder`].
 type TokenSpeedPlainBuilder<B, T> =
     fn(String, &B, T, Vec<u32>) -> Result<tokenspeed_proto::GenerateRequest, String>;
+
+/// The SGLang counterpart of [`VllmPlainBuilder`].
+type SglangPlainBuilder<B, T> =
+    fn(String, &B, T, Vec<u32>) -> Result<sglang_proto::GenerateRequest, String>;
 
 impl BackendClient {
     /// Runtime type backing this client.
@@ -288,6 +304,7 @@ impl BackendClient {
                 ZmqBuilders {
                     vllm: VllmEngineClient::build_generate_request_from_chat,
                     tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_chat,
+                    sglang: SglangSchedulerClient::build_generate_request_from_chat_parts,
                 },
             ),
         }
@@ -317,6 +334,7 @@ impl BackendClient {
                 ZmqBuilders {
                     vllm: VllmEngineClient::build_generate_request_from_messages,
                     tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_messages,
+                    sglang: SglangSchedulerClient::build_generate_request_from_messages_parts,
                 },
             ),
         }
@@ -342,6 +360,7 @@ impl BackendClient {
                 ZmqBuilders {
                     vllm: VllmEngineClient::build_generate_request_from_completion,
                     tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_completion,
+                    sglang: SglangSchedulerClient::build_generate_request_from_completion_parts,
                 },
             ),
         }
@@ -367,6 +386,7 @@ impl BackendClient {
                 ZmqBuilders {
                     vllm: VllmEngineClient::build_plain_generate_request,
                     tokenspeed: TokenSpeedSchedulerClient::build_plain_generate_request,
+                    sglang: SglangSchedulerClient::build_plain_generate_request_parts,
                 },
             ),
         }
@@ -383,9 +403,13 @@ fn build_zmq_request<B>(
     processed_text: String,
     token_ids: Vec<u32>,
     options: GenerateRequestBuildOptions,
-    builders: ZmqBuilders<VllmMmBuilder<B>, TokenSpeedMmBuilder<B>>,
+    builders: ZmqBuilders<VllmMmBuilder<B>, TokenSpeedMmBuilder<B>, SglangMmBuilder<B>>,
 ) -> Result<ProtoGenerateRequest, String> {
-    let ZmqBuilders { vllm, tokenspeed } = builders;
+    let ZmqBuilders {
+        vllm,
+        tokenspeed,
+        sglang,
+    } = builders;
     match dialect {
         ZmqDialect::Vllm => {
             let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
@@ -414,6 +438,22 @@ fn build_zmq_request<B>(
                 )
             })
         }
+        // SGLang tensors ride inline (no SHM handles to release on failure).
+        ZmqDialect::Sglang => {
+            let sglang_mm = zmq_sglang_mm(options.multimodal_inputs)?;
+            let req = sglang(
+                request_id,
+                body,
+                processed_text,
+                token_ids,
+                SglangGenerateRequestOptions {
+                    multimodal_inputs: sglang_mm,
+                    tool_call_constraint: options.tool_constraints,
+                    require_reasoning: options.require_reasoning,
+                },
+            )?;
+            Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
+        }
     }
 }
 
@@ -426,14 +466,25 @@ fn build_zmq_plain_request<B, T>(
     body: &B,
     text: T,
     token_ids: Vec<u32>,
-    builders: ZmqBuilders<VllmPlainBuilder<B, T>, TokenSpeedPlainBuilder<B, T>>,
+    builders: ZmqBuilders<
+        VllmPlainBuilder<B, T>,
+        TokenSpeedPlainBuilder<B, T>,
+        SglangPlainBuilder<B, T>,
+    >,
 ) -> Result<ProtoGenerateRequest, String> {
-    let ZmqBuilders { vllm, tokenspeed } = builders;
+    let ZmqBuilders {
+        vllm,
+        tokenspeed,
+        sglang,
+    } = builders;
     match dialect {
         ZmqDialect::Vllm => Ok(ProtoGenerateRequest::Vllm(Box::new(vllm(
             request_id, body, text, token_ids,
         )?))),
         ZmqDialect::TokenSpeed => Ok(ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed(
+            request_id, body, text, token_ids,
+        )?))),
+        ZmqDialect::Sglang => Ok(ProtoGenerateRequest::Sglang(Box::new(sglang(
             request_id, body, text, token_ids,
         )?))),
     }
@@ -474,6 +525,19 @@ fn zmq_tokenspeed_mm(
             // and has no puller for `remote` payloads.
             MultimodalData::TokenSpeed(data) => Ok(data.into_proto(false)),
             other => Err(mm_variant_mismatch("TokenSpeed", &other)),
+        })
+        .transpose()
+}
+
+/// Convert assembled multimodal data for an SGLang ZMQ backend. See
+/// [`zmq_vllm_mm`] for the mismatch semantics.
+fn zmq_sglang_mm(
+    inputs: Option<MultimodalData>,
+) -> Result<Option<sglang_proto::MultimodalInputs>, String> {
+    inputs
+        .map(|mm| match mm {
+            MultimodalData::Sglang(data) => Ok(data.into_proto()),
+            other => Err(mm_variant_mismatch("SGLang", &other)),
         })
         .transpose()
 }

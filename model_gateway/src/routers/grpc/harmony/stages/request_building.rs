@@ -2,7 +2,10 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use smg_grpc_client::{SglangGenerateRequestOptions, TokenSpeedSchedulerClient, VllmEngineClient};
+use smg_grpc_client::{
+    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
+    VllmEngineClient,
+};
 use tracing::{debug, error};
 
 use crate::routers::{
@@ -309,6 +312,9 @@ fn build_harmony_proto(
             ZmqDialect::TokenSpeed => {
                 build_tokenspeed(body, request_id, text, token_ids, tool_constraints)?
             }
+            ZmqDialect::Sglang => {
+                build_sglang(body, request_id, text, token_ids, tool_constraints)?
+            }
         },
     })
 }
@@ -370,4 +376,36 @@ fn build_tokenspeed(
         }
     };
     Ok(ProtoGenerateRequest::TokenSpeed(Box::new(request)))
+}
+
+fn build_sglang(
+    body: HarmonyBody<'_>,
+    request_id: String,
+    text: String,
+    token_ids: Vec<u32>,
+    tool_constraints: Option<(String, String)>,
+) -> Result<ProtoGenerateRequest, String> {
+    let request = match body {
+        HarmonyBody::Chat(b) => SglangSchedulerClient::build_generate_request_from_chat_parts(
+            request_id,
+            b,
+            text,
+            token_ids,
+            SglangGenerateRequestOptions {
+                multimodal_inputs: None, // Harmony path: multimodal not yet wired
+                tool_call_constraint: tool_constraints,
+                require_reasoning: false,
+            },
+        )?,
+        HarmonyBody::Responses(b) => {
+            SglangSchedulerClient::build_generate_request_from_responses_parts(
+                request_id,
+                b,
+                text,
+                token_ids,
+                tool_constraints,
+            )?
+        }
+    };
+    Ok(ProtoGenerateRequest::Sglang(Box::new(request)))
 }

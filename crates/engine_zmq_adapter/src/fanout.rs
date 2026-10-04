@@ -1,4 +1,4 @@
-//! `n > 1` fan-out shared by both dialects: the wire has no per-sample
+//! `n > 1` fan-out shared by the dialects: the wire has no per-sample
 //! demux, so each sample is its own engine request.
 
 /// Shared n>1 fan-out scaffolding: clone the request into `n` subs and let

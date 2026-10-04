@@ -149,17 +149,20 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             }
         })?;
 
-        // Only vLLM EngineCore and TokenSpeed speak the ZMQ direct-backend wire.
-        // Fail registration here rather than letting the connect-time rejection
-        // strand the worker in Pending.
+        // Only vLLM EngineCore, TokenSpeed and SGLang speak the ZMQ direct-backend
+        // wire. Fail registration here rather than letting the connect-time
+        // rejection strand the worker in Pending.
         if *connection_mode == ConnectionMode::Zmq
-            && !matches!(runtime_type, RuntimeType::Vllm | RuntimeType::TokenSpeed)
+            && !matches!(
+                runtime_type,
+                RuntimeType::Vllm | RuntimeType::TokenSpeed | RuntimeType::Sglang
+            )
         {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("create_worker"),
                 message: format!(
-                    "ZMQ worker {} has unsupported runtime {}: only vllm and tokenspeed \
-                     are supported over the ZMQ direct backend",
+                    "ZMQ worker {} has unsupported runtime {}: only vllm, tokenspeed and \
+                     sglang are supported over the ZMQ direct backend",
                     config.url, runtime_type
                 ),
             });
@@ -168,9 +171,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         validate_zmq_worker_type(*connection_mode, config.worker_type, &config.url)?;
 
         // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
-        // one socket set. Both ZMQ runtimes route per rank: vLLM by in-request
-        // DP rank, TokenSpeed by per-rank socket identity with the producing
-        // rank named on each output batch.
+        // one socket set. Every ZMQ runtime routes per rank: vLLM by in-request
+        // DP rank, TokenSpeed and SGLang by per-rank socket identity with the
+        // producing rank named on each output batch.
         let zmq_engine_group = config
             .dp_size
             .filter(|&n| n > 1 && *connection_mode == ConnectionMode::Zmq);

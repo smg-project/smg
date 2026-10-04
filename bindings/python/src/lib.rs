@@ -852,6 +852,7 @@ impl Router {
                 match self.backend {
                     BackendType::Vllm => Some(worker::RuntimeType::Vllm),
                     BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+                    BackendType::Sglang => Some(worker::RuntimeType::Sglang),
                     _ => None,
                 }
             } else {

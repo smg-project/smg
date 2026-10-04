@@ -305,6 +305,29 @@ async fn fetch_grpc_metadata(
     Ok((labels, runtime_type.to_string()))
 }
 
+/// Labels for a ZMQ worker from the gateway's local model directory: the
+/// sampling defaults in `generation_config.json`, when the directory is local
+/// and the model ships one. A Hub id or a model without the file yields none.
+async fn zmq_local_labels(model_dir: Option<&str>) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    let Some(dir) = model_dir else {
+        return labels;
+    };
+    let path = std::path::Path::new(dir).join("generation_config.json");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => match SamplingDefaults::canonical_json_from_str(&raw) {
+            Ok(Some(canonical)) => {
+                labels.insert(DEFAULT_SAMPLING_PARAMS_LABEL.to_string(), canonical);
+            }
+            Ok(None) => {}
+            Err(e) => warn!("Ignoring {}: {}", path.display(), e),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("Could not read {}: {}", path.display(), e),
+    }
+    labels
+}
+
 /// Rename gRPC-specific keys to canonical names and strip transient state.
 fn normalize_grpc_keys(labels: &mut HashMap<String, String>) {
     for &(from, to) in &[
@@ -417,11 +440,21 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .await
                     .map(|(labels, rt)| (labels, Some(rt)))
             }
-            // An EngineCore worker does not report model/tokenizer metadata over
-            // ZMQ; it is configured at worker registration. Return `None` for the
-            // runtime so the explicitly configured / detected runtime is preserved
-            // (the handshake is shared across engines, so it cannot be probed here).
-            ConnectionMode::Zmq => Ok((HashMap::new(), None)),
+            // A ZMQ engine reports its geometry at the handshake, which runs
+            // after this step; the one fact worth having earlier is the
+            // model's own sampling defaults, read from the local model
+            // directory the gateway was started with (where its EOS backstop
+            // reads too). The runtime stays `None`: the handshake is shared
+            // across engines, so it cannot be probed here and the configured
+            // or detected runtime is preserved.
+            ConnectionMode::Zmq => {
+                let model_dir = context
+                    .data
+                    .app_context
+                    .as_ref()
+                    .and_then(|app| app.router_config.model_path.clone());
+                Ok((zmq_local_labels(model_dir.as_deref()).await, None))
+            }
         }
         .unwrap_or_else(|e| {
             warn!("Failed to fetch metadata for {}: {}", config.url, e);
@@ -448,6 +481,28 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn zmq_labels_carry_the_local_generation_config_sampling_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "repetition_penalty": 1.05, "max_new_tokens": 2048, "do_sample": true}"#,
+        )
+        .unwrap();
+        let labels = zmq_local_labels(Some(dir.path().to_str().unwrap())).await;
+        let defaults: serde_json::Value =
+            serde_json::from_str(&labels[DEFAULT_SAMPLING_PARAMS_LABEL]).unwrap();
+        assert_eq!(defaults["top_k"], 20);
+        assert_eq!(defaults["temperature"], 0.7);
+        assert!(
+            defaults.get("max_new_tokens").is_none(),
+            "length limits are not sampling defaults"
+        );
+        // No directory, a Hub id, or a model without the file: no label.
+        assert!(zmq_local_labels(None).await.is_empty());
+        assert!(zmq_local_labels(Some("Qwen/Qwen3-0.6B")).await.is_empty());
+    }
+
     use super::*;
 
     /// Every engine's spelling of the parallelism widths folds into the

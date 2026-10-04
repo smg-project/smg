@@ -194,7 +194,9 @@ impl SglangSchedulerClient {
         )
     }
 
-    fn build_generate_request_from_chat_parts(
+    /// [`Self::build_generate_request_from_chat`] without a receiver, for
+    /// callers that hold no client (the ZMQ lane builds the same proto).
+    pub fn build_generate_request_from_chat_parts(
         request_id: String,
         body: &ChatCompletionRequest,
         processed_text: String,
@@ -240,7 +242,8 @@ impl SglangSchedulerClient {
         Self::build_plain_generate_request_parts(request_id, body, original_text, token_ids)
     }
 
-    fn build_plain_generate_request_parts(
+    /// [`Self::build_plain_generate_request`] without a receiver.
+    pub fn build_plain_generate_request_parts(
         request_id: String,
         body: &GenerateRequest,
         original_text: Option<String>,
@@ -285,6 +288,24 @@ impl SglangSchedulerClient {
     )]
     pub fn build_generate_request_from_responses(
         &self,
+        request_id: String,
+        body: &ResponsesRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        constraint: Option<(String, String)>,
+    ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_responses_parts(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            constraint,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_responses`] without a receiver,
+    /// for callers that hold no client (the ZMQ lane builds the same proto).
+    pub fn build_generate_request_from_responses_parts(
         request_id: String,
         body: &ResponsesRequest,
         processed_text: String,
@@ -502,7 +523,8 @@ impl SglangSchedulerClient {
         )
     }
 
-    fn build_generate_request_from_messages_parts(
+    /// [`Self::build_generate_request_from_messages`] without a receiver.
+    pub fn build_generate_request_from_messages_parts(
         request_id: String,
         body: &CreateMessageRequest,
         processed_text: String,
@@ -570,6 +592,21 @@ impl SglangSchedulerClient {
     )]
     pub fn build_generate_request_from_completion(
         &self,
+        request_id: String,
+        body: &CompletionRequest,
+        original_text: String,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_completion_parts(
+            request_id,
+            body,
+            original_text,
+            token_ids,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_completion`] without a receiver.
+    pub fn build_generate_request_from_completion_parts(
         request_id: String,
         body: &CompletionRequest,
         original_text: String,

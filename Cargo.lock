@@ -2251,6 +2251,7 @@ dependencies = [
  "half",
  "llm-tokenizer",
  "openai-protocol",
+ "prost-types",
  "rustix",
  "serde_json",
  "smg-grpc-client",

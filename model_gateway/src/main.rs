@@ -1856,6 +1856,7 @@ impl CliArgs {
             match self.backend {
                 Some(Backend::Vllm) => Some(RuntimeType::Vllm),
                 Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+                Some(Backend::Sglang) => Some(RuntimeType::Sglang),
                 _ => None,
             }
         } else {
@@ -3110,6 +3111,21 @@ mod tests {
             server_config.router_config.startup_worker_runtime_type,
             Some(RuntimeType::TokenSpeed),
             "the runtime pin must survive into ServerConfig via to_server_config"
+        );
+
+        let sglang = cli_args_from(&[
+            "--backend",
+            "sglang",
+            "--worker-urls",
+            "ipc:///tmp/smg-zmq/engine-0",
+        ]);
+        assert_eq!(
+            sglang
+                .to_router_config(vec![], vec![])
+                .unwrap()
+                .startup_worker_runtime_type,
+            Some(RuntimeType::Sglang),
+            "--backend sglang must pin the ZMQ startup worker runtime"
         );
     }
 
