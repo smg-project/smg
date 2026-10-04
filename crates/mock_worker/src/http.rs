@@ -24,6 +24,7 @@ use axum::{
         IntoResponse, Response,
     },
     routing::{get, post},
+    serve::ListenerExt,
     Json, Router,
 };
 use futures::{stream, Stream};
@@ -65,6 +66,14 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
     // One simulated engine per listener (i.e. per virtual worker).
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
     let state = Arc::new(AppState { cfg, engine });
+    // TCP_NODELAY: without it Nagle holds each small SSE frame until the
+    // gateway's delayed ACK (~40ms) arrives, which stalls every streamed
+    // response on a pooled keep-alive connection and distorts ITL/CPU numbers.
+    let listener = listener.tap_io(move |tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::warn!("http worker {port}: set_nodelay failed: {e}");
+        }
+    });
     if let Err(e) = axum::serve(listener, router(state)).await {
         tracing::error!("http worker {port} stopped: {e}");
     }
