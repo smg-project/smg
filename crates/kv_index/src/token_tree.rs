@@ -4302,36 +4302,53 @@ mod tests {
 
     /// A tenant removed from the path between the match and the insert replay
     /// (an eviction racing the request) is re-attached and credited by the
-    /// replay, as it was when the insert re-walked the tree.
+    /// replay, as it was when the insert re-walked the tree. The request routes
+    /// to whichever tenant the match stamped, which is what makes the replay
+    /// take its skip branch; routing to the other tenant would exercise the
+    /// ordinary `touch_tenant` path whatever the guard does.
     #[test]
     fn test_match_and_insert_with_reattaches_after_eviction_during_select() {
         let tokens = make_tokens(1, 3);
         let tree = TokenTree::new();
         tree.insert_tokens(&tokens, "w1");
-        tree.insert_tokens(&tokens, "w2"); // the node outlives w1's removal
-        let w1 = intern_tenant("w1");
+        tree.insert_tokens(&tokens, "w2"); // the node outlives either removal
+                                           // One node holds the whole sequence, so the match stamps exactly one
+                                           // tenant and reports it as `matched.tenant`.
+        assert_eq!(path_nodes(&tree, &tokens).len(), 1);
 
+        let mut evicted: Option<&'static str> = None;
         let result = tree.match_and_insert_with(&tokens, |matched| {
             assert_eq!(matched.matched_token_count, tokens.len());
-            // Between the match (which stamped a tenant on every path node)
-            // and the replay: strip w1 from the whole tree.
-            tree.remove_tenant_all(&w1);
-            Some("w1")
+            // Which tenant the match stamped depends on the node's cached
+            // `last_tenant` and map order; take whichever it was.
+            let stamped: &'static str = match matched.tenant.as_ref() {
+                "w1" => "w1",
+                "w2" => "w2",
+                other => panic!("unexpected tenant {other}"),
+            };
+            evicted = Some(stamped);
+            // Between the match (which stamped this tenant on the path) and
+            // the replay: strip it from the whole tree, then route to it.
+            tree.remove_tenant_all(&intern_tenant(stamped));
+            Some(stamped)
         });
         assert_eq!(result.matched_token_count, tokens.len());
+        let evicted = evicted.expect("select ran");
+        let other = if evicted == "w1" { "w2" } else { "w1" };
 
         for node in path_nodes(&tree, &tokens) {
             assert!(
-                node.tenant_last_access_time.contains_key("w1"),
-                "replay must re-attach the evicted tenant"
+                node.tenant_last_access_time.contains_key(evicted),
+                "replay must re-attach the evicted tenant {evicted}"
             );
+            assert!(node.tenant_last_access_time.contains_key(other));
         }
         let counts = tree.get_tenant_token_counts();
         assert_eq!(
-            counts.get("w1"),
+            counts.get(evicted),
             Some(&tokens.len()),
-            "replay must re-credit the path"
+            "replay must re-credit the path to {evicted}"
         );
-        assert_eq!(counts.get("w2"), Some(&tokens.len()));
+        assert_eq!(counts.get(other), Some(&tokens.len()));
     }
 }
