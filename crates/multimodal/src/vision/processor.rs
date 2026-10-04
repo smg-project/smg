@@ -173,7 +173,10 @@ impl VisionProcessorRegistry {
 
     /// Register a processor for a model pattern.
     pub fn register(&mut self, pattern: impl Into<String>, processor: Box<dyn VisionPreProcessor>) {
-        self.processors.insert(pattern.into(), processor);
+        // Matching is case-insensitive on both sides; lowercase the pattern
+        // once here rather than every pattern on every lookup.
+        self.processors
+            .insert(pattern.into().to_lowercase(), processor);
     }
 
     /// Find a processor for the given model ID, falling back to model_type.
@@ -190,12 +193,10 @@ impl VisionProcessorRegistry {
 
     fn find_in_candidate(&self, candidate: &str) -> Option<&dyn VisionPreProcessor> {
         let candidate = candidate.to_lowercase();
-        for (pattern, processor) in &self.processors {
-            if candidate.contains(&pattern.to_lowercase()) {
-                return Some(processor.as_ref());
-            }
-        }
-        None
+        self.processors
+            .iter()
+            .find(|(pattern, _)| candidate.contains(pattern.as_str()))
+            .map(|(_, processor)| processor.as_ref())
     }
 
     /// Get list of supported model patterns.
