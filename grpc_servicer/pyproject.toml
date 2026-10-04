@@ -40,7 +40,7 @@ vllm-redis = ["redis>=5.0", "msgspec>=0.18.0"]
 # create_load_snapshot_reader(). (Earlier floors recorded the shmem load
 # snapshots that replaced the WatchLoadUpdateReq piggyback path in 0.5.13,
 # removed upstream in v0.5.14.)
-sglang = ["sglang>=0.5.20"]
+sglang = ["sglang>=0.5.20", "pyzmq>=25.0.0", "msgspec>=0.18.0"]
 # smg-grpc-proto>=0.4.7 is the first release that ships mlx_engine_pb2;
 # without this floor, installing [mlx] against an older proto build would
 # crash at import time when smg_grpc_servicer.mlx.server runs.
@@ -54,6 +54,12 @@ mlx = ["smg-grpc-proto>=0.4.7", "mlx>=0.22.0", "mlx-lm>=0.22.0,<0.32", "transfor
 # TokenSpeed itself is installed from source (no PyPI release); these are the
 # extra runtime deps the KV-event bridge needs on top of a TokenSpeed install.
 tokenspeed = ["pyzmq>=25.0.0", "msgspec>=0.18.0"]
+
+# SGLang loads this in every scheduler process; it hooks the scheduler behind
+# SMG over ZMQ only when the headless launcher's env is set (see
+# smg_grpc_servicer/sglang/zmq_plugin.py).
+[project.entry-points."sglang.srt.plugins"]
+smg-zmq = "smg_grpc_servicer.sglang.zmq_plugin:register"
 
 [project.urls]
 Homepage = "https://github.com/smg-project/smg"

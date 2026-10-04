@@ -268,6 +268,40 @@ resubscribes with zero. A zero cursor rebuilds knowledge from subsequent live
 events; it is not a complete cache snapshot. An empty replay is conservatively
 reset because it cannot distinguish an idle publisher from a restarted one.
 
+#### Headless over ZMQ (no SGLang change)
+
+SMG can drive SGLang's scheduler directly over ZMQ, the same same-host lane it
+has for vLLM and TokenSpeed, without a gRPC server or SGLang's tokenizer
+manager in between:
+
+```bash
+python -m smg_grpc_servicer.sglang.headless \
+    --zmq-handshake-address tcp://127.0.0.1:<port> --zmq-engine-index 0 \
+    --model-path Qwen/Qwen3-0.6B [any SGLang server args]
+```
+
+`smg serve --backend sglang --connection-mode zmq` runs exactly this for each
+worker, with the handshake port SMG derives from the worker's `ipc://` URL.
+The launcher spawns the scheduler ranks the way SGLang's engine does; the
+scheduler keeps its tokenizer (SMG tokenizes prompts, but SGLang's grammar
+backend for constrained decoding only exists alongside a tokenizer). Inside
+each rank, SGLang loads
+this package's plugin (`smg_grpc_servicer.sglang.zmq_plugin`, registered under
+the `sglang.srt.plugins` entry point and inert unless the launcher's
+`SMG_SGLANG_ZMQ_HANDSHAKE` is set), which hooks the scheduler's own ingress
+and egress seams: the rank that owns request I/O dials SMG's handshake once
+its model is loaded, registers its geometry, decodes SMG's requests (the
+scheduler's native `TokenizedGenerateReqInput`, normalized and verified as the
+tokenizer manager would) and answers with a slim per-step batch (token ids,
+finish reason with message, matched stop and abort status, counts,
+sampled-token logprobs with ranked top logprobs when asked, and a
+scheduler-load tail). Requests the scheduler cannot serve, `n > 1` for
+example (SMG fans out itself), are answered with a terminal abort rather than
+dropped. SGLang itself is unchanged; the plugin pins the wire of the SGLang
+version it was tested with, and a struct change upstream shows up in
+`grpc_servicer/tests/test_sglang_zmq_msgpack.py`.
+
+
 ## Architecture
 
 ```
