@@ -170,6 +170,12 @@ def _is_multi_worker(item: pytest.Item) -> bool:
     return bool(kwargs.get("prefill") or kwargs.get("decode"))
 
 
+def _is_pd_worker_set(item: pytest.Item) -> bool:
+    """True when the item's ``workers`` marker asks for prefill/decode workers."""
+    marker = resolve_class_marker(item, "workers")
+    return marker is not None and bool(marker.kwargs.get("prefill") or marker.kwargs.get("decode"))
+
+
 def _zmq_dedup_key(item: pytest.Item) -> tuple:
     """Group key ignoring the ``setup_backend`` value.
 
@@ -282,10 +288,10 @@ def _filter_sglang_rust_items(
     workers run the Rust servicer.
 
     The Rust servicer reaches the scheduler over the msgpack wire, which
-    carries generate and abort only: no PD/EPD bootstrap fields, no control
-    messages, no embeddings and no multimodal payloads. Those topologies and
-    cases stay with the Python servicer, so they are dropped here rather than
-    failing on a known gap.
+    carries no PD/EPD bootstrap fields and no multimodal payloads. Those
+    topologies and cases stay with the Python servicer, so they are dropped
+    here rather than failing on a known gap; everything else (admin ops,
+    embeddings, data-parallel workers) runs.
     """
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
@@ -293,10 +299,8 @@ def _filter_sglang_rust_items(
         param = _setup_backend_param(item)
         pd_topology = param is not None and param not in _ZMQ_LOCAL_WIRES
         module = item.nodeid.split("::", 1)[0]
-        off_the_wire = module.endswith(("test_admin_ops.py", "test_multimodal.py")) or (
-            "/embeddings/" in module
-        )
-        if pd_topology or _is_multi_worker(item) or off_the_wire:
+        multimodal = module.endswith("test_multimodal.py")
+        if pd_topology or _is_pd_worker_set(item) or multimodal:
             deselected.append(item)
         else:
             kept.append(item)

@@ -276,12 +276,17 @@ reset because it cannot distinguish an idle publisher from a restarted one.
 (`smg.servicer.SglangGrpcServer`, which needs the `smg` wheel) instead: the
 scheduler runs headless in a spawned child over the msgpack ZMQ wire below,
 the Rust server speaks the gRPC contract on top of it, and Python keeps the
-lifecycle only. The Router cannot tell the two implementations apart. What
-the wire does not carry is reported, not emulated: `Embed`, `FlushCache`,
-profiling, LoRA loading and `SubscribeKvEvents` answer UNIMPLEMENTED, prompt
-logprobs, hidden states and multimodal inputs are refused, and PD/EPD
-disaggregation stays with the Python implementation. SGLang's HTTP sidecar
-(metrics and profiling endpoints) is not started on this path.
+lifecycle only. The Router cannot tell the two implementations apart: text
+generation with sampled and prompt logprobs, reasoning-token counts, LoRA ids
+and custom logit processors forwarded as the Python servicer forwards them,
+`Embed`, `FlushCache` and profiling (the scheduler's own control requests,
+carried by the wire's control call) all answer as the Python servicer does.
+What the wire does not carry is reported, not emulated: multimodal inputs and
+hidden states are refused, PD/EPD disaggregation stays with the Python
+implementation (the worker refuses to start on the Rust path in those modes),
+and LoRA loading and `SubscribeKvEvents` answer UNIMPLEMENTED, as they do on
+the Python servicer. SGLang's HTTP sidecar (metrics and profiling endpoints)
+is not started on this path.
 
 #### Headless over ZMQ (no SGLang change)
 
@@ -306,11 +311,14 @@ the `sglang.srt.plugins` entry point and inert unless the launcher's
 `SMG_SGLANG_ZMQ_HANDSHAKE` is set), which hooks the scheduler's own ingress
 and egress seams: the rank that owns request I/O dials SMG's handshake once
 its model is loaded, registers its geometry, decodes SMG's requests (the
-scheduler's native `TokenizedGenerateReqInput`, normalized and verified as the
-tokenizer manager would) and answers with a slim per-step batch (token ids,
-finish reason with message, matched stop and abort status, counts,
-sampled-token logprobs with ranked top logprobs when asked, and a
-scheduler-load tail). Requests the scheduler cannot serve, `n > 1` for
+scheduler's native `TokenizedGenerateReqInput` or `TokenizedEmbeddingReqInput`,
+normalized and verified as the tokenizer manager would, and control calls
+that become the scheduler's own `FlushCacheReqInput` or `ProfileReq`) and
+answers with slim positional structs: a per-step token batch (token ids,
+finish reason with message, matched stop and abort status, counts including
+reasoning tokens, sampled-token and prompt logprobs with ranked top logprobs
+when asked, and a scheduler-load tail), an embedding batch, and a control
+reply under the call id. Requests the scheduler cannot serve, `n > 1` for
 example (SMG fans out itself), are answered with a terminal abort rather than
 dropped. SGLang itself is unchanged; the plugin pins the wire of the SGLang
 version it was tested with, and a struct change upstream shows up in
