@@ -4,7 +4,9 @@ use tokio::task::JoinHandle;
 
 use super::{
     error::{MediaConnectorError, MultiModalError, MultiModalResult},
-    media::{FrameSampling, ImageFetchConfig, MediaConnector, MediaSource, VideoFetchConfig},
+    media::{
+        FetchSource, FrameSampling, ImageFetchConfig, MediaConnector, MediaSource, VideoFetchConfig,
+    },
     types::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
@@ -25,11 +27,29 @@ pub struct TrackerOutput {
     pub uuids: MultiModalUUIDs,
 }
 
+/// What a fetch is looked up by before its payload is compared byte for
+/// byte: the modality, the fetch settings, and the payload's kind and length.
+/// Hashing the payload itself would cost a pass over every data URL of the
+/// request; comparing it costs a pass only over actual duplicates.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FetchKey {
+    modality: Modality,
+    settings: String,
+    kind: u8,
+    len: usize,
+}
+
+/// A slot that fetches, remembered so later parts can be matched against it.
+struct FirstFetch {
+    source: Arc<FetchSource>,
+    slot: usize,
+}
+
 pub struct AsyncMultiModalTracker {
     media_connector: Arc<MediaConnector>,
     pending: HashMap<Modality, Vec<Slot>>,
     uuids: MultiModalUUIDs,
-    first_slot: HashMap<[u8; 32], usize>,
+    first_slot: HashMap<FetchKey, Vec<FirstFetch>>,
     /// Frame rate to sample a video at when the request names none; `None`
     /// keeps the connector default.
     default_video_sample_fps: Option<f32>,
@@ -155,14 +175,32 @@ impl AsyncMultiModalTracker {
         })
     }
 
-    /// The slot that already fetches this media, if an earlier part named it;
-    /// otherwise the next slot is claimed for it.
-    fn same_media_as(&mut self, modality: Modality, key: [u8; 32]) -> Option<usize> {
+    /// The slot that already fetches this media with these settings, if an
+    /// earlier part named it; otherwise the next slot is claimed for it.
+    fn same_media_as(
+        &mut self,
+        modality: Modality,
+        settings: String,
+        source: &Arc<FetchSource>,
+    ) -> Option<usize> {
         let next = self.pending.entry(modality).or_default().len();
-        if let Some(&first) = self.first_slot.get(&key) {
-            return Some(first);
+        let key = FetchKey {
+            modality,
+            settings,
+            kind: source.kind(),
+            len: source.len(),
+        };
+        let candidates = self.first_slot.entry(key).or_default();
+        if let Some(first) = candidates
+            .iter()
+            .find(|candidate| *candidate.source == **source)
+        {
+            return Some(first.slot);
         }
-        self.first_slot.insert(key, next);
+        candidates.push(FirstFetch {
+            source: Arc::clone(source),
+            slot: next,
+        });
         None
     }
 
@@ -180,8 +218,8 @@ impl AsyncMultiModalTracker {
             detail,
             max_long_side_pixel,
         };
-        let key = fetch_key(modality, &format!("{config:?}"), &source);
-        if let Some(first) = self.same_media_as(modality, key) {
+        let source = Arc::new(FetchSource::from(source));
+        if let Some(first) = self.same_media_as(modality, format!("{config:?}"), &source) {
             self.pending
                 .entry(modality)
                 .or_default()
@@ -195,7 +233,7 @@ impl AsyncMultiModalTracker {
             reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
         )]
         let handle = tokio::spawn(async move {
-            let frame = connector.fetch_image(source, config).await?;
+            let frame = connector.fetch_image_from(&source, config).await?;
             Ok(TrackedMedia::Image(frame))
         });
 
@@ -222,8 +260,8 @@ impl AsyncMultiModalTracker {
         let modality = Modality::Video;
         self.uuids.entry(modality).or_default().push(uuid);
 
-        let key = fetch_key(modality, &format!("{cfg:?}"), &source);
-        if let Some(first) = self.same_media_as(modality, key) {
+        let source = Arc::new(FetchSource::from(source));
+        if let Some(first) = self.same_media_as(modality, format!("{cfg:?}"), &source) {
             self.pending
                 .entry(modality)
                 .or_default()
@@ -237,7 +275,7 @@ impl AsyncMultiModalTracker {
             reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
         )]
         let handle = tokio::spawn(async move {
-            let clip = connector.fetch_video(source, cfg).await?;
+            let clip = connector.fetch_video_from(&source, cfg).await?;
             Ok(TrackedMedia::Video(clip))
         });
 
@@ -252,8 +290,8 @@ impl AsyncMultiModalTracker {
         let modality = Modality::Audio;
         self.uuids.entry(modality).or_default().push(uuid);
 
-        let key = fetch_key(modality, "", &source);
-        if let Some(first) = self.same_media_as(modality, key) {
+        let source = Arc::new(FetchSource::from(source));
+        if let Some(first) = self.same_media_as(modality, String::new(), &source) {
             self.pending
                 .entry(modality)
                 .or_default()
@@ -267,7 +305,7 @@ impl AsyncMultiModalTracker {
             reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
         )]
         let handle = tokio::spawn(async move {
-            let clip = connector.fetch_audio(source).await?;
+            let clip = connector.fetch_audio_from(&source).await?;
             Ok(TrackedMedia::Audio(clip))
         });
 
@@ -290,35 +328,6 @@ fn image_url_source(url: String) -> MediaSource {
         Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
         _ => MediaSource::Url(url),
     }
-}
-
-/// Identity of one fetch: the media a part names, together with the settings
-/// it would be fetched with.
-fn fetch_key(modality: Modality, settings: &str, source: &MediaSource) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(modality.to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(settings.as_bytes());
-    hasher.update(b"\0");
-    match source {
-        MediaSource::Url(url) => {
-            hasher.update(b"url\0");
-            hasher.update(url.as_bytes());
-        }
-        MediaSource::DataUrl(url) => {
-            hasher.update(b"data\0");
-            hasher.update(url.as_bytes());
-        }
-        MediaSource::InlineBytes(bytes) => {
-            hasher.update(b"bytes\0");
-            hasher.update(bytes);
-        }
-        MediaSource::File(path) => {
-            hasher.update(b"file\0");
-            hasher.update(path.to_string_lossy().as_bytes());
-        }
-    }
-    hasher.finalize().into()
 }
 
 /// The fetch settings for one video: the request's `fps` when given (and
@@ -563,19 +572,65 @@ mod repeat_tests {
 
     #[test]
     fn a_fetch_is_shared_only_with_the_same_media_and_settings() {
-        let clip = MediaSource::Url("https://example.test/clip.mp4".to_string());
-        let key = fetch_key(Modality::Video, "one", &clip);
+        let mut tracker = tracker();
+        let clip = Arc::new(FetchSource::Url("https://example.test/clip.mp4".into()));
+        // Same length and kind, different bytes: never merged.
+        let other = Arc::new(FetchSource::Url("https://example.test/clop.mp4".into()));
 
-        assert_eq!(key, fetch_key(Modality::Video, "one", &clip));
-        assert_ne!(key, fetch_key(Modality::Video, "two", &clip));
-        assert_ne!(key, fetch_key(Modality::Image, "one", &clip));
-        assert_ne!(
-            key,
-            fetch_key(
-                Modality::Video,
-                "one",
-                &MediaSource::Url("https://example.test/other.mp4".to_string()),
-            )
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &clip),
+            None
         );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &clip),
+            Some(0)
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "two".into(), &clip),
+            None
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Image, "one".into(), &clip),
+            None
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &other),
+            None
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &other),
+            Some(0)
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &clip),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn data_urls_differing_in_one_byte_are_fetched_separately() {
+        let mut tracker = tracker();
+        let mut other = TINY_PNG_URL.to_string();
+        // Flip the last base64 character so the payload differs but not its length.
+        let last = other.pop().expect("non-empty data url");
+        other.push(if last == 'A' { 'B' } else { 'A' });
+        tracker.push_part(image_part(None)).expect("first part");
+        tracker
+            .push_part(MediaContentPart::ImageUrl {
+                url: other,
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            })
+            .expect("second part");
+
+        let slots = tracker
+            .pending
+            .get(&Modality::Image)
+            .expect("image slots")
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Fetch(_)))
+            .count();
+        assert_eq!(slots, 2);
     }
 }

@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -129,6 +129,51 @@ pub enum MediaSource {
     File(PathBuf),
 }
 
+/// A `MediaSource` as a fetch task holds it. The tracker keeps one `Arc` of
+/// it per fetch so later parts of the same request can be compared against
+/// it for deduplication, while the task reads it in place; inline bytes
+/// become `Bytes` so the frame keeps them without a copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FetchSource {
+    Url(String),
+    DataUrl(String),
+    InlineBytes(Bytes),
+    File(PathBuf),
+}
+
+impl From<MediaSource> for FetchSource {
+    fn from(source: MediaSource) -> Self {
+        match source {
+            MediaSource::Url(url) => Self::Url(url),
+            MediaSource::DataUrl(url) => Self::DataUrl(url),
+            MediaSource::InlineBytes(bytes) => Self::InlineBytes(Bytes::from(bytes)),
+            MediaSource::File(path) => Self::File(path),
+        }
+    }
+}
+
+impl FetchSource {
+    /// Which kind of source this is, as a small tag.
+    pub(crate) fn kind(&self) -> u8 {
+        match self {
+            Self::Url(_) => 0,
+            Self::DataUrl(_) => 1,
+            Self::InlineBytes(_) => 2,
+            Self::File(_) => 3,
+        }
+    }
+
+    /// Length of the payload a part names (the URL, the data URL, the bytes,
+    /// or the path).
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Url(url) | Self::DataUrl(url) => url.len(),
+            Self::InlineBytes(bytes) => bytes.len(),
+            Self::File(path) => path.as_os_str().len(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MediaConnector {
     client: Client,
@@ -165,16 +210,24 @@ impl MediaConnector {
         source: MediaSource,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+        self.fetch_image_from(&source.into(), cfg).await
+    }
+
+    pub(crate) async fn fetch_image_from(
+        &self,
+        source: &FetchSource,
+        cfg: ImageFetchConfig,
+    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         match source {
-            MediaSource::Url(url) => self.fetch_http_image(url, cfg).await,
-            MediaSource::DataUrl(data_url) => Self::fetch_data_url(data_url, cfg),
-            MediaSource::InlineBytes(bytes) => Self::decode_image(
-                bytes.into(),
+            FetchSource::Url(url) => self.fetch_http_image(url, cfg).await,
+            FetchSource::DataUrl(data_url) => Self::fetch_data_url(data_url, cfg),
+            FetchSource::InlineBytes(bytes) => Self::decode_image(
+                bytes.clone(),
                 cfg.detail,
                 cfg.max_long_side_pixel,
                 ImageSource::InlineBytes,
             ),
-            MediaSource::File(path) => self.fetch_file(path, cfg).await,
+            FetchSource::File(path) => self.fetch_file(path, cfg).await,
         }
     }
 
@@ -183,14 +236,22 @@ impl MediaConnector {
         source: MediaSource,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
+        self.fetch_video_from(&source.into(), cfg).await
+    }
+
+    pub(crate) async fn fetch_video_from(
+        &self,
+        source: &FetchSource,
+        cfg: VideoFetchConfig,
+    ) -> Result<Arc<VideoClip>, MediaConnectorError> {
         match source {
-            MediaSource::Url(url) => self.fetch_http_video(url, cfg).await,
-            MediaSource::DataUrl(data_url) => self.fetch_video_data_url(data_url, cfg).await,
-            MediaSource::InlineBytes(bytes) => {
-                self.decode_video(bytes.into(), cfg, VideoSource::InlineBytes)
+            FetchSource::Url(url) => self.fetch_http_video(url, cfg).await,
+            FetchSource::DataUrl(data_url) => self.fetch_video_data_url(data_url, cfg).await,
+            FetchSource::InlineBytes(bytes) => {
+                self.decode_video(bytes.clone(), cfg, VideoSource::InlineBytes)
                     .await
             }
-            MediaSource::File(path) => self.fetch_video_file(path, cfg).await,
+            FetchSource::File(path) => self.fetch_video_file(path, cfg).await,
         }
     }
 
@@ -198,23 +259,31 @@ impl MediaConnector {
         &self,
         source: MediaSource,
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
+        self.fetch_audio_from(&source.into()).await
+    }
+
+    pub(crate) async fn fetch_audio_from(
+        &self,
+        source: &FetchSource,
+    ) -> Result<Arc<AudioClip>, MediaConnectorError> {
         match source {
-            MediaSource::Url(url) => self.fetch_http_audio(url).await,
-            MediaSource::DataUrl(data_url) => self.fetch_audio_data_url(data_url).await,
-            MediaSource::InlineBytes(bytes) => {
-                self.decode_audio(bytes.into(), AudioSource::InlineBytes)
+            FetchSource::Url(url) => self.fetch_http_audio(url).await,
+            FetchSource::DataUrl(data_url) => self.fetch_audio_data_url(data_url).await,
+            FetchSource::InlineBytes(bytes) => {
+                self.decode_audio(bytes.clone(), AudioSource::InlineBytes)
                     .await
             }
-            MediaSource::File(path) => self.fetch_audio_file(path).await,
+            FetchSource::File(path) => self.fetch_audio_file(path).await,
         }
     }
 
     async fn fetch_http_image(
         &self,
-        url: String,
+        url: &str,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let parsed = Url::parse(&url).map_err(|_| MediaConnectorError::InvalidUrl(url.clone()))?;
+        let parsed =
+            Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
         self.ensure_domain_allowed(&parsed)?;
 
         let mut req = self.client.get(parsed.as_str());
@@ -243,7 +312,7 @@ impl MediaConnector {
     }
 
     fn fetch_data_url(
-        data_url: String,
+        data_url: &str,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         let (metadata, data) = data_url
@@ -268,7 +337,7 @@ impl MediaConnector {
 
     async fn fetch_video_data_url(
         &self,
-        data_url: String,
+        data_url: &str,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
         let (metadata, data) = data_url
@@ -289,7 +358,7 @@ impl MediaConnector {
 
     async fn fetch_audio_data_url(
         &self,
-        data_url: String,
+        data_url: &str,
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
         let (metadata, data) = data_url
             .split_once(',')
@@ -309,7 +378,7 @@ impl MediaConnector {
 
     async fn fetch_file(
         &self,
-        path: PathBuf,
+        path: &Path,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         let allowed_root = self
@@ -317,7 +386,7 @@ impl MediaConnector {
             .as_ref()
             .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
 
-        let canonical = fs::canonicalize(&path).await?;
+        let canonical = fs::canonicalize(path).await?;
         if !canonical.starts_with(allowed_root) {
             return Err(MediaConnectorError::DisallowedLocalPath(
                 path.display().to_string(),
@@ -335,10 +404,11 @@ impl MediaConnector {
 
     async fn fetch_http_video(
         &self,
-        url: String,
+        url: &str,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let parsed = Url::parse(&url).map_err(|_| MediaConnectorError::InvalidUrl(url.clone()))?;
+        let parsed =
+            Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
         self.ensure_domain_allowed(&parsed)?;
 
         let mut req = self.client.get(parsed.as_str());
@@ -366,8 +436,9 @@ impl MediaConnector {
         .await
     }
 
-    async fn fetch_http_audio(&self, url: String) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let parsed = Url::parse(&url).map_err(|_| MediaConnectorError::InvalidUrl(url.clone()))?;
+    async fn fetch_http_audio(&self, url: &str) -> Result<Arc<AudioClip>, MediaConnectorError> {
+        let parsed =
+            Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
         self.ensure_domain_allowed(&parsed)?;
 
         let mut req = self.client.get(parsed.as_str());
@@ -396,7 +467,7 @@ impl MediaConnector {
 
     async fn fetch_video_file(
         &self,
-        path: PathBuf,
+        path: &Path,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
         let allowed_root = self
@@ -404,7 +475,7 @@ impl MediaConnector {
             .as_ref()
             .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
 
-        let canonical = fs::canonicalize(&path).await?;
+        let canonical = fs::canonicalize(path).await?;
         if !canonical.starts_with(allowed_root) {
             return Err(MediaConnectorError::DisallowedLocalPath(
                 path.display().to_string(),
@@ -416,13 +487,13 @@ impl MediaConnector {
             .await
     }
 
-    async fn fetch_audio_file(&self, path: PathBuf) -> Result<Arc<AudioClip>, MediaConnectorError> {
+    async fn fetch_audio_file(&self, path: &Path) -> Result<Arc<AudioClip>, MediaConnectorError> {
         let allowed_root = self
             .allowed_local_media_path
             .as_ref()
             .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
 
-        let canonical = fs::canonicalize(&path).await?;
+        let canonical = fs::canonicalize(path).await?;
         if !canonical.starts_with(allowed_root) {
             return Err(MediaConnectorError::DisallowedLocalPath(
                 path.display().to_string(),
@@ -551,7 +622,7 @@ impl MediaConnector {
 }
 
 async fn read_file_with_limit(
-    path: &std::path::Path,
+    path: &Path,
     limit: usize,
     media: &'static str,
 ) -> Result<Bytes, MediaConnectorError> {
@@ -792,7 +863,7 @@ async fn decode_video_bytes_with_ffmpeg(
 
 #[cfg(feature = "opencv-video")]
 async fn decode_video_frames_from_path(
-    input_path: &std::path::Path,
+    input_path: &Path,
     input_bytes: usize,
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
@@ -859,7 +930,7 @@ async fn decode_video_frames_from_path(
 
 #[cfg(feature = "opencv-video")]
 fn decode_video_with_opencv_logged(
-    input_path: &std::path::Path,
+    input_path: &Path,
     input_bytes: usize,
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
@@ -969,7 +1040,7 @@ fn log_video_decode_backend_timing(
 
 #[cfg(feature = "opencv-video")]
 fn decode_video_with_opencv_file(
-    input_path: &std::path::Path,
+    input_path: &Path,
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
     let input = input_path.to_str().ok_or_else(|| {
@@ -1411,7 +1482,7 @@ fn opencv_decode_error(err: opencv::Error) -> MediaConnectorError {
 }
 
 async fn decode_video_with_ffmpeg(
-    input_path: &std::path::Path,
+    input_path: &Path,
     input_bytes: usize,
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
@@ -1452,7 +1523,7 @@ async fn decode_video_with_ffmpeg(
 
 /// One pass over the ppm, raw and png runners; `selection` pins the exact source frames.
 async fn decode_video_with_ffmpeg_runners(
-    input_path: &std::path::Path,
+    input_path: &Path,
     input_bytes: usize,
     cfg: VideoFetchConfig,
     metadata: Option<VideoMetadata>,
@@ -1637,7 +1708,7 @@ async fn run_video_command_output(
 }
 
 async fn decode_video_with_ffmpeg_ppm(
-    input_path: &std::path::Path,
+    input_path: &Path,
     cfg: VideoFetchConfig,
     metadata: VideoMetadata,
     selection: Option<&FrameSelection>,
@@ -1686,7 +1757,7 @@ async fn decode_video_with_ffmpeg_ppm(
 }
 
 async fn decode_video_with_ffmpeg_raw(
-    input_path: &std::path::Path,
+    input_path: &Path,
     cfg: VideoFetchConfig,
     metadata: VideoMetadata,
     selection: Option<&FrameSelection>,
@@ -1758,7 +1829,7 @@ async fn decode_video_with_ffmpeg_raw(
 }
 
 async fn decode_video_with_ffmpeg_png(
-    input_path: &std::path::Path,
+    input_path: &Path,
     cfg: VideoFetchConfig,
     metadata: Option<VideoMetadata>,
     selection: Option<&FrameSelection>,
@@ -1841,9 +1912,7 @@ struct ProbedVideoInfo {
     total_frames: Option<usize>,
 }
 
-async fn probe_video_metadata(
-    input_path: &std::path::Path,
-) -> Result<VideoMetadata, MediaConnectorError> {
+async fn probe_video_metadata(input_path: &Path) -> Result<VideoMetadata, MediaConnectorError> {
     let info = probe_video_info(input_path).await?;
     let width = info.width.ok_or_else(|| {
         MediaConnectorError::VideoDecode("ffprobe did not return video width".to_string())
@@ -1860,9 +1929,7 @@ async fn probe_video_metadata(
     })
 }
 
-async fn probe_video_info(
-    input_path: &std::path::Path,
-) -> Result<ProbedVideoInfo, MediaConnectorError> {
+async fn probe_video_info(input_path: &Path) -> Result<ProbedVideoInfo, MediaConnectorError> {
     let mut command = Command::new("ffprobe");
     command
         .args([
@@ -2224,10 +2291,7 @@ fn fps_filter_for_duration(duration: f64, cfg: VideoFetchConfig) -> Option<Strin
     Some(format!("fps={fps:.6}"))
 }
 
-async fn sampling_filter_for_video(
-    input_path: &std::path::Path,
-    cfg: VideoFetchConfig,
-) -> (String, f32) {
+async fn sampling_filter_for_video(input_path: &Path, cfg: VideoFetchConfig) -> (String, f32) {
     if let Ok(duration) = probe_video_duration_seconds(input_path).await {
         if let Some(filter) = fps_filter_for_duration(duration, cfg) {
             return (filter, effective_sample_fps(Some(duration), cfg));
@@ -2237,9 +2301,7 @@ async fn sampling_filter_for_video(
     (format!("fps={}", cfg.sample_fps), cfg.sample_fps)
 }
 
-async fn probe_video_duration_seconds(
-    input_path: &std::path::Path,
-) -> Result<f64, MediaConnectorError> {
+async fn probe_video_duration_seconds(input_path: &Path) -> Result<f64, MediaConnectorError> {
     match probe_video_info(input_path).await {
         Ok(ProbedVideoInfo {
             duration_seconds: Some(duration),
@@ -2250,7 +2312,7 @@ async fn probe_video_duration_seconds(
 }
 
 async fn probe_video_duration_seconds_with_ffmpeg(
-    input_path: &std::path::Path,
+    input_path: &Path,
 ) -> Result<f64, MediaConnectorError> {
     let mut command = Command::new("ffmpeg");
     command
