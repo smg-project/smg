@@ -38,6 +38,7 @@ use crate::{
     codec::{encode_msgpack, OpaqueValue},
     error::{Error, Result},
     protocol::{
+        sglang::SglangProtocol,
         tokenspeed::TokenSpeedProtocol,
         vllm::{
             request::{EngineCoreRequestType, UtilityCall},
@@ -56,6 +57,10 @@ pub type EngineCoreStream = RequestStream<VllmProtocol>;
 pub type TokenSpeedClient = Client<TokenSpeedProtocol>;
 /// The per-request output stream for the TokenSpeed connector.
 pub type TokenSpeedStream = RequestStream<TokenSpeedProtocol>;
+/// The SGLang connector.
+pub type SglangClient = Client<SglangProtocol>;
+/// The per-request output stream for the SGLang connector.
+pub type SglangStream = RequestStream<SglangProtocol>;
 
 /// Per-request output channels are unbounded on purpose. The dispatcher fans
 /// one engine tick out to every request in it while holding the registry lock,

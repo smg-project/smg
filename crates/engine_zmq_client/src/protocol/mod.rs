@@ -1,10 +1,11 @@
 //! Per-engine wire protocol modules plus the engine-neutral seam the transport
 //! and connector are generic over.
 //!
-//! vLLM's EngineCore protocol and TokenSpeed's native msgpack protocol
-//! (issues #2003/#2006) live alongside each other. Both are msgpack-over-ZMQ
-//! with a single-byte request-type frame and share the same transport — only
-//! the message struct shapes differ, so the transport and connector are
+//! vLLM's EngineCore protocol, TokenSpeed's native msgpack protocol (issues
+//! #2003/#2006) and SGLang's scheduler structs (spoken by the SMG plugin inside
+//! the scheduler) live alongside each other. All are msgpack-over-ZMQ with a
+//! single-byte request-type frame and share the same transport — only the
+//! message struct shapes differ, so the transport and connector are
 //! parameterized over the [`EngineProtocol`] trait and each engine family
 //! provides one implementation.
 
@@ -13,13 +14,15 @@ use bytes::Bytes;
 use crate::{codec::OpaqueValue, Result};
 
 pub mod handshake;
+pub(crate) mod positional;
+pub mod sglang;
 pub mod tokenspeed;
 pub mod vllm;
 
 /// Engine-neutral per-rank load signal. Each protocol maps its native scheduler
-/// stats into this shape (vLLM maps `SchedulerStats`; TokenSpeed carries none
-/// yet), so the connector and gateway consume one load type regardless of
-/// engine. Extend it as more engines report load (task #11).
+/// stats into this shape (vLLM its `SchedulerStats`, TokenSpeed and SGLang the
+/// load tail of their slim batches), so the connector and gateway consume one
+/// load type regardless of engine.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EngineLoad {
     /// Requests currently in model-execution batches.
