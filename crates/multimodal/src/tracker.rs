@@ -90,7 +90,7 @@ impl AsyncMultiModalTracker {
                 uuid,
                 max_long_side_pixel,
             } => {
-                let source = image_url_source(url);
+                let source = media_url_source(url, "data:image/");
                 self.enqueue_image(
                     source,
                     detail.unwrap_or_default(),
@@ -115,10 +115,7 @@ impl AsyncMultiModalTracker {
                 return Err(MultiModalError::UnsupportedContent("image_embeds"));
             }
             MediaContentPart::AudioUrl { url, uuid } => {
-                let source = match url::Url::parse(&url) {
-                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-                    _ => MediaSource::Url(url),
-                };
+                let source = media_url_source(url, "data:audio/");
                 self.enqueue_audio(source, uuid);
             }
             MediaContentPart::AudioData {
@@ -134,10 +131,7 @@ impl AsyncMultiModalTracker {
                 fps,
                 max_long_side_pixel,
             } => {
-                let source = match url::Url::parse(&url) {
-                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-                    _ => MediaSource::Url(url),
-                };
+                let source = media_url_source(url, "data:video/");
                 self.enqueue_video(source, uuid, fps, max_long_side_pixel)?;
             }
             MediaContentPart::VideoData {
@@ -317,11 +311,12 @@ impl AsyncMultiModalTracker {
 }
 
 // Avoid scanning and allocating the entire payload just to identify its scheme.
-// Only canonical opaque image URLs take this path; noncanonical forms and
+// Only canonical opaque data URLs of the part's own media type take this path
+// (`data:image/`, `data:audio/`, `data:video/`); noncanonical forms and
 // invalid data:// authorities retain URL parsing. Connector validation still
 // receives the original input unchanged.
-fn image_url_source(url: String) -> MediaSource {
-    if url.starts_with("data:image/") {
+fn media_url_source(url: String, canonical_data_prefix: &str) -> MediaSource {
+    if url.starts_with(canonical_data_prefix) {
         return MediaSource::DataUrl(url);
     }
     match url::Url::parse(&url) {
@@ -474,36 +469,43 @@ mod repeat_tests {
     const TINY_PNG_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
 
     #[test]
-    fn fast_image_scheme_classification_matches_url_parser() {
-        let mut cases = vec![
-            TINY_PNG_URL.to_owned(),
-            "data:".to_owned(),
-            "DATA:image/png;base64,abc".to_owned(),
-            " data:text/plain,hello".to_owned(),
-            "https://example.com/image".to_owned(),
-            "not-a-url".to_owned(),
-            "data://[invalid];base64,abc".to_owned(),
-            "data:\n//[invalid];base64,abc".to_owned(),
-            "data://user:password@[invalid]/image;base64,abc".to_owned(),
-            "data:;base64,abc".to_owned(),
-        ];
-        for byte in 0..=127u8 {
-            cases.push(format!("data:{};base64,abc", char::from(byte)));
-            cases.push(format!("data:text/plain,abc{}def", char::from(byte)));
-            cases.push(format!("data:image/png;base64,abc{}def", char::from(byte)));
-        }
-        for input in cases {
-            let expected = url::Url::parse(&input).is_ok_and(|url| url.scheme() == "data");
-            match image_url_source(input.clone()) {
-                MediaSource::DataUrl(actual) => {
-                    assert!(expected, "{input:?}");
-                    assert_eq!(actual, input);
+    fn fast_data_scheme_classification_matches_url_parser() {
+        for (prefix, mime) in [
+            ("data:image/", "image/png"),
+            ("data:audio/", "audio/wav"),
+            ("data:video/", "video/mp4"),
+        ] {
+            let mut cases = vec![
+                TINY_PNG_URL.to_owned(),
+                format!("data:{mime};base64,abc"),
+                "data:".to_owned(),
+                format!("DATA:{mime};base64,abc"),
+                " data:text/plain,hello".to_owned(),
+                "https://example.com/image".to_owned(),
+                "not-a-url".to_owned(),
+                "data://[invalid];base64,abc".to_owned(),
+                "data:\n//[invalid];base64,abc".to_owned(),
+                "data://user:password@[invalid]/image;base64,abc".to_owned(),
+                "data:;base64,abc".to_owned(),
+            ];
+            for byte in 0..=127u8 {
+                cases.push(format!("data:{};base64,abc", char::from(byte)));
+                cases.push(format!("data:text/plain,abc{}def", char::from(byte)));
+                cases.push(format!("data:{mime};base64,abc{}def", char::from(byte)));
+            }
+            for input in cases {
+                let expected = url::Url::parse(&input).is_ok_and(|url| url.scheme() == "data");
+                match media_url_source(input.clone(), prefix) {
+                    MediaSource::DataUrl(actual) => {
+                        assert!(expected, "{input:?}");
+                        assert_eq!(actual, input);
+                    }
+                    MediaSource::Url(actual) => {
+                        assert!(!expected, "{input:?}");
+                        assert_eq!(actual, input);
+                    }
+                    _ => panic!("unexpected media source"),
                 }
-                MediaSource::Url(actual) => {
-                    assert!(!expected, "{input:?}");
-                    assert_eq!(actual, input);
-                }
-                _ => panic!("unexpected image source"),
             }
         }
     }
