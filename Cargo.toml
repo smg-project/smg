@@ -161,7 +161,10 @@ opt-level = 2
 # gather, wire serialization, base64 and hashing of inline images), the
 # tokenizer path (encode, per-token decode, stop-sequence scan) and the
 # cache-aware routing trees. Built for size they run 25-50% slower; the
-# binary grows by about 1.5 MB (measured in the PR that added these).
+# binary grows by about 1.5 MB (measured in #2768). Note that generic
+# functions are compiled in the crate that instantiates them, at that
+# crate's opt-level: a kv-index entry point generic over a caller closure
+# only benefits once it hands the work to a non-generic inner function.
 [profile.release.package.llm-multimodal]
 opt-level = 3
 
@@ -195,7 +198,8 @@ opt-level = 3
 [profile.release.package.onig_sys]
 opt-level = 3
 
-# The cache-aware routing trees, walked on every request.
+# The cache-aware routing trees, walked on every request (the fused
+# match-and-insert walk is made non-generic in #2766 so it is built here).
 [profile.release.package.kv-index]
 opt-level = 3
 
