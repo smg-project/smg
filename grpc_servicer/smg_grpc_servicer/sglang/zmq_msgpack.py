@@ -34,6 +34,7 @@ import logging
 import struct
 import time
 from array import array
+from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -539,6 +540,10 @@ class MsgpackSendSocket:
         self.socket: zmq.Socket | None = None
         self.engine_index = engine_index
         self._load_probe: Callable[[], LoadSnapshot] | None = None
+        # Requests whose outputs this side could not relay: SMG was told, the
+        # scheduler was not; the receiver's next drain aborts them there.
+        self.pending_aborts: deque[str] = deque()
+        self._relay_failures_logged: set[str] = set()
 
     def attach(
         self,
@@ -593,16 +598,28 @@ class MsgpackSendSocket:
     def send_output(self, output: Any, recv_obj: object | None = None) -> None:
         """Relay one scheduler output. This runs on the scheduler's loop, so
         it never raises: an output this side cannot convert ends its requests
-        with a terminal abort (SMG's streams must not hang) and is logged."""
+        with a terminal abort (SMG's streams must not hang) and queues them
+        for an abort in the scheduler, which would otherwise keep decoding
+        for clients that already got an error (``pending_aborts``, read by
+        the receiver's next drain). The traceback is logged once per output
+        type; a failure that repeats every step logs one line."""
         try:
             self._relay(output, recv_obj)
         except Exception as exc:
             rids = list(getattr(output, "rids", None) or [])
             if not rids and getattr(output, "rid", None):
                 rids = [output.rid]
-            logger.exception(
-                "zmq msgpack: could not relay a %s for %s", type(output).__name__, rids
-            )
+            kind = type(output).__name__
+            if kind not in self._relay_failures_logged:
+                self._relay_failures_logged.add(kind)
+                logger.exception(
+                    "zmq msgpack: could not relay a %s for %s (later failures of this "
+                    "type log one line)",
+                    kind,
+                    rids,
+                )
+            else:
+                logger.warning("zmq msgpack: could not relay a %s for %s: %s", kind, rids, exc)
             for rid in rids:
                 try:
                     self.send_terminal_abort(
@@ -610,6 +627,7 @@ class MsgpackSendSocket:
                     )
                 except Exception as nested:  # the socket is gone: nothing left to tell
                     logger.warning("zmq msgpack: could not abort %s: %s", rid, nested)
+                self.pending_aborts.append(rid)
 
     def _relay(self, output: Any, recv_obj: object | None) -> None:
         from sglang.srt.managers.io_struct import (
@@ -718,11 +736,14 @@ class MsgpackRecvSocket:
         reject: Callable[[str, str], None],
         tokenizer: object | None = None,
         control_reply: Callable[[int, bool, str | None], None] | None = None,
+        pending_aborts: deque[str] | None = None,
     ) -> None:
         self.socket = socket
         self._vocab_size = vocab_size
         self._reject = reject
         self._control_reply = control_reply
+        # The sender's queue of requests it already ended on SMG's side.
+        self._pending_aborts = pending_aborts if pending_aborts is not None else deque()
         # The scheduler's tokenizer when it keeps one (grammar-constrained
         # decoding needs it); normalization then resolves stop strings too.
         self._tokenizer = tokenizer
@@ -754,11 +775,16 @@ class MsgpackRecvSocket:
 
     def drain(self, max_recv: int) -> list:
         from sglang.srt.managers.io_struct import (
+            AbortReq,
             TokenizedEmbeddingReqInput,
             TokenizedGenerateReqInput,
         )
 
+        # Requests the sender ended on SMG's side (an output it could not
+        # relay) still run here: free them, the way an ABORT frame would.
         received: list = []
+        while self._pending_aborts:
+            received.append(AbortReq(rid=self._pending_aborts.popleft()))
         while max_recv < 0 or len(received) < max_recv:
             try:
                 frames = self.socket.recv_multipart(zmq.NOBLOCK, copy=False)
@@ -892,6 +918,7 @@ def connect_msgpack_engine(
         sender.send_terminal_abort,
         tokenizer,
         control_reply=sender.send_control_reply,
+        pending_aborts=sender.pending_aborts,
     )
 
 
