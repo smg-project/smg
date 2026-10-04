@@ -311,34 +311,61 @@ async fn fetch_grpc_metadata(
     Ok((labels, runtime_type.to_string()))
 }
 
-/// The gateway's model directory, when this worker serves that model: a
+/// The gateway's model (a directory or a Hub id), when this worker serves it: a
 /// worker with no identity of its own takes the gateway's (as registration
 /// does), one declaring a different model keeps its own defaults.
-fn zmq_model_dir(router_model: Option<String>, declared_model: &str) -> Option<String> {
+fn zmq_model(router_model: Option<String>, declared_model: &str) -> Option<String> {
     router_model.filter(|path| declared_model == UNKNOWN_MODEL_ID || declared_model == path)
 }
 
 /// Labels for a ZMQ worker from the gateway's model: the sampling defaults in
-/// its `generation_config.json`. A local directory is read in place; a Hub id
-/// is served from the HF cache the gateway's tokenizer loads from (fetched
-/// into it when absent). A model without the file yields none.
-async fn zmq_local_labels(model: Option<&str>) -> HashMap<String, String> {
+/// its `generation_config.json`. A local directory is read in place; a Hub
+/// repo id is served from the HF cache the gateway's tokenizer loads from,
+/// fetched into it when absent, within a bound that keeps registration short
+/// on an offline gateway. A local file, a path that does not exist on this
+/// host, or a model without the file yields none.
+async fn zmq_model_labels(model: Option<&str>) -> HashMap<String, String> {
     let Some(model) = model else {
         return HashMap::new();
     };
     let local = std::path::Path::new(model);
     let path = if local.is_dir() {
         local.join("generation_config.json")
+    } else if local.exists() || !is_hub_repo_id(model) {
+        return HashMap::new();
     } else {
-        match llm_tokenizer::hub::fetch_file(model, "generation_config.json").await {
-            Ok(path) => path,
-            Err(e) => {
+        let fetch = llm_tokenizer::hub::fetch_file(model, "generation_config.json");
+        match tokio::time::timeout(HUB_FETCH_TIMEOUT, fetch).await {
+            Ok(Ok(path)) => path,
+            Ok(Err(e)) => {
                 debug!("No generation_config.json for {model} via the Hub cache: {e}");
+                return HashMap::new();
+            }
+            Err(_) => {
+                warn!("Hub lookup of generation_config.json for {model} timed out; no sampling defaults");
                 return HashMap::new();
             }
         }
     };
     sampling_defaults_label(&path).await
+}
+
+/// Bound on fetching `generation_config.json` from the Hub, inside the step's
+/// own timeout so an unreachable Hub costs one wait, not the step's retries.
+const HUB_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `owner/name`, or a bare legacy `name`: no leading `/`, `.` or `~` and at
+/// most one separator, so a path meant for another host is never sent to the
+/// Hub as a repo id.
+fn is_hub_repo_id(model: &str) -> bool {
+    !model.starts_with(['/', '.', '~'])
+        && model.matches('/').count() <= 1
+        && model.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
 }
 
 /// The sampling-defaults label from one `generation_config.json`, or none.
@@ -485,9 +512,8 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .app_context
                     .as_ref()
                     .and_then(|app| app.router_config.model_path.clone());
-                let model_dir =
-                    zmq_model_dir(router_model, resolve_model_id(config, &config.labels));
-                Ok((zmq_local_labels(model_dir.as_deref()).await, None))
+                let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
+                Ok((zmq_model_labels(model.as_deref()).await, None))
             }
         }
         .unwrap_or_else(|e| {
@@ -523,7 +549,7 @@ mod tests {
             r#"{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "repetition_penalty": 1.05, "max_new_tokens": 2048, "do_sample": true}"#,
         )
         .unwrap();
-        let labels = zmq_local_labels(Some(dir.path().to_str().unwrap())).await;
+        let labels = zmq_model_labels(Some(dir.path().to_str().unwrap())).await;
         let defaults: serde_json::Value =
             serde_json::from_str(&labels[DEFAULT_SAMPLING_PARAMS_LABEL]).unwrap();
         assert_eq!(defaults["top_k"], 20);
@@ -534,21 +560,43 @@ mod tests {
         );
         // Only a worker serving the gateway's model takes its defaults.
         assert_eq!(
-            zmq_model_dir(Some("/m/a".into()), UNKNOWN_MODEL_ID).as_deref(),
+            zmq_model(Some("/m/a".into()), UNKNOWN_MODEL_ID).as_deref(),
             Some("/m/a")
         );
         assert_eq!(
-            zmq_model_dir(Some("/m/a".into()), "/m/a").as_deref(),
+            zmq_model(Some("/m/a".into()), "/m/a").as_deref(),
             Some("/m/a")
         );
-        assert_eq!(zmq_model_dir(Some("/m/a".into()), "org/other"), None);
-        assert_eq!(zmq_model_dir(None, UNKNOWN_MODEL_ID), None);
+        assert_eq!(zmq_model(Some("/m/a".into()), "org/other"), None);
+        assert_eq!(zmq_model(None, UNKNOWN_MODEL_ID), None);
         // No model, or a directory without the file: no label.
-        assert!(zmq_local_labels(None).await.is_empty());
+        assert!(zmq_model_labels(None).await.is_empty());
         let bare = tempfile::tempdir().unwrap();
-        assert!(zmq_local_labels(Some(bare.path().to_str().unwrap()))
+        assert!(zmq_model_labels(Some(bare.path().to_str().unwrap()))
             .await
             .is_empty());
+        // A local file, or a path that is no repo id and does not exist here
+        // (an engine-side mount), never goes to the Hub: no label.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(zmq_model_labels(Some(file.path().to_str().unwrap()))
+            .await
+            .is_empty());
+        assert!(zmq_model_labels(Some("/models/not/mounted/here"))
+            .await
+            .is_empty());
+        assert!(is_hub_repo_id("Qwen/Qwen3-0.6B"));
+        assert!(is_hub_repo_id("gpt2"));
+        for not_id in [
+            "/models/qwen",
+            "./qwen",
+            "~/qwen",
+            "a/b/c",
+            "models--Qwen--Qwen3-0.6B/snapshots/x",
+            "",
+            "org/",
+        ] {
+            assert!(!is_hub_repo_id(not_id), "{not_id}");
+        }
     }
 
     use super::*;
