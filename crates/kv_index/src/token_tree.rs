@@ -339,6 +339,11 @@ impl Node {
     /// order. One write-locked lookup instead of a read-locked check followed
     /// by a write-locked update. `None` when no tenant owns the node (then
     /// nothing is stamped or counted, as before).
+    ///
+    /// A returned tenant is always one this call stamped: both branches pick
+    /// and stamp under the same shard guard, so an eviction cannot remove the
+    /// pick in between and leave the match naming a tenant that no longer
+    /// owns the node. A match never re-attaches an evicted tenant.
     fn touch_any_tenant(&self, ts: u64, track_lfu: bool) -> Option<TenantId> {
         let cached = self.last_tenant.read().clone();
         let tenant = cached
@@ -349,15 +354,13 @@ impl Node {
                     .is_some()
             })
             .or_else(|| {
-                let tenant = self
-                    .tenant_last_access_time
-                    .iter()
+                self.tenant_last_access_time
+                    .iter_mut()
                     .next()
-                    .map(|entry| Arc::clone(entry.key()))?;
-                if let Some(mut stamp) = self.tenant_last_access_time.get_mut(tenant.as_ref()) {
-                    *stamp = ts;
-                }
-                Some(tenant)
+                    .map(|mut entry| {
+                        *entry.value_mut() = ts;
+                        Arc::clone(entry.key())
+                    })
             })?;
         if track_lfu {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
@@ -4350,5 +4353,77 @@ mod tests {
             "replay must re-credit the path to {evicted}"
         );
         assert_eq!(counts.get(other), Some(&tokens.len()));
+    }
+
+    /// `touch_any_tenant` reports only a tenant it stamped in this call. The
+    /// pick and the stamp share one guard, so an eviction between them cannot
+    /// make the match name a tenant that no longer owns the node, and a match
+    /// never re-attaches an evicted tenant.
+    #[test]
+    fn test_touch_any_tenant_reports_only_a_stamped_tenant() {
+        let node = Node::new(make_tokens(1, 1));
+        let (w1, w2) = (intern_tenant("w1"), intern_tenant("w2"));
+        node.touch_tenant(&w1, 1, false);
+        node.touch_tenant(&w2, 2, false);
+
+        // Cached fast path: the cached tenant still owns the node.
+        *node.last_tenant.write() = Some(Arc::clone(&w1));
+        let picked = node.touch_any_tenant(10, false).expect("owned node");
+        assert!(Arc::ptr_eq(&picked, &w1));
+        assert_eq!(*node.tenant_last_access_time.get("w1").expect("w1"), 10);
+        assert_eq!(*node.tenant_last_access_time.get("w2").expect("w2"), 2);
+
+        // The cached tenant was evicted: the fallback picks a tenant that
+        // owns the node, stamps it, and does not bring the evicted one back.
+        node.tenant_last_access_time.remove("w1");
+        let picked = node
+            .touch_any_tenant(32, false)
+            .expect("w2 still owns the node");
+        assert!(Arc::ptr_eq(&picked, &w2), "picked {picked}");
+        assert_eq!(*node.tenant_last_access_time.get("w2").expect("w2"), 32);
+        assert!(
+            !node.tenant_last_access_time.contains_key("w1"),
+            "a match must not re-attach an evicted tenant"
+        );
+        // 32 & 0xF == 0: the cache refresh names the tenant actually stamped.
+        assert!(node
+            .last_tenant
+            .read()
+            .as_ref()
+            .is_some_and(|t| Arc::ptr_eq(t, &w2)));
+
+        // No cache, two owners: evict whichever iterates first; the pick is
+        // the other one, stamped.
+        node.touch_tenant(&w1, 40, false);
+        *node.last_tenant.write() = None;
+        let first_in_order = node
+            .tenant_last_access_time
+            .iter()
+            .next()
+            .map(|entry| Arc::clone(entry.key()))
+            .expect("two owners");
+        let other = if first_in_order.as_ref() == "w1" {
+            &w2
+        } else {
+            &w1
+        };
+        node.tenant_last_access_time.remove(first_in_order.as_ref());
+        let picked = node.touch_any_tenant(41, false).expect("one owner left");
+        assert!(Arc::ptr_eq(&picked, other), "picked {picked}");
+        assert_eq!(
+            *node
+                .tenant_last_access_time
+                .get(other.as_ref())
+                .expect("other"),
+            41
+        );
+        assert!(!node
+            .tenant_last_access_time
+            .contains_key(first_in_order.as_ref()));
+
+        // All evicted: nothing to pick, nothing stamped or attached.
+        node.tenant_last_access_time.remove(other.as_ref());
+        assert!(node.touch_any_tenant(42, false).is_none());
+        assert!(node.tenant_last_access_time.is_empty());
     }
 }
