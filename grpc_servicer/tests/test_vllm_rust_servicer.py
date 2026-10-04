@@ -169,13 +169,15 @@ def test_launcher_import_of_this_package_satisfies_the_hook_check(tmp_path):
     assert rust.upstream_hook_installed(vllm_root=str(tmp_path / "vllm")) is False
 
 
-def test_plugin_adds_the_servicer_impl_flag_to_grpc_parsers():
+def test_plugin_adds_the_servicer_impl_flag_to_grpc_parsers(monkeypatch):
     """vLLM loads this package's general plugin while it builds the serve
     parser; the flag joins any parser that defines --grpc, as it parses."""
     pytest.importorskip("vllm")
     from smg_grpc_servicer.vllm import plugin
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+    # Recorded, so teardown undoes the value the parse step exports.
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
     plugin.register()
     plugin.register()  # idempotent: one wrap of the parse step
     parser = FlexibleArgumentParser(prog="vllm serve")
@@ -231,7 +233,9 @@ def test_plugin_exports_the_parsed_flag_for_the_python_guard(monkeypatch):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     plugin.register()
-    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    monkeypatch.setenv(
+        rust.SERVICER_IMPL_ENV, "python"
+    )  # recorded, so teardown undoes the plugin's write
     parser = FlexibleArgumentParser(prog="vllm serve")
     parser.add_argument("--grpc", action="store_true")
     parser.parse_args(["--grpc", "--servicer-impl", "rust"])

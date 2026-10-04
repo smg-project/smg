@@ -465,24 +465,6 @@ def _imports_servicer_at_module_level(source: str) -> bool:
                         else [child]
                     )
     return False
-    statements = list(tree.body)
-    while statements:
-        node = statements.pop()
-        if isinstance(node, ast.ImportFrom) and node.module in _SWITCH_MODULES:
-            return True
-        if isinstance(node, ast.Import) and any(
-            alias.name in _SWITCH_MODULES for alias in node.names
-        ):
-            return True
-        if isinstance(node, (ast.Try, ast.If, ast.With)):
-            for field in ("body", "orelse", "finalbody", "handlers"):
-                for child in getattr(node, field, []) or []:
-                    statements.extend(
-                        getattr(child, "body", [child])
-                        if isinstance(child, ast.ExceptHandler)
-                        else [child]
-                    )
-    return False
 
 
 def require_upstream_hook() -> None:
