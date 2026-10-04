@@ -7,9 +7,13 @@ use tracing_appender::{
     non_blocking::WorkerGuard,
     rolling::{RollingFileAppender, Rotation},
 };
-use tracing_log::LogTracer;
+use tracing_log::{AsLog, LogTracer};
 use tracing_subscriber::{
-    fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    filter::{LevelFilter, Targets},
+    fmt::time::ChronoUtc,
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    EnvFilter, Layer, Registry,
 };
 
 use super::otel_trace::get_otel_layer;
@@ -121,24 +125,61 @@ fn build_workspace_filter(level_filter: &str) -> String {
     filter
 }
 
-pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig>) -> LogGuard {
-    let _ = LogTracer::init();
+/// The global log filter layer: [`Targets`] when the directives allow it, else [`EnvFilter`].
+type FilterLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 
+/// Parse `directives` (`target=level,...`) into the cheapest filter that can express them.
+///
+/// `Targets` is preferred: it is a static lookup with no per-span state. `EnvFilter`
+/// keeps a `RwLock<HashMap<span::Id, _>>` that it reads on *every* span enter and
+/// exit, even when no span-matching directive exists. An enabled request span is
+/// entered once per polled response-body frame, so under streaming load that single
+/// lock becomes a cross-core cache-line ping-pong (61% of gateway CPU in `perf`,
+/// ~3.5x the CPU per streamed request). Directives `Targets` cannot express
+/// (`target[span{field=value}]=level`) fall back to `EnvFilter`; invalid directives
+/// yield `None`.
+fn build_filter_layer(directives: &str) -> Option<FilterLayer> {
+    if let Ok(targets) = directives.parse::<Targets>() {
+        return Some(Box::new(targets));
+    }
+    EnvFilter::try_new(directives)
+        .ok()
+        .map(|filter| Box::new(filter) as FilterLayer)
+}
+
+pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig>) -> LogGuard {
     let level_filter = level_to_str(config.level);
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        let filter_string = match &config.log_targets {
-            Some(targets) if !targets.is_empty() => build_filter_string(targets, level_filter),
-            _ => {
-                // Default: external deps at WARN, all workspace crates at configured level.
-                // This ensures logs from imported crates (tool_parser, kv_index, etc.)
-                // are visible while suppressing noisy external deps (hyper, h2, tonic, etc.).
-                build_workspace_filter(level_filter)
-            }
-        };
+    // RUST_LOG takes precedence (as `EnvFilter::try_from_default_env` did); an unset,
+    // empty, or invalid value falls through to the configured level/targets.
+    let filter_layer = std::env::var(EnvFilter::DEFAULT_ENV)
+        .ok()
+        .filter(|directives| !directives.trim().is_empty())
+        .and_then(|directives| build_filter_layer(&directives))
+        .unwrap_or_else(|| {
+            let filter_string = match &config.log_targets {
+                Some(targets) if !targets.is_empty() => build_filter_string(targets, level_filter),
+                _ => {
+                    // Default: external deps at WARN, all workspace crates at configured level.
+                    // This ensures logs from imported crates (tool_parser, kv_index, etc.)
+                    // are visible while suppressing noisy external deps (hyper, h2, tonic, etc.).
+                    build_workspace_filter(level_filter)
+                }
+            };
+            build_filter_layer(&filter_string)
+                .unwrap_or_else(|| Box::new(EnvFilter::new(filter_string)))
+        });
 
-        EnvFilter::new(filter_string)
-    });
+    // Cap the `log` facade at the filter's most verbose level. A bare
+    // `LogTracer::init()` leaves `log::max_level()` at TRACE, so every
+    // `log::trace!`/`debug!` in a dependency (the `tokenizers` normalizer and
+    // pre-tokenizer emit them on each encode) builds a record and round-trips
+    // through the tracing dispatcher only to be dropped there.
+    let log_max_level = filter_layer
+        .max_level_hint()
+        .unwrap_or(LevelFilter::TRACE)
+        .as_log();
+    let _ = LogTracer::builder().with_max_level(log_max_level).init();
 
     let mut layers = Vec::with_capacity(3);
 
@@ -212,7 +253,7 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
     }
 
     let _ = tracing_subscriber::registry()
-        .with(env_filter)
+        .with(filter_layer)
         .with(layers)
         .try_init();
 
