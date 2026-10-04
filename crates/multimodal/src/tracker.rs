@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use tokio::task::JoinHandle;
 
@@ -27,10 +30,11 @@ pub struct TrackerOutput {
     pub uuids: MultiModalUUIDs,
 }
 
-/// What a fetch is looked up by before its payload is compared byte for
-/// byte: the modality, the fetch settings, and the payload's kind and length.
-/// Hashing the payload itself would cost a pass over every data URL of the
-/// request; comparing it costs a pass only over actual duplicates.
+/// What a fetch is looked up by before its payload is compared: the
+/// modality, the fetch settings, and the payload's kind and length. Hashing
+/// the payload itself would cost a pass over every data URL of the request;
+/// comparing it costs a pass only over actual duplicates (and over the first
+/// few distinct payloads of one length, see `COMPARE_CANDIDATES`).
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct FetchKey {
     modality: Modality,
@@ -39,10 +43,25 @@ struct FetchKey {
     len: usize,
 }
 
+/// How many distinct payloads of one `FetchKey` a new part is compared
+/// against byte for byte. Past that the bucket is matched by digest, which
+/// keeps a request full of same-length, long-shared-prefix payloads at one
+/// pass over each payload instead of a pass per earlier candidate.
+const COMPARE_CANDIDATES: usize = 4;
+
 /// A slot that fetches, remembered so later parts can be matched against it.
 struct FirstFetch {
     source: Arc<FetchSource>,
     slot: usize,
+    /// blake3 of the payload, computed only once its bucket is crowded.
+    digest: OnceLock<[u8; 32]>,
+}
+
+impl FirstFetch {
+    fn digest(&self) -> &[u8; 32] {
+        self.digest
+            .get_or_init(|| blake3::hash(self.source.payload()).into())
+    }
 }
 
 pub struct AsyncMultiModalTracker {
@@ -185,15 +204,34 @@ impl AsyncMultiModalTracker {
             len: source.len(),
         };
         let candidates = self.first_slot.entry(key).or_default();
-        if let Some(first) = candidates
+        // The first few distinct payloads are compared byte for byte: a repeat
+        // (the common case) matches the first one, a different payload usually
+        // differs within its first bytes.
+        let (compared, hashed) = candidates.split_at(candidates.len().min(COMPARE_CANDIDATES));
+        if let Some(first) = compared
             .iter()
             .find(|candidate| *candidate.source == **source)
         {
             return Some(first.slot);
         }
+        // Past them, every candidate is matched by digest: one pass over this
+        // payload now, one over each candidate the first time it is reached.
+        let digest = if hashed.is_empty() {
+            OnceLock::new()
+        } else {
+            let digest: [u8; 32] = blake3::hash(source.payload()).into();
+            if let Some(first) = hashed
+                .iter()
+                .find(|candidate| *candidate.digest() == digest)
+            {
+                return Some(first.slot);
+            }
+            OnceLock::from(digest)
+        };
         candidates.push(FirstFetch {
             source: Arc::clone(source),
             slot: next,
+            digest,
         });
         None
     }
@@ -607,6 +645,109 @@ mod repeat_tests {
             tracker.same_media_as(Modality::Video, "one".into(), &clip),
             Some(0)
         );
+    }
+
+    /// Distinct data URLs of one length that share everything but their last
+    /// character: the worst case for comparison-based matching.
+    fn same_length_variants(count: usize) -> Vec<String> {
+        let mut base = TINY_PNG_URL.to_string();
+        base.pop().expect("non-empty data url");
+        (0..count)
+            .map(|i| {
+                format!(
+                    "{base}{}",
+                    char::from(b'A' + u8::try_from(i).expect("few variants"))
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_crowded_bucket_matches_by_digest_past_the_first_few_candidates() {
+        let mut tracker = tracker();
+        let sources: Vec<Arc<FetchSource>> = same_length_variants(10)
+            .into_iter()
+            .map(|url| Arc::new(FetchSource::DataUrl(url)))
+            .collect();
+        for source in &sources {
+            assert_eq!(
+                tracker.same_media_as(Modality::Image, String::new(), source),
+                None,
+                "every distinct payload fetches"
+            );
+            // Stand-in for the fetch slot the caller pushes; slots are indices
+            // into this list.
+            tracker
+                .pending
+                .entry(Modality::Image)
+                .or_default()
+                .push(Slot::SameAs(usize::MAX));
+        }
+        // Every repeat, in either region of the bucket, finds its first slot.
+        for (slot, source) in sources.iter().enumerate().rev() {
+            assert_eq!(
+                tracker.same_media_as(Modality::Image, String::new(), source),
+                Some(slot)
+            );
+        }
+        // The first candidates were only ever compared; the rest carry digests,
+        // so a part is compared against at most COMPARE_CANDIDATES payloads.
+        let bucket = tracker
+            .first_slot
+            .values()
+            .next()
+            .expect("one bucket: same modality, settings, kind and length");
+        assert_eq!(bucket.len(), sources.len());
+        let hashed: Vec<bool> = bucket
+            .iter()
+            .map(|candidate| candidate.digest.get().is_some())
+            .collect();
+        assert!(hashed[..COMPARE_CANDIDATES].iter().all(|hashed| !hashed));
+        assert!(hashed[COMPARE_CANDIDATES..].iter().all(|hashed| *hashed));
+        // A lone payload of another length is neither compared nor hashed.
+        let lone = Arc::new(FetchSource::DataUrl(format!("{TINY_PNG_URL}=")));
+        assert_eq!(
+            tracker.same_media_as(Modality::Image, String::new(), &lone),
+            None
+        );
+        let lone_bucket = tracker
+            .first_slot
+            .values()
+            .find(|bucket| bucket.len() == 1)
+            .expect("its own bucket");
+        assert!(lone_bucket[0].digest.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn many_same_length_data_urls_are_fetched_once_each() {
+        let mut tracker = tracker();
+        let variants = same_length_variants(8);
+        for _ in 0..2 {
+            for url in &variants {
+                tracker
+                    .push_part(MediaContentPart::ImageUrl {
+                        url: url.clone(),
+                        detail: None,
+                        uuid: None,
+                        max_long_side_pixel: None,
+                    })
+                    .expect("part");
+            }
+        }
+        let slots = tracker.pending.get(&Modality::Image).expect("image slots");
+        let fetches = slots
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Fetch(_)))
+            .count();
+        let repeats: Vec<usize> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::SameAs(first) => Some(*first),
+                Slot::Fetch(_) => None,
+            })
+            .collect();
+        assert_eq!(fetches, variants.len());
+        assert_eq!(repeats, (0..variants.len()).collect::<Vec<_>>());
     }
 
     #[tokio::test]

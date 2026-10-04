@@ -166,10 +166,16 @@ impl FetchSource {
     /// Length of the payload a part names (the URL, the data URL, the bytes,
     /// or the path).
     pub(crate) fn len(&self) -> usize {
+        self.payload().len()
+    }
+
+    /// The payload a part names, as bytes: the URL, the data URL, the bytes,
+    /// or the path.
+    pub(crate) fn payload(&self) -> &[u8] {
         match self {
-            Self::Url(url) | Self::DataUrl(url) => url.len(),
-            Self::InlineBytes(bytes) => bytes.len(),
-            Self::File(path) => path.as_os_str().len(),
+            Self::Url(url) | Self::DataUrl(url) => url.as_bytes(),
+            Self::InlineBytes(bytes) => bytes,
+            Self::File(path) => path.as_os_str().as_encoded_bytes(),
         }
     }
 }
