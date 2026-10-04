@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -455,11 +455,7 @@ impl ImageFrame {
     /// one photo after another on the calling thread. [`image`](Self::image)
     /// is a lookup for each of them afterwards.
     pub fn decode_all(frames: &[Arc<Self>]) -> Result<(), MediaConnectorError> {
-        let pending: Vec<&Self> = frames
-            .iter()
-            .map(Arc::as_ref)
-            .filter(|frame| frame.decoded.get().is_none())
-            .collect();
+        let pending = Self::undecoded(frames);
         if pending.len() < 2 {
             return pending
                 .into_iter()
@@ -481,6 +477,20 @@ impl ImageFrame {
             .into_iter()
             .find_map(OnceLock::into_inner)
             .map_or(Ok(()), Err)
+    }
+
+    /// The distinct frames of `frames` that still have to be decoded. A
+    /// repeated part is the same `Arc` several times over; it decodes once,
+    /// and the repeats must not become tasks that park on its cell.
+    fn undecoded(frames: &[Arc<Self>]) -> Vec<&Self> {
+        let mut seen = HashSet::with_capacity(frames.len());
+        frames
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|frame| {
+                frame.decoded.get().is_none() && seen.insert(std::ptr::from_ref(*frame))
+            })
+            .collect()
     }
 
     pub fn raw_bytes(&self) -> &[u8] {
@@ -736,5 +746,64 @@ mod tests {
             layouts.model_specific,
             HashMap::from([("image_grid_thw".to_string(), FieldLayout::Batched)])
         );
+    }
+
+    fn encoded_fixture() -> ImageFrame {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/images/tiny.jpg"
+        ))
+        .expect("fixture");
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .expect("format")
+            .into_dimensions()
+            .expect("header");
+        ImageFrame::encoded(
+            bytes::Bytes::from(bytes),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(width, height),
+            None,
+        )
+    }
+
+    #[test]
+    fn decode_all_decodes_a_repeated_frame_once() {
+        let first = Arc::new(encoded_fixture());
+        let second = Arc::new(encoded_fixture());
+        let mut frames: Vec<Arc<ImageFrame>> = (0..70).map(|_| Arc::clone(&first)).collect();
+        frames.push(Arc::clone(&second));
+
+        // 70 repeats of one frame plus one other: two decodes, not 71 tasks.
+        let pending = ImageFrame::undecoded(&frames);
+        assert_eq!(pending.len(), 2);
+        assert!(std::ptr::eq(pending[0], &*first));
+        assert!(std::ptr::eq(pending[1], &*second));
+
+        ImageFrame::decode_all(&frames).expect("decode");
+        let image = first.image().expect("decoded");
+        for frame in &frames[..70] {
+            assert!(std::ptr::eq(frame.image().expect("decoded"), image));
+        }
+        assert!(ImageFrame::undecoded(&frames).is_empty());
+    }
+
+    #[test]
+    fn decode_all_reports_a_bad_repeated_frame_once_and_decodes_the_rest() {
+        let bad = Arc::new(ImageFrame::encoded(
+            bytes::Bytes::from_static(b"not an image"),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(1, 1),
+            None,
+        ));
+        let good = Arc::new(encoded_fixture());
+        let frames = vec![Arc::clone(&bad), Arc::clone(&good), Arc::clone(&bad)];
+        assert_eq!(ImageFrame::undecoded(&frames).len(), 2);
+        assert!(ImageFrame::decode_all(&frames).is_err());
+        assert!(good.image().is_ok());
     }
 }
