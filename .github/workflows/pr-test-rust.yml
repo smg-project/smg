@@ -682,6 +682,45 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
     secrets: inherit
 
+  # The SGLang chat and admin-op cases against the Rust gRPC servicer
+  # (SMG_SGLANG_SERVICER_IMPL=rust): the same workers, the Rust request path.
+  e2e-1gpu-chat-rust-servicer:
+    name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
+    # Qwen2.5-14B) since they're tp=1.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: sglang
+            timeout: 40
+            test_timeout: 32
+            # Chat lane plus the admin ops the Rust servicer serves through
+            # the wire's control calls.
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py
+            min_selected: 204 # floor ≈ 95% of the chat lane's measured effective (215 of 223 ran on the Rust servicer; audit 2026-10-04)
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
+      test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
+      min_selected: ${{ matrix.min_selected }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      servicer_impl: rust
+    secrets: inherit
+
   # Worker-side media processing: the vLLM gRPC worker fetches and
   # preprocesses media itself (SMG_VLLM_MM_PROCESSOR=inprocess) and the
   # gateway, left in auto mode, forwards media references. Same multimodal
