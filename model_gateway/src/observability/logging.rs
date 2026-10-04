@@ -128,23 +128,47 @@ fn build_workspace_filter(level_filter: &str) -> String {
 /// The global log filter layer: [`Targets`] when the directives allow it, else [`EnvFilter`].
 type FilterLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 
-/// Parse `directives` (`target=level,...`) into the cheapest filter that can express them.
+/// `Targets` for `directives` (`target=level,...`) when it reads them exactly as
+/// `EnvFilter` would, else `None`.
 ///
-/// `Targets` is preferred: it is a static lookup with no per-span state. `EnvFilter`
-/// keeps a `RwLock<HashMap<span::Id, _>>` that it reads on *every* span enter and
-/// exit, even when no span-matching directive exists. An enabled request span is
-/// entered once per polled response-body frame, so under streaming load that single
-/// lock becomes a cross-core cache-line ping-pong (61% of gateway CPU in `perf`,
-/// ~3.5x the CPU per streamed request). Directives `Targets` cannot express
-/// (`target[span{field=value}]=level`) fall back to `EnvFilter`; invalid directives
-/// yield `None`.
+/// Callers validate the string with `EnvFilter` first, so this only has to rule
+/// out the forms the two parsers read differently: `EnvFilter` drops empty
+/// items where `Targets` makes an empty target at TRACE that matches everything;
+/// span and field syntax (`target[span]=level`, `target[{field}]=level`) is a
+/// literal target to `Targets`; and an empty level (`target=`) is TRACE to
+/// `EnvFilter` but ERROR to `Targets`.
+fn targets_for(directives: &str) -> Option<Targets> {
+    let items: Vec<&str> = directives
+        .split(',')
+        .filter(|item| !item.is_empty())
+        .collect();
+    if items.is_empty()
+        || items
+            .iter()
+            .any(|item| item.contains(['[', '{']) || item.ends_with('='))
+    {
+        return None;
+    }
+    items.join(",").parse::<Targets>().ok()
+}
+
+/// Parse `directives` into the cheapest filter that can express them.
+///
+/// `EnvFilter` decides whether the string is valid, exactly as before: a string
+/// it rejects yields `None` and the caller falls back to the configured level.
+/// When it accepts, `Targets` is preferred whenever it reads the string the same
+/// way (see [`targets_for`]): it is a static lookup with no per-span state, while
+/// `EnvFilter` keeps a `RwLock<HashMap<span::Id, _>>` that it reads on *every*
+/// span enter and exit, even when no span-matching directive exists. An enabled
+/// request span is entered once per polled response-body frame, so under
+/// streaming load that single lock becomes a cross-core cache-line ping-pong
+/// (61% of gateway CPU in `perf`, ~3.5x the CPU per streamed request).
 fn build_filter_layer(directives: &str) -> Option<FilterLayer> {
-    if let Ok(targets) = directives.parse::<Targets>() {
+    let env_filter = EnvFilter::try_new(directives).ok()?;
+    if let Some(targets) = targets_for(directives) {
         return Some(Box::new(targets));
     }
-    EnvFilter::try_new(directives)
-        .ok()
-        .map(|filter| Box::new(filter) as FilterLayer)
+    Some(Box::new(env_filter))
 }
 
 pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig>) -> LogGuard {
@@ -259,5 +283,88 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
     LogGuard {
         _file_guard: file_guard,
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use tracing::Level;
+
+    use super::*;
+
+    fn targets(directives: &str) -> Targets {
+        targets_for(directives).unwrap_or_else(|| panic!("{directives:?} must use Targets"))
+    }
+
+    fn hint(directives: &str) -> Option<LevelFilter> {
+        build_filter_layer(directives).and_then(|layer| layer.max_level_hint())
+    }
+
+    #[test]
+    fn plain_target_levels_use_targets() {
+        let targets = targets("warn,smg=info");
+        assert!(targets.would_enable("smg", &Level::INFO));
+        assert!(!targets.would_enable("smg", &Level::DEBUG));
+        assert!(targets.would_enable("hyper", &Level::WARN));
+        assert!(!targets.would_enable("hyper", &Level::INFO));
+        assert_eq!(targets.default_level(), Some(LevelFilter::WARN));
+    }
+
+    #[test]
+    fn env_filter_decides_validity() {
+        // Whatever `EnvFilter` rejected before this change is still rejected,
+        // whether or not `Targets` would have taken it (`*smg=debug`, ` smg=debug`).
+        for directives in [
+            "warn,smg=info",
+            "warn,",
+            "warn, smg=debug",
+            "*smg=debug",
+            " , ",
+            "info",
+            "smg[request]=debug",
+            "warn,smg=",
+        ] {
+            assert_eq!(
+                build_filter_layer(directives).is_some(),
+                EnvFilter::try_new(directives).is_ok(),
+                "{directives:?}"
+            );
+        }
+        assert!(targets_for("*smg=debug").is_none() || build_filter_layer("*smg=debug").is_none());
+    }
+
+    #[test]
+    fn forms_the_parsers_read_differently_stay_with_env_filter() {
+        for directives in ["smg[request]=debug", "warn,smg[{model}]=trace", "warn,smg="] {
+            assert!(
+                targets_for(directives).is_none(),
+                "{directives:?} must not be parsed as Targets"
+            );
+            assert!(
+                build_filter_layer(directives).is_some(),
+                "{directives:?} must still produce an EnvFilter"
+            );
+        }
+        // `EnvFilter` reads an empty level as TRACE; `Targets` would have read ERROR.
+        assert_eq!(hint("warn,smg="), Some(LevelFilter::TRACE));
+    }
+
+    #[test]
+    fn a_trailing_comma_is_not_an_empty_target() {
+        let trailing = targets("warn,");
+        assert_eq!(trailing.default_level(), Some(LevelFilter::WARN));
+        assert_eq!(
+            trailing.iter().count(),
+            0,
+            "no per-target directive, let alone an empty one"
+        );
+        assert!(!trailing.would_enable("hyper", &Level::INFO));
+    }
+
+    #[test]
+    fn log_cap_follows_the_most_verbose_directive() {
+        assert_eq!(hint("warn,smg=info"), Some(LevelFilter::INFO));
+        assert_eq!(hint("warn,smg=debug,"), Some(LevelFilter::DEBUG));
+        assert_eq!(hint("error"), Some(LevelFilter::ERROR));
     }
 }
