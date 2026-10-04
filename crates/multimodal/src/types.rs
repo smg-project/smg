@@ -1,11 +1,18 @@
-use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use image::{DynamicImage, RgbImage};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{audio::DecodedAudio, error::MediaConnectorError, media::decode_image_bytes};
+use crate::{
+    audio::DecodedAudio, error::MediaConnectorError, media::decode_image_bytes, vision::execution,
+};
 
 /// Supported multimodal modalities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -441,6 +448,39 @@ impl ImageFrame {
     pub fn image(&self) -> Result<&DynamicImage, MediaConnectorError> {
         self.decoded
             .get_or_try_init(|| decode_image_bytes(&self.raw_bytes, self.max_long_side_pixel))
+    }
+
+    /// Decode the pixels of every frame that is still encoded, in parallel on
+    /// the preprocessing pool (inline under `Parallelism::Inline`), instead of
+    /// one photo after another on the calling thread. [`image`](Self::image)
+    /// is a lookup for each of them afterwards.
+    pub fn decode_all(frames: &[Arc<Self>]) -> Result<(), MediaConnectorError> {
+        let pending: Vec<&Self> = frames
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|frame| frame.decoded.get().is_none())
+            .collect();
+        if pending.len() < 2 {
+            return pending
+                .into_iter()
+                .try_for_each(|frame| frame.image().map(|_| ()));
+        }
+        let failures: Vec<OnceLock<MediaConnectorError>> =
+            pending.iter().map(|_| OnceLock::new()).collect();
+        execution::scope(|spawner| {
+            for (frame, failure) in pending.iter().copied().zip(&failures) {
+                spawner.spawn(move |_| {
+                    if let Err(error) = frame.image() {
+                        // One slot, one attempt: the cell is empty here.
+                        let _ = failure.set(error);
+                    }
+                });
+            }
+        });
+        failures
+            .into_iter()
+            .find_map(OnceLock::into_inner)
+            .map_or(Ok(()), Err)
     }
 
     pub fn raw_bytes(&self) -> &[u8] {

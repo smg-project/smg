@@ -471,6 +471,10 @@ async fn preprocess_modality(
 
     tokio::task::spawn_blocking(move || match media_for_preprocess {
         MediaBatch::Images(images) => {
+            // Decode every frame first, in parallel on the preprocessing
+            // pool, rather than one photo after another on this thread.
+            ImageFrame::decode_all(&images)
+                .map_err(llm_multimodal::MultiModalError::Media)?;
             let processor = registry
                 .find(&model_id_owned, model_type_owned.as_deref())
                 .ok_or_else(|| {
