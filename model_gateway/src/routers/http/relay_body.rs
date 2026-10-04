@@ -6,6 +6,9 @@
 //! only as fast as the response is written. Dropping the body (the client went
 //! away) drops the upstream stream, which closes the worker connection and lets
 //! the engine abort generation.
+//!
+//! What happens to each chunk is a [`ChunkFilter`]: pass-through, SSE
+//! re-slicing, or the PD decode relay's sentinel detection and logprob merge.
 
 use std::{
     future::Future,
@@ -22,26 +25,102 @@ use crate::routers::common::sse_rechunk::{SseRechunker, IDLE_FLUSH};
 
 type Upstream = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send + 'static>>;
 
-pub(crate) struct RelayBody {
+/// Per-chunk policy of a [`RelayBody`].
+pub(crate) trait ChunkFilter: Send + Unpin + 'static {
+    /// One upstream chunk. Returns the bytes to forward now (possibly none)
+    /// and whether the relayed stream ends after them, whatever the upstream
+    /// still has: the upstream is dropped and only [`finish`](Self::finish)
+    /// follows.
+    fn feed(&mut self, chunk: Bytes) -> (Bytes, bool);
+
+    /// Whether text is held back waiting for more input. If so, it is
+    /// released by [`flush_pending`](Self::flush_pending) after `IDLE_FLUSH`
+    /// of upstream silence.
+    fn has_pending(&self) -> bool {
+        false
+    }
+
+    fn flush_pending(&mut self) -> Bytes {
+        Bytes::new()
+    }
+
+    /// Everything still held when the upstream ends or fails.
+    fn finish(&mut self) -> Bytes {
+        Bytes::new()
+    }
+
+    /// The upstream failed; called before the error is relayed.
+    fn on_error(&mut self, _error: &reqwest::Error) {}
+}
+
+impl ChunkFilter for SseRechunker {
+    fn feed(&mut self, chunk: Bytes) -> (Bytes, bool) {
+        (SseRechunker::feed(self, chunk), false)
+    }
+
+    fn has_pending(&self) -> bool {
+        SseRechunker::has_pending(self)
+    }
+
+    fn flush_pending(&mut self) -> Bytes {
+        SseRechunker::flush_pending(self)
+    }
+
+    fn finish(&mut self) -> Bytes {
+        SseRechunker::finish(self)
+    }
+}
+
+/// `None` passes chunks through unchanged.
+impl<F: ChunkFilter> ChunkFilter for Option<F> {
+    fn feed(&mut self, chunk: Bytes) -> (Bytes, bool) {
+        match self {
+            Some(filter) => filter.feed(chunk),
+            None => (chunk, false),
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.as_ref().is_some_and(ChunkFilter::has_pending)
+    }
+
+    fn flush_pending(&mut self) -> Bytes {
+        self.as_mut()
+            .map(ChunkFilter::flush_pending)
+            .unwrap_or_default()
+    }
+
+    fn finish(&mut self) -> Bytes {
+        self.as_mut().map(ChunkFilter::finish).unwrap_or_default()
+    }
+
+    fn on_error(&mut self, error: &reqwest::Error) {
+        if let Some(filter) = self {
+            filter.on_error(error);
+        }
+    }
+}
+
+pub(crate) struct RelayBody<F> {
     /// `None` once the upstream ended or failed.
     upstream: Option<Upstream>,
-    rechunker: Option<SseRechunker>,
-    /// Flushes buffered rechunker text after `IDLE_FLUSH` of upstream silence.
-    /// Armed only while text is pending, from the first poll that found the
-    /// upstream idle after the last chunk.
+    filter: F,
+    /// Flushes text the filter holds back after `IDLE_FLUSH` of upstream
+    /// silence. Armed only while text is pending, from the first poll that
+    /// found the upstream idle after the last chunk.
     idle: Pin<Box<Sleep>>,
     idle_armed: bool,
-    /// Queued ahead of anything else, in this order: the rechunker's tail at
-    /// end of stream, then a terminal upstream error.
+    /// Queued ahead of anything else, in this order: the filter's tail at end
+    /// of stream, then a terminal upstream error.
     tail: Option<Bytes>,
     error: Option<String>,
 }
 
-impl RelayBody {
-    pub(crate) fn new(upstream: Upstream, rechunker: Option<SseRechunker>) -> Self {
+impl<F: ChunkFilter> RelayBody<F> {
+    pub(crate) fn new(upstream: Upstream, filter: F) -> Self {
         Self {
             upstream: Some(upstream),
-            rechunker,
+            filter,
             idle: Box::pin(tokio::time::sleep(IDLE_FLUSH)),
             idle_armed: false,
             tail: None,
@@ -49,19 +128,15 @@ impl RelayBody {
         }
     }
 
-    /// Ends the upstream, queueing whatever the rechunker still holds.
+    /// Ends the upstream, queueing whatever the filter still holds.
     fn finish_upstream(&mut self) {
         self.upstream = None;
         self.idle_armed = false;
-        self.tail = self
-            .rechunker
-            .as_mut()
-            .map(SseRechunker::finish)
-            .filter(|tail| !tail.is_empty());
+        self.tail = Some(self.filter.finish()).filter(|tail| !tail.is_empty());
     }
 }
 
-impl http_body::Body for RelayBody {
+impl<F: ChunkFilter> http_body::Body for RelayBody<F> {
     type Data = Bytes;
     type Error = axum::Error;
 
@@ -87,28 +162,27 @@ impl http_body::Body for RelayBody {
                     if bytes.is_empty() {
                         continue;
                     }
-                    let bytes = match this.rechunker.as_mut() {
-                        Some(rechunker) => {
-                            this.idle_armed = false;
-                            rechunker.feed(bytes)
-                        }
-                        None => bytes,
-                    };
+                    this.idle_armed = false;
+                    let (bytes, end) = this.filter.feed(bytes);
+                    if end {
+                        // The filter saw the end of the stream (an SSE
+                        // `[DONE]`); whatever the upstream still has is not
+                        // for this client.
+                        this.finish_upstream();
+                    }
                     if bytes.is_empty() {
                         continue;
                     }
                     return Poll::Ready(Some(Ok(Frame::data(bytes))));
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    this.filter.on_error(&e);
                     this.finish_upstream();
                     this.error = Some(format!("Stream error: {e}"));
                 }
                 Poll::Ready(None) => this.finish_upstream(),
                 Poll::Pending => {
-                    let Some(rechunker) = this.rechunker.as_mut() else {
-                        return Poll::Pending;
-                    };
-                    if !rechunker.has_pending() {
+                    if !this.filter.has_pending() {
                         this.idle_armed = false;
                         return Poll::Pending;
                     }
@@ -119,7 +193,7 @@ impl http_body::Body for RelayBody {
                     match this.idle.as_mut().poll(cx) {
                         Poll::Ready(()) => {
                             this.idle_armed = false;
-                            let bytes = rechunker.flush_pending();
+                            let bytes = this.filter.flush_pending();
                             if bytes.is_empty() {
                                 return Poll::Pending;
                             }
@@ -139,7 +213,13 @@ impl http_body::Body for RelayBody {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use axum::body::Body;
     use futures_util::stream;
@@ -161,7 +241,7 @@ mod tests {
         reqwest::get("not a url").await.unwrap_err()
     }
 
-    async fn collect(body: RelayBody) -> (Vec<Bytes>, Option<String>) {
+    async fn collect<F: ChunkFilter>(body: RelayBody<F>) -> (Vec<Bytes>, Option<String>) {
         let mut body = Body::new(body);
         let mut frames = Vec::new();
         loop {
@@ -181,7 +261,7 @@ mod tests {
                 Ok(Bytes::new()),
                 Ok(Bytes::from_static(b"b")),
             ]),
-            None,
+            None::<SseRechunker>,
         );
         let (frames, error) = collect(body).await;
         assert_eq!(
@@ -189,6 +269,77 @@ mod tests {
             vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
         );
         assert!(error.is_none());
+    }
+
+    /// Ends the relay after the chunk that contains `END`, counts errors.
+    struct EndAtMarker {
+        errors: Arc<AtomicUsize>,
+    }
+
+    impl ChunkFilter for EndAtMarker {
+        fn feed(&mut self, chunk: Bytes) -> (Bytes, bool) {
+            let end = chunk.windows(3).any(|w| w == b"END");
+            (chunk, end)
+        }
+
+        fn finish(&mut self) -> Bytes {
+            Bytes::from_static(b"<tail>")
+        }
+
+        fn on_error(&mut self, _error: &reqwest::Error) {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_filter_can_end_the_stream_before_the_upstream_does() {
+        let errors = Arc::new(AtomicUsize::new(0));
+        let first = Box::pin(stream::iter(vec![
+            Ok(Bytes::from_static(b"a")),
+            Ok(Bytes::from_static(b"END")),
+        ]));
+        // Never yields: without the early end the body would hang here.
+        let chained: Upstream = Box::pin(futures_util::StreamExt::chain(first, pending_forever()));
+        let body = RelayBody::new(
+            chained,
+            EndAtMarker {
+                errors: errors.clone(),
+            },
+        );
+        let (frames, error) = tokio::time::timeout(Duration::from_secs(2), collect(body))
+            .await
+            .expect("ends without waiting for the upstream");
+        assert_eq!(
+            frames,
+            vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"END"),
+                Bytes::from_static(b"<tail>"),
+            ]
+        );
+        assert!(error.is_none());
+        assert_eq!(errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_filter_sees_the_upstream_error_before_it_is_relayed() {
+        let errors = Arc::new(AtomicUsize::new(0));
+        let body = RelayBody::new(
+            upstream(vec![
+                Ok(Bytes::from_static(b"a")),
+                Err(upstream_error().await),
+            ]),
+            EndAtMarker {
+                errors: errors.clone(),
+            },
+        );
+        let (frames, error) = collect(body).await;
+        assert_eq!(
+            frames,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"<tail>")]
+        );
+        assert!(error.unwrap().contains("Stream error"));
+        assert_eq!(errors.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

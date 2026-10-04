@@ -25,11 +25,12 @@ use serde_json::{
     value::{to_raw_value, RawValue},
     Value,
 };
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::request_body::RawBody;
+use super::{
+    relay_body::{ChunkFilter, RelayBody},
+    request_body::RawBody,
+};
 use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
@@ -54,7 +55,7 @@ use crate::{
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
-            sse::{SseEncoder, SSE_CHANNEL_BUFFER},
+            sse::SseEncoder,
             trim_serialization_slack,
         },
         error,
@@ -149,6 +150,43 @@ struct BootstrapFields {
     host: Box<RawValue>,
     port: Box<RawValue>,
     room: Box<RawValue>,
+}
+
+/// Per-chunk policy for a relayed decode stream: ends the relay at the SSE
+/// `[DONE]` sentinel instead of waiting for the upstream to close, and merges
+/// the prefill logprobs into each event when the client asked for them.
+struct DecodeStreamFilter {
+    /// `Some` only when the request asked for logprobs and prefill returned them.
+    prefill_logprobs: Option<Value>,
+    /// Reusable SSE encoder for the logprob-merge re-encode path.
+    encoder: SseEncoder,
+    /// Whether the next chunk begins at an SSE line boundary (the previous
+    /// chunk ended with an EOL); anchors `[DONE]` detection at a chunk start.
+    at_line_start: bool,
+    decode_url: Option<String>,
+}
+
+impl ChunkFilter for DecodeStreamFilter {
+    fn feed(&mut self, chunk: Bytes) -> (Bytes, bool) {
+        let is_done = PDRouter::chunk_contains_done_event(&chunk, self.at_line_start);
+        if let Some(&last) = chunk.last() {
+            self.at_line_start = last == b'\n' || last == b'\r';
+        }
+        let bytes = match self.prefill_logprobs.as_ref() {
+            Some(prefill) => {
+                PDRouter::merge_streaming_logprobs(Some(prefill), &chunk, &mut self.encoder)
+                    .unwrap_or(chunk)
+            }
+            None => chunk,
+        };
+        (bytes, is_done)
+    }
+
+    fn on_error(&mut self, error: &reqwest::Error) {
+        if let Some(url) = &self.decode_url {
+            error!("Stream error from decode server {url}: {error}");
+        }
+    }
 }
 
 impl PDRouter {
@@ -2025,60 +2063,15 @@ impl PDRouter {
     ) -> Response {
         use crate::worker::AttachedBody;
 
-        let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "fire-and-forget stream relay; gateway shutdown need not wait for decode stream forwarding"
-        )]
-        tokio::spawn(async move {
-            futures_util::pin_mut!(stream);
-            // Reusable SSE encoder for the logprob-merge re-encode path.
-            let mut encoder = SseEncoder::new();
-            // Whether the next chunk begins at an SSE line boundary (i.e. the
-            // previous chunk ended with an EOL); used to anchor the [DONE]
-            // sentinel detection when the match sits at the start of a chunk.
-            let mut at_line_start = true;
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
-                        if let Some(&last) = chunk.last() {
-                            at_line_start = last == b'\n' || last == b'\r';
-                        }
-
-                        let result = if return_logprob && prefill_logprobs.is_some() {
-                            Self::merge_streaming_logprobs(
-                                prefill_logprobs.as_ref(),
-                                &chunk,
-                                &mut encoder,
-                            )
-                            .unwrap_or(chunk)
-                        } else {
-                            chunk
-                        };
-
-                        if tx.send(Ok(result)).await.is_err() {
-                            break;
-                        }
-
-                        if is_done {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(ref url) = decode_url {
-                            error!("Stream error from decode server {}: {}", url, e);
-                        }
-                        let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        let stream = ReceiverStream::new(rx);
-        let body = Body::from_stream(stream);
+        // Polled by the connection task itself: no relay task, no channel, no
+        // cross-thread wakeup per chunk. See `RelayBody`.
+        let filter = DecodeStreamFilter {
+            prefill_logprobs: prefill_logprobs.filter(|_| return_logprob),
+            encoder: SseEncoder::new(),
+            at_line_start: true,
+            decode_url,
+        };
+        let body = Body::new(RelayBody::new(Box::pin(stream), filter));
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -2833,11 +2826,13 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
+        routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
         worker::{BasicWorkerBuilder, WorkerType},
     };
