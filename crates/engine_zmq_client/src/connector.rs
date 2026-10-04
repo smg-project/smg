@@ -35,16 +35,11 @@ use tracing::{trace, warn};
 use zeromq::RouterSendHalf;
 
 use crate::{
-    codec::{encode_msgpack, OpaqueValue},
+    codec::OpaqueValue,
     error::{Error, Result},
     protocol::{
-        sglang::SglangProtocol,
-        tokenspeed::TokenSpeedProtocol,
-        vllm::{
-            request::{EngineCoreRequestType, UtilityCall},
-            VllmProtocol,
-        },
-        EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
+        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, vllm::VllmProtocol, EngineBatch,
+        EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
     },
     transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
 };
@@ -667,14 +662,13 @@ impl<P: EngineProtocol> Drop for Client<P> {
 
 /// This frontend is its engines' only client, so replies come back on vLLM's
 /// `client_index` 0 (the index an unscaled frontend uses).
-const CLIENT_INDEX: u32 = 0;
-
-impl EngineCoreClient {
-    /// Run `method(*args)` on one rank's EngineCore and return its result, as
-    /// vLLM's `AsyncMPClient._call_utility_async` does: the call is framed
-    /// `[engine, UTILITY, (client_index, call_id, method, args)]` and the reply
-    /// resolves by call id. Waits at most `timeout`; the engine still runs a
-    /// call whose reply comes late, that reply is just dropped.
+impl<P: EngineProtocol> Client<P> {
+    /// Run `method(*args)` on one rank and return its result (vLLM's
+    /// `AsyncMPClient._call_utility_async`; the SGLang plugin's control
+    /// call): the protocol frames the call and the reply resolves by call id.
+    /// Waits at most `timeout`; the engine still runs a call whose reply comes
+    /// late, that reply is just dropped. A protocol without control messages
+    /// answers [`Error::UtilityUnsupported`] without touching the wire.
     pub async fn call_utility(
         &self,
         engine_id: &EngineId,
@@ -683,6 +677,11 @@ impl EngineCoreClient {
         timeout: Duration,
     ) -> Result<OpaqueValue> {
         let call_id = self.inner.next_call_id.fetch_add(1, Ordering::Relaxed);
+        let Some((frame, payload)) = P::encode_utility(call_id, method, &args)? else {
+            return Err(Error::UtilityUnsupported {
+                method: method.to_string(),
+            });
+        };
         let receiver = self.inner.registry.lock().register_utility(call_id)?;
         // Retires the registration on every exit (timeout, cancellation, a
         // failed send); a resolved call has already left the map.
@@ -690,19 +689,8 @@ impl EngineCoreClient {
             inner: &self.inner,
             call_id,
         };
-        let payload = encode_msgpack(&UtilityCall {
-            client_index: CLIENT_INDEX,
-            call_id,
-            method: method.to_string(),
-            args,
-        })?;
         self.inner
-            .send_to_engine(
-                engine_id,
-                EngineCoreRequestType::Utility.to_frame(),
-                payload,
-                Vec::new(),
-            )
+            .send_to_engine(engine_id, frame, payload, Vec::new())
             .await?;
         match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(outcome)) => outcome,
@@ -954,7 +942,7 @@ mod tests {
                     DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput,
                     EngineCoreOutputs, RequestBatchOutputs,
                 },
-                request::EngineCoreRequest,
+                request::{EngineCoreRequest, UtilityCall},
                 stats::SchedulerStats,
             },
         },

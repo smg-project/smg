@@ -22,14 +22,14 @@ pub mod structured_outputs;
 use bytes::Bytes;
 
 use crate::{
-    codec::encode_msgpack,
+    codec::{encode_msgpack, OpaqueValue},
     error::Result,
     protocol::{
         vllm::{
             output::{
                 decode_engine_core_outputs, DpControlMessage, EngineCoreOutput, EngineCoreOutputs,
             },
-            request::{EngineCoreRequest, EngineCoreRequestType},
+            request::{EngineCoreRequest, EngineCoreRequestType, UtilityCall},
             stats::SchedulerStats,
         },
         EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
@@ -103,6 +103,25 @@ impl EngineProtocol for VllmProtocol {
         Ok(Some((
             EngineCoreRequestType::StartDpWave.to_frame(),
             encode_msgpack(&(wave, NO_EXCLUDED_RANK))?,
+        )))
+    }
+
+    fn encode_utility(
+        call_id: i64,
+        method: &str,
+        args: &[OpaqueValue],
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        // Framed `[engine, UTILITY, (client_index, call_id, method, args)]`,
+        // as vLLM's `AsyncMPClient._call_utility_async` sends it; this client
+        // has one output socket, so `client_index` is 0.
+        Ok(Some((
+            EngineCoreRequestType::Utility.to_frame(),
+            encode_msgpack(&UtilityCall {
+                client_index: 0,
+                call_id,
+                method: method.to_string(),
+                args: args.to_vec(),
+            })?,
         )))
     }
 

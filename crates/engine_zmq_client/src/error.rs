@@ -59,6 +59,8 @@ pub enum Error {
     UtilityCallFailed { message: String },
     #[error("utility call `{method}` got no reply within {timeout:?}")]
     UtilityTimeout { method: String, timeout: Duration },
+    #[error("utility call `{method}` is not available on this engine protocol")]
+    UtilityUnsupported { method: String },
 
     /// Allows cloning the same error across multiple request streams.
     #[error(transparent)]

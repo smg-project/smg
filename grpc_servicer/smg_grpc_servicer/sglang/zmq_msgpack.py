@@ -10,11 +10,16 @@ module adds the one thing it lacks, discovery, and keeps everything else:
   handshake with a two-byte engine identity, learns the data-plane addresses
   from INIT, registers with its ready response and connects in;
 * requests arrive as ``[type_byte, payload, *aux]`` frames whose payload is
-  the scheduler's own positional ``TokenizedGenerateReqInput`` (``ADD``) or a
-  plain list of request ids (``ABORT``);
-* outputs leave as the positional :class:`BatchTokenIDSlimOutput`: the token
-  columns a frontend that detokenizes itself needs, plus a scheduler-load
-  tail, so the output batch is the one in-band load channel.
+  the scheduler's own positional ``TokenizedGenerateReqInput`` or
+  ``TokenizedEmbeddingReqInput`` (``ADD``, told apart by the tag), a plain
+  list of request ids (``ABORT``), or a control call ``[call_id, method,
+  args]`` (``CONTROL``) that becomes the scheduler's own control request
+  (``FlushCacheReqInput``, ``ProfileReq``);
+* outputs leave as positional tagged structs: :class:`BatchTokenIDSlimOutput`
+  (the token columns a frontend that detokenizes itself needs, plus a
+  scheduler-load tail, so the output batch is the one in-band load channel),
+  :class:`BatchEmbeddingSlimOutput` and :class:`ControlReplySlim` (the
+  scheduler's answer to a control call, under its call id).
 
 The handshake structs are msgpack maps with named keys; the data-plane
 structs are positional arrays. SMG's codec relies on exactly that split. The
@@ -37,8 +42,9 @@ import zmq
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
-        AbortReq,
+        BatchEmbeddingOutput,
         BatchTokenIDOutput,
+        TokenizedEmbeddingReqInput,
         TokenizedGenerateReqInput,
     )
     from sglang.srt.managers.load_snapshot import LoadSnapshot
@@ -50,6 +56,10 @@ logger = logging.getLogger(__name__)
 # without decoding first.
 REQ_TYPE_ADD = b"\x00"
 REQ_TYPE_ABORT = b"\x01"
+REQ_TYPE_CONTROL = b"\x02"
+# The rid a control request carries through the scheduler, so its reply
+# (handed back with the request) maps to the call id SMG issued.
+CONTROL_RID_PREFIX = "smg-control-"
 
 # Raw single-frame sentinel SMG's output loop treats as terminal, so a
 # scheduler that exits marks its worker dead instead of healthy-idle.
@@ -161,6 +171,15 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
     # parallel to the sampled-token logprob columns; empty when not requested.
     output_top_logprobs_val: list[list[list[float]]] | None = None
     output_top_logprobs_idx: list[list[list[int]]] | None = None
+    # Reasoning tokens counted so far (hybrid-reasoning models; 0 otherwise).
+    reasoning_tokens: list[int] | None = None
+    # Prompt logprobs when `logprob_start_len >= 0`, with the prefill tick:
+    # the prompt token's logprob per position (None for the first), its id,
+    # and the ranked candidates per position when asked; empty otherwise.
+    input_token_logprobs_val: list[list[float | None]] | None = None
+    input_token_logprobs_idx: list[list[int]] | None = None
+    input_top_logprobs_val: list[list[list[float]]] | None = None
+    input_top_logprobs_idx: list[list[list[int]]] | None = None
 
     @classmethod
     def from_full(
@@ -222,7 +241,116 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
                 [list(step) for step in (v or [])]
                 for v in column(out.output_top_logprobs_idx, None)
             ],
+            reasoning_tokens=[
+                int(v or 0) for v in column(getattr(out, "reasoning_tokens", None), 0)
+            ],
+            input_token_logprobs_val=[
+                list(v or []) for v in column(getattr(out, "input_token_logprobs_val", None), None)
+            ],
+            input_token_logprobs_idx=[
+                list(v or []) for v in column(getattr(out, "input_token_logprobs_idx", None), None)
+            ],
+            input_top_logprobs_val=[
+                [list(step or []) for step in (v or [])]
+                for v in column(getattr(out, "input_top_logprobs_val", None), None)
+            ],
+            input_top_logprobs_idx=[
+                [list(step or []) for step in (v or [])]
+                for v in column(getattr(out, "input_top_logprobs_idx", None), None)
+            ],
         )
+
+
+def _finish_columns(reasons: list) -> tuple[list[str], list[str | None], list[int | None]]:
+    """A scheduler finish per request reduced to its type, message and status."""
+
+    def status(reason):
+        value = reason.get("status_code") if reason else None
+        return int(value) if isinstance(value, int) else None
+
+    return (
+        [str((r or {}).get("type") or "") for r in reasons],
+        [(r or {}).get("message") for r in reasons],
+        [status(r) for r in reasons],
+    )
+
+
+class BatchEmbeddingSlimOutput(msgspec.Struct, tag=True, array_like=True):
+    """The scheduler's ``BatchEmbeddingOutput`` for SMG: each request's pooled
+    vector with its counts and finish (``stop``, or ``abort`` with the message
+    and status when it could not be served), plus the load tail."""
+
+    rids: list[str]
+    embeddings: list[list[float]]
+    prompt_tokens: list[int]
+    cached_tokens: list[int]
+    finished_reasons: list[str]
+    finished_messages: list[str | None]
+    finished_status: list[int | None]
+    engine_index: int = 0
+    num_running: int = 0
+    num_waiting: int = 0
+    kv_used_tokens: int = 0
+    kv_total_tokens: int = 0
+
+    @classmethod
+    def from_full(
+        cls, out: BatchEmbeddingOutput, *, engine_index: int = 0, **load
+    ) -> BatchEmbeddingSlimOutput:
+        count = len(out.rids or [])
+
+        def column(values, default):
+            values = list(values or [])
+            values.extend(default for _ in range(count - len(values)))
+            return values
+
+        def vector(value) -> list[float]:
+            if value is None:
+                return []
+            if hasattr(value, "tolist"):
+                value = value.tolist()
+            return [float(x) for x in value]
+
+        reasons, messages, statuses = _finish_columns(column(out.finished_reasons, None))
+        return cls(
+            rids=list(out.rids or []),
+            embeddings=[vector(v) for v in column(out.embeddings, None)],
+            prompt_tokens=column(out.prompt_tokens, 0),
+            cached_tokens=column(out.cached_tokens, 0),
+            finished_reasons=reasons,
+            finished_messages=messages,
+            finished_status=statuses,
+            engine_index=engine_index,
+            **load,
+        )
+
+
+class ControlReplySlim(msgspec.Struct, tag=True, array_like=True):
+    """The scheduler's answer to a control call, under the call id SMG issued."""
+
+    call_id: int
+    success: bool
+    message: str | None = None
+    engine_index: int = 0
+
+
+class ControlError(ValueError):
+    """A control call this side cannot turn into a scheduler request; answered
+    under its call id so SMG's caller does not wait out its timeout."""
+
+    def __init__(self, call_id: int, message: str) -> None:
+        super().__init__(message)
+        self.call_id = call_id
+
+
+def control_call_id(rid: object) -> int | None:
+    """The call id a control request's rid carries, or None for any other rid."""
+    if isinstance(rid, str) and rid.startswith(CONTROL_RID_PREFIX):
+        try:
+            return int(rid[len(CONTROL_RID_PREFIX) :])
+        except ValueError:
+            return None
+    return None
 
 
 _WIRE_DTYPE_MAP = {
@@ -249,17 +377,22 @@ def wire_dtype(dtype: Any) -> str:
 
 _ENC = msgspec.msgpack.Encoder()
 _DEC_ABORT = msgspec.msgpack.Decoder(list[str])
+_DEC_CONTROL = msgspec.msgpack.Decoder(tuple[int, str, list])
 _DEC_INIT = msgspec.msgpack.Decoder(WireHandshakeInitMessage)
 _DEC_ADD: msgspec.msgpack.Decoder | None = None
 
 
 def _request_decoder() -> msgspec.msgpack.Decoder:
-    """The scheduler's request struct, decoded with its own extension hooks
-    plus one widening: SMG sends token ids as a plain integer array where the
-    tokenizer manager would send an ``array('q')`` extension."""
+    """The scheduler's request structs (generation or embedding, told apart
+    by the tag), decoded with its own extension hooks plus one widening: SMG
+    sends token ids as a plain integer array where the tokenizer manager
+    would send an ``array('q')`` extension."""
     global _DEC_ADD
     if _DEC_ADD is None:
-        from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+        from sglang.srt.managers.io_struct import (
+            TokenizedEmbeddingReqInput,
+            TokenizedGenerateReqInput,
+        )
         from sglang.srt.utils.msgpack_utils import dec_hook, ext_hook
 
         def request_dec_hook(tp: type, obj: object) -> object:
@@ -268,9 +401,56 @@ def _request_decoder() -> msgspec.msgpack.Decoder:
             return dec_hook(tp, obj)
 
         _DEC_ADD = msgspec.msgpack.Decoder(
-            TokenizedGenerateReqInput, dec_hook=request_dec_hook, ext_hook=ext_hook
+            TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
+            dec_hook=request_dec_hook,
+            ext_hook=ext_hook,
         )
     return _DEC_ADD
+
+
+def control_request(payload: bytes):
+    """The scheduler's own control request for SMG's ``[call_id, method,
+    args]``: ``flush_cache(timeout_s)``, ``start_profile(options)`` or
+    ``stop_profile()``. Unset profiler options take the same environment
+    defaults the Python servicer applies."""
+    call_id, method, args = _DEC_CONTROL.decode(payload)
+    rid = f"{CONTROL_RID_PREFIX}{int(call_id)}"
+    try:
+        if method == "flush_cache":
+            from sglang.srt.managers.io_struct import FlushCacheReqInput
+
+            timeout_s = float(args[0]) if args else 0.0
+            return FlushCacheReqInput(rid=rid, timeout_s=timeout_s)
+        if method in ("start_profile", "stop_profile"):
+            from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+
+            if method == "stop_profile":
+                return ProfileReq(rid=rid, req_type=ProfileReqType.STOP_PROFILE)
+            from sglang.srt.utils import get_bool_env_var
+
+            options = dict(args[0]) if args else {}
+            with_stack = options.get("with_stack")
+            record_shapes = options.get("record_shapes")
+            activities = options.get("activities")
+            return ProfileReq(
+                rid=rid,
+                req_type=ProfileReqType.START_PROFILE,
+                output_dir=options.get("output_dir"),
+                start_step=options.get("start_step"),
+                num_steps=options.get("num_steps"),
+                activities=list(activities) if activities else None,
+                with_stack=(with_stack is not False)
+                and get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true"),
+                record_shapes=(record_shapes is not False)
+                and get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", "true"),
+                profile_by_stage=bool(options.get("profile_by_stage", False)),
+                profile_id=str(options.get("profile_id") or time.time()),
+            )
+    except ControlError:
+        raise
+    except Exception as exc:
+        raise ControlError(int(call_id), f"{method}: {exc}") from exc
+    raise ControlError(int(call_id), f"unknown control method {method!r}")
 
 
 def encode(obj: msgspec.Struct) -> bytes:
@@ -281,12 +461,11 @@ def decode_init(payload: bytes) -> WireHandshakeInitMessage:
     return _DEC_INIT.decode(payload)
 
 
-def decode_request_frames(
-    frames: list[bytes],
-) -> list[TokenizedGenerateReqInput | AbortReq]:
+def decode_request_frames(frames: list[bytes]) -> list:
     """Decode one ``[type_byte, payload, *aux]`` message into io_structs. An
-    ADD yields exactly one request; an ABORT may carry several request ids
-    and yields one ``AbortReq`` each."""
+    ADD yields exactly one request (generation or embedding); an ABORT may
+    carry several request ids and yields one ``AbortReq`` each; a CONTROL
+    yields the scheduler's control request for the call."""
     from sglang.srt.managers.io_struct import AbortReq
 
     if len(frames) < 2:
@@ -296,6 +475,8 @@ def decode_request_frames(
         return [_request_decoder().decode(frames[1])]
     if type_byte == REQ_TYPE_ABORT:
         return [AbortReq(rid=rid) for rid in _DEC_ABORT.decode(frames[1])]
+    if type_byte == REQ_TYPE_CONTROL:
+        return [control_request(frames[1])]
     raise ValueError(f"unknown request type byte {type_byte!r}")
 
 
@@ -331,10 +512,12 @@ class MsgpackSendSocket:
     components during init) and attached to the PUSH socket once the
     handshake completes; anything sent before that is dropped with a log
     line. A ``BatchTokenIDOutput`` is sliced to :class:`BatchTokenIDSlimOutput`
-    with the load tail sampled at send time; an ``AbortReq`` the scheduler
-    emits for a request becomes that request's terminal output, so SMG's
-    stream never hangs on a scheduler-side abort; other control replies have
-    no consumer on this wire and are dropped.
+    with the load tail sampled at send time, a ``BatchEmbeddingOutput`` to
+    :class:`BatchEmbeddingSlimOutput`; an ``AbortReq`` the scheduler emits
+    for a request becomes that request's terminal output, so SMG's stream
+    never hangs on a scheduler-side abort; a control reply (handed back with
+    the control request it answers) becomes a :class:`ControlReplySlim`
+    under the request's call id.
     """
 
     def __init__(self, engine_index: int = 0) -> None:
@@ -376,14 +559,30 @@ class MsgpackSendSocket:
         self._load_cache = (now, tail)
         return tail
 
-    def _send_slim(self, slim: BatchTokenIDSlimOutput) -> None:
+    def _send_slim(self, slim: msgspec.Struct) -> None:
         if self.socket is None:
-            logger.warning("zmq msgpack: dropping an output for %s before the handshake", slim.rids)
+            logger.warning("zmq msgpack: dropping a %s before the handshake", type(slim).__name__)
             return
         self.socket.send(_ENC.encode(slim), copy=False)
 
+    def send_control_reply(self, call_id: int, success: bool, message: str | None) -> None:
+        self._send_slim(
+            ControlReplySlim(
+                call_id=int(call_id),
+                success=bool(success),
+                message=message,
+                engine_index=self.engine_index,
+            )
+        )
+
     def send_output(self, output: Any, recv_obj: object | None = None) -> None:
-        from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
+        from sglang.srt.managers.io_struct import (
+            AbortReq,
+            BatchEmbeddingOutput,
+            BatchTokenIDOutput,
+            FlushCacheReqOutput,
+            ProfileReqOutput,
+        )
 
         if isinstance(output, BatchTokenIDOutput):
             self._send_slim(
@@ -391,6 +590,25 @@ class MsgpackSendSocket:
                     output, engine_index=self.engine_index, **self._load_tail()
                 )
             )
+        elif isinstance(output, BatchEmbeddingOutput):
+            self._send_slim(
+                BatchEmbeddingSlimOutput.from_full(
+                    output, engine_index=self.engine_index, **self._load_tail()
+                )
+            )
+        elif isinstance(output, (FlushCacheReqOutput, ProfileReqOutput)):
+            # The scheduler hands the answered request back; its rid names
+            # the call. A reply for a request this side did not issue (the
+            # scheduler's own) has no consumer here.
+            call_id = control_call_id(getattr(recv_obj, "rid", None))
+            if call_id is None:
+                call_id = control_call_id(getattr(output, "rid", None))
+            if call_id is None:
+                logger.debug(
+                    "zmq msgpack: dropping %s for no control call of SMG's", type(output).__name__
+                )
+                return
+            self.send_control_reply(call_id, bool(output.success), output.message)
         elif isinstance(output, AbortReq) and output.rid:
             # The scheduler's own abort: its status (400 when it refused the
             # request, none for an operational abort), not this side's.
@@ -463,10 +681,12 @@ class MsgpackRecvSocket:
         vocab_size: int,
         reject: Callable[[str, str], None],
         tokenizer: object | None = None,
+        control_reply: Callable[[int, bool, str | None], None] | None = None,
     ) -> None:
         self.socket = socket
         self._vocab_size = vocab_size
         self._reject = reject
+        self._control_reply = control_reply
         # The scheduler's tokenizer when it keeps one (grammar-constrained
         # decoding needs it); normalization then resolves stop strings too.
         self._tokenizer = tokenizer
@@ -484,8 +704,23 @@ class MsgpackRecvSocket:
             return "input_ids are required on this wire"
         return None
 
+    def _embedding_validation_error(self, req: TokenizedEmbeddingReqInput) -> str | None:
+        # What the Python servicer does before it hands an embedding request
+        # to the scheduler: normalize the (sampling-less) params.
+        try:
+            req.sampling_params.max_new_tokens = 0
+            req.sampling_params.normalize(self._tokenizer)
+        except ValueError as exc:
+            return str(exc)
+        if req.input_ids is None or len(req.input_ids) == 0:
+            return "input_ids are required on this wire"
+        return None
+
     def drain(self, max_recv: int) -> list:
-        from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+        from sglang.srt.managers.io_struct import (
+            TokenizedEmbeddingReqInput,
+            TokenizedGenerateReqInput,
+        )
 
         received: list = []
         while max_recv < 0 or len(received) < max_recv:
@@ -496,6 +731,11 @@ class MsgpackRecvSocket:
             frames = [frame.buffer for frame in frames]
             try:
                 decoded = decode_request_frames(frames)
+            except ControlError as exc:
+                logger.warning("zmq msgpack: control call %d refused: %s", exc.call_id, exc)
+                if self._control_reply is not None:
+                    self._control_reply(exc.call_id, False, str(exc))
+                continue
             except Exception as exc:
                 # A request SMG built that this scheduler cannot decode (a
                 # version-skewed field, a value the engine's validation
@@ -516,10 +756,14 @@ class MsgpackRecvSocket:
             for obj in decoded:
                 if isinstance(obj, TokenizedGenerateReqInput):
                     reason = self._validation_error(obj)
-                    if reason is not None:
-                        logger.warning("zmq msgpack: rejecting request %s: %s", obj.rid, reason)
-                        self._answer(obj.rid or "", reason)
-                        continue
+                elif isinstance(obj, TokenizedEmbeddingReqInput):
+                    reason = self._embedding_validation_error(obj)
+                else:
+                    reason = None
+                if reason is not None:
+                    logger.warning("zmq msgpack: rejecting request %s: %s", obj.rid, reason)
+                    self._answer(obj.rid or "", reason)
+                    continue
                 received.append(obj)
         return received
 
@@ -606,7 +850,13 @@ def connect_msgpack_engine(
 
     handshake.close()
     logger.info("zmq msgpack handshake: complete (engine_index=%d)", engine_index)
-    return MsgpackRecvSocket(input_socket, vocab_size, sender.send_terminal_abort, tokenizer)
+    return MsgpackRecvSocket(
+        input_socket,
+        vocab_size,
+        sender.send_terminal_abort,
+        tokenizer,
+        control_reply=sender.send_control_reply,
+    )
 
 
 def _sglang_version() -> str:

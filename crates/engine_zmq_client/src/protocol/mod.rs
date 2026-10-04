@@ -137,6 +137,16 @@ pub trait EngineProtocol: Send + Sync + 'static {
     /// the protocol has no wave protocol — its ranks run independently, so
     /// there is nothing to wake.
     fn encode_start_wave(wave: u64) -> Result<Option<(Bytes, Vec<u8>)>>;
+    /// Encode a utility (control) call, `method(*args)` on one rank answered by
+    /// a [`UtilityReply`] under `call_id`, as `(request-type frame, payload)`.
+    /// `Ok(None)` when the protocol has no control messages.
+    fn encode_utility(
+        _call_id: i64,
+        _method: &str,
+        _args: &[OpaqueValue],
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        Ok(None)
+    }
     /// Decode one output message (frame 0 plus ordered aux frames) into a batch.
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>>;
 }

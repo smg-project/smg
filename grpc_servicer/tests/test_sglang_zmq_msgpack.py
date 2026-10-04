@@ -150,6 +150,11 @@ def test_slim_output_pins_its_positional_layout():
         [None, None],  # finished_status: no abort
         [[], [[-0.5, -1.0]]],  # output_top_logprobs_val: b asked for 2
         [[], [[21, 22]]],  # output_top_logprobs_idx
+        [0, 0],  # reasoning_tokens
+        [[], []],  # input_token_logprobs_val
+        [[], []],  # input_token_logprobs_idx
+        [[], []],  # input_top_logprobs_val
+        [[], []],  # input_top_logprobs_idx
     ]
 
 
@@ -293,3 +298,188 @@ class _Load:
     num_waiting_reqs = 11
     num_used_tokens = 500
     max_total_num_tokens = 5000
+
+
+# ----------------------------------------------------------------------------
+# Control calls, embedding requests and their outputs.
+# ----------------------------------------------------------------------------
+
+
+def _control_frame(call_id, method, args):
+    return msgspec.msgpack.encode([call_id, method, args])
+
+
+def test_control_frames_become_the_schedulers_control_requests(monkeypatch):
+    from sglang.srt.managers.io_struct import FlushCacheReqInput, ProfileReq, ProfileReqType
+
+    (flush,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_CONTROL, _control_frame(7, "flush_cache", [1.5])]
+    )
+    assert isinstance(flush, FlushCacheReqInput)
+    assert flush.rid == "smg-control-7" and flush.timeout_s == 1.5
+    assert wire.control_call_id(flush.rid) == 7
+
+    monkeypatch.setenv("SGLANG_PROFILE_WITH_STACK", "false")
+    options = {
+        "output_dir": "/tmp/t",
+        "num_steps": 3,
+        "activities": ["CPU"],
+        "profile_by_stage": False,
+        "profile_id": "p1",
+    }
+    (start,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_CONTROL, _control_frame(8, "start_profile", [options])]
+    )
+    assert isinstance(start, ProfileReq) and start.req_type == ProfileReqType.START_PROFILE
+    assert start.rid == "smg-control-8" and start.output_dir == "/tmp/t" and start.num_steps == 3
+    assert start.activities == ["CPU"] and start.profile_id == "p1"
+    # Unset options take the Python servicer's environment defaults.
+    assert start.with_stack is False and start.record_shapes is True
+
+    (stop,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_CONTROL, _control_frame(9, "stop_profile", [])]
+    )
+    assert isinstance(stop, ProfileReq) and stop.req_type == ProfileReqType.STOP_PROFILE
+
+    with pytest.raises(wire.ControlError) as refused:
+        wire.decode_request_frames([wire.REQ_TYPE_CONTROL, _control_frame(10, "reboot", [])])
+    assert refused.value.call_id == 10 and "reboot" in str(refused.value)
+    assert wire.control_call_id("r1") is None and wire.control_call_id(None) is None
+
+
+def _positional_embedding_request(rid="e1", input_ids=(1, 2, 3)):
+    sp = msgspec.msgpack.decode(msgspec.msgpack.encode(SamplingParams(max_new_tokens=0)))
+    # The prefix the Rust encoder emits: through `dimensions`.
+    return [
+        "TokenizedEmbeddingReqInput",
+        rid,
+        None,
+        "hi",
+        list(input_ids),
+        None,
+        None,
+        sp,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+
+
+def test_embedding_requests_ride_the_add_frame():
+    from sglang.srt.managers.io_struct import TokenizedEmbeddingReqInput
+
+    (req,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(_positional_embedding_request())]
+    )
+    assert isinstance(req, TokenizedEmbeddingReqInput)
+    assert req.rid == "e1" and list(req.input_ids) == [1, 2, 3] and req.dimensions is None
+    assert req.sampling_params.max_new_tokens == 0
+    # The generate request still decodes through the same union decoder.
+    (gen,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(_positional_request())]
+    )
+    assert type(gen).__name__ == "TokenizedGenerateReqInput"
+
+
+class _Sink:
+    """A sender socket stand-in that keeps what was sent."""
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, payload, copy=False):
+        self.sent.append(msgspec.msgpack.decode(bytes(payload)))
+
+
+def test_sender_slims_embeddings_and_answers_control_replies():
+    from sglang.srt.managers.io_struct import (
+        BatchEmbeddingOutput,
+        FlushCacheReqInput,
+        FlushCacheReqOutput,
+        ProfileReqOutput,
+    )
+
+    sender = wire.MsgpackSendSocket()
+    sink = _Sink()
+    sender.attach(sink, 2, None)
+    unset = {name: None for name in BatchEmbeddingOutput.__struct_fields__}
+    sender.send_output(
+        BatchEmbeddingOutput(
+            **unset
+            | dict(
+                rids=["e1", "e2"],
+                finished_reasons=[
+                    {"type": "stop"},
+                    {"type": "abort", "message": "too long", "status_code": 400},
+                ],
+                embeddings=[[0.25, -0.5], []],
+                prompt_tokens=[3, 0],
+                cached_tokens=[0, 0],
+            )
+        )
+    )
+    (batch,) = sink.sent
+    assert batch[0] == "BatchEmbeddingSlimOutput"
+    assert batch[1] == ["e1", "e2"] and batch[2] == [[0.25, -0.5], []]
+    assert batch[3] == [3, 0] and batch[5] == ["stop", "abort"]
+    assert batch[6] == [None, "too long"] and batch[7] == [None, 400] and batch[8] == 2
+
+    # The scheduler hands the answered control request back with its reply.
+    sink.sent.clear()
+    sender.send_output(
+        FlushCacheReqOutput(success=True), FlushCacheReqInput(rid="smg-control-7", timeout_s=0)
+    )
+    sender.send_output(
+        ProfileReqOutput(success=False, message="no profiler"),
+        FlushCacheReqInput(rid="smg-control-8", timeout_s=0),
+    )
+    # A reply for a request this side did not issue has no consumer.
+    sender.send_output(
+        FlushCacheReqOutput(success=True), FlushCacheReqInput(rid="someone-else", timeout_s=0)
+    )
+    # SGLang's reply struct defaults its message to "", not None.
+    assert sink.sent == [
+        ["ControlReplySlim", 7, True, "", 2],
+        ["ControlReplySlim", 8, False, "no profiler", 2],
+    ]
+
+
+def test_slim_output_appends_prompt_logprobs_and_reasoning_tokens():
+    full = _full_output()
+    full.reasoning_tokens = [0, 4]
+    full.input_token_logprobs_val = [None, [None, -0.7, -1.1]]
+    full.input_token_logprobs_idx = [None, [1, 2, 3]]
+    full.input_top_logprobs_val = [None, [None, [-0.7], [-1.1]]]
+    full.input_top_logprobs_idx = [None, [None, [2], [3]]]
+    slim = wire.BatchTokenIDSlimOutput.from_full(full)
+    encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
+    assert len(encoded) == 24
+    assert encoded[19] == [0, 4]
+    assert encoded[20] == [[], [None, -0.7, -1.1]] and encoded[21] == [[], [1, 2, 3]]
+    assert encoded[22] == [[], [[], [-0.7], [-1.1]]] and encoded[23] == [[], [[], [2], [3]]]
+    # Pins for the Rust decoder (`protocol/sglang/output.rs`): the 24-element
+    # batch, an embedding batch and a control reply.
+    print("PIN_SLIM24", msgspec.msgpack.encode(slim).hex())
+    print(
+        "PIN_EMBED",
+        msgspec.msgpack.encode(
+            wire.BatchEmbeddingSlimOutput(
+                rids=["e1"],
+                embeddings=[[0.25, -0.5]],
+                prompt_tokens=[3],
+                cached_tokens=[0],
+                finished_reasons=["stop"],
+                finished_messages=[None],
+                finished_status=[None],
+                engine_index=1,
+            )
+        ).hex(),
+    )
+    print(
+        "PIN_CONTROL",
+        msgspec.msgpack.encode(
+            wire.ControlReplySlim(call_id=7, success=True, message=None, engine_index=1)
+        ).hex(),
+    )

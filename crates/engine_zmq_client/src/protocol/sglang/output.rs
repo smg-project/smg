@@ -11,6 +11,7 @@ use serde::{
 };
 
 use crate::{
+    codec::OpaqueValue,
     error::{Error, Result},
     protocol::{
         positional::{drain_trailing, expect_tag, next_field},
@@ -19,6 +20,8 @@ use crate::{
 };
 
 /// The msgspec tag for [`BatchTokenIDSlimOutput`] (element 0 on the wire).
+pub const BATCH_EMBEDDING_SLIM_OUTPUT_TAG: &str = "BatchEmbeddingSlimOutput";
+pub const CONTROL_REPLY_SLIM_TAG: &str = "ControlReplySlim";
 pub const BATCH_TOKEN_ID_SLIM_OUTPUT_TAG: &str = "BatchTokenIDSlimOutput";
 
 /// What a request stopped on: the scheduler reports the matched stop token id
@@ -72,11 +75,21 @@ pub struct BatchTokenIDSlimOutput {
     /// not requested or from a plugin that predates the columns.
     pub output_top_logprobs_val: Vec<Vec<Vec<f64>>>,
     pub output_top_logprobs_idx: Vec<Vec<Vec<u32>>>,
+    /// Reasoning tokens counted so far (hybrid-reasoning models); appended.
+    pub reasoning_tokens: Vec<u32>,
+    /// Prompt logprobs when `logprob_start_len >= 0`: the sampled prompt
+    /// token's logprob per position (`None` for the first, which has no
+    /// predecessor), its id, and the ranked candidates per position when
+    /// `top_logprobs_num > 0`; empty per request otherwise. Appended.
+    pub input_token_logprobs_val: Vec<Vec<Option<f64>>>,
+    pub input_token_logprobs_idx: Vec<Vec<u32>>,
+    pub input_top_logprobs_val: Vec<Vec<Vec<f64>>>,
+    pub input_top_logprobs_idx: Vec<Vec<Vec<u32>>>,
 }
 
 impl Serialize for BatchTokenIDSlimOutput {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut tuple = serializer.serialize_tuple(19)?;
+        let mut tuple = serializer.serialize_tuple(24)?;
         tuple.serialize_element(BATCH_TOKEN_ID_SLIM_OUTPUT_TAG)?;
         tuple.serialize_element(&self.rids)?;
         tuple.serialize_element(&self.output_ids)?;
@@ -96,6 +109,11 @@ impl Serialize for BatchTokenIDSlimOutput {
         tuple.serialize_element(&self.finished_status)?;
         tuple.serialize_element(&self.output_top_logprobs_val)?;
         tuple.serialize_element(&self.output_top_logprobs_idx)?;
+        tuple.serialize_element(&self.reasoning_tokens)?;
+        tuple.serialize_element(&self.input_token_logprobs_val)?;
+        tuple.serialize_element(&self.input_token_logprobs_idx)?;
+        tuple.serialize_element(&self.input_top_logprobs_val)?;
+        tuple.serialize_element(&self.input_top_logprobs_idx)?;
         tuple.end()
     }
 }
@@ -116,17 +134,43 @@ impl<'de> Deserialize<'de> for BatchTokenIDSlimOutput {
                 mut seq: A,
             ) -> std::result::Result<Self::Value, A::Error> {
                 expect_tag(&mut seq, BATCH_TOKEN_ID_SLIM_OUTPUT_TAG)?;
+                read_token_batch_after_tag(&mut seq)
+            }
+        }
+
+        deserializer.deserialize_seq(BatchVisitor)
+    }
+}
+
+/// An optional appended column: absent, or `None`, from an older plugin.
+fn appended_column<'de, A: SeqAccess<'de>, T: Deserialize<'de>>(
+    seq: &mut A,
+) -> std::result::Result<Vec<T>, A::Error> {
+    Ok(seq
+        .next_element::<Option<Vec<T>>>()?
+        .flatten()
+        .unwrap_or_default())
+}
+
+/// The token batch's columns after the tag; shared by the struct's own
+/// decoder and the wire enum's.
+fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
+    seq: &mut A,
+) -> std::result::Result<BatchTokenIDSlimOutput, A::Error> {
+    {
+        {
+            {
                 let batch = BatchTokenIDSlimOutput {
-                    rids: next_field(&mut seq, "rids")?,
-                    output_ids: next_field(&mut seq, "output_ids")?,
-                    finished_reasons: next_field(&mut seq, "finished_reasons")?,
-                    finished_messages: next_field(&mut seq, "finished_messages")?,
-                    finished_matched: next_field(&mut seq, "finished_matched")?,
-                    prompt_tokens: next_field(&mut seq, "prompt_tokens")?,
-                    completion_tokens: next_field(&mut seq, "completion_tokens")?,
-                    cached_tokens: next_field(&mut seq, "cached_tokens")?,
-                    output_token_logprobs_val: next_field(&mut seq, "output_token_logprobs_val")?,
-                    output_token_logprobs_idx: next_field(&mut seq, "output_token_logprobs_idx")?,
+                    rids: next_field(seq, "rids")?,
+                    output_ids: next_field(seq, "output_ids")?,
+                    finished_reasons: next_field(seq, "finished_reasons")?,
+                    finished_messages: next_field(seq, "finished_messages")?,
+                    finished_matched: next_field(seq, "finished_matched")?,
+                    prompt_tokens: next_field(seq, "prompt_tokens")?,
+                    completion_tokens: next_field(seq, "completion_tokens")?,
+                    cached_tokens: next_field(seq, "cached_tokens")?,
+                    output_token_logprobs_val: next_field(seq, "output_token_logprobs_val")?,
+                    output_token_logprobs_idx: next_field(seq, "output_token_logprobs_idx")?,
                     // The tail has msgspec defaults; a shorter array from an
                     // older plugin decodes as "rank 0, no snapshot".
                     engine_index: seq.next_element::<u32>()?.unwrap_or(0),
@@ -146,13 +190,16 @@ impl<'de> Deserialize<'de> for BatchTokenIDSlimOutput {
                         .next_element::<Option<Vec<Vec<Vec<u32>>>>>()?
                         .flatten()
                         .unwrap_or_default(),
+                    reasoning_tokens: appended_column(seq)?,
+                    input_token_logprobs_val: appended_column(seq)?,
+                    input_token_logprobs_idx: appended_column(seq)?,
+                    input_top_logprobs_val: appended_column(seq)?,
+                    input_top_logprobs_idx: appended_column(seq)?,
                 };
-                drain_trailing(&mut seq)?;
+                drain_trailing(seq)?;
                 Ok(batch)
             }
         }
-
-        deserializer.deserialize_seq(BatchVisitor)
     }
 }
 
@@ -176,6 +223,15 @@ pub struct SglangOutput {
     /// Ranked candidates per newly decoded token, when requested.
     pub output_top_logprobs_val: Vec<Vec<f64>>,
     pub output_top_logprobs_idx: Vec<Vec<u32>>,
+    /// Reasoning tokens counted so far (0 when the model has no such phase).
+    pub reasoning_tokens: u32,
+    /// Prompt logprobs, delivered once with the prefill tick (empty otherwise).
+    pub input_logprobs_val: Vec<Option<f64>>,
+    pub input_logprobs_idx: Vec<u32>,
+    pub input_top_logprobs_val: Vec<Vec<f64>>,
+    pub input_top_logprobs_idx: Vec<Vec<u32>>,
+    /// The pooled vector of an embedding request (its one, finished, output).
+    pub embedding: Option<Vec<f32>>,
 }
 
 impl EngineOutput for SglangOutput {
@@ -221,6 +277,17 @@ impl BatchTokenIDSlimOutput {
                 "output_top_logprobs_idx",
                 self.output_top_logprobs_idx.len(),
             ),
+            ("reasoning_tokens", self.reasoning_tokens.len()),
+            (
+                "input_token_logprobs_val",
+                self.input_token_logprobs_val.len(),
+            ),
+            (
+                "input_token_logprobs_idx",
+                self.input_token_logprobs_idx.len(),
+            ),
+            ("input_top_logprobs_val", self.input_top_logprobs_val.len()),
+            ("input_top_logprobs_idx", self.input_top_logprobs_idx.len()),
         ];
         if let Some((name, len)) = columns
             .iter()
@@ -244,6 +311,11 @@ impl BatchTokenIDSlimOutput {
         let mut cached_tokens = self.cached_tokens.into_iter();
         let mut logprobs_val = self.output_token_logprobs_val.into_iter();
         let mut logprobs_idx = self.output_token_logprobs_idx.into_iter();
+        let mut reasoning_tokens = self.reasoning_tokens.into_iter();
+        let mut input_val = self.input_token_logprobs_val.into_iter();
+        let mut input_idx = self.input_token_logprobs_idx.into_iter();
+        let mut input_top_val = self.input_top_logprobs_val.into_iter();
+        let mut input_top_idx = self.input_top_logprobs_idx.into_iter();
         Ok(self
             .rids
             .into_iter()
@@ -264,9 +336,269 @@ impl BatchTokenIDSlimOutput {
                     output_logprobs_idx: logprobs_idx.next().unwrap_or_default(),
                     output_top_logprobs_val: top_val.next().unwrap_or_default(),
                     output_top_logprobs_idx: top_idx.next().unwrap_or_default(),
+                    reasoning_tokens: reasoning_tokens.next().unwrap_or(0),
+                    input_logprobs_val: input_val.next().unwrap_or_default(),
+                    input_logprobs_idx: input_idx.next().unwrap_or_default(),
+                    input_top_logprobs_val: input_top_val.next().unwrap_or_default(),
+                    input_top_logprobs_idx: input_top_idx.next().unwrap_or_default(),
+                    embedding: None,
                 }
             })
             .collect())
+    }
+}
+
+/// The plugin's per-step batch for embedding requests: each request's pooled
+/// vector with its counts and finish (`stop`, or `abort` with the message and
+/// status when the scheduler could not serve it), plus the load tail.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BatchEmbeddingSlimOutput {
+    pub rids: Vec<String>,
+    pub embeddings: Vec<Vec<f32>>,
+    pub prompt_tokens: Vec<u32>,
+    pub cached_tokens: Vec<u32>,
+    pub finished_reasons: Vec<String>,
+    pub finished_messages: Vec<Option<String>>,
+    pub finished_status: Vec<Option<u16>>,
+    pub engine_index: u32,
+    pub num_running: u64,
+    pub num_waiting: u64,
+    pub kv_used_tokens: u64,
+    pub kv_total_tokens: u64,
+}
+
+impl Serialize for BatchEmbeddingSlimOutput {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut tuple = serializer.serialize_tuple(13)?;
+        tuple.serialize_element(BATCH_EMBEDDING_SLIM_OUTPUT_TAG)?;
+        tuple.serialize_element(&self.rids)?;
+        tuple.serialize_element(&self.embeddings)?;
+        tuple.serialize_element(&self.prompt_tokens)?;
+        tuple.serialize_element(&self.cached_tokens)?;
+        tuple.serialize_element(&self.finished_reasons)?;
+        tuple.serialize_element(&self.finished_messages)?;
+        tuple.serialize_element(&self.finished_status)?;
+        tuple.serialize_element(&self.engine_index)?;
+        tuple.serialize_element(&self.num_running)?;
+        tuple.serialize_element(&self.num_waiting)?;
+        tuple.serialize_element(&self.kv_used_tokens)?;
+        tuple.serialize_element(&self.kv_total_tokens)?;
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for BatchEmbeddingSlimOutput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct BatchVisitor;
+
+        impl<'de> Visitor<'de> for BatchVisitor {
+            type Value = BatchEmbeddingSlimOutput;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a tagged BatchEmbeddingSlimOutput positional array")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                expect_tag(&mut seq, BATCH_EMBEDDING_SLIM_OUTPUT_TAG)?;
+                read_embedding_batch_after_tag(&mut seq)
+            }
+        }
+
+        deserializer.deserialize_seq(BatchVisitor)
+    }
+}
+
+fn read_embedding_batch_after_tag<'de, A: SeqAccess<'de>>(
+    seq: &mut A,
+) -> std::result::Result<BatchEmbeddingSlimOutput, A::Error> {
+    let batch = BatchEmbeddingSlimOutput {
+        rids: next_field(seq, "rids")?,
+        embeddings: next_field(seq, "embeddings")?,
+        prompt_tokens: next_field(seq, "prompt_tokens")?,
+        cached_tokens: next_field(seq, "cached_tokens")?,
+        finished_reasons: next_field(seq, "finished_reasons")?,
+        finished_messages: next_field(seq, "finished_messages")?,
+        finished_status: next_field(seq, "finished_status")?,
+        engine_index: seq.next_element::<u32>()?.unwrap_or(0),
+        num_running: seq.next_element::<u64>()?.unwrap_or(0),
+        num_waiting: seq.next_element::<u64>()?.unwrap_or(0),
+        kv_used_tokens: seq.next_element::<u64>()?.unwrap_or(0),
+        kv_total_tokens: seq.next_element::<u64>()?.unwrap_or(0),
+    };
+    drain_trailing(seq)?;
+    Ok(batch)
+}
+
+impl BatchEmbeddingSlimOutput {
+    /// One finished [`SglangOutput`] per request; an `abort` carries no vector.
+    pub fn into_outputs(self) -> Result<Vec<SglangOutput>> {
+        let n = self.rids.len();
+        let columns = [
+            ("embeddings", self.embeddings.len()),
+            ("prompt_tokens", self.prompt_tokens.len()),
+            ("cached_tokens", self.cached_tokens.len()),
+            ("finished_reasons", self.finished_reasons.len()),
+            ("finished_messages", self.finished_messages.len()),
+            ("finished_status", self.finished_status.len()),
+        ];
+        if let Some((name, len)) = columns.iter().copied().find(|(_, len)| *len != n) {
+            return Err(Error::Decode {
+                target_type: "BatchEmbeddingSlimOutput",
+                message: format!("column `{name}` has {len} entries for {n} rids"),
+            });
+        }
+        let mut embeddings = self.embeddings.into_iter();
+        let mut prompt_tokens = self.prompt_tokens.into_iter();
+        let mut cached_tokens = self.cached_tokens.into_iter();
+        let mut finished_messages = self.finished_messages.into_iter();
+        let mut finished_status = self.finished_status.into_iter();
+        Ok(self
+            .rids
+            .into_iter()
+            .zip(self.finished_reasons)
+            .map(|(request_id, reason)| {
+                let embedding = embeddings.next().unwrap_or_default();
+                SglangOutput {
+                    request_id,
+                    // An embedding output is terminal by construction.
+                    finish_reason: Some(if reason.is_empty() {
+                        "stop".to_string()
+                    } else {
+                        reason.clone()
+                    }),
+                    finish_message: finished_messages.next().flatten(),
+                    finish_status: finished_status.next().flatten(),
+                    prompt_tokens: prompt_tokens.next().unwrap_or(0),
+                    cached_tokens: cached_tokens.next().unwrap_or(0),
+                    embedding: (reason != "abort").then_some(embedding),
+                    ..SglangOutput::default()
+                }
+            })
+            .collect())
+    }
+}
+
+/// The plugin's answer to a control call (`ControlReplySlim`): the
+/// scheduler's `success`/`message` for the call id SMG issued.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ControlReplySlim {
+    pub call_id: i64,
+    pub success: bool,
+    pub message: Option<String>,
+    pub engine_index: u32,
+}
+
+impl Serialize for ControlReplySlim {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut tuple = serializer.serialize_tuple(5)?;
+        tuple.serialize_element(CONTROL_REPLY_SLIM_TAG)?;
+        tuple.serialize_element(&self.call_id)?;
+        tuple.serialize_element(&self.success)?;
+        tuple.serialize_element(&self.message)?;
+        tuple.serialize_element(&self.engine_index)?;
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ControlReplySlim {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct ReplyVisitor;
+
+        impl<'de> Visitor<'de> for ReplyVisitor {
+            type Value = ControlReplySlim;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a tagged ControlReplySlim positional array")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                expect_tag(&mut seq, CONTROL_REPLY_SLIM_TAG)?;
+                read_control_reply_after_tag(&mut seq)
+            }
+        }
+
+        deserializer.deserialize_seq(ReplyVisitor)
+    }
+}
+
+fn read_control_reply_after_tag<'de, A: SeqAccess<'de>>(
+    seq: &mut A,
+) -> std::result::Result<ControlReplySlim, A::Error> {
+    let reply = ControlReplySlim {
+        call_id: next_field(seq, "call_id")?,
+        success: next_field(seq, "success")?,
+        message: next_field(seq, "message")?,
+        engine_index: seq.next_element::<u32>()?.unwrap_or(0),
+    };
+    drain_trailing(seq)?;
+    Ok(reply)
+}
+
+impl ControlReplySlim {
+    /// The reply as a utility outcome: a map of `success` and `message`, so
+    /// a refused flush (success false) is a reply, not a transport failure.
+    pub fn into_outcome(self) -> OpaqueValue {
+        OpaqueValue::Map(vec![
+            (
+                OpaqueValue::from("success"),
+                OpaqueValue::Boolean(self.success),
+            ),
+            (
+                OpaqueValue::from("message"),
+                self.message.map_or(OpaqueValue::Nil, OpaqueValue::from),
+            ),
+        ])
+    }
+}
+
+/// One output message on the wire, told apart by its tag. The token batch is
+/// boxed: it is by far the largest and the common case.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SglangWireOutput {
+    Tokens(Box<BatchTokenIDSlimOutput>),
+    Embeddings(BatchEmbeddingSlimOutput),
+    ControlReply(ControlReplySlim),
+}
+
+impl<'de> Deserialize<'de> for SglangWireOutput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct WireVisitor;
+
+        impl<'de> Visitor<'de> for WireVisitor {
+            type Value = SglangWireOutput;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a tagged SGLang slim output positional array")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let tag: String = next_field(&mut seq, "tag")?;
+                match tag.as_str() {
+                    BATCH_TOKEN_ID_SLIM_OUTPUT_TAG => read_token_batch_after_tag(&mut seq)
+                        .map(|batch| SglangWireOutput::Tokens(Box::new(batch))),
+                    BATCH_EMBEDDING_SLIM_OUTPUT_TAG => {
+                        read_embedding_batch_after_tag(&mut seq).map(SglangWireOutput::Embeddings)
+                    }
+                    CONTROL_REPLY_SLIM_TAG => {
+                        read_control_reply_after_tag(&mut seq).map(SglangWireOutput::ControlReply)
+                    }
+                    other => Err(serde::de::Error::custom(format!(
+                        "unknown SGLang output tag `{other}`"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_seq(WireVisitor)
     }
 }
 
@@ -279,6 +611,15 @@ mod tests {
     /// b finished on token 42 with logprobs and two ranked candidates on its
     /// last token, load 2/3/40/400 on engine 1, no abort status.
     const PYTHON_SLIM: &str = "dc0013b64261746368546f6b656e4944536c696d4f757470757492a161a16292910a92141592a0a473746f7092c0c092c02a920304920102920001929092cbbfe0000000000000cbbfd0000000000000929092141501020328cd019092c0c092909192cbbfe0000000000000cbbff0000000000000929091921516";
+    /// The same batch from the current plugin (24 elements): `b` with 4
+    /// reasoning tokens and prompt logprobs for its three prompt tokens (no
+    /// value for the first), one ranked candidate per later position.
+    const PYTHON_SLIM24: &str = "dc0018b64261746368546f6b656e4944536c696d4f757470757492a161a16292910a92141592a0a473746f7092c0c092c02a920304920102920001929092cbbfe0000000000000cbbfd00000000000009290921415000000000092c0c092909192cbbfe0000000000000cbbff0000000000000929091921516920004929093c0cbbfe6666666666666cbbff199999999999a9290930102039290939091cbbfe666666666666691cbbff199999999999a9290939091029103";
+    /// The plugin's embedding batch for rid `e1`: vector `[0.25, -0.5]`, 3
+    /// prompt tokens, finished `stop`, engine 1, no load tail.
+    const PYTHON_EMBED: &str = "9db84261746368456d62656464696e67536c696d4f757470757491a265319192cb3fd0000000000000cbbfe00000000000009103910091a473746f7091c091c00100000000";
+    /// The plugin's control reply for call 7: success, no message, engine 1.
+    const PYTHON_CONTROL: &str = "95b0436f6e74726f6c5265706c79536c696d07c3c001";
     /// The plugin's terminal abort for rid `x`: its `n=2` rejection, status 400.
     const PYTHON_ABORT: &str = "dc0013b64261746368546f6b656e4944536c696d4f757470757491a178919091a561626f727491d9396e3d32206973206e6f7420736572766564206f6e207468697320776972653b20534d472066616e73206f7574206e203e203120697473656c6691c091009100910091909190000000000091cd019091909190";
 
@@ -289,9 +630,13 @@ mod tests {
             .collect()
     }
 
+    /// The 19-element pin predates the appended prompt-logprob and reasoning
+    /// columns: it decodes with them empty, and re-encoding (24 elements)
+    /// round-trips to the same value.
     #[test]
     fn python_pinned_batch_decodes_and_re_encodes_identically() {
         let batch: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM)).unwrap();
+        assert!(batch.reasoning_tokens.is_empty() && batch.input_token_logprobs_val.is_empty());
         assert_eq!(batch.rids, vec!["a", "b"]);
         assert_eq!(batch.output_ids, vec![vec![10], vec![20, 21]]);
         assert_eq!(
@@ -309,7 +654,12 @@ mod tests {
             ),
             (1, 2, 3, 40, 400)
         );
-        assert_eq!(encode_msgpack(&batch).unwrap(), hex(PYTHON_SLIM));
+        let re_encoded = encode_msgpack(&batch).unwrap();
+        assert_eq!(re_encoded.len(), hex(PYTHON_SLIM).len() + 5);
+        assert_eq!(
+            decode_msgpack::<BatchTokenIDSlimOutput>(&re_encoded).unwrap(),
+            batch
+        );
         let outputs = batch.into_outputs().unwrap();
         assert_eq!(outputs[0].finish_reason, None);
         assert_eq!(outputs[1].finish_reason.as_deref(), Some("stop"));
@@ -317,6 +667,88 @@ mod tests {
         assert!(outputs[0].output_top_logprobs_val.is_empty());
         assert_eq!(outputs[1].output_top_logprobs_val, vec![vec![-0.5, -1.0]]);
         assert_eq!(outputs[1].output_top_logprobs_idx, vec![vec![21, 22]]);
+    }
+
+    #[test]
+    fn python_pinned_batch_with_appended_columns_round_trips() {
+        let batch: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM24)).unwrap();
+        assert_eq!(batch.reasoning_tokens, vec![0, 4]);
+        assert_eq!(
+            batch.input_token_logprobs_val,
+            vec![vec![], vec![None, Some(-0.7), Some(-1.1)]]
+        );
+        assert_eq!(batch.input_token_logprobs_idx, vec![vec![], vec![1, 2, 3]]);
+        assert_eq!(
+            batch.input_top_logprobs_val,
+            vec![vec![], vec![vec![], vec![-0.7], vec![-1.1]]]
+        );
+        assert_eq!(
+            batch.input_top_logprobs_idx,
+            vec![vec![], vec![vec![], vec![2], vec![3]]]
+        );
+        assert_eq!(encode_msgpack(&batch).unwrap(), hex(PYTHON_SLIM24));
+        let outputs = batch.into_outputs().unwrap();
+        assert_eq!(outputs[1].reasoning_tokens, 4);
+        assert_eq!(outputs[1].input_logprobs_idx, vec![1, 2, 3]);
+        assert_eq!(outputs[1].input_top_logprobs_idx[1], vec![2]);
+        assert!(outputs[0].input_logprobs_val.is_empty() && outputs[0].embedding.is_none());
+        // The wire enum reads the same bytes by tag.
+        assert!(matches!(
+            decode_msgpack::<SglangWireOutput>(&hex(PYTHON_SLIM24)).unwrap(),
+            SglangWireOutput::Tokens(_)
+        ));
+    }
+
+    #[test]
+    fn python_pinned_embedding_batch_and_control_reply_decode_by_tag() {
+        let SglangWireOutput::Embeddings(batch) = decode_msgpack(&hex(PYTHON_EMBED)).unwrap()
+        else {
+            panic!("expected an embedding batch");
+        };
+        assert_eq!(batch.rids, vec!["e1"]);
+        assert_eq!(batch.embeddings, vec![vec![0.25, -0.5]]);
+        assert_eq!((batch.prompt_tokens[0], batch.engine_index), (3, 1));
+        // Python writes the vector as float64, this side keeps float32 (the
+        // proto's `repeated float`): the value round-trips, not the bytes.
+        assert_eq!(
+            decode_msgpack::<BatchEmbeddingSlimOutput>(&encode_msgpack(&batch).unwrap()).unwrap(),
+            batch
+        );
+        let outputs = batch.into_outputs().unwrap();
+        assert_eq!(outputs[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(outputs[0].embedding, Some(vec![0.25, -0.5]));
+        assert!(outputs[0].finished());
+        // An aborted embedding carries no vector.
+        let aborted = BatchEmbeddingSlimOutput {
+            rids: vec!["e2".into()],
+            embeddings: vec![vec![]],
+            prompt_tokens: vec![0],
+            cached_tokens: vec![0],
+            finished_reasons: vec!["abort".into()],
+            finished_messages: vec![Some("too long".into())],
+            finished_status: vec![Some(400)],
+            ..Default::default()
+        };
+        let outputs = aborted.into_outputs().unwrap();
+        assert_eq!(outputs[0].embedding, None);
+        assert_eq!(outputs[0].finish_status, Some(400));
+
+        let SglangWireOutput::ControlReply(reply) = decode_msgpack(&hex(PYTHON_CONTROL)).unwrap()
+        else {
+            panic!("expected a control reply");
+        };
+        assert_eq!(
+            reply,
+            ControlReplySlim {
+                call_id: 7,
+                success: true,
+                message: None,
+                engine_index: 1,
+            }
+        );
+        assert_eq!(encode_msgpack(&reply).unwrap(), hex(PYTHON_CONTROL));
+        let unknown = decode_msgpack::<SglangWireOutput>(&encode_msgpack(&("Mystery", 1)).unwrap());
+        assert!(unknown.is_err());
     }
 
     #[test]
