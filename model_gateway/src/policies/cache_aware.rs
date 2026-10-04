@@ -226,6 +226,28 @@ fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
     (counts.values().sum(), counts.len())
 }
 
+/// The per-model tree, created on first sight.
+///
+/// Reads first: `DashMap::entry` takes the shard's *exclusive* lock (and a
+/// `String` key allocation) on every call, and every request for a model lands
+/// on the same shard, so the selection hot path would serialize on it. A shared
+/// read plus an `Arc` clone is uncontended; only a model's first request pays
+/// for the insert.
+fn tree_for_model<V>(
+    trees: &DashMap<String, Arc<V>>,
+    model_id: &str,
+    new_tree: impl FnOnce() -> V,
+) -> Arc<V> {
+    if let Some(tree) = trees.get(model_id) {
+        return Arc::clone(tree.value());
+    }
+    trees
+        .entry(model_id.to_string())
+        .or_insert_with(|| Arc::new(new_tree()))
+        .value()
+        .clone()
+}
+
 impl CacheAwarePolicy {
     pub fn new() -> Self {
         Self::with_config(CacheAwareConfig::default())
@@ -1942,12 +1964,7 @@ impl CacheAwarePolicy {
         model_id: &str,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let tree = self
-            .token_trees
-            .entry(model_id.to_string())
-            .or_insert_with(|| Arc::new(self.new_token_tree()))
-            .value()
-            .clone();
+        let tree = tree_for_model(&self.token_trees, model_id, || self.new_token_tree());
 
         // A partitioned request keys under its namespace marker: another
         // namespace diverges at position 0 and can never match, and the
@@ -2031,12 +2048,7 @@ impl CacheAwarePolicy {
         model_id: &str,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let tree = self
-            .string_trees
-            .entry(model_id.to_string())
-            .or_insert_with(|| Arc::new(Tree::new()))
-            .value()
-            .clone();
+        let tree = tree_for_model(&self.string_trees, model_id, Tree::new);
 
         // Same partition rule as the token tree, in chars.
         let prefixed;

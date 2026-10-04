@@ -8,8 +8,9 @@
 //! size of the pools they would select from, so traffic can migrate between
 //! HTTP and gRPC and between regular and disaggregated fleets gradually.
 
-use std::{future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -17,7 +18,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use dashmap::DashMap;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -54,8 +54,11 @@ use crate::{
 
 pub struct Gateway {
     worker_registry: Arc<WorkerRegistry>,
-    routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
-    default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
+    /// Copy-on-write: routers are registered at startup and only read per
+    /// request, so a wait-free `load()` replaces a `DashMap` shard lock (and a
+    /// `RwLock` for the default) that every request would contend on.
+    routers: ArcSwap<HashMap<RouterId, Arc<dyn RouterTrait>>>,
+    default_router: ArcSwapOption<RouterId>,
     enable_igw: bool,
 }
 
@@ -69,8 +72,8 @@ impl Gateway {
     pub fn new(worker_registry: Arc<WorkerRegistry>) -> Self {
         Self {
             worker_registry,
-            routers: Arc::new(DashMap::new()),
-            default_router: Arc::new(std::sync::RwLock::new(None)),
+            routers: ArcSwap::from_pointee(HashMap::new()),
+            default_router: ArcSwapOption::empty(),
             enable_igw: false,
         }
     }
@@ -161,28 +164,24 @@ impl Gateway {
     }
 
     pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
-        self.routers.insert(id.clone(), router);
+        self.routers.rcu(|routers| {
+            let mut next: HashMap<_, _> = (**routers).clone();
+            next.insert(id.clone(), Arc::clone(&router));
+            next
+        });
 
-        let mut default_router = self
-            .default_router
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if default_router.is_none() {
-            *default_router = Some(id.clone());
+        if self.default_router.load().is_none() {
+            self.default_router.store(Some(Arc::new(id.clone())));
             info!("Set default router to {}", id.as_str());
         }
     }
 
     pub fn set_default_router(&self, id: RouterId) {
-        let mut default_router = self
-            .default_router
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        *default_router = Some(id);
+        self.default_router.store(Some(Arc::new(id)));
     }
 
     pub fn router_count(&self) -> usize {
-        self.routers.len()
+        self.routers.load().len()
     }
 
     /// Selects a router by weighting available router types by their worker counts.
@@ -208,9 +207,10 @@ impl Gateway {
             (http_regular, &router_ids::HTTP_REGULAR),
         ];
 
+        let routers = self.routers.load();
         let total: usize = options
             .iter()
-            .filter(|(weight, router_id)| *weight > 0 && self.routers.contains_key(*router_id))
+            .filter(|(weight, router_id)| *weight > 0 && routers.contains_key(*router_id))
             .map(|(weight, _)| *weight)
             .sum();
         if total == 0 {
@@ -220,12 +220,12 @@ impl Gateway {
         let pick = ((rand::random::<f64>() * total as f64) as usize).min(total - 1);
         let mut cum = 0usize;
         for (weight, router_id) in &options {
-            if *weight == 0 || !self.routers.contains_key(*router_id) {
+            if *weight == 0 || !routers.contains_key(*router_id) {
                 continue;
             }
             cum += weight;
             if pick < cum {
-                return self.routers.get(*router_id).map(|r| r.clone());
+                return routers.get(*router_id).cloned();
             }
         }
         None
@@ -236,8 +236,9 @@ impl Gateway {
     fn external_router_for(&self, provider: Option<&ProviderType>) -> Option<Arc<dyn RouterTrait>> {
         let spec = spec_for_provider(provider)?;
         self.routers
+            .load()
             .get(&RouterId::new(spec.router_id))
-            .map(|router| Arc::clone(router.value()))
+            .cloned()
     }
 
     /// The router for `model_id` (the whole fleet when `None`), read from the
@@ -270,7 +271,7 @@ impl Gateway {
         let grpc_epd_ready = grpc_encode > 0
             && grpc_prefill > 0
             && grpc_decode > 0
-            && self.routers.contains_key(&router_ids::GRPC_EPD);
+            && self.routers.load().contains_key(&router_ids::GRPC_EPD);
         let grpc_epd = if grpc_epd_ready {
             grpc_encode + grpc_prefill + grpc_decode
         } else {
@@ -316,17 +317,13 @@ impl Gateway {
     ) -> Option<Arc<dyn RouterTrait>> {
         // In single-router mode (enable_igw=false), always use the default router
         if !self.enable_igw {
-            let default_router = self
-                .default_router
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref default_id) = *default_router {
+            if let Some(default_id) = self.default_router.load_full() {
                 debug!(
                     "Single-router mode: using default router {} for model {:?}",
                     default_id.as_str(),
                     model_id
                 );
-                return self.routers.get(default_id).map(|r| r.clone());
+                return self.routers.load().get(&*default_id).cloned();
             }
         }
 
@@ -340,13 +337,9 @@ impl Gateway {
                     return None;
                 }
             }
-            let default = self
-                .default_router
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            default
-                .as_ref()
-                .and_then(|id| self.routers.get(id).map(|r| r.clone()))
+            self.default_router
+                .load_full()
+                .and_then(|id| self.routers.load().get(&*id).cloned())
         })
     }
 
@@ -404,14 +397,10 @@ impl RouterTrait for Gateway {
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
         // Model info is fleet-wide: the default router answers, else any.
-        let default_id = self
-            .default_router
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let router = match default_id {
-            Some(id) => self.routers.get(&id).map(|r| r.clone()),
-            None => self.routers.iter().next().map(|r| r.value().clone()),
+        let routers = self.routers.load();
+        let router = match self.default_router.load_full() {
+            Some(id) => routers.get(&*id).cloned(),
+            None => routers.values().next().cloned(),
         };
         match router {
             Some(router) => router.get_model_info(req).await,
@@ -713,7 +702,7 @@ impl RouterTrait for Gateway {
 impl std::fmt::Debug for Gateway {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gateway")
-            .field("routers", &self.routers.len())
+            .field("routers", &self.routers.load().len())
             .field("enable_igw", &self.enable_igw)
             .field("workers_count", &self.worker_registry.get_all().len())
             .finish()
