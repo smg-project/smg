@@ -1166,13 +1166,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // side alone would break every same-namespace match. It stays
             // unpartitioned here; the approximate and hash modes below key
             // under the request's cache namespace.
-            if self.has_event_indexer(model_id) {
+            if let Some(index) = self.event_index_for(model_id) {
                 self.select_worker_event_driven(
                     workers,
                     tokens,
                     &healthy_indices,
                     avg_load,
-                    model_id,
+                    &index,
                     info,
                 )
             } else {
@@ -1245,18 +1245,43 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     }
 }
 
+/// The event-driven index resolved once per request for the selection.
+struct EventIndex<'a> {
+    indexer: Arc<PositionalIndexer>,
+    block_size: usize,
+    model_id: &'a str,
+}
+
 // Private helper methods for select_worker
 impl CacheAwarePolicy {
-    /// Check if an event-driven indexer exists with data for this model.
-    /// Returns false when the indexer is empty (startup, reconnect) so
-    /// routing falls through to the approximate token tree instead of
-    /// taking the event-driven path with no data and landing on a fallback.
-    fn has_event_indexer(&self, model_id: &str) -> bool {
+    /// The event-driven index for this model: its indexer and block size.
+    /// `None` when there is no monitor or indexer, or the indexer is empty
+    /// (startup, reconnect), so routing falls through to the approximate
+    /// token tree instead of taking the event-driven path with no data and
+    /// landing on a fallback. One monitor lock and one indexer lookup serve
+    /// both this check and the selection that follows.
+    fn event_index_for<'a>(&self, model_id: &'a str) -> Option<EventIndex<'a>> {
         let guard = self.kv_monitor.read();
-        guard
-            .as_ref()
-            .and_then(|m| m.get_indexer(model_id))
-            .is_some_and(|indexer| indexer.current_size() > 0)
+        let monitor = guard.as_ref()?;
+        let indexer = monitor.get_indexer(model_id)?;
+        if indexer.current_size() == 0 {
+            return None;
+        }
+        // Per-model block_size: learned from events > config default
+        let block_size = monitor
+            .block_size(model_id)
+            .unwrap_or(self.config.block_size);
+        Some(EventIndex {
+            indexer,
+            block_size,
+            model_id,
+        })
+    }
+
+    /// Check if an event-driven indexer exists with data for this model.
+    #[cfg(test)]
+    fn has_event_indexer(&self, model_id: &str) -> bool {
+        self.event_index_for(model_id).is_some()
     }
 
     /// The shared load snapshot for waiting-prefill decay, or `None` when
@@ -1453,17 +1478,15 @@ impl CacheAwarePolicy {
         tokens: &[u32],
         healthy_indices: &[usize],
         avg_load: f64,
-        model_id: &str,
+        index: &EventIndex<'_>,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let guard = self.kv_monitor.read();
-        let monitor = guard.as_ref()?;
-        let indexer = monitor.get_indexer(model_id)?;
-
-        // Per-model block_size: learned from events > config default
-        let block_size = monitor
-            .block_size(model_id)
-            .unwrap_or(self.config.block_size);
+        let EventIndex {
+            indexer,
+            block_size,
+            model_id,
+        } = index;
+        let block_size = *block_size;
 
         let waiting_prefill_tokens = self.waiting_prefill_snapshot();
         let tuning = OverlapTuning {
@@ -1476,7 +1499,7 @@ impl CacheAwarePolicy {
             workers,
             tokens,
             healthy_indices,
-            &indexer,
+            indexer,
             block_size,
             &tuning,
         );

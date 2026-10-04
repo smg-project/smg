@@ -154,15 +154,29 @@ pub struct OverlapScores {
     pub tree_sizes: FxHashMap<u32, usize>,
 }
 
-/// Compute content hash from token IDs (position-independent).
-/// Uses XXH3-64 streaming hasher with standard seed — avoids intermediate allocation.
+/// Compute content hash from token IDs (position-independent): XXH3-64 with
+/// the standard seed over the ids' little-endian bytes.
+///
+/// One-shot over a stack buffer for blocks up to 256 tokens: the streaming
+/// hasher derives a seeded secret per instance before it sees a byte, which
+/// outweighs hashing a 16-token block. Same digest either way (the test
+/// below pins that).
 pub fn compute_content_hash(token_ids: &[u32]) -> ContentHash {
-    use std::hash::Hasher;
-    let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(XXH3_SEED);
-    for &t in token_ids {
-        hasher.write(&t.to_le_bytes());
+    const STACK_BYTES: usize = 1024;
+    let len = token_ids.len() * 4;
+    if len <= STACK_BYTES {
+        let mut bytes = [0u8; STACK_BYTES];
+        let (slots, _) = bytes[..len].as_chunks_mut::<4>();
+        for (slot, token) in slots.iter_mut().zip(token_ids) {
+            *slot = token.to_le_bytes();
+        }
+        return ContentHash(xxhash_rust::xxh3::xxh3_64_with_seed(
+            &bytes[..len],
+            XXH3_SEED,
+        ));
     }
-    ContentHash(hasher.finish())
+    let bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
+    ContentHash(xxhash_rust::xxh3::xxh3_64_with_seed(&bytes, XXH3_SEED))
 }
 
 /// Rolling prefix hash over content hashes: `XXH3(prev || current)`, the
@@ -346,13 +360,31 @@ impl SeqEntry {
 /// whose per-URL entries are an order of magnitude larger.
 struct TreeSizes {
     segments: [OnceLock<Box<[AtomicUsize]>>; SEGMENT_COUNT],
+    /// Sum of every slot, moved in step with the slot updates below, so
+    /// `total()` (the policy's per-request "is this indexer empty" check) is
+    /// one load instead of a sweep over every allocated slot.
+    total: AtomicUsize,
 }
 
 impl TreeSizes {
     fn new() -> Self {
         Self {
             segments: std::array::from_fn(|_| OnceLock::new()),
+            total: AtomicUsize::new(0),
         }
+    }
+
+    /// Add `n` blocks to a worker's count.
+    fn add(&self, id: u32, n: usize) {
+        self.slot(id).fetch_add(n, Ordering::Relaxed);
+        self.total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Subtract `n` blocks from a worker's count (the caller guarantees the
+    /// worker holds at least `n`).
+    fn sub(&self, id: u32, n: usize) {
+        self.slot(id).fetch_sub(n, Ordering::Relaxed);
+        self.total.fetch_sub(n, Ordering::Relaxed);
     }
 
     /// Map a worker id to (segment index, offset within segment).
@@ -398,18 +430,14 @@ impl TreeSizes {
     fn reset(&self, id: u32) {
         let (segment, offset) = Self::locate(id);
         if let Some(entries) = self.segments[segment].get() {
-            entries[offset].store(0, Ordering::Relaxed);
+            let previous = entries[offset].swap(0, Ordering::Relaxed);
+            self.total.fetch_sub(previous, Ordering::Relaxed);
         }
     }
 
-    /// Sum of all counters across allocated segments.
+    /// Sum of all counters.
     fn total(&self) -> usize {
-        self.segments
-            .iter()
-            .filter_map(OnceLock::get)
-            .flat_map(|entries| entries.iter())
-            .map(|size| size.load(Ordering::Relaxed))
-            .sum()
+        self.total.load(Ordering::Relaxed)
     }
 
     /// Subtract `n` from a worker's count, saturating at 0. Prune-side
@@ -421,7 +449,10 @@ impl TreeSizes {
         loop {
             let next = current.saturating_sub(n);
             match slot.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
+                Ok(_) => {
+                    self.total.fetch_sub(current - next, Ordering::Relaxed);
+                    break;
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -637,9 +668,7 @@ impl PositionalIndexer {
 
         // Atomically update tree_sizes — lock-free array index.
         if num_new_blocks > 0 {
-            self.tree_sizes
-                .slot(worker_id)
-                .fetch_add(num_new_blocks, Ordering::Relaxed);
+            self.tree_sizes.add(worker_id, num_new_blocks);
         }
 
         Ok(())
@@ -685,9 +714,7 @@ impl PositionalIndexer {
         }
 
         if num_removed > 0 {
-            self.tree_sizes
-                .slot(worker_id)
-                .fetch_sub(num_removed, Ordering::Relaxed);
+            self.tree_sizes.sub(worker_id, num_removed);
         }
     }
 
@@ -1187,6 +1214,43 @@ impl fmt::Debug for PositionalIndexer {
 
 #[cfg(test)]
 mod tests {
+    /// The streaming hasher this function used before; the one-shot path must
+    /// stay bit-identical because workers report hashes computed the old way.
+    fn streaming_content_hash(token_ids: &[u32]) -> ContentHash {
+        use std::hash::Hasher;
+        let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(XXH3_SEED);
+        for &t in token_ids {
+            hasher.write(&t.to_le_bytes());
+        }
+        ContentHash(hasher.finish())
+    }
+
+    #[test]
+    fn content_hash_matches_streaming_hasher() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Every length across the stack/heap boundary (256 tokens), including
+        // the short-input, mid-input and long-input XXH3 regimes.
+        for len in 0..=300usize {
+            let tokens: Vec<u32> = (0..len).map(|_| (next() % 160_000) as u32).collect();
+            assert_eq!(
+                compute_content_hash(&tokens),
+                streaming_content_hash(&tokens),
+                "len={len}"
+            );
+        }
+        assert_eq!(
+            compute_content_hash(&[]),
+            streaming_content_hash(&[]),
+            "empty block"
+        );
+    }
+
     use super::*;
 
     /// Helper: create a sequence of StoredBlocks with distinct seq_hashes and content_hashes.
