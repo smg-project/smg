@@ -3,8 +3,7 @@ run-name: "Nightly engines | smg=${{ github.sha }} | by @${{ github.actor }}"
 
 on:
   schedule:
-    # 07:00 UTC daily — staggered 1 hour after the main nightly (06:00 UTC),
-    # and before the 08:00 UTC nightly benchmarks.
+    # 07:00 UTC daily — staggered 1 hour after the main nightly image (06:00 UTC).
     - cron: '0 7 * * *'
   workflow_dispatch:
 

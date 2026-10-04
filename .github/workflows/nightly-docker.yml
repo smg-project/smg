@@ -2,7 +2,7 @@ name: Nightly Docker Build
 
 on:
   schedule:
-    # 06:00 UTC daily — 2 hours before nightly benchmarks (08:00 UTC)
+    # 06:00 UTC daily; the engine images (07:00) and the PD sweep (09:45) follow
     - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:

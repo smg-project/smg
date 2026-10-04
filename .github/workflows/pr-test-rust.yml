@@ -456,7 +456,6 @@ jobs:
           bash scripts/ci_killall_sglang.sh "nuke_gpus"
           SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest e2e_test/benchmarks \
             --ignore=e2e_test/benchmarks/test_go_bindings_perf.py \
-            --ignore=e2e_test/benchmarks/test_nightly_perf.py \
             -s -vv
 
       - name: Upload benchmark results

@@ -93,10 +93,6 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "slowtest: mark test as slow-running (alias)",
     )
-    config.addinivalue_line(
-        "markers",
-        "nightly: mark test as a nightly comprehensive benchmark",
-    )
 
     # ``hooks.py`` is not itself a conftest — only the functions conftest.py
     # re-imports act as hooks — so the collection-summary reporter is

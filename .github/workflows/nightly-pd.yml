@@ -6,7 +6,7 @@ name: Nightly PD Topologies
 
 on:
   schedule:
-    - cron: "45 9 * * *" # 09:45 UTC daily, after the nightly benchmarks release the GPU pool
+    - cron: "45 9 * * *" # 09:45 UTC daily, after the nightly image builds
   workflow_dispatch:
     inputs:
       engines:

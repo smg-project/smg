@@ -1,6 +1,6 @@
 name: Nightly Triage
 
-# Daily: collect recent nightly benchmark/eval failures and have Claude
+# Daily: collect recent nightly eval and build failures and have Claude
 # triage them — classify each (regression vs infra/upstream flake vs
 # config), rerun clear one-off flakes once, and keep one rolling issue per
 # workflow so failures stop landing in a void. Runs after the ~7h bfcl/tau2
@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WATCHED_WORKFLOWS: nightly-bfcl.yml nightly-tau2.yml nightly-benchmark.yml nightly-docker.yml nightly-engine-docker.yml nightly-mlx-bench.yml nightly-pd.yml
+  WATCHED_WORKFLOWS: nightly-bfcl.yml nightly-tau2.yml nightly-docker.yml nightly-engine-docker.yml nightly-pd.yml
 
 jobs:
   collect:
@@ -49,8 +49,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 48h lookback: a run still in progress at collection time (e.g.
-          # nightly-benchmark allows 24h) is picked up the next day; Claude
+          # 48h lookback: a run still in progress at collection time (the
+          # bfcl/tau2 legs run for hours) is picked up the next day; Claude
           # dedups already-triaged run ids against the rolling issue.
           since=$(date -u -d '48 hours ago' +%Y-%m-%dT%H:%M:%SZ)
           failures='[]'

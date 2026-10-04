@@ -67,7 +67,7 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  # Build the smg wheel once (mirrors nightly-benchmark.yml build-wheel + cache).
+  # Build the smg wheel once and cache it by lockfile hash.
   # CPU-only work (Rust/maturin compile) — no GPU needed, so don't occupy a GPU runner.
   build-wheel:
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
