@@ -17,11 +17,15 @@ from __future__ import annotations
 
 import argparse
 import functools
+import os
 from typing import Any
 
-from smg_grpc_servicer.vllm.rust import IMPLS, SERVICER_IMPL_ENV
+# Loaded in every vLLM process: nothing heavier than the package init here.
+from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV
+from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
 
 SERVICER_IMPL_FLAG = "--servicer-impl"
+SERVICER_IMPL_CHOICES = ("python", "rust")
 _FLAG_MARK = "_smg_servicer_impl_flag"
 
 
@@ -34,7 +38,7 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     parser.add_argument(
         SERVICER_IMPL_FLAG,
         dest="servicer_impl",
-        choices=sorted(IMPLS),
+        choices=list(SERVICER_IMPL_CHOICES),
         default=None,
         help=(
             "Which implementation serves the gRPC contract under --grpc: the Python "
@@ -47,7 +51,8 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
 
 def register() -> None:
     """The ``vllm.general_plugins`` entry point. Idempotent, and loaded in
-    every vLLM process: it only wraps the parser class's parse step."""
+    every vLLM process: it wraps the parser class's parse step and installs
+    the launcher switch's import hook, nothing else."""
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     if getattr(FlexibleArgumentParser, _FLAG_MARK, False):
@@ -60,7 +65,15 @@ def register() -> None:
         # building the parser, so it is there for `--help` and for the
         # subcommand parse `vllm serve` dispatches to.
         add_servicer_impl_argument(self)
-        return original(self, args, namespace)
+        parsed, extras = original(self, args, namespace)
+        impl = getattr(parsed, "servicer_impl", None)
+        if impl:
+            # The Python servicer's guard reads only the environment: carry the
+            # flag there, so a switch that never bound still fails loudly.
+            os.environ[SERVICER_IMPL_ENV] = impl
+        return parsed, extras
 
     FlexibleArgumentParser.parse_known_args = parse_known_args  # type: ignore[method-assign]
     setattr(FlexibleArgumentParser, _FLAG_MARK, True)
+    # The launcher is imported after the parse; the finder binds the switch as it loads.
+    install_launcher_switch()

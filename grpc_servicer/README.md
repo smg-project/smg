@@ -144,7 +144,9 @@ vllm serve Qwen/Qwen3-0.6B --grpc --port 50051
 # it as a general plugin while it builds the parser (smg_grpc_servicer/vllm/plugin.py).
 vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl rust
 
-# The environment form works for every launcher, including the deprecated module entry.
+# The environment form works for the import-based entrypoints too (`vllm serve --grpc`,
+# the deprecated `python -m vllm.entrypoints.grpc_server`); a launcher file executed
+# directly as __main__ is not switched and refuses the flag instead.
 SMG_VLLM_SERVICER_IMPL=rust python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
 ```
 

@@ -363,15 +363,17 @@ def resolve_servicer_impl(
 
 def require_python_impl(environ: Mapping[str, str] | None = None) -> None:
     """Refuse to start the Python servicer when the flag asks for Rust. A
-    launcher that gets this far has no hook (or ignored it); a silent fallback
+    launcher that gets this far ran without the switch; a silent fallback
     would report Rust coverage that never ran."""
     impl = resolve_servicer_impl(environ=environ)
     if impl != "python":
         raise RuntimeError(
             f"{SERVICER_IMPL_ENV}={impl}, but this process is starting the Python "
-            "servicer: the installed vLLM gRPC entrypoint does not consult "
-            "smg_grpc_servicer.vllm.resolve_servicer_impl. Add the hook to its "
-            "serve_grpc, or unset the flag."
+            "servicer: the switch this package installs over vLLM's gRPC launcher "
+            "never ran (a launcher executed directly as __main__, or one that did "
+            "not import smg_grpc_servicer.vllm.servicer before defining serve_grpc). "
+            "Start through `vllm serve <model> --grpc`, or unset the flag; a silent "
+            "Python fallback would report Rust coverage that never ran."
         )
 
 
@@ -416,15 +418,53 @@ _SWITCH_MODULES = (
 )
 
 
+_SWITCH_NAMES = ("VllmEngineServicer", "VllmHealthServicer")
+
+
+def _is_type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
 def _imports_servicer_at_module_level(source: str) -> bool:
     """Whether a launcher imports a switch-installing module of this package
-    at module level (directly or inside a top-level ``try``/``if``). An import
-    inside ``serve_grpc`` would run too late: the switch binds over the next
-    call, not the running one."""
+    at module level: directly, inside a top-level ``try``/``if``/``with``, or
+    through the package's own lazy names (``from smg_grpc_servicer.vllm import
+    VllmEngineServicer``, which imports the module). An ``if TYPE_CHECKING:``
+    body never runs, and an import inside ``serve_grpc`` would run too late
+    (the switch would bind over the next call, not the running one); neither
+    counts."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return False
+    statements = list(tree.body)
+    while statements:
+        node = statements.pop()
+        if isinstance(node, ast.ImportFrom):
+            if node.module in _SWITCH_MODULES:
+                return True
+            if node.module == "smg_grpc_servicer.vllm" and any(
+                alias.name in _SWITCH_NAMES for alias in node.names
+            ):
+                return True
+        if isinstance(node, ast.Import) and any(
+            alias.name in _SWITCH_MODULES for alias in node.names
+        ):
+            return True
+        if isinstance(node, ast.If) and _is_type_checking(node.test):
+            statements.extend(node.orelse)
+            continue
+        if isinstance(node, (ast.Try, ast.If, ast.With)):
+            for field in ("body", "orelse", "finalbody", "handlers"):
+                for child in getattr(node, field, []) or []:
+                    statements.extend(
+                        getattr(child, "body", [child])
+                        if isinstance(child, ast.ExceptHandler)
+                        else [child]
+                    )
+    return False
     statements = list(tree.body)
     while statements:
         node = statements.pop()

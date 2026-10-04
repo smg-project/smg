@@ -73,7 +73,7 @@ def test_a_launcher_flag_decision_is_written_back_for_the_python_guard():
 def test_python_servicer_refuses_to_start_when_the_flag_asks_for_rust():
     rust.require_python_impl(environ={})
     rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "python"})
-    with pytest.raises(RuntimeError, match="does not consult"):
+    with pytest.raises(RuntimeError, match="never ran"):
         rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "rust"})
 
 
@@ -198,6 +198,65 @@ def test_plugin_entry_point_is_declared():
     pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
     assert 'smg-servicer = "smg_grpc_servicer.vllm.plugin:register"' in pyproject
     assert '[project.entry-points."vllm.general_plugins"]' in pyproject
+
+
+def test_launcher_imported_after_this_package_is_switched_as_it_loads(tmp_path):
+    """Something imported the servicer first (or the launcher imports it
+    lazily): the meta-path finder binds the switch when the launcher loads,
+    in a fresh interpreter so the real vLLM, if installed, stays out of it."""
+    pkg = tmp_path / "vllm" / "entrypoints" / "launchers"
+    pkg.mkdir(parents=True)
+    for d in (tmp_path / "vllm", tmp_path / "vllm" / "entrypoints", pkg):
+        (d / "__init__.py").write_text("")
+    (pkg / "grpc_server.py").write_text("async def serve_grpc(args):\n    return 'python ran'\n")
+    script = (
+        "import sys\n"
+        "from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch\n"
+        f"sys.path.insert(0, {str(tmp_path)!r})\n"
+        "assert install_launcher_switch() == []  # no launcher yet\n"
+        "import vllm.entrypoints.launchers.grpc_server as launcher\n"
+        "print(getattr(launcher.__dict__['serve_grpc'], '__smg_servicer_switch__', False))\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    out = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert out.returncode == 0, out.stderr[-800:]
+    assert out.stdout.strip() == "True"
+
+
+def test_plugin_exports_the_parsed_flag_for_the_python_guard(monkeypatch):
+    pytest.importorskip("vllm")
+    from smg_grpc_servicer.vllm import plugin
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    plugin.register()
+    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    parser = FlexibleArgumentParser(prog="vllm serve")
+    parser.add_argument("--grpc", action="store_true")
+    parser.parse_args(["--grpc", "--servicer-impl", "rust"])
+    # A switch that never bound would start the Python servicer, whose guard
+    # reads only the environment: the flag is there.
+    assert os.environ[rust.SERVICER_IMPL_ENV] == "rust"
+    with pytest.raises(RuntimeError, match="never ran"):
+        rust.require_python_impl()
+    assert set(plugin.SERVICER_IMPL_CHOICES) == set(rust.IMPLS)
+
+
+def test_launcher_scan_ignores_type_checking_and_accepts_the_package_names(tmp_path):
+    launcher = tmp_path / "vllm" / "entrypoints" / "launchers"
+    launcher.mkdir(parents=True)
+    path = launcher / "grpc_server.py"
+    path.write_text(
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from smg_grpc_servicer.vllm.servicer import VllmEngineServicer\n"
+        "async def serve_grpc(args):\n"
+        "    from smg_grpc_servicer.vllm.servicer import VllmEngineServicer\n"
+    )
+    assert rust.upstream_hook_installed(vllm_root=str(tmp_path / "vllm")) is False
+    path.write_text("from smg_grpc_servicer.vllm import VllmEngineServicer, VllmHealthServicer\n")
+    assert rust.upstream_hook_installed(vllm_root=str(tmp_path / "vllm")) is True
 
 
 # ---------------------------------------------------------------------------

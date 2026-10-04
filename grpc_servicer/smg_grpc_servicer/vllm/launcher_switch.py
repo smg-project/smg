@@ -16,14 +16,18 @@ deprecated shim's ``import main, serve_grpc``) rebinds ``serve_grpc`` in the
 module dict to :func:`with_servicer_switch`'s wrapper: the three lines an
 in-source hook would carry, with the launcher's own ``args``. The launcher's
 ``main()`` reads the rebound name from its globals, so every documented entry
-runs the switch. A launcher file executed directly as ``__main__`` is the one
-form this cannot reach; there the Python servicer refuses the flag loudly
+runs the switch. A launcher imported after this package (something imported
+the servicer first, or a launcher that imports it lazily) is caught by a
+meta-path finder that binds the switch as the launcher loads. A launcher file
+executed directly as ``__main__`` is the one form neither reaches; there the
+Python servicer refuses the flag loudly
 (:func:`smg_grpc_servicer.vllm.rust.require_python_impl`).
 """
 
 from __future__ import annotations
 
 import functools
+import importlib.abc
 import sys
 import types
 from collections.abc import Awaitable, Callable
@@ -72,10 +76,51 @@ class _SwitchedLauncher(types.ModuleType):
         return super().__getattribute__(name)
 
 
+class _SwitchingLoader(importlib.abc.Loader):
+    """The launcher's own loader, plus the switch bound right after the module
+    body ran (so the name is rebound before anything can call it)."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    def create_module(self, spec: Any) -> Any:
+        create = getattr(self.inner, "create_module", None)
+        return create(spec) if create is not None else None
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        self.inner.exec_module(module)
+        _rebind(vars(module))
+
+    def __getattr__(self, name: str) -> Any:  # get_code, get_source, is_package, ...
+        return getattr(self.inner, name)
+
+
+class _LauncherFinder(importlib.abc.MetaPathFinder):
+    """For a launcher imported after this package: the real spec from the
+    other finders, with the loader wrapped in :class:`_SwitchingLoader`."""
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        if fullname not in LAUNCHER_MODULES:
+            return None
+        for finder in sys.meta_path:
+            if finder is self or not hasattr(finder, "find_spec"):
+                continue
+            spec = finder.find_spec(fullname, path, target)
+            if spec is not None:
+                if spec.loader is not None and not isinstance(spec.loader, _SwitchingLoader):
+                    spec.loader = _SwitchingLoader(spec.loader)
+                return spec
+        return None
+
+
 def install_launcher_switch() -> list[str]:
-    """Hook every launcher module that is importing or imported. Idempotent;
-    returns the names hooked. A module another extension already replaced
-    with its own class is left alone."""
+    """Hook every launcher module that is importing or imported, and arrange
+    for one imported later (this package imported first, or a launcher that
+    imports it lazily) to be hooked as it loads. Idempotent; returns the names
+    hooked now. A module another extension already replaced with its own
+    class is left alone."""
+    if not any(isinstance(finder, _LauncherFinder) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _LauncherFinder())
     hooked: list[str] = []
     for name in LAUNCHER_MODULES:
         module = sys.modules.get(name)
