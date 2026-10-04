@@ -299,7 +299,8 @@ def _filter_sglang_rust_items(
         param = _setup_backend_param(item)
         pd_topology = param is not None and param not in _ZMQ_LOCAL_WIRES
         module = item.nodeid.split("::", 1)[0]
-        multimodal = module.endswith("test_multimodal.py")
+        # An HTTP case talks to SGLang's own server, never to the servicer.
+        multimodal = module.endswith("test_multimodal.py") and param != "http"
         if pd_topology or _is_pd_worker_set(item) or multimodal:
             deselected.append(item)
         else:
@@ -395,6 +396,10 @@ def _format_selection_line(stats: dict) -> str:
         parts.append(f"{stats['by_tokenspeed_dp']} by tokenspeed-dp")
     if stats.get("by_tokenspeed_rust"):
         parts.append(f"{stats['by_tokenspeed_rust']} by tokenspeed-rust-servicer")
+    if stats.get("by_sglang_rust"):
+        parts.append(f"{stats['by_sglang_rust']} by sglang-rust-servicer")
+    if stats.get("by_sglang_zmq"):
+        parts.append(f"{stats['by_sglang_zmq']} by sglang-zmq-wire")
     return (
         f"{header}: selected {stats['selected']} of {stats['collected']} collected "
         f"({', '.join(parts)})"
@@ -452,6 +457,8 @@ def pytest_collection_modifyitems(
         "by_zmq": 0,
         "by_tokenspeed_dp": 0,
         "by_tokenspeed_rust": 0,
+        "by_sglang_rust": 0,
+        "by_sglang_zmq": 0,
     }
 
     if any([engine, vendor, gpu_tier]):

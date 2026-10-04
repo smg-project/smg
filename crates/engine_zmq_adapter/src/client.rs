@@ -949,7 +949,16 @@ impl ZmqEngineClient {
             ZmqBackend::Sglang(_) => {
                 let ready = self.ready_response();
                 ZmqServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
-                    sglang_version: ready.map(|r| r.vllm_version.clone()).unwrap_or_default(),
+                    // The plugin reports `sglang-<version>` in the shared
+                    // field; the gRPC servicer reports the bare version.
+                    sglang_version: ready
+                        .map(|r| {
+                            r.vllm_version
+                                .strip_prefix("sglang-")
+                                .unwrap_or(&r.vllm_version)
+                                .to_string()
+                        })
+                        .unwrap_or_default(),
                     server_type: "zmq".to_string(),
                     max_total_num_tokens: ready
                         .and_then(|r| r.kv_cache_size_tokens)

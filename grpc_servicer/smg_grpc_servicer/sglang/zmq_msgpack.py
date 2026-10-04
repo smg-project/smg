@@ -696,7 +696,7 @@ class MsgpackRecvSocket:
         try:
             params.normalize(self._tokenizer)
             params.verify(self._vocab_size)
-        except ValueError as exc:
+        except Exception as exc:  # drain must never raise: any failure is the request's
             return str(exc)
         if params.n != 1:
             return f"n={params.n} is not served on this wire; SMG fans out n > 1 itself"
@@ -710,7 +710,7 @@ class MsgpackRecvSocket:
         try:
             req.sampling_params.max_new_tokens = 0
             req.sampling_params.normalize(self._tokenizer)
-        except ValueError as exc:
+        except Exception as exc:  # drain must never raise: any failure is the request's
             return str(exc)
         if req.input_ids is None or len(req.input_ids) == 0:
             return "input_ids are required on this wire"

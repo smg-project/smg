@@ -1492,8 +1492,9 @@ class RouterArgs:
             default=RouterArgs.backend,
             choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
             help=(
-                "Backend runtime to use (default: sglang). For ZMQ workers, vllm/"
-                "tokenspeed/sglang also pin the wire protocol (it cannot be auto-detected)"
+                "Backend runtime to use (default: sglang). Over ZMQ the backend names the "
+                "workers' engine and pins the wire protocol (it cannot be auto-detected): "
+                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers"
             ),
         )
         backend_group.add_argument(
