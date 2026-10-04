@@ -317,13 +317,13 @@ impl Gateway {
     ) -> Option<Arc<dyn RouterTrait>> {
         // In single-router mode (enable_igw=false), always use the default router
         if !self.enable_igw {
-            if let Some(default_id) = self.default_router.load_full() {
+            if let Some(default_id) = &*self.default_router.load() {
                 debug!(
                     "Single-router mode: using default router {} for model {:?}",
                     default_id.as_str(),
                     model_id
                 );
-                return self.routers.load().get(&*default_id).cloned();
+                return self.routers.load().get(&**default_id).cloned();
             }
         }
 
@@ -338,8 +338,9 @@ impl Gateway {
                 }
             }
             self.default_router
-                .load_full()
-                .and_then(|id| self.routers.load().get(&*id).cloned())
+                .load()
+                .as_ref()
+                .and_then(|id| self.routers.load().get(&**id).cloned())
         })
     }
 

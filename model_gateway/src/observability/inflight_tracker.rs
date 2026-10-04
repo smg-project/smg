@@ -61,8 +61,9 @@ impl InFlightRequestTracker {
 
     pub fn track(self: &Arc<Self>) -> InFlightGuard {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.requests.insert(request_id, Instant::now());
+        // Count first: a drain check must never see zero once admission began.
         self.count.fetch_add(1, Ordering::AcqRel);
+        self.requests.insert(request_id, Instant::now());
         InFlightGuard {
             tracker: self.clone(),
             request_id,
