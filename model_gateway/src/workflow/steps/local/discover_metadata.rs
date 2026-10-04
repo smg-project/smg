@@ -318,16 +318,33 @@ fn zmq_model_dir(router_model: Option<String>, declared_model: &str) -> Option<S
     router_model.filter(|path| declared_model == UNKNOWN_MODEL_ID || declared_model == path)
 }
 
-/// Labels for a ZMQ worker from the gateway's local model directory: the
-/// sampling defaults in `generation_config.json`, when the directory is local
-/// and the model ships one. A Hub id or a model without the file yields none.
-async fn zmq_local_labels(model_dir: Option<&str>) -> HashMap<String, String> {
-    let mut labels = HashMap::new();
-    let Some(dir) = model_dir else {
-        return labels;
+/// Labels for a ZMQ worker from the gateway's model: the sampling defaults in
+/// its `generation_config.json`. A local directory is read in place; a Hub id
+/// is served from the HF cache the gateway's tokenizer loads from (fetched
+/// into it when absent). A model without the file yields none.
+async fn zmq_local_labels(model: Option<&str>) -> HashMap<String, String> {
+    let Some(model) = model else {
+        return HashMap::new();
     };
-    let path = std::path::Path::new(dir).join("generation_config.json");
-    match tokio::fs::read_to_string(&path).await {
+    let local = std::path::Path::new(model);
+    let path = if local.is_dir() {
+        local.join("generation_config.json")
+    } else {
+        match llm_tokenizer::hub::fetch_file(model, "generation_config.json").await {
+            Ok(path) => path,
+            Err(e) => {
+                debug!("No generation_config.json for {model} via the Hub cache: {e}");
+                return HashMap::new();
+            }
+        }
+    };
+    sampling_defaults_label(&path).await
+}
+
+/// The sampling-defaults label from one `generation_config.json`, or none.
+async fn sampling_defaults_label(path: &std::path::Path) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    match tokio::fs::read_to_string(path).await {
         Ok(raw) => match SamplingDefaults::canonical_json_from_str(&raw) {
             Ok(Some(canonical)) => {
                 labels.insert(DEFAULT_SAMPLING_PARAMS_LABEL.to_string(), canonical);
@@ -455,12 +472,13 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             }
             // A ZMQ engine reports its geometry at the handshake, which runs
             // after this step; the one fact worth having earlier is the
-            // model's own sampling defaults, read from the local model
-            // directory the gateway was started with, for a worker that
-            // serves that model (one registered for another model, by spec
-            // or label, must not inherit them). The runtime stays `None`: the
-            // handshake is shared across engines, so it cannot be probed here
-            // and the configured or detected runtime is preserved.
+            // model's own sampling defaults, read from the model the gateway
+            // was started with (a local directory, or a Hub id through the
+            // HF cache), for a worker that serves that model (one registered
+            // for another model, by spec or label, must not inherit them).
+            // The runtime stays `None`: the handshake is shared across
+            // engines, so it cannot be probed here and the configured or
+            // detected runtime is preserved.
             ConnectionMode::Zmq => {
                 let router_model = context
                     .data
@@ -525,9 +543,12 @@ mod tests {
         );
         assert_eq!(zmq_model_dir(Some("/m/a".into()), "org/other"), None);
         assert_eq!(zmq_model_dir(None, UNKNOWN_MODEL_ID), None);
-        // No directory, a Hub id, or a model without the file: no label.
+        // No model, or a directory without the file: no label.
         assert!(zmq_local_labels(None).await.is_empty());
-        assert!(zmq_local_labels(Some("Qwen/Qwen3-0.6B")).await.is_empty());
+        let bare = tempfile::tempdir().unwrap();
+        assert!(zmq_local_labels(Some(bare.path().to_str().unwrap()))
+            .await
+            .is_empty());
     }
 
     use super::*;
