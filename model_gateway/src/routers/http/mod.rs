@@ -2,6 +2,7 @@
 
 pub mod pd_router;
 pub mod pd_types;
+pub(crate) mod relay_body;
 pub(crate) mod request_body;
 pub(crate) mod request_stream;
 pub mod router;

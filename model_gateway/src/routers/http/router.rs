@@ -39,6 +39,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, warn};
 
+use super::relay_body::RelayBody;
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
@@ -65,8 +66,7 @@ use crate::{
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, is_retryable_status, RetryExecutor},
-            sse::SSE_CHANNEL_BUFFER,
-            sse_rechunk::{SseRechunker, IDLE_FLUSH},
+            sse_rechunk::SseRechunker,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -1238,83 +1238,14 @@ impl Router {
                 Some(ct) => ct.starts_with("text/event-stream"),
                 None => status.is_success(),
             };
-            let mut rechunker = (rechunk && upstream_sse).then(SseRechunker::new);
+            let rechunker = (rechunk && upstream_sse).then(SseRechunker::new);
             if rechunker.is_some() {
                 // Re-chunking changes the body length.
                 response_headers.remove(CONTENT_LENGTH);
             }
-            let stream = res.bytes_stream();
-            // Bounded channel applies backpressure: a slow client makes the
-            // relay await on `send` instead of buffering the whole response.
-            let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
-
-            // Spawn task to forward stream
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
-            )]
-            tokio::spawn(async move {
-                let mut stream = stream;
-                // One timer, reset per chunk, instead of a fresh sleep per token.
-                let idle = tokio::time::sleep(IDLE_FLUSH);
-                tokio::pin!(idle);
-                loop {
-                    tokio::select! {
-                        chunk = stream.next() => {
-                            if rechunker.is_some() {
-                                idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
-                            }
-                            match chunk {
-                                // Same as the regular relay: an empty upstream chunk must
-                                // not become an empty h2 DATA frame toward the client.
-                                Some(Ok(bytes)) if bytes.is_empty() => {}
-                                Some(Ok(bytes)) => {
-                                    let bytes = match rechunker.as_mut() {
-                                        Some(r) => r.feed(bytes),
-                                        None => bytes,
-                                    };
-                                    if !bytes.is_empty() && tx.send(Ok(bytes)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Some(Err(e)) => {
-                                    if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
-                                        if !tail.is_empty() {
-                                            let _ = tx.send(Ok(tail)).await;
-                                        }
-                                    }
-                                    let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                    break;
-                                }
-                                None => {
-                                    if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
-                                        if !tail.is_empty() {
-                                            let _ = tx.send(Ok(tail)).await;
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                        },
-                        () = &mut idle, if rechunker.as_ref().is_some_and(SseRechunker::has_pending) => {
-                            idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
-                            if let Some(tail) = rechunker.as_mut().map(SseRechunker::flush_pending) {
-                                if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
-                        () = tx.closed() => break,
-                    }
-                }
-            });
-
-            let stream = ReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            // Polled directly by the connection task: no relay task, no channel,
+            // no cross-thread wakeup per chunk. See `RelayBody`.
+            let body = Body::new(RelayBody::new(Box::pin(res.bytes_stream()), rechunker));
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
