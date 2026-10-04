@@ -56,7 +56,8 @@ impl SglangRequestType {
 /// `token_ids_logprob`, `stream`, then the 19 defaulted fields up to
 /// `require_reasoning` (session, LoRA, PD and routing slots SMG leaves at the
 /// scheduler's defaults) so that flag lands in its slot. The encoder emits
-/// exactly these 34 elements (tag + 33 fields); every later field keeps its
+/// the shortest valid prefix: 14 elements (tag + 13 fields) through `stream`,
+/// or 34 when `require_reasoning` is set; every later field keeps its
 /// `msgspec` default. Token ids go as a plain integer array; the plugin
 /// widens the scheduler's `array('q')` decode hook to accept it.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,7 +105,10 @@ impl Default for TokenizedGenerateReqInput {
 impl Serialize for TokenizedGenerateReqInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
-        let mut tuple = serializer.serialize_tuple(34)?;
+        // The shortest valid prefix: through `stream` unless the reasoning
+        // flag has to reach its slot past the 19 defaulted fields.
+        let len = if self.require_reasoning { 34 } else { 14 };
+        let mut tuple = serializer.serialize_tuple(len)?;
         tuple.serialize_element(TOKENIZED_GENERATE_REQ_INPUT_TAG)?;
         tuple.serialize_element(&self.rid)?;
         tuple.serialize_element(&NIL)?; // http_worker_ipc
@@ -119,20 +123,23 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.top_logprobs_num)?;
         tuple.serialize_element(&self.token_ids_logprob)?;
         tuple.serialize_element(&self.stream)?;
-        // The defaulted fields between `stream` and `require_reasoning`, at
-        // the scheduler's own defaults: return_sampling_mask,
-        // return_flat_raw_top_logprobs, return_hidden_states,
-        // return_routed_experts, routed_experts_start_len, return_indexer_topk,
-        // then session_id .. routing_key (13 optionals).
-        for _ in 0..4 {
+        if self.require_reasoning {
+            // The defaulted fields between `stream` and `require_reasoning`,
+            // at the scheduler's own defaults: return_sampling_mask,
+            // return_flat_raw_top_logprobs, return_hidden_states,
+            // return_routed_experts, routed_experts_start_len,
+            // return_indexer_topk, then session_id .. routing_key (13
+            // optionals).
+            for _ in 0..4 {
+                tuple.serialize_element(&false)?;
+            }
+            tuple.serialize_element(&0u32)?;
             tuple.serialize_element(&false)?;
+            for _ in 0..13 {
+                tuple.serialize_element(&NIL)?;
+            }
+            tuple.serialize_element(&self.require_reasoning)?;
         }
-        tuple.serialize_element(&0u32)?;
-        tuple.serialize_element(&false)?;
-        for _ in 0..13 {
-            tuple.serialize_element(&NIL)?;
-        }
-        tuple.serialize_element(&self.require_reasoning)?;
         tuple.end()
     }
 }
@@ -260,6 +267,21 @@ mod tests {
             "session..routing_key nil"
         );
         assert_eq!(arr[33].as_bool(), Some(true), "require_reasoning at 33");
+    }
+
+    #[test]
+    fn a_request_without_reasoning_stops_at_stream() {
+        let request = TokenizedGenerateReqInput {
+            rid: "r1".into(),
+            input_ids: vec![1],
+            stream: true,
+            ..TokenizedGenerateReqInput::default()
+        };
+        let value: Value = rmp_serde::from_slice(&encode_msgpack(&request).unwrap()).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 14);
+        let decoded: TokenizedGenerateReqInput =
+            decode_msgpack(&encode_msgpack(&request).unwrap()).unwrap();
+        assert_eq!(decoded, request);
     }
 
     #[test]

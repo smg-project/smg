@@ -289,9 +289,13 @@ class Worker:
 
         if self.engine == "sglang":
             if self.mode == ConnectionMode.ZMQ:
-                cmd = self._build_sglang_zmq_cmd(model_path, tp_size, spec)
-            else:
-                cmd = self._build_sglang_cmd(model_path, tp_size, features, spec)
+                # The launcher validates the complete engine argument list
+                # (it refuses a DP launch this wire does not carry yet), so
+                # the extras go through it instead of onto its output.
+                return self._build_sglang_zmq_cmd(
+                    model_path, tp_size, spec, list(self.extra_engine_args or [])
+                )
+            cmd = self._build_sglang_cmd(model_path, tp_size, features, spec)
         elif self.engine == "vllm":
             if self.mode == ConnectionMode.ZMQ:
                 cmd = self._build_vllm_zmq_cmd(model_path, tp_size, spec)
@@ -451,18 +455,25 @@ class Worker:
             cmd.extend(extra)
         return cmd
 
-    def _build_sglang_zmq_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
+    def _build_sglang_zmq_cmd(
+        self,
+        model_path: str,
+        tp_size: int,
+        spec: dict,
+        extra_engine_args: list[str] | None = None,
+    ) -> list[str]:
         """Build the headless SGLang command for the ZMQ direct backend.
 
         Delegates to the ``smg serve`` launcher so the engine flags and the
-        FNV-1a handshake port stay identical to the production launch path.
+        FNV-1a handshake port stay identical to the production launch path,
+        and so the launcher sees every engine argument, extras included.
         """
         from smg.serve import SglangWorkerLauncher
 
         args = argparse.Namespace(
             connection_mode="zmq", model_path=model_path, tensor_parallel_size=tp_size
         )
-        backend_args = list(spec.get("sglang_args", []))
+        backend_args = list(spec.get("sglang_args", [])) + list(extra_engine_args or [])
         if tp_size > 1:
             backend_args += ["--tp-size", str(tp_size)]
         return SglangWorkerLauncher().build_command(args, backend_args, DEFAULT_HOST, self.port)

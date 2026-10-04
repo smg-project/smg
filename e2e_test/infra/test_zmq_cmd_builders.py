@@ -61,6 +61,19 @@ def test_sglang_zmq_cmd_runs_the_headless_launcher_with_derived_handshake_port(s
     assert cmd[cmd.index("--mem-fraction-static") + 1] == "0.5"
 
 
+def test_sglang_zmq_extra_engine_args_go_through_the_launcher(serve):
+    # Extras reach the launcher's validation (and its output) instead of
+    # being appended behind its back: a DP launch the wire does not carry
+    # is refused up front.
+    w = _worker("sglang")
+    w.extra_engine_args = ["--mem-fraction-static", "0.4"]
+    cmd = w._build_cmd()
+    assert cmd[cmd.index("--mem-fraction-static") + 1] == "0.4"
+    w.extra_engine_args = ["--dp-size", "2"]
+    with pytest.raises(ValueError, match="dp-size"):
+        w._build_cmd()
+
+
 def test_tokenspeed_zmq_cmd_is_headless_with_derived_handshake_port(serve):
     w = _worker("tokenspeed")
     cmd = w._build_tokenspeed_zmq_cmd(
