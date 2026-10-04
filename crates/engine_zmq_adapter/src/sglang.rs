@@ -47,6 +47,87 @@ impl SglangGenerateStream {
             pending: None,
         }
     }
+
+    /// End this choice as aborted: the engine's own parked `Complete` when it
+    /// already finished, else the terminal `Complete` the Python servicer
+    /// yields after an `Abort` RPC (`finish_reason = "abort"`). The
+    /// engine-side request is aborted when the stream is dropped, so the
+    /// caller drops it next.
+    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
+        if let Some(parked) = self.pending.take() {
+            return parked;
+        }
+        let mut pending = None;
+        // No new tokens on a frontend finish, so `emit_tick` yields the
+        // `Complete` directly and parks nothing.
+        self.state.emit_tick(
+            self.index,
+            Vec::new(),
+            None,
+            Some(("abort".to_string(), None)),
+            &mut pending,
+        )
+    }
+}
+
+/// A vLLM-proto response of an SGLang stream as the SGLang proto the
+/// `SglangScheduler` service answers with, under `request_id` (the vLLM proto
+/// carries none). The two share the chunk and completion fields this wire
+/// fills; what it does not carry (reasoning-token counts, prompt logprobs,
+/// hidden states, speculative counters) stays at the proto defaults.
+pub fn to_sglang_response(
+    request_id: &str,
+    response: vllm::GenerateResponse,
+) -> sglang_proto::GenerateResponse {
+    use sglang_proto::generate_response::Response as SgResponse;
+    use vllm::generate_response::Response;
+    let logprobs = |logprobs: Option<vllm::OutputLogProbs>| {
+        logprobs.map(|lp| sglang_proto::OutputLogProbs {
+            token_logprobs: lp.token_logprobs,
+            token_ids: lp.token_ids,
+            top_logprobs: lp
+                .top_logprobs
+                .into_iter()
+                .map(|top| sglang_proto::TopLogProbs {
+                    values: top.values,
+                    token_ids: top.token_ids,
+                })
+                .collect(),
+        })
+    };
+    let mapped = response.response.map(|inner| match inner {
+        Response::Chunk(chunk) => SgResponse::Chunk(sglang_proto::GenerateStreamChunk {
+            token_ids: chunk.token_ids,
+            prompt_tokens: chunk.prompt_tokens,
+            completion_tokens: chunk.completion_tokens,
+            cached_tokens: chunk.cached_tokens,
+            output_logprobs: logprobs(chunk.output_logprobs),
+            index: chunk.index,
+            ..Default::default()
+        }),
+        Response::Complete(complete) => {
+            use sglang_proto::generate_complete::MatchedStop as SgMatchedStop;
+            use vllm::generate_complete::MatchedStop;
+            SgResponse::Complete(sglang_proto::GenerateComplete {
+                output_ids: complete.output_ids,
+                finish_reason: complete.finish_reason,
+                prompt_tokens: complete.prompt_tokens,
+                completion_tokens: complete.completion_tokens,
+                cached_tokens: complete.cached_tokens,
+                output_logprobs: logprobs(complete.output_logprobs),
+                matched_stop: complete.matched_stop.map(|matched| match matched {
+                    MatchedStop::MatchedTokenId(id) => SgMatchedStop::MatchedTokenId(id),
+                    MatchedStop::MatchedStopStr(text) => SgMatchedStop::MatchedStopStr(text),
+                }),
+                index: complete.index,
+                ..Default::default()
+            })
+        }
+    });
+    sglang_proto::GenerateResponse {
+        request_id: request_id.to_string(),
+        response: mapped,
+    }
 }
 
 impl MappedGenerateStream for SglangGenerateStream {
@@ -248,13 +329,15 @@ pub(crate) fn translate_request_sglang(
 
 /// Map the proto sampling params onto SGLang's own struct, in its API-input
 /// form: the plugin runs the scheduler's `normalize()`/`verify()` on receipt.
-/// String `stop` sequences are not forwarded (the scheduler runs without a
-/// tokenizer; the gateway resolved them upstream).
+/// String `stop` sequences ride along: the headless scheduler keeps its
+/// tokenizer and matches them itself (the gateway's own lane strips them
+/// upstream and sends none).
 pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> SglangSamplingParams {
     use sglang_proto::sampling_params::Constraint;
 
     let mut params = SglangSamplingParams {
         max_new_tokens: sp.max_new_tokens,
+        stop: (!sp.stop.is_empty()).then_some(sp.stop),
         stop_token_ids: (!sp.stop_token_ids.is_empty()).then_some(sp.stop_token_ids),
         temperature: f64::from(sp.temperature),
         top_p: f64::from(sp.top_p),
@@ -347,7 +430,11 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(params.max_new_tokens, Some(16));
-        assert_eq!(params.stop, None, "string stops are the gateway's job");
+        assert_eq!(
+            params.stop.as_deref(),
+            Some(&["###".to_string()][..]),
+            "string stops reach the scheduler, which keeps its tokenizer"
+        );
         assert_eq!(params.stop_token_ids, Some(vec![2]));
         assert_eq!(params.top_k, -1, "the scheduler resolves the API sentinel");
         assert_eq!(params.repetition_penalty, 1.0);

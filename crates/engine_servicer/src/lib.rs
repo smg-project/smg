@@ -3,7 +3,7 @@
 //! same-host ZMQ engine adapter (`engine-zmq-adapter`).
 //!
 //! The Router keeps speaking the engine's own proto (`vllm_engine.proto` for
-//! vLLM; each further ZMQ engine's servicer serves its own), so it cannot
+//! vLLM, `sglang_scheduler.proto` for SGLang, and so on per engine), so it cannot
 //! tell this servicer from the Python one. What changes is the node:
 //! the Python frontend leaves the request path, and the engine is reached the
 //! way the direct-ZMQ lane already reaches it. Python keeps the lifecycle only
@@ -15,8 +15,10 @@ mod engine_link;
 mod error;
 mod health;
 mod kv_events;
+mod proto_json;
 mod requests;
 mod server;
+pub mod sglang;
 mod stop_match;
 mod tokenizer_bundle;
 pub mod tokenspeed;
@@ -28,6 +30,7 @@ pub use error::ServicerError;
 use futures::Stream;
 pub use server::init_tracing;
 pub(crate) use server::{lock, record_error, ServerThread, SharedError, Shutdown};
+pub use sglang::{SglangModelInfo, SglangServicerConfig, SglangServicerServer};
 pub use tokenspeed::{TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer};
 use tonic::Status;
 pub use vllm::{

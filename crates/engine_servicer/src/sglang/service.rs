@@ -1,0 +1,156 @@
+//! `sglang.grpc.scheduler.SglangScheduler` over the shared state: each RPC
+//! delegates to its handler module. The msgpack wire carries generate and
+//! abort only, so the scheduler's control RPCs (`FlushCache`, profiling, LoRA
+//! loading), `Embed` and the KV-event relay answer UNIMPLEMENTED here.
+
+use std::sync::Arc;
+
+use smg_grpc_client::{
+    common_proto as common,
+    sglang_proto::{self as sg, sglang_scheduler_server::SglangScheduler},
+};
+use tonic::{Request, Response, Status};
+
+use super::{generate, info, State};
+use crate::{tokenizer_bundle, BoxStream};
+
+/// What the msgpack wire has no message for.
+const NO_CONTROL_WIRE: &str = "is not available through the Rust SGLang servicer: the \
+                               scheduler's msgpack wire carries generate and abort only";
+
+#[derive(Clone)]
+pub(super) struct SglangService {
+    pub(super) state: Arc<State>,
+}
+
+fn no_control_wire(rpc: &str) -> Status {
+    Status::unimplemented(format!("{rpc} {NO_CONTROL_WIRE}"))
+}
+
+#[tonic::async_trait]
+impl SglangScheduler for SglangService {
+    type GenerateStream = BoxStream<sg::GenerateResponse>;
+    type GetTokenizerStream = BoxStream<common::GetTokenizerChunk>;
+    type SubscribeKvEventsStream = BoxStream<common::KvEventBatch>;
+
+    async fn generate(
+        &self,
+        request: Request<sg::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        generate::generate(&self.state, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn embed(
+        &self,
+        _request: Request<sg::EmbedRequest>,
+    ) -> Result<Response<sg::EmbedResponse>, Status> {
+        Err(no_control_wire("Embed"))
+    }
+
+    async fn health_check(
+        &self,
+        _request: Request<sg::HealthCheckRequest>,
+    ) -> Result<Response<sg::HealthCheckResponse>, Status> {
+        Ok(Response::new(info::health_check(&self.state)))
+    }
+
+    async fn abort(
+        &self,
+        request: Request<sg::AbortRequest>,
+    ) -> Result<Response<sg::AbortResponse>, Status> {
+        let request = request.into_inner();
+        // The choices of an `n > 1` request live under the one registration,
+        // so aborting the parent id ends every choice.
+        self.state
+            .registry
+            .abort(std::slice::from_ref(&request.request_id))?;
+        Ok(Response::new(sg::AbortResponse {
+            success: true,
+            message: format!("aborted {}", request.request_id),
+        }))
+    }
+
+    async fn get_model_info(
+        &self,
+        _request: Request<sg::GetModelInfoRequest>,
+    ) -> Result<Response<sg::GetModelInfoResponse>, Status> {
+        Ok(Response::new(info::model_info(&self.state)))
+    }
+
+    async fn get_server_info(
+        &self,
+        _request: Request<sg::GetServerInfoRequest>,
+    ) -> Result<Response<sg::GetServerInfoResponse>, Status> {
+        Ok(Response::new(info::server_info(&self.state)))
+    }
+
+    async fn get_loads(
+        &self,
+        request: Request<sg::GetLoadsRequest>,
+    ) -> Result<Response<sg::GetLoadsResponse>, Status> {
+        info::loads(&self.state, request.into_inner().dp_rank).map(Response::new)
+    }
+
+    async fn flush_cache(
+        &self,
+        _request: Request<common::FlushCacheRequest>,
+    ) -> Result<Response<common::FlushCacheResponse>, Status> {
+        Err(no_control_wire("FlushCache"))
+    }
+
+    async fn start_profile(
+        &self,
+        _request: Request<common::StartProfileRequest>,
+    ) -> Result<Response<common::ProfileResponse>, Status> {
+        Err(no_control_wire("StartProfile"))
+    }
+
+    async fn stop_profile(
+        &self,
+        _request: Request<common::StopProfileRequest>,
+    ) -> Result<Response<common::ProfileResponse>, Status> {
+        Err(no_control_wire("StopProfile"))
+    }
+
+    async fn get_tokenizer(
+        &self,
+        _request: Request<common::GetTokenizerRequest>,
+    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
+        tokenizer_bundle::get_tokenizer(self.state.tokenizer_dir.clone())
+            .await
+            .map(Response::new)
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _request: Request<common::SubscribeKvEventsRequest>,
+    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+        Err(Status::unimplemented(
+            "SubscribeKvEvents is not available through the Rust SGLang servicer yet: the \
+             scheduler's KV-event publisher is not relayed on this path",
+        ))
+    }
+
+    async fn load_lo_ra_adapter(
+        &self,
+        _request: Request<sg::LoadLoRaAdapterRequest>,
+    ) -> Result<Response<sg::LoadLoRaAdapterResponse>, Status> {
+        Err(no_control_wire("LoadLoRAAdapter"))
+    }
+
+    async fn unload_lo_ra_adapter(
+        &self,
+        _request: Request<sg::UnloadLoRaAdapterRequest>,
+    ) -> Result<Response<sg::UnloadLoRaAdapterResponse>, Status> {
+        Err(no_control_wire("UnloadLoRAAdapter"))
+    }
+
+    async fn list_loaded_lo_ra_adapters(
+        &self,
+        _request: Request<sg::ListLoadedLoRaAdaptersRequest>,
+    ) -> Result<Response<sg::ListLoadedLoRaAdaptersResponse>, Status> {
+        Err(no_control_wire("ListLoadedLoRAAdapters"))
+    }
+}

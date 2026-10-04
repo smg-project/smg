@@ -1,18 +1,18 @@
 //! Read-only RPCs: `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `GetLoads`.
 //! Metadata comes from the launcher's config (what the Python servicer reads
-//! off TokenSpeed's `ModelConfig` and `ServerArgs`) and from the handshake.
+//! off SGLang's `ModelConfig` and `ServerArgs`) and from the handshake.
 
 use engine_zmq_adapter::ZmqEngineClient;
 use prost_types::Timestamp;
-use smg_grpc_client::tokenspeed_proto as ts;
+use smg_grpc_client::sglang_proto as sg;
 use tonic::Status;
 
 use super::State;
 use crate::proto_json::{number, struct_from_json};
 
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
-pub(super) fn health_check(state: &State) -> ts::HealthCheckResponse {
-    ts::HealthCheckResponse {
+pub(super) fn health_check(state: &State) -> sg::HealthCheckResponse {
+    sg::HealthCheckResponse {
         healthy: state.is_serving(),
         message: state.health_message().to_string(),
     }
@@ -20,7 +20,7 @@ pub(super) fn health_check(state: &State) -> ts::HealthCheckResponse {
 
 /// `GetModelInfo`: the launcher's config, with the handshake's context length
 /// as the fallback for a launcher that reported none.
-pub(super) fn model_info(state: &State) -> ts::GetModelInfoResponse {
+pub(super) fn model_info(state: &State) -> sg::GetModelInfoResponse {
     let model = &state.model;
     let ready = state
         .engine
@@ -38,15 +38,17 @@ pub(super) fn model_info(state: &State) -> ts::GetModelInfoResponse {
     } else {
         max_context_length
     };
-    ts::GetModelInfoResponse {
+    sg::GetModelInfoResponse {
         model_path: model.model_path.clone(),
         tokenizer_path: model.tokenizer_path.clone(),
+        is_generation: model.is_generation,
+        preferred_sampling_params: model.preferred_sampling_params.clone(),
+        weight_version: model.weight_version.clone(),
         served_model_name: model.served_model_name.clone(),
-        model_type: model.model_type.clone(),
-        architectures: model.architectures.clone(),
         max_context_length,
-        max_req_input_len,
         vocab_size: model.vocab_size,
+        supports_vision: model.supports_vision,
+        model_type: model.model_type.clone(),
         eos_token_ids: model
             .eos_token_ids
             .iter()
@@ -54,20 +56,18 @@ pub(super) fn model_info(state: &State) -> ts::GetModelInfoResponse {
             .collect(),
         pad_token_id: model.pad_token_id,
         bos_token_id: model.bos_token_id,
-        weight_version: model.weight_version.clone(),
+        max_req_input_len,
+        architectures: model.architectures.clone(),
+        id2label_json: model.id2label_json.clone(),
+        num_labels: model.num_labels,
         default_sampling_params_json: model.default_sampling_params_json.clone(),
-        supports_vision: model.supports_vision,
-        supports_multimodal: model.supports_multimodal,
-        supported_modalities: model.supported_modalities.clone(),
-        model_dtype: model.model_dtype.clone(),
-        multimodal_encoder_dtype: model.multimodal_encoder_dtype.clone(),
     }
 }
 
 /// `GetServerInfo`: the launcher's `server_args` (the Router's label source)
 /// and a `scheduler_info` of the handshake's capacity figures over the
 /// launcher's entries, as the Python servicer reports them.
-pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
+pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     let model = &state.model;
     let ready = state
         .engine
@@ -90,47 +90,51 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
             number(max_running_requests(state)),
         );
     }
-    let version = Some(model.tokenspeed_version.clone())
+    let version = Some(model.sglang_version.clone())
         .filter(|version| !version.is_empty())
         .or_else(|| {
             ready.map(|ready| {
                 ready
                     .vllm_version
-                    .strip_prefix("tokenspeed-")
+                    .strip_prefix("sglang-")
                     .unwrap_or(&ready.vllm_version)
                     .to_string()
             })
         })
         .filter(|version| !version.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
-    ts::GetServerInfoResponse {
+    sg::GetServerInfoResponse {
         server_args: Some(struct_from_json(&model.server_args_json)),
         scheduler_info: Some(scheduler_info),
         active_requests: i32::try_from(state.registry.len()).unwrap_or(i32::MAX),
         is_paused: false,
+        last_receive_timestamp: 0.0,
         uptime_seconds: state.started.elapsed().as_secs_f64(),
-        max_total_num_tokens,
-        tokenspeed_version: version,
+        sglang_version: version,
+        // The Router strips this label; the two implementations serve the
+        // same contract and are not told apart by it.
+        server_type: "grpc".to_string(),
         start_time: Some(Timestamp::from(state.started_at)),
+        max_total_num_tokens,
     }
 }
 
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
 /// response shape the Python servicer derives from the scheduler's load
-/// replies: pages in use become tokens, running is total minus waiting.
-pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsResponse, Status> {
+/// snapshots. The `include` sections have no source on this wire.
+pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsResponse, Status> {
     let client = state.engine()?;
     let ready = client.ready_response();
     let max_total_num_tokens = max_total_num_tokens(state);
     let max_running_requests = max_running_requests(state);
     let snapshot = client.get_loads();
-    let mut loads: Vec<ts::SchedulerLoad> = snapshot
+    let mut loads: Vec<sg::SchedulerLoad> = snapshot
         .loads
         .into_iter()
         .filter(|load| dp_rank.is_none_or(|rank| rank == load.dp_rank))
         .map(|load| {
             let num_used_tokens = (load.token_usage * f64::from(max_total_num_tokens)).round();
-            ts::SchedulerLoad {
+            sg::SchedulerLoad {
                 dp_rank: load.dp_rank,
                 num_running_reqs: load.num_running_reqs,
                 num_waiting_reqs: load.num_waiting_reqs,
@@ -153,7 +157,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
             .unwrap_or(1)
             .max(1);
         loads = (0..ranks)
-            .map(|rank| ts::SchedulerLoad {
+            .map(|rank| sg::SchedulerLoad {
                 dp_rank: i32::try_from(rank).unwrap_or(i32::MAX),
                 max_running_requests,
                 max_total_num_tokens,
@@ -168,12 +172,12 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
     } else {
         loads.iter().map(|load| load.token_usage).sum::<f64>() / loads.len() as f64
     };
-    Ok(ts::GetLoadsResponse {
+    Ok(sg::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
-        version: "tokenspeed".to_string(),
+        version: state.model.sglang_version.clone(),
         dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
         loads,
-        aggregate: Some(ts::AggregateMetrics {
+        aggregate: Some(sg::AggregateMetrics {
             total_running_reqs: total_running,
             total_waiting_reqs: total_waiting,
             total_reqs: total_running.saturating_add(total_waiting),
@@ -195,7 +199,8 @@ fn max_total_num_tokens(state: &State) -> i32 {
         .unwrap_or(0)
 }
 
-/// The admission window: the launcher's `max_num_seqs`, else the handshake's.
+/// The admission window: the launcher's `--max-running-requests`, else the
+/// handshake's.
 fn max_running_requests(state: &State) -> i32 {
     if state.model.max_running_requests > 0 {
         return state.model.max_running_requests;

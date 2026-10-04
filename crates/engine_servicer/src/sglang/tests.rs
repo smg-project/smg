@@ -1,0 +1,724 @@
+//! The Rust SGLang servicer against a mock scheduler on the msgpack wire: the
+//! mock decodes the `TokenizedGenerateReqInput` frames the servicer sends and
+//! answers with `BatchTokenIDSlimOutput` batches, as the SMG plugin inside a
+//! headless scheduler does.
+
+use std::time::Duration;
+
+use bytes::Bytes;
+use engine_zmq_client::{
+    codec::{decode_msgpack, encode_msgpack},
+    mock_engine::{connect_to_frontend, default_ready_response, MockEngineInput, MockEngineOutput},
+    protocol::sglang::{
+        output::{BatchTokenIDSlimOutput, MatchedStop},
+        request::{SglangRequestType, TokenizedGenerateReqInput},
+    },
+    EngineId,
+};
+use portpicker::pick_unused_port;
+use prost_types::value::Kind;
+use smg_grpc_client::{
+    common_proto as common,
+    sglang_proto::{self as sg, sglang_scheduler_client::SglangSchedulerClient},
+};
+use tonic::{transport::Channel, Code};
+use tonic_health::pb::{
+    health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
+};
+
+use super::*;
+use crate::ServicerError;
+
+fn model_info() -> SglangModelInfo {
+    SglangModelInfo {
+        model_path: "org/model".to_string(),
+        served_model_name: "served".to_string(),
+        tokenizer_path: "org/model".to_string(),
+        is_generation: true,
+        model_type: "qwen3".to_string(),
+        architectures: vec!["Qwen3ForCausalLM".to_string()],
+        max_context_length: 4096,
+        vocab_size: 1024,
+        eos_token_ids: vec![999],
+        pad_token_id: 0,
+        bos_token_id: 1,
+        default_sampling_params_json: "{\"temperature\":0.7}".to_string(),
+        server_args_json: r#"{"model_path":"org/model","tp_size":2,"dp_size":1,"context_length":4096,"pairing_protocol":"p1"}"#.to_string(),
+        scheduler_info_json: r#"{"is_generation":true}"#.to_string(),
+        sglang_version: "0.5.20".to_string(),
+        max_running_requests: 64,
+        data_parallel_size: 1,
+        ..Default::default()
+    }
+}
+
+fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> SglangServicerConfig {
+    SglangServicerConfig {
+        bind_address: "127.0.0.1:0".to_string(),
+        ipc_base_url: format!("ipc://{}", dir.join("engine").display()),
+        handshake_address: handshake.to_string(),
+        engine_count: 1,
+        tokenizer_dir: None,
+        model,
+        engine_startup_timeout: Duration::from_secs(10),
+    }
+}
+
+fn handshake_address() -> String {
+    format!(
+        "tcp://127.0.0.1:{}",
+        pick_unused_port().expect("a free handshake port")
+    )
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    for _ in 0..400 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("condition not met within 10s");
+}
+
+/// A bound servicer, a handshaken mock scheduler, and a gRPC client.
+struct Harness {
+    server: SglangServicerServer,
+    engine_in: MockEngineInput,
+    engine_out: MockEngineOutput,
+    client: SglangSchedulerClient<Channel>,
+    _dir: tempfile::TempDir,
+}
+
+async fn harness(model: SglangModelInfo) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address();
+    let server = SglangServicerServer::start(config(dir.path(), &handshake, model))
+        .expect("servicer starts");
+    let engine = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .expect("mock scheduler handshake");
+    wait_until(|| server.engine_ready()).await;
+    let client = SglangSchedulerClient::connect(format!("http://{}", server.address()))
+        .await
+        .expect("grpc client");
+    let (engine_in, engine_out) = engine.split();
+    Harness {
+        server,
+        engine_in,
+        engine_out,
+        client,
+        _dir: dir,
+    }
+}
+
+/// One scheduler step for `rid`: `tokens` generated, finished with `finish`
+/// (`None` = still running), carrying a load snapshot when given.
+fn batch(
+    rid: &str,
+    tokens: Vec<u32>,
+    completion_tokens: u32,
+    finish: Option<&str>,
+    load: Option<(u64, u64, u64, u64)>,
+) -> BatchTokenIDSlimOutput {
+    let (num_running, num_waiting, kv_used_tokens, kv_total_tokens) = load.unwrap_or_default();
+    BatchTokenIDSlimOutput {
+        rids: vec![rid.to_string()],
+        output_ids: vec![tokens],
+        finished_reasons: vec![finish.unwrap_or_default().to_string()],
+        finished_messages: vec![None],
+        finished_matched: vec![None],
+        prompt_tokens: vec![3],
+        completion_tokens: vec![completion_tokens],
+        cached_tokens: vec![0],
+        output_token_logprobs_val: vec![Vec::new()],
+        output_token_logprobs_idx: vec![Vec::new()],
+        engine_index: 0,
+        num_running,
+        num_waiting,
+        kv_used_tokens,
+        kv_total_tokens,
+        ..Default::default()
+    }
+}
+
+async fn send(engine_out: &mut MockEngineOutput, batch: &BatchTokenIDSlimOutput) {
+    engine_out
+        .send_frames(vec![Bytes::from(encode_msgpack(batch).unwrap())])
+        .await
+        .unwrap();
+}
+
+async fn recv_add(engine: &mut MockEngineInput) -> TokenizedGenerateReqInput {
+    let frames = engine.recv_frames().await.unwrap();
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Add)
+    );
+    decode_msgpack(frames[1].as_ref()).unwrap()
+}
+
+async fn recv_abort(engine: &mut MockEngineInput) -> Vec<String> {
+    let frames = engine.recv_frames().await.unwrap();
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Abort)
+    );
+    decode_msgpack(frames[1].as_ref()).unwrap()
+}
+
+fn generate_request(id: &str, stream: bool, stops: Vec<String>) -> sg::GenerateRequest {
+    sg::GenerateRequest {
+        request_id: id.to_string(),
+        tokenized: Some(sg::TokenizedInput {
+            input_ids: vec![1, 2, 3],
+            original_text: String::new(),
+        }),
+        sampling_params: Some(sg::SamplingParams {
+            max_new_tokens: Some(8),
+            stop: stops,
+            ..Default::default()
+        }),
+        logprob_start_len: -1,
+        stream,
+        ..Default::default()
+    }
+}
+
+fn chunk(response: sg::GenerateResponse) -> sg::GenerateStreamChunk {
+    match response.response {
+        Some(sg::generate_response::Response::Chunk(chunk)) => chunk,
+        other => panic!("expected a chunk, got {other:?}"),
+    }
+}
+
+fn complete(response: sg::GenerateResponse) -> sg::GenerateComplete {
+    match response.response {
+        Some(sg::generate_response::Response::Complete(complete)) => complete,
+        other => panic!("expected a complete, got {other:?}"),
+    }
+}
+
+#[test]
+fn config_is_validated_before_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad_bind = SglangServicerConfig {
+        bind_address: "nope".to_string(),
+        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
+    };
+    assert!(matches!(
+        SglangServicerServer::start(bad_bind),
+        Err(ServicerError::InvalidConfig(_))
+    ));
+    let no_engines = SglangServicerConfig {
+        engine_count: 0,
+        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
+    };
+    assert!(matches!(
+        SglangServicerServer::start(no_engines),
+        Err(ServicerError::InvalidConfig(_))
+    ));
+    let no_model = SglangServicerConfig {
+        model: SglangModelInfo::default(),
+        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
+    };
+    assert!(matches!(
+        SglangServicerServer::start(no_model),
+        Err(ServicerError::InvalidConfig(_))
+    ));
+}
+
+/// Health is NOT_SERVING until the scheduler handshakes, SERVING after, and
+/// NOT_SERVING again once the lifecycle owner drains.
+#[tokio::test]
+async fn health_follows_the_engine_link_and_the_drain_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address();
+    let server = SglangServicerServer::start(config(dir.path(), &handshake, model_info()))
+        .expect("servicer starts");
+    let channel = Channel::from_shared(format!("http://{}", server.address()))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut health = HealthClient::new(channel);
+    let status = |response: tonic_health::pb::HealthCheckResponse| response.status;
+    let check = HealthCheckRequest {
+        service: SERVICE_NAME.to_string(),
+    };
+    assert_eq!(
+        status(health.check(check.clone()).await.unwrap().into_inner()),
+        ServingStatus::NotServing as i32
+    );
+    let mut client = SglangSchedulerClient::connect(format!("http://{}", server.address()))
+        .await
+        .unwrap();
+    let before = client
+        .health_check(sg::HealthCheckRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!before.healthy);
+    assert_eq!(before.message, "Engine is starting");
+
+    let _engine = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .expect("mock scheduler handshake");
+    wait_until(|| server.engine_ready()).await;
+    assert_eq!(
+        status(health.check(check.clone()).await.unwrap().into_inner()),
+        ServingStatus::Serving as i32
+    );
+    server.set_serving(false);
+    assert_eq!(
+        status(health.check(check).await.unwrap().into_inner()),
+        ServingStatus::NotServing as i32
+    );
+    let draining = client
+        .health_check(sg::HealthCheckRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(draining.message, "Draining");
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Streaming: one chunk per scheduler step, then the scheduler's own
+/// `Complete` with the accumulated ids, all under the request's id.
+#[tokio::test]
+async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
+    let mut h = harness(model_info()).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(request.rid, "r1");
+    assert_eq!(request.input_ids, vec![1, 2, 3]);
+    assert_eq!(request.sampling_params.max_new_tokens, Some(8));
+    assert_eq!(request.sampling_params.n, 1);
+    assert!(request.stream);
+
+    send(&mut h.engine_out, &batch("r1", vec![10], 1, None, None)).await;
+    send(
+        &mut h.engine_out,
+        &batch("r1", vec![11], 2, Some("length"), None),
+    )
+    .await;
+
+    let first = stream.message().await.unwrap().unwrap();
+    assert_eq!(first.request_id, "r1");
+    let first = chunk(first);
+    assert_eq!(first.token_ids, vec![10]);
+    assert_eq!(first.prompt_tokens, 3);
+    assert_eq!(
+        chunk(stream.message().await.unwrap().unwrap()).token_ids,
+        vec![11]
+    );
+    let done = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10, 11]);
+    assert_eq!(done.prompt_tokens, 3);
+    assert_eq!(done.completion_tokens, 2);
+    assert_eq!(done.index, 0);
+    assert!(stream.message().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Non-streaming delivers exactly the terminal `Complete`.
+#[tokio::test]
+async fn non_streaming_generate_delivers_only_the_complete() {
+    let mut h = harness(model_info()).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r2", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r2", vec![10], 1, None, None)).await;
+    send(
+        &mut h.engine_out,
+        &batch("r2", vec![11, 12], 3, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert_eq!(done.output_ids, vec![10, 11, 12]);
+    assert!(stream.message().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// String stops ride the request to the scheduler, which keeps its tokenizer
+/// and reports the matched string back.
+#[tokio::test]
+async fn string_stops_reach_the_scheduler_and_its_match_comes_back() {
+    let mut h = harness(model_info()).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r3", false, vec!["###".to_string()]))
+        .await
+        .expect("generate")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        request.sampling_params.stop.as_deref(),
+        Some(&["###".to_string()][..])
+    );
+    let mut done = batch("r3", vec![10, 11], 2, Some("stop"), None);
+    done.finished_matched = vec![Some(MatchedStop::Text("###".to_string()))];
+    send(&mut h.engine_out, &done).await;
+    let done = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert_eq!(
+        done.matched_stop,
+        Some(sg::generate_complete::MatchedStop::MatchedStopStr(
+            "###".to_string()
+        ))
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// `Abort` ends the stream with an `abort` Complete and tells the scheduler;
+/// an unknown id is a no-op.
+#[tokio::test]
+async fn abort_rpc_ends_the_stream_and_reaches_the_scheduler() {
+    let mut h = harness(model_info()).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r4", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r4", vec![10], 1, None, None)).await;
+    assert_eq!(
+        chunk(stream.message().await.unwrap().unwrap()).token_ids,
+        vec![10]
+    );
+
+    let response = h
+        .client
+        .abort(sg::AbortRequest {
+            request_id: "r4".to_string(),
+            reason: "client left".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success);
+    let done = complete(stream.message().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "abort");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().await.unwrap().is_none());
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r4".to_string()]);
+
+    let unknown = h
+        .client
+        .abort(sg::AbortRequest {
+            request_id: "nobody".to_string(),
+            reason: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(unknown.success);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+#[tokio::test]
+async fn duplicate_request_ids_are_refused() {
+    let mut h = harness(model_info()).await;
+    let _first = h
+        .client
+        .generate(generate_request("dup", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let second = h
+        .client
+        .generate(generate_request("dup", true, Vec::new()))
+        .await;
+    assert_eq!(second.err().map(|s| s.code()), Some(Code::AlreadyExists));
+    let no_ids = h
+        .client
+        .generate(sg::GenerateRequest {
+            request_id: "empty".to_string(),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(no_ids.err().map(|s| s.code()), Some(Code::InvalidArgument));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// `n = 2`: two single-sample scheduler requests under the parent id, demuxed
+/// back into two indexed `Complete`s on the one gRPC stream.
+#[tokio::test]
+async fn n2_fans_out_under_the_parent_id() {
+    let mut h = harness(model_info()).await;
+    let mut req = generate_request("r5", false, Vec::new());
+    if let Some(params) = req.sampling_params.as_mut() {
+        params.n = 2;
+    }
+    let mut stream = h.client.generate(req).await.expect("generate").into_inner();
+    let mut rids = vec![
+        recv_add(&mut h.engine_in).await.rid,
+        recv_add(&mut h.engine_in).await.rid,
+    ];
+    rids.sort();
+    assert_eq!(rids, vec!["r5-0".to_string(), "r5-1".to_string()]);
+    let both = BatchTokenIDSlimOutput {
+        rids: vec!["r5-0".into(), "r5-1".into()],
+        output_ids: vec![vec![10], vec![11]],
+        finished_reasons: vec!["stop".into(), "stop".into()],
+        finished_messages: vec![None, None],
+        finished_matched: vec![None, None],
+        prompt_tokens: vec![3, 3],
+        completion_tokens: vec![1, 1],
+        cached_tokens: vec![0, 0],
+        output_token_logprobs_val: vec![vec![], vec![]],
+        output_token_logprobs_idx: vec![vec![], vec![]],
+        ..Default::default()
+    };
+    send(&mut h.engine_out, &both).await;
+    let mut completes = [
+        complete(stream.message().await.unwrap().unwrap()),
+        complete(stream.message().await.unwrap().unwrap()),
+    ];
+    completes.sort_by_key(|done| done.index);
+    assert_eq!(
+        (completes[0].index, &completes[0].output_ids),
+        (0, &vec![10])
+    );
+    assert_eq!(
+        (completes[1].index, &completes[1].output_ids),
+        (1, &vec![11])
+    );
+    assert!(stream.message().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Sampled-token logprobs and ranked candidates pass through per chunk and
+/// cumulatively on the Complete.
+#[tokio::test]
+async fn logprobs_and_ranked_candidates_pass_through() {
+    let mut h = harness(model_info()).await;
+    let mut req = generate_request("r6", true, Vec::new());
+    req.return_logprob = true;
+    req.top_logprobs_num = 2;
+    let mut stream = h.client.generate(req).await.expect("generate").into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert!(request.return_logprob);
+    assert_eq!(request.top_logprobs_num, 2);
+    let mut step = batch("r6", vec![10], 1, Some("length"), None);
+    step.output_token_logprobs_val = vec![vec![-0.5]];
+    step.output_token_logprobs_idx = vec![vec![10]];
+    step.output_top_logprobs_val = vec![vec![vec![-0.5, -1.5]]];
+    step.output_top_logprobs_idx = vec![vec![vec![10, 12]]];
+    send(&mut h.engine_out, &step).await;
+    let first = chunk(stream.message().await.unwrap().unwrap());
+    let logprobs = first.output_logprobs.expect("chunk logprobs");
+    assert_eq!(logprobs.token_logprobs, vec![-0.5]);
+    assert_eq!(logprobs.top_logprobs[0].token_ids, vec![10, 12]);
+    let done = complete(stream.message().await.unwrap().unwrap());
+    let logprobs = done.output_logprobs.expect("complete logprobs");
+    assert_eq!(logprobs.token_ids, vec![10]);
+    assert_eq!(logprobs.top_logprobs.len(), 1);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A request the scheduler refuses (its 400) is the caller's error on the
+/// stream, as the Python servicer's `context.abort(INVALID_ARGUMENT)`.
+#[tokio::test]
+async fn a_scheduler_refusal_is_the_callers_error() {
+    let mut h = harness(model_info()).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r7", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut refusal = batch("r7", vec![], 0, Some("abort"), None);
+    refusal.finished_messages = vec![Some("n=2 is not served on this wire".to_string())];
+    refusal.finished_status = vec![Some(400)];
+    send(&mut h.engine_out, &refusal).await;
+    let error = stream.message().await.expect_err("a status");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("n=2 is not served"), "{error}");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Model and server info come from the launcher's facts plus the handshake's
+/// capacity figures; loads are zero-filled until a batch carries a snapshot.
+#[tokio::test]
+async fn info_rpcs_report_launcher_facts_and_handshake_figures() {
+    let mut h = harness(model_info()).await;
+    let ready = default_ready_response();
+    let info = h
+        .client
+        .get_model_info(sg::GetModelInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.model_path, "org/model");
+    assert_eq!(info.served_model_name, "served");
+    assert_eq!(info.max_context_length, 4096);
+    assert_eq!(info.max_req_input_len, 4096);
+    assert_eq!(info.eos_token_ids, vec![999]);
+    assert!(info.is_generation);
+    assert_eq!(info.default_sampling_params_json, "{\"temperature\":0.7}");
+
+    let server = h
+        .client
+        .get_server_info(sg::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let args = server.server_args.expect("server_args");
+    assert_eq!(
+        args.fields["tp_size"].kind,
+        Some(Kind::NumberValue(2.0)),
+        "the Router reads its labels off server_args"
+    );
+    assert_eq!(
+        args.fields["pairing_protocol"].kind,
+        Some(Kind::StringValue("p1".to_string()))
+    );
+    let scheduler_info = server.scheduler_info.expect("scheduler_info");
+    assert_eq!(
+        scheduler_info.fields["page_size"].kind,
+        Some(Kind::NumberValue(f64::from(
+            i32::try_from(ready.block_size).unwrap()
+        )))
+    );
+    assert_eq!(
+        scheduler_info.fields["max_running_requests"].kind,
+        Some(Kind::NumberValue(64.0))
+    );
+    assert_eq!(server.sglang_version, "0.5.20");
+    assert_eq!(server.server_type, "grpc");
+    let expected_capacity = ready
+        .kv_cache_size_tokens
+        .map(|tokens| i32::try_from(tokens).unwrap())
+        .unwrap_or(0);
+    assert_eq!(server.max_total_num_tokens, expected_capacity);
+    assert_eq!(server.active_requests, 0);
+
+    let idle = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: None,
+            include: vec!["all".to_string()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(idle.dp_rank_count, 1);
+    assert_eq!(idle.loads[0].num_running_reqs, 0);
+    assert_eq!(idle.loads[0].max_running_requests, 64);
+    assert_eq!(idle.version, "0.5.20");
+
+    // A batch with a load tail updates the snapshot the next GetLoads reports.
+    let mut stream = h
+        .client
+        .generate(generate_request("r8", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r8", vec![10], 1, None, Some((1, 2, 50, 1000))),
+    )
+    .await;
+    chunk(stream.message().await.unwrap().unwrap());
+    let busy = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(0),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(busy.loads.len(), 1);
+    assert_eq!(busy.loads[0].num_running_reqs, 1);
+    assert_eq!(busy.loads[0].num_waiting_reqs, 2);
+    assert!((busy.loads[0].token_usage - 0.05).abs() < 1e-9);
+    assert_eq!(busy.aggregate.unwrap().total_reqs, 3);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// What the wire does not carry is reported, not emulated.
+#[tokio::test]
+async fn control_rpcs_report_the_wire_gap() {
+    let mut h = harness(model_info()).await;
+    let flush = h
+        .client
+        .flush_cache(common::FlushCacheRequest::default())
+        .await;
+    assert_eq!(flush.err().map(|s| s.code()), Some(Code::Unimplemented));
+    let embed = h.client.embed(sg::EmbedRequest::default()).await;
+    assert_eq!(embed.err().map(|s| s.code()), Some(Code::Unimplemented));
+    let lora = h
+        .client
+        .load_lo_ra_adapter(sg::LoadLoRaAdapterRequest::default())
+        .await;
+    assert_eq!(lora.err().map(|s| s.code()), Some(Code::Unimplemented));
+    let kv = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await;
+    assert_eq!(kv.err().map(|s| s.code()), Some(Code::Unimplemented));
+    let tokenizer = h
+        .client
+        .get_tokenizer(common::GetTokenizerRequest::default())
+        .await;
+    assert_eq!(
+        tokenizer.err().map(|s| s.code()),
+        Some(Code::FailedPrecondition),
+        "no tokenizer directory was configured"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A scheduler that never dials in: the server stays up (health NOT_SERVING),
+/// the error is reported, and the listener port is released on stop.
+#[tokio::test]
+async fn startup_timeout_keeps_the_server_up_and_reports_the_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path(), &handshake_address(), model_info());
+    config.engine_startup_timeout = Duration::from_millis(300);
+    let server = SglangServicerServer::start(config).expect("servicer starts");
+    wait_until(|| matches!(server.last_error(), Ok(Some(_)))).await;
+    assert!(!server.engine_ready());
+    assert!(server.running());
+    let mut client = SglangSchedulerClient::connect(format!("http://{}", server.address()))
+        .await
+        .unwrap();
+    let health = client
+        .health_check(sg::HealthCheckRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!health.healthy);
+    assert_eq!(health.message, "Engine connection failed");
+    let generate = client
+        .generate(generate_request("late", true, Vec::new()))
+        .await;
+    assert_eq!(generate.err().map(|s| s.code()), Some(Code::Unavailable));
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
