@@ -2074,7 +2074,7 @@ impl CacheAwarePolicy {
                     workers,
                     healthy_indices,
                     &result.matched_tenants,
-                    text.chars().count(),
+                    input,
                     avg_load,
                     info,
                 )
