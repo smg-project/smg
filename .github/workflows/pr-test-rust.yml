@@ -738,6 +738,10 @@ jobs:
             timeout: 60
             test_timeout: 48
             min_selected: 109 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          - engine: sglang
+            timeout: 60
+            test_timeout: 48
+            min_selected: 204 # floor ≈ 95% of measured effective (215 of 223 selected ran; audit 2026-10-03)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}

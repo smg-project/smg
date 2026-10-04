@@ -210,6 +210,24 @@ def _filter_zmq_items(items: list[pytest.Item]) -> tuple[list[pytest.Item], list
     return kept, deselected
 
 
+_SGLANG_ZMQ_SKIPPED_MODULES = ("test_multimodal.py", "test_error_shapes.py")
+
+
+def _filter_sglang_zmq_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for the SGLang ZMQ lane: the
+    multimodal module stays on the gRPC lane until the wire carries media, and
+    the error-shape module tests SGLang's HTTP server's own validation."""
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        module = item.nodeid.split("::", 1)[0]
+        skipped = module.endswith(_SGLANG_ZMQ_SKIPPED_MODULES)
+        (deselected if skipped else kept).append(item)
+    return kept, deselected
+
+
 # Models whose TokenSpeed forward crashes on the 0-token idle batch a DP rank
 # runs to stay in the group's collectives (flashinfer silu_and_mul cannot
 # launch over an empty grid). Fixed upstream by
@@ -426,6 +444,17 @@ def pytest_collection_modifyitems(
         if deselected:
             config.hook.pytest_deselected(items=deselected)
             items[:] = kept
+
+        # Multimodal is not wired over the SGLang ZMQ wire yet (the adapter
+        # refuses mm inputs), and the error-shape cases exercise SGLang's own
+        # HTTP server, which this wire has no counterpart of; the gRPC and HTTP
+        # lanes keep covering those modules.
+        if get_runtime() == "sglang":
+            kept, deselected = _filter_sglang_zmq_items(items)
+            stats["by_sglang_zmq"] = len(deselected)
+            if deselected:
+                config.hook.pytest_deselected(items=deselected)
+                items[:] = kept
 
         # Grouped TokenSpeed lane: drop the models the pinned engine cannot
         # run under DP (see _TOKENSPEED_DP_BROKEN_MODELS).

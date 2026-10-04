@@ -47,6 +47,20 @@ def test_vllm_zmq_cmd_is_headless_with_derived_handshake_port(serve):
     assert cmd[cmd.index("--max-model-len") + 1] == "2048"
 
 
+def test_sglang_zmq_cmd_runs_the_headless_launcher_with_derived_handshake_port(serve):
+    w = _worker("sglang")
+    cmd = w._build_sglang_zmq_cmd(
+        "/models/qwen", 1, {"sglang_args": ["--mem-fraction-static", "0.5"]}
+    )
+    # SGLang itself is unchanged: the scheduler is launched headless by the
+    # smg servicer package, whose SGLang plugin dials SMG from inside it.
+    assert cmd[1:3] == ["-m", "smg_grpc_servicer.sglang.headless"]
+    assert "/models/qwen" in cmd and "--grpc-mode" not in cmd
+    expected_port = serve._zmq_handshake_port(serve._zmq_ipc_url(w.port))
+    assert cmd[cmd.index("--zmq-handshake-address") + 1] == f"tcp://127.0.0.1:{expected_port}"
+    assert cmd[cmd.index("--mem-fraction-static") + 1] == "0.5"
+
+
 def test_tokenspeed_zmq_cmd_is_headless_with_derived_handshake_port(serve):
     w = _worker("tokenspeed")
     cmd = w._build_tokenspeed_zmq_cmd(

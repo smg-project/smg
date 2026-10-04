@@ -9,16 +9,15 @@ from infra.constants import ConnectionMode, Runtime
 setup_backend = pytest.importorskip("fixtures.setup_backend")
 
 
-@pytest.mark.parametrize("engine", [Runtime.VLLM.value, Runtime.TOKENSPEED.value])
+@pytest.mark.parametrize(
+    "engine", [Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value]
+)
 def test_zmq_allowed_for_capable_engines(engine):
     # Does not raise.
     setup_backend._validate_connection_mode(ConnectionMode.ZMQ, engine)
 
 
-@pytest.mark.parametrize(
-    "engine",
-    [Runtime.SGLANG.value, Runtime.TRTLLM.value, Runtime.MLX.value],
-)
+@pytest.mark.parametrize("engine", [Runtime.TRTLLM.value, Runtime.MLX.value])
 def test_zmq_rejected_for_incapable_engines(engine):
     with pytest.raises(ValueError, match="ConnectionMode.ZMQ is only supported"):
         setup_backend._validate_connection_mode(ConnectionMode.ZMQ, engine)

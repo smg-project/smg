@@ -78,7 +78,9 @@ _MAX_WORKER_START_FAILURES = 3  # fail fast after this many failures (matches --
 # Engines that speak the direct-ZMQ backend wire in e2e. Pairing ZMQ with any
 # other engine can't work, so we reject it up front instead of timing out on a
 # worker that never becomes ready.
-ZMQ_CAPABLE_ENGINES = frozenset({Runtime.VLLM.value, Runtime.TOKENSPEED.value})
+ZMQ_CAPABLE_ENGINES = frozenset(
+    {Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value}
+)
 
 
 def _validate_connection_mode(connection_mode: ConnectionMode, engine: str) -> None:

@@ -725,6 +725,20 @@ class TestSglangWorkerLauncher:
             assert arg in cmd
         assert "--enable-cache-report" in cmd
 
+    def test_build_zmq_command_launches_headless_and_refuses_dp(self):
+        launcher = SglangWorkerLauncher()
+        args = argparse.Namespace(model_path="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--mem-fraction-static", "0.5"], "127.0.0.1", 31000)
+        assert "smg_grpc_servicer.sglang.headless" in cmd
+        expected_port = _zmq_handshake_port(_zmq_ipc_url(31000))
+        assert cmd[cmd.index("--zmq-handshake-address") + 1] == f"tcp://127.0.0.1:{expected_port}"
+        assert cmd[cmd.index("--model-path") + 1] == "/tmp/model"
+        assert "--mem-fraction-static" in cmd and "--grpc-mode" not in cmd
+        # DP over the SGLang ZMQ wire is not wired yet: refuse rather than
+        # start ranks the gateway will not await.
+        with pytest.raises(ValueError, match="dp-size"):
+            launcher.build_command(args, ["--dp-size", "2"], "127.0.0.1", 31000)
+
     def test_worker_url_grpc_mode(self):
         launcher = SglangWorkerLauncher()
         args = argparse.Namespace(connection_mode="grpc")

@@ -284,3 +284,11 @@ def test_floor_satisfied_from_collection_hook(monkeypatch):
     config = _FakeConfig()
     items = _run(config, [match, wrong])
     assert items == [match]
+
+
+def test_sglang_zmq_lane_keeps_multimodal_and_http_error_shapes_off_the_wire():
+    mm = _FakeItem("e2e_test/chat_completions/test_multimodal.py::test_image[grpc]")
+    shape = _FakeItem("e2e_test/chat_completions/test_error_shapes.py::test_json[http]")
+    text = _FakeItem("e2e_test/chat_completions/test_basic.py::test_chat[grpc]")
+    kept, deselected = hooks._filter_sglang_zmq_items([mm, shape, text])
+    assert kept == [text] and deselected == [mm, shape]

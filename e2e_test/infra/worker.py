@@ -288,7 +288,10 @@ class Worker:
         features = spec.get("features", [])
 
         if self.engine == "sglang":
-            cmd = self._build_sglang_cmd(model_path, tp_size, features, spec)
+            if self.mode == ConnectionMode.ZMQ:
+                cmd = self._build_sglang_zmq_cmd(model_path, tp_size, spec)
+            else:
+                cmd = self._build_sglang_cmd(model_path, tp_size, features, spec)
         elif self.engine == "vllm":
             if self.mode == ConnectionMode.ZMQ:
                 cmd = self._build_vllm_zmq_cmd(model_path, tp_size, spec)
@@ -447,6 +450,22 @@ class Worker:
         if extra:
             cmd.extend(extra)
         return cmd
+
+    def _build_sglang_zmq_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
+        """Build the headless SGLang command for the ZMQ direct backend.
+
+        Delegates to the ``smg serve`` launcher so the engine flags and the
+        FNV-1a handshake port stay identical to the production launch path.
+        """
+        from smg.serve import SglangWorkerLauncher
+
+        args = argparse.Namespace(
+            connection_mode="zmq", model_path=model_path, tensor_parallel_size=tp_size
+        )
+        backend_args = list(spec.get("sglang_args", []))
+        if tp_size > 1:
+            backend_args += ["--tp-size", str(tp_size)]
+        return SglangWorkerLauncher().build_command(args, backend_args, DEFAULT_HOST, self.port)
 
     def _build_tokenspeed_zmq_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build the headless TokenSpeed command for the ZMQ direct backend.

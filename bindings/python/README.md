@@ -38,7 +38,7 @@ smg serve --backend sglang --model-path /path/to/model --port 8080 --dp-size 4
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--backend` | `sglang` | Backend to use: `sglang`, `vllm`, or `trtllm` |
-| `--connection-mode` | `grpc` | Connection mode: `grpc` or `http`. vllm/trtllm only support grpc |
+| `--connection-mode` | `grpc` | Connection mode: `grpc`, `http`, or `zmq`. trtllm only supports grpc; tokenspeed only zmq; `zmq` (a same-host direct engine connection) is available for vllm, tokenspeed, and sglang |
 | `--host` | `127.0.0.1` | Host for the router |
 | `--port` | `8080` | Port for the router |
 | `--dp-size` | `1` | Data parallel size (number of worker replicas) |
