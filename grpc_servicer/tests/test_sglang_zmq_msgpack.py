@@ -9,10 +9,12 @@ import tempfile
 import threading
 import time
 
-import msgspec
 import pytest
-import zmq
 
+# The wire rides on pyzmq and msgspec and is pinned against SGLang's own
+# structs; the plain unit-test job has none of them and skips this module.
+msgspec = pytest.importorskip("msgspec")
+zmq = pytest.importorskip("zmq")
 sglang_io = pytest.importorskip("sglang.srt.managers.io_struct")
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from smg_grpc_servicer.sglang import zmq_msgpack as wire  # noqa: E402

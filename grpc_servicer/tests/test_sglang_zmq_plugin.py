@@ -4,8 +4,13 @@ import dataclasses
 from types import SimpleNamespace
 
 import pytest
-from smg_grpc_servicer.sglang import zmq_plugin
-from smg_grpc_servicer.sglang.zmq_msgpack import MsgpackRecvSocket, MsgpackSendSocket
+
+# The plugin's wire module imports pyzmq and msgspec (SGLang's own deps); the
+# plain unit-test job has neither and skips this module.
+pytest.importorskip("msgspec")
+pytest.importorskip("zmq")
+from smg_grpc_servicer.sglang import zmq_plugin  # noqa: E402
+from smg_grpc_servicer.sglang.zmq_msgpack import MsgpackRecvSocket, MsgpackSendSocket  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
