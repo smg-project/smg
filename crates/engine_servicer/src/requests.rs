@@ -73,10 +73,9 @@ impl RequestRegistry {
         ))
     }
 
-    /// Fire the cancellation of every listed request that is still
-    /// registered. Unknown ids are a no-op: cleanup is idempotent.
     /// Fire the cancellation of every given id that is live; returns how many
-    /// were (an unknown or already-finished id is a no-op).
+    /// were. An unknown or already-finished id is a no-op: cleanup is
+    /// idempotent.
     pub(crate) fn abort(&self, request_ids: &[String]) -> Result<usize, Status> {
         let mut entries = self
             .entries
