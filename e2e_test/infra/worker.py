@@ -29,6 +29,7 @@ from .constants import (
     get_gpu_offset,
     get_mm_processing,
     get_runtime,
+    get_sglang_servicer_impl,
     get_tokenspeed_servicer_impl,
     get_vllm_mm_processor,
     get_vllm_servicer_impl,
@@ -602,6 +603,14 @@ class Worker:
                 env["SMG_TOKENSPEED_SERVICER_IMPL"] = "rust"
             else:
                 env.pop("SMG_TOKENSPEED_SERVICER_IMPL", None)
+
+        # The SGLang servicer implementation is a flag inside the smg servicer
+        # package too, read at the entry SGLang's --grpc-mode calls.
+        if self.engine == "sglang" and self.mode == ConnectionMode.GRPC:
+            if get_sglang_servicer_impl() == "rust":
+                env["SMG_SGLANG_SERVICER_IMPL"] = "rust"
+            else:
+                env.pop("SMG_SGLANG_SERVICER_IMPL", None)
 
         if (
             self.engine == "vllm"

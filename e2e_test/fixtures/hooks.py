@@ -19,6 +19,7 @@ from infra import (
     cleanup_pool,
     get_connection_mode_override,
     get_runtime,
+    get_sglang_servicer_impl,
     get_tokenspeed_servicer_impl,
     get_zmq_engine_count,
 )
@@ -274,6 +275,34 @@ def _filter_tokenspeed_rust_items(
     return kept, deselected
 
 
+def _filter_sglang_rust_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for an SGLang lane whose gRPC
+    workers run the Rust servicer.
+
+    The Rust servicer reaches the scheduler over the msgpack wire, which
+    carries generate and abort only: no PD/EPD bootstrap fields, no control
+    messages, no embeddings and no multimodal payloads. Those topologies and
+    cases stay with the Python servicer, so they are dropped here rather than
+    failing on a known gap.
+    """
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        param = _setup_backend_param(item)
+        pd_topology = param is not None and param not in _ZMQ_LOCAL_WIRES
+        module = item.nodeid.split("::", 1)[0]
+        off_the_wire = module.endswith(("test_admin_ops.py", "test_multimodal.py")) or (
+            "/embeddings/" in module
+        )
+        if pd_topology or _is_multi_worker(item) or off_the_wire:
+            deselected.append(item)
+        else:
+            kept.append(item)
+    return kept, deselected
+
+
 def _filter_env_items(
     items: list[pytest.Item],
     engine: str | None,
@@ -434,6 +463,13 @@ def pytest_collection_modifyitems(
     if get_runtime() == "tokenspeed" and get_tokenspeed_servicer_impl() == "rust":
         kept, deselected = _filter_tokenspeed_rust_items(items)
         stats["by_tokenspeed_rust"] = len(deselected)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = kept
+
+    if get_runtime() == "sglang" and get_sglang_servicer_impl() == "rust":
+        kept, deselected = _filter_sglang_rust_items(items)
+        stats["by_sglang_rust"] = len(deselected)
         if deselected:
             config.hook.pytest_deselected(items=deselected)
             items[:] = kept

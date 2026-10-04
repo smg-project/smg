@@ -69,6 +69,9 @@ ENV_ZMQ_ENGINE_COUNT = (
 ENV_VLLM_SERVICER_IMPL = (
     "E2E_VLLM_SERVICER_IMPL"  # vLLM gRPC servicer implementation: python (default) or rust
 )
+ENV_SGLANG_SERVICER_IMPL = (
+    "E2E_SGLANG_SERVICER_IMPL"  # SGLang gRPC servicer implementation: python (default) or rust
+)
 ENV_TOKENSPEED_SERVICER_IMPL = (
     "E2E_TOKENSPEED_SERVICER_IMPL"  # TokenSpeed gRPC servicer implementation: python or rust
 )
@@ -253,6 +256,27 @@ def get_tokenspeed_servicer_impl() -> str:
     if value not in VLLM_SERVICER_IMPLS:
         raise ValueError(
             f"{ENV_TOKENSPEED_SERVICER_IMPL}={value!r} is not a valid servicer impl; "
+            f"use one of {VLLM_SERVICER_IMPLS}"
+        )
+    return value
+
+
+def get_sglang_servicer_impl() -> str:
+    """Which implementation serves the SGLang gRPC contract on gRPC lanes.
+
+    Set ``E2E_SGLANG_SERVICER_IMPL=rust`` to run SGLang gRPC workers
+    with the Rust servicer: the worker command stays
+    ``sglang.launch_server --grpc-mode`` and the flag travels to it as
+    ``SMG_SGLANG_SERVICER_IMPL`` in the worker's environment, read at the
+    smg entry that mode calls. The Router and every test case stay the
+    same. Unset/blank means python.
+    """
+    value = os.environ.get(ENV_SGLANG_SERVICER_IMPL, "").strip().lower()
+    if not value:
+        return "python"
+    if value not in VLLM_SERVICER_IMPLS:
+        raise ValueError(
+            f"{ENV_SGLANG_SERVICER_IMPL}={value!r} is not a valid servicer impl; "
             f"use one of {VLLM_SERVICER_IMPLS}"
         )
     return value
