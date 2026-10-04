@@ -20,9 +20,11 @@ use crate::{
 };
 
 /// The msgspec tag for [`BatchTokenIDSlimOutput`] (element 0 on the wire).
-pub const BATCH_EMBEDDING_SLIM_OUTPUT_TAG: &str = "BatchEmbeddingSlimOutput";
-pub const CONTROL_REPLY_SLIM_TAG: &str = "ControlReplySlim";
 pub const BATCH_TOKEN_ID_SLIM_OUTPUT_TAG: &str = "BatchTokenIDSlimOutput";
+/// The msgspec tag for [`BatchEmbeddingSlimOutput`] (element 0 on the wire).
+pub const BATCH_EMBEDDING_SLIM_OUTPUT_TAG: &str = "BatchEmbeddingSlimOutput";
+/// The msgspec tag for [`ControlReplySlim`] (element 0 on the wire).
+pub const CONTROL_REPLY_SLIM_TAG: &str = "ControlReplySlim";
 
 /// What a request stopped on: the scheduler reports the matched stop token id
 /// or stop string in its finish reason, and the plugin forwards it.
@@ -157,50 +159,44 @@ fn appended_column<'de, A: SeqAccess<'de>, T: Deserialize<'de>>(
 fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
     seq: &mut A,
 ) -> std::result::Result<BatchTokenIDSlimOutput, A::Error> {
-    {
-        {
-            {
-                let batch = BatchTokenIDSlimOutput {
-                    rids: next_field(seq, "rids")?,
-                    output_ids: next_field(seq, "output_ids")?,
-                    finished_reasons: next_field(seq, "finished_reasons")?,
-                    finished_messages: next_field(seq, "finished_messages")?,
-                    finished_matched: next_field(seq, "finished_matched")?,
-                    prompt_tokens: next_field(seq, "prompt_tokens")?,
-                    completion_tokens: next_field(seq, "completion_tokens")?,
-                    cached_tokens: next_field(seq, "cached_tokens")?,
-                    output_token_logprobs_val: next_field(seq, "output_token_logprobs_val")?,
-                    output_token_logprobs_idx: next_field(seq, "output_token_logprobs_idx")?,
-                    // The tail has msgspec defaults; a shorter array from an
-                    // older plugin decodes as "rank 0, no snapshot".
-                    engine_index: seq.next_element::<u32>()?.unwrap_or(0),
-                    num_running: seq.next_element::<u64>()?.unwrap_or(0),
-                    num_waiting: seq.next_element::<u64>()?.unwrap_or(0),
-                    kv_used_tokens: seq.next_element::<u64>()?.unwrap_or(0),
-                    kv_total_tokens: seq.next_element::<u64>()?.unwrap_or(0),
-                    finished_status: seq
-                        .next_element::<Option<Vec<Option<u16>>>>()?
-                        .flatten()
-                        .unwrap_or_default(),
-                    output_top_logprobs_val: seq
-                        .next_element::<Option<Vec<Vec<Vec<f64>>>>>()?
-                        .flatten()
-                        .unwrap_or_default(),
-                    output_top_logprobs_idx: seq
-                        .next_element::<Option<Vec<Vec<Vec<u32>>>>>()?
-                        .flatten()
-                        .unwrap_or_default(),
-                    reasoning_tokens: appended_column(seq)?,
-                    input_token_logprobs_val: appended_column(seq)?,
-                    input_token_logprobs_idx: appended_column(seq)?,
-                    input_top_logprobs_val: appended_column(seq)?,
-                    input_top_logprobs_idx: appended_column(seq)?,
-                };
-                drain_trailing(seq)?;
-                Ok(batch)
-            }
-        }
-    }
+    let batch = BatchTokenIDSlimOutput {
+        rids: next_field(seq, "rids")?,
+        output_ids: next_field(seq, "output_ids")?,
+        finished_reasons: next_field(seq, "finished_reasons")?,
+        finished_messages: next_field(seq, "finished_messages")?,
+        finished_matched: next_field(seq, "finished_matched")?,
+        prompt_tokens: next_field(seq, "prompt_tokens")?,
+        completion_tokens: next_field(seq, "completion_tokens")?,
+        cached_tokens: next_field(seq, "cached_tokens")?,
+        output_token_logprobs_val: next_field(seq, "output_token_logprobs_val")?,
+        output_token_logprobs_idx: next_field(seq, "output_token_logprobs_idx")?,
+        // The tail has msgspec defaults; a shorter array from an
+        // older plugin decodes as "rank 0, no snapshot".
+        engine_index: seq.next_element::<u32>()?.unwrap_or(0),
+        num_running: seq.next_element::<u64>()?.unwrap_or(0),
+        num_waiting: seq.next_element::<u64>()?.unwrap_or(0),
+        kv_used_tokens: seq.next_element::<u64>()?.unwrap_or(0),
+        kv_total_tokens: seq.next_element::<u64>()?.unwrap_or(0),
+        finished_status: seq
+            .next_element::<Option<Vec<Option<u16>>>>()?
+            .flatten()
+            .unwrap_or_default(),
+        output_top_logprobs_val: seq
+            .next_element::<Option<Vec<Vec<Vec<f64>>>>>()?
+            .flatten()
+            .unwrap_or_default(),
+        output_top_logprobs_idx: seq
+            .next_element::<Option<Vec<Vec<Vec<u32>>>>>()?
+            .flatten()
+            .unwrap_or_default(),
+        reasoning_tokens: appended_column(seq)?,
+        input_token_logprobs_val: appended_column(seq)?,
+        input_token_logprobs_idx: appended_column(seq)?,
+        input_top_logprobs_val: appended_column(seq)?,
+        input_top_logprobs_idx: appended_column(seq)?,
+    };
+    drain_trailing(seq)?;
+    Ok(batch)
 }
 
 /// One request's slice of a [`BatchTokenIDSlimOutput`].

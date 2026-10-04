@@ -304,17 +304,32 @@ class BatchEmbeddingSlimOutput(msgspec.Struct, tag=True, array_like=True):
             values.extend(default for _ in range(count - len(values)))
             return values
 
-        def vector(value) -> list[float]:
+        def vector(value) -> list[float] | None:
+            # SGLang types an embedding as a list, a bare float (a cross-encoder
+            # or single-label classifier) or a sparse dict (token id -> weight,
+            # `SGLANG_EMBEDDINGS_SPARSE_HEAD`); the wire carries a vector.
             if value is None:
                 return []
             if hasattr(value, "tolist"):
                 value = value.tolist()
+            if isinstance(value, (int, float)):
+                return [float(value)]
+            if isinstance(value, dict):
+                return None
             return [float(x) for x in value]
 
         reasons, messages, statuses = _finish_columns(column(out.finished_reasons, None))
+        embeddings = []
+        for i, value in enumerate(column(out.embeddings, None)):
+            vec = vector(value)
+            if vec is None:
+                vec = []
+                reasons[i], statuses[i] = "abort", None
+                messages[i] = "sparse embeddings are not carried on this wire"
+            embeddings.append(vec)
         return cls(
             rids=list(out.rids or []),
-            embeddings=[vector(v) for v in column(out.embeddings, None)],
+            embeddings=embeddings,
             prompt_tokens=column(out.prompt_tokens, 0),
             cached_tokens=column(out.cached_tokens, 0),
             finished_reasons=reasons,
@@ -576,6 +591,27 @@ class MsgpackSendSocket:
         )
 
     def send_output(self, output: Any, recv_obj: object | None = None) -> None:
+        """Relay one scheduler output. This runs on the scheduler's loop, so
+        it never raises: an output this side cannot convert ends its requests
+        with a terminal abort (SMG's streams must not hang) and is logged."""
+        try:
+            self._relay(output, recv_obj)
+        except Exception as exc:
+            rids = list(getattr(output, "rids", None) or [])
+            if not rids and getattr(output, "rid", None):
+                rids = [output.rid]
+            logger.exception(
+                "zmq msgpack: could not relay a %s for %s", type(output).__name__, rids
+            )
+            for rid in rids:
+                try:
+                    self.send_terminal_abort(
+                        rid, f"the scheduler's output could not be relayed: {exc}", status=None
+                    )
+                except Exception as nested:  # the socket is gone: nothing left to tell
+                    logger.warning("zmq msgpack: could not abort %s: %s", rid, nested)
+
+    def _relay(self, output: Any, recv_obj: object | None) -> None:
         from sglang.srt.managers.io_struct import (
             AbortReq,
             BatchEmbeddingOutput,

@@ -660,8 +660,6 @@ impl<P: EngineProtocol> Drop for Client<P> {
     }
 }
 
-/// This frontend is its engines' only client, so replies come back on vLLM's
-/// `client_index` 0 (the index an unscaled frontend uses).
 impl<P: EngineProtocol> Client<P> {
     /// Run `method(*args)` on one rank and return its result (vLLM's
     /// `AsyncMPClient._call_utility_async`; the SGLang plugin's control

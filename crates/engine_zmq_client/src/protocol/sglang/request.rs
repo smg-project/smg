@@ -17,8 +17,9 @@ use crate::protocol::{
 };
 
 /// The msgspec tag for [`TokenizedGenerateReqInput`] (element 0 on the wire).
-pub const TOKENIZED_EMBEDDING_REQ_INPUT_TAG: &str = "TokenizedEmbeddingReqInput";
 pub const TOKENIZED_GENERATE_REQ_INPUT_TAG: &str = "TokenizedGenerateReqInput";
+/// The msgspec tag for [`TokenizedEmbeddingReqInput`] (element 0 on the wire).
+pub const TOKENIZED_EMBEDDING_REQ_INPUT_TAG: &str = "TokenizedEmbeddingReqInput";
 
 /// Request types: a single raw byte sent as its own ZMQ frame ahead of the
 /// msgpack payload, so the plugin dispatches without decoding first.

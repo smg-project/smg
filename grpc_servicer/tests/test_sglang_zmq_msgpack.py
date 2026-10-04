@@ -483,3 +483,40 @@ def test_slim_output_appends_prompt_logprobs_and_reasoning_tokens():
             wire.ControlReplySlim(call_id=7, success=True, message=None, engine_index=1)
         ).hex(),
     )
+
+
+def test_sender_handles_scalar_and_sparse_embeddings_and_never_raises():
+    from sglang.srt.managers.io_struct import BatchEmbeddingOutput, BatchTokenIDOutput
+
+    sender = wire.MsgpackSendSocket()
+    sink = _Sink()
+    sender.attach(sink, 0, None)
+    unset = {name: None for name in BatchEmbeddingOutput.__struct_fields__}
+    sender.send_output(
+        BatchEmbeddingOutput(
+            **unset
+            | dict(
+                rids=["s1", "d1"],
+                finished_reasons=[{"type": "stop"}, {"type": "stop"}],
+                embeddings=[0.75, {3: 0.5, 9: 0.25}],
+                prompt_tokens=[2, 2],
+                cached_tokens=[0, 0],
+            )
+        )
+    )
+    (batch,) = sink.sent
+    # A bare float (cross-encoder, single label) is a one-element vector; a
+    # sparse dict has no slot on the wire and ends that request with an abort.
+    assert batch[2] == [[0.75], []]
+    assert batch[5] == ["stop", "abort"] and "sparse" in batch[6][1]
+
+    # A conversion failure on the scheduler's loop never raises: the batch's
+    # requests end with a terminal abort instead.
+    sink.sent.clear()
+    broken = BatchTokenIDOutput(
+        **{name: None for name in BatchTokenIDOutput.__struct_fields__} | dict(rids=["b1"])
+    )
+    sender.send_output(broken)
+    (abort,) = sink.sent
+    assert abort[0] == "BatchTokenIDSlimOutput" and abort[1] == ["b1"] and abort[3] == ["abort"]
+    assert "could not be relayed" in abort[4][0]
