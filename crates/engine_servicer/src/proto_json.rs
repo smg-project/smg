@@ -37,6 +37,14 @@ pub(crate) fn value_from_json(value: serde_json::Value) -> Value {
     Value { kind: Some(kind) }
 }
 
+/// Whether `json` parses as a JSON object (what the info RPCs can carry).
+pub(crate) fn is_json_object(json: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(json),
+        Ok(serde_json::Value::Object(_))
+    )
+}
+
 /// An integer as a proto number `Value`.
 pub(crate) fn number(value: i32) -> Value {
     Value {

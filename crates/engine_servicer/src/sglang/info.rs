@@ -90,19 +90,6 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
             number(max_running_requests(state)),
         );
     }
-    let version = Some(model.sglang_version.clone())
-        .filter(|version| !version.is_empty())
-        .or_else(|| {
-            ready.map(|ready| {
-                ready
-                    .vllm_version
-                    .strip_prefix("sglang-")
-                    .unwrap_or(&ready.vllm_version)
-                    .to_string()
-            })
-        })
-        .filter(|version| !version.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
     sg::GetServerInfoResponse {
         server_args: Some(struct_from_json(&model.server_args_json)),
         scheduler_info: Some(scheduler_info),
@@ -110,7 +97,7 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
         is_paused: false,
         last_receive_timestamp: 0.0,
         uptime_seconds: state.started.elapsed().as_secs_f64(),
-        sglang_version: version,
+        sglang_version: sglang_version(state),
         // The Router strips this label; the two implementations serve the
         // same contract and are not told apart by it.
         server_type: "grpc".to_string(),
@@ -174,7 +161,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsR
     };
     Ok(sg::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
-        version: state.model.sglang_version.clone(),
+        version: sglang_version(state),
         dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
         loads,
         aggregate: Some(sg::AggregateMetrics {
@@ -185,6 +172,29 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsR
             ..Default::default()
         }),
     })
+}
+
+/// The SGLang version to report: the launcher's, else the handshake's
+/// (`sglang-<version>` on the wire), else `unknown`.
+fn sglang_version(state: &State) -> String {
+    Some(state.model.sglang_version.clone())
+        .filter(|version| !version.is_empty())
+        .or_else(|| {
+            state
+                .engine
+                .client
+                .get()
+                .and_then(ZmqEngineClient::ready_response)
+                .map(|ready| {
+                    ready
+                        .vllm_version
+                        .strip_prefix("sglang-")
+                        .unwrap_or(&ready.vllm_version)
+                        .to_string()
+                })
+        })
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The KV capacity in tokens, from the handshake; 0 before the engines are up.

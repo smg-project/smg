@@ -293,7 +293,15 @@ pub(crate) fn translate_request_sglang(
         return Err("hidden states are not supported over the SGLang ZMQ backend".to_string());
     }
     // Slots past the emitted prefix stay at the scheduler's defaults; refuse
-    // rather than silently run on the base model or without the processor.
+    // rather than silently run on the base model, without the processor, or
+    // without the PD bootstrap the request asked for.
+    if req.disaggregated_params.is_some() {
+        return Err(
+            "PD disaggregation (disaggregated_params) is not supported over the SGLang ZMQ \
+             backend"
+                .to_string(),
+        );
+    }
     if !req.lora_id.is_empty() {
         return Err("LoRA adapters are not supported over the SGLang ZMQ backend yet".to_string());
     }
@@ -486,6 +494,11 @@ mod tests {
         .is_err());
         assert!(translate_request_sglang(sglang_proto::GenerateRequest {
             lora_id: "adapter".into(),
+            ..base.clone()
+        })
+        .is_err());
+        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+            disaggregated_params: Some(sglang_proto::DisaggregatedParams::default()),
             ..base.clone()
         })
         .is_err());

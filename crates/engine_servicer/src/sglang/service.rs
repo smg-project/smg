@@ -62,13 +62,22 @@ impl SglangScheduler for SglangService {
     ) -> Result<Response<sg::AbortResponse>, Status> {
         let request = request.into_inner();
         // The choices of an `n > 1` request live under the one registration,
-        // so aborting the parent id ends every choice.
-        self.state
+        // so aborting the parent id ends every choice. An unknown or finished
+        // id is reported as the Python servicer reports it.
+        let found = self
+            .state
             .registry
             .abort(std::slice::from_ref(&request.request_id))?;
-        Ok(Response::new(sg::AbortResponse {
-            success: true,
-            message: format!("aborted {}", request.request_id),
+        Ok(Response::new(if found > 0 {
+            sg::AbortResponse {
+                success: true,
+                message: format!("aborted {}", request.request_id),
+            }
+        } else {
+            sg::AbortResponse {
+                success: false,
+                message: format!("Request {} not found", request.request_id),
+            }
         }))
     }
 

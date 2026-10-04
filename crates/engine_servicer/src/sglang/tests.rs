@@ -230,6 +230,18 @@ fn config_is_validated_before_binding() {
         SglangServicerServer::start(no_model),
         Err(ServicerError::InvalidConfig(_))
     ));
+    // Launcher JSON the Router would read labels from must be an object.
+    let bad_args = SglangServicerConfig {
+        model: SglangModelInfo {
+            server_args_json: "NaN".to_string(),
+            ..model_info()
+        },
+        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
+    };
+    assert!(matches!(
+        SglangServicerServer::start(bad_args),
+        Err(ServicerError::InvalidConfig(message)) if message.contains("server_args_json")
+    ));
 }
 
 /// Health is NOT_SERVING until the scheduler handshakes, SERVING after, and
@@ -391,7 +403,7 @@ async fn string_stops_reach_the_scheduler_and_its_match_comes_back() {
 }
 
 /// `Abort` ends the stream with an `abort` Complete and tells the scheduler;
-/// an unknown id is a no-op.
+/// an unknown id is a no-op reported as not found.
 #[tokio::test]
 async fn abort_rpc_ends_the_stream_and_reaches_the_scheduler() {
     let mut h = harness(model_info()).await;
@@ -433,7 +445,8 @@ async fn abort_rpc_ends_the_stream_and_reaches_the_scheduler() {
         .await
         .unwrap()
         .into_inner();
-    assert!(unknown.success);
+    assert!(!unknown.success, "an unknown id is reported as not found");
+    assert!(unknown.message.contains("not found"));
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

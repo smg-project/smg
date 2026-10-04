@@ -30,8 +30,8 @@ use tonic_health::pb::health_server::HealthServer;
 use tracing::{info, warn};
 
 use crate::{
-    engine_link::EngineLink, health::HealthReporter, requests::RequestRegistry, ServerThread,
-    ServicerError, Shutdown,
+    engine_link::EngineLink, health::HealthReporter, proto_json, requests::RequestRegistry,
+    ServerThread, ServicerError, Shutdown,
 };
 
 /// The gRPC service name, as the health service reports it.
@@ -49,8 +49,8 @@ pub struct SglangModelInfo {
     pub is_generation: bool,
     pub model_type: String,
     pub architectures: Vec<String>,
-    /// The launcher's context length; the handshake's figure wins once the
-    /// scheduler is up (the Python servicer reports the scheduler's).
+    /// The launcher's context length (`ModelConfig.context_len`); the
+    /// handshake's `max_model_len` is the fallback when the launcher sent 0.
     pub max_context_length: i32,
     pub max_req_input_len: i32,
     pub vocab_size: i32,
@@ -182,6 +182,16 @@ impl SglangServicerServer {
         }
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
+        }
+        // The Router reads its labels off these; a text that is not a JSON
+        // object would silently become an empty Struct at GetServerInfo.
+        for (name, json) in [
+            ("server_args_json", &config.model.server_args_json),
+            ("scheduler_info_json", &config.model.scheduler_info_json),
+        ] {
+            if !json.trim().is_empty() && !proto_json::is_json_object(json) {
+                return Err(invalid(&format!("{name} must be a JSON object")));
+            }
         }
         let state = Arc::new(State {
             tokenizer_dir: config.tokenizer_dir.clone(),

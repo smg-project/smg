@@ -174,7 +174,9 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         sglang_version = ""
     dp_size = getattr(server_args, "dp_size", None)
     return {
-        "server_args_json": json.dumps(args_dict, sort_keys=True),
+        # allow_nan=False: a non-finite float would otherwise become `NaN` text,
+        # which the Rust side rejects as a whole object.
+        "server_args_json": json.dumps(args_dict, sort_keys=True, allow_nan=False),
         "scheduler_info_json": "{}",
         "sglang_version": str(sglang_version),
         "max_running_requests": int(getattr(server_args, "max_running_requests", None) or 0),
@@ -221,10 +223,28 @@ def tokenizer_dir_for(server_args: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def refuse_disaggregation(server_args: Any) -> None:
+    """PD/EPD stays with the Python servicer: the msgpack wire carries no
+    bootstrap fields and this path starts no bootstrap server, so such a
+    worker must not start rather than report SERVING and hang requests."""
+    mode = getattr(server_args, "disaggregation_mode", "null") or "null"
+    if mode != "null":
+        raise ValueError(
+            f"{SERVICER_IMPL_ENV}=rust does not support PD disaggregation "
+            f"(disaggregation_mode={mode!r}); unset it for this worker"
+        )
+    if getattr(server_args, "language_only", False) or getattr(server_args, "encoder_only", False):
+        raise ValueError(
+            f"{SERVICER_IMPL_ENV}=rust does not support EPD disaggregation "
+            "(language_only / encoder_only); unset it for this worker"
+        )
+
+
 async def serve_rust(server_args: Any) -> int:
     """Serve this process's gRPC contract from Rust: start the Rust server,
     launch the headless scheduler against its handshake, and supervise both
     until a signal or a failure. Returns the process exit code."""
+    refuse_disaggregation(server_args)
     from smg.servicer import SglangGrpcServer, init_servicer_tracing
 
     init_servicer_tracing(None)

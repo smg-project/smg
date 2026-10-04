@@ -121,6 +121,22 @@ def test_server_facts_carry_the_router_labels_and_the_window(monkeypatch):
     assert facts["scheduler_info_json"] == "{}"
 
 
+def test_disaggregated_workers_are_refused_up_front():
+    rust.refuse_disaggregation(_server_args())
+    rust.refuse_disaggregation(_server_args(disaggregation_mode="null"))
+    with pytest.raises(ValueError, match="PD disaggregation"):
+        rust.refuse_disaggregation(_server_args(disaggregation_mode="prefill"))
+    with pytest.raises(ValueError, match="EPD"):
+        rust.refuse_disaggregation(_server_args(language_only=True))
+    with pytest.raises(ValueError, match="PD disaggregation"):
+        asyncio.run(rust.serve_rust(_server_args(disaggregation_mode="decode")))
+
+
+def test_server_facts_refuse_non_finite_floats():
+    with pytest.raises(ValueError):
+        rust.server_facts(_server_args(mem_fraction_static=float("nan")))
+
+
 def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatch, tmp_path):
     created = {}
 

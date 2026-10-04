@@ -75,17 +75,21 @@ impl RequestRegistry {
 
     /// Fire the cancellation of every listed request that is still
     /// registered. Unknown ids are a no-op: cleanup is idempotent.
-    pub(crate) fn abort(&self, request_ids: &[String]) -> Result<(), Status> {
+    /// Fire the cancellation of every given id that is live; returns how many
+    /// were (an unknown or already-finished id is a no-op).
+    pub(crate) fn abort(&self, request_ids: &[String]) -> Result<usize, Status> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| Status::internal("request registry is poisoned"))?;
+        let mut found = 0;
         for request_id in request_ids {
             if let Some((_, cancel)) = entries.remove(request_id) {
                 let _ = cancel.send(());
+                found += 1;
             }
         }
-        Ok(())
+        Ok(found)
     }
 
     /// Fire every registered cancellation: shutdown ends the streams before
