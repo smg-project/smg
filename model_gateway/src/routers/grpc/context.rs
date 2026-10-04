@@ -33,7 +33,7 @@ use super::{
     multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
-        ProtoRequest, ProtoStream,
+        ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
     spec::ResponseSpec,
     utils::ParserResolver,
@@ -1249,10 +1249,17 @@ pub(crate) enum ExecutionResult {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
         /// Guards indexed by fan-out sample. Each starts as `Some` and is taken
-        /// when that sample completes; siblings retain their guards.
+        /// when that sample completes; siblings retain their guards. A leg
+        /// whose prefill already ran to completion in the execution stage
+        /// (sequential PD) carries `None` — there is no live guard to release.
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         /// PD timing context, for honest PD TTFT (prefill start to first decode token).
         pd_timing: PdTiming,
+        /// Input (prompt) logprobs harvested from the prefill `Complete` frame.
+        /// `Some` only for sequential PD, where the execution stage drains the
+        /// prefill stream before the streaming layer runs; parallel/fan-out PD
+        /// leaves this `None` and the streaming layer drains the stream itself.
+        prefill_input_logprobs: Option<ProtoInputLogProbs>,
     },
     /// Embedding requests return a single response, not a stream
     Embedding {

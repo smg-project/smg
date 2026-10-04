@@ -51,7 +51,8 @@ use crate::{
             },
             context,
             proto_wrapper::{
-                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoResponseVariant, ProtoStream,
+                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoInputLogProbs,
+                ProtoResponseVariant, ProtoStream,
             },
             spec::{
                 ChatResponseSpec, CompletionResponseSpec, GenerateResponseSpec,
@@ -260,6 +261,8 @@ impl StreamingProcessor {
                 decode,
                 prefill_guards,
                 pd_timing,
+                // Chat streaming does not emit prompt logprobs.
+                prefill_input_logprobs: _,
             } => {
                 let processor = self.clone();
                 let tokenizer_clone = tokenizer.clone();
@@ -1038,6 +1041,7 @@ impl StreamingProcessor {
                 decode,
                 prefill_guards,
                 pd_timing,
+                prefill_input_logprobs,
             } => {
                 // For PD mode, need to handle prefill stream for input_logprobs
                 let tokenizer = tokenizer.clone();
@@ -1053,6 +1057,7 @@ impl StreamingProcessor {
                         ctx,
                         &tx,
                         pd_timing,
+                        prefill_input_logprobs,
                         prefill_guards,
                         reservation,
                     )
@@ -1240,11 +1245,20 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &SseSender,
         pd_timing: context::PdTiming,
+        prefill_input_logprobs: Option<ProtoInputLogProbs>,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Drain prefill stream. Collect input_logprobs only when requested.
-        let mut input_token_logprobs = None;
+        // Sequential PD drained the stream in the execution stage, so its
+        // logprobs arrive via `prefill_input_logprobs` instead.
+        let mut input_token_logprobs = if ctx.return_logprob {
+            prefill_input_logprobs
+                .as_ref()
+                .map(utils::convert_generate_input_logprobs)
+        } else {
+            None
+        };
         drain_prefill(&mut prefill_stream, prefill_guards, true, |complete| {
             if ctx.return_logprob && input_token_logprobs.is_none() {
                 input_token_logprobs = complete

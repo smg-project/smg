@@ -470,6 +470,7 @@ async fn execute_fanout_pd(
             decode,
             prefill_guards: guards,
             pd_timing,
+            prefill_input_logprobs: _,
         } = result
         else {
             error!(
@@ -501,6 +502,9 @@ async fn execute_fanout_pd(
         decode: Box::new(ProtoStream::Fanout(FanoutStream::new(decodes))),
         prefill_guards,
         pd_timing,
+        // Fan-out children keep live prefill streams; the streaming layer
+        // drains them for input logprobs.
+        prefill_input_logprobs: None,
     })
 }
 
@@ -793,6 +797,8 @@ async fn execute_parallel_pd(
                     prefill_start,
                     runtime,
                 },
+                // The streaming layer drains the live prefill stream itself.
+                prefill_input_logprobs: None,
             })
         }
         PdDispatchOutcome::FailedFirst {
@@ -1196,10 +1202,11 @@ async fn execute_sequential_pd(
             )
         })?;
 
-    // Drain prefill response, harvesting connector params and the processed
-    // media identity from the Complete frame
+    // Drain prefill response, harvesting connector params, the processed
+    // media identity, and input logprobs from the Complete frame
     let mut prefill_kv_params: Option<String> = None;
     let mut prefill_media_identity: Option<vllm::MediaIdentity> = None;
+    let mut prefill_input_logprobs = None;
     while let Some(result) = prefill_stream.next().await {
         match result {
             Ok(response) => {
@@ -1209,6 +1216,9 @@ async fn execute_sequential_pd(
                     }
                     if let Some(identity) = complete.media_identity() {
                         prefill_media_identity = Some(identity.clone());
+                    }
+                    if let Some(logprobs) = complete.input_logprobs() {
+                        prefill_input_logprobs = Some(logprobs);
                     }
                 }
             }
@@ -1385,6 +1395,7 @@ async fn execute_sequential_pd(
             prefill_start,
             runtime,
         },
+        prefill_input_logprobs,
     })
 }
 

@@ -200,3 +200,41 @@ async fn collect_stream_responses(
 
     Ok(all_responses)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::routers::grpc::proto_wrapper::ProtoGenerateResponse;
+
+    /// A stream that is already at EOF, as sequential PD hands to the
+    /// streaming layer after draining prefill in the execution stage.
+    struct ExhaustedStream;
+
+    impl FanoutChild for ExhaustedStream {
+        async fn next_item(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+            None
+        }
+
+        fn mark_completed(&mut self) {}
+
+        fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_prefill_accepts_exhausted_stream_with_released_guard() {
+        // Sequential PD releases the prefill guard in the execution stage, so
+        // the streaming layer receives an exhausted stream with `vec![None]`.
+        let mut stream = ExhaustedStream;
+        let completions = AtomicUsize::new(0);
+        let result = drain_prefill(&mut stream, vec![None], true, |_complete| {
+            completions.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+    }
+}
