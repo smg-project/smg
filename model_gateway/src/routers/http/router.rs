@@ -1203,11 +1203,11 @@ impl Router {
             .await
     }
 
-    /// Relay a worker response to the client. A streaming response flows
-    /// through a bounded channel with the load guard attached to the body; a
-    /// buffered response is read capped at the ingress payload limit. With
-    /// `rechunk`, SSE delta payloads are re-sliced to the provider's
-    /// packet-size contract.
+    /// Relay a worker response to the client. A streaming response is relayed
+    /// by `RelayBody`, polled on the connection task, with the load guard
+    /// attached to the body; a buffered response is read capped at the ingress
+    /// payload limit. With `rechunk`, SSE delta payloads are re-sliced to the
+    /// provider's packet-size contract.
     async fn forward_worker_response(
         &self,
         res: reqwest::Response,

@@ -155,6 +155,12 @@ mod tests {
         Box::pin(stream::pending())
     }
 
+    /// A `reqwest::Error` built without touching the network: the URL fails to
+    /// parse, so the error comes straight from the request builder.
+    async fn upstream_error() -> reqwest::Error {
+        reqwest::get("not a url").await.unwrap_err()
+    }
+
     async fn collect(body: RelayBody) -> (Vec<Bytes>, Option<String>) {
         let mut body = Body::new(body);
         let mut frames = Vec::new();
@@ -221,13 +227,25 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_error_follows_the_tail() {
-        let err = reqwest::get("http://[::1]:1/").await.unwrap_err();
+        // Below the rechunker's emit threshold, so the text is still buffered
+        // when the upstream fails and only `finish()` releases it.
+        let event = br#"data: {"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}
+
+"#;
         let body = RelayBody::new(
-            upstream(vec![Ok(Bytes::from_static(b"data: x\n\n")), Err(err)]),
-            None,
+            upstream(vec![
+                Ok(Bytes::from_static(event)),
+                Err(upstream_error().await),
+            ]),
+            Some(SseRechunker::new()),
         );
         let (frames, error) = collect(body).await;
-        assert_eq!(frames, vec![Bytes::from_static(b"data: x\n\n")]);
+        assert_eq!(frames.len(), 1, "the buffered tail is flushed as one frame");
+        let text = String::from_utf8(frames[0].to_vec()).unwrap();
+        assert!(
+            text.contains(r#""content":"hi""#),
+            "tail before error: {text}"
+        );
         assert!(error.unwrap().contains("Stream error"));
     }
 }
