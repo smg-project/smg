@@ -1193,10 +1193,28 @@ impl TokenTree {
     /// advances are frozen at match time); only per-node access timestamps are
     /// approximate — a concurrently-split intermediate may miss a bump and evict
     /// slightly early.
+    #[inline]
     pub fn match_and_insert_with<'t, F>(&self, tokens: &[TokenId], select: F) -> PrefixMatchResult
     where
         F: FnOnce(&PrefixMatchResult) -> Option<&'t str>,
     {
+        // `select` runs exactly once; the Option carries the FnOnce through
+        // the FnMut interface of the non-generic walk below.
+        let mut select = Some(select);
+        self.match_and_insert_dyn(tokens, &mut |result| {
+            select.take().and_then(|select| select(result))
+        })
+    }
+
+    /// The whole fused descent, behind one indirect call. It is deliberately
+    /// not generic over the closure: a generic walk is monomorphized into
+    /// every calling crate and compiled at that crate's optimization level,
+    /// whereas this body is compiled once, here, at this crate's.
+    fn match_and_insert_dyn<'t>(
+        &self,
+        tokens: &[TokenId],
+        select: &mut dyn FnMut(&PrefixMatchResult) -> Option<&'t str>,
+    ) -> PrefixMatchResult {
         let page_size = self.page_size;
         let input_token_count = tokens.len();
 

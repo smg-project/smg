@@ -804,10 +804,28 @@ impl Tree {
     /// compared once. The match runs fully before any insert mutation, so the
     /// tenant pick observes the un-polluted tree; only insert's timestamps shift
     /// by a few ticks, immaterial to LRU.
+    #[inline]
     pub fn match_and_insert_with<'t, F>(&self, text: &str, select: F) -> PrefixMatchResult
     where
         F: FnOnce(&PrefixMatchResult) -> Option<&'t str>,
     {
+        // `select` runs exactly once; the Option carries the FnOnce through
+        // the FnMut interface of the non-generic walk below.
+        let mut select = Some(select);
+        self.match_and_insert_dyn(text, &mut |result| {
+            select.take().and_then(|select| select(result))
+        })
+    }
+
+    /// The whole fused descent, behind one indirect call. It is deliberately
+    /// not generic over the closure: a generic walk is monomorphized into
+    /// every calling crate and compiled at that crate's optimization level,
+    /// whereas this body is compiled once, here, at this crate's.
+    fn match_and_insert_dyn<'t>(
+        &self,
+        text: &str,
+        select: &mut dyn FnMut(&PrefixMatchResult) -> Option<&'t str>,
+    ) -> PrefixMatchResult {
         // ---- Phase 1: MATCH descent (mirrors match_prefix_with_counts) ----
         // Record the full-match nodes (for ancestor re-attach) and the fall-off
         // point (node + remaining slice) for the suffix splice. No mutation here
