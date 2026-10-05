@@ -6,13 +6,23 @@
 //! format SMG serves today can be replayed through Symphony before any format is ported, and so
 //! the gateway can switch to [`Parser`] without waiting for the ports.
 //!
-//! The pair gives this bridge less than Symphony promises, and the tracker records both limits as
-//! compromises to remove with the old crates:
+//! The pair gives this bridge less than Symphony promises. The tracker records every item below
+//! as a compromise to remove with the old crates:
 //!
-//! - neither old trait sees token ids, so every `Text::tokens` is `None` and
+//! - neither old trait sees token ids, so every text run is `Text::uncounted` and
 //!   `Event::Finish::reasoning_tokens` is zero for want of a count;
 //! - neither reports the bytes a tool call was written as, so the `source` of tool-call events is
-//!   empty and the conservation property cannot be checked through this bridge.
+//!   empty and the conservation property cannot be checked through this bridge;
+//! - the markers the old reasoning parser consumes (`<think>` and its closer) produce no `Dropped`
+//!   events, for the same reason;
+//! - the old tool trait has no end-of-call signal, so `ToolCallEnd` is emitted for every call only
+//!   when the stream ends;
+//! - the old crates mint no call ids, so ids are `call_{index}`.
+//!
+//! The old parsers take nothing from the prompt. `Input::Prompt` is accepted first in the
+//! lifecycle and otherwise ignored; whether the model starts inside its reasoning block is decided
+//! at construction with [`Combined::starting_in_reasoning`], the way the gateway decides it before
+//! the first chunk arrives.
 //!
 //! One deliberate difference from the gateway: the gateway skips the tool parser for text produced
 //! in a chunk that ends inside reasoning. This bridge sends all content to the tool parser, because
@@ -24,7 +34,7 @@ use reasoning_parser::ReasoningParser;
 use tool_parser::{types::ToolCallItem, ToolParser};
 
 use crate::{
-    event::{Event, Events, FinishReason, Text},
+    event::{Event, Events, FinishReason, MalformedReason, Text},
     input::{EngineFinish, Input},
     parser::{ParseError, Parser},
 };
@@ -34,9 +44,14 @@ pub struct Combined {
     reasoning: Option<Box<dyn ReasoningParser>>,
     tool: Option<Box<dyn ToolParser>>,
     tools: Vec<Tool>,
-    starts_in_reasoning: bool,
     reasoning_open: bool,
     calls_started: Vec<u32>,
+    /// Argument fragments that arrived for a call before its name did, kept until the name
+    /// arrives so that a call always starts before its arguments.
+    arguments_before_name: Vec<(u32, String)>,
+    /// The error that stopped parsing, if one did. After it, only `End` is accepted, and what the
+    /// old parsers still hold is returned as `Malformed` text.
+    failure: Option<String>,
     stage: Stage,
 }
 
@@ -70,9 +85,10 @@ impl Combined {
             reasoning,
             tool,
             tools,
-            starts_in_reasoning: false,
             reasoning_open: false,
             calls_started: Vec::new(),
+            arguments_before_name: Vec::new(),
+            failure: None,
             stage: Stage::Fresh,
         }
     }
@@ -105,9 +121,11 @@ impl Combined {
     }
 
     /// Tell the reasoning parser that the prompt already opened the reasoning block, the way the
-    /// gateway does when the rendered prompt ends inside it. Takes effect when the prompt is fed.
+    /// gateway does when the rendered prompt ends inside it.
     pub fn starting_in_reasoning(mut self) -> Self {
-        self.starts_in_reasoning = true;
+        if let Some(reasoning) = self.reasoning.as_mut() {
+            reasoning.mark_reasoning_started();
+        }
         self
     }
 
@@ -116,9 +134,10 @@ impl Combined {
         let Some(reasoning) = self.reasoning.as_mut() else {
             return Ok(text.to_string());
         };
-        let split = reasoning
-            .parse_reasoning_streaming_incremental(text)
-            .map_err(|e| ParseError::Internal(e.to_string()))?;
+        let split = match reasoning.parse_reasoning_streaming_incremental(text) {
+            Ok(split) => split,
+            Err(e) => return Err(self.fail(e.to_string())),
+        };
         let still_open = reasoning.is_in_reasoning();
         self.emit_reasoning(&split.reasoning_text, still_open, out);
         Ok(split.normal_text)
@@ -147,13 +166,20 @@ impl Combined {
             out.push_content(Text::uncounted(content));
             return Ok(());
         };
-        let found = block_on(tool.parse_incremental(content, &self.tools))
-            .map_err(|e| ParseError::Internal(e.to_string()))?;
+        // The old trait is async, but its parsers only await their own parse calls and never a
+        // timer, a socket or a lock, so running the future to completion here cannot block.
+        let found = match block_on(tool.parse_incremental(content, &self.tools)) {
+            Ok(found) => found,
+            Err(e) => return Err(self.fail(e.to_string())),
+        };
         out.push_content(Text::uncounted(found.normal_text));
         self.emit_calls(found.calls, out);
         Ok(())
     }
 
+    /// The old trait announces a call's name before or together with its first arguments. Should
+    /// arguments ever arrive first, they wait here until the name does, so a call always starts
+    /// before its arguments.
     fn emit_calls(&mut self, items: Vec<ToolCallItem>, out: &mut Events) {
         for item in items {
             let index = item.tool_index as u32;
@@ -166,19 +192,70 @@ impl Combined {
                         name,
                         source: Text::default(),
                     });
+                    let waiting: Vec<String> = self
+                        .arguments_before_name
+                        .iter()
+                        .filter(|(i, _)| *i == index)
+                        .map(|(_, json)| json.clone())
+                        .collect();
+                    self.arguments_before_name.retain(|(i, _)| *i != index);
+                    for json in waiting {
+                        out.push(Event::ToolCallArguments {
+                            index,
+                            json,
+                            source: Text::default(),
+                        });
+                    }
                 }
             }
-            if !item.parameters.is_empty() {
+            if item.parameters.is_empty() {
+                continue;
+            }
+            if self.calls_started.contains(&index) {
                 out.push(Event::ToolCallArguments {
                     index,
                     json: item.parameters,
                     source: Text::default(),
                 });
+            } else {
+                self.arguments_before_name.push((index, item.parameters));
             }
         }
     }
 
+    /// Remember why parsing stopped and report it.
+    fn fail(&mut self, message: String) -> ParseError {
+        self.failure = Some(message.clone());
+        ParseError::Internal(message)
+    }
+
+    /// Collect what the old parsers still hold without parsing it further.
+    fn recover_held_text(&mut self) -> String {
+        let mut held = String::new();
+        if let Some(reasoning) = self.reasoning.as_mut() {
+            if let Ok(split) = reasoning.flush() {
+                held.push_str(&split.reasoning_text);
+                held.push_str(&split.normal_text);
+            }
+        }
+        if let Some(tool) = self.tool.as_mut() {
+            held.push_str(&tool.take_unstreamed_normal_text());
+        }
+        held
+    }
+
     fn finish(&mut self, finish: EngineFinish, out: &mut Events) -> Result<(), ParseError> {
+        if let Some(message) = self.failure.clone() {
+            let held = self.recover_held_text();
+            if !held.is_empty() {
+                out.push(Event::Malformed {
+                    text: Text::uncounted(held),
+                    why: MalformedReason::Other(message),
+                });
+            }
+            self.close(finish, out);
+            return Ok(());
+        }
         if let Some(reasoning) = self.reasoning.as_mut() {
             let held = reasoning
                 .flush()
@@ -193,6 +270,12 @@ impl Combined {
                 self.emit_calls(items, out);
             }
         }
+        self.close(finish, out);
+        Ok(())
+    }
+
+    /// Close whatever is open and report the finish; shared by the normal and the failed path.
+    fn close(&mut self, finish: EngineFinish, out: &mut Events) {
         if self.reasoning_open {
             out.push(Event::ReasoningEnd);
             self.reasoning_open = false;
@@ -216,7 +299,6 @@ impl Combined {
             tool_calls,
             reasoning_tokens: 0,
         });
-        Ok(())
     }
 }
 
@@ -228,11 +310,6 @@ impl Parser for Combined {
                     return Err(ParseError::Lifecycle(
                         "prompt after output began".to_string(),
                     ));
-                }
-                if self.starts_in_reasoning {
-                    if let Some(reasoning) = self.reasoning.as_mut() {
-                        reasoning.mark_reasoning_started();
-                    }
                 }
                 self.stage = Stage::Streaming;
                 Ok(())
@@ -259,7 +336,6 @@ impl Parser for Combined {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::TokenSpan;
 
     fn weather_tool() -> Tool {
         serde_json::from_value(serde_json::json!({
@@ -273,7 +349,7 @@ mod tests {
         .expect("a valid tool definition")
     }
 
-    fn delta<'a>(text: &'a str) -> Input<'a> {
+    fn delta(text: &str) -> Input<'_> {
         Input::Delta {
             token_ids: &[],
             text,
@@ -482,8 +558,6 @@ mod tests {
             ),
             Err(ParseError::Lifecycle(_))
         ));
-        let spans: [TokenSpan; 0] = [];
-        assert!(TokenSpan::partitions("", &spans));
     }
 
     #[test]
