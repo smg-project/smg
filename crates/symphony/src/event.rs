@@ -134,6 +134,10 @@ pub enum Event {
 /// A parser pushes what it has as soon as it has it; two consecutive `Content` events become one,
 /// and so do two consecutive `Reasoning` events. Nothing else is merged, and a text event with no
 /// text and no tokens is not recorded.
+///
+/// Merging only ever touches events the caller has not taken yet. The caller takes events with
+/// [`Events::drain`] after each `feed`; what it took is final, and the next push starts a new
+/// event even when it is text of the same kind.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Events {
     items: Vec<Event>,
@@ -197,6 +201,12 @@ impl Events {
         out
     }
 
+    /// Take every event recorded so far, leaving the list empty. What is taken is final: later
+    /// pushes never merge into it.
+    pub fn drain(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.items)
+    }
+
     /// Consume the list.
     pub fn into_vec(self) -> Vec<Event> {
         self.items
@@ -249,6 +259,17 @@ mod tests {
                 Event::Reasoning(Text::new("late", 1)),
             ]
         );
+    }
+
+    #[test]
+    fn drained_events_are_final_and_later_text_starts_a_new_event() {
+        let mut events = Events::new();
+        events.push_content("Hel", 1);
+        let taken = events.drain();
+        assert_eq!(taken, vec![Event::Content(Text::new("Hel", 1))]);
+        assert!(events.is_empty());
+        events.push_content("lo", 1);
+        assert_eq!(events.as_slice(), &[Event::Content(Text::new("lo", 1))]);
     }
 
     #[test]
