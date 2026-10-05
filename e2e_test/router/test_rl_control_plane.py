@@ -146,10 +146,14 @@ class TestRlControlPlaneTokenSpeed(RlControlPlaneBehavior):
         assert resp.status_code == 200, resp.text
         assert "weight_version" in resp.json()["body"]
 
-    def test_discovery_advertises_distributed_refits_only(self, setup_backend):
+    def test_discovery_advertises_no_disk_or_tensor_refits(self, setup_backend):
         _backend, _model, _client, gateway = setup_backend
         w = self._workers(gateway)["workers"][0]
-        assert w["capabilities"]["update_from"] == ["distributed"]
+        # The engine lists the loads its scheduler implements (distributed, plus
+        # mooncake on newer builds); disk and tensor never appear.
+        update_from = w["capabilities"]["update_from"]
+        assert "distributed" in update_from
+        assert not {"disk", "tensor"} & set(update_from)
         assert w["capabilities"]["source"] == "label"
 
     def test_disk_refit_is_refused_per_worker_and_the_engine_keeps_serving(self, setup_backend):
