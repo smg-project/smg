@@ -9,6 +9,11 @@ including bytes that were dropped or could not be parsed.
 Status: skeleton. The public types are the contract; the engine, the format definitions and the
 protocol adapters follow.
 
+Why the crate has a name: the community has spent years on many parser implementations, and none
+of them is right the way we want it, SMG's own two crates included. Not right as working code;
+right as a made thing. This crate is the attempt to write the one that is. Code here is a craft,
+and "this can be better" is always a good enough reason for a change.
+
 Rules this crate works under:
 
 - It changes nothing outside `crates/symphony/`. It depends on other crates but never edits them;

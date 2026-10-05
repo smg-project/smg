@@ -13,6 +13,9 @@
 //! in. The design and the delivery plan live with the maintainers; the short version is in this
 //! crate's `README.md`.
 //!
+//! The standard this crate is held to is craftsmanship: code that reads as well as it runs, with no
+//! compromise kept for convenience. A change whose only reason is "this can be better" is welcome.
+//!
 //! Status: skeleton. The public types below are the contract; the engine, the format definitions
 //! and the protocol adapters follow in later changes.
 
