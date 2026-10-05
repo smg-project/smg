@@ -30,9 +30,10 @@
 //!
 //! Item statuses follow: `in_progress` while the response has not finished or when the engine
 //! failed, `completed` otherwise, except that a call whose argument fragments never became a whole
-//! JSON value is `incomplete`. The old path checked that only after `length`; here the status
-//! describes the call, whatever stopped the output. A call the model closed without arguments has
-//! empty arguments and is complete.
+//! JSON value is `incomplete`. Two of these differ from the old path, which called the reasoning
+//! item `completed` whatever the response's state (here it follows the message) and marked a call
+//! `incomplete` only after `length` (here the status describes the call, whatever stopped the
+//! output). A call the model closed without arguments has empty arguments and is complete.
 //!
 //! Policy this adapter sets, where the events say more than the Responses API can:
 //!
