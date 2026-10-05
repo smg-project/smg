@@ -69,7 +69,8 @@ impl Assembler {
         }
     }
 
-    /// Whether the object has closed; `feed` takes nothing after that, so the format stops here.
+    /// Whether the object has closed, as a call or as an object that named none; `feed` takes
+    /// nothing after that, so the format stops here.
     pub fn done(&self) -> bool {
         self.done
     }
@@ -94,6 +95,14 @@ impl Assembler {
         };
         if !self.started {
             let Some(name) = found.name.clone() else {
+                if let Some(close) = found.close {
+                    // Closed without a name: not a call. Said now, so `done` is true at the close.
+                    out.push(Event::Malformed {
+                        text: Text::uncounted(&self.text[..close]),
+                        why: MalformedReason::Other("a tool call without a name".to_string()),
+                    });
+                    self.done = true;
+                }
                 return taken;
             };
             let head_end = match (&found.arguments, found.close) {
@@ -387,13 +396,19 @@ mod tests {
 
     #[test]
     fn an_object_that_never_names_its_call_comes_back_malformed() {
+        let mut assembler = Assembler::new(0, "call_0");
+        let mut out = Events::new();
+        assert_eq!(assembler.feed(r#"{"foo": 1}  more"#, &mut out), 10);
+        assert!(assembler.done(), "closed, as an object that named no call");
         assert_eq!(
-            run(&[r#"{"foo": 1}"#]),
+            out.drain(),
             vec![Event::Malformed {
                 text: Text::uncounted(r#"{"foo": 1}"#),
                 why: MalformedReason::Other("a tool call without a name".into()),
             }]
         );
+        assembler.finish(&mut out);
+        assert!(out.is_empty(), "nothing more to say at the end");
         assert_eq!(
             run(&[r#"{"arguments": {"a"#]),
             vec![Event::Malformed {
@@ -402,6 +417,27 @@ mod tests {
             }]
         );
         assert_eq!(run(&[]), vec![], "nothing fed, nothing said");
+    }
+
+    #[test]
+    fn a_surrogate_pair_escape_in_the_arguments_streams_as_written() {
+        let text = r#"{"name": "f", "arguments": {"e": "\ud83c\udf0d", "f": 1}}"#;
+        let whole = run(&[text]);
+        assert_eq!(arguments(&whole), r#"{"e": "\ud83c\udf0d", "f": 1}"#);
+        assert!(
+            !whole.iter().any(|e| matches!(e, Event::Malformed { .. })),
+            "valid JSON, nothing malformed"
+        );
+        let pieces: Vec<&str> = text
+            .char_indices()
+            .map(|(i, c)| &text[i..i + c.len_utf8()])
+            .collect();
+        let bytewise = run(&pieces);
+        assert_eq!(arguments(&bytewise), arguments(&whole));
+        assert!(!bytewise
+            .iter()
+            .any(|e| matches!(e, Event::Malformed { .. })));
+        assert_eq!(sources(&bytewise), text);
     }
 
     #[test]
