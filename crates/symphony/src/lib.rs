@@ -26,8 +26,10 @@ pub mod adapt;
 pub mod event;
 pub mod input;
 pub mod json;
+pub mod markers;
 pub mod parser;
 
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
 pub use input::{EngineFinish, Input, TokenSpan};
+pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};
