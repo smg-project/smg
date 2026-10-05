@@ -3,8 +3,11 @@
 # checkpoint/sampling. Track B of docs/proposals/2026-06-10-bfcl-nightly-parser-
 # verification.md. Informational/non-blocking — never a merge gate.
 #
-# Runs nightly over non_live + live + multi_turn (static, reproducible; excludes
-# the agentic/executable categories that need web-search/memory/sandbox infra).
+# Runs weekly (Mondays 07:17 UTC) over non_live + live + multi_turn (static,
+# reproducible; excludes the agentic/executable categories that need
+# web-search/memory/sandbox infra). The Blackwell legs are skipped on the schedule
+# while the `blackwell` runner is offline (no job since 2026-09-18); a dispatch
+# still runs them.
 # On PRs that touch this pipeline it runs a quick non-live sanity subset for
 # merge confidence. The A/B mechanics were validated manually on an H100 box
 # (see scripts/bfcl/README.md "Validation status").
@@ -12,7 +15,7 @@ name: Nightly BFCL
 
 on:
   schedule:
-    - cron: "17 7 * * 1,3,5" # Mon/Wed/Fri 07:17 UTC = 00:17 PDT — alternates nights with nightly-tau2 so the two ~7h runs don't queue back-to-back on the shared Blackwell runner
+    - cron: "17 7 * * 1" # Mondays 07:17 UTC = 00:17 PDT; nightly-tau2 takes Thursdays so the two never share the 4-gpu-h100 pool
   # PR sanity: only when the BFCL pipeline itself changes. Runs a quick non-live
   # subset so the A/B is exercised end-to-end (engine, FC mode, parser, scoring)
   # before merge — confidence the pipeline works, not a statistical result.
@@ -23,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|kimi-k2.6|glm-5.3-flash); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash); empty = all"
         required: false
         default: ""
       model:
@@ -114,6 +117,7 @@ jobs:
       - id: build
         env:
           ONLY: ${{ github.event.inputs.only }}
+          EVENT_NAME: ${{ github.event_name }}
           MODEL_OVERRIDE: ${{ github.event.inputs.model }}
           BFCL_OVERRIDE: ${{ github.event.inputs.bfcl_model }}
         run: |
@@ -207,17 +211,6 @@ jobs:
                # Per-arm cap carried over from the M2.7 leg.
                "run_timeout": "14400",
                "model_cache": "/raid/models", "arm_mode": "concurrent", "max_model_len": "auto"},
-              # Kimi-K2.6 int4 (~500GB) fits TP=4 half-node.
-              {"name": "kimi-k2.6", "runner": "blackwell", "tp": 4,
-               "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
-               "model": "moonshotai/Kimi-K2.6", "bfcl_model": "moonshotai/Kimi-K2.6-FC",
-               "vllm_tool": "kimi_k2", "vllm_reason": "kimi_k2",
-               "smg_tool": "kimik2",
-               "smg_reason": "kimi_thinking",  # K2.6 template prefills <think> (always-in-reasoning); kimi_k25 (always_in_reasoning=false) mis-splits reasoning -> SMG scored 0
-               # Generous startup: 1T MoE at TP=4 needs minutes for load+compile+quant (420s timed out).
-               "vllm_extra": "--trust-remote-code", "gpu_mem": "0.90", "startup_timeout": "2400",
-               "run_timeout": "14400",
-               "model_cache": "/raid/models", "arm_mode": "concurrent", "max_model_len": "auto"},
               # GLM-5.3-Flash: 321B/18B-active native-FP8 multimodal MoE (~306GiB, KDA +
               # NoPE sparse MLA). Fits a TP=4 half-node, so unlike GLM-5.2-FP8 (~744GB,
               # whole node) it runs concurrent like the other Blackwell legs. vLLM recipe
@@ -250,6 +243,14 @@ jobs:
           # below are a tiny non-live subset for every leg.
           if only and not legs:
               raise SystemExit(f"unknown leg {only!r}; valid: {valid_names}")
+          # Scheduled runs take the H100 legs only: the `blackwell` runner has served
+          # no job since 2026-09-18, and a leg queued against an offline label sits in
+          # GitHub's queue for its 24h maximum and is cancelled, which marks the whole
+          # run cancelled and trips the node-health "queued over 24h" alert. A
+          # dispatch (with or without `only`) still runs every leg, so the Blackwell
+          # legs stay one click away once the runner is back.
+          if os.environ.get("EVENT_NAME") == "schedule":
+              legs = [l for l in legs if l["runner"] != "blackwell"]
           print("matrix=" + json.dumps({"include": legs}))
           PY
 
@@ -311,7 +312,8 @@ jobs:
         run: |
           pip uninstall -y smg || true
           pip install wheel/*.whl
-          pip install "bfcl-eval" soundfile ninja
+          # bfcl-eval is pinned to the release the green runs used; bump it deliberately.
+          pip install "bfcl-eval==2026.3.23" soundfile ninja
       - name: Register model in bfcl (no-op if bfcl already ships a handler)
         run: python scripts/bfcl/register_bfcl_model.py --model-id "$MODEL" || true
       - name: Stage model weights
