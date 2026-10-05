@@ -16,11 +16,13 @@
 //! The standard this crate is held to is craftsmanship: code that reads as well as it runs, with no
 //! compromise kept for convenience. A change whose only reason is "this can be better" is welcome.
 //!
-//! Status: skeleton. The public types below are the contract; the engine, the format definitions
-//! and the protocol adapters follow in later changes.
+//! Status: skeleton plus [`compat::Combined`], which drives the two existing parser crates as one
+//! Symphony parser so every format SMG serves today can be replayed through this interface before
+//! any format is ported. The engine, the format definitions and the protocol adapters follow.
 
 #![forbid(unsafe_code)]
 
+pub mod compat;
 pub mod event;
 pub mod input;
 pub mod parser;

@@ -7884,9 +7884,13 @@ dependencies = [
 name = "smg-symphony"
 version = "0.0.1"
 dependencies = [
+ "futures",
+ "openai-protocol",
+ "reasoning-parser",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tool-parser",
 ]
 
 [[package]]
