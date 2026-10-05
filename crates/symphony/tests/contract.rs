@@ -2,14 +2,20 @@
 //! chunking them.
 //!
 //! Four properties hold today and are checked here for the Qwen3 format: conservation (every byte
-//! of the output lands in exactly one event, in order); chunking invariance (what the parser says
-//! about an output does not depend on how the output was cut into deltas); prefix stability (what
-//! the parser has said so far is never taken back: content, reasoning, dropped and malformed text
-//! only grow, the calls so far are a prefix of the final calls, and a call's arguments so far are a
-//! prefix of its final arguments); and order (calls are numbered from zero in the order they start,
-//! with ids that follow the index). The fifth property of the design, token identity, comes with
-//! token attribution. Each new format adds its outputs to the corpus below.
+//! of the output lands in exactly one event, in order, with `Finish` last); chunking invariance
+//! (what the parser says about an output does not depend on how the output was cut into deltas);
+//! well-formedness of the event stream (arguments and an end only for a call that has started and
+//! not ended, one start per index, reasoning text only inside an open reasoning region, exactly one
+//! `Finish`); and order (calls are numbered from zero as they start, with ids that follow the
+//! index, every started call ended once, the finish counting them). The design's "committed stays
+//! committed" is not a separate check: `Events` is append-only and conservation forbids saying a
+//! byte twice, so nothing a parser pushed can be taken back through the event list; what a client
+//! relies on beyond that is the well-formedness checked here. The fifth property, token identity,
+//! comes with token attribution. Each new format adds its outputs to the corpus below.
 
+mod common;
+
+use common::chunkings;
 use symphony::{EngineFinish, Event, Events, Input, ParseError, Parser, Qwen3};
 
 const OUTPUTS: &[&str] = &[
@@ -72,23 +78,6 @@ impl Said {
         }
         said
     }
-
-    /// Whether `self` is what `later` said at an earlier point: nothing taken back since.
-    fn is_prefix_of(&self, later: &Self) -> bool {
-        later.content.starts_with(&self.content)
-            && later.reasoning.starts_with(&self.reasoning)
-            && later.dropped.starts_with(&self.dropped)
-            && later.malformed.starts_with(&self.malformed)
-            && later.calls.starts_with(&self.calls)
-            && self.arguments.iter().all(|(index, so_far)| {
-                later
-                    .arguments
-                    .iter()
-                    .any(|(i, final_args)| i == index && final_args.starts_with(so_far))
-            })
-            && later.ended.starts_with(&self.ended)
-            && (!self.finished || later.finished)
-    }
 }
 
 fn bytes_of(event: &Event) -> &str {
@@ -102,36 +91,10 @@ fn bytes_of(event: &Event) -> &str {
     }
 }
 
-/// The cut offsets to replay `text` with: whole, every two-way split, byte by byte, and thirty seeded
-/// plans of one to eight characters; every cut on a character boundary.
-fn chunkings(text: &str) -> Vec<Vec<usize>> {
-    let chars: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-    let mut plans = vec![vec![]];
-    plans.extend(chars.iter().skip(1).map(|&cut| vec![cut]));
-    plans.push(chars.iter().skip(1).copied().collect());
-    for seed in 1..=30u64 {
-        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let mut cuts = Vec::new();
-        let mut at = 0;
-        while at < chars.len() {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            at += 1 + (state >> 33) as usize % 8;
-            if at < chars.len() {
-                cuts.push(chars[at]);
-            }
-        }
-        plans.push(cuts);
-    }
-    plans
-}
-
-/// Replay `text` cut at `cuts`: the final events, and what was said after each delta.
-fn replay(text: &str, cuts: &[usize]) -> Result<(Vec<Event>, Vec<Said>), ParseError> {
+/// Replay `text` cut at `cuts` and return the events.
+fn replay(text: &str, cuts: &[usize]) -> Result<Vec<Event>, ParseError> {
     let mut parser = Qwen3::new();
     let mut out = Events::new();
-    let mut said_after_each = Vec::new();
     let mut from = 0;
     for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
         if cut > from {
@@ -143,7 +106,6 @@ fn replay(text: &str, cuts: &[usize]) -> Result<(Vec<Event>, Vec<Said>), ParseEr
                 },
                 &mut out,
             )?;
-            said_after_each.push(Said::of(out.as_slice()));
             from = cut;
         }
     }
@@ -153,14 +115,66 @@ fn replay(text: &str, cuts: &[usize]) -> Result<(Vec<Event>, Vec<Said>), ParseEr
         },
         &mut out,
     )?;
-    Ok((out.drain(), said_after_each))
+    Ok(out.drain())
+}
+
+/// What a client relies on in the shape of the stream, checked event by event.
+fn check_well_formed(text: &str, cuts: &[usize], events: &[Event]) {
+    let mut started: Vec<u32> = Vec::new();
+    let mut ended: Vec<u32> = Vec::new();
+    let mut reasoning_open = false;
+    let mut finished = false;
+    for (at, event) in events.iter().enumerate() {
+        let place = || format!("{text:?} cut at {cuts:?}, event {at}: {event:?}");
+        assert!(!finished, "{}: after Finish", place());
+        match event {
+            Event::ToolCallStart { index, .. } => {
+                assert!(!started.contains(index), "{}: a second start", place());
+                started.push(*index);
+            }
+            Event::ToolCallArguments { index, .. } | Event::ToolCallEnd { index, .. } => {
+                assert!(
+                    started.contains(index),
+                    "{}: before the call's start",
+                    place()
+                );
+                assert!(!ended.contains(index), "{}: after the call's end", place());
+                if let Event::ToolCallEnd { .. } = event {
+                    ended.push(*index);
+                }
+            }
+            Event::ReasoningStart => {
+                assert!(!reasoning_open, "{}: reasoning already open", place());
+                reasoning_open = true;
+            }
+            Event::Reasoning(_) => {
+                assert!(reasoning_open, "{}: reasoning outside a region", place());
+            }
+            Event::ReasoningEnd => {
+                assert!(reasoning_open, "{}: no reasoning open", place());
+                reasoning_open = false;
+            }
+            Event::Finish { .. } => finished = true,
+            Event::Content(_) | Event::Dropped { .. } | Event::Malformed { .. } => {}
+        }
+    }
+    assert!(finished, "{text:?} cut at {cuts:?}: no Finish");
+    assert!(
+        !reasoning_open,
+        "{text:?} cut at {cuts:?}: reasoning left open"
+    );
+    assert_eq!(
+        started.len(),
+        ended.len(),
+        "{text:?} cut at {cuts:?}: a call without an end"
+    );
 }
 
 #[test]
 fn every_byte_of_every_output_lands_in_exactly_one_event_in_order() {
     for text in OUTPUTS {
         for cuts in chunkings(text) {
-            let (events, _) = replay(text, &cuts).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            let events = replay(text, &cuts).unwrap_or_else(|e| panic!("{text:?}: {e}"));
             let conserved: String = events.iter().map(bytes_of).collect();
             assert_eq!(conserved, *text, "cuts {cuts:?}");
             assert!(
@@ -174,43 +188,30 @@ fn every_byte_of_every_output_lands_in_exactly_one_event_in_order() {
 #[test]
 fn what_the_parser_says_does_not_depend_on_the_chunking() {
     for text in OUTPUTS {
-        let (whole, _) = replay(text, &[]).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+        let whole = replay(text, &[]).unwrap_or_else(|e| panic!("{text:?}: {e}"));
         let expected = Said::of(&whole);
         for cuts in chunkings(text) {
-            let (events, _) = replay(text, &cuts).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            let events = replay(text, &cuts).unwrap_or_else(|e| panic!("{text:?}: {e}"));
             assert_eq!(Said::of(&events), expected, "{text:?} cut at {cuts:?}");
         }
     }
 }
 
 #[test]
-fn nothing_said_is_ever_taken_back() {
+fn the_event_stream_is_well_formed_under_every_chunking() {
     for text in OUTPUTS {
         for cuts in chunkings(text) {
-            let (events, said_after_each) =
-                replay(text, &cuts).unwrap_or_else(|e| panic!("{text:?}: {e}"));
-            let final_said = Said::of(&events);
-            let mut previous = Said::default();
-            for (step, said) in said_after_each.iter().enumerate() {
-                assert!(
-                    previous.is_prefix_of(said),
-                    "{text:?} cut at {cuts:?}: step {step} took back what step {} said:\n  before {previous:?}\n  after  {said:?}",
-                    step.saturating_sub(1)
-                );
-                assert!(
-                    said.is_prefix_of(&final_said),
-                    "{text:?} cut at {cuts:?}: step {step} said what the end did not keep:\n  step {said:?}\n  final {final_said:?}"
-                );
-                previous = said.clone();
-            }
+            let events = replay(text, &cuts).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            check_well_formed(text, &cuts, &events);
         }
     }
 }
 
 #[test]
 fn calls_are_numbered_from_zero_in_order_with_ids_that_follow_the_index() {
+    // The whole output is enough: chunking invariance above makes every other cut say the same.
     for text in OUTPUTS {
-        let (events, _) = replay(text, &[]).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+        let events = replay(text, &[]).unwrap_or_else(|e| panic!("{text:?}: {e}"));
         let said = Said::of(&events);
         for (position, (index, id, _)) in said.calls.iter().enumerate() {
             assert_eq!(*index as usize, position, "{text:?}");
