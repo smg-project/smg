@@ -530,6 +530,9 @@ jobs:
       - uses: dorny/paths-filter@v4
         id: filter
         with:
+          # Lets a filter exclude paths with `!` patterns. Filters without them
+          # behave exactly as before: any changed file matching any pattern.
+          predicate-quantifier: 'some-with-excludes'
           filters: |
             common:
               - 'model_gateway/**'
@@ -607,7 +610,8 @@ jobs:
             symphony:
               - 'crates/symphony/**'
             # Everything that is not Symphony's crate or the lock file. A PR is Symphony-only
-            # when `symphony` matched and this did not.
+            # when `symphony` matched and this did not. The `!` patterns only exclude under
+            # `some-with-excludes` above; with the default quantifier `**` would match every file.
             outside-symphony:
               - '**'
               - '!crates/symphony/**'
