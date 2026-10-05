@@ -14,7 +14,10 @@
 //! Two policy questions stand between the parser and bitwise parity, and the test declares them
 //! rather than hides them. Bellwether #17: the template's separator bytes (the newline after
 //! `<think>`, the two after `</think>`) are in the parser's content and reasoning and not in the
-//! reference's; a case that matches once both are trimmed is counted as "separators only". Bellwether
+//! reference's; a case that matches once both are trimmed is counted as "separators only". Two of the
+//! bitwise cases, the parallel calls, owe their count to the adapter rather than the parser: there
+//! the parser's content is nothing but the separator between the calls, and the adapter's rule that
+//! whitespace-only content is absent folds the difference away before the comparison. Bellwether
 //! #16: two probe cases put marker strings inside text, and the parser reads them as markers like
 //! every marker parser; they are listed in [`KNOWN_DIFFERENCES`] with their reason, the run fails on
 //! any other difference, and it fails again when a listed case starts matching, so the list cannot
