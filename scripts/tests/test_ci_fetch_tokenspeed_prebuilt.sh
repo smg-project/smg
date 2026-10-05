@@ -13,7 +13,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/ci_fetch_tokenspeed_prebuilt.sh"
 TAG="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-IMAGE="ghcr.io/smg-project/smg@sha256:${TAG}"
+IMAGE="ghcr.io/smg-project/smg:ci-tokenspeed-20000101@sha256:${TAG}"
 
 assert_eq() {
     local expected="$1" actual="$2" what="${3:-}"
@@ -97,6 +97,7 @@ test_cold_pull_populates_cache_and_links_install_root() {
     assert_contains "$(cat "$T/opt/github.env")" "SMG_BAKED_VENV=$T/opt/smg-ci/.venv"
     assert_contains "$(cat "$T/opt/github.env")" "TOKENSPEED_PREBUILT_JOB_DIR=$CACHE/jobs/"
     assert_contains "$out" "Prebuilt payload installed"
+    assert_contains "$out" "Prebuilt image: $IMAGE"
 }
 
 test_warm_cache_skips_docker_entirely() {
@@ -108,6 +109,7 @@ test_warm_cache_skips_docker_entirely() {
     assert_link_into "$T/opt-b/smg-ci" "$CACHE/jobs"
     assert_eq "deadbeef" "$(cat "$T/opt-b/smg-ci/tokenspeed.ref")"
     assert_contains "$out" "cache hit"
+    assert_contains "$out" "Prebuilt image: $IMAGE"
 }
 
 test_job_copies_are_private() {

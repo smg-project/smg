@@ -51,6 +51,7 @@ fallback() {
 }
 
 [ -n "$IMAGE" ] || fallback "TOKENSPEED_PREBUILT_IMAGE unset"
+log "Prebuilt image: ${IMAGE}"
 command -v docker &> /dev/null || fallback "docker not available on this runner"
 if command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
 

@@ -139,7 +139,7 @@ jobs:
                && manifest="$(docker manifest inspect --verbose "$candidate" 2>/dev/null)"; then
               digest="$(jq -r 'if type == "array" then .[] | select(.Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "amd64") | .Descriptor.digest else .Descriptor.digest // empty end' <<< "$manifest")"
               if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-                image="${candidate%:*}@${digest}"
+                image="${candidate}@${digest}"
               fi
             fi
           fi
