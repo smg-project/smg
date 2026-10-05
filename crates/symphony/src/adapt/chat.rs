@@ -18,8 +18,9 @@
 //!
 //! One rule for `finish_reason`, in both shapes: the engine's reason, except that `stop` after at
 //! least one tool call becomes `tool_calls`. `length`, `abort` and engine-specific reasons stay what
-//! the engine said even when calls were made; the old non-streaming path turned every reason but
-//! `length` into `tool_calls`, and its streaming path rewrote `stop` only. The rule keeps the
+//! the engine said even when calls were made. The old streaming path rewrote `stop` only, as here;
+//! the old non-streaming path turned every reason but `length`, `failed` and `error` into
+//! `tool_calls`, so the two differ on `abort` and engine-specific reasons, where the rule keeps the
 //! information.
 //!
 //! Policy this adapter sets, where the events say more than Chat Completions can:
