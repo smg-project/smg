@@ -136,8 +136,10 @@ impl Qwen3 {
                 self.open_call();
             }
             (Region::Call(_), CALL_CLOSE) => {
-                Self::drop_marker(marker, out);
+                // The call's remaining events come before the marker that closed it, so the events'
+                // bytes stay in the output's order.
                 self.close_call(out);
+                Self::drop_marker(marker, out);
             }
             (Region::Call(_), CALL_OPEN) => {
                 // A new call before the previous one closed: finish what arrived, then start.
@@ -153,14 +155,18 @@ impl Qwen3 {
         }
     }
 
+    /// The next call takes the next free index; the index is spent only if the region produces a
+    /// call, so a `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
         let index = self.calls;
-        self.calls += 1;
         self.region = Region::Call(Assembler::new(index, format!("call_{index}")));
     }
 
     fn close_call(&mut self, out: &mut Events) {
         if let Region::Call(assembler) = std::mem::replace(&mut self.region, Region::Content) {
+            if assembler.started() {
+                self.calls += 1;
+            }
             assembler.finish(out);
         }
     }
@@ -488,6 +494,87 @@ mod tests {
             }
         )));
         assert_eq!(bytes(&events), "<tool_call>\nnot json");
+        assert_eq!(
+            events.last(),
+            Some(&Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 0,
+                reasoning_tokens: 0,
+            }),
+            "a block that held no call is not counted"
+        );
+    }
+
+    #[test]
+    fn a_cut_short_call_keeps_its_events_in_the_outputs_order() {
+        let output = "<tool_call>\n{\"name\": \"f\", \"arguments\": {},</tool_call>";
+        let events = run(&[output], EngineFinish::Stop);
+        assert_eq!(
+            events,
+            vec![
+                dropped("<tool_call>"),
+                Event::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "f".into(),
+                    source: Text::uncounted("\n{\"name\": \"f\", \"arguments\": "),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "{}".into(),
+                    source: Text::uncounted("{}"),
+                },
+                Event::Malformed {
+                    text: Text::uncounted(","),
+                    why: MalformedReason::UnterminatedRegion,
+                },
+                Event::ToolCallEnd {
+                    index: 0,
+                    source: Text::default(),
+                },
+                dropped("</tool_call>"),
+                Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 1,
+                    reasoning_tokens: 0,
+                },
+            ]
+        );
+        assert_eq!(bytes(&events), output);
+    }
+
+    #[test]
+    fn a_block_that_held_no_call_takes_no_index_and_is_not_counted() {
+        let output = format!("<tool_call>junk</tool_call>{CALL}");
+        let events = run(&[&output], EngineFinish::Stop);
+        assert_eq!(
+            events[1],
+            Event::Malformed {
+                text: Text::uncounted("junk"),
+                why: MalformedReason::UnterminatedRegion,
+            }
+        );
+        let starts: Vec<(u32, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolCallStart { index, id, .. } => Some((*index, id.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![(0, "call_0".into())],
+            "the real call takes the first index"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 1,
+                reasoning_tokens: 0,
+            })
+        );
+        assert_eq!(bytes(&events), output);
     }
 
     #[test]

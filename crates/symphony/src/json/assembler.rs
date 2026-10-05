@@ -77,6 +77,12 @@ impl Assembler {
         self.done
     }
 
+    /// Whether a call has started, that is, whether `ToolCallStart` has been pushed. A format counts
+    /// its calls and advances their index by this, not by the markers it saw.
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
     /// Append the next bytes of the object, push the events they complete, and return how many of
     /// the bytes the object took: all of them before the close, up to the closing brace in the
     /// piece that carries it, none after it.
