@@ -24,6 +24,12 @@
 //! at construction with [`Combined::starting_in_reasoning`], the way the gateway decides it before
 //! the first chunk arrives.
 //!
+//! When an old parser fails, the error is `Internal`, a further `Delta` is a `Lifecycle` error, and
+//! `End` returns what the pair still holds as one `Malformed` event: the text the reasoning parser
+//! flushes, the tool parser's unstreamed text, and the arguments it has not handed over, in that
+//! order and without boundaries, since the old traits keep none. A failure while finishing is
+//! final: the stream is closed in the output before the error is returned.
+//!
 //! One deliberate difference from the gateway: the gateway skips the tool parser for text produced
 //! in a chunk that ends inside reasoning. This bridge sends all content to the tool parser, because
 //! the reasoning parser has already said that text is content.
@@ -132,7 +138,7 @@ impl Combined {
         };
         let split = match reasoning.parse_reasoning_streaming_incremental(text) {
             Ok(split) => split,
-            Err(e) => return Err(self.fail(e.to_string())),
+            Err(e) => return Err(self.fail(&e.to_string())),
         };
         let still_open = reasoning.is_in_reasoning();
         self.emit_reasoning(&split.reasoning_text, still_open, out);
@@ -166,7 +172,7 @@ impl Combined {
         // timer, a socket or a lock, so running the future to completion here cannot block.
         let found = match block_on(tool.parse_incremental(content, &self.tools)) {
             Ok(found) => found,
-            Err(e) => return Err(self.fail(e.to_string())),
+            Err(e) => return Err(self.fail(&e.to_string())),
         };
         out.push_content(Text::uncounted(found.normal_text));
         self.emit_calls(found.calls, out)
@@ -176,7 +182,8 @@ impl Combined {
     /// old parser keeps to that, so arguments for a call that has not started are a defect in the
     /// parser, reported rather than guessed around.
     fn emit_calls(&mut self, items: Vec<ToolCallItem>, out: &mut Events) -> Result<(), ParseError> {
-        for item in items {
+        let mut items = items.into_iter();
+        while let Some(item) = items.next() {
             let index = item.tool_index as u32;
             if let Some(name) = item.name {
                 if !self.calls_started.contains(&index) {
@@ -195,11 +202,17 @@ impl Combined {
             if !self.calls_started.contains(&index) {
                 let message =
                     format!("the tool parser sent arguments for call {index} before its name");
+                // Nothing from here on is emitted: this item's arguments and every later item's
+                // come back as one malformed text, so the bytes are accounted for.
+                let mut unemitted = item.parameters;
+                for later in items {
+                    unemitted.push_str(&later.parameters);
+                }
                 out.push(Event::Malformed {
-                    text: Text::uncounted(item.parameters),
+                    text: Text::uncounted(unemitted),
                     why: MalformedReason::Other(message.clone()),
                 });
-                return Err(self.fail(message));
+                return Err(self.fail(&message));
             }
             out.push(Event::ToolCallArguments {
                 index,
@@ -211,12 +224,14 @@ impl Combined {
     }
 
     /// Remember why parsing stopped and report it.
-    fn fail(&mut self, message: String) -> ParseError {
-        self.failure = Some(message.clone());
-        ParseError::Internal(message)
+    fn fail(&mut self, message: &str) -> ParseError {
+        self.failure = Some(message.to_string());
+        ParseError::Internal(message.to_string())
     }
 
-    /// Collect what the old parsers still hold without parsing it further.
+    /// Collect what the old parsers still hold without parsing it further: the text the reasoning
+    /// parser flushes, the tool parser's unstreamed text, and the arguments it has not handed over,
+    /// concatenated, since the old traits give no boundaries to keep.
     fn recover_held_text(&mut self) -> String {
         let mut held = String::new();
         if let Some(reasoning) = self.reasoning.as_mut() {
@@ -227,39 +242,61 @@ impl Combined {
         }
         if let Some(tool) = self.tool.as_mut() {
             held.push_str(&tool.take_unstreamed_normal_text());
+            for item in tool.get_unstreamed_tool_args().unwrap_or_default() {
+                held.push_str(&item.parameters);
+            }
         }
         held
     }
 
-    fn finish(&mut self, finish: EngineFinish, out: &mut Events) -> Result<(), ParseError> {
-        if let Some(message) = self.failure.clone() {
-            let held = self.recover_held_text();
-            if !held.is_empty() {
-                out.push(Event::Malformed {
-                    text: Text::uncounted(held),
-                    why: MalformedReason::Other(message),
-                });
-            }
-            self.close(finish, out);
-            return Ok(());
+    /// After a failure, return what the pair still holds as one `Malformed` event.
+    fn return_held_text(&mut self, out: &mut Events) {
+        let Some(message) = self.failure.clone() else {
+            return;
+        };
+        let held = self.recover_held_text();
+        if !held.is_empty() {
+            out.push(Event::Malformed {
+                text: Text::uncounted(held),
+                why: MalformedReason::Other(message),
+            });
         }
-        // The stream has ended, so no `End` can follow an error raised here: the stream is closed
-        // either way, and the error is handed on after `Finish` is in `out`.
-        let flushed = self.flush_old_parsers(out);
+    }
+
+    fn finish(&mut self, finish: EngineFinish, out: &mut Events) -> Result<(), ParseError> {
+        // After a failure during the stream the old parsers are not flushed, only emptied. A failure
+        // while flushing is final too, since no `End` can follow, and the flush returns what is still
+        // held itself. Either way the stream is closed, and an error is handed on after `Finish`.
+        let flushed = match self.failure {
+            Some(_) => {
+                self.return_held_text(out);
+                Ok(())
+            }
+            None => self.flush_old_parsers(out),
+        };
         self.close(finish, out);
         flushed
     }
 
-    /// Emit what the old parsers still hold at the end of the stream.
+    /// Emit what the old parsers still hold at the end of the stream. On a failure, whatever has not
+    /// been read yet comes back as `Malformed`, and nothing is read twice: `emit_calls` returns the
+    /// items it did not emit, so a failure there leaves nothing to recover.
     fn flush_old_parsers(&mut self, out: &mut Events) -> Result<(), ParseError> {
         if let Some(reasoning) = self.reasoning.as_mut() {
             let held = match reasoning.flush() {
                 Ok(held) => held,
-                Err(e) => return Err(self.fail(e.to_string())),
+                Err(e) => {
+                    let error = self.fail(&e.to_string());
+                    self.return_held_text(out);
+                    return Err(error);
+                }
             };
             let still_open = reasoning.is_in_reasoning();
             self.emit_reasoning(&held.reasoning_text, still_open, out);
-            self.parse_tools(&held.normal_text, out)?;
+            if let Err(error) = self.parse_tools(&held.normal_text, out) {
+                self.return_held_text(out);
+                return Err(error);
+            }
         }
         if let Some(tool) = self.tool.as_mut() {
             out.push_content(Text::uncounted(tool.take_unstreamed_normal_text()));
@@ -424,18 +461,54 @@ mod tests {
         fn mark_think_start_stripped(&mut self) {}
     }
 
+    /// An old tool parser that streams nothing and holds every chunk for the end.
+    struct HoldsEverything {
+        held: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolParser for HoldsEverything {
+        async fn parse_complete(
+            &self,
+            output: &str,
+        ) -> tool_parser::errors::ParserResult<(String, Vec<tool_parser::ToolCall>)> {
+            Ok((output.to_string(), vec![]))
+        }
+
+        async fn parse_incremental(
+            &mut self,
+            chunk: &str,
+            _tools: &[Tool],
+        ) -> tool_parser::errors::ParserResult<tool_parser::StreamingParseResult> {
+            self.held.push_str(chunk);
+            Ok(tool_parser::StreamingParseResult {
+                normal_text: String::new(),
+                calls: vec![],
+            })
+        }
+
+        fn has_tool_markers(&self, _text: &str) -> bool {
+            true
+        }
+
+        fn take_unstreamed_normal_text(&mut self) -> String {
+            std::mem::take(&mut self.held)
+        }
+    }
+
     /// An old tool parser that sends a call's arguments before its name, which no real one does:
-    /// during the stream, or only among the arguments it still holds at the end.
+    /// during the stream, or only among the arguments it still holds at the end, where a second
+    /// item follows the defective one.
     struct ArgumentsFirst {
         at_end: bool,
     }
 
     impl ArgumentsFirst {
-        fn item() -> ToolCallItem {
+        fn item(parameters: &str) -> ToolCallItem {
             ToolCallItem {
                 tool_index: 0,
                 name: None,
-                parameters: r#"{"city":"#.to_string(),
+                parameters: parameters.to_string(),
             }
         }
     }
@@ -459,7 +532,7 @@ mod tests {
                 calls: if self.at_end {
                     vec![]
                 } else {
-                    vec![Self::item()]
+                    vec![Self::item(r#"{"city":"#)]
                 },
             })
         }
@@ -469,7 +542,8 @@ mod tests {
         }
 
         fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
-            self.at_end.then(|| vec![Self::item()])
+            self.at_end
+                .then(|| vec![Self::item(r#"{"city":"#), Self::item(r#""Paris"}"#)])
         }
     }
 
@@ -837,7 +911,7 @@ mod tests {
             out.drain(),
             vec![
                 Event::Malformed {
-                    text: Text::uncounted(r#"{"city":"#),
+                    text: Text::uncounted(r#"{"city":"Paris"}"#),
                     why: MalformedReason::Other(
                         "the tool parser sent arguments for call 0 before its name".into()
                     ),
@@ -853,6 +927,47 @@ mod tests {
             parser.feed(end, &mut out),
             Err(ParseError::Lifecycle(_))
         ));
+    }
+
+    #[test]
+    fn a_failing_flush_still_returns_what_the_other_parser_holds() {
+        let mut parser = Combined::new(
+            Some(Box::new(RefusesToFlush)),
+            Some(Box::new(HoldsEverything {
+                held: String::new(),
+            })),
+            vec![weather_tool()],
+        );
+        let mut out = Events::new();
+        parser
+            .feed(delta("held by the tool parser"), &mut out)
+            .expect("delta");
+        assert!(out.is_empty(), "the tool stub streams nothing");
+        assert_eq!(
+            parser.feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            ),
+            Err(ParseError::Internal(
+                "Parser configuration error: cannot flush".into()
+            ))
+        );
+        assert_eq!(
+            out.drain(),
+            vec![
+                Event::Malformed {
+                    text: Text::uncounted("held by the tool parser"),
+                    why: MalformedReason::Other("Parser configuration error: cannot flush".into()),
+                },
+                Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 0,
+                    reasoning_tokens: 0,
+                },
+            ]
+        );
     }
 
     #[test]
