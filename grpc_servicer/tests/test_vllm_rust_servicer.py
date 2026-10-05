@@ -418,16 +418,17 @@ def test_model_info_reports_vision_from_vllms_own_check():
     assert rust.model_info_from_config(config)["supports_vision"] is False
 
 
+@pytest.mark.parametrize("modalities", [("image", "video"), ("image", "video", "audio")])
 @pytest.mark.parametrize(
     "limits,expected", [({"video": 0}, True), ({"image": 0, "video": 0}, False)]
 )
-def test_model_info_respects_effective_multimodal_limits(monkeypatch, limits, expected):
+def test_model_info_respects_effective_multimodal_limits(monkeypatch, limits, expected, modalities):
     _install(
         monkeypatch,
         "vllm.multimodal",
         MULTIMODAL_REGISTRY=SimpleNamespace(
             get_processing_info=lambda mc: SimpleNamespace(
-                supported_mm_limits={"image": None, "video": None}
+                supported_mm_limits=dict.fromkeys(modalities)
             )
         ),
     )

@@ -154,10 +154,13 @@ def test_engine_accepts_mm_inputs_mm_embeds_only(monkeypatch):
         (("image", "video"), {"image": 1, "video": 0}, True),
         (("image", "video"), {"image": 0, "video": 0}, False),
         (("image",), {"image": 0, "video": 1}, False),
-        (("image", "audio"), {"image": 0}, True),
+        (("image", "audio"), {"image": 0}, False),
+        (("image", "video", "audio"), {"image": 0, "video": 0}, False),
+        (("image", "audio"), {"audio": 0}, True),
+        (("audio",), {}, False),
     ],
 )
-def test_engine_accepts_mm_inputs_uses_all_supported_modalities(
+def test_engine_accepts_mm_inputs_uses_supported_visual_modalities(
     monkeypatch, supports, modalities, limits, expected, public_api
 ):
     _fake_vllm_registry(monkeypatch, lambda mc: True, modalities, public_api=public_api)
