@@ -1,0 +1,318 @@
+//! Parity with bellwether's parse fixtures.
+//!
+//! bellwether (smg-project/bellwether) records, per model, what a model's output must parse to: the
+//! output text, its token ids, chunk plans, and the reference assistant message from the round trip
+//! through the checkpoint's template. This test replays every Qwen3-8B parse case through
+//! [`Qwen3`], folds the events into the assistant message with [`adapt::chat::message`], and
+//! compares it with the reference: whole, at every byte split, byte by byte, and on thirty seeded
+//! byte plans. Every replay also has to conserve the output's bytes across its events and agree
+//! with every other replay of the same case.
+//!
+//! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory of a bellwether
+//! checkout; without it the test prints a skip notice and passes.
+//!
+//! Two policy questions stand between the parser and bitwise parity, and the test declares them
+//! rather than hides them. Bellwether #17: the template's separator bytes (the newline after
+//! `<think>`, the two after `</think>`) are in the parser's content and reasoning and not in the
+//! reference's; a case that matches once both are trimmed is counted as "separators only". Bellwether
+//! #16: two probe cases put marker strings inside text, and the parser reads them as markers like
+//! every marker parser; they are listed in [`KNOWN_DIFFERENCES`] with their reason, the run fails on
+//! any other difference, and it fails again when a listed case starts matching, so the list cannot
+//! rot. The fixtures' token-level chunk plans are not replayed here: that needs the token-to-text
+//! pieces, which bellwether's detokenize fixtures will carry.
+
+use std::{fs, path::PathBuf};
+
+use serde::Deserialize;
+use symphony::{adapt, EngineFinish, Event, Events, Input, ParseError, Parser, Qwen3};
+
+const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
+const SLUG: &str = "qwen3-8b";
+const RANDOM_PLANS: u64 = 30;
+const RANDOM_LONGEST_CHUNK: usize = 8;
+
+/// Cases known to differ from the reference beyond the separator bytes, with the reason.
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
+    (
+        "qwen3-8b/parse/reasoning-with-marker-text",
+        "the reasoning holds a `</think>`; the parser ends the reasoning there, as every marker parser \
+         does, and the reference keeps the marker as reasoning text (bellwether #16)",
+    ),
+    (
+        "qwen3-8b/parse/content-with-marker-in-code-fence",
+        "the content holds a complete `<tool_call>` block inside a code fence; the parser makes a call \
+         of it, as every marker parser does, and the reference keeps it as content (bellwether #16)",
+    ),
+];
+
+#[derive(Deserialize)]
+struct Fixture {
+    id: String,
+    reference: Reference,
+}
+
+#[derive(Deserialize)]
+struct Reference {
+    text: String,
+    message: ReferenceMessage,
+    finish_reason: String,
+}
+
+#[derive(Deserialize)]
+struct ReferenceMessage {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ReferenceCall>,
+}
+
+#[derive(Deserialize)]
+struct ReferenceCall {
+    function: ReferenceFunction,
+}
+
+#[derive(Deserialize)]
+struct ReferenceFunction {
+    name: String,
+    arguments: String,
+}
+
+/// What the parser said an output means, in the terms the reference uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Said {
+    content: Option<String>,
+    reasoning: Option<String>,
+    calls: Vec<(String, String)>,
+    finish: String,
+}
+
+impl Said {
+    fn of(events: &[Event]) -> Self {
+        let choice = adapt::chat::message(0, events);
+        Self {
+            content: choice.message.content,
+            reasoning: choice.message.reasoning_content,
+            calls: choice
+                .message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(|call| {
+                    (
+                        call.function.name,
+                        call.function.arguments.unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            finish: choice.finish_reason.unwrap_or_default(),
+        }
+    }
+
+    fn of_reference(reference: &Reference) -> Self {
+        Self {
+            content: reference.message.content.clone().filter(|c| !c.is_empty()),
+            reasoning: reference.message.reasoning_content.clone(),
+            calls: reference
+                .message
+                .tool_calls
+                .iter()
+                .map(|call| (call.function.name.clone(), call.function.arguments.clone()))
+                .collect(),
+            finish: reference.finish_reason.clone(),
+        }
+    }
+
+    /// The same, with the separator bytes trimmed from content and reasoning (bellwether #17).
+    fn trimmed(&self) -> Self {
+        let trim = |part: &Option<String>| {
+            part.as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            content: trim(&self.content),
+            reasoning: trim(&self.reasoning),
+            calls: self.calls.clone(),
+            finish: self.finish.clone(),
+        }
+    }
+}
+
+#[test]
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "the skip notice and the per-case report are test diagnostic output"
+)]
+fn qwen3_parse_fixtures_match_the_reference() {
+    let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "skipping: {FIXTURES_ENV} is not set; point it at the fixtures/ directory of a bellwether checkout"
+        );
+        return;
+    };
+    let fixtures = read_fixtures(&root.join(SLUG).join("parse")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !fixtures.is_empty(),
+        "no parse fixtures under {}",
+        root.display()
+    );
+
+    let known: Vec<&str> = KNOWN_DIFFERENCES.iter().map(|(id, _)| *id).collect();
+    let mut failures = Vec::new();
+    let (mut bitwise, mut separators_only, mut listed) = (0, 0, 0);
+    for fixture in &fixtures {
+        let text = fixture.reference.text.as_str();
+        let expected = Said::of_reference(&fixture.reference);
+        let mut saids = Vec::new();
+        for plan in plans(text) {
+            let events = replay(text, &plan)
+                .unwrap_or_else(|e| panic!("{}: plan {plan:?}: {e}", fixture.id));
+            let conserved: String = events.iter().map(bytes_of).collect();
+            if conserved != text {
+                failures.push(format!(
+                    "{}: bytes not conserved on plan {plan:?}",
+                    fixture.id
+                ));
+            }
+            let mut index = 0;
+            for event in &events {
+                if let Event::ToolCallStart { index: i, id, .. } = event {
+                    if *i != index || *id != format!("call_{index}") {
+                        failures.push(format!(
+                            "{}: call index {i} / id {id} on plan {plan:?}",
+                            fixture.id
+                        ));
+                    }
+                    index += 1;
+                }
+            }
+            saids.push(Said::of(&events));
+        }
+        let said = saids[0].clone();
+        if saids.iter().any(|s| *s != said) {
+            failures.push(format!(
+                "{}: the replays disagree with each other",
+                fixture.id
+            ));
+        }
+        let verdict = if said == expected {
+            bitwise += 1;
+            "bitwise"
+        } else if said.trimmed() == expected.trimmed() {
+            separators_only += 1;
+            "separators only (bellwether #17)"
+        } else if known.contains(&fixture.id.as_str()) {
+            listed += 1;
+            "listed (bellwether #16)"
+        } else {
+            failures.push(format!(
+                "{}: differs from the reference\n    said:      {said:?}\n    reference: {expected:?}",
+                fixture.id
+            ));
+            "DIFFERS"
+        };
+        if known.contains(&fixture.id.as_str()) && said.trimmed() == expected.trimmed() {
+            failures.push(format!(
+                "{}: listed in KNOWN_DIFFERENCES but matching the reference now; remove it",
+                fixture.id
+            ));
+        }
+        println!("  {verdict:34} {}", fixture.id);
+    }
+    println!(
+        "{} cases: {bitwise} bitwise, {separators_only} separators only, {listed} listed",
+        fixtures.len()
+    );
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// The chunkings of `text` to replay: whole, every two-way byte split, byte by byte, and thirty
+/// seeded plans of one to eight characters; every cut on a character boundary.
+fn plans(text: &str) -> Vec<Vec<usize>> {
+    let boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).skip(1).collect();
+    let mut plans = vec![vec![]];
+    plans.extend(boundaries.iter().map(|&cut| vec![cut]));
+    plans.push(boundaries.clone());
+    let chars: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    for seed in 1..=RANDOM_PLANS {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut cuts = Vec::new();
+        let mut at = 0;
+        while at < chars.len() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let step = 1 + (state >> 33) as usize % RANDOM_LONGEST_CHUNK;
+            at += step;
+            if at < chars.len() {
+                cuts.push(chars[at]);
+            }
+        }
+        plans.push(cuts);
+    }
+    plans
+}
+
+/// Feed `text` cut at `cuts`, then the end, and return the events.
+fn replay(text: &str, cuts: &[usize]) -> Result<Vec<Event>, ParseError> {
+    let mut parser = Qwen3::new();
+    let mut out = Events::new();
+    let mut from = 0;
+    for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
+        if cut > from {
+            parser.feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: &text[from..cut],
+                    spans: &[],
+                },
+                &mut out,
+            )?;
+            from = cut;
+        }
+    }
+    parser.feed(
+        Input::End {
+            finish: EngineFinish::Stop,
+        },
+        &mut out,
+    )?;
+    Ok(out.drain())
+}
+
+fn bytes_of(event: &Event) -> &str {
+    match event {
+        Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+        Event::ToolCallStart { source, .. }
+        | Event::ToolCallArguments { source, .. }
+        | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
+    }
+}
+
+fn read_fixtures(dir: &std::path::Path) -> Result<Vec<Fixture>, String> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    files.sort();
+    let mut fixtures = Vec::new();
+    for file in files {
+        let text = fs::read_to_string(&file)
+            .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+        for (number, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let fixture: Fixture = serde_json::from_str(line)
+                .map_err(|e| format!("{}:{}: {e}", file.display(), number + 1))?;
+            fixtures.push(fixture);
+        }
+    }
+    Ok(fixtures)
+}
