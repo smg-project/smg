@@ -549,6 +549,23 @@ struct Router {
     prefill_max_inflight_requests_per_worker: i32,
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
+    /// The keyword-only `discovery` mapping, read by the same rules as
+    /// `RouterConfig.discovery`.
+    discovery: Option<config::DiscoveryConfig>,
+}
+
+/// Read the keyword-only `discovery` mapping by the same rules as
+/// `RouterConfig.discovery`. It goes through JSON, so nested mappings and
+/// lists convert without a hand-written walker.
+fn parse_discovery(mapping: &Bound<'_, PyAny>) -> PyResult<Option<config::DiscoveryConfig>> {
+    let invalid = |e: serde_json::Error| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid discovery mapping: {e}"))
+    };
+    let json: String = PyModule::import(mapping.py(), "json")?
+        .call_method1("dumps", (mapping,))?
+        .extract()?;
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(invalid)?;
+    config::deserialize_discovery(value).map_err(invalid)
 }
 
 impl Router {
@@ -612,7 +629,8 @@ impl Router {
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
-            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+            DiscoveryConfig, KubernetesDiscoveryConfig, MetricsConfig,
+            PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
         // Validate the transport mode up front. The CLI (value_parser) and the
@@ -755,8 +773,7 @@ impl Router {
         let policy = convert_policy(&self.policy)?;
 
         let discovery = if self.service_discovery {
-            Some(DiscoveryConfig {
-                enabled: true,
+            Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
                 namespace: self.service_discovery_namespace.clone(),
                 port: self.service_discovery_port,
                 check_interval_secs: 60,
@@ -771,10 +788,11 @@ impl Router {
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
-            })
+            }))
         } else {
-            None
+            self.discovery.clone()
         };
+        let has_discovery = discovery.is_some();
 
         let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
             (Some(port), Some(host)) => Some(MetricsConfig {
@@ -915,7 +933,7 @@ impl Router {
                 // service discovery, which is what re-adds a removed worker.
                 remove_unhealthy_workers: config::resolve_worker_auto_recovery(
                     self.remove_unhealthy_workers,
-                    self.service_discovery,
+                    has_discovery,
                 ),
                 drain_settle_secs: self.drain_settle_secs,
             })
@@ -1166,12 +1184,11 @@ impl Router {
         prefill_max_inflight_requests_per_worker = -1,
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
+        // Keyword-only, so it never takes a positional slot.
+        *,
+        discovery = None,
     ))]
     #[expect(clippy::too_many_arguments)]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "PyO3 #[new] method signature requires PyResult"
-    )]
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -1335,7 +1352,20 @@ impl Router {
         prefill_max_inflight_requests_per_worker: i32,
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
+        discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        // Two spellings of one choice: refuse both rather than pick one.
+        if service_discovery && discovery.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Pass service_discovery=True or a discovery mapping, not both",
+            ));
+        }
+        let discovery = discovery
+            .as_ref()
+            .map(parse_discovery)
+            .transpose()?
+            .flatten();
+
         let mut all_urls = worker_urls.clone();
 
         if let Some(ref encode_urls) = encode_urls {
@@ -1516,6 +1546,7 @@ impl Router {
             prefill_max_inflight_requests_per_worker,
             prefill_queue_size,
             prefill_queue_timeout_secs,
+            discovery,
         })
     }
 
@@ -1530,51 +1561,23 @@ impl Router {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration validation failed: {e}"))
         })?;
 
-        let model_id_source = self
-            .model_id_from
-            .as_deref()
-            .map(|s| {
-                service_discovery::ModelIdSource::parse(s).map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid --model-id-from value '{s}': {e}"
-                    ))
-                })
+        let service_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .map(|discovery| {
+                service_discovery::RuntimeDiscoveryConfig::from_config(
+                    discovery,
+                    &router_config.mode,
+                )
             })
-            .transpose()?;
-
-        let service_discovery_config = if self.service_discovery {
-            Some(service_discovery::ServiceDiscoveryConfig {
-                enabled: true,
-                selector: self.selector.clone(),
-                check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
-                namespace: self.service_discovery_namespace.clone(),
-                disaggregated_mode: self.pd_disaggregation || self.epd_disaggregation,
-                encode_selector: self.encode_selector.clone(),
-                prefill_selector: self.prefill_selector.clone(),
-                decode_selector: self.decode_selector.clone(),
-                bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
-                worker_ports_annotation: self.worker_ports_annotation.clone(),
-                kv_connector_annotation: self.kv_connector_annotation.clone(),
-                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
-                model_id_source,
-            })
-        } else {
-            None
-        };
-
-        // Mesh-router discovery now has its own task and lifetime, but stays
-        // gated on the legacy service-discovery flag until it gains its own
-        // config surface with the tagged provider configuration.
-        let mesh_discovery_config = if self.service_discovery && !self.router_selector.is_empty() {
-            Some(mesh_discovery::MeshDiscoveryConfig {
-                namespace: self.service_discovery_namespace.clone(),
-                router_selector: self.router_selector.clone(),
-                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-            })
-        } else {
-            None
-        };
+            .transpose()
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
+            })?;
+        let mesh_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .and_then(mesh_discovery::MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
     HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
@@ -205,6 +205,7 @@ pub struct RouterConfig {
     /// `api_key` rather than replacing it.
     #[serde(default)]
     pub tenant_api_keys: Vec<TenantApiKeyEntry>,
+    #[serde(default, deserialize_with = "deserialize_discovery")]
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
@@ -966,10 +967,78 @@ impl PolicyConfig {
     }
 }
 
-/// Service discovery configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveryConfig {
-    pub enabled: bool,
+/// Worker discovery: the one provider that finds this router's workers, and
+/// that provider's settings. Presence means discovery is on; there is no
+/// `enabled` flag.
+///
+/// Serialized as a `provider` tag beside the provider's own flat fields:
+///
+/// ```yaml
+/// discovery:
+///   provider: kubernetes
+///   selector: { app: sglang }
+///   port: 8000
+/// ```
+///
+/// [`RouterConfig::discovery`] also reads the flat Kubernetes object that
+/// predates the tag; see [`deserialize_discovery`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum DiscoveryConfig {
+    Kubernetes(KubernetesDiscoveryConfig),
+}
+
+impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
+    fn from(config: KubernetesDiscoveryConfig) -> Self {
+        Self::Kubernetes(config)
+    }
+}
+
+/// Deserialize [`RouterConfig::discovery`] from either shape it has had.
+///
+/// The flat Kubernetes object that predates the `provider` tag has no tag and
+/// carries an `enabled` flag. A missing tag means Kubernetes, the only
+/// provider that object could describe. `enabled: false` becomes `None` here,
+/// at deserialization, because canonical output has no `enabled` to carry the
+/// `false`: a disabled config that is read and written back must stay
+/// disabled.
+///
+/// Fields are read only after the object is buffered to find its tag, so a
+/// YAML scalar keeps the type YAML gave it: a label value that looks like a
+/// number or boolean must be quoted (`version: "1"`), as in a Kubernetes
+/// manifest. The flat struct once read such values as strings.
+///
+/// Public so every input surface — the Python binding's `discovery` mapping
+/// included — reads discovery by the same rules.
+pub fn deserialize_discovery<'de, D>(deserializer: D) -> Result<Option<DiscoveryConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(mut value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let Some(fields) = value.as_object_mut() {
+        match fields.remove("enabled") {
+            None | Some(serde_json::Value::Bool(true)) => {}
+            Some(serde_json::Value::Bool(false)) => return Ok(None),
+            Some(other) => {
+                return Err(de::Error::custom(format!(
+                    "discovery.enabled must be a boolean, got {other}"
+                )));
+            }
+        }
+        fields
+            .entry("provider")
+            .or_insert_with(|| serde_json::Value::from("kubernetes"));
+    }
+    DiscoveryConfig::deserialize(value)
+        .map(Some)
+        .map_err(de::Error::custom)
+}
+
+/// Kubernetes worker discovery: Pods matching a selector become workers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KubernetesDiscoveryConfig {
     /// None = all namespaces
     pub namespace: Option<String>,
     pub port: u16,
@@ -1019,10 +1088,9 @@ fn default_kv_engine_id_annotation() -> String {
     "smg.ai/kv-engine-id".to_string()
 }
 
-impl Default for DiscoveryConfig {
+impl Default for KubernetesDiscoveryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             namespace: None,
             port: 8000,
             check_interval_secs: 120,
@@ -1295,7 +1363,7 @@ impl RouterConfig {
 
     /// Check if service discovery is enabled
     pub fn has_service_discovery(&self) -> bool {
-        self.discovery.as_ref().is_some_and(|d| d.enabled)
+        self.discovery.is_some()
     }
 
     /// Check if metrics are enabled
@@ -2040,9 +2108,8 @@ mod tests {
 
     #[test]
     fn test_discovery_config_default() {
-        let config = DiscoveryConfig::default();
+        let config = KubernetesDiscoveryConfig::default();
 
-        assert!(!config.enabled);
         assert!(config.namespace.is_none());
         assert_eq!(config.port, 8000);
         assert_eq!(config.check_interval_secs, 120);
@@ -2061,8 +2128,7 @@ mod tests {
         selector.insert("app".to_string(), "sglang".to_string());
         selector.insert("role".to_string(), "worker".to_string());
 
-        let config = DiscoveryConfig {
-            enabled: true,
+        let config = KubernetesDiscoveryConfig {
             namespace: Some("default".to_string()),
             port: 9000,
             check_interval_secs: 30,
@@ -2079,7 +2145,6 @@ mod tests {
             model_id_source: None,
         };
 
-        assert!(config.enabled);
         assert_eq!(config.namespace, Some("default".to_string()));
         assert_eq!(config.port, 9000);
         assert_eq!(config.selector.len(), 2);
@@ -2088,17 +2153,145 @@ mod tests {
 
     #[test]
     fn test_discovery_config_namespace() {
-        let config = DiscoveryConfig {
+        let config = KubernetesDiscoveryConfig {
             namespace: None,
             ..Default::default()
         };
         assert!(config.namespace.is_none());
 
-        let config = DiscoveryConfig {
+        let config = KubernetesDiscoveryConfig {
             namespace: Some("production".to_string()),
             ..Default::default()
         };
         assert_eq!(config.namespace, Some("production".to_string()));
+    }
+
+    /// `discovery` as `RouterConfig` reads it, from a JSON object.
+    fn read_discovery(discovery: serde_json::Value) -> Option<DiscoveryConfig> {
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        config["discovery"] = discovery;
+        serde_json::from_value::<RouterConfig>(config)
+            .unwrap()
+            .discovery
+    }
+
+    /// The fields the discovery object has always required.
+    fn kubernetes_fields() -> serde_json::Value {
+        serde_json::json!({
+            "namespace": "prod",
+            "port": 8000,
+            "check_interval_secs": 60,
+            "selector": { "app": "sglang" },
+            "prefill_selector": {},
+            "decode_selector": {},
+            "bootstrap_port_annotation": "sglang.ai/bootstrap-port",
+        })
+    }
+
+    fn with(mut base: serde_json::Value, key: &str, value: serde_json::Value) -> serde_json::Value {
+        base[key] = value;
+        base
+    }
+
+    #[test]
+    fn legacy_flat_discovery_reads_as_kubernetes() {
+        let legacy = with(kubernetes_fields(), "enabled", true.into());
+        let Some(DiscoveryConfig::Kubernetes(kubernetes)) = read_discovery(legacy) else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(kubernetes.namespace.as_deref(), Some("prod"));
+        assert_eq!(
+            kubernetes.selector.get("app").map(String::as_str),
+            Some("sglang")
+        );
+    }
+
+    /// A missing tag means Kubernetes even without the legacy `enabled`:
+    /// presence alone turns discovery on.
+    #[test]
+    fn untagged_discovery_without_enabled_reads_as_kubernetes() {
+        assert!(matches!(
+            read_discovery(kubernetes_fields()),
+            Some(DiscoveryConfig::Kubernetes(_))
+        ));
+    }
+
+    #[test]
+    fn tagged_kubernetes_discovery_reads_as_kubernetes() {
+        let tagged = with(kubernetes_fields(), "provider", "kubernetes".into());
+        assert!(matches!(
+            read_discovery(tagged),
+            Some(DiscoveryConfig::Kubernetes(_))
+        ));
+    }
+
+    /// `enabled: false` is dropped at deserialization, so writing the config
+    /// back out cannot turn discovery on.
+    #[test]
+    fn disabled_legacy_discovery_reads_as_none_and_stays_none() {
+        let disabled = with(kubernetes_fields(), "enabled", false.into());
+        assert!(read_discovery(disabled.clone()).is_none());
+
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        config["discovery"] = disabled;
+        let config: RouterConfig = serde_json::from_value(config).unwrap();
+        let reread: RouterConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(reread.discovery.is_none());
+    }
+
+    /// Canonical output carries the tag and no `enabled`, and reads back to
+    /// the same config.
+    #[test]
+    fn discovery_serializes_tagged_without_enabled() {
+        let discovery = DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
+            namespace: Some("prod".to_string()),
+            ..Default::default()
+        });
+        let written = serde_json::to_value(&discovery).unwrap();
+        assert_eq!(written["provider"], "kubernetes");
+        assert!(written.get("enabled").is_none());
+        assert_eq!(read_discovery(written), Some(discovery));
+    }
+
+    #[test]
+    fn legacy_flat_discovery_reads_from_yaml() {
+        let yaml = "
+discovery:
+  enabled: true
+  port: 8000
+  check_interval_secs: 60
+  selector: { app: sglang }
+  prefill_selector: {}
+  decode_selector: {}
+  bootstrap_port_annotation: sglang.ai/bootstrap-port
+";
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        let overlay: serde_json::Value = serde_yaml::from_str(yaml).unwrap();
+        for (key, value) in overlay.as_object().unwrap() {
+            config[key] = value.clone();
+        }
+        let config: RouterConfig = serde_json::from_value(config).unwrap();
+        assert!(matches!(
+            config.discovery,
+            Some(DiscoveryConfig::Kubernetes(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_discovery_provider_is_rejected() {
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        config["discovery"] = with(kubernetes_fields(), "provider", "zookeeper".into());
+        let err = serde_json::from_value::<RouterConfig>(config).unwrap_err();
+        assert!(err.to_string().contains("zookeeper"), "{err}");
+    }
+
+    #[test]
+    fn non_boolean_discovery_enabled_is_rejected() {
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        config["discovery"] = with(kubernetes_fields(), "enabled", "yes".into());
+        let err = serde_json::from_value::<RouterConfig>(config).unwrap_err();
+        assert!(err.to_string().contains("discovery.enabled"), "{err}");
     }
 
     #[test]
@@ -2155,14 +2348,6 @@ mod tests {
     #[test]
     fn test_has_service_discovery() {
         let config = RouterConfig::default();
-        assert!(!config.has_service_discovery());
-
-        let config = RouterConfig::builder()
-            .discovery_config(DiscoveryConfig {
-                enabled: false,
-                ..Default::default()
-            })
-            .build_unchecked();
         assert!(!config.has_service_discovery());
 
         let config = RouterConfig::builder().enable_discovery().build_unchecked();
@@ -2269,8 +2454,7 @@ mod tests {
             .request_timeout_secs(120)
             .worker_startup_timeout_secs(60)
             .worker_startup_check_interval_secs(5)
-            .discovery_config(DiscoveryConfig {
-                enabled: true,
+            .discovery_config(KubernetesDiscoveryConfig {
                 namespace: Some("sglang".to_string()),
                 ..Default::default()
             })
@@ -2307,8 +2491,7 @@ mod tests {
             .request_timeout_secs(300)
             .worker_startup_timeout_secs(180)
             .worker_startup_check_interval_secs(15)
-            .discovery_config(DiscoveryConfig {
-                enabled: true,
+            .discovery_config(KubernetesDiscoveryConfig {
                 namespace: None,
                 port: 8080,
                 check_interval_secs: 45,
@@ -2344,8 +2527,7 @@ mod tests {
             .request_timeout_secs(900)
             .worker_startup_timeout_secs(600)
             .worker_startup_check_interval_secs(20)
-            .discovery_config(DiscoveryConfig {
-                enabled: true,
+            .discovery_config(KubernetesDiscoveryConfig {
                 namespace: Some("production".to_string()),
                 port: 8443,
                 check_interval_secs: 120,
@@ -2378,10 +2560,10 @@ mod tests {
 
         assert_eq!(deserialized.host, "::1");
         assert_eq!(deserialized.port, 8888);
-        assert_eq!(
-            deserialized.discovery.unwrap().namespace,
-            Some("production".to_string())
-        );
+        let Some(DiscoveryConfig::Kubernetes(discovery)) = deserialized.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(discovery.namespace, Some("production".to_string()));
     }
 
     #[test]

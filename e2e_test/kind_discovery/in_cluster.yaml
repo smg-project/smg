@@ -56,7 +56,10 @@ spec:
             - 0.0.0.0
             - --port
             - "3009"
-            - --service-discovery
+            # The tagged spelling. The host-process journey (conftest.py)
+            # keeps the legacy --service-discovery, so a run covers both.
+            - --discovery-provider
+            - kubernetes
             - --selector
             - app=engines-incluster
             - --service-discovery-port

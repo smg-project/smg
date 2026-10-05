@@ -11,6 +11,7 @@ import pytest
 from smg.launch_router import RouterArgs, launch_router
 from smg.router import policy_from_str
 from smg.smg_rs import PolicyType
+from smg.smg_rs import Router as _Router
 
 
 class TestRouterConfigValidation:
@@ -435,3 +436,36 @@ class TestRouterConfigValidation:
         assert args.prefill_selector == {}
         assert args.decode_selector == {}
         assert args.storage_context_headers == {}
+
+
+class TestDiscoveryMapping:
+    """The binding's keyword-only `discovery` mapping."""
+
+    @staticmethod
+    def kubernetes_fields():
+        return {
+            "port": 8000,
+            "check_interval_secs": 60,
+            "selector": {"app": "worker"},
+            "prefill_selector": {},
+            "decode_selector": {},
+            "bootstrap_port_annotation": "sglang.ai/bootstrap-port",
+        }
+
+    def test_tagged_kubernetes_mapping_is_accepted(self):
+        _Router(worker_urls=[], discovery={"provider": "kubernetes", **self.kubernetes_fields()})
+
+    def test_untagged_mapping_reads_as_kubernetes(self):
+        _Router(worker_urls=[], discovery=self.kubernetes_fields())
+
+    def test_mapping_and_service_discovery_conflict(self):
+        with pytest.raises(ValueError, match="not both"):
+            _Router(
+                worker_urls=[],
+                service_discovery=True,
+                discovery=self.kubernetes_fields(),
+            )
+
+    def test_unknown_provider_is_rejected(self):
+        with pytest.raises(ValueError, match="Invalid discovery mapping"):
+            _Router(worker_urls=[], discovery={"provider": "zookeeper"})

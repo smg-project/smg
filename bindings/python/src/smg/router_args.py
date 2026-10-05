@@ -24,6 +24,8 @@ COMMON_POLICY_CHOICES = [
 
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
+# Worker discovery providers --discovery-provider accepts.
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes"]
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -286,6 +288,9 @@ class RouterArgs:
     prefill_max_inflight_requests_per_worker: int = -1
     prefill_queue_size: int | None = None
     prefill_queue_timeout_secs: int | None = None
+    # The worker discovery provider. service_discovery=True is the legacy
+    # spelling of discovery_provider="kubernetes"; set one or the other.
+    discovery_provider: str | None = None
 
     @staticmethod
     def add_cli_args(
@@ -1079,10 +1084,21 @@ class RouterArgs:
         )
 
         # Service discovery configuration
-        k8s_group.add_argument(
+        discovery_selection = k8s_group.add_mutually_exclusive_group()
+        discovery_selection.add_argument(
             f"--{prefix}service-discovery",
             action="store_true",
-            help="Enable Kubernetes service discovery",
+            help=(
+                "Enable Kubernetes service discovery (the legacy spelling of"
+                " --discovery-provider kubernetes)"
+            ),
+        )
+        discovery_selection.add_argument(
+            f"--{prefix}discovery-provider",
+            type=str,
+            choices=DISCOVERY_PROVIDER_CHOICES,
+            default=None,
+            help="Worker discovery provider. Give this or --service-discovery, not both",
         )
         k8s_group.add_argument(
             f"--{prefix}selector",
@@ -1878,6 +1894,23 @@ class RouterArgs:
         )
 
         return cls(**args_dict)
+
+    def selected_discovery_provider(self) -> str | None:
+        """The worker discovery provider selected by either spelling.
+
+        ``service_discovery=True`` is ``discovery_provider="kubernetes"``.
+        Setting both is an error rather than a precedence rule, as on the CLI.
+        """
+        if self.discovery_provider is not None:
+            if self.service_discovery:
+                raise ValueError("Set service_discovery=True or discovery_provider, not both")
+            if self.discovery_provider not in DISCOVERY_PROVIDER_CHOICES:
+                raise ValueError(
+                    f"Unknown discovery provider {self.discovery_provider!r};"
+                    f" expected one of {DISCOVERY_PROVIDER_CHOICES}"
+                )
+            return self.discovery_provider
+        return "kubernetes" if self.service_discovery else None
 
     def _validate_router_args(self):
         # Validate configuration based on mode

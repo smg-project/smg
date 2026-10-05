@@ -14,9 +14,9 @@ use smg::{
     config::{
         resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode,
-        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MetricsConfig,
+        OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
+        RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig,
     },
     mesh_discovery::MeshDiscoveryConfig,
@@ -25,7 +25,7 @@ use smg::{
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
     server::{self, ServerConfig},
-    service_discovery::{ModelIdSource, ServiceDiscoveryConfig},
+    service_discovery::{ModelIdSource, RuntimeDiscoveryConfig},
     version,
     worker::{ConnectionMode, RuntimeType},
 };
@@ -107,6 +107,13 @@ impl std::fmt::Display for Backend {
         };
         write!(f, "{s}")
     }
+}
+
+/// A worker discovery provider, as `--discovery-provider` names it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DiscoveryProvider {
+    #[value(name = "kubernetes")]
+    Kubernetes,
 }
 
 #[derive(Parser, Debug)]
@@ -666,13 +673,23 @@ struct CliArgs {
     log_mm_timing: bool,
 
     // ==================== Service Discovery (Kubernetes) ====================
-    /// Enable Kubernetes service discovery
+    /// Enable Kubernetes service discovery (the legacy spelling of
+    /// `--discovery-provider kubernetes`)
     #[arg(
         long,
         default_value_t = false,
         help_heading = "Service Discovery (Kubernetes)"
     )]
     service_discovery: bool,
+
+    /// Worker discovery provider. Give this or `--service-discovery`, not both
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with = "service_discovery",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    discovery_provider: Option<DiscoveryProvider>,
 
     /// Label selector for Kubernetes service discovery (format: key=value)
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -1410,6 +1427,24 @@ impl CliArgs {
             .unwrap_or(ConnectionMode::Http)
     }
 
+    /// The worker discovery provider selected by either spelling:
+    /// `--service-discovery` is `--discovery-provider kubernetes`.
+    fn selected_discovery_provider(&self) -> Option<DiscoveryProvider> {
+        if self.service_discovery {
+            Some(DiscoveryProvider::Kubernetes)
+        } else {
+            self.discovery_provider
+        }
+    }
+
+    /// Selecting a discovery provider, by either spelling, turns IGW mode on.
+    /// Returns whether this call turned it on.
+    fn enable_igw_for_discovery(&mut self) -> bool {
+        let enable = self.selected_discovery_provider().is_some() && !self.enable_igw;
+        self.enable_igw |= enable;
+        enable
+    }
+
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for item in selector_list {
@@ -1778,27 +1813,28 @@ impl CliArgs {
 
         let policy = self.parse_policy(&self.policy);
 
-        let discovery = if self.service_discovery {
-            Some(DiscoveryConfig {
-                enabled: true,
-                namespace: self.service_discovery_namespace.clone(),
-                port: self.service_discovery_port,
-                check_interval_secs: 60,
-                selector: Self::parse_selector(&self.selector),
-                encode_selector: Self::parse_selector(&self.encode_selector),
-                prefill_selector: Self::parse_selector(&self.prefill_selector),
-                decode_selector: Self::parse_selector(&self.decode_selector),
-                bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-                worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                kv_connector_annotation: self.kv_connector_annotation.clone(),
-                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
-                router_selector: Self::parse_selector(&self.router_selector),
-                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source: self.model_id_from.clone(),
-            })
-        } else {
-            None
-        };
+        let discovery = self
+            .selected_discovery_provider()
+            .map(|provider| match provider {
+                DiscoveryProvider::Kubernetes => {
+                    DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
+                        namespace: self.service_discovery_namespace.clone(),
+                        port: self.service_discovery_port,
+                        check_interval_secs: 60,
+                        selector: Self::parse_selector(&self.selector),
+                        encode_selector: Self::parse_selector(&self.encode_selector),
+                        prefill_selector: Self::parse_selector(&self.prefill_selector),
+                        decode_selector: Self::parse_selector(&self.decode_selector),
+                        bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                        worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                        kv_connector_annotation: self.kv_connector_annotation.clone(),
+                        kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                        router_selector: Self::parse_selector(&self.router_selector),
+                        router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
+                        model_id_source: self.model_id_from.clone(),
+                    })
+                }
+            });
 
         let metrics = Some(MetricsConfig {
             port: self.prometheus_port,
@@ -1984,7 +2020,7 @@ impl CliArgs {
                 disable_health_check: self.disable_health_check,
                 remove_unhealthy_workers: resolve_worker_auto_recovery(
                     self.remove_unhealthy_workers,
-                    self.service_discovery,
+                    self.selected_discovery_provider().is_some(),
                 ),
                 drain_settle_secs: self.drain_settle_secs,
             })
@@ -2053,74 +2089,15 @@ impl CliArgs {
     }
 
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
-        let service_discovery_config = if self.service_discovery {
-            let (kv_connector_annotation, kv_engine_id_annotation) = router_config
-                .discovery
-                .as_ref()
-                .map(|d| {
-                    (
-                        d.kv_connector_annotation.clone(),
-                        d.kv_engine_id_annotation.clone(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        self.kv_connector_annotation.clone(),
-                        self.kv_engine_id_annotation.clone(),
-                    )
-                });
-
-            let model_id_source = self
-                .model_id_from
-                .as_deref()
-                .or_else(|| {
-                    router_config
-                        .discovery
-                        .as_ref()
-                        .and_then(|d| d.model_id_source.as_deref())
-                })
-                .map(|s| {
-                    ModelIdSource::parse(s).map_err(|e| ConfigError::InvalidValue {
-                        field: "model_id_source".to_string(),
-                        value: s.to_string(),
-                        reason: e,
-                    })
-                })
-                .transpose()?;
-
-            Some(ServiceDiscoveryConfig {
-                enabled: true,
-                selector: Self::parse_selector(&self.selector),
-                check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
-                namespace: self.service_discovery_namespace.clone(),
-                disaggregated_mode: self.pd_disaggregation || self.epd_disaggregation,
-                encode_selector: Self::parse_selector(&self.encode_selector),
-                prefill_selector: Self::parse_selector(&self.prefill_selector),
-                decode_selector: Self::parse_selector(&self.decode_selector),
-                bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-                worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                kv_connector_annotation,
-                kv_engine_id_annotation,
-                model_id_source,
-            })
-        } else {
-            None
-        };
-
-        // Mesh-router discovery now has its own task and lifetime, but its
-        // configuration still arrives inside `discovery`, so it stays reachable
-        // only under `--service-discovery`. Moving it onto its own config
-        // surface lands with the tagged provider configuration.
+        let service_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .map(|discovery| RuntimeDiscoveryConfig::from_config(discovery, &router_config.mode))
+            .transpose()?;
         let mesh_discovery_config = router_config
             .discovery
             .as_ref()
-            .map(|d| MeshDiscoveryConfig {
-                namespace: d.namespace.clone(),
-                router_selector: d.router_selector.clone(),
-                router_mesh_port_annotation: d.router_mesh_port_annotation.clone(),
-            })
-            .filter(MeshDiscoveryConfig::is_enabled);
+            .and_then(MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
@@ -2223,10 +2200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => cli.router_args,
     };
 
-    // Automatically enable IGW mode when service discovery is turned on
-    if cli_args.service_discovery && !cli_args.enable_igw {
+    if cli_args.enable_igw_for_discovery() {
         println!("INFO: IGW mode automatically enabled because service discovery is turned on");
-        cli_args.enable_igw = true;
     }
 
     let mode_str = if cli_args.enable_igw {
@@ -2538,9 +2513,9 @@ mod tests {
     }
 
     /// Mesh-router discovery has its own task and lifetime, but is still
-    /// configured through `discovery`, which only `--service-discovery`
-    /// populates. `--router-selector` alone therefore still does nothing; it
-    /// gains its own config surface with the tagged provider configuration.
+    /// configured through Kubernetes `discovery`, which only a selected
+    /// Kubernetes provider populates. `--router-selector` alone therefore
+    /// still does nothing until router discovery gets its own config surface.
     #[test]
     fn router_selector_alone_does_not_yet_configure_mesh_discovery() {
         let cli = cli_args_from(&["--router-selector", "role=router"]);
@@ -2632,21 +2607,101 @@ mod tests {
             "example.com/engine-id",
         ]);
         let router = cli.to_router_config(vec![], vec![]).unwrap();
-        let discovery = router.discovery.as_ref().unwrap();
+        let Some(DiscoveryConfig::Kubernetes(discovery)) = &router.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
         assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
         assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
 
         let server = cli.to_server_config(router).unwrap();
-        let discovery = server.service_discovery_config.as_ref().unwrap();
+        let Some(RuntimeDiscoveryConfig::Kubernetes(discovery)) = &server.service_discovery_config
+        else {
+            panic!("expected Kubernetes runtime discovery");
+        };
         assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
         assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
 
         let defaults = cli_args_from(&["--service-discovery", "--selector", "app=worker"])
             .to_router_config(vec![], vec![])
             .unwrap();
-        let defaults = defaults.discovery.as_ref().unwrap();
+        let Some(DiscoveryConfig::Kubernetes(defaults)) = &defaults.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
         assert_eq!(defaults.kv_connector_annotation, "smg.ai/kv-connector");
         assert_eq!(defaults.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    }
+
+    /// `--discovery-provider kubernetes` is `--service-discovery` under its
+    /// new name: the same detail flags build the same configuration, worker
+    /// and router discovery alike.
+    #[test]
+    fn discovery_provider_kubernetes_matches_service_discovery() {
+        let details = [
+            "--selector",
+            "app=worker",
+            "--service-discovery-port",
+            "9000",
+            "--service-discovery-namespace",
+            "prod",
+            "--kv-connector-annotation",
+            "example.com/connector",
+            "--model-id-from",
+            "namespace",
+            "--router-selector",
+            "role=router",
+        ];
+        let build = |selection: &[&str]| {
+            let args: Vec<&str> = selection.iter().chain(details.iter()).copied().collect();
+            let cli = cli_args_from(&args);
+            let router = cli.to_router_config(vec![], vec![]).unwrap();
+            let discovery = router.discovery.clone();
+            let server = cli.to_server_config(router).unwrap();
+            (
+                discovery,
+                format!("{:?}", server.service_discovery_config),
+                format!("{:?}", server.mesh_discovery_config),
+            )
+        };
+
+        let legacy = build(&["--service-discovery"]);
+        let tagged = build(&["--discovery-provider", "kubernetes"]);
+        assert!(matches!(legacy.0, Some(DiscoveryConfig::Kubernetes(_))));
+        assert_eq!(legacy, tagged);
+    }
+
+    /// Two spellings of one choice: giving both is a usage error, not a
+    /// precedence rule to remember.
+    #[test]
+    fn service_discovery_and_discovery_provider_conflict() {
+        let err = Cli::try_parse_from([
+            "smg",
+            "--service-discovery",
+            "--discovery-provider",
+            "kubernetes",
+        ])
+        .expect_err("both spellings must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// IGW mode follows the selected provider, whichever spelling selected it.
+    #[test]
+    fn selecting_a_discovery_provider_enables_igw() {
+        for selection in [
+            &["--service-discovery"][..],
+            &["--discovery-provider", "kubernetes"][..],
+        ] {
+            let mut cli = cli_args_from(selection);
+            assert!(cli.enable_igw_for_discovery(), "{selection:?}");
+            assert!(cli.enable_igw, "{selection:?}");
+        }
+
+        let mut already_on = cli_args_from(&["--service-discovery", "--enable-igw"]);
+        assert!(!already_on.enable_igw_for_discovery());
+        assert!(already_on.enable_igw);
+
+        let mut no_discovery = cli_args_from(&[]);
+        assert!(!no_discovery.enable_igw_for_discovery());
+        assert!(!no_discovery.enable_igw);
     }
 
     /// `--worker-auto-recovery` defaults to the `--service-discovery`
@@ -2660,6 +2715,12 @@ mod tests {
             .to_router_config(vec![], vec![])
             .unwrap();
         assert!(derived_on.health_check.remove_unhealthy_workers);
+
+        let derived_on_tagged =
+            cli_args_from(&["--discovery-provider", "kubernetes", "--selector", "app=w"])
+                .to_router_config(vec![], vec![])
+                .unwrap();
+        assert!(derived_on_tagged.health_check.remove_unhealthy_workers);
 
         let derived_off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert!(!derived_off.health_check.remove_unhealthy_workers);

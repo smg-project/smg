@@ -63,7 +63,7 @@ use crate::{
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
-    service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+    service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
@@ -755,7 +755,7 @@ pub struct ServerConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub log_json: bool,
-    pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    pub service_discovery_config: Option<RuntimeDiscoveryConfig>,
     /// Kubernetes discovery of SMG mesh router peers. Independent of the
     /// worker discovery provider: either may run without the other.
     pub mesh_discovery_config: Option<MeshDiscoveryConfig>,
@@ -1484,19 +1484,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let mut discovery_tasks = DiscoveryTasks::default();
 
     if let Some(service_discovery_config) = config.service_discovery_config {
-        if service_discovery_config.enabled {
-            let app_context_arc = Arc::clone(&app_state.context);
-            match start_service_discovery(service_discovery_config, app_context_arc).await {
-                Ok(handle) => {
-                    info!("Service discovery started");
-                    discovery_tasks
-                        .0
-                        .push(supervise_discovery("Worker discovery", handle));
-                }
-                Err(e) => {
-                    error!("Failed to start service discovery: {e}");
-                    warn!("Continuing without service discovery");
-                }
+        let app_context_arc = Arc::clone(&app_state.context);
+        match start_service_discovery(service_discovery_config, app_context_arc).await {
+            Ok(handle) => {
+                info!("Service discovery started");
+                discovery_tasks
+                    .0
+                    .push(supervise_discovery("Worker discovery", handle));
+            }
+            Err(e) => {
+                error!("Failed to start service discovery: {e}");
+                warn!("Continuing without service discovery");
             }
         }
     }

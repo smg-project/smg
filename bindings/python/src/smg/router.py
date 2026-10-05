@@ -228,6 +228,10 @@ class Router:
         service_discovery: Enable Kubernetes service discovery. When enabled, the
             router will automatically discover worker pods based on the selector.
             Default: False
+        discovery: The worker discovery provider's configuration, keyword-only:
+            a mapping with a ``provider`` key and that provider's fields, read
+            like ``RouterConfig.discovery`` (no ``provider`` means Kubernetes).
+            Mutually exclusive with ``service_discovery``. Default: None
         selector: Dictionary mapping of label keys to values for Kubernetes pod
             selection. Example: {"app": "sglang-worker"}. Default: {}
         service_discovery_port: Port to use for service discovery. The router will
@@ -313,6 +317,9 @@ class Router:
         """Create a router from a RouterArgs instance."""
 
         args_dict = vars(args).copy()
+        # Kubernetes, by either spelling, reaches Rust as service_discovery.
+        args_dict["service_discovery"] = args.selected_discovery_provider() == "kubernetes"
+        args_dict.pop("discovery_provider")
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []

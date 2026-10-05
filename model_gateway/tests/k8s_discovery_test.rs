@@ -236,7 +236,6 @@ fn worker_pod(name: &str, uid: &str, ports: &str, ready: bool) -> Pod {
 
 fn discovery_config() -> ServiceDiscoveryConfig {
     ServiceDiscoveryConfig {
-        enabled: true,
         selector: [("app".to_string(), "smg-it".to_string())].into(),
         check_interval: Duration::from_millis(300),
         ..Default::default()

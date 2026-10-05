@@ -35,6 +35,8 @@ class TestRouterArgs:
 
         # Test service discovery defaults
         assert args.service_discovery is False
+        assert args.discovery_provider is None
+        assert args.selected_discovery_provider() is None
         assert args.selector == {}
         assert args.service_discovery_port == 80
         assert args.service_discovery_namespace is None
@@ -861,6 +863,40 @@ class TestParseRouterArgs:
         assert router_args.prefill_queue_size == 13
         assert router_args.prefill_queue_timeout_secs == 17
 
+    def test_parse_discovery_provider_kubernetes(self):
+        """--discovery-provider kubernetes selects Kubernetes without the legacy flag."""
+        router_args = parse_router_args(
+            ["--discovery-provider", "kubernetes", "--selector", "app=worker"]
+        )
+
+        assert router_args.discovery_provider == "kubernetes"
+        assert router_args.service_discovery is False
+        assert router_args.selected_discovery_provider() == "kubernetes"
+        assert router_args.selector == {"app": "worker"}
+
+    def test_service_discovery_and_discovery_provider_are_exclusive(self):
+        """Both spellings of one choice is a usage error, not a precedence rule."""
+        with pytest.raises(SystemExit):
+            parse_router_args(["--service-discovery", "--discovery-provider", "kubernetes"])
+
+    def test_unknown_discovery_provider_is_rejected(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--discovery-provider", "zookeeper"])
+
+    def test_selected_discovery_provider_programmatic(self):
+        """RouterArgs built in code follows the CLI's rules."""
+        assert RouterArgs(service_discovery=True).selected_discovery_provider() == "kubernetes"
+        assert (
+            RouterArgs(discovery_provider="kubernetes").selected_discovery_provider()
+            == "kubernetes"
+        )
+        with pytest.raises(ValueError, match="not both"):
+            RouterArgs(
+                service_discovery=True, discovery_provider="kubernetes"
+            ).selected_discovery_provider()
+        with pytest.raises(ValueError, match="Unknown discovery provider"):
+            RouterArgs(discovery_provider="zookeeper").selected_discovery_provider()
+
     def test_parse_service_discovery_args(self):
         """Test parsing service discovery arguments."""
         args_a = [
@@ -1541,6 +1577,7 @@ class TestRouterArgsFieldOrder:
         "prefill_max_inflight_requests_per_worker",
         "prefill_queue_size",
         "prefill_queue_timeout_secs",
+        "discovery_provider",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
