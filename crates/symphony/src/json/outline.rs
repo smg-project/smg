@@ -29,8 +29,8 @@ pub struct Outline {
     pub complete: bool,
 }
 
-/// A value's place in the text: byte offsets, the end exclusive and known only once the value is
-/// complete.
+/// A value's place in the text the outline was taken from: byte offsets, the end exclusive and
+/// known only once the value is complete. `text` and `range` take that same text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     /// The byte at which the value starts.
@@ -92,6 +92,11 @@ pub fn outline(text: &str) -> Outline {
         let Some(value_start) = after_whitespace(text, colon + 1) else {
             return found;
         };
+        if text[value_start..].starts_with([',', '}', ']', ':']) {
+            // A delimiter where a value should start: the object is malformed from here, and the
+            // outline says nothing it would have to take back.
+            return found;
+        }
         let value_end = value_end(text, value_start);
         let key = decode_string(&text[key_start..key_end]);
         if found.name.is_none() && key.as_deref().is_some_and(|k| NAME_KEYS.contains(&k)) {
@@ -142,7 +147,10 @@ fn string_end(text: &str, at: usize) -> Option<usize> {
 ///
 /// Objects and arrays end at their matching bracket, strings at their closing quote, and numbers
 /// and literals at the first byte that cannot continue them, which exists only once something
-/// follows them: a number cut at the end of the text may still grow.
+/// follows them: a number cut at the end of the text may still grow. Bracket kinds are not told
+/// apart (a `]` closes a `{` at the same depth) and any Unicode whitespace separates: the outline
+/// finds where the model's value ends, and whether that value is valid JSON is for the format to
+/// decide when it parses the bytes.
 fn value_end(text: &str, at: usize) -> Option<usize> {
     let rest = &text[at..];
     match rest.chars().next()? {
@@ -325,6 +333,24 @@ mod tests {
             r#"{"q": "a } ] \" {", "n": [1, "]"]}"#
         );
         assert!(found.complete);
+    }
+
+    #[test]
+    fn a_delimiter_where_a_value_should_start_ends_the_outline_without_a_span() {
+        for text in [
+            r#"{"arguments": }"#,
+            r#"{"arguments": ,}"#,
+            r#"{"arguments": ]"#,
+            r#"{"arguments": :"#,
+        ] {
+            let found = outline(text);
+            assert_eq!(found.arguments, None, "{text:?}: no value, so no span");
+            assert!(
+                !found.complete,
+                "{text:?}: a malformed object does not close"
+            );
+        }
+        assert_eq!(outline(r#"{"name": }"#).name, None);
     }
 
     #[test]
