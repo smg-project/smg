@@ -57,7 +57,7 @@ pub enum MalformedReason {
 }
 
 /// The finish reason the parser reports after refining the engine's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     /// Natural stop.
@@ -68,6 +68,8 @@ pub enum FinishReason {
     ToolCalls,
     /// The request was aborted.
     Abort,
+    /// A finish reason this crate does not interpret, carried through from the engine verbatim.
+    Other(String),
 }
 
 /// One parsed unit of model output, in wire order.
@@ -90,6 +92,8 @@ pub enum Event {
         id: String,
         /// The function name.
         name: String,
+        /// The output bytes this event accounts for: the opening marker and the name as written.
+        source: Text,
     },
     /// A fragment of the call's arguments. Concatenated fragments for one index are always a
     /// valid JSON prefix and equal the final arguments when the call ends.
@@ -98,11 +102,17 @@ pub enum Event {
         index: u32,
         /// The fragment, as JSON text.
         json: String,
+        /// The output bytes this event accounts for, in the format's own syntax. Empty when the
+        /// fragment came from bytes an earlier event already accounted for.
+        source: Text,
     },
     /// The call's region closed.
     ToolCallEnd {
         /// Which call ended.
         index: u32,
+        /// The output bytes this event accounts for: the closing marker, and any buffered bytes
+        /// no earlier event of this call accounted for.
+        source: Text,
     },
     /// Text the format consumed without showing it.
     Dropped {
@@ -184,18 +194,20 @@ impl Events {
         self.items.is_empty()
     }
 
-    /// All text these events carry, in order: content, reasoning, dropped and malformed text.
-    /// Tool-call arguments are not included, they are JSON derived from the source bytes rather
-    /// than the bytes themselves; the conservation check covers them through their source spans.
+    /// The output bytes these events account for, in order: content, reasoning, dropped and
+    /// malformed text, and the source bytes of tool-call events. For a complete, well-formed
+    /// parse this equals the model's output byte for byte; that is the conservation property.
     pub fn text(&self) -> String {
         let mut out = String::new();
         for event in &self.items {
             match event {
                 Event::Content(t) | Event::Reasoning(t) => out.push_str(&t.s),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => {
-                    out.push_str(&text.s);
-                }
-                _ => {}
+                Event::Dropped { text, .. }
+                | Event::Malformed { text, .. }
+                | Event::ToolCallStart { source: text, .. }
+                | Event::ToolCallArguments { source: text, .. }
+                | Event::ToolCallEnd { source: text, .. } => out.push_str(&text.s),
+                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => {}
             };
         }
         out
@@ -293,12 +305,18 @@ mod tests {
             index: 0,
             id: "call_1".into(),
             name: "f".into(),
+            source: Text::new("<tool_call>f", 3),
+        });
+        events.push(Event::ToolCallArguments {
+            index: 0,
+            json: "{\"a\":1".into(),
+            source: Text::new("<arg a=1>", 4),
         });
         events.push(Event::Malformed {
             text: Text::new("{broken", 2),
             why: MalformedReason::InvalidArguments,
         });
-        assert_eq!(events.text(), "a<m>{broken");
+        assert_eq!(events.text(), "a<m><tool_call>f<arg a=1>{broken");
     }
 
     #[test]
@@ -306,11 +324,12 @@ mod tests {
         let event = Event::ToolCallArguments {
             index: 2,
             json: "{\"a\":".into(),
+            source: Text::new("<a>", 1),
         };
         let json = serde_json::to_string(&event).expect("serializes");
         assert_eq!(
             json,
-            r#"{"kind":"tool_call_arguments","index":2,"json":"{\"a\":"}"#
+            r#"{"kind":"tool_call_arguments","index":2,"json":"{\"a\":","source":{"s":"<a>","tokens":1}}"#
         );
         let back: Event = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, event);
@@ -324,5 +343,8 @@ mod tests {
             finish,
             r#"{"kind":"finish","reason":"tool_calls","tool_calls":1,"reasoning_tokens":7}"#
         );
+        let other = serde_json::to_string(&FinishReason::Other("content_filter".into()))
+            .expect("serializes");
+        assert_eq!(other, r#"{"other":"content_filter"}"#);
     }
 }

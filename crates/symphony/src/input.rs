@@ -1,34 +1,40 @@
 //! What a parser is fed: the prompt, decoded deltas, and the end of the stream.
 
-/// Where one engine token's bytes sit in the decoded text of a delta, as byte offsets into that
-/// text.
+/// Where some bytes of the decoded text of a delta came from, as byte offsets into that text.
 ///
 /// The spans of a delta partition its text: they are in order, contiguous, and together cover
-/// every byte, which [`TokenSpan::cover`] checks. `end` is exclusive.
+/// every byte, which [`TokenSpan::cover`] checks. `end` is exclusive. Boundaries fall on
+/// character boundaries, because the decoder only releases whole characters.
 ///
-/// Two cases have no bytes of their own and get `start == end`:
+/// Each engine token is listed exactly once in `token_ids`, in the delta the engine produced it
+/// in, and has exactly one span with `continued == false` in that same delta. That is the span
+/// to count when counting tokens. It is zero-width (`start == end`) in two cases:
 ///
 /// - a special token the decoder hid (`skip_special_tokens`), which parsers that match markers
 ///   by token identity still see;
 /// - a token whose bytes the decoder is still holding, because they end an incomplete UTF-8
-///   sequence or a possible stop string. Such a token sits at the end of the delta with a
-///   zero-width span. When its bytes are released in a later delta they are attributed to the
-///   same token id again, so one id can appear in more than one delta. Parsers read a span as
-///   "these bytes came from token X", never as "token X occurred once".
+///   sequence or a possible stop string.
+///
+/// Bytes the decoder releases later than the token that produced them appear in the later delta
+/// under a span with `continued == true` and the same `token_id`. Such a span is never counted
+/// as a token. A character completed by a later token belongs to that later token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenSpan {
     /// The engine's token id.
     pub token_id: u32,
-    /// First byte of this token's text in the delta.
+    /// First byte of this span in the delta's text.
     pub start: usize,
-    /// One past the last byte of this token's text in the delta.
+    /// One past the last byte of this span in the delta's text.
     pub end: usize,
+    /// Whether these bytes belong to a token listed in an earlier delta.
+    pub continued: bool,
 }
 
 impl TokenSpan {
     /// Whether `spans` partition `text`: in order, contiguous, starting at zero and ending at
     /// `text.len()`, with every boundary on a character boundary. Zero-width spans are allowed
-    /// anywhere. An empty `spans` covers only empty text.
+    /// anywhere. An empty `spans` covers only empty text. This checks the layout, not the
+    /// `continued` flags.
     pub fn cover(text: &str, spans: &[TokenSpan]) -> bool {
         let mut at = 0;
         for span in spans {
@@ -68,12 +74,13 @@ pub enum Input<'a> {
     /// One engine chunk, decoded. The gateway owns detokenization, so ids, text and their
     /// alignment are all available.
     Delta {
-        /// Token ids in this chunk.
+        /// The tokens the engine produced in this chunk, each listed once.
         token_ids: &'a [u32],
-        /// Decoded text of this chunk.
+        /// The text the decoder released for this chunk.
         text: &'a str,
-        /// One span per entry of `token_ids`, in the same order, locating each token's bytes in
-        /// `text`; together they partition `text` (see [`TokenSpan::cover`]).
+        /// Where the bytes of `text` came from: one span with `continued == false` per entry of
+        /// `token_ids`, in the same order, plus `continued` spans for bytes released late from
+        /// earlier tokens. Together they partition `text` (see [`TokenSpan::cover`]).
         spans: &'a [TokenSpan],
     },
     /// The stream ended. The parser flushes what it holds and reports the finish.
@@ -92,6 +99,14 @@ mod tests {
             token_id,
             start,
             end,
+            continued: false,
+        }
+    }
+
+    fn continued(token_id: u32, start: usize, end: usize) -> TokenSpan {
+        TokenSpan {
+            continued: true,
+            ..span(token_id, start, end)
         }
     }
 
@@ -108,6 +123,14 @@ mod tests {
             "ab",
             &[span(7, 0, 0), span(1, 0, 1), span(2, 1, 2), span(8, 2, 2)]
         ));
+    }
+
+    #[test]
+    fn bytes_released_late_are_continued_spans_of_the_earlier_token() {
+        // Delta 1: token 5 produced "<", which the decoder held as a possible stop string.
+        assert!(TokenSpan::cover("ab", &[span(4, 0, 2), span(5, 2, 2)]));
+        // Delta 2: the held "<" is released together with token 6's text.
+        assert!(TokenSpan::cover("<c", &[continued(5, 0, 1), span(6, 1, 2)]));
     }
 
     #[test]

@@ -8,9 +8,10 @@ use crate::{event::Events, input::Input};
 /// them, then one `End`. Whole-output parsing is the same sequence with a single `Delta`, so
 /// streaming and non-streaming share one implementation.
 ///
-/// On `Err`, everything already pushed into `out` is final. The caller then feeds `End`, and the
-/// parser reports what it still held as a `Malformed` event, so the bytes are returned rather than
-/// lost.
+/// On `Err`, everything already pushed into `out` is final. After a `BufferOverflow` or
+/// `Internal` error the caller feeds `End`, and the parser reports what it still held as a
+/// `Malformed` event, so the bytes are returned rather than lost. After a `Lifecycle` error the
+/// stream is already over or was never started; the parser holds nothing and emits nothing more.
 pub trait Parser: Send {
     /// Feed one lifecycle step and append the resulting events to `out`.
     fn feed(&mut self, input: Input<'_>, out: &mut Events) -> Result<(), ParseError>;
