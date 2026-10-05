@@ -3,7 +3,7 @@
 /// Where some bytes of the decoded text of a delta came from, as byte offsets into that text.
 ///
 /// The spans of a delta partition its text: they are in order, contiguous, and together cover
-/// every byte, which [`TokenSpan::cover`] checks. `end` is exclusive. Boundaries fall on
+/// every byte, which [`TokenSpan::partitions`] checks. `end` is exclusive. Boundaries fall on
 /// character boundaries, because the decoder only releases whole characters.
 ///
 /// Each engine token is listed exactly once in `token_ids`, in the delta the engine produced it
@@ -35,7 +35,7 @@ impl TokenSpan {
     /// `text.len()`, with every boundary on a character boundary. Zero-width spans are allowed
     /// anywhere. An empty `spans` covers only empty text. This checks the layout, not the
     /// `continued` flags.
-    pub fn cover(text: &str, spans: &[TokenSpan]) -> bool {
+    pub fn partitions(text: &str, spans: &[TokenSpan]) -> bool {
         let mut at = 0;
         for span in spans {
             if span.start != at || span.end < span.start || !text.is_char_boundary(span.end) {
@@ -80,7 +80,7 @@ pub enum Input<'a> {
         text: &'a str,
         /// Where the bytes of `text` came from: one span with `continued == false` per entry of
         /// `token_ids`, in the same order, plus `continued` spans for bytes released late from
-        /// earlier tokens. Together they partition `text` (see [`TokenSpan::cover`]).
+        /// earlier tokens. Together they partition `text` (see [`TokenSpan::partitions`]).
         spans: &'a [TokenSpan],
     },
     /// The stream ended. The parser flushes what it holds and reports the finish.
@@ -111,15 +111,18 @@ mod tests {
     }
 
     #[test]
-    fn spans_that_partition_the_text_cover_it() {
-        assert!(TokenSpan::cover("héllo", &[span(1, 0, 3), span(2, 3, 6)]));
-        assert!(TokenSpan::cover("", &[]));
-        assert!(TokenSpan::cover("", &[span(9, 0, 0)]));
+    fn spans_that_partition_the_text_are_accepted() {
+        assert!(TokenSpan::partitions(
+            "héllo",
+            &[span(1, 0, 3), span(2, 3, 6)]
+        ));
+        assert!(TokenSpan::partitions("", &[]));
+        assert!(TokenSpan::partitions("", &[span(9, 0, 0)]));
     }
 
     #[test]
     fn zero_width_spans_for_hidden_or_held_tokens_are_allowed() {
-        assert!(TokenSpan::cover(
+        assert!(TokenSpan::partitions(
             "ab",
             &[span(7, 0, 0), span(1, 0, 1), span(2, 1, 2), span(8, 2, 2)]
         ));
@@ -128,16 +131,25 @@ mod tests {
     #[test]
     fn bytes_released_late_are_continued_spans_of_the_earlier_token() {
         // Delta 1: token 5 produced "<", which the decoder held as a possible stop string.
-        assert!(TokenSpan::cover("ab", &[span(4, 0, 2), span(5, 2, 2)]));
+        assert!(TokenSpan::partitions("ab", &[span(4, 0, 2), span(5, 2, 2)]));
         // Delta 2: the held "<" is released together with token 6's text.
-        assert!(TokenSpan::cover("<c", &[continued(5, 0, 1), span(6, 1, 2)]));
+        assert!(TokenSpan::partitions(
+            "<c",
+            &[continued(5, 0, 1), span(6, 1, 2)]
+        ));
     }
 
     #[test]
-    fn gaps_overlaps_short_coverage_and_split_characters_do_not_cover() {
-        assert!(!TokenSpan::cover("abc", &[span(1, 0, 1), span(2, 2, 3)]));
-        assert!(!TokenSpan::cover("abc", &[span(1, 0, 2), span(2, 1, 3)]));
-        assert!(!TokenSpan::cover("abc", &[span(1, 0, 2)]));
-        assert!(!TokenSpan::cover("é", &[span(1, 0, 1), span(2, 1, 2)]));
+    fn gaps_overlaps_short_coverage_and_split_characters_are_rejected() {
+        assert!(!TokenSpan::partitions(
+            "abc",
+            &[span(1, 0, 1), span(2, 2, 3)]
+        ));
+        assert!(!TokenSpan::partitions(
+            "abc",
+            &[span(1, 0, 2), span(2, 1, 3)]
+        ));
+        assert!(!TokenSpan::partitions("abc", &[span(1, 0, 2)]));
+        assert!(!TokenSpan::partitions("é", &[span(1, 0, 1), span(2, 1, 2)]));
     }
 }

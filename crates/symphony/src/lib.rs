@@ -22,11 +22,9 @@
 #![forbid(unsafe_code)]
 
 pub mod event;
-pub mod format;
 pub mod input;
 pub mod parser;
 
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
-pub use format::Format;
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use parser::{ParseError, Parser};

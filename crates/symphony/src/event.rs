@@ -2,31 +2,43 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A run of text and the number of engine tokens it came from.
+/// A run of text and, when the parser saw token ids, the number of engine tokens it came from.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Text {
     /// The text.
-    pub s: String,
-    /// How many engine tokens produced it; zero when unknown.
-    pub tokens: u32,
+    pub text: String,
+    /// How many engine tokens produced it. `None` when the parser was not given token ids, as
+    /// through the compatibility bridge over the old crates.
+    pub tokens: Option<u32>,
 }
 
 impl Text {
-    /// A text run.
-    pub fn new(s: impl Into<String>, tokens: u32) -> Self {
+    /// A text run with a known token count.
+    pub fn new(text: impl Into<String>, tokens: u32) -> Self {
         Self {
-            s: s.into(),
-            tokens,
+            text: text.into(),
+            tokens: Some(tokens),
+        }
+    }
+
+    /// A text run whose token count is not known.
+    pub fn uncounted(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tokens: None,
         }
     }
 
     fn is_nothing(&self) -> bool {
-        self.s.is_empty() && self.tokens == 0
+        self.text.is_empty() && self.tokens.unwrap_or(0) == 0
     }
 
     fn append(&mut self, other: &Text) {
-        self.s.push_str(&other.s);
-        self.tokens += other.tokens;
+        self.text.push_str(&other.text);
+        self.tokens = match (self.tokens, other.tokens) {
+            (Some(a), Some(b)) => Some(a + b),
+            _ => None,
+        };
     }
 }
 
@@ -170,13 +182,13 @@ impl Events {
     }
 
     /// Append visible text.
-    pub fn push_content(&mut self, s: impl Into<String>, tokens: u32) {
-        self.push(Event::Content(Text::new(s, tokens)));
+    pub fn push_content(&mut self, text: Text) {
+        self.push(Event::Content(text));
     }
 
     /// Append reasoning text.
-    pub fn push_reasoning(&mut self, s: impl Into<String>, tokens: u32) {
-        self.push(Event::Reasoning(Text::new(s, tokens)));
+    pub fn push_reasoning(&mut self, text: Text) {
+        self.push(Event::Reasoning(text));
     }
 
     /// The events so far.
@@ -201,12 +213,12 @@ impl Events {
         let mut out = String::new();
         for event in &self.items {
             match event {
-                Event::Content(t) | Event::Reasoning(t) => out.push_str(&t.s),
+                Event::Content(t) | Event::Reasoning(t) => out.push_str(&t.text),
                 Event::Dropped { text, .. }
                 | Event::Malformed { text, .. }
                 | Event::ToolCallStart { source: text, .. }
                 | Event::ToolCallArguments { source: text, .. }
-                | Event::ToolCallEnd { source: text, .. } => out.push_str(&text.s),
+                | Event::ToolCallEnd { source: text, .. } => out.push_str(&text.text),
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => {}
             };
         }
@@ -217,17 +229,6 @@ impl Events {
     /// pushes never merge into it.
     pub fn drain(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.items)
-    }
-
-    /// Consume the list.
-    pub fn into_vec(self) -> Vec<Event> {
-        self.items
-    }
-}
-
-impl From<Events> for Vec<Event> {
-    fn from(events: Events) -> Self {
-        events.items
     }
 }
 
@@ -247,8 +248,8 @@ mod tests {
     #[test]
     fn adjacent_content_merges_and_counts_tokens() {
         let mut events = Events::new();
-        events.push_content("Hel", 1);
-        events.push_content("lo", 2);
+        events.push_content(Text::new("Hel", 1));
+        events.push_content(Text::new("lo", 2));
         assert_eq!(events.as_slice(), &[Event::Content(Text::new("Hello", 3))]);
     }
 
@@ -256,11 +257,11 @@ mod tests {
     fn adjacent_reasoning_merges_but_not_across_kinds() {
         let mut events = Events::new();
         events.push(Event::ReasoningStart);
-        events.push_reasoning("think", 1);
-        events.push_reasoning("ing", 1);
+        events.push_reasoning(Text::new("think", 1));
+        events.push_reasoning(Text::new("ing", 1));
         events.push(Event::ReasoningEnd);
-        events.push_content("answer", 1);
-        events.push_reasoning("late", 1);
+        events.push_content(Text::new("answer", 1));
+        events.push_reasoning(Text::new("late", 1));
         assert_eq!(
             events.as_slice(),
             &[
@@ -276,27 +277,36 @@ mod tests {
     #[test]
     fn drained_events_are_final_and_later_text_starts_a_new_event() {
         let mut events = Events::new();
-        events.push_content("Hel", 1);
+        events.push_content(Text::new("Hel", 1));
         let taken = events.drain();
         assert_eq!(taken, vec![Event::Content(Text::new("Hel", 1))]);
         assert!(events.is_empty());
-        events.push_content("lo", 1);
+        events.push_content(Text::new("lo", 1));
         assert_eq!(events.as_slice(), &[Event::Content(Text::new("lo", 1))]);
     }
 
     #[test]
     fn empty_text_is_not_recorded_but_tokens_without_text_are() {
         let mut events = Events::new();
-        events.push_content("", 0);
+        events.push_content(Text::new("", 0));
+        events.push_content(Text::uncounted(""));
         assert!(events.is_empty());
-        events.push_content("", 1);
+        events.push_content(Text::new("", 1));
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn a_merge_with_an_uncounted_run_loses_the_count() {
+        let mut events = Events::new();
+        events.push_content(Text::new("a", 1));
+        events.push_content(Text::uncounted("b"));
+        assert_eq!(events.as_slice(), &[Event::Content(Text::uncounted("ab"))]);
     }
 
     #[test]
     fn text_concatenates_shown_dropped_and_malformed_in_order() {
         let mut events = Events::new();
-        events.push_content("a", 1);
+        events.push_content(Text::new("a", 1));
         events.push(Event::Dropped {
             text: Text::new("<m>", 1),
             why: DropReason::ControlToken,
@@ -329,7 +339,7 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serializes");
         assert_eq!(
             json,
-            r#"{"kind":"tool_call_arguments","index":2,"json":"{\"a\":","source":{"s":"<a>","tokens":1}}"#
+            r#"{"kind":"tool_call_arguments","index":2,"json":"{\"a\":","source":{"text":"<a>","tokens":1}}"#
         );
         let back: Event = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, event);
