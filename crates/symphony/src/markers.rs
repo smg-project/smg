@@ -27,10 +27,15 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    /// A scanner for `markers`. With none, every byte is text.
+    /// A scanner for `markers`. With none, every byte is text. An empty string is no marker and is
+    /// dropped, so the scan always moves forward; the indices of the pieces count the markers kept.
     pub fn new(markers: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
-            markers: markers.into_iter().map(Into::into).collect(),
+            markers: markers
+                .into_iter()
+                .map(Into::into)
+                .filter(|marker| !marker.is_empty())
+                .collect(),
             held: String::new(),
         }
     }
@@ -277,6 +282,24 @@ mod tests {
         let mut scanner = Scanner::new(markers);
         assert_eq!(scanner.feed("ok <｜tool"), vec![Piece::Text("ok ".into())]);
         assert_eq!(scanner.held(), "<｜tool");
+    }
+
+    #[test]
+    fn an_empty_marker_is_dropped_so_the_scan_always_moves_forward() {
+        let mut scanner = Scanner::new(["", "<think>", ""]);
+        assert_eq!(
+            scanner.feed("a<think>b"),
+            vec![
+                Piece::Text("a".into()),
+                Piece::Marker(0),
+                Piece::Text("b".into()),
+            ]
+        );
+        assert_eq!(scanner.marker(0), "<think>");
+        assert_eq!(
+            Scanner::new([""]).feed("plain"),
+            vec![Piece::Text("plain".into())]
+        );
     }
 
     #[test]
