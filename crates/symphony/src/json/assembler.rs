@@ -14,13 +14,31 @@
 //! after the value is the `source` of `ToolCallEnd`. When the arguments come before the name they
 //! are held until the name is whole, since a call starts before its arguments.
 //!
+//! The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form a
+//! valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is checked
+//! with [`PartialJson`] in prefix mode before it is emitted, and from the first byte the parser cannot
+//! take, the argument bytes come back as `Malformed` with `InvalidArguments` instead, nothing already
+//! emitted being revised. The prefix parser tolerates what the old crate tolerated (a bracket closed
+//! by the wrong kind, a literal's prefix), so the promise is exactly as strong as that parser.
+//!
+//! A started call whose object never closes is closed at `finish` with what arrived, and the bytes
+//! after its last complete member (a comma cut short, or bytes that are no member) come back as
+//! `Malformed` with `UnterminatedRegion`.
+//!
+//! `feed` takes one piece and returns how many of its bytes the object took: all of them before the
+//! close, and up to the closing brace in the piece that carries it, so the format routes whatever
+//! follows the object (a closing marker, more text) itself. Bytes fed after the close are not taken.
+//!
 //! What the assembler does not decide: the call's index and id (the format mints them and passes
 //! them to [`Assembler::new`]), whether the name is a declared tool, and whether a string-valued
 //! arguments member should be decoded. The format decides those with the events in hand.
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},
-    json::outline::{outline, Span},
+    json::{
+        outline::{outline, Span},
+        partial::PartialJson,
+    },
 };
 
 /// The events of one tool call, from the bytes of its object.
@@ -30,7 +48,10 @@ pub struct Assembler {
     id: String,
     text: String,
     started: bool,
+    /// Argument bytes accounted for so far, as fragments or as malformed text.
     emitted: usize,
+    /// The argument byte from which the arguments stopped being a valid JSON prefix, if they did.
+    invalid_from: Option<usize>,
     done: bool,
 }
 
@@ -43,30 +64,42 @@ impl Assembler {
             text: String::new(),
             started: false,
             emitted: 0,
+            invalid_from: None,
             done: false,
         }
     }
 
-    /// Whether the object has closed; bytes fed after that are ignored, so the format stops here.
+    /// Whether the object has closed; `feed` takes nothing after that, so the format stops here.
     pub fn done(&self) -> bool {
         self.done
     }
 
-    /// Append the next bytes of the object and push the events they complete.
-    pub fn feed(&mut self, bytes: &str, out: &mut Events) {
+    /// Append the next bytes of the object, push the events they complete, and return how many of
+    /// the bytes the object took: all of them before the close, up to the closing brace in the
+    /// piece that carries it, none after it.
+    pub fn feed(&mut self, bytes: &str, out: &mut Events) -> usize {
         if self.done {
-            return;
+            return 0;
         }
+        let before = self.text.len();
         self.text.push_str(bytes);
-        let found = outline(&self.text);
+        let mut found = outline(&self.text);
+        let taken = match found.close {
+            Some(close) => {
+                self.text.truncate(close);
+                found = outline(&self.text);
+                close - before
+            }
+            None => bytes.len(),
+        };
         if !self.started {
             let Some(name) = found.name.clone() else {
-                return;
+                return taken;
             };
-            let head_end = match (&found.arguments, found.complete) {
+            let head_end = match (&found.arguments, found.close) {
                 (Some(span), _) => span.start,
-                (None, true) => self.text.len(),
-                (None, false) => return,
+                (None, Some(close)) => close,
+                (None, None) => return taken,
             };
             out.push(Event::ToolCallStart {
                 index: self.index,
@@ -77,22 +110,24 @@ impl Assembler {
             self.started = true;
         }
         self.emit_new_argument_bytes(found.arguments.as_ref(), out);
-        if found.complete {
+        if let Some(close) = found.close {
             let tail_start = found
                 .arguments
                 .as_ref()
                 .and_then(|span| span.end)
-                .unwrap_or(self.text.len());
+                .unwrap_or(close);
             out.push(Event::ToolCallEnd {
                 index: self.index,
-                source: Text::uncounted(&self.text[tail_start..]),
+                source: Text::uncounted(&self.text[tail_start..close]),
             });
             self.done = true;
         }
+        taken
     }
 
-    /// No more bytes will come. A call that started is closed with what arrived; an object that
-    /// never named its call, or never closed, comes back as `Malformed`, so its bytes are not lost.
+    /// No more bytes will come. A call that started is closed with what arrived, the bytes after
+    /// its last complete member returned as `Malformed`; an object that never named its call comes
+    /// back as `Malformed` whole. Either way no byte is lost.
     pub fn finish(self, out: &mut Events) {
         if self.done {
             return;
@@ -101,18 +136,26 @@ impl Assembler {
         if self.started {
             let mut this = self;
             this.emit_new_argument_bytes(found.arguments.as_ref(), out);
+            // The object never closed: whatever followed its last complete member is not part of a
+            // well-formed call, whether a comma cut short or bytes that are no member at all.
             let tail_start = found
                 .arguments
                 .as_ref()
                 .and_then(|span| span.end)
                 .unwrap_or(this.text.len());
+            if tail_start < this.text.len() {
+                out.push(Event::Malformed {
+                    text: Text::uncounted(&this.text[tail_start..]),
+                    why: MalformedReason::UnterminatedRegion,
+                });
+            }
             out.push(Event::ToolCallEnd {
                 index: this.index,
-                source: Text::uncounted(&this.text[tail_start..]),
+                source: Text::default(),
             });
             return;
         }
-        let why = if found.complete {
+        let why = if found.complete() {
             MalformedReason::Other("a tool call without a name".to_string())
         } else {
             MalformedReason::UnterminatedRegion
@@ -125,18 +168,37 @@ impl Assembler {
         }
     }
 
-    /// The argument bytes that arrived since the last fragment, as one fragment.
+    /// The argument bytes that arrived since the last call: a fragment for the part that keeps the
+    /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken.
     fn emit_new_argument_bytes(&mut self, arguments: Option<&Span>, out: &mut Events) {
         let Some(span) = arguments else {
             return;
         };
         let bytes = span.text(&self.text);
-        if bytes.len() > self.emitted {
-            let fresh = &bytes[self.emitted..];
+        if bytes.len() <= self.emitted {
+            return;
+        }
+        let valid_end = match self.invalid_from {
+            Some(from) => from,
+            None => match PartialJson::default().parse(bytes, true) {
+                Ok((_, consumed)) if consumed == bytes.len() => bytes.len(),
+                Ok((_, consumed)) => *self.invalid_from.insert(consumed.max(self.emitted)),
+                Err(_) => *self.invalid_from.insert(self.emitted),
+            },
+        };
+        if self.emitted < valid_end {
+            let fresh = &bytes[self.emitted..valid_end];
             out.push(Event::ToolCallArguments {
                 index: self.index,
                 json: fresh.to_string(),
                 source: Text::uncounted(fresh),
+            });
+            self.emitted = valid_end;
+        }
+        if self.emitted < bytes.len() {
+            out.push(Event::Malformed {
+                text: Text::uncounted(&bytes[self.emitted..]),
+                why: MalformedReason::InvalidArguments,
             });
             self.emitted = bytes.len();
         }
@@ -356,25 +418,95 @@ mod tests {
         let events = run(&[r#"{"name": "f", "arguments": {},"#]);
         assert_eq!(arguments(&events), "{}");
         assert_eq!(
-            events.last(),
-            Some(&Event::ToolCallEnd {
-                index: 0,
-                source: Text::uncounted(","),
-            })
+            &events[events.len() - 2..],
+            [
+                Event::Malformed {
+                    text: Text::uncounted(","),
+                    why: MalformedReason::UnterminatedRegion,
+                },
+                Event::ToolCallEnd {
+                    index: 0,
+                    source: Text::default(),
+                },
+            ]
         );
     }
 
     #[test]
-    fn bytes_after_the_close_are_ignored_and_done_says_so() {
+    fn feed_says_how_many_bytes_the_object_took_and_takes_none_after_the_close() {
         let mut assembler = Assembler::new(0, "call_0");
         let mut out = Events::new();
-        assembler.feed(CALL, &mut out);
+        let piece = format!("{CALL}\n</tool_call>\nmore text");
+        assert_eq!(assembler.feed(&piece, &mut out), CALL.len());
         assert!(assembler.done());
+        assert_eq!(
+            out.as_slice().last(),
+            Some(&Event::ToolCallEnd {
+                index: 0,
+                source: Text::uncounted("}"),
+            }),
+            "the surplus after the brace is the format's, not the end's"
+        );
+        assert_eq!(sources(out.as_slice()), CALL);
         let before = out.len();
-        assembler.feed("}}", &mut out);
+        assert_eq!(assembler.feed("}}", &mut out), 0);
         assert_eq!(out.len(), before);
         assembler.finish(&mut out);
         assert_eq!(out.len(), before);
+        let mut assembler = Assembler::new(0, "call_0");
+        let cut = r#"{"name": "f", "arg"#.len();
+        assert_eq!(
+            assembler.feed(&CALL[..cut], &mut out),
+            cut,
+            "before the close every byte is taken"
+        );
+    }
+
+    #[test]
+    fn arguments_that_stop_being_a_json_prefix_come_back_malformed_from_that_byte() {
+        let events = run(&[r#"{"name": "f", "arguments": 12abc}"#]);
+        assert_eq!(
+            events,
+            vec![
+                Event::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "f".into(),
+                    source: Text::uncounted(r#"{"name": "f", "arguments": "#),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "12".into(),
+                    source: Text::uncounted("12"),
+                },
+                Event::Malformed {
+                    text: Text::uncounted("abc"),
+                    why: MalformedReason::InvalidArguments,
+                },
+                Event::ToolCallEnd {
+                    index: 0,
+                    source: Text::uncounted("}"),
+                },
+            ]
+        );
+        // Byte by byte, with the junk after the value rather than inside it: the arguments stay
+        // whole, the object never closes, and the junk comes back as the unterminated region's tail.
+        let text = r#"{"name": "f", "arguments": {"a": 1} junk}"#;
+        let pieces: Vec<&str> = text
+            .char_indices()
+            .map(|(i, c)| &text[i..i + c.len_utf8()])
+            .collect();
+        let events = run(&pieces);
+        assert_eq!(arguments(&events), r#"{"a": 1}"#);
+        let malformed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(malformed, " junk}");
+        assert_eq!(sources(&events), text);
     }
 
     #[test]
