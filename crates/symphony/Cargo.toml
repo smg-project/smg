@@ -1,0 +1,25 @@
+[package]
+name = "smg-symphony"
+version = "0.0.1"
+edition = "2021"
+description = "One parser for everything a model says: content, reasoning and tool calls as typed events from one streaming entry point"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+authors = [
+    "Simo Lin <linsimo.mark@gmail.com>",
+    "Chang Su <mckvtl@gmail.com>",
+]
+keywords = ["llm", "parser", "tool-calling", "reasoning", "streaming"]
+categories = ["parsing", "text-processing"]
+publish = false
+
+[lib]
+name = "symphony"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
