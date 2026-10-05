@@ -1,18 +1,26 @@
-//! Chat Completions: parser events as stream choices.
+//! Chat Completions: parser events as stream choices or as one message.
 //!
-//! [`delta`] maps one [`Event`] to at most one [`ChatStreamChoice`]. It is pure: call ids ride on
-//! the events, the finish reason is decided from the `Finish` event alone, and nothing is remembered
-//! between calls. The driver wraps the choices in the response envelope (request id, model,
-//! timestamp, usage) and sets `matched_stop` on the finishing choice, since the engine's stop match
-//! is not something the events carry.
+//! [`delta`] maps one [`Event`] to at most one [`ChatStreamChoice`]; [`message`] folds a whole
+//! event sequence into one [`ChatChoice`]. Both are pure: call ids ride on the events, the finish
+//! reason is decided from the `Finish` event alone, and nothing is remembered between calls. The
+//! driver wraps the choices in the response envelope (request id, model, timestamp, usage) and sets
+//! `matched_stop`, and `logprobs` where it has them, since the events carry neither.
 //!
 //! The shapes are the ones SMG's gateway sends today, the same fields in the same places:
 //!
 //! - content and reasoning deltas carry `role: "assistant"`; reasoning goes to `reasoning_content`;
 //! - a call begins with its `id`, `type: "function"` and `name` and no arguments; every later
 //!   fragment carries the call's `index` and `arguments` only;
-//! - the finishing choice has an empty delta without a role, and `finish_reason` is the engine's
-//!   reason, except that `stop` after at least one tool call becomes `tool_calls`.
+//! - the finishing choice has an empty delta without a role;
+//! - the whole message has `content` only when it is not whitespace, `reasoning_content` only when
+//!   there was reasoning, and `tool_calls` only when a call was made, each call with its id, name
+//!   and its argument fragments joined.
+//!
+//! One rule for `finish_reason`, in both shapes: the engine's reason, except that `stop` after at
+//! least one tool call becomes `tool_calls`. `length`, `abort` and engine-specific reasons stay what
+//! the engine said even when calls were made; the old non-streaming path turned every reason but
+//! `length` into `tool_calls`, and its streaming path rewrote `stop` only. The rule keeps the
+//! information.
 //!
 //! Policy this adapter sets, where the events say more than Chat Completions can:
 //!
@@ -24,8 +32,8 @@
 //! - An empty text or an empty argument fragment produces nothing; the gateway sends no empty deltas.
 
 use openai_protocol::{
-    chat::{ChatMessageDelta, ChatStreamChoice},
-    common::{FunctionCallDelta, ToolCallDelta},
+    chat::{ChatChoice, ChatCompletionMessage, ChatMessageDelta, ChatStreamChoice},
+    common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
 };
 
 use crate::event::{Event, FinishReason};
@@ -121,6 +129,71 @@ pub fn deltas<'a>(
         .into_iter()
         .filter_map(|event| delta(choice, event))
         .collect()
+}
+
+/// One message for the choice at `choice`, folded from a whole event sequence.
+///
+/// `content` is every content and malformed text in order, absent when it is only whitespace;
+/// `reasoning_content` is every reasoning text, absent when there was none; `tool_calls` lists the
+/// calls in the order they started, absent when there was none; `finish_reason` is set by the
+/// `Finish` event, so a sequence without one gives a message that is not finished. Argument
+/// fragments for a call that never started cannot occur under the `Event` contract; should one
+/// arrive, its text joins the content so that no byte is lost.
+pub fn message<'a>(choice: u32, events: impl IntoIterator<Item = &'a Event>) -> ChatChoice {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut calls: Vec<(u32, ToolCall)> = Vec::new();
+    let mut finish = None;
+    for event in events {
+        match event {
+            Event::Content(text) | Event::Malformed { text, .. } => content.push_str(&text.text),
+            Event::Reasoning(text) => reasoning.push_str(&text.text),
+            Event::ToolCallStart {
+                index, id, name, ..
+            } => calls.push((
+                *index,
+                ToolCall {
+                    id: id.clone(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCallResponse {
+                        name: name.clone(),
+                        arguments: Some(String::new()),
+                    },
+                },
+            )),
+            Event::ToolCallArguments { index, json, .. } => {
+                match calls.iter_mut().find(|(started, _)| started == index) {
+                    Some((_, call)) => call
+                        .function
+                        .arguments
+                        .get_or_insert_with(String::new)
+                        .push_str(json),
+                    None => content.push_str(json),
+                }
+            }
+            Event::Finish {
+                reason, tool_calls, ..
+            } => finish = Some(finish_reason(reason, *tool_calls)),
+            Event::ReasoningStart
+            | Event::ReasoningEnd
+            | Event::ToolCallEnd { .. }
+            | Event::Dropped { .. } => {}
+        }
+    }
+    ChatChoice {
+        index: choice,
+        message: ChatCompletionMessage {
+            role: "assistant".to_string(),
+            content: (!content.trim().is_empty()).then_some(content),
+            tool_calls: (!calls.is_empty())
+                .then(|| calls.into_iter().map(|(_, call)| call).collect()),
+            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+        },
+        logprobs: None,
+        finish_reason: finish,
+        matched_stop: None,
+        hidden_states: None,
+    }
 }
 
 /// The `finish_reason` string for the engine's reason: `stop` after a tool call is `tool_calls`.
@@ -314,6 +387,154 @@ mod tests {
         for event in &silent {
             assert!(delta(0, event).is_none(), "{event:?}");
         }
+    }
+
+    fn call(index: u32, name: &str) -> Event {
+        Event::ToolCallStart {
+            index,
+            id: format!("call_{index}"),
+            name: name.into(),
+            source: Text::default(),
+        }
+    }
+
+    fn arguments(index: u32, json: &str) -> Event {
+        Event::ToolCallArguments {
+            index,
+            json: json.into(),
+            source: Text::default(),
+        }
+    }
+
+    fn finish(reason: FinishReason, tool_calls: u32) -> Event {
+        Event::Finish {
+            reason,
+            tool_calls,
+            reasoning_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn a_whole_output_folds_into_one_message_in_the_gateway_shape() {
+        let events = [
+            Event::ReasoningStart,
+            Event::Reasoning(Text::uncounted("plan ")),
+            Event::Reasoning(Text::uncounted("more")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("Let me check.")),
+            call(0, "get_weather"),
+            arguments(0, r#"{"city":"#),
+            arguments(0, r#""Paris"}"#),
+            Event::ToolCallEnd {
+                index: 0,
+                source: Text::default(),
+            },
+            finish(FinishReason::Stop, 1),
+        ];
+        assert_eq!(
+            serde_json::to_value(message(1, &events)).expect("serializable"),
+            json!({
+                "index": 1,
+                "message": {
+                    "role": "assistant",
+                    "content": "Let me check.",
+                    "tool_calls": [{
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                    }],
+                    "reasoning_content": "plan more",
+                },
+                "finish_reason": "tool_calls",
+            })
+        );
+    }
+
+    #[test]
+    fn whitespace_only_content_and_absent_reasoning_and_calls_are_left_out() {
+        let events = [
+            Event::Content(Text::uncounted("  \n")),
+            finish(FinishReason::Stop, 0),
+        ];
+        assert_eq!(
+            serde_json::to_value(message(0, &events)).expect("serializable"),
+            json!({
+                "index": 0,
+                "message": {"role": "assistant", "reasoning_content": null},
+                "finish_reason": "stop",
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_text_joins_the_content_of_the_message() {
+        let events = [
+            Event::Content(Text::uncounted("Sure. ")),
+            Event::Malformed {
+                text: Text::uncounted("<tool_call>{broken"),
+                why: MalformedReason::InvalidArguments,
+            },
+        ];
+        let choice = message(0, &events);
+        assert_eq!(
+            choice.message.content.as_deref(),
+            Some("Sure. <tool_call>{broken")
+        );
+        assert!(
+            choice.finish_reason.is_none(),
+            "no Finish event, so the message is not finished"
+        );
+    }
+
+    #[test]
+    fn calls_keep_the_order_they_started_in_and_their_own_fragments() {
+        let events = [
+            call(0, "get_weather"),
+            call(1, "get_time"),
+            arguments(1, r#"{"zone":"CET"}"#),
+            arguments(0, r#"{"city":"Paris"}"#),
+            finish(FinishReason::Stop, 2),
+        ];
+        let calls = message(0, &events).message.tool_calls.expect("two calls");
+        let summary: Vec<(String, String)> = calls
+            .into_iter()
+            .map(|c| (c.function.name, c.function.arguments.unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("get_weather".to_string(), r#"{"city":"Paris"}"#.to_string()),
+                ("get_time".to_string(), r#"{"zone":"CET"}"#.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_one_finish_rule_holds_for_the_whole_message_too() {
+        let reason = |reason: FinishReason, tool_calls: u32| {
+            message(0, &[call(0, "f"), finish(reason, tool_calls)]).finish_reason
+        };
+        assert_eq!(reason(FinishReason::Stop, 1).as_deref(), Some("tool_calls"));
+        assert_eq!(reason(FinishReason::Length, 1).as_deref(), Some("length"));
+        assert_eq!(reason(FinishReason::Abort, 1).as_deref(), Some("abort"));
+        assert_eq!(
+            reason(FinishReason::Other("content_filter".into()), 1).as_deref(),
+            Some("content_filter")
+        );
+    }
+
+    #[test]
+    fn a_fragment_for_a_call_that_never_started_joins_the_content() {
+        let events = [
+            Event::Content(Text::uncounted("x")),
+            arguments(7, r#"{"stray":true}"#),
+        ];
+        let choice = message(0, &events);
+        assert_eq!(
+            choice.message.content.as_deref(),
+            Some(r#"x{"stray":true}"#)
+        );
+        assert!(choice.message.tool_calls.is_none());
     }
 
     #[test]
