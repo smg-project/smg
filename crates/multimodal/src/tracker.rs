@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::task::JoinHandle;
 
@@ -49,26 +46,33 @@ struct FetchKey {
 /// pass over each payload instead of a pass per earlier candidate.
 const COMPARE_CANDIDATES: usize = 4;
 
-/// A slot that fetches, remembered so later parts can be matched against it.
-struct FirstFetch {
-    source: Arc<FetchSource>,
-    slot: usize,
-    /// blake3 of the payload, computed only once its bucket is crowded.
-    digest: OnceLock<[u8; 32]>,
+/// The fetching slots of one `FetchKey`, remembered so later parts can be
+/// matched against them.
+#[derive(Default)]
+struct Bucket {
+    /// The first distinct payloads, kept so parts can be compared against
+    /// them byte for byte.
+    compared: Vec<Compared>,
+    /// Later distinct payloads, kept as their digest only: nothing compares
+    /// their bytes again, so the table does not hold them past their fetch.
+    hashed: Vec<Hashed>,
 }
 
-impl FirstFetch {
-    fn digest(&self) -> &[u8; 32] {
-        self.digest
-            .get_or_init(|| blake3::hash(self.source.payload()).into())
-    }
+struct Compared {
+    source: Arc<FetchSource>,
+    slot: usize,
+}
+
+struct Hashed {
+    digest: [u8; 32],
+    slot: usize,
 }
 
 pub struct AsyncMultiModalTracker {
     media_connector: Arc<MediaConnector>,
     pending: HashMap<Modality, Vec<Slot>>,
     uuids: MultiModalUUIDs,
-    first_slot: HashMap<FetchKey, Vec<FirstFetch>>,
+    first_slot: HashMap<FetchKey, Bucket>,
     /// Frame rate to sample a video at when the request names none; `None`
     /// keeps the connector default.
     default_video_sample_fps: Option<f32>,
@@ -203,36 +207,36 @@ impl AsyncMultiModalTracker {
             kind: source.kind(),
             len: source.len(),
         };
-        let candidates = self.first_slot.entry(key).or_default();
+        let bucket = self.first_slot.entry(key).or_default();
         // The first few distinct payloads are compared byte for byte: a repeat
         // (the common case) matches the first one, a different payload usually
-        // differs within its first bytes.
-        let (compared, hashed) = candidates.split_at(candidates.len().min(COMPARE_CANDIDATES));
-        if let Some(first) = compared
+        // differs within its first bytes. A part that differs from all of them
+        // cannot match them later either, so they never need a digest.
+        if let Some(first) = bucket
+            .compared
             .iter()
             .find(|candidate| *candidate.source == **source)
         {
             return Some(first.slot);
         }
-        // Past them, every candidate is matched by digest: one pass over this
-        // payload now, one over each candidate the first time it is reached.
-        let digest = if hashed.is_empty() {
-            OnceLock::new()
-        } else {
-            let digest: [u8; 32] = blake3::hash(source.payload()).into();
-            if let Some(first) = hashed
-                .iter()
-                .find(|candidate| *candidate.digest() == digest)
-            {
-                return Some(first.slot);
-            }
-            OnceLock::from(digest)
-        };
-        candidates.push(FirstFetch {
-            source: Arc::clone(source),
-            slot: next,
-            digest,
-        });
+        if bucket.compared.len() < COMPARE_CANDIDATES {
+            bucket.compared.push(Compared {
+                source: Arc::clone(source),
+                slot: next,
+            });
+            return None;
+        }
+        // Past them the bucket is matched by digest: one pass over this
+        // payload, and only its digest is kept.
+        let digest: [u8; 32] = blake3::hash(source.payload()).into();
+        if let Some(first) = bucket
+            .hashed
+            .iter()
+            .find(|candidate| candidate.digest == digest)
+        {
+            return Some(first.slot);
+        }
+        bucket.hashed.push(Hashed { digest, slot: next });
         None
     }
 
@@ -690,20 +694,24 @@ mod repeat_tests {
                 Some(slot)
             );
         }
-        // The first candidates were only ever compared; the rest carry digests,
-        // so a part is compared against at most COMPARE_CANDIDATES payloads.
+        // The first candidates are kept to be compared, so a part is compared
+        // against at most COMPARE_CANDIDATES payloads; the rest are kept as a
+        // digest and a slot only, so their bytes are not retained by the table.
         let bucket = tracker
             .first_slot
             .values()
-            .next()
+            .find(|bucket| !bucket.hashed.is_empty())
             .expect("one bucket: same modality, settings, kind and length");
-        assert_eq!(bucket.len(), sources.len());
-        let hashed: Vec<bool> = bucket
-            .iter()
-            .map(|candidate| candidate.digest.get().is_some())
-            .collect();
-        assert!(hashed[..COMPARE_CANDIDATES].iter().all(|hashed| !hashed));
-        assert!(hashed[COMPARE_CANDIDATES..].iter().all(|hashed| *hashed));
+        assert_eq!(bucket.compared.len(), COMPARE_CANDIDATES);
+        assert_eq!(bucket.hashed.len(), sources.len() - COMPARE_CANDIDATES);
+        for (i, source) in sources.iter().enumerate() {
+            let expected = if i < COMPARE_CANDIDATES { 2 } else { 1 };
+            assert_eq!(
+                Arc::strong_count(source),
+                expected,
+                "candidate {i}: only the compared ones are held by the table"
+            );
+        }
         // A lone payload of another length is neither compared nor hashed.
         let lone = Arc::new(FetchSource::DataUrl(format!("{TINY_PNG_URL}=")));
         assert_eq!(
@@ -713,9 +721,10 @@ mod repeat_tests {
         let lone_bucket = tracker
             .first_slot
             .values()
-            .find(|bucket| bucket.len() == 1)
+            .find(|bucket| bucket.compared.len() == 1)
             .expect("its own bucket");
-        assert!(lone_bucket[0].digest.get().is_none());
+        assert!(lone_bucket.hashed.is_empty());
+        assert_eq!(Arc::strong_count(&lone), 2);
     }
 
     #[tokio::test]
