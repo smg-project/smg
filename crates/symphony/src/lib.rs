@@ -17,8 +17,8 @@
 //! compromise kept for convenience. A change whose only reason is "this can be better" is welcome.
 //!
 //! Status: the public types below are the contract, and [`adapt`] renders them for the Chat
-//! Completions API; the engine, the format definitions and the other adapters follow in later
-//! changes.
+//! Completions and Responses APIs; the engine, the format definitions and the Messages adapter
+//! follow in later changes.
 
 #![forbid(unsafe_code)]
 
