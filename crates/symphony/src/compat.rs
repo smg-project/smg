@@ -46,11 +46,8 @@ pub struct Combined {
     tools: Vec<Tool>,
     reasoning_open: bool,
     calls_started: Vec<u32>,
-    /// Argument fragments that arrived for a call before its name did, kept until the name
-    /// arrives so that a call always starts before its arguments.
-    arguments_before_name: Vec<(u32, String)>,
-    /// The error that stopped parsing, if one did. After it, only `End` is accepted, and what the
-    /// old parsers still hold is returned as `Malformed` text.
+    /// The error that stopped parsing, if one did. After it a `Delta` is a `Lifecycle` error, only
+    /// `End` is accepted, and what the old parsers still hold is returned as `Malformed` text.
     failure: Option<String>,
     stage: Stage,
 }
@@ -87,7 +84,6 @@ impl Combined {
             tools,
             reasoning_open: false,
             calls_started: Vec::new(),
-            arguments_before_name: Vec::new(),
             failure: None,
             stage: Stage::Fresh,
         }
@@ -173,14 +169,13 @@ impl Combined {
             Err(e) => return Err(self.fail(e.to_string())),
         };
         out.push_content(Text::uncounted(found.normal_text));
-        self.emit_calls(found.calls, out);
-        Ok(())
+        self.emit_calls(found.calls, out)
     }
 
-    /// The old trait announces a call's name before or together with its first arguments. Should
-    /// arguments ever arrive first, they wait here until the name does, so a call always starts
-    /// before its arguments.
-    fn emit_calls(&mut self, items: Vec<ToolCallItem>, out: &mut Events) {
+    /// The old trait announces a call's name before or together with its first arguments; every
+    /// old parser keeps to that, so arguments for a call that has not started are a defect in the
+    /// parser, reported rather than guessed around.
+    fn emit_calls(&mut self, items: Vec<ToolCallItem>, out: &mut Events) -> Result<(), ParseError> {
         for item in items {
             let index = item.tool_index as u32;
             if let Some(name) = item.name {
@@ -192,35 +187,23 @@ impl Combined {
                         name,
                         source: Text::default(),
                     });
-                    let waiting: Vec<String> = self
-                        .arguments_before_name
-                        .iter()
-                        .filter(|(i, _)| *i == index)
-                        .map(|(_, json)| json.clone())
-                        .collect();
-                    self.arguments_before_name.retain(|(i, _)| *i != index);
-                    for json in waiting {
-                        out.push(Event::ToolCallArguments {
-                            index,
-                            json,
-                            source: Text::default(),
-                        });
-                    }
                 }
             }
             if item.parameters.is_empty() {
                 continue;
             }
-            if self.calls_started.contains(&index) {
-                out.push(Event::ToolCallArguments {
-                    index,
-                    json: item.parameters,
-                    source: Text::default(),
-                });
-            } else {
-                self.arguments_before_name.push((index, item.parameters));
+            if !self.calls_started.contains(&index) {
+                return Err(self.fail(format!(
+                    "the tool parser sent arguments for call {index} before its name"
+                )));
             }
+            out.push(Event::ToolCallArguments {
+                index,
+                json: item.parameters,
+                source: Text::default(),
+            });
         }
+        Ok(())
     }
 
     /// Remember why parsing stopped and report it.
@@ -267,7 +250,7 @@ impl Combined {
         if let Some(tool) = self.tool.as_mut() {
             out.push_content(Text::uncounted(tool.take_unstreamed_normal_text()));
             if let Some(items) = tool.get_unstreamed_tool_args() {
-                self.emit_calls(items, out);
+                self.emit_calls(items, out)?;
             }
         }
         self.close(finish, out);
@@ -318,6 +301,11 @@ impl Parser for Combined {
                 if self.stage == Stage::Ended {
                     return Err(ParseError::Lifecycle("delta after end".to_string()));
                 }
+                if self.failure.is_some() {
+                    return Err(ParseError::Lifecycle(
+                        "delta after a parse error; only end is accepted".to_string(),
+                    ));
+                }
                 self.stage = Stage::Streaming;
                 let content = self.split_reasoning(text, out)?;
                 self.parse_tools(&content, out)
@@ -336,6 +324,83 @@ impl Parser for Combined {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An old reasoning parser that refuses every chunk and holds text for `flush`.
+    struct FailsThenHolds {
+        held: &'static str,
+    }
+
+    impl ReasoningParser for FailsThenHolds {
+        fn detect_and_parse_reasoning(
+            &mut self,
+            text: &str,
+        ) -> Result<reasoning_parser::ParserResult, reasoning_parser::ParseError> {
+            Ok(reasoning_parser::ParserResult::normal(text.to_string()))
+        }
+
+        fn parse_reasoning_streaming_incremental(
+            &mut self,
+            _text: &str,
+        ) -> Result<reasoning_parser::ParserResult, reasoning_parser::ParseError> {
+            Err(reasoning_parser::ParseError::ConfigError(
+                "refused by the stub".to_string(),
+            ))
+        }
+
+        fn flush(
+            &mut self,
+        ) -> Result<reasoning_parser::ParserResult, reasoning_parser::ParseError> {
+            Ok(reasoning_parser::ParserResult::normal(
+                self.held.to_string(),
+            ))
+        }
+
+        fn reset(&mut self) {}
+
+        fn model_type(&self) -> &str {
+            "stub"
+        }
+
+        fn is_in_reasoning(&self) -> bool {
+            false
+        }
+
+        fn mark_reasoning_started(&mut self) {}
+
+        fn mark_think_start_stripped(&mut self) {}
+    }
+
+    /// An old tool parser that sends a call's arguments before its name, which no real one does.
+    struct ArgumentsFirst;
+
+    #[async_trait::async_trait]
+    impl ToolParser for ArgumentsFirst {
+        async fn parse_complete(
+            &self,
+            output: &str,
+        ) -> tool_parser::errors::ParserResult<(String, Vec<tool_parser::ToolCall>)> {
+            Ok((output.to_string(), vec![]))
+        }
+
+        async fn parse_incremental(
+            &mut self,
+            _chunk: &str,
+            _tools: &[Tool],
+        ) -> tool_parser::errors::ParserResult<tool_parser::StreamingParseResult> {
+            Ok(tool_parser::StreamingParseResult {
+                normal_text: String::new(),
+                calls: vec![ToolCallItem {
+                    tool_index: 0,
+                    name: None,
+                    parameters: r#"{"city":"#.to_string(),
+                }],
+            })
+        }
+
+        fn has_tool_markers(&self, _text: &str) -> bool {
+            true
+        }
+    }
 
     fn weather_tool() -> Tool {
         serde_json::from_value(serde_json::json!({
@@ -558,6 +623,118 @@ mod tests {
             ),
             Err(ParseError::Lifecycle(_))
         ));
+    }
+
+    #[test]
+    fn a_prompt_that_opened_the_reasoning_block_makes_the_first_text_reasoning() {
+        let mut parser = Combined::by_name(Some("deepseek_r1"), None, vec![])
+            .expect("known parser")
+            .starting_in_reasoning();
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: "<think>",
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser
+            .feed(delta("still thinking</think>answer"), &mut out)
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        assert_eq!(
+            out.drain(),
+            vec![
+                Event::ReasoningStart,
+                Event::Reasoning(Text::uncounted("still thinking")),
+                Event::ReasoningEnd,
+                Event::Content(Text::uncounted("answer")),
+                Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 0,
+                    reasoning_tokens: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn after_a_parse_error_only_end_is_accepted_and_held_text_comes_back_malformed() {
+        let mut parser = Combined::new(
+            Some(Box::new(FailsThenHolds { held: "held" })),
+            None,
+            vec![],
+        );
+        let mut out = Events::new();
+        assert!(matches!(
+            parser.feed(delta("a"), &mut out),
+            Err(ParseError::Internal(_))
+        ));
+        assert!(matches!(
+            parser.feed(delta("b"), &mut out),
+            Err(ParseError::Lifecycle(_))
+        ));
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        assert_eq!(
+            out.drain(),
+            vec![
+                Event::Malformed {
+                    text: Text::uncounted("held"),
+                    why: MalformedReason::Other(
+                        "Parser configuration error: refused by the stub".into()
+                    ),
+                },
+                Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 0,
+                    reasoning_tokens: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn arguments_before_the_name_are_a_defect_of_the_old_parser() {
+        let mut parser = Combined::new(None, Some(Box::new(ArgumentsFirst)), vec![weather_tool()]);
+        let mut out = Events::new();
+        assert_eq!(
+            parser.feed(delta("x"), &mut out),
+            Err(ParseError::Internal(
+                "the tool parser sent arguments for call 0 before its name".into()
+            ))
+        );
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        assert_eq!(
+            out.drain(),
+            vec![Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 0,
+                reasoning_tokens: 0,
+            }]
+        );
     }
 
     #[test]

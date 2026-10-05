@@ -25,5 +25,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tool-parser.workspace = true
 
+[dev-dependencies]
+async-trait.workspace = true
+
 [lints]
 workspace = true

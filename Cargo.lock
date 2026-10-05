@@ -7884,6 +7884,7 @@ dependencies = [
 name = "smg-symphony"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "futures",
  "openai-protocol",
  "reasoning-parser",
