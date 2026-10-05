@@ -193,9 +193,13 @@ impl Combined {
                 continue;
             }
             if !self.calls_started.contains(&index) {
-                return Err(self.fail(format!(
-                    "the tool parser sent arguments for call {index} before its name"
-                )));
+                let message =
+                    format!("the tool parser sent arguments for call {index} before its name");
+                out.push(Event::Malformed {
+                    text: Text::uncounted(item.parameters),
+                    why: MalformedReason::Other(message.clone()),
+                });
+                return Err(self.fail(message));
             }
             out.push(Event::ToolCallArguments {
                 index,
@@ -239,10 +243,20 @@ impl Combined {
             self.close(finish, out);
             return Ok(());
         }
+        // The stream has ended, so no `End` can follow an error raised here: the stream is closed
+        // either way, and the error is handed on after `Finish` is in `out`.
+        let flushed = self.flush_old_parsers(out);
+        self.close(finish, out);
+        flushed
+    }
+
+    /// Emit what the old parsers still hold at the end of the stream.
+    fn flush_old_parsers(&mut self, out: &mut Events) -> Result<(), ParseError> {
         if let Some(reasoning) = self.reasoning.as_mut() {
-            let held = reasoning
-                .flush()
-                .map_err(|e| ParseError::Internal(e.to_string()))?;
+            let held = match reasoning.flush() {
+                Ok(held) => held,
+                Err(e) => return Err(self.fail(e.to_string())),
+            };
             let still_open = reasoning.is_in_reasoning();
             self.emit_reasoning(&held.reasoning_text, still_open, out);
             self.parse_tools(&held.normal_text, out)?;
@@ -253,7 +267,6 @@ impl Combined {
                 self.emit_calls(items, out)?;
             }
         }
-        self.close(finish, out);
         Ok(())
     }
 
@@ -370,8 +383,62 @@ mod tests {
         fn mark_think_start_stripped(&mut self) {}
     }
 
-    /// An old tool parser that sends a call's arguments before its name, which no real one does.
-    struct ArgumentsFirst;
+    /// An old reasoning parser that accepts every chunk as content and cannot flush.
+    struct RefusesToFlush;
+
+    impl ReasoningParser for RefusesToFlush {
+        fn detect_and_parse_reasoning(
+            &mut self,
+            text: &str,
+        ) -> Result<reasoning_parser::ParserResult, reasoning_parser::ParseError> {
+            Ok(reasoning_parser::ParserResult::normal(text.to_string()))
+        }
+
+        fn parse_reasoning_streaming_incremental(
+            &mut self,
+            text: &str,
+        ) -> Result<reasoning_parser::ParserResult, reasoning_parser::ParseError> {
+            Ok(reasoning_parser::ParserResult::normal(text.to_string()))
+        }
+
+        fn flush(
+            &mut self,
+        ) -> Result<reasoning_parser::ParserResult, reasoning_parser::ParseError> {
+            Err(reasoning_parser::ParseError::ConfigError(
+                "cannot flush".to_string(),
+            ))
+        }
+
+        fn reset(&mut self) {}
+
+        fn model_type(&self) -> &str {
+            "stub"
+        }
+
+        fn is_in_reasoning(&self) -> bool {
+            false
+        }
+
+        fn mark_reasoning_started(&mut self) {}
+
+        fn mark_think_start_stripped(&mut self) {}
+    }
+
+    /// An old tool parser that sends a call's arguments before its name, which no real one does:
+    /// during the stream, or only among the arguments it still holds at the end.
+    struct ArgumentsFirst {
+        at_end: bool,
+    }
+
+    impl ArgumentsFirst {
+        fn item() -> ToolCallItem {
+            ToolCallItem {
+                tool_index: 0,
+                name: None,
+                parameters: r#"{"city":"#.to_string(),
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl ToolParser for ArgumentsFirst {
@@ -389,16 +456,20 @@ mod tests {
         ) -> tool_parser::errors::ParserResult<tool_parser::StreamingParseResult> {
             Ok(tool_parser::StreamingParseResult {
                 normal_text: String::new(),
-                calls: vec![ToolCallItem {
-                    tool_index: 0,
-                    name: None,
-                    parameters: r#"{"city":"#.to_string(),
-                }],
+                calls: if self.at_end {
+                    vec![]
+                } else {
+                    vec![Self::item()]
+                },
             })
         }
 
         fn has_tool_markers(&self, _text: &str) -> bool {
             true
+        }
+
+        fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+            self.at_end.then(|| vec![Self::item()])
         }
     }
 
@@ -711,13 +782,16 @@ mod tests {
 
     #[test]
     fn arguments_before_the_name_are_a_defect_of_the_old_parser() {
-        let mut parser = Combined::new(None, Some(Box::new(ArgumentsFirst)), vec![weather_tool()]);
+        let mut parser = Combined::new(
+            None,
+            Some(Box::new(ArgumentsFirst { at_end: false })),
+            vec![weather_tool()],
+        );
         let mut out = Events::new();
+        let defect = "the tool parser sent arguments for call 0 before its name";
         assert_eq!(
             parser.feed(delta("x"), &mut out),
-            Err(ParseError::Internal(
-                "the tool parser sent arguments for call 0 before its name".into()
-            ))
+            Err(ParseError::Internal(defect.into()))
         );
         parser
             .feed(
@@ -729,11 +803,84 @@ mod tests {
             .expect("end");
         assert_eq!(
             out.drain(),
-            vec![Event::Finish {
-                reason: FinishReason::Stop,
-                tool_calls: 0,
-                reasoning_tokens: 0,
-            }]
+            vec![
+                Event::Malformed {
+                    text: Text::uncounted(r#"{"city":"#),
+                    why: MalformedReason::Other(defect.into()),
+                },
+                Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 0,
+                    reasoning_tokens: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_error_raised_while_finishing_still_closes_the_stream() {
+        let mut parser = Combined::new(
+            None,
+            Some(Box::new(ArgumentsFirst { at_end: true })),
+            vec![weather_tool()],
+        );
+        let mut out = Events::new();
+        parser.feed(delta("x"), &mut out).expect("delta");
+        let end = Input::End {
+            finish: EngineFinish::Stop,
+        };
+        assert!(matches!(
+            parser.feed(end.clone(), &mut out),
+            Err(ParseError::Internal(_))
+        ));
+        assert_eq!(
+            out.drain(),
+            vec![
+                Event::Malformed {
+                    text: Text::uncounted(r#"{"city":"#),
+                    why: MalformedReason::Other(
+                        "the tool parser sent arguments for call 0 before its name".into()
+                    ),
+                },
+                Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 0,
+                    reasoning_tokens: 0,
+                },
+            ]
+        );
+        assert!(matches!(
+            parser.feed(end, &mut out),
+            Err(ParseError::Lifecycle(_))
+        ));
+    }
+
+    #[test]
+    fn a_reasoning_parser_that_cannot_flush_still_gets_its_stream_closed() {
+        let mut parser = Combined::new(Some(Box::new(RefusesToFlush)), None, vec![]);
+        let mut out = Events::new();
+        parser.feed(delta("a"), &mut out).expect("delta");
+        assert_eq!(
+            parser.feed(
+                Input::End {
+                    finish: EngineFinish::Length,
+                },
+                &mut out,
+            ),
+            Err(ParseError::Internal(
+                "Parser configuration error: cannot flush".into()
+            ))
+        );
+        assert_eq!(
+            out.drain(),
+            vec![
+                Event::Content(Text::uncounted("a")),
+                Event::Finish {
+                    reason: FinishReason::Length,
+                    tool_calls: 0,
+                    reasoning_tokens: 0,
+                },
+            ]
         );
     }
 
