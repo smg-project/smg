@@ -11,8 +11,9 @@
 //! - A parameter declared `string` is its text, every byte of it. Nothing is trimmed and nothing is
 //!   decoded: `"exact phrase"` keeps its quotes, indentation and a trailing newline stay, and
 //!   `&amp;` is five characters.
-//! - A parameter declared `integer` is that integer when its text is one, with the whitespace
-//!   around it ignored. It may be spelled `+5` or `007`; it is written in JSON's spelling.
+//! - A parameter declared `integer` is that integer when its text is a sign and digits, however
+//!   many, with the whitespace around it ignored. It may be spelled `+5` or `007`; it is written in
+//!   JSON's spelling.
 //! - Everything else is inferred: text that is JSON is that JSON, Python's `True`, `False` and
 //!   `None` are `true`, `false` and `null`, and the rest is a string holding the text exactly.
 //!   That covers a parameter the tool does not declare, a declared integer whose text is not one,
@@ -20,10 +21,11 @@
 //!   templates as JSON, which is what inference reads, so declaring one changes nothing.
 //!
 //! A value read as JSON keeps the model's own bytes: `[1, 2.5]` stays spaced as written, and
-//! `9007199254740993` keeps every digit. JSON here means what `serde_json` reads into a value,
-//! because that is how the adapters read a call's arguments back. Text it refuses, such as a lone
-//! surrogate escape or nesting more than 128 levels deep, is a string like any other text, so one
-//! odd value never costs a call its other arguments.
+//! `9007199254740993` keeps every digit. JSON here means what `serde_json` reads into a value from
+//! inside the arguments object, because that is how the adapters read a call's arguments back.
+//! Text it refuses there, such as a lone surrogate escape or nesting that reaches its depth limit
+//! once the object is around it, is a string like any other text, so one odd value never costs a
+//! call its other arguments.
 //!
 //! Ported from `safe_val` and `coerce_value` in `crates/tool_parser/src/parsers/qwen_xml.rs` and
 //! from `coerce_by_schema_type` and `param_types_for_function` in that crate's `helpers.rs`. Three
@@ -104,18 +106,33 @@ fn parameters_of(schema: &Value) -> HashMap<String, Kind> {
 pub fn json(text: &str, kind: Option<Kind>) -> String {
     match kind {
         Some(Kind::String) => string(text),
-        Some(Kind::Integer) => match text.trim().parse::<i64>() {
-            Ok(integer) => integer.to_string(),
-            Err(_) => inferred(text),
-        },
+        Some(Kind::Integer) => integer(text.trim()).unwrap_or_else(|| inferred(text)),
         None => inferred(text),
     }
+}
+
+/// `text` as a JSON integer when it is an optional sign and then digits: no sign for `+`, no
+/// leading zeros. The digits are never read as a number, so their count has no limit.
+fn integer(text: &str) -> Option<String> {
+    let (minus, digits) = match text.strip_prefix('-') {
+        Some(digits) => ("-", digits),
+        None => ("", text.strip_prefix('+').unwrap_or(text)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let significant = digits.trim_start_matches('0');
+    Some(if significant.is_empty() {
+        "0".to_string()
+    } else {
+        format!("{minus}{significant}")
+    })
 }
 
 /// What the text is when no declared type decided it.
 fn inferred(text: &str) -> String {
     let trimmed = text.trim();
-    if serde_json::from_str::<Value>(trimmed).is_ok() {
+    if reads_back_as_an_argument(trimmed) {
         return trimmed.to_string();
     }
     match trimmed {
@@ -124,6 +141,14 @@ fn inferred(text: &str) -> String {
         "None" => "null".to_string(),
         _ => string(text),
     }
+}
+
+/// Whether `text` is one JSON value that `serde_json` still reads once it is a member of the
+/// arguments object. The first parse says it is one value; the second reads it one level down,
+/// where the object puts it, which is where nesting at the depth limit stops being readable.
+fn reads_back_as_an_argument(text: &str) -> bool {
+    serde_json::from_str::<Value>(text).is_ok()
+        && serde_json::from_str::<Value>(&format!("[{text}]")).is_ok()
 }
 
 /// `text` as a JSON string.
@@ -240,11 +265,25 @@ mod tests {
             ("\n150\n", "150"),
             ("+5", "5"),
             ("007", "7"),
+            ("-007", "-7"),
+            ("0", "0"),
+            ("-0", "0"),
+            ("000", "0"),
+            // Wider than any machine integer, with a sign and zeros to remove.
+            ("+9223372036854775808", "9223372036854775808"),
+            (
+                "-00123456789012345678901234567890",
+                "-123456789012345678901234567890",
+            ),
             // Not an integer, so it is inferred: JSON when the text is JSON, else a string.
             ("5.5", "5.5"),
             ("12345678901234567890", "12345678901234567890"),
             ("five", r#""five""#),
             ("", r#""""#),
+            ("+", r#""+""#),
+            ("-", r#""-""#),
+            ("1_000", r#""1_000""#),
+            ("٣", r#""٣""#),
         ] {
             assert_eq!(json(text, Some(Kind::Integer)), expected, "{text:?}");
         }
@@ -303,16 +342,49 @@ mod tests {
         }
     }
 
+    /// The arguments object with `value` as one of its members, read the way the adapters read it.
+    fn read_back(value: &str) -> Option<Value> {
+        serde_json::from_str(&format!(r#"{{"p": {value}, "q": 1}}"#)).ok()
+    }
+
     #[test]
     fn text_the_adapters_could_not_read_back_is_a_string() {
         // A lone surrogate escape is JSON by its grammar, and not a value serde_json reads.
         let surrogate = r#"["\ud83d"]"#;
         assert_eq!(json(surrogate, None), r#""[\"\\ud83d\"]""#);
-        // So is nesting past serde_json's limit of 128 levels.
-        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
-        assert_eq!(json(&deep, None), format!("\"{deep}\""));
-        let shallow = format!("{}{}", "[".repeat(100), "]".repeat(100));
-        assert_eq!(json(&shallow, None), shallow);
+        assert!(read_back(&json(surrogate, None)).is_some());
+        // Two values are not one, whatever brackets around them would read as.
+        assert_eq!(json("1, 2", None), r#""1, 2""#);
+    }
+
+    #[test]
+    fn nesting_is_json_only_as_deep_as_the_arguments_object_can_hold_it() {
+        let nested = |levels: usize| format!("{}{}", "[".repeat(levels), "]".repeat(levels));
+        let mut deepest_kept = 0;
+        for levels in 1..=140 {
+            let text = nested(levels);
+            let written = json(&text, None);
+            assert!(
+                read_back(&written).is_some(),
+                "{levels} levels cost the call its arguments"
+            );
+            if written == text {
+                assert_eq!(
+                    deepest_kept,
+                    levels - 1,
+                    "{levels} kept after a shallower refusal"
+                );
+                deepest_kept = levels;
+            } else {
+                assert_eq!(written, format!("\"{text}\""), "{levels} levels");
+            }
+        }
+        // The limit is serde_json's, less the level the object adds: one level deeper is still
+        // JSON by itself, and no longer readable inside the object.
+        assert!((100..140).contains(&deepest_kept), "{deepest_kept}");
+        let one_deeper = nested(deepest_kept + 1);
+        assert!(serde_json::from_str::<Value>(&one_deeper).is_ok());
+        assert!(read_back(&one_deeper).is_none());
     }
 
     /// A small deterministic generator, so the property below needs no dependency.
@@ -330,18 +402,22 @@ mod tests {
 
     #[test]
     fn whatever_the_text_and_the_kind_the_result_reads_back_as_one_json_value() {
-        const PIECES: [&str; 27] = [
-            "", " ", "\n", "0", "-", "1.5", "e9", "true", "True", "None", "null", "\"", "\\", "{",
-            "}", "[", "]", ":", ",", "a", "é", "\u{1}", "<", "&amp;", "u", "d800", "dc00",
+        const SURROGATE: &str = r#""\ud800""#;
+        const PIECES: [&str; 26] = [
+            "", " ", "\n", "0", "-", "+", "1.5", "e9", "true", "True", "None", "null", "\"", "\\",
+            "{", "}", "[", "]", ":", ",", "a", "é", "\u{1}", "<", "&amp;", SURROGATE,
         ];
         const KINDS: [Option<Kind>; 3] = [None, Some(Kind::String), Some(Kind::Integer)];
         let mut random = Lcg(7);
-        let mut surrogates = 0;
+        let mut json_but_for_a_surrogate = 0;
         for _ in 0..40_000 {
             let text: String = (0..random.next() % 8)
                 .map(|_| PIECES[random.next() % PIECES.len()])
                 .collect();
-            surrogates += usize::from(text.contains("\\ud800"));
+            // The string alone or in an array: JSON by its grammar, which serde_json refuses.
+            let trimmed = text.trim();
+            json_but_for_a_surrogate +=
+                usize::from(trimmed == SURROGATE || trimmed == format!("[{SURROGATE}]"));
             for kind in KINDS {
                 let written = json(&text, kind);
                 let parsed: Result<Value, _> = serde_json::from_str(&written);
@@ -352,8 +428,8 @@ mod tests {
             }
         }
         assert!(
-            surrogates > 0,
-            "the generator never wrote a surrogate escape"
+            json_but_for_a_surrogate > 0,
+            "the generator never wrote text that only a surrogate escape keeps from being JSON"
         );
     }
 }
