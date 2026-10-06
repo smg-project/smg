@@ -19,9 +19,11 @@
 //! the open block and hands the stop reason back for the driver's `message_delta`, which also
 //! carries the usage and the stop sequence the events do not have; `message_start`, `ping` and
 //! `message_stop` are the driver's as well. For an output whose reasoning, text and calls come in
-//! that order, the stream's blocks are the ones [`output`] folds from the same events; when they
-//! alternate, the stream keeps the order the model wrote them in and the fold gathers each kind
-//! into one block, as the gateway's two paths do today.
+//! that order, with nothing but calls after the first call, the stream's blocks are the ones
+//! [`output`] folds from the same events. Otherwise the two differ as the gateway's two paths do
+//! today: the stream keeps the order the model wrote the blocks in and lets go of the whitespace
+//! between them, while the fold gathers each kind into one block and, once its text has
+//! substance, keeps every run of whitespace in it, the separators after a call included.
 //!
 //! The blocks are the ones SMG's gateway builds today from a finished turn, in the order the
 //! Messages API uses:
@@ -50,8 +52,8 @@
 //!
 //! Policy this adapter sets, where the events say more than the Messages API can:
 //!
-//! - `ReasoningStart`, `ReasoningEnd`, `ToolCallEnd` and `Dropped` shape nothing; the markers a
-//!   format consumes never reach the client.
+//! - `ReasoningStart` and `Dropped` shape nothing, and `ReasoningEnd` and `ToolCallEnd` only close
+//!   their blocks in the stream: the markers a format consumes never reach the client.
 //! - `Malformed` text is content, as in `chat`: the model wrote it, and the client sees it rather
 //!   than losing it.
 //! - A call whose argument fragments are not a whole JSON value, because the output was cut or the
@@ -61,9 +63,11 @@
 //!   arguments has `{}` too.
 //! - Argument fragments for a call that never started cannot occur under the `Event` contract;
 //!   should one arrive, its text joins the content so that no byte is lost. In the stream the same
-//!   goes for a fragment whose `tool_use` block has closed because other text arrived: it is text.
-//!   The formats parse a call from one contiguous region, so this does not happen for them, and
-//!   nothing is dropped if it does; the old driver dropped such fragments.
+//!   goes for a fragment whose call has no open `tool_use` block because other text, or another
+//!   call, came between the call's start and the fragment: the Messages API streams one block at a
+//!   time and cannot reopen a closed one, so the fragment is text, where the fold still gives it to
+//!   its call. The formats parse a call from one contiguous region, so this does not happen for
+//!   them, and nothing is dropped if it does; the old driver dropped such fragments.
 //! - In the stream, the thinking block stops when the reasoning region ends rather than when the
 //!   next text arrives, as the old driver did, so a client sees the block close as soon as the
 //!   model stops thinking.
@@ -750,6 +754,58 @@ mod tests {
         assert_eq!(
             last,
             json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "1}"}})
+        );
+    }
+
+    #[test]
+    fn a_fragment_of_a_call_whose_block_another_call_closed_is_text() {
+        let interleaved = [
+            call(0, "get_weather"),
+            call(1, "get_time"),
+            arguments(1, r#"{"zone":"CET"}"#),
+            arguments(0, r#"{"city":"Paris"}"#),
+            end(1),
+            end(0),
+            finish(FinishReason::Stop, 2),
+        ];
+        let (out, _) = stream(&interleaved);
+        let summary: Vec<String> = out
+            .iter()
+            .map(|event| match event {
+                MessageStreamEvent::ContentBlockStart { index, .. } => format!(
+                    "start {index} {}",
+                    event_wire(event)["content_block"]["type"]
+                        .as_str()
+                        .expect("a type")
+                ),
+                MessageStreamEvent::ContentBlockDelta { index, delta } => match delta {
+                    ContentBlockDelta::InputJsonDelta { partial_json } => {
+                        format!("input {index} {partial_json}")
+                    }
+                    ContentBlockDelta::TextDelta { text } => format!("text {index} {text}"),
+                    other => format!("{other:?}"),
+                },
+                MessageStreamEvent::ContentBlockStop { index } => format!("stop {index}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                "start 0 tool_use",
+                "stop 0",
+                "start 1 tool_use",
+                r#"input 1 {"zone":"CET"}"#,
+                "stop 1",
+                "start 2 text",
+                r#"text 2 {"city":"Paris"}"#,
+                "stop 2",
+            ]
+        );
+        assert_eq!(
+            wire(&output(&interleaved).content)[0]["input"],
+            json!({"city": "Paris"}),
+            "the fold still gives the fragment to its call"
         );
     }
 
