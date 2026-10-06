@@ -22,7 +22,10 @@
 //! of a bellwether checkout; without it the test prints a skip notice and
 //! passes. Tokenizer files come from the Hugging Face cache snapshot at the
 //! manifest's revision when it is there, else from a one-time download into
-//! `.tokenizer_cache/bellwether/<slug>/<revision>/`.
+//! `.tokenizer_cache/bellwether/<slug>/<revision>/`. That download needs the
+//! TLS backend a workspace build enables: under `cargo test -p llm-tokenizer`
+//! alone the crate's `reqwest` dev-dependency has none, so with a cold cache
+//! run it from the workspace or fill the Hugging Face cache first.
 //!
 //! A difference is a finding, not something to hide: every known one is listed
 //! in [`KNOWN_DIFFERENCES`] with its reason and where it is tracked, the run
@@ -138,6 +141,16 @@ fn encode_and_incremental_decode_match_the_reference() {
     );
 
     let known: BTreeMap<&str, &str> = KNOWN_DIFFERENCES.iter().copied().collect();
+    for id in known.keys() {
+        let mut parts = id.splitn(3, '/');
+        let (slug, kind, name) = (parts.next(), parts.next(), parts.next());
+        assert!(
+            slug.is_some_and(|s| !s.is_empty())
+                && matches!(kind, Some("render" | "parse"))
+                && name.is_some_and(|n| !n.is_empty()),
+            "KNOWN_DIFFERENCES entry {id} is not <slug>/render/<name> or <slug>/parse/<name>"
+        );
+    }
     let mut loaded_dirs = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut differences = BTreeMap::new();
