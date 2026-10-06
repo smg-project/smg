@@ -54,6 +54,10 @@ use std::collections::HashMap;
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
+/// The texts that mean null for a nullable string: JSON's word and the `None` a template writes
+/// for a null argument.
+pub(crate) const NULL_WORDS: [&str; 2] = ["null", "None"];
+
 /// The type a tool declares for one parameter, of the types that change how its text is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -159,10 +163,8 @@ fn parameters_of(schema: &Value) -> HashMap<String, Kind> {
 pub fn json(text: &str, kind: Option<Kind>) -> String {
     match kind {
         Some(Kind::String) => string(text),
-        Some(Kind::NullableString) => match text {
-            "null" | "None" => "null".to_string(),
-            _ => string(text),
-        },
+        Some(Kind::NullableString) if NULL_WORDS.contains(&text) => "null".to_string(),
+        Some(Kind::NullableString) => string(text),
         Some(Kind::Integer) => integer(text.trim())
             .filter(|integer| reads_back_as_an_argument(integer))
             .unwrap_or_else(|| inferred(text)),
