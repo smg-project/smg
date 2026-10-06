@@ -139,15 +139,15 @@ pub async fn call_worker(
     let Some(base) = worker.control_url.as_deref() else {
         return Err(no_control_endpoint(
             worker,
-            "no `rl.control_url` label; register the worker with one or upgrade the engine to advertise it",
+            "no `rl.control_url` label: launch the engine with a routable --rl-control-host (a wildcard bind is not advertised), or set the label at registration",
         ));
     };
-    let Some(client) = worker.control_client.as_ref() else {
-        return Err(no_control_endpoint(
+    let client = worker.control_client.as_ref().map_err(|e| {
+        no_control_endpoint(
             worker,
-            "the gateway could not build an HTTP client for the control endpoint (see the gateway log)",
-        ));
-    };
+            &format!("no HTTP client for the control endpoint: {e}"),
+        )
+    })?;
     let url = req.url_for(base);
     // The worker's client carries the gateway's request timeout; a refit
     // can outlive it, so the control deadline is set per request, as the
@@ -418,7 +418,6 @@ mod tests {
         let mut grpc = worker("g1", &engine.url, RuntimeType::Sglang);
         grpc.connection_mode = ConnectionMode::Grpc;
         grpc.control_url = None;
-        grpc.control_client = None;
         let app = crate::router::<()>(state(
             vec![worker("w1", &engine.url, RuntimeType::Sglang), grpc],
             5,
@@ -505,7 +504,7 @@ mod tests {
         let mut w = worker("g2", "grpc://engine:30000", RuntimeType::TokenSpeed);
         w.connection_mode = ConnectionMode::Grpc;
         w.control_url = Some("http://ctl:1".to_string());
-        w.control_client = None;
+        w.control_client = Err("bad CA bundle".to_string());
         let app = crate::router::<()>(state(vec![w], 5));
         let r = app
             .oneshot(
@@ -518,7 +517,8 @@ mod tests {
         assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = json_body(r).await;
         assert_eq!(body["error"], "no_control_endpoint");
-        assert!(body["message"].as_str().unwrap().contains("HTTP client"));
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("bad CA bundle"), "{message}");
     }
 
     /// The control deadline is applied per request, so it holds even when
@@ -527,7 +527,7 @@ mod tests {
     async fn control_timeout_is_applied_per_request_on_the_worker_client() {
         let slow_engine = FakeEngine::start(StatusCode::OK, json!({}), 1500).await;
         let mut w = worker("slow", &slow_engine.url, RuntimeType::Sglang);
-        w.control_client = Some(Arc::new(reqwest::Client::new()));
+        w.control_client = Ok(Arc::new(reqwest::Client::new()));
         let app = crate::router::<()>(state(vec![w], 1));
 
         let r = app

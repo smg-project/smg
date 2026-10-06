@@ -3,10 +3,12 @@
 //! (label `rl.control_url`), with a wildcard bind host swapped for the host the
 //! gateway already reaches the worker on.
 
-/// Resolve an advertised control URL against the worker's own URL.
+/// Resolve an advertised control URL against the worker's own base URL.
 ///
-/// An engine that bound `0.0.0.0` (or `::`) advertises what it bound; the
-/// only host the gateway knows is reachable is the worker's own, so use it.
+/// An engine does not advertise a wildcard bind, but an operator may label
+/// one (`http://0.0.0.0:P`); the only host the gateway knows is reachable is
+/// the worker's own, so use it. A worker with no host of its own (an `ipc://`
+/// ZMQ worker) leaves the label as it is.
 pub fn resolve_control_url(advertised: &str, worker_url: &str) -> String {
     let advertised = advertised.trim().trim_end_matches('/');
     let Some((scheme, rest)) = advertised.split_once("://") else {
@@ -24,7 +26,9 @@ pub fn resolve_control_url(advertised: &str, worker_url: &str) -> String {
         .next()
         .map(|authority| split_host_port(authority).0)
         .unwrap_or("");
-    let worker_host = worker_host.split('@').next().unwrap_or(worker_host);
+    if worker_host.is_empty() {
+        return advertised.to_string();
+    }
     let mut out = format!("{scheme}://{worker_host}");
     if let Some(port) = port {
         out.push(':');
@@ -84,9 +88,17 @@ mod tests {
             "http://[fd00::5]:40100"
         );
         assert_eq!(
-            resolve_control_url("http://:40100", "grpc://10.0.0.5:30000@2"),
-            "http://10.0.0.5:40100",
-            "a DP-rank suffix on the worker URL is not part of the host"
+            resolve_control_url("http://:40100", "grpc://10.0.0.5:30000"),
+            "http://10.0.0.5:40100"
+        );
+    }
+
+    #[test]
+    fn a_worker_without_a_host_keeps_the_label_as_advertised() {
+        assert_eq!(
+            resolve_control_url("http://0.0.0.0:40100", "ipc:///tmp/engine.sock"),
+            "http://0.0.0.0:40100",
+            "there is no worker host to substitute"
         );
     }
 

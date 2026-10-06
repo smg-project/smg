@@ -52,7 +52,7 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
         dp_size: None,
         labels,
         control_url: Some(base_url),
-        control_client: Some(test_client()),
+        control_client: Ok(test_client()),
     }
 }
 

@@ -1108,7 +1108,9 @@ impl HealthCheckUpdate {
 /// Per-worker HTTP connection configuration.
 /// All fields optional — `None` means "use router/global default".
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct HttpPoolConfig {
     /// Max idle connections per host (default: 500).
     pub pool_max_idle_per_host: Option<usize>,
