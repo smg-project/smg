@@ -10,11 +10,15 @@
 //! Ported from `crates/tool_parser/src/partial_json.rs` (smg 897ef9a9) under ground rule 27. What
 //! changed in form: an error type of its own, `is_complete` as a function of this module, the
 //! cursor's literal parsing shared by `true`, `false` and `null`, names and documentation. What
-//! changed in behaviour, once: a word of letters that is no literal never advances the cursor. The
+//! changed in behaviour, twice. A word of letters that is no literal never advances the cursor: the
 //! original looked ahead over at most the longest literal of the kind (five bytes for either boolean,
 //! four for `null`), so `truex` was rejected unseen but `false` or `null` followed by letters passed
-//! the look-ahead, was consumed, and was rejected only then: `[1, falsex` consumed ten bytes there
-//! and `[1, nullx` nine, both consume four here. Everything else behaves as before, since the
+//! the look-ahead, was consumed, and was rejected only then (`[1, falsex` consumed ten bytes there
+//! and `[1, nullx` nine, both consume four here). And a surrogate pair written as two `\u` escapes
+//! is one character: the original could not read one and stopped at its first half, so an object
+//! holding such a string came back without it and with the parse ending there; here the pair
+//! decodes, a cut inside it is an unfinished escape, and a surrogate without its other half is
+//! invalid, as before. Everything else behaves as before, since the
 //! ported streaming parser must reproduce the old one until bellwether's fixtures judge otherwise;
 //! the choices worth a second look are named here so that the parity review finds them: an unknown
 //! escape keeps the escaped character, an unfinished `\u` escape becomes U+FFFD, a number that
@@ -278,19 +282,52 @@ impl Cursor<'_> {
         }
     }
 
-    /// The four hex digits after `\u`; fewer than four give U+FFFD in prefix mode.
+    /// The character after `\u`: four hex digits, or a surrogate pair written as two `\u` escapes.
+    ///
+    /// Fewer than four digits, or a pair cut after its first half, is an unfinished escape: U+FFFD
+    /// in prefix mode, where the string is still arriving, and an error otherwise. A surrogate
+    /// without its other half is invalid in both modes.
     fn unicode_escape(&mut self) -> Parsed<char> {
+        let Some(high) = self.hex_unit() else {
+            return self.unfinished_escape();
+        };
+        if !(0xD800..0xDC00).contains(&high) {
+            return char::from_u32(high).ok_or(PartialJsonError::Invalid("invalid unicode escape"));
+        }
+        let mut ahead = self.chars.clone();
+        match (ahead.next(), ahead.next()) {
+            (Some('\\'), Some('u')) => {
+                self.advance();
+                self.advance();
+                let Some(low) = self.hex_unit() else {
+                    return self.unfinished_escape();
+                };
+                if (0xDC00..0xE000).contains(&low) {
+                    let scalar = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+                    return char::from_u32(scalar)
+                        .ok_or(PartialJsonError::Invalid("invalid unicode escape"));
+                }
+                Err(PartialJsonError::Invalid("invalid unicode escape"))
+            }
+            (None, _) | (Some('\\'), None) => self.unfinished_escape(),
+            _ => Err(PartialJsonError::Invalid("invalid unicode escape")),
+        }
+    }
+
+    /// Four hex digits, consumed, as a number; `None` when fewer than four were there.
+    fn hex_unit(&mut self) -> Option<u32> {
         let mut hex = String::new();
         while hex.len() < 4 && self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
             hex.push(self.peek().unwrap_or_default());
             self.advance();
         }
-        if hex.len() == 4 {
-            u32::from_str_radix(&hex, 16)
-                .ok()
-                .and_then(char::from_u32)
-                .ok_or(PartialJsonError::Invalid("invalid unicode escape"))
-        } else if self.allow_incomplete {
+        (hex.len() == 4)
+            .then(|| u32::from_str_radix(&hex, 16).ok())
+            .flatten()
+    }
+
+    fn unfinished_escape(&self) -> Parsed<char> {
+        if self.allow_incomplete {
             Ok('\u{FFFD}')
         } else {
             Err(PartialJsonError::Invalid("incomplete unicode escape"))
@@ -543,6 +580,49 @@ mod tests {
             "an unknown escape keeps its character"
         );
         assert_eq!(prefix(r#""\u00"#).0, json!("\u{FFFD}"));
+    }
+
+    #[test]
+    fn a_surrogate_pair_written_as_two_escapes_is_one_character() {
+        let text = r#"{"e": "\ud83c\udf0d", "f": 1}"#;
+        let (value, consumed) = prefix(text);
+        assert_eq!(value, json!({"e": "🌍", "f": 1}));
+        assert_eq!(consumed, text.len());
+        for cut in 0..=text.len() {
+            let (_, consumed) = prefix(&text[..cut]);
+            assert_eq!(
+                consumed, cut,
+                "cut at {cut}: a pair cut in two is a string still arriving"
+            );
+        }
+        assert_eq!(
+            PartialJson::new(8, false)
+                .parse(text, true)
+                .expect("complete")
+                .0,
+            json!({"e": "🌍", "f": 1})
+        );
+    }
+
+    #[test]
+    fn a_surrogate_without_its_other_half_is_invalid_in_both_modes() {
+        for text in [
+            r#""\ud83c""#,
+            r#""\udf0d""#,
+            r#""\ud83c x""#,
+            r#""\ud83c\u0041""#,
+        ] {
+            assert_eq!(
+                PartialJson::default().parse(text, true),
+                Err(PartialJsonError::Invalid("invalid unicode escape")),
+                "{text}"
+            );
+            assert_eq!(
+                PartialJson::new(8, false).parse(text, true),
+                Err(PartialJsonError::Invalid("invalid unicode escape")),
+                "{text}"
+            );
+        }
     }
 
     #[test]
