@@ -419,6 +419,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
             stop_sequences: None,
+            first_tool_call_only: false,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -809,6 +810,7 @@ async fn messages_blocks_and_inputs(
         history_tool_calls_count: 0,
         chat_tools: chat_spec(true).tools.unwrap(),
         stop_sequences: None,
+        first_tool_call_only: false,
     };
     let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
     frames.push(complete(0, "stop"));
@@ -1119,5 +1121,208 @@ async fn messages_tool_arguments_need_an_open_block() {
             ]
         );
         assert_eq!(inputs, [input]);
+    }
+}
+
+/// Two calls in the `qwen` tool format, one per chunk.
+const TWO_CALLS: [&str; 2] = [
+    "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>",
+    "\n<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2}}\n</tool_call>",
+];
+
+/// Two calls as JSON constrained output for a forced choice.
+const TWO_JSON_CALLS: [&str; 2] = [
+    "[{\"name\": \"lookup\", \"parameters\": {\"q\": 1}}",
+    ", {\"name\": \"lookup\", \"parameters\": {\"q\": 2}}]",
+];
+
+fn qwen_resolver() -> utils::ParserResolver {
+    utils::ParserResolver::new(
+        Arc::new(WorkerRegistry::new()),
+        Some("qwen".to_string()),
+        None,
+    )
+}
+
+/// `parallel_tool_calls: false` streams the first of the calls a model
+/// writes; unset or true, all of them.
+#[tokio::test]
+async fn chat_stream_with_parallel_tool_calls_false_has_the_first_call() {
+    for (parallel, calls) in [(None, 2), (Some(true), 2), (Some(false), 1)] {
+        let request = serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+            "model": "eof-test", "messages": [], "stream": true,
+            "parallel_tool_calls": parallel,
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "parameters": {"type": "object", "properties": {}}
+            }}]
+        }))
+        .expect("chat request");
+        let frames = vec![
+            chunk(0, TWO_CALLS[0]),
+            chunk(0, TWO_CALLS[1]),
+            complete(0, "stop"),
+        ];
+        let (stream, server) = scripted_stream(frames, "0").await;
+        let (tx, rx) = sse_channel();
+        let processor = StreamingProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            qwen_resolver(),
+            "vllm",
+        );
+        let result = processor
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                ChatResponseSpec::from(&request),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        let mut arguments: Vec<String> = Vec::new();
+        for call in events
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array())
+            .flatten()
+        {
+            let index = call["index"].as_u64().unwrap() as usize;
+            if index == arguments.len() {
+                arguments.push(String::new());
+            }
+            arguments[index].push_str(call["function"]["arguments"].as_str().unwrap_or(""));
+        }
+        assert_eq!(arguments.len(), calls, "{parallel:?}: {events:?}");
+        assert_eq!(arguments[0], "{\"q\":1}", "{parallel:?}");
+        let finish = events
+            .iter()
+            .find_map(|event| event["choices"][0]["finish_reason"].as_str());
+        assert_eq!(finish, Some("tool_calls"), "{parallel:?}");
+    }
+}
+
+/// The `tool_use` inputs of a Messages response to `texts` with
+/// `tool_choice`, unary or streamed.
+async fn messages_tool_inputs(tool_choice: Value, texts: &[&str], stream: bool) -> Vec<Value> {
+    let request = serde_json::from_value::<messages::CreateMessageRequest>(serde_json::json!({
+        "model": "eof-test", "max_tokens": 16, "tool_choice": tool_choice,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}]
+    }))
+    .expect("messages request");
+    let spec = MessagesResponseSpec::from(&request);
+    let mut last = complete(0, "stop");
+    if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+        complete.output_ids = texts.concat().chars().map(u32::from).collect();
+    }
+    let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
+    frames.push(last);
+    let (grpc_stream, server) = scripted_stream(frames, "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let inputs = if stream {
+        let processor = StreamingProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            qwen_resolver(),
+            "vllm",
+        );
+        let (tx, rx) = sse_channel();
+        let result = processor
+            .process_messages_streaming_chunks(
+                grpc_stream,
+                dispatch(),
+                tokenizer,
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        assert!(result.is_ok(), "{result:?}");
+        let mut inputs: Vec<String> = Vec::new();
+        for event in collect_events(rx).await {
+            if event["content_block"]["type"] == "tool_use" {
+                inputs.push(String::new());
+            }
+            if let Some(json) = event["delta"]["partial_json"].as_str() {
+                inputs.last_mut().unwrap().push_str(json);
+            }
+        }
+        inputs
+            .iter()
+            .map(|json| serde_json::from_str(json).unwrap())
+            .collect()
+    } else {
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            qwen_resolver(),
+        );
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let message = processor
+            .process_non_streaming_messages_response(
+                context::ExecutionResult::Single {
+                    stream: grpc_stream,
+                },
+                spec,
+                dispatch(),
+                tokenizer,
+                &mut decoder,
+            )
+            .await
+            .unwrap_or_else(|response| panic!("{}", response.status()));
+        let message = serde_json::to_value(message).unwrap();
+        let blocks = message["content"].as_array().unwrap().iter();
+        blocks
+            .filter(|block| block["type"] == "tool_use")
+            .map(|block| block["input"].clone())
+            .collect()
+    };
+    server.abort();
+    inputs
+}
+
+/// `disable_parallel_tool_use: true` returns the first of the calls a model
+/// writes, unary and streamed; otherwise all of them.
+#[tokio::test]
+async fn messages_with_parallel_tool_use_disabled_have_the_first_call() {
+    let first = serde_json::json!({"q": 1});
+    let both = [first.clone(), serde_json::json!({"q": 2})];
+    for stream in [false, true] {
+        for (tool_choice, texts, inputs) in [
+            (serde_json::json!({"type": "auto"}), TWO_CALLS, &both[..]),
+            (
+                serde_json::json!({"type": "auto", "disable_parallel_tool_use": false}),
+                TWO_CALLS,
+                &both[..],
+            ),
+            (
+                serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+                TWO_CALLS,
+                &both[..1],
+            ),
+            (
+                serde_json::json!({"type": "any"}),
+                TWO_JSON_CALLS,
+                &both[..],
+            ),
+            (
+                serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
+                TWO_JSON_CALLS,
+                &both[..1],
+            ),
+        ] {
+            assert_eq!(
+                messages_tool_inputs(tool_choice.clone(), &texts, stream).await,
+                inputs,
+                "{tool_choice} stream={stream}"
+            );
+        }
     }
 }
