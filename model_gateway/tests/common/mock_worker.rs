@@ -268,8 +268,9 @@ fn record_request(port: u16, version: Version, body: &serde_json::Value) {
     }
 }
 
-/// Record the `authorization` header of one RL control request. Called
-/// alongside [`record_request`] so the two vectors stay index-aligned.
+/// Record the `authorization` header of one RL control request. Only the
+/// RL control routes call it, so this vector is shorter than `bodies` when
+/// the recorder's port also served other routes.
 fn record_authorization(port: u16, value: Option<String>) {
     let recorder = request_recorders_table()
         .lock()
