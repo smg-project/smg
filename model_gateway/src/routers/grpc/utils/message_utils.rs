@@ -5,6 +5,8 @@
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
 #![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
+use std::collections::HashMap;
+
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
@@ -30,14 +32,16 @@ use crate::routers::grpc::{multimodal::PlaceholderTokens, ProcessedMessages};
 ///
 /// Parallel to `process_chat_messages()` in chat_utils, but works with
 /// Anthropic Messages API types. Converts InputMessages to JSON values
-/// that the chat template expects, then applies the template. The second
-/// element says how the tokenize step must encode the prompt.
+/// that the chat template expects, then applies the template, with
+/// `reasoning_effort` as the template kwarg of that name when set. The
+/// second element says how the tokenize step must encode the prompt.
 pub fn process_messages(
     request: &CreateMessageRequest,
     tokenizer: &dyn Tokenizer,
     chat_tools: Option<&[ChatTool]>,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
+    reasoning_effort: Option<&str>,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     let content_format = tokenizer.chat_template_content_format();
 
@@ -93,9 +97,16 @@ pub fn process_messages(
     };
 
     // Step 6: Apply chat template
+    let template_kwargs = reasoning_effort.map(|effort| {
+        HashMap::from([(
+            chat_utils::REASONING_EFFORT_KEY.to_string(),
+            Value::String(effort.to_string()),
+        )])
+    });
     let params = ChatTemplateParams {
         add_generation_prompt: true,
         tools: tools_json.as_deref(),
+        template_kwargs: template_kwargs.as_ref(),
         thinking,
         ..Default::default()
     };
@@ -118,6 +129,24 @@ pub fn process_messages(
         },
         rendered.encoding,
     ))
+}
+
+/// The effort a request states in `output_config.effort`: a string, or a
+/// number as its text, as a Chat request's `reasoning_effort` is read;
+/// `None` when absent or null. Any other type is an error.
+pub(crate) fn output_config_effort(
+    request: &CreateMessageRequest,
+) -> Result<Option<String>, String> {
+    match request
+        .other
+        .get("output_config")
+        .map(|config| &config["effort"])
+    {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(effort)) => Ok(Some(effort.clone())),
+        Some(Value::Number(effort)) => Ok(Some(effort.to_string())),
+        Some(_) => Err("output_config.effort must be a string, number, or null".to_string()),
+    }
 }
 
 // ============================================================================
@@ -996,5 +1025,54 @@ mod tests {
             cache_control: None,
         };
         assert_eq!(tool_result_image_blocks(&empty).count(), 0);
+    }
+    /// `output_config.effort` reads as a Chat `reasoning_effort` does, and
+    /// reaches the chat template as the `reasoning_effort` kwarg.
+    #[test]
+    fn output_config_effort_is_rendered_as_the_reasoning_effort() {
+        let request = |output_config: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .unwrap()
+        };
+        for (output_config, effort) in [
+            (json!({"effort": "high"}), Some("high")),
+            (json!({"effort": 64}), Some("64")),
+            (json!({"effort": null}), None),
+            (json!({}), None),
+        ] {
+            let got = output_config_effort(&request(output_config.clone())).unwrap();
+            assert_eq!(got.as_deref(), effort, "{output_config}");
+        }
+        assert!(output_config_effort(&request(json!({"effort": ["low"]}))).is_err());
+
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                "{%- for m in messages -%}{{ m.role }}: {{ m.content }} {% endfor -%}\
+                 effort={{ reasoning_effort | default('unset') }}"
+                    .to_string(),
+            )
+            .unwrap();
+        let request = request(json!({"effort": "high"}));
+        let rendered = |effort| {
+            process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                effort,
+            )
+            .unwrap()
+            .0
+            .text
+        };
+        assert_eq!(rendered(Some("high")), "user: Hello effort=high");
+        assert_eq!(rendered(None), "user: Hello effort=unset");
     }
 }
