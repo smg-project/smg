@@ -47,12 +47,16 @@
 //! it; `abort` cancels it, where the old path called an aborted response complete; any other
 //! engine-specific reason completes it. A sequence without `Finish` is `in_progress`.
 //!
-//! Item statuses follow: `in_progress` while the response has not finished or when the engine
-//! failed, `completed` otherwise, except that a call whose argument fragments never became a whole
-//! JSON value is `incomplete`. Two of these differ from the old path, which called the reasoning
-//! item `completed` whatever the response's state (here it follows the message) and marked a call
-//! `incomplete` only after `length` (here the status describes the call, whatever stopped the
-//! output). A call the model closed without arguments has empty arguments and is complete.
+//! Item statuses follow. While the response has not finished, and when the engine failed, an item
+//! is `in_progress` unless its own events ended it: a reasoning item whose region closed is
+//! `completed`, a call that ended is `completed`, and the message, which ends only with the
+//! response, is `in_progress`. Once the response finished otherwise, every item is `completed`. In
+//! either case a call whose argument fragments never became a whole JSON value is `incomplete`
+//! rather than `completed`. Three of these differ from the old path, which called the reasoning
+//! item `completed` whatever the response's state, left every item of a failed response
+//! `in_progress`, what had finished included, and marked a call `incomplete` only after `length`;
+//! here each status describes its item. A call the model closed without arguments has empty
+//! arguments and is complete.
 //!
 //! Policy this adapter sets, where the events say more than the Responses API can:
 //!
@@ -105,18 +109,25 @@ struct Call {
     id: String,
     name: String,
     arguments: String,
+    /// Whether `ToolCallEnd` came for it.
+    ended: bool,
 }
 
 /// The output of the response `response_id`, folded from a whole event sequence.
 pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>) -> Output {
     let mut content = String::new();
     let mut reasoning = String::new();
+    let mut reasoning_ended = false;
     let mut calls: Vec<Call> = Vec::new();
     let mut finish = None;
     for event in events {
         match event {
             Event::Content(text) | Event::Malformed { text, .. } => content.push_str(&text.text),
-            Event::Reasoning(text) => reasoning.push_str(&text.text),
+            Event::Reasoning(text) => {
+                reasoning.push_str(&text.text);
+                reasoning_ended = false;
+            }
+            Event::ReasoningEnd => reasoning_ended = true,
             Event::ToolCallStart {
                 index, id, name, ..
             } => calls.push(Call {
@@ -124,6 +135,7 @@ pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>
                 id: id.clone(),
                 name: name.clone(),
                 arguments: String::new(),
+                ended: false,
             }),
             Event::ToolCallArguments { index, json, .. } => {
                 match calls.iter_mut().find(|call| call.index == *index) {
@@ -131,33 +143,37 @@ pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>
                     None => content.push_str(json),
                 }
             }
+            Event::ToolCallEnd { index, .. } => {
+                if let Some(call) = calls.iter_mut().find(|call| call.index == *index) {
+                    call.ended = true;
+                }
+            }
             Event::Finish { reason, .. } => finish = Some(reason),
-            Event::ReasoningStart
-            | Event::ReasoningEnd
-            | Event::ToolCallEnd { .. }
-            | Event::Dropped { .. } => {}
+            Event::ReasoningStart | Event::Dropped { .. } => {}
         }
     }
 
     let (status, incomplete_details) = response_status(finish);
-    let item_status = item_status(&status);
 
     let mut items = Vec::new();
     if !reasoning.is_empty() {
         items.push(reasoning_item(
             format!("rs_{response_id}"),
             reasoning,
-            item_status,
+            item_status(&status, reasoning_ended),
         ));
     }
     if !content.trim().is_empty() {
         items.push(message_item(
             format!("msg_{response_id}"),
             content,
-            item_status,
+            item_status(&status, false),
         ));
     }
-    items.extend(calls.into_iter().map(|call| call_item(call, item_status)));
+    items.extend(calls.into_iter().map(|call| {
+        let status = item_status(&status, call.ended);
+        call_item(call, status)
+    }));
 
     Output {
         items,
@@ -321,6 +337,8 @@ enum Record {
         index: u32,
         id: String,
         text: String,
+        /// Whether the region is still open.
+        open: bool,
     },
     Message {
         index: u32,
@@ -330,7 +348,6 @@ enum Record {
     Call {
         index: u32,
         call: Call,
-        open: bool,
     },
 }
 
@@ -353,7 +370,7 @@ impl Stream {
         match event {
             Event::Content(text) | Event::Malformed { text, .. } => self.content(&text.text, out),
             Event::Reasoning(text) => self.reasoning(&text.text, out),
-            Event::ReasoningEnd => self.close_reasoning(out),
+            Event::ReasoningEnd => self.close_reasoning("completed", out),
             Event::ToolCallStart {
                 index, id, name, ..
             } => self.start_call(*index, id, name, out),
@@ -412,6 +429,7 @@ impl Stream {
                     index,
                     id,
                     text: String::new(),
+                    open: true,
                 });
                 self.reasoning = Some(self.records.len() - 1);
                 self.records.len() - 1
@@ -421,6 +439,7 @@ impl Stream {
             index,
             id,
             text: whole,
+            ..
         } = &mut self.records[position]
         {
             whole.push_str(text);
@@ -433,12 +452,20 @@ impl Stream {
         }
     }
 
-    /// Completes the open reasoning item, if any.
-    fn close_reasoning(&mut self, out: &mut Vec<StreamEvent>) {
+    /// Completes the open reasoning item, if any, with `status`: `completed` when its region ended,
+    /// the response's item status when the response ended first.
+    fn close_reasoning(&mut self, status: &str, out: &mut Vec<StreamEvent>) {
         let Some(position) = self.reasoning.take() else {
             return;
         };
-        if let Record::Reasoning { index, id, text } = &self.records[position] {
+        if let Record::Reasoning {
+            index,
+            id,
+            text,
+            open,
+        } = &mut self.records[position]
+        {
+            *open = false;
             out.push(StreamEvent::ReasoningTextDone {
                 output_index: *index,
                 item_id: id.clone(),
@@ -455,7 +482,7 @@ impl Stream {
             });
             out.push(StreamEvent::OutputItemDone {
                 output_index: *index,
-                item: reasoning_item(id.clone(), text.clone(), "completed"),
+                item: reasoning_item(id.clone(), text.clone(), status),
             });
         }
     }
@@ -473,7 +500,7 @@ impl Stream {
                     self.held.push_str(text);
                     return;
                 }
-                self.close_reasoning(out);
+                self.close_reasoning("completed", out);
                 let index = self.next_index();
                 let id = format!("msg_{}", self.response_id);
                 out.push(StreamEvent::OutputItemAdded {
@@ -521,29 +548,26 @@ impl Stream {
 
     /// Opens a call's item.
     fn start_call(&mut self, call: u32, id: &str, name: &str, out: &mut Vec<StreamEvent>) {
-        self.close_reasoning(out);
+        self.close_reasoning("completed", out);
         let index = self.next_index();
         let call = Call {
             index: call,
             id: id.to_string(),
             name: name.to_string(),
             arguments: String::new(),
+            ended: false,
         };
         out.push(StreamEvent::OutputItemAdded {
             output_index: index,
             item: call_item(call.clone(), "in_progress"),
         });
-        self.records.push(Record::Call {
-            index,
-            call,
-            open: true,
-        });
+        self.records.push(Record::Call { index, call });
     }
 
     /// The position of the open item of call `call`, if it has one.
     fn open_call(&self, call: u32) -> Option<usize> {
         self.records.iter().position(|record| {
-            matches!(record, Record::Call { call: started, open: true, .. } if started.index == call)
+            matches!(record, Record::Call { call: started, .. } if started.index == call && !started.ended)
         })
     }
 
@@ -569,14 +593,14 @@ impl Stream {
     /// Completes a call's item, if it is open.
     fn end_call(&mut self, call: u32, out: &mut Vec<StreamEvent>) {
         if let Some(position) = self.open_call(call) {
-            self.complete_call(position, out);
+            self.complete_call(position, "completed", out);
         }
     }
 
-    /// Completes the call item at `position`: arguments done, then the item.
-    fn complete_call(&mut self, position: usize, out: &mut Vec<StreamEvent>) {
-        if let Record::Call { index, call, open } = &mut self.records[position] {
-            *open = false;
+    /// Completes the call item at `position` with `status`: arguments done, then the item.
+    fn complete_call(&mut self, position: usize, status: &str, out: &mut Vec<StreamEvent>) {
+        if let Record::Call { index, call } = &mut self.records[position] {
+            call.ended = true;
             out.push(StreamEvent::FunctionCallArgumentsDone {
                 output_index: *index,
                 item_id: call.id.clone(),
@@ -584,19 +608,37 @@ impl Stream {
             });
             out.push(StreamEvent::OutputItemDone {
                 output_index: *index,
-                item: call_item(call.clone(), "completed"),
+                item: call_item(call.clone(), status),
             });
         }
     }
 
-    /// Completes every open item under the engine's reason and returns the response's output.
+    /// Completes every open item under the engine's reason and returns the response's output,
+    /// each item with the status it reached: what the end closes is `in_progress` when the response
+    /// did not finish or the engine failed, what ended on its own keeps its status.
     fn end(&mut self, finish: Option<&FinishReason>, out: &mut Vec<StreamEvent>) -> Output {
         let (status, incomplete_details) = response_status(finish);
-        let item_status = item_status(&status);
-        self.close_reasoning(out);
+        let open_status = item_status(&status, false);
+        let items = self
+            .records
+            .iter()
+            .map(|record| match record {
+                Record::Reasoning { id, text, open, .. } => {
+                    reasoning_item(id.clone(), text.clone(), item_status(&status, !open))
+                }
+                Record::Message { id, text, .. } => {
+                    message_item(id.clone(), text.clone(), open_status)
+                }
+                Record::Call { call, .. } => {
+                    let status = item_status(&status, call.ended);
+                    call_item(call.clone(), status)
+                }
+            })
+            .collect();
+        self.close_reasoning(open_status, out);
         for position in 0..self.records.len() {
-            if matches!(self.records[position], Record::Call { open: true, .. }) {
-                self.complete_call(position, out);
+            if matches!(&self.records[position], Record::Call { call, .. } if !call.ended) {
+                self.complete_call(position, open_status, out);
             }
         }
         if let Some(position) = self.message.take() {
@@ -615,24 +657,11 @@ impl Stream {
                 });
                 out.push(StreamEvent::OutputItemDone {
                     output_index: *index,
-                    item: message_item(id.clone(), text.clone(), item_status),
+                    item: message_item(id.clone(), text.clone(), open_status),
                 });
             }
         }
         self.held.clear();
-        let items = self
-            .records
-            .iter()
-            .map(|record| match record {
-                Record::Reasoning { id, text, .. } => {
-                    reasoning_item(id.clone(), text.clone(), item_status)
-                }
-                Record::Message { id, text, .. } => {
-                    message_item(id.clone(), text.clone(), item_status)
-                }
-                Record::Call { call, .. } => call_item(call.clone(), item_status),
-            })
-            .collect();
         Output {
             items,
             status,
@@ -641,10 +670,11 @@ impl Stream {
     }
 }
 
-/// The status of an item under the response's status: still in progress while the response is,
-/// or when the engine failed; completed otherwise.
-fn item_status(status: &ResponseStatus) -> &'static str {
-    if matches!(status, ResponseStatus::InProgress | ResponseStatus::Failed) {
+/// The status of an item under the response's status: while the response has not finished, and
+/// when the engine failed, `in_progress` unless the item's own events ended it; `completed`
+/// otherwise.
+fn item_status(status: &ResponseStatus, ended: bool) -> &'static str {
+    if !ended && matches!(status, ResponseStatus::InProgress | ResponseStatus::Failed) {
         "in_progress"
     } else {
         "completed"
@@ -984,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn items_stay_in_progress_until_the_response_finishes_and_when_the_engine_fails() {
+    fn items_cut_short_stay_in_progress_and_items_that_ended_keep_their_status() {
         let unfinished = [
             Event::Reasoning(Text::uncounted("plan")),
             Event::Content(Text::uncounted("text")),
@@ -996,7 +1026,7 @@ mod tests {
             ["in_progress", "in_progress", "in_progress"]
         );
 
-        let failed = [
+        let failed_mid_reasoning = [
             Event::Reasoning(Text::uncounted("plan")),
             Event::Content(Text::uncounted("text")),
             call(0, "get_weather"),
@@ -1004,12 +1034,27 @@ mod tests {
             end(0),
             finish(FinishReason::Other("failed".into()), 1),
         ];
-        let out = output("r", &failed);
+        let out = output("r", &failed_mid_reasoning);
         assert_eq!(
             statuses(&out.items),
-            ["in_progress", "in_progress", "in_progress"]
+            ["in_progress", "in_progress", "completed"],
+            "the call ended before the engine failed; the reasoning region and the message did not"
         );
         assert_eq!(out.status, ResponseStatus::Failed);
+
+        let failed_after_reasoning = [
+            Event::Reasoning(Text::uncounted("plan")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("text")),
+            call(0, "get_weather"),
+            arguments(0, r#"{"city":"#),
+            finish(FinishReason::Other("error".into()), 1),
+        ];
+        assert_eq!(
+            statuses(&output("r", &failed_after_reasoning).items),
+            ["completed", "in_progress", "in_progress"],
+            "the reasoning region closed; the message and the unended call were cut short"
+        );
     }
 
     #[test]
@@ -1289,6 +1334,35 @@ mod tests {
         let (out, done) = stream("r", &failed);
         assert_eq!(stream_wire(&out)[5]["item"]["status"], "in_progress");
         assert_eq!(done.expect("output").status, ResponseStatus::Failed);
+
+        let failed_after_a_call = [
+            Event::Reasoning(Text::uncounted("plan")),
+            Event::ReasoningEnd,
+            call(0, "f"),
+            arguments(0, "{}"),
+            end(0),
+            Event::Content(Text::uncounted("x")),
+            finish(FinishReason::Other("failed".into()), 1),
+        ];
+        let (out, done) = stream("r", &failed_after_a_call);
+        let done_statuses: Vec<String> = stream_wire(&out)
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.done")
+            .map(|event| {
+                event["item"]["status"]
+                    .as_str()
+                    .expect("a status")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(done_statuses, ["completed", "completed", "in_progress"]);
+        assert_eq!(
+            statuses(&done.expect("output").items),
+            ["completed", "completed", "in_progress"],
+            "the terminal output keeps the status each item reached"
+        );
     }
 
     #[test]
