@@ -21,8 +21,11 @@ transport. An HTTP worker is controlled through itself; an `rl.control_url`
 label on an HTTP worker is ignored. A gRPC or ZMQ worker needs the
 `rl.control_url` label: TokenSpeed engines advertise it in server
 info (SMG's discovery turns it into the label), and any worker can be given one
-at `POST /workers` or through the worker update route. A wildcard bind host in
-the advertised URL (`0.0.0.0`, `::`) is replaced by the worker's own host. The
+at `POST /workers` or through the worker update route. The engine advertises
+the URL only for a concrete `--rl-control-host`: a wildcard bind (`0.0.0.0`,
+`::`) is not advertised, and the default loopback is right only when SMG runs
+on the same machine. A wildcard host in an operator-supplied label is replaced
+by the worker's own host. The
 worker's `api_key` is sent as the bearer to the control endpoint. The label is
 trusted: whatever host `rl.control_url` names receives the worker's `api_key`
 as a bearer, so only engines and operators you trust may set it. A worker with
