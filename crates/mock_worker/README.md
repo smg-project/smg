@@ -98,7 +98,8 @@ Keys are the field names in
 - `request_id`, `input_ids`, `original_text` and `stream`. The gateway sends a
   client `rid` as `request_id` (with a suffix under PD), so lines join to
   responses on it.
-- Every `SamplingParams` scalar, and `logit_bias` as an object. An optional the
+- Every `SamplingParams` scalar, and `logit_bias` as an object with sorted
+  keys, so the same request always gives the same bytes. An optional the
   gateway left unset is `null`. A float is the shortest decimal that reads back
   as the same `f32`, so a request's `0.7` shows as `0.7`; NaN and infinities,
   which JSON cannot hold, are strings such as `"NaN"`.

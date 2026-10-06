@@ -417,3 +417,40 @@ async fn unopenable_capture_file_fails_at_startup() {
         "nothing is left listening on port {port}"
     );
 }
+
+/// The same request gives the same bytes. Decoding puts `logit_bias` in a
+/// `HashMap`, whose order changes from one decode to the next, so its keys
+/// must be written in a fixed order.
+#[tokio::test]
+async fn the_same_request_gives_byte_identical_lines() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("generate.jsonl");
+    let client = start(config(Some(path.clone()))).await;
+
+    let tokens = [
+        0, 1, 5, 7, 9, 13, 31, 42, 64, 77, 100, 256, 2000, 128000, 151643, 151645,
+    ];
+    let mut req = request("biased", &[1], "biased");
+    if let Some(sampling) = req.sampling_params.as_mut() {
+        sampling.logit_bias = tokens
+            .iter()
+            .map(|token| (token.to_string(), -1.5))
+            .collect();
+    }
+    generate(&client, req.clone()).await;
+    generate(&client, req).await;
+
+    let text = std::fs::read_to_string(&path).expect("read the capture file");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0], lines[1], "the same request gives the same bytes");
+    let line: Value = serde_json::from_str(lines[0]).expect("one JSON object");
+    let keys: Vec<&String> = line["logit_bias"]
+        .as_object()
+        .expect("logit_bias is an object")
+        .keys()
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "logit_bias keys are sorted");
+}

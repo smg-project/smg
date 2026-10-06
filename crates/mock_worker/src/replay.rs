@@ -2,6 +2,7 @@
 //! worker receives, so a test can check what the gateway put on the wire.
 
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{self, Write},
     path::Path,
@@ -57,9 +58,13 @@ fn capture_json(req: &ts::GenerateRequest) -> Value {
     };
     let unset = ts::SamplingParams::default();
     let sampling = req.sampling_params.as_ref().unwrap_or(&unset);
+    // Decoding puts `logit_bias` in a `HashMap`, whose order changes from one
+    // decode to the next; sorted keys give the same request the same bytes.
     let logit_bias: Map<String, Value> = sampling
         .logit_bias
         .iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
         .map(|(token, bias)| (token.clone(), f32_json(*bias)))
         .collect();
     json!({
