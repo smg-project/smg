@@ -147,7 +147,7 @@ fn encode_and_incremental_decode_match_the_reference() {
         assert!(
             slug.is_some_and(|s| !s.is_empty())
                 && matches!(kind, Some("render" | "parse"))
-                && name.is_some_and(|n| !n.is_empty()),
+                && name.is_some_and(|n| !n.is_empty() && !n.contains('/')),
             "KNOWN_DIFFERENCES entry {id} is not <slug>/render/<name> or <slug>/parse/<name>"
         );
     }
