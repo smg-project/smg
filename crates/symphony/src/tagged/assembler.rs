@@ -160,38 +160,35 @@ impl Assembler {
 
     /// The block the model ended before `</function>`: an open string is closed, the object is
     /// closed, and the bytes of a value, a name or a tag cut short come back as `Malformed`. A
-    /// block that never named a function comes back as `Malformed` whole.
+    /// block that never named a function has had its text reported as it came; what is left of it
+    /// comes back as `Malformed` here.
     pub fn close(mut self, out: &mut Events) {
         if self.done {
             return;
         }
         let held = self.held_tag();
-        match &self.stage {
-            Stage::Opening => {
-                self.carried.push_str(&held);
+        if !self.started() {
+            self.carried.push_str(&held);
+            if matches!(self.stage, Stage::Opening) {
                 self.leftover(MalformedReason::Other(WITHOUT_A_FUNCTION.to_string()), out);
-                return;
+            } else {
+                self.report_tag(CLOSED_EARLY, out);
             }
-            Stage::FunctionName { .. } => {
-                self.carried.push_str(&held);
-                self.leftover(MalformedReason::Other(CLOSED_EARLY.to_string()), out);
-                return;
+            return;
+        }
+        if matches!(self.stage, Stage::Between) {
+            let source = Text::uncounted(std::mem::take(&mut self.carried));
+            self.close_object(source, out);
+            self.carried = held;
+            self.leftover(MalformedReason::Other(CLOSED_EARLY.to_string()), out);
+        } else {
+            let open_string = self.open_string();
+            self.carried.push_str(&held);
+            self.report_tag(CLOSED_EARLY, out);
+            if open_string {
+                self.push_fragment("\"".to_string(), Text::default(), out);
             }
-            Stage::Between => {
-                let source = Text::uncounted(std::mem::take(&mut self.carried));
-                self.close_object(source, out);
-                self.carried = held;
-                self.leftover(MalformedReason::Other(CLOSED_EARLY.to_string()), out);
-            }
-            Stage::ParameterName { .. } | Stage::Value(_) => {
-                let open_string = self.open_string();
-                self.carried.push_str(&held);
-                self.leftover(MalformedReason::Other(CLOSED_EARLY.to_string()), out);
-                if open_string {
-                    self.push_fragment("\"".to_string(), Text::default(), out);
-                }
-                self.close_object(Text::default(), out);
-            }
+            self.close_object(Text::default(), out);
         }
         out.push(Event::ToolCallEnd {
             index: self.index,
@@ -201,8 +198,8 @@ impl Assembler {
 
     /// No more bytes will come, and the call never closed. Nothing is closed for the client: an
     /// open string stays open, the bytes of a value, a name or a tag cut short come back as
-    /// `Malformed`, and a started call ends. A block that never named a function comes back as
-    /// `Malformed` whole.
+    /// `Malformed`, and a started call ends. A block that never named a function has had its text
+    /// reported as it came; what is left of it comes back as `Malformed` here.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -245,6 +242,28 @@ impl Assembler {
         }
     }
 
+    /// A tag that is reported, with the carried bytes: the whitespace before it is the template's
+    /// and is dropped, the tag's own bytes come back as `Malformed`.
+    fn report_tag(&mut self, why: &str, out: &mut Events) {
+        let text = std::mem::take(&mut self.carried);
+        let tag_at = text
+            .char_indices()
+            .find(|(_, c)| !c.is_whitespace())
+            .map_or(text.len(), |(at, _)| at);
+        if tag_at > 0 {
+            out.push(Event::Dropped {
+                text: Text::uncounted(&text[..tag_at]),
+                why: DropReason::Wrapper,
+            });
+        }
+        if tag_at < text.len() {
+            out.push(Event::Malformed {
+                text: Text::uncounted(&text[tag_at..]),
+                why: MalformedReason::Other(why.to_string()),
+            });
+        }
+    }
+
     /// The carried bytes as the template's wrapper, when there are any: they come before text
     /// that is reported on its own, so they cannot wait for a later event's source.
     fn drop_carried(&mut self, out: &mut Events) {
@@ -271,7 +290,7 @@ impl Assembler {
             // A tag cuts the name short: the tag's bytes so far are reported, and the tag is read
             // where the name began.
             Stage::FunctionName { .. } => {
-                self.leftover(MalformedReason::Other(TAG_CUT_SHORT.to_string()), out);
+                self.report_tag(TAG_CUT_SHORT, out);
                 self.stage = if self.started() {
                     Stage::Between
                 } else {
@@ -280,7 +299,7 @@ impl Assembler {
                 self.tag_between(tag, out);
             }
             Stage::ParameterName { .. } => {
-                self.leftover(MalformedReason::Other(TAG_CUT_SHORT.to_string()), out);
+                self.report_tag(TAG_CUT_SHORT, out);
                 self.stage = Stage::Between;
                 self.tag_between(tag, out);
             }
@@ -384,14 +403,14 @@ impl Assembler {
     /// already, in which case the tag is reported.
     fn function_named(&mut self, name: String, out: &mut Events) {
         if name.is_empty() {
-            self.leftover(MalformedReason::Other(EMPTY_NAME.to_string()), out);
+            self.report_tag(EMPTY_NAME, out);
             self.stage = if self.started() {
                 Stage::Between
             } else {
                 Stage::Opening
             };
         } else if self.started() {
-            self.leftover(MalformedReason::Other(SECOND_FUNCTION.to_string()), out);
+            self.report_tag(SECOND_FUNCTION, out);
             self.stage = Stage::Between;
         } else {
             out.push(Event::ToolCallStart {
@@ -408,7 +427,8 @@ impl Assembler {
     /// The parameter's tag is whole: the value begins. A declared string opens its fragment now.
     fn parameter_named(&mut self, key: String, declared: &Declared, out: &mut Events) {
         if key.is_empty() {
-            self.leftover(MalformedReason::Other(EMPTY_NAME.to_string()), out);
+            // vLLM keeps an empty parameter name and writes `"": value`; here it is reported.
+            self.report_tag(EMPTY_NAME, out);
             self.stage = Stage::Between;
             return;
         }
@@ -466,6 +486,7 @@ impl Assembler {
             }
         }
         if text.is_empty() {
+            // The piece was the template's newline alone.
             return;
         }
         match value.mode {
@@ -487,14 +508,11 @@ impl Assembler {
         let Stage::Value(value) = &mut self.stage else {
             return;
         };
-        let key = std::mem::take(&mut value.key);
+        let key = value.key.clone();
         value.mode = Mode::Streaming {
             held_newline: false,
         };
         self.open_string_fragment(&key, out);
-        if let Stage::Value(value) = &mut self.stage {
-            value.key = key;
-        }
         self.stream(&arrived, out);
     }
 
@@ -515,10 +533,8 @@ impl Assembler {
         };
         *held_newline = ends_with_newline;
         if body.is_empty() && !had_newline {
-            // Only a newline arrived; it waits with the carried bytes for the piece that follows.
-            if ends_with_newline {
-                self.carried.push('\n');
-            }
+            // The piece is one newline; it waits with the carried bytes for the piece that follows.
+            self.carried.push('\n');
             return;
         }
         let mut json = String::with_capacity(body.len() + 2);
@@ -1060,8 +1076,9 @@ mod tests {
         assert_eq!(arguments(&events), "{}");
         assert_eq!(
             malformed(&events),
-            vec![("\n<parameter=a".to_string(), other(TAG_CUT_SHORT))]
+            vec![("<parameter=a".to_string(), other(TAG_CUT_SHORT))]
         );
+        assert_eq!(dropped(&events), vec!["\n"]);
         assert_eq!(events.last(), Some(&end("</function>")));
         assert_eq!(bytes(&events), call);
         // A parameter tag inside the key starts the next parameter.
@@ -1089,11 +1106,12 @@ mod tests {
         assert_eq!(
             malformed(&events),
             vec![
-                ("\n<parameter=>".to_string(), other(EMPTY_NAME)),
+                ("<parameter=>".to_string(), other(EMPTY_NAME)),
                 ("x".to_string(), other(TEXT_BETWEEN_TAGS)),
                 ("</parameter>".to_string(), other(TAG_OUT_OF_PLACE)),
             ]
         );
+        assert_eq!(dropped(&events), vec!["\n", "\n", "\n"]);
         assert_eq!(bytes(&events), call);
     }
 
@@ -1104,8 +1122,9 @@ mod tests {
         assert_eq!(arguments(&events), r#"{"city": "Paris"}"#);
         assert_eq!(
             malformed(&events),
-            vec![("\n</param".to_string(), other(CLOSED_EARLY))]
+            vec![("</param".to_string(), other(CLOSED_EARLY))]
         );
+        assert_eq!(dropped(&events), vec!["\n"]);
         assert_eq!(
             bytes(&events),
             "<function=f>\n<parameter=city>\nParis\n</param"
@@ -1118,21 +1137,22 @@ mod tests {
         assert_eq!(arguments(&events), r#"{"city": "Paris"}"#);
         assert_eq!(
             malformed(&events),
-            vec![("\n<parameter=limit>\n5".to_string(), other(CLOSED_EARLY))]
+            vec![("<parameter=limit>\n5".to_string(), other(CLOSED_EARLY))]
         );
+        assert_eq!(dropped(&events), vec!["\n"]);
         // A string that may still be null is a value written whole.
         let events = closed(&["<function=f>\n<parameter=note>\nnul"]);
         assert_eq!(arguments(&events), "{}");
         assert_eq!(
             malformed(&events),
-            vec![("\n<parameter=note>\nnul".to_string(), other(CLOSED_EARLY))]
+            vec![("<parameter=note>\nnul".to_string(), other(CLOSED_EARLY))]
         );
         // Inside a key, and a tag the scanner held between parameters: the same.
         let events = closed(&["<function=f>\n<parameter=ci"]);
         assert_eq!(arguments(&events), "{}");
         assert_eq!(
             malformed(&events),
-            vec![("\n<parameter=ci".to_string(), other(CLOSED_EARLY))]
+            vec![("<parameter=ci".to_string(), other(CLOSED_EARLY))]
         );
         let events = closed(&["<function=f>\n<param"]);
         assert_eq!(
@@ -1193,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn a_block_without_a_function_tag_is_malformed_whole() {
+    fn a_block_without_a_function_tag_reports_every_byte() {
         // A JSON object where tags were expected: its words are text between tags, the whitespace
         // around them the wrapper, and what is left at the end never closed.
         let events = finished(&["\n{\"name\": \"f\"}\n"]);
@@ -1235,6 +1255,18 @@ mod tests {
             vec![("\n".to_string(), other(WITHOUT_A_FUNCTION))]
         );
         assert!(closed(&[]).is_empty());
+        // Held bytes at the ending are reported too, with the whitespace before them.
+        let events = closed(&["\n<para"]);
+        assert_eq!(
+            malformed(&events),
+            vec![("\n<para".to_string(), other(WITHOUT_A_FUNCTION))]
+        );
+        let events = closed(&["<function=f</fun"]);
+        assert_eq!(
+            malformed(&events),
+            vec![("<function=f</fun".to_string(), other(CLOSED_EARLY))]
+        );
+        assert_eq!(ends(&events), 0);
         // `</function>` with no function open ends the block as one that named none.
         let (events, taken) = run(&["\nx</function>rest"], Assembler::finish);
         assert_eq!(
@@ -1249,16 +1281,69 @@ mod tests {
     }
 
     #[test]
-    fn a_second_function_tag_inside_a_call_is_malformed_whole_and_the_call_goes_on() {
+    fn a_second_function_tag_inside_a_call_is_reported_and_the_call_goes_on() {
         let call = "<function=f>\n<function=g>\n<parameter=limit>\n5\n</parameter>\n</function>";
         let events = finished(&[call]);
         assert_eq!(name_of(&events), Some("f"));
         assert_eq!(arguments(&events), r#"{"limit": 5}"#);
         assert_eq!(
             malformed(&events),
-            vec![("\n<function=g>".to_string(), other(SECOND_FUNCTION))]
+            vec![("<function=g>".to_string(), other(SECOND_FUNCTION))]
         );
+        assert_eq!(dropped(&events), vec!["\n"]);
         assert_eq!(bytes(&events), call);
+        // The block ending inside the second function tag still ends the call, closed.
+        let events = closed(&["<function=f>\n<parameter=city>\nParis\n</parameter>\n<function=g"]);
+        assert_eq!(arguments(&events), r#"{"city": "Paris"}"#);
+        assert_eq!(
+            malformed(&events),
+            vec![("<function=g".to_string(), other(CLOSED_EARLY))]
+        );
+        assert_eq!(events.last(), Some(&end("")));
+        assert_eq!(ends(&events), 1);
+        let events = closed(&["<function=f>\n<function="]);
+        assert_eq!(arguments(&events), "{}");
+        assert_eq!(ends(&events), 1);
+    }
+
+    #[test]
+    fn a_report_with_no_whitespace_before_it_drops_nothing() {
+        let events = finished(&["<function=f>x<function=g>y</function>"]);
+        assert_eq!(
+            malformed(&events),
+            vec![
+                ("x".to_string(), other(TEXT_BETWEEN_TAGS)),
+                ("<function=g>".to_string(), other(SECOND_FUNCTION)),
+                ("y".to_string(), other(TEXT_BETWEEN_TAGS)),
+            ]
+        );
+        assert!(dropped(&events).is_empty());
+        nothing_empty(&events);
+        // Whitespace outside ASCII counts as the template's too.
+        let events = finished(&["<function=f>\u{3000}\u{a0}x</function>"]);
+        assert_eq!(dropped(&events), vec!["\u{3000}\u{a0}"]);
+        assert_eq!(
+            malformed(&events),
+            vec![("x".to_string(), other(TEXT_BETWEEN_TAGS))]
+        );
+    }
+
+    #[test]
+    fn a_string_that_may_be_null_is_read_without_the_templates_newlines_too() {
+        for (text, expected) in [
+            ("null", "null"),
+            ("Paris", r#""Paris""#),
+            ("nul", r#""nul""#),
+        ] {
+            let call = format!("<function=f><parameter=note>{text}</parameter></function>");
+            let events = finished(&[&call]);
+            assert_eq!(
+                arguments(&events),
+                format!(r#"{{"note": {expected}}}"#),
+                "{text:?}"
+            );
+            assert_eq!(bytes(&events), call, "{text:?}");
+        }
     }
 
     #[test]
