@@ -28,8 +28,8 @@ mod common;
 
 use common::{bytes_of, chunkings, delta, prompt};
 use symphony::{
-    json::PartialJson, DropReason, EngineFinish, Event, Events, FinishReason, Input,
-    MalformedReason, ParseError, Parser, Qwen3, TokenSpan,
+    json::PartialJson, Choice, Constrained, DropReason, EngineFinish, Event, Events, FinishReason,
+    Input, MalformedReason, ParseError, Parser, Qwen3, TokenSpan,
 };
 
 /// A format under test: how to make its parser, and the outputs it is checked over.
@@ -43,11 +43,33 @@ fn qwen3() -> Box<dyn Parser> {
     Box::new(Qwen3::new())
 }
 
-const FORMATS: &[Format] = &[Format {
-    name: "qwen3",
-    new: qwen3,
-    outputs: QWEN3_OUTPUTS,
-}];
+fn forced_function() -> Box<dyn Parser> {
+    Box::new(Constrained::new(Choice::Function(
+        "get_weather".to_string(),
+    )))
+}
+
+fn required_call() -> Box<dyn Parser> {
+    Box::new(Constrained::new(Choice::Required))
+}
+
+const FORMATS: &[Format] = &[
+    Format {
+        name: "qwen3",
+        new: qwen3,
+        outputs: QWEN3_OUTPUTS,
+    },
+    Format {
+        name: "constrained, one function",
+        new: forced_function,
+        outputs: FUNCTION_OUTPUTS,
+    },
+    Format {
+        name: "constrained, required",
+        new: required_call,
+        outputs: REQUIRED_OUTPUTS,
+    },
+];
 
 const QWEN3_OUTPUTS: &[&str] = &[
     "",
@@ -68,6 +90,42 @@ const QWEN3_OUTPUTS: &[&str] = &[
     "<think>I could write </think> here but it is text.\n</think>\n\nParis is sunny.",
     "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n x\n</tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": {}}x y</tool_call>",
+];
+
+/// Outputs of a request that forced one function: the arguments of that call, as the grammar
+/// shaped them, plus what a grammar never produces, since the parser must survive it anyway.
+const FUNCTION_OUTPUTS: &[&str] = &[
+    "",
+    "\n\n",
+    "{}",
+    "{\"city\": \"Paris\"}",
+    "  {\"city\": \"Paris\"}\n",
+    "{\"a\": [1, 2",
+    "{\"a\": 1} and more",
+    "@ not json at all",
+    "\"a string\"",
+    "{\"e\": \"\\ud83c\\udf0d\"}",
+    "{\"nested\": {\"x\": [true, null, 1.5e3]}, \"計画\": \"🌍\"}",
+    "{\"a\": 1, #}",
+];
+
+/// Outputs of a request that required a call: a list of call objects, shaped and misshapen.
+const REQUIRED_OUTPUTS: &[&str] = &[
+    "",
+    "[]",
+    "[{\"name\": \"f\", \"parameters\": {}}]",
+    "[{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}, \
+     {\"name\": \"get_time\", \"parameters\": {\"zone\": \"CET\"}}]",
+    " [ {\"name\": \"f\", \"parameters\": {\"a\": 1}} , {\"name\": \"g\", \"parameters\": {}} ] \n",
+    "[{\"name\": \"f\", \"parameters\": {\"a\": [1,",
+    "[{\"parameters\": {}, \"name\": \"f\"}]",
+    "[{\"parameters\": {}}]",
+    "{\"name\": \"f\"}",
+    "[{\"name\": \"f\", \"parameters\": {}}] junk",
+    "[1, 2]",
+    "[{\"name\": \"f\", \"arguments\": {\"a\": 1}}]",
+    "[{\"name\": \"f\", \"parameters\": {\"e\": \"\\ud83c\\udf0d\"}}]",
+    "[{\"name\": \"f\", \"parameters\": 12abc}]",
 ];
 
 /// Every format with each of its outputs.

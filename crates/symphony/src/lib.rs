@@ -32,7 +32,7 @@ pub mod parser;
 pub mod tokens;
 
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
-pub use formats::Qwen3;
+pub use formats::{Choice, Constrained, Qwen3};
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};

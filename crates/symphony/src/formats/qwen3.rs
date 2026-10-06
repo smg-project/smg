@@ -41,7 +41,7 @@
 //! `<think>` into the output, so nothing about the prompt decides where the output starts.
 
 use crate::{
-    event::{DropReason, Event, Events, FinishReason, MalformedReason},
+    event::{DropReason, Event, Events, MalformedReason},
     input::{EngineFinish, Input},
     json::Assembler,
     markers::{Piece, Scanner},
@@ -252,14 +252,8 @@ impl Qwen3 {
             Region::Content => {}
         }
         self.tokens.finish(out);
-        let reason = match finish {
-            EngineFinish::Stop => FinishReason::Stop,
-            EngineFinish::Length => FinishReason::Length,
-            EngineFinish::Abort => FinishReason::Abort,
-            EngineFinish::Other(other) => FinishReason::Other(other),
-        };
         out.push(Event::Finish {
-            reason,
+            reason: super::finish_reason(finish),
             tool_calls: self.calls,
             reasoning_tokens: if self.tokens.counting() {
                 self.reasoning_tokens
@@ -308,7 +302,10 @@ impl Parser for Qwen3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{event::Text, input::TokenSpan};
+    use crate::{
+        event::{FinishReason, Text},
+        input::TokenSpan,
+    };
 
     const CALL: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
 
