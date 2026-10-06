@@ -7,8 +7,11 @@
 //! passed through: the model writes no JSON object, so the parser writes one, and it has to decide
 //! what type each value's text is.
 //!
-//! [`value`] is that decision. The assembler that turns a call's text into its events comes next.
+//! [`value`] is that decision; [`assembler`] turns one call's tags into its events, streaming a
+//! declared string as it arrives and writing every other value at its close.
 
+pub mod assembler;
 pub mod value;
 
+pub use assembler::Assembler;
 pub use value::{json, Declared, Kind};
