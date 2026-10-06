@@ -349,4 +349,102 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+
+    /// The stage renders `output_config.effort` as the `reasoning_effort`
+    /// template kwarg, renders none without it, and refuses another type.
+    #[tokio::test]
+    async fn the_stage_renders_output_config_effort() {
+        use std::sync::Arc;
+
+        use llm_tokenizer::{traits::Tokenizer, HuggingFaceTokenizer, TokenizerRegistry};
+        use openai_protocol::messages::CreateMessageRequest;
+        use reasoning_parser::ParserFactory as ReasoningParserFactory;
+        use serde_json::{json, Value};
+        use tool_parser::ParserFactory as ToolParserFactory;
+
+        use crate::{
+            routers::grpc::{
+                common::stages::PipelineStage,
+                context::{PreparationOutput, RequestContext, SharedComponents},
+                regular::{
+                    stages::messages::MessagePreparationStage, symphony::template::Templates,
+                },
+                utils::ParserResolver,
+            },
+            worker::WorkerRegistry,
+        };
+
+        const MODEL: &str = "effort-model";
+        let dir = tempfile::TempDir::new().unwrap();
+        let vocab: serde_json::Map<_, _> = (0..=255u32)
+            .map(|byte| (format!("<0x{byte:02X}>"), json!(byte)))
+            .collect();
+        let tokenizer = json!({
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": {"type": "Sequence", "decoders": [{"type": "ByteFallback"}, {"type": "Fuse"}]},
+            "model": {"type": "BPE", "vocab": vocab, "merges": [], "byte_fallback": true}
+        });
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, tokenizer.to_string()).unwrap();
+        let template = dir.path().join("template.jinja");
+        std::fs::write(
+            &template,
+            "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
+             effort={{ reasoning_effort | default('unset') }}",
+        )
+        .unwrap();
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            HuggingFaceTokenizer::from_file_with_chat_template(
+                path.to_str().unwrap(),
+                Some(template.to_str().unwrap()),
+            )
+            .unwrap(),
+        );
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        tokenizer_registry
+            .load(MODEL, MODEL, "test", || async move { Ok(tokenizer) })
+            .await
+            .unwrap();
+        let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
+            tokenizer_registry,
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: ParserResolver::disabled(),
+            multimodal: None,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
+        });
+        for (output_config, rendered) in [
+            (json!({"effort": "high"}), Ok("effort=high")),
+            (json!({"effort": 2}), Ok("effort=2")),
+            (json!({"effort": null}), Ok("effort=unset")),
+            (Value::Null, Ok("effort=unset")),
+        ] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": MODEL, "max_tokens": 8, "output_config": output_config,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+            let mut ctx = RequestContext::for_messages(
+                Arc::new(request),
+                None,
+                MODEL.into(),
+                components.clone(),
+            );
+            let got = match MessagePreparationStage::new(&[]).execute(&mut ctx).await {
+                Err(response) => Err(response.status()),
+                Ok(()) => match &ctx.state.preparation {
+                    Some(PreparationOutput::Messages {
+                        processed_messages, ..
+                    }) => Ok(processed_messages.text.lines().last().unwrap().to_string()),
+                    _ => panic!("no messages preparation"),
+                },
+            };
+            assert_eq!(got, rendered.map(str::to_string), "{output_config}");
+        }
+    }
 }

@@ -344,6 +344,7 @@ fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesRes
     MessagesResponseSpec {
         provider: ProviderProfile::Generic,
         continues_final_assistant: false,
+        reasoning_effort: None,
         thinking: thinking.then_some(messages::ThinkingConfig::Enabled {
             budget_tokens: 1024,
             display: None,

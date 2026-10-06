@@ -10,8 +10,10 @@ use serde_json::{Map, Value};
 use validator::Validate;
 
 use crate::{
+    chat::deserialize_reasoning_effort,
     common::{CachePartition, GenerationRequest},
     model_card::ModelCard,
+    profile::ProviderProfile,
     validated::Normalizable,
 };
 
@@ -82,14 +84,36 @@ pub struct CreateMessageRequest {
     /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
+    /// The effort the response renders with, and the config's other keys.
+    pub output_config: Option<OutputConfig>,
+
     /// Additional fields not explicitly defined above (e.g. beta features like
-    /// context_management, output_config). Captured and forwarded to backends.
+    /// context_management). Captured and forwarded to backends.
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
 
 impl Normalizable for CreateMessageRequest {
     // Use default no-op implementation
+}
+
+/// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
+/// string, or a number as its text; another type is refused); the other
+/// keys (a `format`, beta fields) ride through.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OutputConfig {
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
+    pub effort: Option<String>,
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+/// The thinking preference a prompt is rendered with: the `thinking` block,
+/// else the provider profile's reading of the effort (see
+/// [`crate::chat::ChatCompletionRequest::template_thinking`]).
+fn template_thinking(model: &str, thinking: Option<bool>, effort: Option<&str>) -> Option<bool> {
+    thinking.or_else(|| ProviderProfile::for_model(model).thinking_from_reasoning_effort(effort))
 }
 
 impl CreateMessageRequest {
@@ -123,9 +147,19 @@ impl CreateMessageRequest {
         continues_final_assistant(&self.messages)
     }
 
+    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.output_config.as_ref()?.effort.as_deref()
+    }
+
     /// The thinking preference the `thinking` block states, none without one.
     pub fn thinking_toggle(&self) -> Option<bool> {
         self.thinking.as_ref().map(ThinkingConfig::enabled)
+    }
+
+    /// The thinking preference the prompt is rendered with.
+    pub fn template_thinking(&self) -> Option<bool> {
+        template_thinking(&self.model, self.thinking_toggle(), self.reasoning_effort())
     }
 }
 
@@ -1329,6 +1363,9 @@ pub struct CountMessageTokensRequest {
     /// Tool definitions
     pub tools: Option<Vec<Tool>>,
 
+    /// The effort the prompt is rendered with, and the config's other keys.
+    pub output_config: Option<OutputConfig>,
+
     /// Additional backend-specific token counting options.
     #[serde(flatten)]
     pub other: Map<String, Value>,
@@ -1343,6 +1380,17 @@ impl CountMessageTokensRequest {
     /// response continues (see [`continues_final_assistant`]).
     pub fn continues_final_assistant(&self) -> bool {
         continues_final_assistant(&self.messages)
+    }
+
+    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The thinking preference the prompt is rendered with.
+    pub fn template_thinking(&self) -> Option<bool> {
+        let thinking = self.thinking.as_ref().map(ThinkingConfig::enabled);
+        template_thinking(&self.model, thinking, self.reasoning_effort())
     }
 }
 
@@ -2236,6 +2284,53 @@ mod tests {
         assert!(count.continues_final_assistant());
     }
 
+    /// `output_config.effort` reads as a Chat `reasoning_effort`: a string
+    /// as given, a number as its text, null or absent as none; another type
+    /// does not parse. The config's other keys stay with it, and a request
+    /// serializes back with the config it came with.
+    #[test]
+    fn output_config_effort_reads_as_a_reasoning_effort() {
+        let body = |output_config: Value| {
+            json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config,
+                "messages": [{"role": "user", "content": "Hello"}]
+            })
+        };
+        for (output_config, effort) in [
+            (json!({"effort": "high"}), Some("high")),
+            (json!({"effort": 64}), Some("64")),
+            (json!({"effort": null}), None),
+            (json!({}), None),
+            (Value::Null, None),
+        ] {
+            let request: CreateMessageRequest =
+                serde_json::from_value(body(output_config.clone())).expect("a Messages request");
+            assert_eq!(request.reasoning_effort(), effort, "{output_config}");
+            let count: CountMessageTokensRequest = serde_json::from_value(
+                json!({"model": "m", "messages": [], "output_config": output_config}),
+            )
+            .expect("a count_tokens request");
+            assert_eq!(count.reasoning_effort(), effort);
+        }
+        assert!(
+            serde_json::from_value::<CreateMessageRequest>(body(json!({"effort": ["low"]})))
+                .is_err()
+        );
+
+        let with_format = body(json!({"effort": "low", "format": {"type": "json_schema"}}));
+        let request: CreateMessageRequest =
+            serde_json::from_value(with_format.clone()).expect("a Messages request");
+        assert_eq!(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|config| config.other.get("format")),
+            Some(&json!({"type": "json_schema"}))
+        );
+        let back = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(back["output_config"], with_format["output_config"]);
+    }
+
     #[test]
     fn tool_use_block_carries_the_caller_the_public_api_reports() {
         // A block built without a caller (every engine-issued call) leaves
@@ -2367,6 +2462,7 @@ mod tests {
 
     fn base_request() -> CreateMessageRequest {
         CreateMessageRequest {
+            output_config: None,
             model: "claude-test".to_string(),
             messages: vec![InputMessage {
                 role: Role::User,

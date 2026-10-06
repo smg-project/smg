@@ -512,7 +512,9 @@ pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<
     }
 }
 
-fn deserialize_reasoning_effort<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub(crate) fn deserialize_reasoning_effort<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

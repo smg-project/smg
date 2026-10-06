@@ -17,7 +17,7 @@ use openai_protocol::{
     common::{self, StringOrArray, Tool as ChatTool, ToolChoice as ChatToolChoice},
     messages::{
         self, CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
-        InputMessage, SystemContent, ThinkingConfig, ToolResultContent,
+        InputMessage, SystemContent, ToolResultContent,
     },
 };
 use serde_json::{json, Value};
@@ -44,7 +44,11 @@ use crate::routers::{
 pub(crate) struct MessagesPrompt<'a> {
     pub messages: &'a [InputMessage],
     pub system: Option<&'a SystemContent>,
-    pub thinking: Option<&'a ThinkingConfig>,
+    /// The thinking preference the prompt is rendered with
+    /// (`CreateMessageRequest::template_thinking`).
+    pub thinking: Option<bool>,
+    /// `output_config.effort`, rendered as the `reasoning_effort` kwarg.
+    pub reasoning_effort: Option<&'a str>,
     pub stop_sequences: Option<&'a [String]>,
     /// The request's tool choice, told to the template as the chat path
     /// tells it; a renderer that declares the tools under `none` writes its
@@ -57,7 +61,8 @@ impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
         Self {
             messages: &request.messages,
             system: request.system.as_ref(),
-            thinking: request.thinking.as_ref(),
+            thinking: request.template_thinking(),
+            reasoning_effort: request.reasoning_effort(),
             stop_sequences: request.stop_sequences.as_deref(),
             tool_choice: request.tool_choice.as_ref(),
         }
@@ -69,7 +74,8 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
         Self {
             messages: &request.messages,
             system: request.system.as_ref(),
-            thinking: request.thinking.as_ref(),
+            thinking: request.template_thinking(),
+            reasoning_effort: request.reasoning_effort(),
             stop_sequences: None,
             tool_choice: request.tool_choice.as_ref(),
         }
@@ -80,8 +86,9 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
 ///
 /// Parallel to `process_chat_messages()` in chat_utils, but works with
 /// Anthropic Messages API types. Converts InputMessages to JSON values
-/// that the chat template expects, then applies the template. The second
-/// element says how the tokenize step must encode the prompt.
+/// that the chat template expects, then applies the template, with
+/// `reasoning_effort` as the template kwarg of that name when set. The
+/// second element says how the tokenize step must encode the prompt.
 pub fn process_messages(
     request: &CreateMessageRequest,
     tokenizer: &dyn Tokenizer,
@@ -166,24 +173,29 @@ pub(crate) fn process_messages_prompt(
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {e}"))?;
 
-    // Step 5: Project the Anthropic ThinkingConfig onto a thinking on/off
-    // preference. Adaptive is treated as "thinking on"; the model decides
-    // whether to actually emit it. The tokenizer applies this under the model's
-    // own toggle key (`enable_thinking`/`thinking`) in `apply`.
-    let thinking = request.thinking.map(ThinkingConfig::enabled);
+    // Step 5: the thinking preference the request states, or its provider
+    // profile reads from the effort, as for Chat.
+    let thinking = request.thinking;
 
     // Step 6: Apply chat template. The template learns the tool choice the
     // way the chat path tells it (the chat value under the same kwarg): a
     // renderer that declares the tools under `none` writes its instruction
-    // not to call them from this key.
-    let template_kwargs = request.tool_choice.map(|tool_choice| {
-        let mut kwargs = HashMap::with_capacity(1);
+    // not to call them from this key. The effort rides under the chat
+    // path's `reasoning_effort` kwarg as well.
+    let mut kwargs = HashMap::with_capacity(2);
+    if let Some(tool_choice) = request.tool_choice {
         chat_utils::insert_tool_choice_kwarg(
             &mut kwargs,
             &convert_message_tool_choice(tool_choice),
         );
-        kwargs
-    });
+    }
+    if let Some(effort) = request.reasoning_effort {
+        kwargs.insert(
+            chat_utils::REASONING_EFFORT_KEY.to_string(),
+            Value::String(effort.to_string()),
+        );
+    }
+    let template_kwargs = (!kwargs.is_empty()).then_some(kwargs);
     // A trailing assistant message with text is a prefill the response
     // continues. As for chat `continue_final_message`, a renderer that
     // continues it natively keeps it; any other gets it popped and its text
@@ -415,9 +427,9 @@ pub(crate) enum CountError {
 
 /// The prompt tokens `/v1/messages` would send for `prompt` (a message
 /// request's or a count_tokens request's): the same tool set, media
-/// placeholders, template rendering and encoding as the preparation stage,
-/// without media processing (an image counts as the placeholder the template
-/// writes for it; the image itself is not fetched). A text or content-source
+/// placeholders, reasoning effort, template rendering and encoding as the
+/// preparation stage, without media processing (an image counts as the
+/// placeholder the template writes for it; the image itself is not fetched). A text or content-source
 /// document counts as its rendered text; a source with no text is refused,
 /// as `/v1/messages` refuses it.
 pub(crate) async fn count_input_tokens(
@@ -1299,6 +1311,7 @@ mod tests {
     fn test_get_history_tool_calls_count_messages() {
         // No tool calls
         let request = CreateMessageRequest {
+            output_config: None,
             model: "test".to_string(),
             messages: vec![InputMessage {
                 role: Role::User,
@@ -1325,6 +1338,7 @@ mod tests {
 
         // With tool calls in assistant message
         let request = CreateMessageRequest {
+            output_config: None,
             model: "test".to_string(),
             messages: vec![
                 InputMessage {
@@ -2063,5 +2077,134 @@ mod tests {
             assert_eq!(rendered["add_generation_prompt"], json!(true));
             assert_eq!(rendered["messages"][1], kept);
         }
+    }
+
+    /// `output_config.effort` reads as a Chat `reasoning_effort` does, and
+    /// reaches the chat template as the `reasoning_effort` kwarg.
+    #[test]
+    fn output_config_effort_is_rendered_as_the_reasoning_effort() {
+        let request = |output_config: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .unwrap()
+        };
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                "{%- for m in messages -%}{{ m.role }}: {{ m.content }} {% endfor -%}\
+                 effort={{ reasoning_effort | default('unset') }}"
+                    .to_string(),
+            )
+            .unwrap();
+        let rendered = |output_config| {
+            process_messages(
+                &request(output_config),
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+            )
+            .unwrap()
+            .0
+            .text
+        };
+        assert_eq!(
+            rendered(json!({"effort": "high"})),
+            "user: Hello effort=high"
+        );
+        assert_eq!(rendered(json!({"effort": 64})), "user: Hello effort=64");
+        assert_eq!(
+            rendered(json!({"effort": null})),
+            "user: Hello effort=unset"
+        );
+        assert_eq!(rendered(json!({})), "user: Hello effort=unset");
+    }
+
+    /// The reasoning parser is armed from the effort the template renders: on
+    /// a template that switches thinking through `reasoning_effort`, an
+    /// `output_config.effort` that closes the think block leaves the parser
+    /// unarmed, as the same effort does for a Chat request. Without a thinking
+    /// block, "none" turns a toggle template's thinking off, as for Chat.
+    #[test]
+    fn output_config_effort_arms_the_reasoning_parser_as_rendered() {
+        use crate::routers::grpc::{
+            spec::MessagesResponseSpec,
+            utils::{chat_reasoning_starts_in_prefill, messages_reasoning_starts_in_prefill},
+        };
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                "{# think_begin_token #}{%- for m in messages -%}{{ m.role }}: {{ m.content }}\n{% endfor -%}\
+                 {%- if reasoning_effort is defined and reasoning_effort == 'no_think' -%}assistant: <think></think>\
+                 {%- else -%}assistant: <think>{%- endif -%}"
+                    .to_string(),
+            )
+            .unwrap();
+        for (effort, prompt_end, armed) in [
+            (json!("no_think"), "<think></think>", false),
+            (json!("high"), "<think>", true),
+            (Value::Null, "<think>", true),
+        ] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m", "max_tokens": 8, "output_config": {"effort": effort},
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .unwrap();
+            let rendered =
+                process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
+                    .unwrap()
+                    .0
+                    .text;
+            assert_eq!(rendered, format!("user: Hello\nassistant: {prompt_end}"));
+            assert_eq!(
+                messages_reasoning_starts_in_prefill(&request, false, &tokenizer),
+                armed,
+                "{effort}"
+            );
+            // The response processors arm from the request's spec.
+            assert_eq!(
+                MessagesResponseSpec::from(&request).reasoning_starts_in_prefill(&tokenizer),
+                armed,
+                "spec {effort}"
+            );
+            let chat: openai_protocol::chat::ChatCompletionRequest =
+                serde_json::from_value(json!({
+                    "model": "m", "reasoning_effort": effort,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .unwrap();
+            assert_eq!(
+                chat_reasoning_starts_in_prefill(&chat, &tokenizer),
+                armed,
+                "chat {effort}"
+            );
+        }
+
+        tokenizer
+            .set_chat_template(
+                "{%- for m in messages -%}{{ m.role }}: {{ m.content }} {% endfor -%}\
+                 thinking={{ enable_thinking | default('unset') }}"
+                    .to_string(),
+            )
+            .unwrap();
+        let rendered = |effort: &str| {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m", "max_tokens": 8, "output_config": {"effort": effort},
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .unwrap();
+            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
+                .unwrap()
+                .0
+                .text
+        };
+        assert_eq!(rendered("none"), "user: Hello thinking=False");
+        assert_eq!(rendered("high"), "user: Hello thinking=unset");
     }
 }

@@ -350,16 +350,17 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
 /// `disabled` off, absent → the template's default), and
 /// `continued_final_message` is the rendered prompt's (a trailing assistant
 /// message with text and no tool call is continued where the template can).
+/// `output_config.effort` is the `reasoning_effort` the template renders, as
+/// a Chat request's effective effort is.
 pub fn messages_reasoning_starts_in_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
-    let user_thinking = request.thinking_toggle();
     reasoning_starts_in_prefill(
         None,
-        None,
-        user_thinking,
+        request.reasoning_effort(),
+        request.thinking_toggle(),
         continued_final_message,
         tokenizer,
         ProviderProfile::for_model(&request.model),

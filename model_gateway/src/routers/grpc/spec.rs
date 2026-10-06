@@ -192,8 +192,7 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
 
 #[derive(Clone)]
 pub(crate) struct MessagesResponseSpec {
-    /// The provider profile the requested model selects; it reads the
-    /// request's thinking the way the chat spec's does.
+    /// The provider profile the requested model selects.
     pub provider: ProviderProfile,
     pub thinking: Option<messages::ThinkingConfig>,
     /// Native channel formats can derive the initial state from the rendered prompt.
@@ -210,6 +209,8 @@ pub(crate) struct MessagesResponseSpec {
     /// a prefill. Request building replaces the request's ask with what the
     /// rendered prompt did (`ProcessedMessages::continued_final_message`).
     pub continues_final_assistant: bool,
+    /// `output_config.effort`, the `reasoning_effort` the template rendered.
+    pub reasoning_effort: Option<String>,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -231,23 +232,24 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             stop_sequences: request.stop_sequences.clone(),
             symphony: None,
             continues_final_assistant: request.continues_final_assistant(),
+            reasoning_effort: request.reasoning_effort().map(str::to_owned),
         }
     }
 }
 
 impl MessagesResponseSpec {
+    /// Whether the reasoning parser starts in reasoning mode for this
+    /// request (see [`utils::messages_reasoning_starts_in_prefill`]).
     pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
         if let Some(in_prefill) = self.reasoning_in_prefill {
             return in_prefill;
         }
-        let user_thinking = self
-            .thinking
-            .as_ref()
-            .map(messages::ThinkingConfig::enabled);
         utils::reasoning_starts_in_prefill(
             None,
-            None,
-            user_thinking,
+            self.reasoning_effort.as_deref(),
+            self.thinking
+                .as_ref()
+                .map(messages::ThinkingConfig::enabled),
             self.continues_final_assistant,
             tokenizer,
             self.provider,
