@@ -11,63 +11,54 @@
 //! - A parameter declared `string` is its text, every byte of it. Nothing is trimmed and nothing is
 //!   decoded: `"exact phrase"` keeps its quotes, indentation and a trailing newline stay, and
 //!   `&amp;` is five characters.
-//! - A parameter declared `integer`, `number`, `boolean`, `array` or `object` is read as that type
-//!   when its text is one, with the whitespace around it ignored. An integer may be spelled `+5` or
-//!   `007` and a boolean `True` or `False`; they are written in JSON's spelling.
+//! - A parameter declared `integer` is that integer when its text is one, with the whitespace
+//!   around it ignored. It may be spelled `+5` or `007`; it is written in JSON's spelling.
 //! - Everything else is inferred: text that is JSON is that JSON, Python's `True`, `False` and
 //!   `None` are `true`, `false` and `null`, and the rest is a string holding the text exactly.
-//!   That covers a parameter the tool does not declare, a declared type this module does not know,
-//!   and a value that is not of its declared type.
+//!   That covers a parameter the tool does not declare, a declared integer whose text is not one,
+//!   and every other declared type: a `number`, `boolean`, `array` or `object` is written by the
+//!   templates as JSON, which is what inference reads, so declaring one changes nothing.
 //!
 //! A value read as JSON keeps the model's own bytes: `[1, 2.5]` stays spaced as written, and
-//! `9007199254740993` keeps every digit. Whether text is JSON is decided without building the
-//! value, so neither its size nor its depth costs more than one pass over it.
+//! `9007199254740993` keeps every digit. JSON here means what `serde_json` reads into a value,
+//! because that is how the adapters read a call's arguments back. Text it refuses, such as a lone
+//! surrogate escape or nesting more than 128 levels deep, is a string like any other text, so one
+//! odd value never costs a call its other arguments.
 //!
 //! Ported from `safe_val` and `coerce_value` in `crates/tool_parser/src/parsers/qwen_xml.rs` and
-//! from `coerce_by_schema_type` and `param_types_for_function` in that crate's `helpers.rs`. Two
-//! things differ, both because the templates write values this way and bellwether's references
-//! record it:
+//! from `coerce_by_schema_type` and `param_types_for_function` in that crate's `helpers.rs`. Three
+//! things differ. The first two are how the templates write values and what bellwether's
+//! references record:
 //!
 //! - A string keeps its text exactly. The old functions trimmed it, and unquoted a value declared
 //!   `string` that happened to be a JSON string literal, so a search for `"exact phrase"` lost its
 //!   quotes and a file's contents lost their final newline.
 //! - JSON keeps the model's bytes. The old functions parsed the value and wrote it again compactly,
 //!   so `{"a": 1}` reached the client as `{"a":1}`.
+//! - The old functions had a rule each for `number`, `boolean`, `array` and `object`. Each gave
+//!   exactly what inference gives, so they are not carried over.
 
 use std::collections::HashMap;
 
 use openai_protocol::common::Tool;
-use serde::de::IgnoredAny;
 use serde_json::Value;
 
-/// The type a tool declares for one parameter, of the types that change how its text is read.
+/// The type a tool declares for one parameter, of the two types that change how its text is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// `"type": "string"`.
     String,
     /// `"type": "integer"`.
     Integer,
-    /// `"type": "number"`.
-    Number,
-    /// `"type": "boolean"`.
-    Boolean,
-    /// `"type": "array"`.
-    Array,
-    /// `"type": "object"`.
-    Object,
 }
 
 impl Kind {
-    /// The kind a parameter's schema declares, when its `type` is one name this module knows. A
-    /// list of types, a missing `type` and any other name declare nothing here.
+    /// The kind a parameter's schema declares, when its `type` is `string` or `integer`. Any other
+    /// name, a list of types and a missing `type` declare nothing here.
     fn of(schema: &Value) -> Option<Self> {
         match schema.get("type")?.as_str()? {
             "string" => Some(Self::String),
             "integer" => Some(Self::Integer),
-            "number" => Some(Self::Number),
-            "boolean" => Some(Self::Boolean),
-            "array" => Some(Self::Array),
-            "object" => Some(Self::Object),
             _ => None,
         }
     }
@@ -109,25 +100,22 @@ fn parameters_of(schema: &Value) -> HashMap<String, Kind> {
 }
 
 /// The JSON for one parameter's `text`, read as `kind` when the tool declares one. The result is
-/// always one complete JSON value.
+/// always one JSON value that `serde_json` reads back.
 pub fn json(text: &str, kind: Option<Kind>) -> String {
-    if kind == Some(Kind::String) {
-        return string(text);
+    match kind {
+        Some(Kind::String) => string(text),
+        Some(Kind::Integer) => match text.trim().parse::<i64>() {
+            Ok(integer) => integer.to_string(),
+            Err(_) => inferred(text),
+        },
+        None => inferred(text),
     }
-    let trimmed = text.trim();
-    let typed = match kind {
-        Some(Kind::Integer) => trimmed.parse::<i64>().ok().map(|n| n.to_string()),
-        Some(Kind::Number) => is_json_number(trimmed).then(|| trimmed.to_string()),
-        Some(Kind::Boolean) => boolean(trimmed).map(str::to_string),
-        Some(Kind::Array | Kind::Object) => is_json(trimmed).then(|| trimmed.to_string()),
-        Some(Kind::String) | None => None,
-    };
-    typed.unwrap_or_else(|| inferred(text, trimmed))
 }
 
 /// What the text is when no declared type decided it.
-fn inferred(text: &str, trimmed: &str) -> String {
-    if is_json(trimmed) {
+fn inferred(text: &str) -> String {
+    let trimmed = text.trim();
+    if serde_json::from_str::<Value>(trimmed).is_ok() {
         return trimmed.to_string();
     }
     match trimmed {
@@ -136,22 +124,6 @@ fn inferred(text: &str, trimmed: &str) -> String {
         "None" => "null".to_string(),
         _ => string(text),
     }
-}
-
-fn boolean(trimmed: &str) -> Option<&'static str> {
-    match trimmed {
-        "true" | "True" => Some("true"),
-        "false" | "False" => Some("false"),
-        _ => None,
-    }
-}
-
-fn is_json(text: &str) -> bool {
-    serde_json::from_str::<IgnoredAny>(text).is_ok()
-}
-
-fn is_json_number(text: &str) -> bool {
-    text.starts_with(|c: char| c == '-' || c.is_ascii_digit()) && is_json(text)
 }
 
 /// `text` as a JSON string.
@@ -185,37 +157,33 @@ mod tests {
                 "search",
                 value!({"query": {"type": "string"}, "limit": {"type": "integer"}}),
             ),
-            tool(
-                "draw",
-                value!({"points": {"type": "array"}, "style": {"type": "object"}}),
-            ),
-            tool(
-                "set",
-                value!({"ratio": {"type": "number"}, "on": {"type": "boolean"}}),
-            ),
+            tool("count", value!({"query": {"type": "integer"}})),
         ]);
         assert_eq!(declared.kind("search", "query"), Some(Kind::String));
         assert_eq!(declared.kind("search", "limit"), Some(Kind::Integer));
-        assert_eq!(declared.kind("draw", "points"), Some(Kind::Array));
-        assert_eq!(declared.kind("draw", "style"), Some(Kind::Object));
-        assert_eq!(declared.kind("set", "ratio"), Some(Kind::Number));
-        assert_eq!(declared.kind("set", "on"), Some(Kind::Boolean));
-        assert_eq!(declared.kind("search", "points"), None);
+        assert_eq!(declared.kind("count", "query"), Some(Kind::Integer));
+        assert_eq!(declared.kind("count", "limit"), None);
         assert_eq!(declared.kind("missing", "query"), None);
     }
 
     #[test]
-    fn a_schema_that_names_no_single_known_type_declares_nothing() {
+    fn only_a_single_string_or_integer_type_declares_a_kind() {
         let declared = Declared::of(&[tool(
             "f",
             value!({
+                "ratio": {"type": "number"},
+                "on": {"type": "boolean"},
+                "points": {"type": "array"},
+                "style": {"type": "object"},
+                "nothing": {"type": "null"},
                 "nullable": {"type": ["string", "null"]},
                 "untyped": {"description": "anything"},
-                "other": {"type": "null"},
                 "choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
             }),
         )]);
-        for parameter in ["nullable", "untyped", "other", "choice"] {
+        for parameter in [
+            "ratio", "on", "points", "style", "nothing", "nullable", "untyped", "choice",
+        ] {
             assert_eq!(declared.kind("f", parameter), None, "{parameter}");
         }
     }
@@ -283,61 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_number_keeps_the_digits_the_model_wrote() {
-        for (text, expected) in [
-            ("0.5", "0.5"),
-            ("150", "150"),
-            ("-1e-5", "-1e-5"),
-            ("1.50", "1.50"),
-            // A float could not hold this integer; the text does.
-            ("9007199254740993", "9007199254740993"),
-            (" 2.5 ", "2.5"),
-            // JSON, but not a number: inferred, so it stays the JSON it is.
-            ("true", "true"),
-            ("[1]", "[1]"),
-            ("fast", r#""fast""#),
-        ] {
-            assert_eq!(json(text, Some(Kind::Number)), expected, "{text:?}");
-        }
-    }
-
-    #[test]
-    fn a_declared_boolean_takes_json_and_python_spellings() {
-        for (text, expected) in [
-            ("true", "true"),
-            ("True", "true"),
-            ("false", "false"),
-            ("False", "false"),
-            (" true\n", "true"),
-            ("yes", r#""yes""#),
-            ("1", "1"),
-        ] {
-            assert_eq!(json(text, Some(Kind::Boolean)), expected, "{text:?}");
-        }
-    }
-
-    #[test]
-    fn a_declared_array_or_object_keeps_the_models_bytes() {
-        for kind in [Kind::Array, Kind::Object] {
-            for (text, expected) in [
-                (r#"["a", "b"]"#, r#"["a", "b"]"#),
-                (
-                    r#"{"nested": {"deep": [1, 2.5, true, null]}}"#,
-                    r#"{"nested": {"deep": [1, 2.5, true, null]}}"#,
-                ),
-                ("\n[60,30]\n", "[60,30]"),
-                (r#"{"a":1}"#, r#"{"a":1}"#),
-                // Not JSON: a string, since nothing better can be said of it.
-                ("[1, 2", r#""[1, 2""#),
-                ("{'a': 1}", r#""{'a': 1}""#),
-            ] {
-                assert_eq!(json(text, Some(kind)), expected, "{kind:?} {text:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn an_undeclared_value_is_inferred() {
+    fn any_other_value_is_inferred() {
         for (text, expected) in [
             ("42", "42"),
             ("1.5", "1.5"),
@@ -351,6 +265,7 @@ mod tests {
             ("False", "false"),
             ("None", "null"),
             ("hello world", r#""hello world""#),
+            ("yes", r#""yes""#),
             ("&lt;div&gt;", r#""&lt;div&gt;""#),
             ("it&#39;s", r#""it&#39;s""#),
             ("&#x3C;", r#""&#x3C;""#),
@@ -361,22 +276,43 @@ mod tests {
             // A string keeps the whitespace the old parser trimmed; JSON does not need it.
             ("  spaces  ", r#""  spaces  ""#),
             (" 42 ", "42"),
+            ("\n[60,30]\n", "[60,30]"),
             ("", r#""""#),
+            // Text that looks like JSON and is not one value: a string.
+            ("[1, 2", r#""[1, 2""#),
+            ("{'a': 1}", r#""{'a': 1}""#),
+            ("1 2", r#""1 2""#),
         ] {
             assert_eq!(json(text, None), expected, "{text:?}");
         }
     }
 
     #[test]
-    fn deeply_nested_json_is_still_json() {
-        let deep = format!("{}{}", "[".repeat(50_000), "]".repeat(50_000));
-        assert_eq!(json(&deep, Some(Kind::Array)), deep);
-        assert_eq!(json(&deep, None), deep);
-        let unclosed = "[".repeat(50_000);
-        assert_eq!(
-            json(&unclosed, Some(Kind::Array)),
-            format!("\"{unclosed}\"")
-        );
+    fn json_keeps_the_bytes_the_model_wrote() {
+        for text in [
+            "0.5",
+            "-1e-5",
+            "1.50",
+            // A float could not hold this integer; the text does.
+            "9007199254740993",
+            r#"["a", "b"]"#,
+            r#"{"a":1}"#,
+            r#"{"nested": {"deep": [1, 2.5, true, null]}}"#,
+        ] {
+            assert_eq!(json(text, None), text, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn text_the_adapters_could_not_read_back_is_a_string() {
+        // A lone surrogate escape is JSON by its grammar, and not a value serde_json reads.
+        let surrogate = r#"["\ud83d"]"#;
+        assert_eq!(json(surrogate, None), r#""[\"\\ud83d\"]""#);
+        // So is nesting past serde_json's limit of 128 levels.
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        assert_eq!(json(&deep, None), format!("\"{deep}\""));
+        let shallow = format!("{}{}", "[".repeat(100), "]".repeat(100));
+        assert_eq!(json(&shallow, None), shallow);
     }
 
     /// A small deterministic generator, so the property below needs no dependency.
@@ -393,25 +329,19 @@ mod tests {
     }
 
     #[test]
-    fn whatever_the_text_and_the_kind_the_result_is_one_json_value() {
-        const PIECES: [&str; 24] = [
+    fn whatever_the_text_and_the_kind_the_result_reads_back_as_one_json_value() {
+        const PIECES: [&str; 27] = [
             "", " ", "\n", "0", "-", "1.5", "e9", "true", "True", "None", "null", "\"", "\\", "{",
-            "}", "[", "]", ":", ",", "a", "é", "\u{1}", "<", "&amp;",
+            "}", "[", "]", ":", ",", "a", "é", "\u{1}", "<", "&amp;", "u", "d800", "dc00",
         ];
-        const KINDS: [Option<Kind>; 7] = [
-            None,
-            Some(Kind::String),
-            Some(Kind::Integer),
-            Some(Kind::Number),
-            Some(Kind::Boolean),
-            Some(Kind::Array),
-            Some(Kind::Object),
-        ];
+        const KINDS: [Option<Kind>; 3] = [None, Some(Kind::String), Some(Kind::Integer)];
         let mut random = Lcg(7);
-        for _ in 0..20_000 {
-            let text: String = (0..random.next() % 7)
+        let mut surrogates = 0;
+        for _ in 0..40_000 {
+            let text: String = (0..random.next() % 8)
                 .map(|_| PIECES[random.next() % PIECES.len()])
                 .collect();
+            surrogates += usize::from(text.contains("\\ud800"));
             for kind in KINDS {
                 let written = json(&text, kind);
                 let parsed: Result<Value, _> = serde_json::from_str(&written);
@@ -421,5 +351,9 @@ mod tests {
                 }
             }
         }
+        assert!(
+            surrogates > 0,
+            "the generator never wrote a surrogate escape"
+        );
     }
 }
