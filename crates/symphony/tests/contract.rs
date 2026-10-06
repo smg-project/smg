@@ -24,7 +24,7 @@
 
 mod common;
 
-use common::chunkings;
+use common::{bytes_of, chunkings, delta, prompt};
 use symphony::{
     json::PartialJson, DropReason, EngineFinish, Event, Events, FinishReason, Input,
     MalformedReason, ParseError, Parser, Qwen3,
@@ -65,6 +65,7 @@ const QWEN3_OUTPUTS: &[&str] = &[
     "<tool_call>{\"name\": \"f\", \"arguments\": 12abc}</tool_call>",
     "<think>I could write </think> here but it is text.\n</think>\n\nParis is sunny.",
     "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n x\n</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {}}x y</tool_call>",
 ];
 
 /// Every format with each of its outputs.
@@ -145,64 +146,26 @@ fn joined_by<R: Clone + PartialEq>(list: &mut Vec<(R, String)>, why: &R, text: &
     }
 }
 
-fn bytes_of(event: &Event) -> &str {
-    match event {
-        Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-        Event::ToolCallStart { source, .. }
-        | Event::ToolCallArguments { source, .. }
-        | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-    }
-}
-
-fn delta(text: &str) -> Input<'_> {
-    Input::Delta {
-        token_ids: &[],
-        text,
-        spans: &[],
-    }
-}
-
-fn prompt() -> Input<'static> {
-    Input::Prompt {
-        token_ids: &[],
-        text: "",
-    }
-}
-
 fn end() -> Input<'static> {
     Input::End {
         finish: EngineFinish::Stop,
     }
 }
 
-/// Replay `text` cut at `cuts`, after the prompt, and return the events. With `empty_between`, an
-/// empty delta comes before every piece and after the last.
+/// Replay `text` through a new parser of `format`, cut at `cuts`, ending with `stop`.
 fn replay(
     format: &Format,
     text: &str,
     cuts: &[usize],
     empty_between: bool,
 ) -> Result<Vec<Event>, ParseError> {
-    let mut parser = (format.new)();
-    let mut out = Events::new();
-    parser.feed(prompt(), &mut out)?;
-    let mut from = 0;
-    for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
-        if cut > from {
-            if empty_between {
-                parser.feed(delta(""), &mut out)?;
-            }
-            parser.feed(delta(&text[from..cut]), &mut out)?;
-            from = cut;
-        }
-    }
-    if empty_between {
-        parser.feed(delta(""), &mut out)?;
-    }
-    parser.feed(end(), &mut out)?;
-    Ok(out.drain())
+    common::replay(
+        &mut *(format.new)(),
+        text,
+        cuts,
+        &EngineFinish::Stop,
+        empty_between,
+    )
 }
 
 /// Whether `text` is a JSON prefix the prefix parser takes whole.

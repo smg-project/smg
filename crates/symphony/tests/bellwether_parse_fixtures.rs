@@ -28,15 +28,16 @@
 //! here: that needs token attribution, which will read the pieces bellwether records as
 //! `output_pieces`.
 
+mod common;
+
 use std::{fs, path::PathBuf};
 
+use common::{bytes_of, chunkings, replay};
 use serde::Deserialize;
-use symphony::{adapt, EngineFinish, Event, Events, Input, ParseError, Parser, Qwen3};
+use symphony::{adapt, EngineFinish, Event, Qwen3};
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 const SLUG: &str = "qwen3-8b";
-const RANDOM_PLANS: u64 = 30;
-const RANDOM_LONGEST_CHUNK: usize = 8;
 
 /// A case known to differ from the reference beyond the separator bytes: why, and what the parser
 /// says instead, its call count and finish reason, so that the list allows that difference and no
@@ -190,8 +191,8 @@ fn qwen3_parse_fixtures_match_the_reference() {
         let expected = Said::of_reference(&fixture.reference);
         let mut saids = Vec::new();
         let finish = engine_finish(&fixture.reference.finish_reason);
-        for plan in plans(text) {
-            let events = replay(text, &plan, &finish)
+        for plan in chunkings(text) {
+            let events = replay(&mut Qwen3::new(), text, &plan, &finish, false)
                 .unwrap_or_else(|e| panic!("{}: plan {plan:?}: {e}", fixture.id));
             let conserved: String = events.iter().map(bytes_of).collect();
             if conserved != text {
@@ -274,77 +275,12 @@ fn qwen3_parse_fixtures_match_the_reference() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// The chunkings of `text` to replay: whole, every two-way byte split, byte by byte, and thirty
-/// seeded plans of one to eight characters; every cut on a character boundary.
-fn plans(text: &str) -> Vec<Vec<usize>> {
-    let boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).skip(1).collect();
-    let mut plans = vec![vec![]];
-    plans.extend(boundaries.iter().map(|&cut| vec![cut]));
-    plans.push(boundaries.clone());
-    let chars: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-    for seed in 1..=RANDOM_PLANS {
-        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let mut cuts = Vec::new();
-        let mut at = 0;
-        while at < chars.len() {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let step = 1 + (state >> 33) as usize % RANDOM_LONGEST_CHUNK;
-            at += step;
-            if at < chars.len() {
-                cuts.push(chars[at]);
-            }
-        }
-        plans.push(cuts);
-    }
-    plans
-}
-
 /// The engine's finish for a reference's finish reason. The adapter turns `stop` after a call into
 /// `tool_calls`, so only a truncation needs its own engine reason.
 fn engine_finish(reference: &str) -> EngineFinish {
     match reference {
         "length" => EngineFinish::Length,
         _ => EngineFinish::Stop,
-    }
-}
-
-/// Feed `text` cut at `cuts`, then the end with the engine's `finish`, and return the events.
-fn replay(text: &str, cuts: &[usize], finish: &EngineFinish) -> Result<Vec<Event>, ParseError> {
-    let mut parser = Qwen3::new();
-    let mut out = Events::new();
-    let mut from = 0;
-    for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
-        if cut > from {
-            parser.feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: &text[from..cut],
-                    spans: &[],
-                },
-                &mut out,
-            )?;
-            from = cut;
-        }
-    }
-    parser.feed(
-        Input::End {
-            finish: finish.clone(),
-        },
-        &mut out,
-    )?;
-    Ok(out.drain())
-}
-
-fn bytes_of(event: &Event) -> &str {
-    match event {
-        Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-        Event::ToolCallStart { source, .. }
-        | Event::ToolCallArguments { source, .. }
-        | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
     }
 }
 
