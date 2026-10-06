@@ -7,8 +7,8 @@
 //! reaches the client with the least delay the markers allow and no marker is ever shown as text.
 //!
 //! The scanner knows nothing about what the markers mean; the format does. At a position where
-//! several markers match, the longest wins, and a marker that is a prefix of another (`ab` and `abc`)
-//! is told apart only once enough bytes are there, so `ab` at the end of the text is held.
+//! several markers match, the longest wins, and a marker that is a prefix of another (`ab` and
+//! `abc`) is told apart only once enough bytes are there, so `ab` at the end of the text is held.
 
 /// What a piece of the model's text turned out to be.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,15 +27,12 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    /// A scanner for `markers`. With none, every byte is text. An empty string is no marker and is
-    /// dropped, so the scan always moves forward; the indices of the pieces count the markers kept.
+    /// A scanner for `markers`, each reported by its position in the list as given. With none,
+    /// every byte is text. An empty string never matches, so the scan always moves forward, and of
+    /// two equal markers the first in the list is the one reported.
     pub fn new(markers: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
-            markers: markers
-                .into_iter()
-                .map(Into::into)
-                .filter(|marker| !marker.is_empty())
-                .collect(),
+            markers: markers.into_iter().map(Into::into).collect(),
             held: String::new(),
         }
     }
@@ -63,8 +60,8 @@ impl Scanner {
         self.scan(text, false)
     }
 
-    /// Split `text` into pieces. With `more_may_come`, a tail that could still grow into a marker is
-    /// held instead of released.
+    /// Split `text` into pieces. With `more_may_come`, a tail that could still grow into a marker
+    /// is held instead of released.
     fn scan(&mut self, text: String, more_may_come: bool) -> Vec<Piece> {
         let mut pieces = Vec::new();
         let mut released = 0;
@@ -96,14 +93,16 @@ impl Scanner {
             .any(|marker| marker.len() > rest.len() && marker.starts_with(rest))
     }
 
-    /// The longest marker that `rest` starts with, by index.
+    /// The longest marker that `rest` starts with, by index; of equal ones, the first in the list.
     fn longest_marker_at(&self, rest: &str) -> Option<usize> {
-        self.markers
-            .iter()
-            .enumerate()
-            .filter(|(_, marker)| rest.starts_with(marker.as_str()))
-            .max_by_key(|(_, marker)| marker.len())
-            .map(|(index, _)| index)
+        let mut found: Option<(usize, usize)> = None;
+        for (index, marker) in self.markers.iter().enumerate() {
+            let longer = found.is_none_or(|(_, length)| marker.len() > length);
+            if !marker.is_empty() && longer && rest.starts_with(marker.as_str()) {
+                found = Some((index, marker.len()));
+            }
+        }
+        found.map(|(index, _)| index)
     }
 
     fn release(pieces: &mut Vec<Piece>, text: &str) {
@@ -285,20 +284,37 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_marker_is_dropped_so_the_scan_always_moves_forward() {
+    fn an_empty_marker_never_matches_and_keeps_its_place_in_the_list() {
         let mut scanner = Scanner::new(["", "<think>", ""]);
         assert_eq!(
             scanner.feed("a<think>b"),
             vec![
                 Piece::Text("a".into()),
-                Piece::Marker(0),
+                Piece::Marker(1),
                 Piece::Text("b".into()),
             ]
         );
-        assert_eq!(scanner.marker(0), "<think>");
+        assert_eq!(
+            scanner.marker(1),
+            "<think>",
+            "indices are the list's as given"
+        );
         assert_eq!(
             Scanner::new([""]).feed("plain"),
             vec![Piece::Text("plain".into())]
+        );
+        assert_eq!(
+            Scanner::new(["<think>", ""]).finish(),
+            vec![],
+            "finishing with nothing held ends at once"
+        );
+    }
+
+    #[test]
+    fn of_two_equal_markers_the_first_in_the_list_is_reported() {
+        assert_eq!(
+            Scanner::new(["<x>", "<x>", "<x>y"]).feed("<x>z"),
+            vec![Piece::Marker(0), Piece::Text("z".into())]
         );
     }
 
