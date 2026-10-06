@@ -7,6 +7,19 @@
 //! the blocks in the message envelope (id, model, usage) and, when its stop decoder matched a stop
 //! sequence, sets `stop_sequence` and that reason, since the events carry neither.
 //!
+//! [`Stream`] is the streaming half, the content-block machine: one block is open at a time, and
+//! each parser event becomes the `content_block_start`, `content_block_delta` and
+//! `content_block_stop` events a client expects, the block index advancing by one per block. A
+//! `thinking` block opens at the first reasoning text and closes when the region ends; a `text`
+//! block opens at the first content; a `tool_use` block opens at `ToolCallStart` with an empty
+//! `input` and closes at `ToolCallEnd`; a block closes when text of another kind arrives. `Finish`
+//! closes the open block and hands the stop reason back for the driver's `message_delta`, which
+//! also carries the usage and the stop sequence the events do not have; `message_start`, `ping` and
+//! `message_stop` are the driver's as well. For an output whose reasoning, text and calls come in
+//! that order, the stream's blocks are the ones [`output`] folds from the same events; when they
+//! alternate, the stream keeps the order the model wrote them in and the fold gathers each kind
+//! into one block, as the gateway's two paths do today.
+//!
 //! The blocks are the ones SMG's gateway builds today from a finished turn, in the order the
 //! Messages API uses:
 //!
@@ -44,9 +57,15 @@
 //!   `incomplete`; here `max_tokens` is all a client learns. A call the model closed without
 //!   arguments has `{}` too.
 //! - Argument fragments for a call that never started cannot occur under the `Event` contract;
-//!   should one arrive, its text joins the content so that no byte is lost.
+//!   should one arrive, its text joins the content so that no byte is lost. In the stream the same
+//!   goes for a fragment whose `tool_use` block has closed because other text arrived: it is text.
+//!   The formats parse a call from one contiguous region, so this does not happen for them, and
+//!   nothing is dropped if it does; the old driver dropped such fragments.
+//! - In the stream, the thinking block stops when the reasoning region ends rather than when the
+//!   next text arrives, as the old driver did, so a client sees the block close as soon as the
+//!   model stops thinking.
 
-use openai_protocol::messages::{ContentBlock, StopReason};
+use openai_protocol::messages::{ContentBlock, ContentBlockDelta, MessageStreamEvent, StopReason};
 use serde_json::{Map, Value};
 
 use crate::event::{Event, FinishReason};
@@ -125,6 +144,156 @@ pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
     Output {
         content: blocks,
         stop_reason,
+    }
+}
+
+/// The streaming half: parser events as `content_block_*` events, one block open at a time.
+///
+/// Feed every event in order; the machine opens, continues and closes blocks as the module doc
+/// describes and numbers them from zero. `Finish` closes the open block and returns the stop reason
+/// for the driver's `message_delta`.
+#[derive(Clone, Debug, Default)]
+pub struct Stream {
+    /// The open block, if any.
+    open: Option<Block>,
+    /// The index of the open block, or of the next block to open.
+    index: u32,
+}
+
+/// The kind of block that is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Block {
+    Thinking,
+    Text,
+    ToolUse {
+        /// The call whose arguments the block takes.
+        call: u32,
+    },
+}
+
+impl Stream {
+    /// A machine with no block open; the first block gets index zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends the stream events `event` produces to `out`, in order. Returns the stop reason when
+    /// `event` is `Finish`, after closing the open block.
+    pub fn feed(&mut self, event: &Event, out: &mut Vec<MessageStreamEvent>) -> Option<StopReason> {
+        match event {
+            Event::Content(text) | Event::Malformed { text, .. } => self.text(&text.text, out),
+            Event::Reasoning(text) => {
+                if !text.text.is_empty() {
+                    self.start(
+                        Block::Thinking,
+                        ContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: String::new(),
+                        },
+                        out,
+                    );
+                    out.push(MessageStreamEvent::ContentBlockDelta {
+                        index: self.index,
+                        delta: ContentBlockDelta::ThinkingDelta {
+                            thinking: text.text.clone(),
+                        },
+                    });
+                }
+            }
+            Event::ReasoningEnd => {
+                if self.open == Some(Block::Thinking) {
+                    self.close(out);
+                }
+            }
+            Event::ToolCallStart {
+                index, id, name, ..
+            } => self.start(
+                Block::ToolUse { call: *index },
+                ContentBlock::ToolUse {
+                    id: tool_use_id(id),
+                    name: name.clone(),
+                    input: Value::Object(Map::new()),
+                },
+                out,
+            ),
+            Event::ToolCallArguments { index, json, .. } => {
+                if json.is_empty() {
+                    return None;
+                }
+                if self.open == Some(Block::ToolUse { call: *index }) {
+                    out.push(MessageStreamEvent::ContentBlockDelta {
+                        index: self.index,
+                        delta: ContentBlockDelta::InputJsonDelta {
+                            partial_json: json.clone(),
+                        },
+                    });
+                } else {
+                    self.text(json, out);
+                }
+            }
+            Event::ToolCallEnd { index, .. } => {
+                if self.open == Some(Block::ToolUse { call: *index }) {
+                    self.close(out);
+                }
+            }
+            Event::Finish {
+                reason, tool_calls, ..
+            } => {
+                self.close(out);
+                return Some(stop(reason, *tool_calls));
+            }
+            Event::ReasoningStart | Event::Dropped { .. } => {}
+        }
+        None
+    }
+
+    /// Stops the open block, if any, so that the next block gets the next index. For a stream that
+    /// ends without `Finish`; `feed` closes blocks itself otherwise.
+    pub fn close(&mut self, out: &mut Vec<MessageStreamEvent>) {
+        if self.open.take().is_some() {
+            out.push(MessageStreamEvent::ContentBlockStop { index: self.index });
+            self.index += 1;
+        }
+    }
+
+    /// Text into the open text block, opened first when another kind of block or none is open.
+    fn text(&mut self, text: &str, out: &mut Vec<MessageStreamEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        self.start(
+            Block::Text,
+            ContentBlock::Text {
+                text: String::new(),
+                citations: None,
+            },
+            out,
+        );
+        out.push(MessageStreamEvent::ContentBlockDelta {
+            index: self.index,
+            delta: ContentBlockDelta::TextDelta {
+                text: text.to_string(),
+            },
+        });
+    }
+
+    /// Makes `block` the open block: nothing when it already is, otherwise the open block is closed
+    /// and `content_block` starts at the next index.
+    fn start(
+        &mut self,
+        block: Block,
+        content_block: ContentBlock,
+        out: &mut Vec<MessageStreamEvent>,
+    ) {
+        if self.open == Some(block) {
+            return;
+        }
+        self.close(out);
+        out.push(MessageStreamEvent::ContentBlockStart {
+            index: self.index,
+            content_block,
+        });
+        self.open = Some(block);
     }
 }
 
@@ -380,5 +549,273 @@ mod tests {
         let out = output(&silent);
         assert!(out.content.is_empty(), "{:?}", out.content);
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    /// Every event through one machine; the stop reason of the last `Finish`, if any.
+    fn stream(events: &[Event]) -> (Vec<MessageStreamEvent>, Option<StopReason>) {
+        let mut machine = Stream::new();
+        let mut out = Vec::new();
+        let mut stop = None;
+        for event in events {
+            if let Some(reason) = machine.feed(event, &mut out) {
+                stop = Some(reason);
+            }
+        }
+        (out, stop)
+    }
+
+    fn stream_wire(events: &[MessageStreamEvent]) -> Value {
+        serde_json::to_value(events).expect("serializable")
+    }
+
+    fn event_wire(event: &MessageStreamEvent) -> Value {
+        serde_json::to_value(event).expect("serializable")
+    }
+
+    #[test]
+    fn a_whole_output_streams_as_the_gateway_events_in_order() {
+        let events = [
+            Event::ReasoningStart,
+            Event::Reasoning(Text::uncounted("plan ")),
+            Event::Reasoning(Text::uncounted("more")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("Let me ")),
+            Event::Content(Text::uncounted("check.")),
+            call(0, "get_weather"),
+            arguments(0, r#"{"city":"#),
+            arguments(0, r#""Paris"}"#),
+            end(0),
+            finish(FinishReason::Stop, 1),
+        ];
+        let (out, stop) = stream(&events);
+        assert_eq!(
+            stream_wire(&out),
+            json!([
+                {"type": "content_block_start", "index": 0,
+                 "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "thinking_delta", "thinking": "plan "}},
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "thinking_delta", "thinking": "more"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "content_block_start", "index": 1,
+                 "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 1,
+                 "delta": {"type": "text_delta", "text": "Let me "}},
+                {"type": "content_block_delta", "index": 1,
+                 "delta": {"type": "text_delta", "text": "check."}},
+                {"type": "content_block_stop", "index": 1},
+                {"type": "content_block_start", "index": 2,
+                 "content_block": {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {}}},
+                {"type": "content_block_delta", "index": 2,
+                 "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}},
+                {"type": "content_block_delta", "index": 2,
+                 "delta": {"type": "input_json_delta", "partial_json": "\"Paris\"}"}},
+                {"type": "content_block_stop", "index": 2},
+            ])
+        );
+        assert_eq!(stop, Some(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn blocks_alternate_in_the_order_written_and_the_index_advances_per_block() {
+        let events = [
+            Event::Content(Text::uncounted("a")),
+            Event::Reasoning(Text::uncounted("b")),
+            Event::Content(Text::uncounted("c")),
+            call(0, "f"),
+            Event::Content(Text::uncounted("d")),
+        ];
+        let (out, _) = stream(&events);
+        let summary: Vec<String> = out
+            .iter()
+            .map(|event| match event {
+                MessageStreamEvent::ContentBlockStart { index, .. } => format!(
+                    "start {index} {}",
+                    event_wire(event)["content_block"]["type"]
+                        .as_str()
+                        .expect("a type")
+                ),
+                MessageStreamEvent::ContentBlockDelta { index, .. } => format!("delta {index}"),
+                MessageStreamEvent::ContentBlockStop { index } => format!("stop {index}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                "start 0 text",
+                "delta 0",
+                "stop 0",
+                "start 1 thinking",
+                "delta 1",
+                "stop 1",
+                "start 2 text",
+                "delta 2",
+                "stop 2",
+                "start 3 tool_use",
+                "stop 3",
+                "start 4 text",
+                "delta 4",
+            ]
+        );
+    }
+
+    #[test]
+    fn finish_closes_the_open_block_and_returns_the_stop_reason() {
+        let (out, stop) = stream(&[
+            Event::Content(Text::uncounted("done")),
+            finish(FinishReason::Stop, 0),
+        ]);
+        assert_eq!(
+            stream_wire(&out),
+            json!([
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "done"}},
+                {"type": "content_block_stop", "index": 0},
+            ])
+        );
+        assert_eq!(stop, Some(StopReason::EndTurn));
+
+        let (out, stop) = stream(&[finish(FinishReason::Length, 1)]);
+        assert!(out.is_empty(), "no block was open: {out:?}");
+        assert_eq!(stop, Some(StopReason::MaxTokens));
+    }
+
+    #[test]
+    fn a_fragment_with_no_open_tool_use_block_is_text() {
+        let never_started = [arguments(7, r#"{"stray":true}"#)];
+        assert_eq!(
+            stream_wire(&stream(&never_started).0),
+            json!([
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "text_delta", "text": "{\"stray\":true}"}},
+            ])
+        );
+
+        let closed_by_text = [
+            call(0, "f"),
+            arguments(0, r#"{"a":"#),
+            Event::Content(Text::uncounted("between")),
+            arguments(0, "1}"),
+        ];
+        let (out, _) = stream(&closed_by_text);
+        let last = stream_wire(&out);
+        let last = last
+            .as_array()
+            .expect("an array")
+            .last()
+            .expect("an event")
+            .clone();
+        assert_eq!(
+            last,
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "1}"}})
+        );
+    }
+
+    #[test]
+    fn events_without_a_block_to_shape_produce_no_stream_events() {
+        let (out, stop) = stream(&[
+            Event::ReasoningStart,
+            Event::ReasoningEnd,
+            end(3),
+            Event::Dropped {
+                text: Text::uncounted("<think>"),
+                why: DropReason::Wrapper,
+            },
+            Event::Content(Text::uncounted("")),
+            Event::Reasoning(Text::uncounted("")),
+            arguments(0, ""),
+        ]);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(stop, None);
+    }
+
+    #[test]
+    fn close_stops_the_open_block_once() {
+        let mut machine = Stream::new();
+        let mut out = Vec::new();
+        machine.feed(&Event::Reasoning(Text::uncounted("x")), &mut out);
+        machine.close(&mut out);
+        machine.close(&mut out);
+        assert_eq!(
+            stream_wire(&out),
+            json!([
+                {"type": "content_block_start", "index": 0,
+                 "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "x"}},
+                {"type": "content_block_stop", "index": 0},
+            ])
+        );
+        machine.feed(&Event::Content(Text::uncounted("y")), &mut out);
+        assert_eq!(
+            stream_wire(&out)[3]["index"],
+            json!(1),
+            "the next block takes the next index"
+        );
+    }
+
+    #[test]
+    fn the_stream_and_the_fold_agree_on_an_output_in_block_order() {
+        let events = [
+            Event::ReasoningStart,
+            Event::Reasoning(Text::uncounted("plan")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("Let me ")),
+            Event::Malformed {
+                text: Text::uncounted("<tool_call>{broken"),
+                why: MalformedReason::InvalidArguments,
+            },
+            call(0, "get_weather"),
+            arguments(0, r#"{"city":"#),
+            arguments(0, r#""Paris"}"#),
+            end(0),
+            call(1, "get_time"),
+            arguments(1, r#"{"zone":"#),
+            end(1),
+            finish(FinishReason::Length, 2),
+        ];
+        let (out, stop) = stream(&events);
+        let mut blocks: Vec<Value> = Vec::new();
+        let mut inputs: Vec<String> = Vec::new();
+        for event in &out {
+            match event {
+                MessageStreamEvent::ContentBlockStart { .. } => {
+                    blocks.push(event_wire(event)["content_block"].clone());
+                    inputs.push(String::new());
+                }
+                MessageStreamEvent::ContentBlockDelta { delta, .. } => {
+                    let block = blocks.last_mut().expect("a started block");
+                    let last = inputs.last_mut().expect("a started block");
+                    match delta {
+                        ContentBlockDelta::TextDelta { text } => {
+                            let text =
+                                block["text"].as_str().unwrap_or_default().to_string() + text;
+                            block["text"] = json!(text);
+                        }
+                        ContentBlockDelta::ThinkingDelta { thinking } => {
+                            let text = block["thinking"].as_str().unwrap_or_default().to_string()
+                                + thinking;
+                            block["thinking"] = json!(text);
+                        }
+                        ContentBlockDelta::InputJsonDelta { partial_json } => {
+                            last.push_str(partial_json);
+                        }
+                        other => panic!("unexpected delta {other:?}"),
+                    }
+                }
+                MessageStreamEvent::ContentBlockStop { .. } => {}
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        for (block, input) in blocks.iter_mut().zip(&inputs) {
+            if block["type"] == "tool_use" {
+                block["input"] = serde_json::from_str(input).unwrap_or_else(|_| json!({}));
+            }
+        }
+        let folded = output(&events);
+        assert_eq!(Value::Array(blocks), wire(&folded.content));
+        assert_eq!(stop, folded.stop_reason);
     }
 }

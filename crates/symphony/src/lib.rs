@@ -18,7 +18,7 @@
 //!
 //! Status: the public types below are the contract, and [`adapt`] renders them for the Chat
 //! Completions, Responses and Messages APIs; the engine, the format definitions and the streaming
-//! halves of the Responses and Messages adapters follow in later changes.
+//! half of the Responses adapter follow in later changes.
 
 #![forbid(unsafe_code)]
 
