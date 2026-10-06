@@ -185,6 +185,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         from smg_grpc_servicer.vllm.rust import require_python_impl
 
         require_python_impl()
+        # vLLM 0.31+ configures logging after this module is imported; attach again.
+        attach_vllm_logging()
         self.engine = async_llm
         self.start_time = start_time
         # Resolve KV-event publishing config from the engine. Non-None only when
