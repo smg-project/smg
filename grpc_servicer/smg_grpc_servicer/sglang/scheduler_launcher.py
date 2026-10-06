@@ -148,18 +148,8 @@ def _start_scheduler_processes(
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
 
-                # Calculate parallelism ranks (matching engine.py logic)
-                attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
-                attn_tp_size = server_args.tp_size // attn_dp_size // server_args.attn_cp_size
-                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
-                moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
-                moe_ep_rank = (
-                    tp_rank
-                    % (server_args.tp_size // server_args.moe_dp_size)
-                    // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
-                )
-
-                # Create scheduler process
+                # Create scheduler process. The scheduler derives the attention and MoE
+                # ranks itself from tp_rank and pp_rank.
                 proc = mp.Process(
                     target=run_scheduler_with_signal_handling,
                     args=(
@@ -167,9 +157,6 @@ def _start_scheduler_processes(
                         port_args,
                         gpu_id,
                         tp_rank,
-                        attn_cp_rank,
-                        moe_dp_rank,
-                        moe_ep_rank,
                         pp_rank,
                         None,  # dp_rank
                         writer,
