@@ -28,8 +28,8 @@ mod common;
 
 use common::{bytes_of, chunkings, delta, prompt};
 use symphony::{
-    json::PartialJson, Choice, Constrained, DropReason, EngineFinish, Event, Events, FinishReason,
-    Input, MalformedReason, ParseError, Parser, Qwen3, TokenSpan,
+    json::scan, Choice, Constrained, DropReason, EngineFinish, Event, Events, FinishReason, Input,
+    MalformedReason, ParseError, Parser, Qwen3, TokenSpan,
 };
 
 /// A format under test: how to make its parser, and the outputs it is checked over.
@@ -90,10 +90,14 @@ const QWEN3_OUTPUTS: &[&str] = &[
     "<think>I could write </think> here but it is text.\n</think>\n\nParis is sunny.",
     "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n x\n</tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": {}}x y</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": nope}}</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": truex}</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": [1, falsex, 2]}</tool_call>",
 ];
 
 /// Outputs of a request that forced one function: the arguments of that call, as the grammar
-/// shaped them, plus what a grammar never produces, since the parser must survive it anyway.
+/// shaped them, plus what a grammar never produces, since the parser must survive it anyway, junk
+/// that begins like a JSON literal included.
 const FUNCTION_OUTPUTS: &[&str] = &[
     "",
     "\n\n",
@@ -107,6 +111,10 @@ const FUNCTION_OUTPUTS: &[&str] = &[
     "{\"e\": \"\\ud83c\\udf0d\"}",
     "{\"nested\": {\"x\": [true, null, 1.5e3]}, \"計画\": \"🌍\"}",
     "{\"a\": 1, #}",
+    "nope",
+    "not json at all",
+    "truex",
+    "{\"a\": nope}",
 ];
 
 /// Outputs of a request that required a call: a list of call objects, shaped and misshapen.
@@ -126,6 +134,8 @@ const REQUIRED_OUTPUTS: &[&str] = &[
     "[{\"name\": \"f\", \"arguments\": {\"a\": 1}}]",
     "[{\"name\": \"f\", \"parameters\": {\"e\": \"\\ud83c\\udf0d\"}}]",
     "[{\"name\": \"f\", \"parameters\": 12abc}]",
+    "[{\"name\": \"f\", \"parameters\": truex}]",
+    "[{\"name\": \"f\", \"parameters\": {\"a\": nope}}]",
 ];
 
 /// Every format with each of its outputs.
@@ -228,9 +238,9 @@ fn replay(
     )
 }
 
-/// Whether `text` is a JSON prefix the prefix parser takes whole.
+/// Whether some JSON value could still continue `text`, by the strict acceptor.
 fn valid_json_prefix(text: &str) -> bool {
-    matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
+    scan(text).valid == text.len()
 }
 
 /// What a client relies on in the shape of the stream, checked event by event.

@@ -14,11 +14,11 @@
 //! One function: the bytes before the value are whitespace and dropped as such; the call starts at
 //! the first byte of the value, named by the request (its `source` is empty, since no output byte
 //! names it), and its argument fragments are the output's bytes for as long as they keep the
-//! arguments a valid JSON prefix; from the first byte that does not, the bytes come back as
-//! `Malformed` with `InvalidArguments`. Once the value is whole, the whitespace after it is
-//! dropped, and from the first byte that is not whitespace everything to the end is `Malformed`
-//! with `Other`. The call ends when the output ends, whole or not, so a value cut short is a call
-//! with what arrived, as the assembler does for an object that never closed.
+//! arguments a valid JSON prefix, by the strict acceptor [`scan`]; from the first byte that does
+//! not, the bytes come back as `Malformed` with `InvalidArguments`. Once the value is whole, the
+//! whitespace after it is dropped, and from the first byte that is not whitespace everything to the
+//! end is `Malformed` with `Other`. The call ends when the output ends, whole or not, so a value
+//! cut short is a call with what arrived, as the assembler does for an object that never closed.
 //!
 //! Required: the list's brackets and commas are `Dropped { Wrapper }`, the whitespace between them
 //! `Dropped { Whitespace }`, and each object goes to an [`Assembler`], which emits the call's
@@ -39,7 +39,7 @@ use super::finish_reason;
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
     input::{EngineFinish, Input},
-    json::{is_complete, Assembler, PartialJson},
+    json::{scan, Assembler},
     parser::{ParseError, Parser},
     tokens::Ledger,
 };
@@ -219,14 +219,16 @@ impl Single {
         let valid_end = match (self.invalid_from, self.whole_end) {
             (Some(from), _) => from,
             (None, Some(end)) => end,
-            (None, None) => match PartialJson::default().parse(&self.value, true) {
-                Ok((_, consumed)) if consumed == self.value.len() => consumed,
-                Ok((_, consumed)) if is_complete(&self.value[..consumed]) => {
-                    *self.whole_end.insert(consumed)
+            (None, None) => {
+                let scanned = scan(&self.value);
+                if let Some(end) = scanned.complete {
+                    *self.whole_end.insert(end)
+                } else if scanned.valid == self.value.len() {
+                    scanned.valid
+                } else {
+                    *self.invalid_from.insert(scanned.valid.max(self.emitted))
                 }
-                Ok((_, consumed)) => *self.invalid_from.insert(consumed.max(self.emitted)),
-                Err(_) => *self.invalid_from.insert(self.emitted),
-            },
+            }
         };
         if self.emitted < valid_end {
             let fresh = &self.value[self.emitted..valid_end];
@@ -534,6 +536,20 @@ mod tests {
             broken[2],
             Event::Malformed {
                 text: Text::uncounted("nope}"),
+                why: MalformedReason::InvalidArguments,
+            },
+            "after a comma an object wants a key, so no byte of `nope` is a prefix"
+        );
+        let literal = function(&["{\"a\": nope}"]);
+        assert_eq!(
+            literal[1],
+            fragment(0, "{\"a\": n"),
+            "`n` may still become `null`; `o` cannot follow it"
+        );
+        assert_eq!(
+            literal[2],
+            Event::Malformed {
+                text: Text::uncounted("ope}"),
                 why: MalformedReason::InvalidArguments,
             }
         );

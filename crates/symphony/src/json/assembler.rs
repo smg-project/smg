@@ -15,12 +15,11 @@
 //! are held until the name is whole, since a call starts before its arguments.
 //!
 //! The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form
-//! a valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is
-//! checked with [`PartialJson`] in prefix mode before it is emitted, and from the first byte the
-//! parser cannot take, the argument bytes come back as `Malformed` with `InvalidArguments` instead,
-//! nothing already emitted being revised. The prefix parser tolerates what the old crate tolerated
-//! (a bracket closed by the wrong kind, a literal's prefix), so the promise is exactly as strong as
-//! that parser.
+//! a valid JSON prefix: the argument bytes are run through [`scan`], the strict acceptor of JSON
+//! prefixes, and exactly the bytes some JSON value could still continue are emitted as fragments;
+//! from the first byte none could, the argument bytes come back as `Malformed` with
+//! `InvalidArguments` instead, nothing already emitted being revised. The acceptor is a function of
+//! the bytes alone, so where the fragments stop does not depend on how the output was cut.
 //!
 //! A started call whose object never closes is closed at `finish` with what arrived, and the bytes
 //! after its arguments value (a comma cut short, a complete member, or bytes that are no member)
@@ -39,7 +38,7 @@ use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::{
         outline::{outline, Span},
-        partial::PartialJson,
+        prefix::scan,
     },
 };
 
@@ -77,8 +76,8 @@ impl Assembler {
         self.done
     }
 
-    /// Whether a call has started, that is, whether `ToolCallStart` has been pushed. A format counts
-    /// its calls and advances their index by this, not by the markers it saw.
+    /// Whether a call has started, that is, whether `ToolCallStart` has been pushed. A format
+    /// counts its calls and advances their index by this, not by the markers it saw.
     pub fn started(&self) -> bool {
         self.started
     }
@@ -194,11 +193,14 @@ impl Assembler {
         }
         let valid_end = match self.invalid_from {
             Some(from) => from,
-            None => match PartialJson::default().parse(bytes, true) {
-                Ok((_, consumed)) if consumed == bytes.len() => bytes.len(),
-                Ok((_, consumed)) => *self.invalid_from.insert(consumed.max(self.emitted)),
-                Err(_) => *self.invalid_from.insert(self.emitted),
-            },
+            None => {
+                let scanned = scan(bytes);
+                if scanned.valid == bytes.len() {
+                    bytes.len()
+                } else {
+                    *self.invalid_from.insert(scanned.valid.max(self.emitted))
+                }
+            }
         };
         if self.emitted < valid_end {
             let fresh = &bytes[self.emitted..valid_end];
