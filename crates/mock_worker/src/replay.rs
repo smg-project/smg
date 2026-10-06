@@ -1,6 +1,8 @@
 //! Replay testing: `--capture` records every gRPC `Generate` request the
 //! worker receives, so a test can check what the gateway put on the wire.
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
@@ -19,9 +21,16 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// Open `path` for appending, creating it if it does not exist.
+    /// Open `path` for appending, creating it if it does not exist. A capture
+    /// holds prompts, so a file this creates is readable by its owner only
+    /// (mode 0o600 on Unix). A file that already exists keeps its mode: it
+    /// was made by someone who chose who may read it.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path)?;
         Ok(Self {
             file: Mutex::new(file),
         })
@@ -138,5 +147,32 @@ mod tests {
         assert_eq!(f32_json(f32::NAN), json!("NaN"));
         assert_eq!(f32_json(f32::INFINITY), json!("inf"));
         assert_eq!(f32_json(f32::NEG_INFINITY), json!("-inf"));
+    }
+
+    /// A capture holds prompts, so a file the mock creates is readable by
+    /// its owner only. A file that already exists keeps the mode it has.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_capture_file_is_owner_only() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mode = |path: &Path| {
+            let mode = fs::metadata(path)
+                .expect("capture file metadata")
+                .permissions()
+                .mode();
+            format!("{:o}", mode & 0o777)
+        };
+
+        let created = dir.path().join("created.jsonl");
+        Capture::open(&created).expect("create a capture file");
+        assert_eq!(mode(&created), "600", "a new file is owner-only");
+
+        let existing = dir.path().join("existing.jsonl");
+        fs::write(&existing, b"").expect("create a file");
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        Capture::open(&existing).expect("open an existing capture file");
+        assert_eq!(mode(&existing), "644", "an existing file keeps its mode");
     }
 }

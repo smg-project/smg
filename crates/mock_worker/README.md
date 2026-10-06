@@ -113,7 +113,9 @@ Keys are the field names in
 
 Each line is in the file before the worker sends the first frame of its
 response, so killing the worker loses no line. A capture path that cannot be
-opened fails at startup with exit code 2, before any worker starts.
+opened fails at startup with exit code 2, before any worker starts. A new
+capture file is readable by its owner only (mode 0o600); an existing file keeps
+its mode.
 
 ## Scale-test rig (gateway CPU)
 
