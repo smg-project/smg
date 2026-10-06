@@ -30,11 +30,14 @@ labels (`TOKENSPEED_GRPC_KEYS`); `src/routers/grpc/proto_wrapper.rs`,
 `src/routers/grpc/common/response_formatting.rs` (`effective_weight_version`),
 `src/routers/grpc/regular/{processor,streaming}.rs` and
 `src/routers/grpc/pipeline.rs` carry the engine-reported
-`meta_info.weight_version`.
-`model_gateway/tests/rl_tokenspeed_control_endpoint_test.rs` registers a
-TokenSpeed gRPC mock through `POST /workers`, drives it through `/v1/rl` via
-the control endpoint its server info advertised, and checks the version the
-gRPC `/generate` path reports.
+`meta_info.weight_version`; `src/routers/grpc/router.rs` and
+`src/routers/grpc/pipeline.rs` give slime's model-less single-prompt
+`/generate` SGLang's shape; `src/routers/http/router.rs` (with
+`crates/protocols/src/generate.rs`) stops forwarding the wildcard `model`
+placeholder. `model_gateway/tests/rl_tokenspeed_control_endpoint_test.rs`
+registers a TokenSpeed gRPC mock through `POST /workers`, drives it through
+`/v1/rl` via the control endpoint its server info advertised, and checks the
+version and the shape the gRPC `/generate` path reports.
 
 Wire types are not a gateway coupling: they live in `crates/protocols/src/rl.rs`
 (`openai_protocol::rl`) next to the `/workers` types, and
