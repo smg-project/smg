@@ -18,12 +18,14 @@
 //! ends, so the template's separators between blocks open no block of their own. `Finish` closes
 //! the open block and hands the stop reason back for the driver's `message_delta`, which also
 //! carries the usage and the stop sequence the events do not have; `message_start`, `ping` and
-//! `message_stop` are the driver's as well. For an output whose reasoning, text and calls come in
-//! that order, with nothing but calls after the first call, the stream's blocks are the ones
-//! [`output`] folds from the same events. Otherwise the two differ as the gateway's two paths do
-//! today: the stream keeps the order the model wrote the blocks in and lets go of the whitespace
-//! between them, while the fold gathers each kind into one block and, once its text has
-//! substance, keeps every run of whitespace in it, the separators after a call included.
+//! `message_stop` are the driver's as well. For an output with one reasoning region, then text,
+//! then calls, with nothing but calls after the first call and each call's events together, the
+//! stream's blocks are the ones [`output`] folds from the same events. Otherwise the two differ:
+//! the stream keeps the order the model wrote the blocks in, gives each reasoning region a thinking
+//! block of its own, lets go of the whitespace between blocks, and makes text of a fragment whose
+//! call's block another block has closed; the fold gathers each kind into one block, gives every
+//! fragment to its call, and once its text has substance keeps every run of whitespace in it, the
+//! separators after a call included.
 //!
 //! The blocks are the ones SMG's gateway builds today from a finished turn, in the order the
 //! Messages API uses:
