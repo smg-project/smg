@@ -1,16 +1,16 @@
 //! The outline of a tool-call object as it arrives: where its name is and where its arguments are.
 //!
-//! A model writes a call as a JSON object, `{"name": "get_weather", "arguments": {"city": "Paris"}}`
-//! in some order and with its own spacing, and the object arrives in pieces. [`outline`] reads the
-//! object so far and reports the call's name once its string is complete, the byte span of the
-//! arguments value from the moment its first byte has arrived, and where the object closed, so the
-//! caller knows how many of its bytes the object took.
-//! Because the span is a range into the model's own text, an argument stream can emit exactly the
-//! bytes the model wrote, as they arrive, and nothing it emitted ever has to change: a byte of the
-//! value, once there, stays. That replaces the old crate's way of streaming arguments, which parsed
-//! the partial object, re-serialized the arguments and emitted the difference to the previous
-//! serialization, so that clients saw `{"city":"Paris"}` where the model had written
-//! `{"city": "Paris"}`.
+//! A model writes a call as a JSON object,
+//! `{"name": "get_weather", "arguments": {"city": "Paris"}}` in some order and with its own
+//! spacing, and the object arrives in pieces. [`outline`] reads the object so far and reports the
+//! call's name once its string is complete, the byte span of the arguments value from the moment
+//! its first byte has arrived, and where the object closed, so the caller knows how many of its
+//! bytes the object took. Because the span is a range into the model's own text, an argument stream
+//! can emit exactly the bytes the model wrote, as they arrive, and nothing it emitted ever has to
+//! change: a byte of the value, once there, stays. That replaces the old crate's way of streaming
+//! arguments, which parsed the partial object, re-serialized the arguments and emitted the
+//! difference to the previous serialization, so that clients saw `{"city":"Paris"}` where the model
+//! had written `{"city": "Paris"}`.
 //!
 //! The member names a call uses are the ones the old crate accepted: `name` or `tool_name` for the
 //! name, `arguments` or `parameters` for the arguments; the first of each that appears counts. The

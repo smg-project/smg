@@ -11,19 +11,19 @@
 //! changed in form: an error type of its own, `is_complete` as a function of this module, the
 //! cursor's literal parsing shared by `true`, `false` and `null`, names and documentation. What
 //! changed in behaviour, twice. A word of letters that is no literal never advances the cursor: the
-//! original looked ahead over at most the longest literal of the kind (five bytes for either boolean,
-//! four for `null`), so `truex` was rejected unseen but `false` or `null` followed by letters passed
-//! the look-ahead, was consumed, and was rejected only then (`[1, falsex` consumed ten bytes there
-//! and `[1, nullx` nine, both consume four here). And a surrogate pair written as two `\u` escapes
-//! is one character: the original could not read one and stopped at its first half, so an object
-//! holding such a string came back without it and with the parse ending there; here the pair
-//! decodes, a cut inside it is an unfinished escape, and a surrogate without its other half is
-//! invalid, as before. Everything else behaves as before, since the
-//! ported streaming parser must reproduce the old one until bellwether's fixtures judge otherwise;
-//! the choices worth a second look are named here so that the parity review finds them: an unknown
-//! escape keeps the escaped character, an unfinished `\u` escape becomes U+FFFD, a number that
-//! cannot be read becomes `0`, a prefix of `true`, `false` or `null` counts as the literal, and a
-//! trailing comma before a closing bracket is accepted.
+//! original looked ahead over at most the longest literal of the kind (five bytes for either
+//! boolean, four for `null`), so `truex` was rejected unseen but `false` or `null` followed by
+//! letters passed the look-ahead, was consumed, and was rejected only then (`[1, falsex` consumed
+//! ten bytes there and `[1, nullx` nine, both consume four here). And a surrogate pair written as
+//! two `\u` escapes is one character: the original could not read one and stopped at its first
+//! half, so an object holding such a string came back without it and with the parse ending there;
+//! here the pair decodes, a cut inside it is an unfinished escape, and a surrogate without its
+//! other half is invalid, as before. Everything else behaves as before, since the ported streaming
+//! parser must reproduce the old one until bellwether's fixtures judge otherwise; the choices worth
+//! a second look are named here so that the parity review finds them: an unknown escape keeps the
+//! escaped character, an unfinished `\u` escape becomes U+FFFD, a number that cannot be read
+//! becomes `0`, a prefix of `true`, `false` or `null` counts as the literal, and a trailing comma
+//! before a closing bracket is accepted.
 
 use serde::{de::IgnoredAny, Deserialize};
 use serde_json::{Deserializer, Map, Number, Value};
@@ -383,11 +383,12 @@ impl Cursor<'_> {
     /// `true`, `false` or `null` (`expected`), or in prefix mode a prefix of it.
     ///
     /// The whole run of letters is looked at before anything is consumed, so a word that is no
-    /// literal leaves the position where it was and the enclosing value closes before it: `[1, truex`,
-    /// `[1, falsex` and `[1, nullx` all give `[1]` after four bytes. The original looked ahead over
-    /// at most the longest literal of the kind (five bytes for either boolean, four for `null`), which
-    /// let `false` or `null` followed by letters advance the cursor before the word was rejected;
-    /// that is the one behaviour this port changes.
+    /// literal leaves the position where it was and the enclosing value closes before it:
+    /// `[1, truex`, `[1, falsex` and `[1, nullx` all give `[1]` after four bytes. The original
+    /// looked ahead over at most the longest literal of the kind (five bytes for either boolean,
+    /// four for `null`), which let `false` or `null` followed by letters advance the cursor before
+    /// the word was rejected; that is one of the two behaviours this port changes, and the module
+    /// doc names both.
     fn literal(&mut self, expected: &'static str, value: Value) -> Parsed<Value> {
         let word: String = self
             .chars

@@ -4,30 +4,32 @@
 //! text, and turns it into the events of one call: `ToolCallStart` once the name is whole and the
 //! arguments value has begun (or the object has closed without one), `ToolCallArguments` for every
 //! run of new argument bytes, `ToolCallEnd` when the object closes. The fragments are the model's
-//! own bytes: what a client receives, concatenated, is exactly what the model wrote as the arguments
-//! value, spacing included, and no fragment ever has to be revised. The old crate had no equivalent;
-//! it parsed the partial object on every chunk, re-serialized the arguments and emitted the
-//! difference, which is how `{"city": "Paris"}` reached clients as `{"city":"Paris"}`.
+//! own bytes: what a client receives, concatenated, is exactly what the model wrote as the
+//! arguments value, spacing included, and no fragment ever has to be revised. The old crate had no
+//! equivalent; it parsed the partial object on every chunk, re-serialized the arguments and emitted
+//! the difference, which is how `{"city": "Paris"}` reached clients as `{"city":"Paris"}`.
 //!
 //! Every byte of the object lands in exactly one event: the head up to the arguments value is the
 //! `source` of `ToolCallStart`, the argument bytes are the `source` of their fragments, the tail
 //! after the value is the `source` of `ToolCallEnd`. When the arguments come before the name they
 //! are held until the name is whole, since a call starts before its arguments.
 //!
-//! The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form a
-//! valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is checked
-//! with [`PartialJson`] in prefix mode before it is emitted, and from the first byte the parser cannot
-//! take, the argument bytes come back as `Malformed` with `InvalidArguments` instead, nothing already
-//! emitted being revised. The prefix parser tolerates what the old crate tolerated (a bracket closed
-//! by the wrong kind, a literal's prefix), so the promise is exactly as strong as that parser.
+//! The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form
+//! a valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is
+//! checked with [`PartialJson`] in prefix mode before it is emitted, and from the first byte the
+//! parser cannot take, the argument bytes come back as `Malformed` with `InvalidArguments` instead,
+//! nothing already emitted being revised. The prefix parser tolerates what the old crate tolerated
+//! (a bracket closed by the wrong kind, a literal's prefix), so the promise is exactly as strong as
+//! that parser.
 //!
 //! A started call whose object never closes is closed at `finish` with what arrived, and the bytes
-//! after its last complete member (a comma cut short, or bytes that are no member) come back as
-//! `Malformed` with `UnterminatedRegion`.
+//! after its arguments value (a comma cut short, a complete member, or bytes that are no member)
+//! come back as `Malformed` with `UnterminatedRegion`.
 //!
 //! `feed` takes one piece and returns how many of its bytes the object took: all of them before the
 //! close, and up to the closing brace in the piece that carries it, so the format routes whatever
-//! follows the object (a closing marker, more text) itself. Bytes fed after the close are not taken.
+//! follows the object (a closing marker, more text) itself. Bytes fed after the close are not
+//! taken.
 //!
 //! What the assembler does not decide: the call's index and id (the format mints them and passes
 //! them to [`Assembler::new`]), whether the name is a declared tool, and whether a string-valued
@@ -134,45 +136,42 @@ impl Assembler {
         taken
     }
 
-    /// No more bytes will come. A call that started is closed with what arrived, the bytes after
-    /// its last complete member returned as `Malformed`; an object that never named its call comes
-    /// back as `Malformed` whole. Either way no byte is lost.
-    pub fn finish(self, out: &mut Events) {
+    /// No more bytes will come, and the object never closed. A call that started is closed with
+    /// what arrived, the bytes after its arguments value returned as `Malformed`; an object that
+    /// never named its call comes back as `Malformed` whole. Either way no byte is lost.
+    pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
         }
         let found = outline(&self.text);
         if self.started {
-            let mut this = self;
-            this.emit_new_argument_bytes(found.arguments.as_ref(), out);
-            // The object never closed: whatever followed its last complete member is not part of a
-            // well-formed call, whether a comma cut short or bytes that are no member at all.
+            self.emit_new_argument_bytes(found.arguments.as_ref(), out);
+            // The object never closed, so what follows the arguments value is the tail of an
+            // unterminated region: a comma cut short, a complete member, or bytes that are no
+            // member at all. A closed object's tail is the source of its `ToolCallEnd` instead.
             let tail_start = found
                 .arguments
                 .as_ref()
                 .and_then(|span| span.end)
-                .unwrap_or(this.text.len());
-            if tail_start < this.text.len() {
+                .unwrap_or(self.text.len());
+            if tail_start < self.text.len() {
                 out.push(Event::Malformed {
-                    text: Text::uncounted(&this.text[tail_start..]),
+                    text: Text::uncounted(&self.text[tail_start..]),
                     why: MalformedReason::UnterminatedRegion,
                 });
             }
             out.push(Event::ToolCallEnd {
-                index: this.index,
+                index: self.index,
                 source: Text::default(),
             });
             return;
         }
-        let why = if found.complete() {
-            MalformedReason::Other("a tool call without a name".to_string())
-        } else {
-            MalformedReason::UnterminatedRegion
-        };
+        // `feed` answers an object that closed without a name at its brace, so what is left here
+        // never closed.
         if !self.text.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(self.text),
-                why,
+                why: MalformedReason::UnterminatedRegion,
             });
         }
     }
