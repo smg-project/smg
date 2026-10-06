@@ -279,8 +279,10 @@ mod tests {
     /// build eagerly; CA bundles are only read when a connection is made.)
     #[test]
     fn a_failed_client_build_is_reported_on_the_worker() {
-        let mut config = RouterConfig::default();
-        config.client_identity = Some(b"not a pem".to_vec());
+        let config = RouterConfig {
+            client_identity: Some(b"not a pem".to_vec()),
+            ..RouterConfig::default()
+        };
         let info = view_with(&config, vec![grpc_worker("grpc://a:1")])
             .list()
             .pop()
