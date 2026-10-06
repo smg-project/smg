@@ -1024,6 +1024,7 @@ impl StreamingProcessor {
                             model,
                             history_tool_calls_count,
                             used_json_schema,
+                            original_request.first_tool_call_only,
                         )
                         .await
                     };
@@ -1092,7 +1093,10 @@ impl StreamingProcessor {
                     .map_err(|_| "Failed to send flushed content chunk".to_string())?;
             }
 
-            if let Some(unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
+            if let Some(mut unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
+                if original_request.first_tool_call_only {
+                    utils::keep_first_tool_call_items(&mut unstreamed_items);
+                }
                 for tool_call_item in unstreamed_items {
                     let tool_call_delta = ToolCallDelta {
                         index: tool_call_item.tool_index as u32,
@@ -2034,6 +2038,7 @@ impl StreamingProcessor {
         model: &str,
         history_tool_calls_count: usize,
         use_json_parser: bool,
+        first_call_only: bool,
     ) -> Vec<ChatStreamChoice> {
         let mut chunks = Vec::new();
 
@@ -2054,7 +2059,13 @@ impl StreamingProcessor {
 
         if let Some(parser) = tool_parsers.get_mut(&index) {
             match parser.parse_incremental(delta, tools).await {
-                Ok(StreamingParseResult { normal_text, calls }) => {
+                Ok(StreamingParseResult {
+                    normal_text,
+                    mut calls,
+                }) => {
+                    if first_call_only {
+                        utils::keep_first_tool_call_items(&mut calls);
+                    }
                     // Emit normal text if present
                     if !normal_text.is_empty() {
                         chunks.push(assistant_choice(index, Some(normal_text), None, None));
@@ -3036,6 +3047,9 @@ impl StreamingProcessor {
                             normal_text: text,
                             mut calls,
                         }) => {
+                            if original_request.first_tool_call_only {
+                                utils::keep_first_tool_call_items(&mut calls);
+                            }
                             // Arguments that finish the open call come before
                             // the text after it in the same chunk.
                             let finishing = if tool_block_open {
@@ -3246,7 +3260,10 @@ impl StreamingProcessor {
         }
 
         if let Some(ref parser) = streaming_tool_parser {
-            if let Some(unstreamed_items) = parser.get_unstreamed_tool_args() {
+            if let Some(mut unstreamed_items) = parser.get_unstreamed_tool_args() {
+                if original_request.first_tool_call_only {
+                    utils::keep_first_tool_call_items(&mut unstreamed_items);
+                }
                 for tool_call_item in unstreamed_items {
                     has_tool_calls = true;
 

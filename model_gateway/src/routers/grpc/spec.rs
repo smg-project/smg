@@ -93,6 +93,8 @@ pub(crate) struct ChatResponseSpec {
     /// building replaces the request's ask with what the rendered prompt did
     /// (`ProcessedMessages::continued_final_message`).
     pub continues_final_assistant: bool,
+    /// `parallel_tool_calls: false`: only the first tool call is returned.
+    pub first_tool_call_only: bool,
     /// `n`, normalized.
     pub expected_choices: u32,
     pub logprobs: bool,
@@ -136,6 +138,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             reasoning_effort: request.effective_reasoning_effort().map(str::to_string),
             thinking: request.effective_thinking_toggle(),
             continues_final_assistant: request.continues_final_assistant(),
+            first_tool_call_only: request.parallel_tool_calls == Some(false),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
             top_logprobs: request.top_logprobs,
@@ -211,6 +214,9 @@ pub(crate) struct MessagesResponseSpec {
     pub continues_final_assistant: bool,
     /// `output_config.effort`, the `reasoning_effort` the template rendered.
     pub reasoning_effort: Option<String>,
+    /// `disable_parallel_tool_use: true`: only the first tool call is
+    /// returned.
+    pub first_tool_call_only: bool,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -233,6 +239,9 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             symphony: None,
             continues_final_assistant: request.continues_final_assistant(),
             reasoning_effort: request.reasoning_effort().map(str::to_owned),
+            first_tool_call_only: utils::message_utils::disables_parallel_tool_use(
+                request.tool_choice.as_ref(),
+            ),
         }
     }
 }

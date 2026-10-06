@@ -345,6 +345,7 @@ fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesRes
         provider: ProviderProfile::Generic,
         continues_final_assistant: false,
         reasoning_effort: None,
+        first_tool_call_only: false,
         thinking: thinking.then_some(messages::ThinkingConfig::Enabled {
             budget_tokens: 1024,
             display: None,
