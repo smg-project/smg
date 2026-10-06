@@ -16,8 +16,9 @@
 //!   decoded: `"exact phrase"` keeps its quotes, indentation and a trailing newline stay, and
 //!   `&amp;` is five characters. A parameter is declared `string` when its schema admits that
 //!   type at all: `"type": "string"`, a list of types or an `anyOf` that includes it, or an `enum`
-//!   of strings. When the same schema admits `null`, the text `null`, and the `None` a template
-//!   writes for a null argument, are null; any other text is the string.
+//!   of strings, with or without `null` among them. When the same schema admits `null`, the text
+//!   `null`, and the `None` a template writes for a null argument, are null; any other text is the
+//!   string.
 //! - A parameter declared `integer` is that integer when its text is a sign and digits, with the
 //!   whitespace around it ignored. It may be spelled `+5` or `007`; it is written in JSON's
 //!   spelling, with the digits the model wrote.
@@ -87,7 +88,8 @@ impl Kind {
 }
 
 /// The type names `schema` admits: its `type`, as one name or a list; the types of its `anyOf` or
-/// `oneOf` members; and `string` for an `enum` whose values are all strings.
+/// `oneOf` members; and for an `enum` of strings, `string`, and `null` too when `null` is among
+/// them (what Pydantic writes for `Literal["a", "b", None]`).
 fn admitted_types<'a>(schema: &'a Value, into: &mut Vec<&'a str>) {
     match schema.get("type") {
         Some(Value::String(name)) => into.push(name),
@@ -101,8 +103,14 @@ fn admitted_types<'a>(schema: &'a Value, into: &mut Vec<&'a str>) {
         }
     }
     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        if !values.is_empty() && values.iter().all(Value::is_string) {
+        let strings_or_null = values
+            .iter()
+            .all(|value| value.is_string() || value.is_null());
+        if strings_or_null && values.iter().any(Value::is_string) {
             into.push("string");
+            if values.iter().any(Value::is_null) {
+                into.push("null");
+            }
         }
     }
 }
@@ -256,6 +264,7 @@ mod tests {
                 "choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
                 "named": {"enum": ["celsius", "fahrenheit"]},
                 "named_or_null": {"enum": ["celsius", "fahrenheit"], "type": ["string", "null"]},
+                "named_or_none": {"enum": ["celsius", "fahrenheit", null]},
                 "nested": {"anyOf": [{"anyOf": [{"type": "string"}]}, {"type": "null"}]},
             }),
         )]);
@@ -267,6 +276,7 @@ mod tests {
             ("choice", Kind::String),
             ("named", Kind::String),
             ("named_or_null", Kind::NullableString),
+            ("named_or_none", Kind::NullableString),
             ("nested", Kind::NullableString),
         ] {
             assert_eq!(declared.kind("f", parameter), Some(kind), "{parameter}");
@@ -288,6 +298,7 @@ mod tests {
                 "untyped": {"description": "anything"},
                 "mixed": {"enum": [1, "two"]},
                 "empty": {"enum": []},
+                "only_null": {"enum": [null]},
                 // Aliases and other spellings of a type name are not read today; vLLM reads
                 // these as string and integer. Whether Symphony follows is Simo's decision.
                 "alias": {"type": "str"},
@@ -307,6 +318,7 @@ mod tests {
             "untyped",
             "mixed",
             "empty",
+            "only_null",
             "alias",
             "cased",
             "padded",
@@ -467,6 +479,7 @@ mod tests {
     #[test]
     fn a_declared_integer_with_more_digits_than_can_be_read_back_is_a_string() {
         let mut longest_kept = 0;
+        let mut refused = false;
         for digits in [1, 19, 20, 21, 39, 100, 300, 308, 309, 310, 400, 5000] {
             let text = "9".repeat(digits);
             let written = json(&text, Some(Kind::Integer));
@@ -475,9 +488,13 @@ mod tests {
                 "{digits} digits cost the call its arguments"
             );
             if written == text {
-                assert!(longest_kept < digits);
+                assert!(
+                    !refused,
+                    "{digits} digits kept after a shorter count was refused"
+                );
                 longest_kept = digits;
             } else {
+                refused = true;
                 assert_eq!(written, format!("\"{text}\""), "{digits} digits");
             }
         }
