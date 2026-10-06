@@ -24,8 +24,9 @@
 //! with the call count and finish reason the parser gives, so the list allows that difference and
 //! no other. The run fails on any other difference, when a listed case starts matching, and when a
 //! listed case is no longer among the fixtures, so the list cannot rot. Each replay ends with the
-//! engine finish the reference implies. The fixtures' token-level chunk plans are replayed with
-//! token attribution, which reads the pieces bellwether records as `output_pieces`.
+//! engine finish the reference implies. The fixtures' token-level chunk plans are not replayed
+//! here: that needs token attribution, which will read the pieces bellwether records as
+//! `output_pieces`.
 
 use std::{fs, path::PathBuf};
 
