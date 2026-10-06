@@ -237,12 +237,12 @@ class Worker:
             if held:
                 # The wait gives up once the figure stops moving, usually well
                 # inside the 30 s cap; report what was actually waited, and
-                # which processes hold a context on those GPUs. An empty list
-                # means the memory belongs to an exited process and a peer
-                # still maps it (see gpu_compute_apps).
+                # the compute processes nvidia-smi lists on those GPUs. An empty
+                # list is not evidence of anything from inside a container (see
+                # gpu_compute_apps).
                 logger.warning(
                     "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, "
-                    "baseline %s MiB, processes on those GPUs: %s",
+                    "baseline %s MiB, compute processes nvidia-smi lists there: %s",
                     self.model_id,
                     time.monotonic() - waited,
                     held,

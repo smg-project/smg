@@ -195,14 +195,13 @@ def gpu_memory_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
 
 
 def gpu_compute_apps(gpu_ids: list[int]) -> dict[int, list[tuple[int, int | None]]] | None:
-    """Processes holding a context on each GPU via ``nvidia-smi``: ``(pid, used MiB)``.
+    """Compute processes ``nvidia-smi`` lists on each GPU: ``(pid, used MiB)``.
 
-    An empty list for a GPU whose memory is still in use means no live process
-    has a context there: the allocation belongs to an exited process and stays
-    resident because another process still maps it (a peer's CUDA IPC import
-    of a dead prefill's KV cache, typically). ``used`` is ``None`` when the
-    driver withholds the figure. ``None`` overall when ``nvidia-smi`` is
-    unavailable.
+    Only a non-empty list says anything. Inside a job container ``nvidia-smi``
+    can list nothing while workers hold contexts, or list the host's PIDs, so
+    an empty list does not show that the memory belongs to an exited process.
+    ``used`` is ``None`` when the driver withholds the figure. ``None`` overall
+    when ``nvidia-smi`` is unavailable.
     """
     apps: dict[int, list[tuple[int, int | None]]] = {}
     for gpu in gpu_ids:
