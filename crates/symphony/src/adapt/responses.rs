@@ -154,7 +154,12 @@ pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>
             Event::ToolCallArguments { index, json, .. } => {
                 match calls.iter_mut().find(|call| call.index == *index) {
                     Some(call) => call.arguments.push_str(json),
-                    None => content.push_str(json),
+                    None => {
+                        content.push_str(json);
+                        if !json.trim().is_empty() {
+                            reasoning_ended = true;
+                        }
+                    }
                 }
             }
             Event::ToolCallEnd { index, .. } => {
@@ -1439,6 +1444,23 @@ mod tests {
             statuses(&done.expect("output").items),
             ["in_progress", "completed"],
             "content with substance ends a reasoning region even after the message has opened"
+        );
+
+        let stray_fragment = [
+            Event::Reasoning(Text::uncounted("plan")),
+            arguments(7, r#"{"stray":true}"#),
+            finish(FinishReason::Other("failed".into()), 0),
+        ];
+        let (_, done) = stream("r", &stray_fragment);
+        let done = done.expect("output");
+        assert_eq!(
+            output_wire(&done),
+            output_wire(&output("r", &stray_fragment))
+        );
+        assert_eq!(
+            statuses(&done.items),
+            ["completed", "in_progress"],
+            "a fragment that falls back to content ends the region as content does"
         );
     }
 
