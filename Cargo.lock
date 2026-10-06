@@ -4009,6 +4009,7 @@ dependencies = [
  "tiktoken-rs",
  "tokenizers",
  "tokio",
+ "toml 1.1.5+spec-1.1.0",
  "tracing",
  "uuid",
 ]
