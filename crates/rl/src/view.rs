@@ -29,12 +29,13 @@ pub struct RlWorkerInfo {
     /// HTTP worker, the engine-advertised `rl.control_url` (wildcard host
     /// resolved) for a gRPC or ZMQ worker, `None` when it has neither.
     pub control_url: Option<String>,
-    /// The client used for control calls. For an HTTP worker it is the
-    /// client the gateway negotiated for the worker (HTTP version, TLS
-    /// identity and roots, pool tuning); for other transports it is a cached
-    /// client with the same TLS settings on HTTP/1.1. `None` when the worker
-    /// has no control endpoint.
-    pub control_client: Option<Arc<reqwest::Client>>,
+    /// The client for control calls. For an HTTP worker it is the client the
+    /// gateway negotiated for the worker (HTTP version, TLS identity and
+    /// roots, pool tuning); for other transports it is a client with the same
+    /// TLS settings on HTTP/1.1, shared by the workers with the same pool
+    /// config. `Err` says why the gateway has none; the 422 for the worker
+    /// repeats it.
+    pub control_client: Result<Arc<reqwest::Client>, String>,
 }
 
 impl fmt::Debug for RlWorkerInfo {
@@ -88,7 +89,7 @@ mod tests {
             dp_size: None,
             labels: HashMap::new(),
             control_url: None,
-            control_client: None,
+            control_client: Err("no client".to_string()),
         }
     }
 

@@ -4,7 +4,7 @@
 
 pub mod capability;
 pub mod config;
-pub mod control;
+mod control;
 pub mod discovery;
 pub mod error;
 pub mod fanout;
