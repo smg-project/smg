@@ -14,15 +14,18 @@
 //! Two policy questions stand between the parser and bitwise parity, and the test declares them
 //! rather than hides them. Bellwether #17: the template's separator bytes (the newline after
 //! `<think>`, the two after `</think>`) are in the parser's content and reasoning and not in the
-//! reference's; a case that matches once both are trimmed is counted as "separators only". Two of the
-//! bitwise cases, the parallel calls, owe their count to the adapter rather than the parser: there
-//! the parser's content is nothing but the separator between the calls, and the adapter's rule that
-//! whitespace-only content is absent folds the difference away before the comparison. Bellwether
-//! #16: two probe cases put marker strings inside text, and the parser reads them as markers like
-//! every marker parser; they are listed in [`KNOWN_DIFFERENCES`] with their reason, the run fails on
-//! any other difference, and it fails again when a listed case starts matching, so the list cannot
-//! rot. The fixtures' token-level chunk plans are not replayed here: that needs the token-to-text
-//! pieces, which bellwether's detokenize fixtures will carry.
+//! reference's; a case that matches once the newlines at both ends are trimmed is counted as
+//! "separators only", and any other whitespace still counts as a difference. Two of
+//! the bitwise cases, the parallel calls, owe their count to the adapter rather than the parser:
+//! there the parser's content is nothing but the separator between the calls, and the adapter's
+//! rule that whitespace-only content is absent folds the difference away before the comparison.
+//! Bellwether #16: two probe cases put marker strings inside text, and the parser reads them as
+//! markers like every marker parser; they are listed in [`KNOWN_DIFFERENCES`] with their reason and
+//! with the call count and finish reason the parser gives, so the list allows that difference and
+//! no other. The run fails on any other difference, when a listed case starts matching, and when a
+//! listed case is no longer among the fixtures, so the list cannot rot. Each replay ends with the
+//! engine finish the reference implies. The fixtures' token-level chunk plans are replayed with
+//! token attribution, which reads the pieces bellwether records as `output_pieces`.
 
 use std::{fs, path::PathBuf};
 
@@ -34,18 +37,32 @@ const SLUG: &str = "qwen3-8b";
 const RANDOM_PLANS: u64 = 30;
 const RANDOM_LONGEST_CHUNK: usize = 8;
 
-/// Cases known to differ from the reference beyond the separator bytes, with the reason.
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
-    (
-        "qwen3-8b/parse/reasoning-with-marker-text",
-        "the reasoning holds a `</think>`; the parser ends the reasoning there, as every marker parser \
-         does, and the reference keeps the marker as reasoning text (bellwether #16)",
-    ),
-    (
-        "qwen3-8b/parse/content-with-marker-in-code-fence",
-        "the content holds a complete `<tool_call>` block inside a code fence; the parser makes a call \
-         of it, as every marker parser does, and the reference keeps it as content (bellwether #16)",
-    ),
+/// A case known to differ from the reference beyond the separator bytes: why, and what the parser
+/// says instead, its call count and finish reason, so that the list allows that difference and no
+/// other.
+struct KnownDifference {
+    id: &'static str,
+    reason: &'static str,
+    calls: usize,
+    finish: &'static str,
+}
+
+const KNOWN_DIFFERENCES: &[KnownDifference] = &[
+    KnownDifference {
+        id: "qwen3-8b/parse/reasoning-with-marker-text",
+        reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every marker \
+                 parser does, and the reference keeps the marker as reasoning text (bellwether #16)",
+        calls: 0,
+        finish: "stop",
+    },
+    KnownDifference {
+        id: "qwen3-8b/parse/content-with-marker-in-code-fence",
+        reason: "the content holds a complete `<tool_call>` block inside a code fence; the parser makes \
+                 a call of it, as every marker parser does, and the reference keeps it as content \
+                 (bellwether #16)",
+        calls: 1,
+        finish: "tool_calls",
+    },
 ];
 
 #[derive(Deserialize)]
@@ -125,11 +142,13 @@ impl Said {
         }
     }
 
-    /// The same, with the separator bytes trimmed from content and reasoning (bellwether #17).
+    /// The same, with the separator bytes trimmed from content and reasoning (bellwether #17). The
+    /// template's separators are newlines, so only newlines are trimmed: any other whitespace the
+    /// parser kept or lost still counts as a difference.
     fn trimmed(&self) -> Self {
         let trim = |part: &Option<String>| {
             part.as_deref()
-                .map(str::trim)
+                .map(|text| text.trim_matches('\n'))
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
         };
@@ -162,15 +181,16 @@ fn qwen3_parse_fixtures_match_the_reference() {
         root.display()
     );
 
-    let known: Vec<&str> = KNOWN_DIFFERENCES.iter().map(|(id, _)| *id).collect();
+    let known = |id: &str| KNOWN_DIFFERENCES.iter().find(|known| known.id == id);
     let mut failures = Vec::new();
     let (mut bitwise, mut separators_only, mut listed) = (0, 0, 0);
     for fixture in &fixtures {
         let text = fixture.reference.text.as_str();
         let expected = Said::of_reference(&fixture.reference);
         let mut saids = Vec::new();
+        let finish = engine_finish(&fixture.reference.finish_reason);
         for plan in plans(text) {
-            let events = replay(text, &plan)
+            let events = replay(text, &plan, &finish)
                 .unwrap_or_else(|e| panic!("{}: plan {plan:?}: {e}", fixture.id));
             let conserved: String = events.iter().map(bytes_of).collect();
             if conserved != text {
@@ -206,7 +226,18 @@ fn qwen3_parse_fixtures_match_the_reference() {
         } else if said.trimmed() == expected.trimmed() {
             separators_only += 1;
             "separators only (bellwether #17)"
-        } else if known.contains(&fixture.id.as_str()) {
+        } else if let Some(listed_case) = known(&fixture.id) {
+            if said.calls.len() != listed_case.calls || said.finish != listed_case.finish {
+                failures.push(format!(
+                    "{}: listed in KNOWN_DIFFERENCES for {} call(s) and `{}`, but the parser says {} \
+                     call(s) and `{}`",
+                    fixture.id,
+                    listed_case.calls,
+                    listed_case.finish,
+                    said.calls.len(),
+                    said.finish
+                ));
+            }
             listed += 1;
             "listed (bellwether #16)"
         } else {
@@ -216,13 +247,24 @@ fn qwen3_parse_fixtures_match_the_reference() {
             ));
             "DIFFERS"
         };
-        if known.contains(&fixture.id.as_str()) && said.trimmed() == expected.trimmed() {
+        if known(&fixture.id).is_some() && said.trimmed() == expected.trimmed() {
             failures.push(format!(
                 "{}: listed in KNOWN_DIFFERENCES but matching the reference now; remove it",
                 fixture.id
             ));
         }
         println!("  {verdict:34} {}", fixture.id);
+        if let Some(listed_case) = known(&fixture.id) {
+            println!("  {:34} {}", "", listed_case.reason);
+        }
+    }
+    for listed_case in KNOWN_DIFFERENCES {
+        if !fixtures.iter().any(|fixture| fixture.id == listed_case.id) {
+            failures.push(format!(
+                "{}: listed in KNOWN_DIFFERENCES but not among the fixtures; remove it",
+                listed_case.id
+            ));
+        }
     }
     println!(
         "{} cases: {bitwise} bitwise, {separators_only} separators only, {listed} listed",
@@ -258,8 +300,17 @@ fn plans(text: &str) -> Vec<Vec<usize>> {
     plans
 }
 
-/// Feed `text` cut at `cuts`, then the end, and return the events.
-fn replay(text: &str, cuts: &[usize]) -> Result<Vec<Event>, ParseError> {
+/// The engine's finish for a reference's finish reason. The adapter turns `stop` after a call into
+/// `tool_calls`, so only a truncation needs its own engine reason.
+fn engine_finish(reference: &str) -> EngineFinish {
+    match reference {
+        "length" => EngineFinish::Length,
+        _ => EngineFinish::Stop,
+    }
+}
+
+/// Feed `text` cut at `cuts`, then the end with the engine's `finish`, and return the events.
+fn replay(text: &str, cuts: &[usize], finish: &EngineFinish) -> Result<Vec<Event>, ParseError> {
     let mut parser = Qwen3::new();
     let mut out = Events::new();
     let mut from = 0;
@@ -278,7 +329,7 @@ fn replay(text: &str, cuts: &[usize]) -> Result<Vec<Event>, ParseError> {
     }
     parser.feed(
         Input::End {
-            finish: EngineFinish::Stop,
+            finish: finish.clone(),
         },
         &mut out,
     )?;
