@@ -29,6 +29,7 @@ pub mod input;
 pub mod json;
 pub mod markers;
 pub mod parser;
+pub mod tagged;
 pub mod tokens;
 
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
