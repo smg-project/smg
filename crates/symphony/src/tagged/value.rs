@@ -11,9 +11,9 @@
 //! - A parameter declared `string` is its text, every byte of it. Nothing is trimmed and nothing is
 //!   decoded: `"exact phrase"` keeps its quotes, indentation and a trailing newline stay, and
 //!   `&amp;` is five characters.
-//! - A parameter declared `integer` is that integer when its text is a sign and digits, however
-//!   many, with the whitespace around it ignored. It may be spelled `+5` or `007`; it is written in
-//!   JSON's spelling.
+//! - A parameter declared `integer` is that integer when its text is a sign and digits, with the
+//!   whitespace around it ignored. It may be spelled `+5` or `007`; it is written in JSON's
+//!   spelling, with the digits the model wrote.
 //! - Everything else is inferred: text that is JSON is that JSON, Python's `True`, `False` and
 //!   `None` are `true`, `false` and `null`, and the rest is a string holding the text exactly.
 //!   That covers a parameter the tool does not declare, a declared integer whose text is not one,
@@ -106,13 +106,16 @@ fn parameters_of(schema: &Value) -> HashMap<String, Kind> {
 pub fn json(text: &str, kind: Option<Kind>) -> String {
     match kind {
         Some(Kind::String) => string(text),
-        Some(Kind::Integer) => integer(text.trim()).unwrap_or_else(|| inferred(text)),
+        Some(Kind::Integer) => integer(text.trim())
+            .filter(|integer| reads_back_as_an_argument(integer))
+            .unwrap_or_else(|| inferred(text)),
         None => inferred(text),
     }
 }
 
 /// `text` as a JSON integer when it is an optional sign and then digits: no sign for `+`, no
-/// leading zeros. The digits are never read as a number, so their count has no limit.
+/// leading zeros. The digits are copied, not read as a number, so none of them is lost; whether
+/// `serde_json` can read that many is for the caller to check.
 fn integer(text: &str) -> Option<String> {
     let (minus, digits) = match text.strip_prefix('-') {
         Some(digits) => ("-", digits),
@@ -342,6 +345,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_declared_integer_with_more_digits_than_can_be_read_back_is_a_string() {
+        let mut longest_kept = 0;
+        for digits in [1, 19, 20, 21, 39, 100, 300, 308, 309, 310, 400, 5000] {
+            let text = "9".repeat(digits);
+            let written = json(&text, Some(Kind::Integer));
+            assert!(
+                read_back(&written).is_some(),
+                "{digits} digits cost the call its arguments"
+            );
+            if written == text {
+                assert!(longest_kept < digits);
+                longest_kept = digits;
+            } else {
+                assert_eq!(written, format!("\"{text}\""), "{digits} digits");
+            }
+        }
+        // Past what a machine integer holds the digits still come through, up to what a float can.
+        assert!((100..400).contains(&longest_kept), "{longest_kept}");
+    }
+
     /// The arguments object with `value` as one of its members, read the way the adapters read it.
     fn read_back(value: &str) -> Option<Value> {
         serde_json::from_str(&format!(r#"{{"p": {value}, "q": 1}}"#)).ok()
@@ -408,11 +432,14 @@ mod tests {
             "{", "}", "[", "]", ":", ",", "a", "é", "\u{1}", "<", "&amp;", SURROGATE,
         ];
         const KINDS: [Option<Kind>; 3] = [None, Some(Kind::String), Some(Kind::Integer)];
+        // More digits than serde_json reads as a number, alone or after other digits.
+        let digits = "9".repeat(400);
+        let pieces = [PIECES.as_slice(), &[digits.as_str()]].concat();
         let mut random = Lcg(7);
         let mut json_but_for_a_surrogate = 0;
         for _ in 0..40_000 {
             let text: String = (0..random.next() % 8)
-                .map(|_| PIECES[random.next() % PIECES.len()])
+                .map(|_| pieces[random.next() % pieces.len()])
                 .collect();
             // The string alone or in an array: JSON by its grammar, which serde_json refuses.
             let trimmed = text.trim();
