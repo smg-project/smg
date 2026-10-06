@@ -8,20 +8,21 @@
 //!
 //! [`Stream`] is the streaming half: it opens, continues and completes output items as the events
 //! arrive and produces the API's stream events, typed here as [`StreamEvent`] because the gateway
-//! builds them as untyped JSON and `openai-protocol` has no type for them. Their items and parts are
-//! the same `ResponseOutputItem` and `ResponseContentPart` the final response carries, so the stream
-//! and the fold share one shape; they serialise as the API's `type`-tagged objects without
+//! builds them as untyped JSON and `openai-protocol` has no type for them. Their items and parts
+//! are the same `ResponseOutputItem` and `ResponseContentPart` the final response carries, so the
+//! stream and the fold share one shape; they serialise as the API's `type`-tagged objects without
 //! `sequence_number`, which the driver adds as it numbers every event of the response, its own
 //! `response.created`, `response.in_progress` and the terminal event included. A `reasoning` item
 //! opens at the first reasoning text and completes when the region ends; the `message` opens at
 //! the first content with substance and stays open to the end, so content after a call continues
 //! it; a `function_call` item opens at `ToolCallStart`, takes its fragments as
 //! `function_call_arguments.delta` and completes at `ToolCallEnd`, so a client can act on a call
-//! while the model goes on. `Finish` completes what is open and hands back the same [`Output`] the
-//! fold would give, items in the order they opened, for the driver's terminal event. For an output
-//! whose reasoning, text and calls come in that order, and for text that continues after a call,
-//! the stream's items are the fold's; only a call before any text puts the call first where the fold
-//! puts the message first.
+//! while the model goes on. `Finish` completes what is open and hands back the response's
+//! [`Output`], items in the order they opened, for the driver's terminal event. When the reasoning
+//! comes first, in one region, and the first content comes before the first call, those items are
+//! the fold's. Otherwise the stream keeps the order the items opened in, where the fold gathers
+//! each kind into one item in OpenAI's order: a call before any content comes first, reasoning
+//! after content follows the message, and a second reasoning region is a second item.
 //!
 //! The items are the ones SMG's gateway builds today from a finished chat message, in OpenAI's
 //! order, so items replayed as the next turn's input rebuild the same turn:
@@ -60,8 +61,9 @@
 //!
 //! Policy this adapter sets, where the events say more than the Responses API can:
 //!
-//! - `ReasoningStart`, `ReasoningEnd`, `ToolCallEnd` and `Dropped` shape nothing; the markers a
-//!   format consumes never reach the client.
+//! - `ReasoningStart` and `Dropped` shape nothing, and `ReasoningEnd` and `ToolCallEnd` only end
+//!   their items (the statuses above, and the stream's `done` events): the markers a format
+//!   consumes never reach the client.
 //! - `Malformed` text is content, as in `chat`: the model wrote it, and the client sees it rather
 //!   than losing it.
 //! - Argument fragments for a call that never started cannot occur under the `Event` contract;
@@ -311,9 +313,10 @@ pub enum Part {
 /// The streaming half: parser events as Responses stream events, items opened and completed as the
 /// events arrive.
 ///
-/// Feed every event in order. `Finish` completes what is open and returns the [`Output`] the fold
-/// would give for the same events, for the driver's terminal event; [`Stream::close`] does the same
-/// for a stream that ends without `Finish`.
+/// One per response, like the parser that feeds it. Feed every event in order. `Finish` completes
+/// what is open and returns the response's [`Output`] for the driver's terminal event, the fold's
+/// when the items opened in OpenAI's order (the module doc says when); [`Stream::close`] does the
+/// same for a stream that ends without `Finish`.
 #[derive(Clone, Debug)]
 pub struct Stream {
     /// The response id the item ids are built from.
@@ -400,40 +403,7 @@ impl Stream {
         }
         let position = match self.reasoning {
             Some(position) => position,
-            None => {
-                let index = self.next_index();
-                let id = if self.reasoning_items == 0 {
-                    format!("rs_{}", self.response_id)
-                } else {
-                    format!("rs_{}_{index}", self.response_id)
-                };
-                self.reasoning_items += 1;
-                out.push(StreamEvent::OutputItemAdded {
-                    output_index: index,
-                    item: ResponseOutputItem::new_reasoning(
-                        id.clone(),
-                        Vec::new(),
-                        Vec::new(),
-                        Some("in_progress".to_string()),
-                    ),
-                });
-                out.push(StreamEvent::ContentPartAdded {
-                    output_index: index,
-                    item_id: id.clone(),
-                    content_index: 0,
-                    part: Part::Reasoning(ResponseReasoningContent::ReasoningText {
-                        text: String::new(),
-                    }),
-                });
-                self.records.push(Record::Reasoning {
-                    index,
-                    id,
-                    text: String::new(),
-                    open: true,
-                });
-                self.reasoning = Some(self.records.len() - 1);
-                self.records.len() - 1
-            }
+            None => self.open_reasoning(out),
         };
         if let Record::Reasoning {
             index,
@@ -450,6 +420,43 @@ impl Stream {
                 delta: text.to_string(),
             });
         }
+    }
+
+    /// Opens a reasoning item and its text part at the next index, and returns its position.
+    fn open_reasoning(&mut self, out: &mut Vec<StreamEvent>) -> usize {
+        let index = self.next_index();
+        let id = if self.reasoning_items == 0 {
+            format!("rs_{}", self.response_id)
+        } else {
+            format!("rs_{}_{index}", self.response_id)
+        };
+        self.reasoning_items += 1;
+        out.push(StreamEvent::OutputItemAdded {
+            output_index: index,
+            item: ResponseOutputItem::new_reasoning(
+                id.clone(),
+                Vec::new(),
+                Vec::new(),
+                Some("in_progress".to_string()),
+            ),
+        });
+        out.push(StreamEvent::ContentPartAdded {
+            output_index: index,
+            item_id: id.clone(),
+            content_index: 0,
+            part: Part::Reasoning(ResponseReasoningContent::ReasoningText {
+                text: String::new(),
+            }),
+        });
+        self.records.push(Record::Reasoning {
+            index,
+            id,
+            text: String::new(),
+            open: true,
+        });
+        let position = self.records.len() - 1;
+        self.reasoning = Some(position);
+        position
     }
 
     /// Completes the open reasoning item, if any, with `status`: `completed` when its region ended,
@@ -495,38 +502,11 @@ impl Stream {
         }
         let position = match self.message {
             Some(position) => position,
-            None => {
-                if text.trim().is_empty() {
-                    self.held.push_str(text);
-                    return;
-                }
-                self.close_reasoning("completed", out);
-                let index = self.next_index();
-                let id = format!("msg_{}", self.response_id);
-                out.push(StreamEvent::OutputItemAdded {
-                    output_index: index,
-                    item: ResponseOutputItem::Message {
-                        id: id.clone(),
-                        role: "assistant".to_string(),
-                        content: Vec::new(),
-                        status: "in_progress".to_string(),
-                        phase: None,
-                    },
-                });
-                out.push(StreamEvent::ContentPartAdded {
-                    output_index: index,
-                    item_id: id.clone(),
-                    content_index: 0,
-                    part: Part::Text(text_part(String::new())),
-                });
-                self.records.push(Record::Message {
-                    index,
-                    id,
-                    text: String::new(),
-                });
-                self.message = Some(self.records.len() - 1);
-                self.records.len() - 1
+            None if text.trim().is_empty() => {
+                self.held.push_str(text);
+                return;
             }
+            None => self.open_message(out),
         };
         let mut delta = mem::take(&mut self.held);
         delta.push_str(text);
@@ -544,6 +524,38 @@ impl Stream {
                 delta,
             });
         }
+    }
+
+    /// Opens the message and its text part at the next index, completing an open reasoning item
+    /// first, and returns its position.
+    fn open_message(&mut self, out: &mut Vec<StreamEvent>) -> usize {
+        self.close_reasoning("completed", out);
+        let index = self.next_index();
+        let id = format!("msg_{}", self.response_id);
+        out.push(StreamEvent::OutputItemAdded {
+            output_index: index,
+            item: ResponseOutputItem::Message {
+                id: id.clone(),
+                role: "assistant".to_string(),
+                content: Vec::new(),
+                status: "in_progress".to_string(),
+                phase: None,
+            },
+        });
+        out.push(StreamEvent::ContentPartAdded {
+            output_index: index,
+            item_id: id.clone(),
+            content_index: 0,
+            part: Part::Text(text_part(String::new())),
+        });
+        self.records.push(Record::Message {
+            index,
+            id,
+            text: String::new(),
+        });
+        let position = self.records.len() - 1;
+        self.message = Some(position);
+        position
     }
 
     /// Opens a call's item.
@@ -613,6 +625,31 @@ impl Stream {
         }
     }
 
+    /// Completes the message, if it opened, with `status`: text done, part done, then the item.
+    fn complete_message(&mut self, status: &str, out: &mut Vec<StreamEvent>) {
+        let Some(position) = self.message.take() else {
+            return;
+        };
+        if let Record::Message { index, id, text } = &self.records[position] {
+            out.push(StreamEvent::OutputTextDone {
+                output_index: *index,
+                item_id: id.clone(),
+                content_index: 0,
+                text: text.clone(),
+            });
+            out.push(StreamEvent::ContentPartDone {
+                output_index: *index,
+                item_id: id.clone(),
+                content_index: 0,
+                part: Part::Text(text_part(text.clone())),
+            });
+            out.push(StreamEvent::OutputItemDone {
+                output_index: *index,
+                item: message_item(id.clone(), text.clone(), status),
+            });
+        }
+    }
+
     /// Completes every open item under the engine's reason and returns the response's output,
     /// each item with the status it reached: what the end closes is `in_progress` when the response
     /// did not finish or the engine failed, what ended on its own keeps its status.
@@ -641,26 +678,7 @@ impl Stream {
                 self.complete_call(position, open_status, out);
             }
         }
-        if let Some(position) = self.message.take() {
-            if let Record::Message { index, id, text } = &self.records[position] {
-                out.push(StreamEvent::OutputTextDone {
-                    output_index: *index,
-                    item_id: id.clone(),
-                    content_index: 0,
-                    text: text.clone(),
-                });
-                out.push(StreamEvent::ContentPartDone {
-                    output_index: *index,
-                    item_id: id.clone(),
-                    content_index: 0,
-                    part: Part::Text(text_part(text.clone())),
-                });
-                out.push(StreamEvent::OutputItemDone {
-                    output_index: *index,
-                    item: message_item(id.clone(), text.clone(), open_status),
-                });
-            }
-        }
+        self.complete_message(open_status, out);
         self.held.clear();
         Output {
             items,
@@ -1383,6 +1401,17 @@ mod tests {
             .map(|item| item["id"].as_str().expect("an id").to_string())
             .collect();
         assert_eq!(ids, ["rs_r", "msg_r", "rs_r_2"]);
+        let folded: Vec<String> = wire(&output("r", &events).items)
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|item| item["id"].as_str().expect("an id").to_string())
+            .collect();
+        assert_eq!(
+            folded,
+            ["rs_r", "msg_r"],
+            "the fold gathers both regions into one reasoning item"
+        );
     }
 
     #[test]
