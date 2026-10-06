@@ -6,19 +6,27 @@
 //! back from the parameters the tool declares: [`Declared`] holds those types for one request, and
 //! [`json`] turns one value's text into the JSON a client receives for it.
 //!
+//! The text [`json`] takes is the value's own: the template writes one newline after the opening
+//! tag and one before the closing tag, and the caller has removed exactly those two, as vLLM's
+//! parsers do. Every other byte is the value's.
+//!
 //! The rules, in the order [`json`] applies them:
 //!
 //! - A parameter declared `string` is its text, every byte of it. Nothing is trimmed and nothing is
 //!   decoded: `"exact phrase"` keeps its quotes, indentation and a trailing newline stay, and
-//!   `&amp;` is five characters.
+//!   `&amp;` is five characters. A parameter is declared `string` when its schema admits that
+//!   type at all: `"type": "string"`, a list of types or an `anyOf` that includes it, or an `enum`
+//!   of strings. When the same schema admits `null`, the text `null`, and the `None` a template
+//!   writes for a null argument, are null; any other text is the string.
 //! - A parameter declared `integer` is that integer when its text is a sign and digits, with the
 //!   whitespace around it ignored. It may be spelled `+5` or `007`; it is written in JSON's
 //!   spelling, with the digits the model wrote.
 //! - Everything else is inferred: text that is JSON is that JSON, Python's `True`, `False` and
 //!   `None` are `true`, `false` and `null`, and the rest is a string holding the text exactly.
 //!   That covers a parameter the tool does not declare, a declared integer whose text is not one,
-//!   and every other declared type: a `number`, `boolean`, `array` or `object` is written by the
-//!   templates as JSON, which is what inference reads, so declaring one changes nothing.
+//!   and every other declared type. The templates write an array or object as JSON and a boolean
+//!   or null as Python's `True`, `False` and `None`, which is what inference reads, so declaring a
+//!   `number`, `boolean`, `array` or `object` changes nothing.
 //!
 //! A value read as JSON keeps the model's own bytes: `[1, 2.5]` stays spaced as written, and
 //! `9007199254740993` keeps every digit. JSON here means what `serde_json` reads into a value from
@@ -45,23 +53,56 @@ use std::collections::HashMap;
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
-/// The type a tool declares for one parameter, of the two types that change how its text is read.
+/// The type a tool declares for one parameter, of the types that change how its text is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// `"type": "string"`.
+    /// A schema that admits `string`: the text is the string.
     String,
-    /// `"type": "integer"`.
+    /// A schema that admits `string` and `null`: `null` or `None` is null, any other text the
+    /// string.
+    NullableString,
+    /// A schema that admits `integer` and nothing else.
     Integer,
 }
 
 impl Kind {
-    /// The kind a parameter's schema declares, when its `type` is `string` or `integer`. Any other
-    /// name, a list of types and a missing `type` declare nothing here.
+    /// The kind a parameter's schema declares. A schema that admits a string declares a string,
+    /// nullable when it admits `null` too; one that admits an integer alone declares an integer;
+    /// any other schema declares nothing here.
     fn of(schema: &Value) -> Option<Self> {
-        match schema.get("type")?.as_str()? {
-            "string" => Some(Self::String),
-            "integer" => Some(Self::Integer),
-            _ => None,
+        let mut admitted = Vec::new();
+        admitted_types(schema, &mut admitted);
+        if admitted.contains(&"string") {
+            Some(if admitted.contains(&"null") {
+                Self::NullableString
+            } else {
+                Self::String
+            })
+        } else if admitted == ["integer"] {
+            Some(Self::Integer)
+        } else {
+            None
+        }
+    }
+}
+
+/// The type names `schema` admits: its `type`, as one name or a list; the types of its `anyOf` or
+/// `oneOf` members; and `string` for an `enum` whose values are all strings.
+fn admitted_types<'a>(schema: &'a Value, into: &mut Vec<&'a str>) {
+    match schema.get("type") {
+        Some(Value::String(name)) => into.push(name),
+        Some(Value::Array(names)) => into.extend(names.iter().filter_map(Value::as_str)),
+        _ => {}
+    }
+    for key in ["anyOf", "oneOf"] {
+        let members = schema.get(key).and_then(Value::as_array);
+        for member in members.into_iter().flatten() {
+            admitted_types(member, into);
+        }
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        if !values.is_empty() && values.iter().all(Value::is_string) {
+            into.push("string");
         }
     }
 }
@@ -103,9 +144,17 @@ fn parameters_of(schema: &Value) -> HashMap<String, Kind> {
 
 /// The JSON for one parameter's `text`, read as `kind` when the tool declares one. The result is
 /// always one JSON value that `serde_json` reads back.
+///
+/// `text` is the value's own text. The caller has removed the one newline the template writes
+/// after the opening tag and the one it writes before the closing tag, and nothing else: a
+/// declared string keeps every byte it is given.
 pub fn json(text: &str, kind: Option<Kind>) -> String {
     match kind {
         Some(Kind::String) => string(text),
+        Some(Kind::NullableString) => match text {
+            "null" | "None" => "null".to_string(),
+            _ => string(text),
+        },
         Some(Kind::Integer) => integer(text.trim())
             .filter(|integer| reads_back_as_an_argument(integer))
             .unwrap_or_else(|| inferred(text)),
@@ -195,22 +244,73 @@ mod tests {
     }
 
     #[test]
-    fn only_a_single_string_or_integer_type_declares_a_kind() {
+    fn a_schema_that_admits_a_string_declares_one_nullable_when_it_admits_null_too() {
         let declared = Declared::of(&[tool(
             "f",
             value!({
+                "plain": {"type": "string"},
+                "listed": {"type": ["string", "null"]},
+                // What Pydantic writes for `Optional[str]`.
+                "optional": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "either": {"oneOf": [{"type": "null"}, {"type": "string"}]},
+                "choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                "named": {"enum": ["celsius", "fahrenheit"]},
+                "named_or_null": {"enum": ["celsius", "fahrenheit"], "type": ["string", "null"]},
+                "nested": {"anyOf": [{"anyOf": [{"type": "string"}]}, {"type": "null"}]},
+            }),
+        )]);
+        for (parameter, kind) in [
+            ("plain", Kind::String),
+            ("listed", Kind::NullableString),
+            ("optional", Kind::NullableString),
+            ("either", Kind::NullableString),
+            ("choice", Kind::String),
+            ("named", Kind::String),
+            ("named_or_null", Kind::NullableString),
+            ("nested", Kind::NullableString),
+        ] {
+            assert_eq!(declared.kind("f", parameter), Some(kind), "{parameter}");
+        }
+    }
+
+    #[test]
+    fn an_integer_is_declared_alone_and_every_other_schema_declares_nothing() {
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                "count": {"type": "integer"},
                 "ratio": {"type": "number"},
                 "on": {"type": "boolean"},
                 "points": {"type": "array"},
                 "style": {"type": "object"},
                 "nothing": {"type": "null"},
-                "nullable": {"type": ["string", "null"]},
+                "optional_count": {"type": ["integer", "null"]},
                 "untyped": {"description": "anything"},
-                "choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                "mixed": {"enum": [1, "two"]},
+                "empty": {"enum": []},
+                // Aliases and other spellings of a type name are not read today; vLLM reads
+                // these as string and integer. Whether Symphony follows is Simo's decision.
+                "alias": {"type": "str"},
+                "cased": {"type": "String"},
+                "padded": {"type": " integer "},
+                "width": {"type": "int32"},
             }),
         )]);
+        assert_eq!(declared.kind("f", "count"), Some(Kind::Integer));
         for parameter in [
-            "ratio", "on", "points", "style", "nothing", "nullable", "untyped", "choice",
+            "ratio",
+            "on",
+            "points",
+            "style",
+            "nothing",
+            "optional_count",
+            "untyped",
+            "mixed",
+            "empty",
+            "alias",
+            "cased",
+            "padded",
+            "width",
         ] {
             assert_eq!(declared.kind("f", parameter), None, "{parameter}");
         }
@@ -261,11 +361,30 @@ mod tests {
     }
 
     #[test]
+    fn a_nullable_string_is_null_for_null_or_none_and_otherwise_its_text() {
+        for (text, expected) in [
+            ("null", "null"),
+            ("None", "null"),
+            ("Paris", r#""Paris""#),
+            ("12345", r#""12345""#),
+            ("true", r#""true""#),
+            ("", r#""""#),
+            // Only the bare words: the value's own text is kept as it is.
+            (" null", r#"" null""#),
+            ("NULL", r#""NULL""#),
+            ("none", r#""none""#),
+            (r#""null""#, r#""\"null\"""#),
+        ] {
+            assert_eq!(json(text, Some(Kind::NullableString)), expected, "{text:?}");
+        }
+    }
+
+    #[test]
     fn a_declared_integer_is_a_number_when_its_text_is_one() {
         for (text, expected) in [
             ("5", "5"),
             ("-3", "-3"),
-            ("\n150\n", "150"),
+            (" 150 ", "150"),
             ("+5", "5"),
             ("007", "7"),
             ("-007", "-7"),
@@ -318,7 +437,7 @@ mod tests {
             // A string keeps the whitespace the old parser trimmed; JSON does not need it.
             ("  spaces  ", r#""  spaces  ""#),
             (" 42 ", "42"),
-            ("\n[60,30]\n", "[60,30]"),
+            (" [60,30] ", "[60,30]"),
             ("", r#""""#),
             // Text that looks like JSON and is not one value: a string.
             ("[1, 2", r#""[1, 2""#),
@@ -379,6 +498,10 @@ mod tests {
         assert!(read_back(&json(surrogate, None)).is_some());
         // Two values are not one, whatever brackets around them would read as.
         assert_eq!(json("1, 2", None), r#""1, 2""#);
+        // A number past what a float holds is JSON by its grammar and not a value serde_json
+        // reads; it stays a string, and would stop being one if `arbitrary_precision` were on.
+        assert_eq!(json("1e400", None), r#""1e400""#);
+        assert!(read_back(&json("1e400", None)).is_some());
     }
 
     #[test]
@@ -431,7 +554,12 @@ mod tests {
             "", " ", "\n", "0", "-", "+", "1.5", "e9", "true", "True", "None", "null", "\"", "\\",
             "{", "}", "[", "]", ":", ",", "a", "é", "\u{1}", "<", "&amp;", SURROGATE,
         ];
-        const KINDS: [Option<Kind>; 3] = [None, Some(Kind::String), Some(Kind::Integer)];
+        const KINDS: [Option<Kind>; 4] = [
+            None,
+            Some(Kind::String),
+            Some(Kind::NullableString),
+            Some(Kind::Integer),
+        ];
         // More digits than serde_json reads as a number, alone or after other digits.
         let digits = "9".repeat(400);
         let pieces = [PIECES.as_slice(), &[digits.as_str()]].concat();
@@ -449,7 +577,9 @@ mod tests {
                 let written = json(&text, kind);
                 let parsed: Result<Value, _> = serde_json::from_str(&written);
                 assert!(parsed.is_ok(), "{kind:?} {text:?} gave {written:?}");
-                if kind == Some(Kind::String) {
+                if kind == Some(Kind::String)
+                    || (kind == Some(Kind::NullableString) && text != "null" && text != "None")
+                {
                     assert_eq!(parsed.ok(), Some(Value::String(text.clone())), "{text:?}");
                 }
             }

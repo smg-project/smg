@@ -11,4 +11,4 @@
 
 pub mod value;
 
-pub use value::{Declared, Kind};
+pub use value::{json, Declared, Kind};
