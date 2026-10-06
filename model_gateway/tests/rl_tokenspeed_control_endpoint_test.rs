@@ -558,12 +558,19 @@ async fn single_prompt_generate_answers_with_an_object_like_sglang() {
     assert_eq!(body["meta_info"]["weight_version"], ENGINE_VERSION);
 }
 
-/// slime never sends `model` on `/generate`; when the fleet serves exactly
-/// one model (as this fixture does), the gRPC router defaults the wildcard
-/// placeholder to it instead of 404ing.
+/// slime never sends `model` on `/generate`; when the gateway serves exactly
+/// one model, the gRPC router defaults the wildcard placeholder to it
+/// instead of 404ing. The mixed fleet serves two (the HTTP mock registers
+/// under its own model id), so this case builds a one-model context.
 #[tokio::test]
 async fn model_less_generate_defaults_to_the_single_served_model() {
-    let f = fleet(18933, 18934).await;
+    let ctx = grpc_rl_context().await;
+    register_directly(&ctx, start_mock_grpc_engine(BTreeMap::new()).await, true);
+    let router: Arc<dyn RouterTrait> = Arc::from(
+        RouterFactory::create_router(&ctx)
+            .await
+            .expect("gRPC RL router should build"),
+    );
     let request: GenerateRequest = serde_json::from_value(json!({
         "input_ids": [1, 2, 3],
         "sampling_params": {"max_new_tokens": 3},
@@ -571,8 +578,7 @@ async fn model_less_generate_defaults_to_the_single_served_model() {
     .unwrap();
     assert_eq!(request.model, UNKNOWN_MODEL_ID, "no `model` in the body");
 
-    let resp = f
-        .router
+    let resp = router
         .route_generate(None, &tenant(), request, UNKNOWN_MODEL_ID)
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
