@@ -139,14 +139,14 @@ impl Assembler {
     /// No more bytes will come, and the object never closed. A call that started is closed with
     /// what arrived, the bytes after its arguments value returned as `Malformed`; an object that
     /// never named its call comes back as `Malformed` whole. Either way no byte is lost.
-    pub fn finish(mut self, out: &mut Events) {
+    pub fn finish(self, out: &mut Events) {
         if self.done {
             return;
         }
         let found = outline(&self.text);
         if self.started {
-            self.emit_new_argument_bytes(found.arguments.as_ref(), out);
-            // The object never closed, so what follows the arguments value is the tail of an
+            // `feed` has emitted every argument byte that arrived, as fragments or as malformed
+            // text. The object never closed, so what follows the arguments value is the tail of an
             // unterminated region: a comma cut short, a complete member, or bytes that are no
             // member at all. A closed object's tail is the source of its `ToolCallEnd` instead.
             let tail_start = found
