@@ -6,8 +6,9 @@
 //! between markers is; inside a call region the [`Assembler`] turns the object into the call's
 //! events, streaming the model's own argument bytes. Every byte of the output lands in exactly one
 //! event: the markers as `Dropped { Wrapper }`, the whitespace between a call's object and its
-//! closing marker as `Dropped { Wrapper }` too, and the rest as content, reasoning, or the call's
-//! events.
+//! closing marker as `Dropped { Wrapper }` too, any other text there as `Malformed`, run by run so
+//! that where the chunks were cut changes nothing, and the rest as content, reasoning, or the
+//! call's events.
 //!
 //! What this format decides, and what it leaves open:
 //!
@@ -17,10 +18,13 @@
 //!   two after `</think>`, and so on are reasoning or content, not dropped. Whether they should be
 //!   is bellwether #17; `Dropped { Whitespace }` exists for the other answer.
 //! - A closing marker with nothing open (`</think>` in content) is content, as the model wrote it.
-//!   A marker inside a code fence is a marker, as for every parser that reads markers; bellwether
-//!   #16 is where that policy is judged.
+//!   A marker inside a code fence, or inside a string in a call's arguments, is a marker, as for
+//!   every parser that reads markers: `</tool_call>` in an argument's text ends the call there.
+//!   Bellwether #16 is where that policy is judged.
 //! - A `<tool_call>` that never closes is finished at the end of the stream: a call with what
-//!   arrived, or the bytes as `Malformed { UnterminatedRegion }`.
+//!   arrived, or the bytes as `Malformed { UnterminatedRegion }`. A block whose closing marker comes
+//!   before a complete call gives what is left as `Malformed` with a reason that says so, since
+//!   `UnterminatedRegion` means the stream ended inside the region.
 //! - Call ids are `call_<index>` for now; the id scheme is Simo's decision (deterministic or carrying
 //!   the conversation's history) and changes only this one line.
 //! - Text is `Text::uncounted`: token attribution from the input spans comes with the engine work;
@@ -43,6 +47,15 @@ const THINK_CLOSE: usize = 1;
 const CALL_OPEN: usize = 2;
 const CALL_CLOSE: usize = 3;
 const MARKERS: [&str; 4] = ["<think>", "</think>", "<tool_call>", "</tool_call>"];
+const BLOCK_WITHOUT_A_COMPLETE_CALL: &str = "a tool-call block that closed without a complete call";
+const TEXT_AFTER_THE_OBJECT: &str = "text between a call's object and its closing marker";
+
+/// Why a call region closed: its closing marker (or the next opener) arrived, or the stream ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Closed {
+    ByMarker,
+    ByEnd,
+}
 
 /// The Qwen3 format as a parser. One per generated choice.
 #[derive(Debug)]
@@ -97,24 +110,35 @@ impl Qwen3 {
             Region::Reasoning => out.push_reasoning(Text::uncounted(text)),
             Region::Call(assembler) => {
                 let taken = assembler.feed(text, out);
-                let surplus = &text[taken..];
-                if surplus.is_empty() {
-                    return;
-                }
-                if surplus.trim().is_empty() {
-                    out.push(Event::Dropped {
-                        text: Text::uncounted(surplus),
-                        why: DropReason::Wrapper,
-                    });
-                } else {
-                    out.push(Event::Malformed {
-                        text: Text::uncounted(surplus),
-                        why: MalformedReason::Other(
-                            "text between a call's object and its closing marker".to_string(),
-                        ),
-                    });
-                }
+                Self::surplus(&text[taken..], out);
             }
+        }
+    }
+
+    /// Text after a call's object and before its closing marker: each run of whitespace is the
+    /// template's wrapping and is dropped, each run of anything else is malformed. Classifying run
+    /// by run keeps the result the same wherever the chunks were cut.
+    fn surplus(surplus: &str, out: &mut Events) {
+        let mut rest = surplus;
+        while let Some(first) = rest.chars().next() {
+            let space = first.is_whitespace();
+            let length = rest
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace() != space)
+                .map_or(rest.len(), |(at, _)| at);
+            let run = Text::uncounted(&rest[..length]);
+            out.push(if space {
+                Event::Dropped {
+                    text: run,
+                    why: DropReason::Wrapper,
+                }
+            } else {
+                Event::Malformed {
+                    text: run,
+                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
+                }
+            });
+            rest = &rest[length..];
         }
     }
 
@@ -138,12 +162,12 @@ impl Qwen3 {
             (Region::Call(_), CALL_CLOSE) => {
                 // The call's remaining events come before the marker that closed it, so the events'
                 // bytes stay in the output's order.
-                self.close_call(out);
+                self.close_call(Closed::ByMarker, out);
                 Self::drop_marker(marker, out);
             }
             (Region::Call(_), CALL_OPEN) => {
                 // A new call before the previous one closed: finish what arrived, then start.
-                self.close_call(out);
+                self.close_call(Closed::ByMarker, out);
                 Self::drop_marker(marker, out);
                 self.open_call();
             }
@@ -162,12 +186,28 @@ impl Qwen3 {
         self.region = Region::Call(Assembler::new(index, format!("call_{index}")));
     }
 
-    fn close_call(&mut self, out: &mut Events) {
+    /// Ends the call region: the assembler closes what arrived. A region its marker closed reports
+    /// leftover bytes as a block without a complete call; `UnterminatedRegion` is kept for a region
+    /// the end of the stream cut.
+    fn close_call(&mut self, closed: Closed, out: &mut Events) {
         if let Region::Call(assembler) = std::mem::replace(&mut self.region, Region::Content) {
             if assembler.started() {
                 self.calls += 1;
             }
-            assembler.finish(out);
+            let mut finished = Events::new();
+            assembler.finish(&mut finished);
+            for event in finished.drain() {
+                out.push(match event {
+                    Event::Malformed {
+                        text,
+                        why: MalformedReason::UnterminatedRegion,
+                    } if closed == Closed::ByMarker => Event::Malformed {
+                        text,
+                        why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
+                    },
+                    event => event,
+                });
+            }
         }
     }
 
@@ -188,7 +228,7 @@ impl Qwen3 {
                 out.push(Event::ReasoningEnd);
                 self.region = Region::Content;
             }
-            Region::Call(_) => self.close_call(out),
+            Region::Call(_) => self.close_call(Closed::ByEnd, out),
             Region::Content => {}
         }
         let reason = match finish {
@@ -506,6 +546,44 @@ mod tests {
     }
 
     #[test]
+    fn text_after_a_calls_object_is_classified_run_by_run_whatever_the_chunking() {
+        let output = "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n x\n</tool_call>";
+        let whole = run(&[output], EngineFinish::Stop);
+        let surplus: Vec<&Event> = whole
+            .iter()
+            .filter(|e| matches!(e, Event::Dropped { .. } | Event::Malformed { .. }))
+            .collect();
+        assert_eq!(
+            surplus,
+            [
+                &dropped("<tool_call>"),
+                &dropped("\n "),
+                &Event::Malformed {
+                    text: Text::uncounted("x"),
+                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
+                },
+                &dropped("\n"),
+                &dropped("</tool_call>"),
+            ]
+        );
+        let per_byte: Vec<String> = output.chars().map(String::from).collect();
+        let per_byte: Vec<&str> = per_byte.iter().map(String::as_str).collect();
+        let pieces = run(&per_byte, EngineFinish::Stop);
+        let texts = |events: &[Event], dropped: bool| -> String {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Dropped { text, .. } if dropped => Some(text.text.as_str()),
+                    Event::Malformed { text, .. } if !dropped => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(texts(&pieces, true), texts(&whole, true));
+        assert_eq!(texts(&pieces, false), texts(&whole, false));
+    }
+
+    #[test]
     fn a_cut_short_call_keeps_its_events_in_the_outputs_order() {
         let output = "<tool_call>\n{\"name\": \"f\", \"arguments\": {},</tool_call>";
         let events = run(&[output], EngineFinish::Stop);
@@ -526,7 +604,7 @@ mod tests {
                 },
                 Event::Malformed {
                     text: Text::uncounted(","),
-                    why: MalformedReason::UnterminatedRegion,
+                    why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
                 },
                 Event::ToolCallEnd {
                     index: 0,
@@ -551,8 +629,9 @@ mod tests {
             events[1],
             Event::Malformed {
                 text: Text::uncounted("junk"),
-                why: MalformedReason::UnterminatedRegion,
-            }
+                why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
+            },
+            "the block closed at its marker, so the stream did not end inside it"
         );
         let starts: Vec<(u32, String)> = events
             .iter()
