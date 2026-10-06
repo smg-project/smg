@@ -308,6 +308,7 @@ mod tests {
             output_tokens: 4,
             realistic: false,
             engine: EngineParams::default(),
+            replay: Default::default(),
         }
     }
 

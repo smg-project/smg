@@ -20,6 +20,7 @@ use ts::{
 use crate::{
     config::Config,
     engine::{self, Engine, NewRequest},
+    replay::Capture,
 };
 
 /// Serve the mock TokenSpeed gRPC service on `port` until the process exits.
@@ -45,9 +46,26 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
 /// port 0 and read it back instead of picking one and binding it later.
 pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
     let addr = listener.local_addr().ok();
+    let capture = match &cfg.replay.capture {
+        Some(path) => match Capture::open(path) {
+            Ok(capture) => Some(Arc::new(capture)),
+            Err(e) => {
+                tracing::error!(
+                    "grpc worker {addr:?} cannot open capture file {}: {e}",
+                    path.display()
+                );
+                return;
+            }
+        },
+        None => None,
+    };
     // One simulated engine per listener (i.e. per virtual worker).
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
-    let service = MockScheduler { cfg, engine };
+    let service = MockScheduler {
+        cfg,
+        engine,
+        capture,
+    };
     if let Err(e) = Server::builder()
         .add_service(TokenSpeedSchedulerServer::new(service))
         .serve_with_incoming(TcpListenerStream::new(listener))
@@ -62,6 +80,8 @@ struct MockScheduler {
     cfg: Arc<Config>,
     /// Present iff the worker runs the realistic engine simulator.
     engine: Option<Engine>,
+    /// Present iff `--capture` is set: every `Generate` request is recorded.
+    capture: Option<Arc<Capture>>,
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -79,9 +99,18 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        let req = request.into_inner();
+        // Record before anything else: the line is in the file before the
+        // stream is returned, so before the gateway can read any frame.
+        if let Some(capture) = &self.capture {
+            if let Err(e) = capture.record(&req) {
+                tracing::error!("capturing request {} failed: {e}", req.request_id);
+                return Err(Status::internal(format!("mock-worker capture failed: {e}")));
+            }
+        }
+
         // Realistic mode: submit to the engine simulator and stream its output.
         if let Some(engine) = &self.engine {
-            let req = request.into_inner();
             let request_id = req.request_id;
             let prompt_token_ids = req.tokenized.map(|t| t.input_ids).unwrap_or_default();
             // Omitted limit falls back to the worker default, matching the HTTP
@@ -107,7 +136,7 @@ impl TokenSpeedScheduler for MockScheduler {
         }
 
         // Canned mode: a single up-front delay, then synthetic token ids.
-        let request_id = request.into_inner().request_id;
+        let request_id = req.request_id;
         if !self.cfg.gen_delay.is_zero() {
             tokio::time::sleep(self.cfg.gen_delay).await;
         }

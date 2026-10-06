@@ -8,7 +8,7 @@
 
 use std::{process::ExitCode, sync::Arc};
 
-use mock_worker::{config::Config, grpc, http, zmq};
+use mock_worker::{config::Config, grpc, http, replay::Capture, zmq};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -23,6 +23,19 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // A capture file that cannot be opened is a config error. Each gRPC worker
+    // opens it again, and one that cannot would stop while the process kept
+    // running, so check it once before any worker starts.
+    if let Some(path) = &cfg.replay.capture {
+        if let Err(e) = Capture::open(path) {
+            eprintln!(
+                "mock-worker: cannot open capture file {}: {e}",
+                path.display()
+            );
+            return ExitCode::from(2);
+        }
+    }
 
     tracing::info!(
         "mock-worker: {} http from :{}, {} grpc from :{}, model={}",

@@ -132,6 +132,7 @@ async fn scripted_stream(
         output_tokens: 0,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        replay: Default::default(),
     });
     let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
     let client = VllmEngineClient::connect(&format!("http://127.0.0.1:{port}"))

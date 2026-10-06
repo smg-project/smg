@@ -1,6 +1,6 @@
 //! Runtime configuration for the mock worker fleet, parsed from CLI flags.
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use crate::engine::EngineParams;
 
@@ -38,11 +38,29 @@ pub struct Config {
     pub realistic: bool,
     /// Engine-simulator parameters (only used when `realistic`).
     pub engine: EngineParams,
+    /// Settings for replay testing (gRPC workers only).
+    pub replay: ReplayConfig,
+}
+
+/// Settings for replaying recorded requests through the gateway against
+/// this mock. Kept in one struct so that adding a replay flag does not
+/// touch every `Config` literal.
+#[derive(Debug, Clone, Default)]
+pub struct ReplayConfig {
+    /// `--capture PATH`: append every gRPC `Generate` request to `PATH`,
+    /// one JSON object per line.
+    pub capture: Option<PathBuf>,
 }
 
 impl Config {
     /// Parse the configuration from `std::env::args`, falling back to defaults.
     pub fn from_args() -> Result<Self, String> {
+        Self::parse(std::env::args().skip(1))
+    }
+
+    /// Parse the configuration from command-line flags, without the program
+    /// name.
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut cfg = Self {
             host: "127.0.0.1".to_string(),
             http_base_port: 9000,
@@ -58,9 +76,10 @@ impl Config {
             output_tokens: 8,
             realistic: false,
             engine: EngineParams::default(),
+            replay: ReplayConfig::default(),
         };
 
-        let mut args = std::env::args().skip(1);
+        let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--host" => cfg.host = value(&mut args, &flag)?,
@@ -79,6 +98,7 @@ impl Config {
                     cfg.gen_delay = Duration::from_millis(parse(value(&mut args, &flag)?, &flag)?);
                 }
                 "--output-tokens" => cfg.output_tokens = parse(value(&mut args, &flag)?, &flag)?,
+                "--capture" => cfg.replay.capture = Some(value(&mut args, &flag)?.into()),
                 "--engine" => {
                     cfg.realistic = match value(&mut args, &flag)?.as_str() {
                         "realistic" => true,
@@ -158,6 +178,7 @@ fn usage() -> String {
        --tokenizer <path>       tokenizer path for gRPC autoload (default = model)\n\
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
+       --capture <path>         append each gRPC Generate request to <path> as a JSON line\n\
      \n\
      Realistic engine simulator (continuous batching; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\
@@ -170,4 +191,27 @@ fn usage() -> String {
        --block-size <n>         cache block/page size in tokens (default 16)\n\
        --prefix-cache <bool>    enable prefix caching + KV events (default true)"
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(flags: &[&str]) -> Result<Config, String> {
+        Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    #[test]
+    fn capture_flag_sets_the_capture_path() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let cfg = parse(&grpc).expect("gRPC flags parse");
+        assert_eq!(cfg.replay.capture, None, "capture is off by default");
+
+        let cfg = parse(&[&grpc[..], &["--capture", "/tmp/generate.jsonl"]].concat())
+            .expect("--capture parses");
+        assert_eq!(
+            cfg.replay.capture,
+            Some(PathBuf::from("/tmp/generate.jsonl"))
+        );
+    }
 }

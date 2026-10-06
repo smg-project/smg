@@ -80,6 +80,40 @@ label, e.g. `"labels":{"tokenizer_path":"gpt2"}`, and a `"kv_block_size":16`, an
 do **not** pass `--disable-tokenizer-autoload`. (HTTP workers need no tokenizer
 but cannot drive event-driven `cache_aware`, which requires token ids.)
 
+## Capturing requests
+
+`--capture PATH` appends every gRPC `Generate` request a worker receives to
+`PATH`, one JSON object per line, so a test can check exactly what the gateway
+put on the wire. Responses are unchanged, in canned and realistic mode alike.
+HTTP and ZMQ workers do not capture.
+
+```bash
+cargo run --release -p mock-worker -- \
+  --grpc-base-port 19000 --grpc-count 1 --model mock-model --capture generate.jsonl
+```
+
+Keys are the field names in
+[`tokenspeed_scheduler.proto`](../grpc_client/proto/tokenspeed_scheduler.proto):
+
+- `request_id`, `input_ids`, `original_text` and `stream`. The gateway sends a
+  client `rid` as `request_id` (with a suffix under PD), so lines join to
+  responses on it.
+- Every `SamplingParams` scalar, and `logit_bias` as an object. An optional the
+  gateway left unset is `null`. A float is the shortest decimal that reads back
+  as the same `f32`, so a request's `0.7` shows as `0.7`; NaN and infinities,
+  which JSON cannot hold, are strings such as `"NaN"`.
+- `constraint`: `{"kind": "regex" | "json_schema" | "ebnf_grammar" |
+  "structural_tag", "value": <the string as sent>}`, or `null`.
+- `return_logprob`, `logprob_start_len`, `top_logprobs_num` and
+  `token_ids_logprob`.
+- `has_custom_params`, `has_mm_inputs`, `has_encode_bootstrap_info`,
+  `has_kv_bootstrap_info` and `has_data_parallel_rank`: those fields are
+  recorded only as present or absent.
+
+Each line is in the file before the worker sends the first frame of its
+response, so killing the worker loses no line. A capture path that cannot be
+opened fails at startup with exit code 2, before any worker starts.
+
 ## Scale-test rig (gateway CPU)
 
 `scripts/scale_test.sh` launches an IGW gateway, starts a canned mock fleet,
