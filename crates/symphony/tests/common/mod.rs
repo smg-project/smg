@@ -1,7 +1,7 @@
 //! Shared by the integration tests: the ways an output is cut into deltas.
 
-/// The cut offsets to replay `text` with: whole, every two-way split, byte by byte, and thirty seeded
-/// plans of one to eight characters; every cut on a character boundary.
+/// The cut offsets to replay `text` with: whole, every two-way split, byte by byte, and thirty
+/// seeded plans of one to eight characters; every cut on a character boundary.
 pub fn chunkings(text: &str) -> Vec<Vec<usize>> {
     let chars: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
     let mut plans = vec![vec![]];
