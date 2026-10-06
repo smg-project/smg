@@ -13,11 +13,11 @@
 //! `thinking` block opens at the first reasoning text and closes when the region ends; a `text`
 //! block opens at the first content; a `tool_use` block opens at `ToolCallStart` with an empty
 //! `input` and closes at `ToolCallEnd`; a block closes when text of another kind arrives.
-//! Whitespace-only text that arrives with no text block open is held: it leads the block when text
-//! with substance follows, and is let go when another block starts or the stream ends, as the fold
-//! leaves whitespace-only content out; the template's separators between blocks open no block of
-//! their own. `Finish` closes the open block and hands the stop reason back for the driver's `message_delta`, which
-//! also carries the usage and the stop sequence the events do not have; `message_start`, `ping` and
+//! Whitespace-only text that arrives with no text block open is held: it leads the text block when
+//! text with substance follows, and is let go when a block of another kind starts or the stream
+//! ends, so the template's separators between blocks open no block of their own. `Finish` closes
+//! the open block and hands the stop reason back for the driver's `message_delta`, which also
+//! carries the usage and the stop sequence the events do not have; `message_start`, `ping` and
 //! `message_stop` are the driver's as well. For an output whose reasoning, text and calls come in
 //! that order, the stream's blocks are the ones [`output`] folds from the same events; when they
 //! alternate, the stream keeps the order the model wrote them in and the fold gathers each kind
@@ -157,9 +157,9 @@ pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
 
 /// The streaming half: parser events as `content_block_*` events, one block open at a time.
 ///
-/// Feed every event in order; the machine opens, continues and closes blocks as the module doc
-/// describes and numbers them from zero. `Finish` closes the open block and returns the stop reason
-/// for the driver's `message_delta`.
+/// One per message, like the parser that feeds it. Feed every event in order; the machine opens,
+/// continues and closes blocks as the module doc describes and numbers them from zero. `Finish`
+/// closes the open block and returns the stop reason for the driver's `message_delta`.
 #[derive(Clone, Debug, Default)]
 pub struct Stream {
     /// The open block, if any.
@@ -192,24 +192,7 @@ impl Stream {
     pub fn feed(&mut self, event: &Event, out: &mut Vec<MessageStreamEvent>) -> Option<StopReason> {
         match event {
             Event::Content(text) | Event::Malformed { text, .. } => self.text(&text.text, out),
-            Event::Reasoning(text) => {
-                if !text.text.is_empty() {
-                    self.start(
-                        Block::Thinking,
-                        ContentBlock::Thinking {
-                            thinking: String::new(),
-                            signature: String::new(),
-                        },
-                        out,
-                    );
-                    out.push(MessageStreamEvent::ContentBlockDelta {
-                        index: self.index,
-                        delta: ContentBlockDelta::ThinkingDelta {
-                            thinking: text.text.clone(),
-                        },
-                    });
-                }
-            }
+            Event::Reasoning(text) => self.reasoning(&text.text, out),
             Event::ReasoningEnd => {
                 if self.open == Some(Block::Thinking) {
                     self.stop_open(out);
@@ -226,21 +209,7 @@ impl Stream {
                 },
                 out,
             ),
-            Event::ToolCallArguments { index, json, .. } => {
-                if json.is_empty() {
-                    return None;
-                }
-                if self.open == Some(Block::ToolUse { call: *index }) {
-                    out.push(MessageStreamEvent::ContentBlockDelta {
-                        index: self.index,
-                        delta: ContentBlockDelta::InputJsonDelta {
-                            partial_json: json.clone(),
-                        },
-                    });
-                } else {
-                    self.text(json, out);
-                }
-            }
+            Event::ToolCallArguments { index, json, .. } => self.arguments(*index, json, out),
             Event::ToolCallEnd { index, .. } => {
                 if self.open == Some(Block::ToolUse { call: *index }) {
                     self.stop_open(out);
@@ -270,6 +239,46 @@ impl Stream {
             out.push(MessageStreamEvent::ContentBlockStop { index: self.index });
             self.index += 1;
         }
+    }
+
+    /// Reasoning text into the open thinking block, opened first when another kind of block or none
+    /// is open.
+    fn reasoning(&mut self, text: &str, out: &mut Vec<MessageStreamEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        self.start(
+            Block::Thinking,
+            ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            },
+            out,
+        );
+        out.push(MessageStreamEvent::ContentBlockDelta {
+            index: self.index,
+            delta: ContentBlockDelta::ThinkingDelta {
+                thinking: text.to_string(),
+            },
+        });
+    }
+
+    /// A fragment of call `call`'s arguments into its open `tool_use` block; text when the call has
+    /// no open block, so that no byte is lost.
+    fn arguments(&mut self, call: u32, json: &str, out: &mut Vec<MessageStreamEvent>) {
+        if json.is_empty() {
+            return;
+        }
+        if self.open != Some(Block::ToolUse { call }) {
+            self.text(json, out);
+            return;
+        }
+        out.push(MessageStreamEvent::ContentBlockDelta {
+            index: self.index,
+            delta: ContentBlockDelta::InputJsonDelta {
+                partial_json: json.to_string(),
+            },
+        });
     }
 
     /// Text into the open text block, opened first when another kind of block or none is open.
@@ -829,6 +838,28 @@ mod tests {
                 {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": " "}},
             ]),
             "held whitespace leads the block; whitespace inside an open block is text at once"
+        );
+
+        let before_thinking = [
+            Event::Content(Text::uncounted("\n")),
+            Event::Reasoning(Text::uncounted("plan")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("Hello")),
+        ];
+        let text: String = stream(&before_thinking)
+            .0
+            .iter()
+            .filter_map(|event| match event {
+                MessageStreamEvent::ContentBlockDelta {
+                    delta: ContentBlockDelta::TextDelta { text },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "Hello",
+            "whitespace held before a thinking block is let go, not carried past it"
         );
     }
 
