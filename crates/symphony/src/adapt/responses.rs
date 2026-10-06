@@ -19,8 +19,8 @@
 //! `function_call_arguments.delta` and completes at `ToolCallEnd`, so a client can act on a call
 //! while the model goes on. `Finish` completes what is open and hands back the response's
 //! [`Output`], items in the order they opened, for the driver's terminal event. When the reasoning
-//! comes first, in one region, and the first content comes before the first call, those items are
-//! the fold's. Otherwise the stream keeps the order the items opened in, where the fold gathers
+//! comes first, in one region, and the first content with substance comes before the first call,
+//! those items are the fold's, statuses included. Otherwise the stream keeps the order the items opened in, where the fold gathers
 //! each kind into one item in OpenAI's order: a call before any content comes first, reasoning
 //! after content follows the message, and a second reasoning region is a second item.
 //!
@@ -56,8 +56,10 @@
 //! rather than `completed`. Three of these differ from the old path, which called the reasoning
 //! item `completed` whatever the response's state, left every item of a failed response
 //! `in_progress`, what had finished included, and marked a call `incomplete` only after `length`;
-//! here each status describes its item. A call the model closed without arguments has empty
-//! arguments and is complete.
+//! here each status describes its item. A reasoning region ends at `ReasoningEnd`, or when content
+//! with substance or a call comes after it, in the fold as in the stream. A call with empty
+//! arguments is complete: the formats start a call only once its arguments value has begun or its
+//! object has closed, so a call without arguments is one the model closed.
 //!
 //! Policy this adapter sets, where the events say more than the Responses API can:
 //!
@@ -96,7 +98,8 @@ use crate::event::{Event, FinishReason};
 /// A whole output as the Responses API reports it: the items and the response status.
 #[derive(Clone, Debug)]
 pub struct Output {
-    /// The output items in OpenAI's order: reasoning, message, then the calls as they started.
+    /// The output items: from [`output`], in OpenAI's order (reasoning, message, then the calls as
+    /// they started); from [`Stream`], in the order the items opened.
     pub items: Vec<ResponseOutputItem>,
     /// The response status decided from the `Finish` event.
     pub status: ResponseStatus,
@@ -124,7 +127,12 @@ pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>
     let mut finish = None;
     for event in events {
         match event {
-            Event::Content(text) | Event::Malformed { text, .. } => content.push_str(&text.text),
+            Event::Content(text) | Event::Malformed { text, .. } => {
+                content.push_str(&text.text);
+                if !text.text.trim().is_empty() {
+                    reasoning_ended = true;
+                }
+            }
             Event::Reasoning(text) => {
                 reasoning.push_str(&text.text);
                 reasoning_ended = false;
@@ -132,13 +140,16 @@ pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>
             Event::ReasoningEnd => reasoning_ended = true,
             Event::ToolCallStart {
                 index, id, name, ..
-            } => calls.push(Call {
-                index: *index,
-                id: id.clone(),
-                name: name.clone(),
-                arguments: String::new(),
-                ended: false,
-            }),
+            } => {
+                reasoning_ended = true;
+                calls.push(Call {
+                    index: *index,
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: String::new(),
+                    ended: false,
+                });
+            }
             Event::ToolCallArguments { index, json, .. } => {
                 match calls.iter_mut().find(|call| call.index == *index) {
                     Some(call) => call.arguments.push_str(json),
@@ -495,10 +506,13 @@ impl Stream {
     }
 
     /// Content into the message item, opened at the first content with substance; whitespace
-    /// before that is held and leads it.
+    /// before that is held and leads it. Content with substance ends an open reasoning region.
     fn content(&mut self, text: &str, out: &mut Vec<StreamEvent>) {
         if text.is_empty() {
             return;
+        }
+        if !text.trim().is_empty() {
+            self.close_reasoning("completed", out);
         }
         let position = match self.message {
             Some(position) => position,
@@ -526,10 +540,8 @@ impl Stream {
         }
     }
 
-    /// Opens the message and its text part at the next index, completing an open reasoning item
-    /// first, and returns its position.
+    /// Opens the message and its text part at the next index, and returns its position.
     fn open_message(&mut self, out: &mut Vec<StreamEvent>) -> usize {
-        self.close_reasoning("completed", out);
         let index = self.next_index();
         let id = format!("msg_{}", self.response_id);
         out.push(StreamEvent::OutputItemAdded {
@@ -1041,22 +1053,23 @@ mod tests {
         ];
         assert_eq!(
             statuses(&output("r", &unfinished).items),
-            ["in_progress", "in_progress", "in_progress"]
+            ["completed", "in_progress", "in_progress"],
+            "the reasoning region ended when the content came; the message and the call did not end"
         );
 
         let failed_mid_reasoning = [
             Event::Reasoning(Text::uncounted("plan")),
-            Event::Content(Text::uncounted("text")),
             call(0, "get_weather"),
             arguments(0, r#"{"city":"Paris"}"#),
             end(0),
+            Event::Reasoning(Text::uncounted("more")),
             finish(FinishReason::Other("failed".into()), 1),
         ];
         let out = output("r", &failed_mid_reasoning);
         assert_eq!(
             statuses(&out.items),
-            ["in_progress", "in_progress", "completed"],
-            "the call ended before the engine failed; the reasoning region and the message did not"
+            ["in_progress", "completed"],
+            "the call ended before the engine failed; the reasoning, resumed after it, did not"
         );
         assert_eq!(out.status, ResponseStatus::Failed);
 
@@ -1380,6 +1393,51 @@ mod tests {
             statuses(&done.expect("output").items),
             ["completed", "completed", "in_progress"],
             "the terminal output keeps the status each item reached"
+        );
+    }
+
+    #[test]
+    fn a_region_that_ends_without_its_marker_has_the_same_status_in_stream_and_fold() {
+        let unmarked = [
+            Event::Reasoning(Text::uncounted("plan")),
+            Event::Content(Text::uncounted("text")),
+            call(0, "get_weather"),
+            arguments(0, r#"{"city":"Paris"}"#),
+            end(0),
+            finish(FinishReason::Other("failed".into()), 1),
+        ];
+        let (out, done) = stream("r", &unmarked);
+        let done = done.expect("output");
+        assert_eq!(output_wire(&done), output_wire(&output("r", &unmarked)));
+        assert_eq!(
+            statuses(&done.items),
+            ["completed", "in_progress", "completed"]
+        );
+        let reasoning_done = stream_wire(&out)
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.done" && event["item"]["type"] == "reasoning"
+            })
+            .expect("the reasoning item completes")["item"]["status"]
+            .clone();
+        assert_eq!(
+            reasoning_done, "completed",
+            "done event and terminal item agree"
+        );
+
+        let content_then_reasoning = [
+            Event::Content(Text::uncounted("a")),
+            Event::Reasoning(Text::uncounted("b")),
+            Event::Content(Text::uncounted("c")),
+            finish(FinishReason::Other("failed".into()), 0),
+        ];
+        let (_, done) = stream("r", &content_then_reasoning);
+        assert_eq!(
+            statuses(&done.expect("output").items),
+            ["in_progress", "completed"],
+            "content with substance ends a reasoning region even after the message has opened"
         );
     }
 
