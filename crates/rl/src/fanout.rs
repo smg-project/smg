@@ -228,7 +228,6 @@ mod tests {
         let mut grpc = worker("g1", &format!("{}/grpc", good.url), RuntimeType::Sglang);
         grpc.connection_mode = ConnectionMode::Grpc;
         grpc.control_url = None;
-        grpc.control_client = None;
         let app = crate::router::<()>(state(
             vec![
                 worker("w1", &good.url, RuntimeType::Sglang),
