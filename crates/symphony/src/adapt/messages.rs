@@ -12,8 +12,11 @@
 //! `content_block_stop` events a client expects, the block index advancing by one per block. A
 //! `thinking` block opens at the first reasoning text and closes when the region ends; a `text`
 //! block opens at the first content; a `tool_use` block opens at `ToolCallStart` with an empty
-//! `input` and closes at `ToolCallEnd`; a block closes when text of another kind arrives. `Finish`
-//! closes the open block and hands the stop reason back for the driver's `message_delta`, which
+//! `input` and closes at `ToolCallEnd`; a block closes when text of another kind arrives.
+//! Whitespace-only text that arrives with no text block open is held: it leads the block when text
+//! with substance follows, and is let go when another block starts or the stream ends, as the fold
+//! leaves whitespace-only content out; the template's separators between blocks open no block of
+//! their own. `Finish` closes the open block and hands the stop reason back for the driver's `message_delta`, which
 //! also carries the usage and the stop sequence the events do not have; `message_start`, `ping` and
 //! `message_stop` are the driver's as well. For an output whose reasoning, text and calls come in
 //! that order, the stream's blocks are the ones [`output`] folds from the same events; when they
@@ -64,6 +67,11 @@
 //! - In the stream, the thinking block stops when the reasoning region ends rather than when the
 //!   next text arrives, as the old driver did, so a client sees the block close as soon as the
 //!   model stops thinking.
+//! - In the stream, whitespace-only text opens no block until text with substance joins it; the old
+//!   driver opened a text block for any non-empty text, so a separator between a thinking block
+//!   and a call became a block holding one newline.
+
+use std::mem;
 
 use openai_protocol::messages::{ContentBlock, ContentBlockDelta, MessageStreamEvent, StopReason};
 use serde_json::{Map, Value};
@@ -158,6 +166,8 @@ pub struct Stream {
     open: Option<Block>,
     /// The index of the open block, or of the next block to open.
     index: u32,
+    /// Whitespace-only text that arrived with no text block open, waiting for text with substance.
+    held: String,
 }
 
 /// The kind of block that is open.
@@ -202,7 +212,7 @@ impl Stream {
             }
             Event::ReasoningEnd => {
                 if self.open == Some(Block::Thinking) {
-                    self.close(out);
+                    self.stop_open(out);
                 }
             }
             Event::ToolCallStart {
@@ -233,7 +243,7 @@ impl Stream {
             }
             Event::ToolCallEnd { index, .. } => {
                 if self.open == Some(Block::ToolUse { call: *index }) {
-                    self.close(out);
+                    self.stop_open(out);
                 }
             }
             Event::Finish {
@@ -247,9 +257,15 @@ impl Stream {
         None
     }
 
-    /// Stops the open block, if any, so that the next block gets the next index. For a stream that
-    /// ends without `Finish`; `feed` closes blocks itself otherwise.
+    /// Ends the stream's blocks: stops the open block, if any, and lets held whitespace go. For a
+    /// stream that ends without `Finish`; `feed` does this itself at `Finish`.
     pub fn close(&mut self, out: &mut Vec<MessageStreamEvent>) {
+        self.stop_open(out);
+        self.held.clear();
+    }
+
+    /// Stops the open block, if any, so that the next block gets the next index.
+    fn stop_open(&mut self, out: &mut Vec<MessageStreamEvent>) {
         if self.open.take().is_some() {
             out.push(MessageStreamEvent::ContentBlockStop { index: self.index });
             self.index += 1;
@@ -257,28 +273,39 @@ impl Stream {
     }
 
     /// Text into the open text block, opened first when another kind of block or none is open.
+    /// Whitespace-only text with no text block open is held for the text with substance that may
+    /// follow it.
     fn text(&mut self, text: &str, out: &mut Vec<MessageStreamEvent>) {
         if text.is_empty() {
             return;
         }
-        self.start(
-            Block::Text,
-            ContentBlock::Text {
-                text: String::new(),
-                citations: None,
-            },
-            out,
-        );
+        if self.open != Some(Block::Text) {
+            if text.trim().is_empty() {
+                self.held.push_str(text);
+                return;
+            }
+            self.start(
+                Block::Text,
+                ContentBlock::Text {
+                    text: String::new(),
+                    citations: None,
+                },
+                out,
+            );
+        }
+        let mut text_with_held = mem::take(&mut self.held);
+        text_with_held.push_str(text);
         out.push(MessageStreamEvent::ContentBlockDelta {
             index: self.index,
             delta: ContentBlockDelta::TextDelta {
-                text: text.to_string(),
+                text: text_with_held,
             },
         });
     }
 
     /// Makes `block` the open block: nothing when it already is, otherwise the open block is closed
-    /// and `content_block` starts at the next index.
+    /// and `content_block` starts at the next index. Held whitespace is let go when the block is
+    /// not a text block.
     fn start(
         &mut self,
         block: Block,
@@ -288,7 +315,10 @@ impl Stream {
         if self.open == Some(block) {
             return;
         }
-        self.close(out);
+        if block != Block::Text {
+            self.held.clear();
+        }
+        self.stop_open(out);
         out.push(MessageStreamEvent::ContentBlockStart {
             index: self.index,
             content_block,
@@ -757,11 +787,58 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_only_text_opens_no_block_until_substance_joins_it() {
+        let separators_only = [
+            Event::Reasoning(Text::uncounted("plan")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("\n\n")),
+            call(0, "f"),
+            end(0),
+            Event::Content(Text::uncounted("\n")),
+            finish(FinishReason::Stop, 1),
+        ];
+        let (out, _) = stream(&separators_only);
+        let kinds: Vec<Value> = stream_wire(&out)
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|event| json!([event["type"], event["index"]]))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                json!(["content_block_start", 0]),
+                json!(["content_block_delta", 0]),
+                json!(["content_block_stop", 0]),
+                json!(["content_block_start", 1]),
+                json!(["content_block_stop", 1]),
+            ],
+            "the separators open no text block"
+        );
+
+        let led_by_whitespace = [
+            Event::Content(Text::uncounted("\n\n")),
+            Event::Content(Text::uncounted("Hello")),
+            Event::Content(Text::uncounted(" ")),
+        ];
+        assert_eq!(
+            stream_wire(&stream(&led_by_whitespace).0),
+            json!([
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "\n\nHello"}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": " "}},
+            ]),
+            "held whitespace leads the block; whitespace inside an open block is text at once"
+        );
+    }
+
+    #[test]
     fn the_stream_and_the_fold_agree_on_an_output_in_block_order() {
         let events = [
             Event::ReasoningStart,
             Event::Reasoning(Text::uncounted("plan")),
             Event::ReasoningEnd,
+            Event::Content(Text::uncounted("\n\n")),
             Event::Content(Text::uncounted("Let me ")),
             Event::Malformed {
                 text: Text::uncounted("<tool_call>{broken"),
