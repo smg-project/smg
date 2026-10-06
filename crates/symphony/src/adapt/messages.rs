@@ -26,10 +26,11 @@
 //! echoing the id back names the same call.
 //!
 //! Stop reason, from the `Finish` event: `length` is `max_tokens`, and parsed calls do not override
-//! a truncation; `tool_calls`, and `stop` after at least one tool call, are `tool_use`; `stop` is
-//! `end_turn`; `abort` and engine-specific reasons are `end_turn` too, since the Messages API has no
-//! word for them and the driver decides whether a failed generation is a message at all. A sequence
-//! without `Finish` has no stop reason.
+//! a truncation; `tool_calls`, and any other reason after at least one tool call, are `tool_use`,
+//! since a message with `tool_use` blocks says so whatever stopped the model, as the API itself
+//! does; `stop` is `end_turn`; `abort` and engine-specific reasons are `end_turn` too when no call
+//! was made, since the Messages API has no word for them and the driver decides whether a failed
+//! generation is a message at all. A sequence without `Finish` has no stop reason.
 //!
 //! Policy this adapter sets, where the events say more than the Messages API can:
 //!
@@ -132,7 +133,9 @@ fn stop(reason: &FinishReason, tool_calls: u32) -> StopReason {
     match reason {
         FinishReason::Length => StopReason::MaxTokens,
         FinishReason::ToolCalls => StopReason::ToolUse,
-        FinishReason::Stop if tool_calls > 0 => StopReason::ToolUse,
+        FinishReason::Stop | FinishReason::Abort | FinishReason::Other(_) if tool_calls > 0 => {
+            StopReason::ToolUse
+        }
         FinishReason::Stop | FinishReason::Abort | FinishReason::Other(_) => StopReason::EndTurn,
     }
 }
@@ -294,10 +297,19 @@ mod tests {
             Some(StopReason::MaxTokens),
             "parsed calls do not override a truncation"
         );
-        assert_eq!(reason(FinishReason::Abort, 1), Some(StopReason::EndTurn));
+        assert_eq!(reason(FinishReason::Abort, 0), Some(StopReason::EndTurn));
         assert_eq!(
             reason(FinishReason::Other("failed".into()), 0),
             Some(StopReason::EndTurn)
+        );
+        assert_eq!(
+            reason(FinishReason::Abort, 1),
+            Some(StopReason::ToolUse),
+            "a message with tool_use blocks says so, whatever stopped the model"
+        );
+        assert_eq!(
+            reason(FinishReason::Other("failed".into()), 1),
+            Some(StopReason::ToolUse)
         );
         assert_eq!(output(&[]).stop_reason, None);
     }
