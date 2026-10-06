@@ -13,16 +13,17 @@
 //! stream and the fold share one shape; they serialise as the API's `type`-tagged objects without
 //! `sequence_number`, which the driver adds as it numbers every event of the response, its own
 //! `response.created`, `response.in_progress` and the terminal event included. A `reasoning` item
-//! opens at the first reasoning text and completes when the region ends; the `message` opens at
-//! the first content with substance and stays open to the end, so content after a call continues
-//! it; a `function_call` item opens at `ToolCallStart`, takes its fragments as
+//! opens at the first reasoning text and completes when the region ends; the `message` opens at the
+//! first content with substance and stays open to the end, so content after a call continues it; a
+//! `function_call` item opens at `ToolCallStart`, takes its fragments as
 //! `function_call_arguments.delta` and completes at `ToolCallEnd`, so a client can act on a call
 //! while the model goes on. `Finish` completes what is open and hands back the response's
 //! [`Output`], items in the order they opened, for the driver's terminal event. When the reasoning
 //! comes first, in one region, and the first content with substance comes before the first call,
-//! those items are the fold's, statuses included. Otherwise the stream keeps the order the items opened in, where the fold gathers
-//! each kind into one item in OpenAI's order: a call before any content comes first, reasoning
-//! after content follows the message, and a second reasoning region is a second item.
+//! those items are the fold's, statuses included. Otherwise the stream keeps the order the items
+//! opened in, where the fold gathers each kind into one item in OpenAI's order: a call before any
+//! content comes first, reasoning after content follows the message, and a second reasoning region
+//! is a second item.
 //!
 //! The items are the ones SMG's gateway builds today from a finished chat message, in OpenAI's
 //! order, so items replayed as the next turn's input rebuild the same turn:
