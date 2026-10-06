@@ -239,6 +239,11 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
         "{matched} cases match, {} differ, {with_witnesses} carry engine witnesses",
         differences.len()
     );
+    assert!(
+        !seen.is_empty(),
+        "no render case under {}: every fixtures/<slug>/render directory is missing or empty",
+        root.display()
+    );
 
     let unexpected: Vec<String> = differences
         .iter()
