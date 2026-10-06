@@ -273,19 +273,20 @@ mod tests {
         );
     }
 
-    /// A pool config the gateway cannot build a client for is the worker's
+    /// A gateway whose TLS settings cannot produce a client is the worker's
     /// problem to report, not a silent `None`: the error rides on the info
-    /// and ends up in the 422.
+    /// and ends up in the 422. (An unparsable client identity fails the
+    /// build eagerly; CA bundles are only read when a connection is made.)
     #[test]
     fn a_failed_client_build_is_reported_on_the_worker() {
         let mut config = RouterConfig::default();
-        config.ca_certificates = vec![b"not a certificate".to_vec()];
+        config.client_identity = Some(b"not a pem".to_vec());
         let info = view_with(&config, vec![grpc_worker("grpc://a:1")])
             .list()
             .pop()
             .expect("one worker");
         assert_eq!(info.control_url.as_deref(), Some("http://a:40100"));
         let err = info.control_client.expect_err("no client");
-        assert!(err.contains("CA certificate"), "{err}");
+        assert!(err.contains("client identity"), "{err}");
     }
 }
