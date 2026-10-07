@@ -1833,6 +1833,9 @@ mod tests {
 
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
         DispatchContext {
+            root_request_id: None,
+            cache_trace: None,
+            attempt: 0,
             model_id: model_id.to_string(),
             dispatch_model: model_id.to_string(),
             streaming: false,

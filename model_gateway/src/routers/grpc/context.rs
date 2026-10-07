@@ -40,6 +40,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
+    observability::cache_trace,
     policies::CacheNamespace,
     routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
     worker::{
@@ -274,6 +275,9 @@ impl WireConstraint {
 /// [`RequestContext::into_dispatch`]. `ResponseSpec` is the only
 /// request-derived input past this point.
 pub(crate) struct DispatchContext {
+    pub root_request_id: Option<String>,
+    pub cache_trace: Option<String>,
+    pub attempt: u32,
     /// Canonical model ID (routing, registries).
     pub model_id: String,
     /// Model the response reports, captured from the request at the build
@@ -810,7 +814,7 @@ impl RequestContext {
             headers,
             model_id,
             streaming,
-            tenant_request_meta: _,
+            tenant_request_meta,
             rate_limit_cell,
         } = input;
         // The model the response reports. `RequestContext::new` already
@@ -855,6 +859,14 @@ impl RequestContext {
                 )
             })?;
         Ok(DispatchContext {
+            root_request_id: if cache_trace::enabled() {
+                super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
+                    .map(str::to_owned)
+            } else {
+                None
+            },
+            cache_trace: None,
+            attempt: 0,
             model_id,
             dispatch_model,
             streaming,

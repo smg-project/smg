@@ -23,7 +23,7 @@ use super::{
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
-    observability::metrics::Metrics,
+    observability::{cache_trace, metrics::Metrics},
     policies::cache_aware::LoadReceiver,
     routers::common::header_utils::{
         extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
@@ -286,6 +286,7 @@ impl PolicyRegistry {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
+        cache_trace::prediction(serde_json::Value::Null);
         if let Some(sticky) = self.routing_key_sticky.as_ref() {
             if Self::routing_key_override_applies(policy.name()) {
                 if let Some((key, source)) = self.effective_sticky_key(info) {
@@ -295,7 +296,9 @@ impl PolicyRegistry {
                 }
             }
         }
-        policy.select_worker(workers, info)
+        let selected = policy.select_worker(workers, info);
+        cache_trace::selection(policy.name(), "policy", workers, selected);
+        selected
     }
 
     #[cfg(test)]
@@ -344,6 +347,7 @@ impl PolicyRegistry {
         let over_cap =
             |idx: usize| workers[idx].routing_key_inflight(load_key) >= STICKY_INFLIGHT_CAP;
         let finish = |result: Option<usize>, branch: ExecutionBranch| {
+            cache_trace::selection(policy.name(), branch.as_str(), workers, result);
             Metrics::record_worker_manual_policy_branch(branch.as_str());
             Metrics::set_manual_policy_cache_entries(sticky.map_len());
             debug!(

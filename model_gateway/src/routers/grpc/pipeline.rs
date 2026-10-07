@@ -64,7 +64,10 @@ use super::{
 use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
-    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
+    observability::{
+        cache_trace,
+        metrics::{bool_to_static_str, metrics_labels, Metrics},
+    },
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
@@ -490,6 +493,7 @@ impl RequestPipeline {
         attempt: u32,
         last_attempt: bool,
     ) -> Result<Option<Response>, Response> {
+        dctx.attempt = attempt;
         if attempt > 0 {
             // Fresh worker selection per attempt; the retained plan is
             // re-stamped (engine ids, sampling defaults, PD rooms) for the
@@ -563,6 +567,27 @@ impl RequestPipeline {
     /// enables the dispatch-phase retry loop. Callers `Box::pin` this future:
     /// it holds ingress + per-attempt state across awaits.
     async fn run(
+        &self,
+        ctx: RequestContext,
+        metrics_endpoint: Option<&'static str>,
+        retry_config: Option<&RetryConfig>,
+    ) -> Result<RunOutcome, Response> {
+        if !cache_trace::enabled() {
+            return self.run_inner(ctx, metrics_endpoint, retry_config).await;
+        }
+        let root_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref())
+            .map(str::to_owned);
+        Box::pin(cache_trace::scope(async {
+            let result = self.run_inner(ctx, metrics_endpoint, retry_config).await;
+            if let Err(response) = &result {
+                cache_trace::failure(root_id.as_deref(), response.status().as_u16());
+            }
+            result
+        }))
+        .await
+    }
+
+    async fn run_inner(
         &self,
         mut ctx: RequestContext,
         metrics_endpoint: Option<&'static str>,
@@ -681,6 +706,11 @@ impl RequestPipeline {
 
     /// Attribute a response to the worker from the successful dispatch attempt.
     fn routed_response(ctx: &DispatchContext, mut response: Response) -> Response {
+        if let Some(trace) = ctx.cache_trace.as_ref() {
+            if let Ok(value) = http::HeaderValue::from_str(trace) {
+                response.headers_mut().insert("x-smg-cache-trace", value);
+            }
+        }
         if let Some(workers) = ctx.workers.as_ref() {
             let worker = match workers {
                 WorkerSelection::Single { worker } => worker,

@@ -222,6 +222,19 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # n>1 emits a *list* of final dicts (non-streaming) or per-choice
         # streamed dicts tagged with ``index`` — both handled below.
         expanded_rid = getattr(req_obj, "rid", None)
+        if os.environ.get("SMG_CACHE_TRACE") == "1":
+            logger.info(
+                "cache_request_mapping %s",
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "parent_id": rid,
+                        "child_ids": expanded_rid
+                        if isinstance(expanded_rid, list)
+                        else [expanded_rid],
+                    }
+                ),
+            )
 
         # Threaded through the response builders so the matched stop token
         # stays in ``output_ids`` when the client asked to keep it.

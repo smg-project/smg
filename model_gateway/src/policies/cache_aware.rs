@@ -102,7 +102,7 @@ pub(crate) use crate::worker::load_state::{LoadReceiver, LoadSnapshot};
 use crate::{
     config::CacheIndexKind,
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
-    observability::metrics::Metrics,
+    observability::{cache_trace, metrics::Metrics},
     worker::{liveness, KvEventMonitor, KvIndex, Worker},
 };
 
@@ -1484,6 +1484,13 @@ impl CacheAwarePolicy {
         let mut load_sum = 0usize;
         for (idx, worker) in workers.iter().enumerate() {
             let state = worker.routing_state();
+            if cache_trace::enabled() && !state.eligible() {
+                cache_trace::gate(serde_json::json!({
+                    "phase": "eligibility", "worker": worker.url(),
+                    "load": state.load, "overloaded": state.overloaded,
+                    "eligible": false,
+                }));
+            }
             // The overload veto costs nothing here: `state` is the word this
             // pass already loaded for health, circuit breaker and load.
             if state.eligible() {
@@ -1794,8 +1801,16 @@ impl CacheAwarePolicy {
         avg_load: f64,
     ) -> bool {
         let load = workers[selected].load() as f64;
-        load > avg_load * f64::from(self.config.balance_rel_threshold)
-            && load > avg_load + self.config.balance_abs_threshold as f64
+        let spill = load > avg_load * f64::from(self.config.balance_rel_threshold)
+            && load > avg_load + self.config.balance_abs_threshold as f64;
+        if cache_trace::enabled() {
+            cache_trace::gate(serde_json::json!({
+                "worker": workers[selected].url(), "load": load, "average_load": avg_load,
+                "relative_threshold": self.config.balance_rel_threshold,
+                "absolute_threshold": self.config.balance_abs_threshold, "spill": spill,
+            }));
+        }
+        spill
     }
 
     /// The warm-up slice: one cache miss in `1 / share` goes to the
@@ -2368,6 +2383,12 @@ impl CacheAwarePolicy {
             model_id,
             "Event-driven routing"
         );
+        if cache_trace::enabled() {
+            cache_trace::prediction(serde_json::json!({
+                "source": "event_index_overlap", "branch": branch,
+                "overlap_blocks": overlap_blocks, "request_blocks": content_hashes.len(), "block_size": block_size,
+            }));
+        }
         Some(idx)
     }
 
@@ -2701,6 +2722,12 @@ impl CacheAwarePolicy {
         } else {
             0
         };
+        if cache_trace::enabled() {
+            cache_trace::prediction(serde_json::json!({
+                "source": "approximate_tree", "branch": branch,
+                "matched_units": matched_units, "input_units": input_units, "credited_units": credited_units,
+            }));
+        }
         debug!(
             index = "tree",
             branch,
@@ -2718,6 +2745,11 @@ impl CacheAwarePolicy {
     /// One decision line per hash-mode selection. `level` is the matched
     /// boundary (0 for the fallback branches).
     fn log_hash_decision(branch: &'static str, level: usize, worker: &str, model_id: &str) {
+        if cache_trace::enabled() {
+            cache_trace::prediction(serde_json::json!({
+                "source": "approximate_hash_index", "branch": branch, "level": level,
+            }));
+        }
         debug!(
             index = "hash",
             branch, level, worker, model_id, "Cache-aware selection"

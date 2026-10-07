@@ -12,7 +12,10 @@ use super::{
     pd_protocol::{DpPlacement, PdDispatch, PdProtocol},
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::{
+        cache_trace,
+        metrics::{metrics_labels, Metrics},
+    },
     routers::{
         common::{
             kv_transfer::{
@@ -240,7 +243,7 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// budget.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
-    execution_plan: ExecutionPlan,
+    mut execution_plan: ExecutionPlan,
     last_attempt: bool,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
@@ -312,6 +315,19 @@ pub(crate) async fn execute_plan(
     let model = dispatch.model.as_str();
     let request_type = execution_plan.request_type();
     let mode = execution_plan.mode_label();
+    if cache_trace::enabled() {
+        let engine_ids = execution_plan
+            .generate_requests_mut()
+            .take(32)
+            .map(|request| request.request_id().to_owned())
+            .collect();
+        ctx.cache_trace = cache_trace::dispatch(
+            ctx.root_request_id.as_deref(),
+            ctx.attempt,
+            engine_ids,
+            mode,
+        );
+    }
 
     // Create OTEL span for gRPC request execution
     let span = info_span!(
