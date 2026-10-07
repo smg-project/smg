@@ -203,12 +203,22 @@ impl Format {
         self.calls.as_ref()
     }
 
-    /// What every table must hold before an engine runs it: a state to start in, a call syntax
-    /// when a state emits arguments, a text for every terminal and a turn opener that is not
-    /// empty. The builder keeps a row from naming what the table lacks; this checks the rest.
+    /// What every table must hold before an engine runs it: a state to start in, which does not
+    /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
+    /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
+    /// engine), a call syntax when a state emits arguments, a text for every terminal and a turn
+    /// opener that is not empty. The builder keeps a row from naming what the table lacks; this
+    /// checks the rest.
     pub fn validate(&self) -> Result<(), String> {
-        if self.states.is_empty() {
+        let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
+        };
+        if first.emits == Emits::Reasoning {
+            return Err(format!(
+                "format {}: the first state {:?} emits reasoning; a thought the output starts \
+                 inside is entered by the prompt",
+                self.name, first.name
+            ));
         }
         if self
             .states
@@ -282,6 +292,23 @@ mod tests {
                 .state("c", Emits::Content)
                 .validate(),
             Err("format blank: terminal \"t\" has no text".to_string())
+        );
+        assert_eq!(
+            Format::new("opener")
+                .state("c", Emits::Content)
+                .opens_turn("")
+                .validate(),
+            Err("format opener: an empty turn opener".to_string())
+        );
+        assert_eq!(
+            Format::new("thought")
+                .state("r", Emits::Reasoning)
+                .validate(),
+            Err(
+                "format thought: the first state \"r\" emits reasoning; a thought the output \
+                 starts inside is entered by the prompt"
+                    .to_string()
+            )
         );
     }
 

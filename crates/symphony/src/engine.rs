@@ -104,8 +104,8 @@ impl Call {
     fn new(syntax: Option<CallSyntax>, index: u32) -> Self {
         let id = format!("call_{index}");
         match syntax {
-            // A format whose table has an arguments state but names no syntax reads the call as
-            // Qwen3 writes it; the definitions in the crate always name one.
+            // `None` is unreachable: `Format::validate`, run by `Engine::new`, refuses a table
+            // with an arguments state and no call syntax. The arm keeps the match total.
             Some(CallSyntax::Json) | None => Self::Json(json::Assembler::new(index, id)),
             Some(CallSyntax::Tagged) => Self::Tagged(tagged::Assembler::new(index, id)),
         }
@@ -151,8 +151,9 @@ impl Engine {
     ///
     /// # Panics
     ///
-    /// A table [`Format::validate`] refuses has nowhere to put the output's text, or no syntax for
-    /// its calls; definitions are written in the crate, so that is a programming error.
+    /// A table [`Format::validate`] refuses: no state, a first state that emits reasoning, an
+    /// arguments state with no call syntax, a terminal with no text, an empty turn opener.
+    /// Definitions are written in the crate, so that is a programming error.
     #[expect(
         clippy::panic,
         reason = "a table the crate wrote that fails its own check is a programming error"
@@ -161,7 +162,7 @@ impl Engine {
         if let Err(why) = format.validate() {
             panic!("{why}");
         }
-        Self {
+        let mut engine = Self {
             scanner: Scanner::new(format.terminal_texts()),
             format,
             declared,
@@ -171,7 +172,13 @@ impl Engine {
             tokens: Ledger::new(),
             reasoning_tokens: 0,
             stage: Stage::Fresh,
+        };
+        // A table whose output starts inside a call (a bare list of calls, with no marker before
+        // it) opens the call here, since no terminal will.
+        if engine.emits() == Emits::Arguments {
+            engine.open_call();
         }
+        engine
     }
 
     fn emits(&self) -> Emits {

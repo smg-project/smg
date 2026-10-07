@@ -1084,6 +1084,44 @@ mod tests {
     }
 
     #[test]
+    fn a_table_whose_first_state_emits_arguments_starts_inside_a_call() {
+        // No marker before the call: the engine opens it at the start, and the output's first
+        // bytes are the call's.
+        let bare = Format::new("bare")
+            .state("call", Emits::Arguments)
+            .calls(CallSyntax::Json);
+        let mut parser = Engine::new(bare, Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: "{\"name\": \"f\", \"arguments\": {\"a\": 1}}",
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        assert!(matches!(
+            events.first(),
+            Some(Event::ToolCallStart { index: 0, name, .. }) if name == "f"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
+
+    #[test]
     fn inputs_out_of_order_are_lifecycle_errors() {
         let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
