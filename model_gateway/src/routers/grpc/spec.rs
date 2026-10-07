@@ -201,7 +201,8 @@ pub(crate) struct MessagesResponseSpec {
     pub stop_sequences: Option<Vec<String>>,
     /// Symphony's assignment when a table reads the message (see `regular::symphony`).
     pub symphony: Option<Assignment>,
-    /// A trailing assistant message with text, continued as a prefill.
+    /// A trailing assistant message with text and no tool call, continued as
+    /// a prefill.
     pub continues_final_assistant: bool,
 }
 
