@@ -293,7 +293,7 @@ pub fn chat_reasoning_starts_in_prefill(
 /// [`reasoning_starts_in_prefill`] for a Messages API request: the
 /// `thinking` block is the user's preference (`enabled`/`adaptive` on,
 /// `disabled` off, absent → the template's default), and a trailing
-/// assistant message with text is continued.
+/// assistant message with text and no tool call is continued.
 pub fn messages_reasoning_starts_in_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
     tokenizer: &dyn Tokenizer,
@@ -684,8 +684,8 @@ mod tests {
 
     /// A Messages prefill (trailing assistant text) continued natively is
     /// rendered past the turn's reasoning, so the parser is not armed; a
-    /// trailing tool call opens a new turn and a popped prefill follows the
-    /// generation prompt, and both arm as before.
+    /// trailing tool call, with or without text, opens a new turn and a
+    /// popped prefill follows the generation prompt, and both arm as before.
     #[test]
     fn messages_prefill_continued_natively_does_not_arm() {
         let request = |last: Value| -> openai_protocol::messages::CreateMessageRequest {
@@ -700,6 +700,10 @@ mod tests {
         let tool_use = request(serde_json::json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
         ]}));
+        let text_and_tool_use = request(serde_json::json!({"role": "assistant", "content": [
+            {"type": "text", "text": "a"},
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        ]}));
         let thinking_on =
             || llm_tokenizer::MockTokenizer::new().with_thinking_toggle(ThinkingToggle::DefaultOn);
         let native =
@@ -710,6 +714,10 @@ mod tests {
 
         assert!(!messages_reasoning_starts_in_prefill(&prefill, &native));
         assert!(messages_reasoning_starts_in_prefill(&tool_use, &native));
+        assert!(messages_reasoning_starts_in_prefill(
+            &text_and_tool_use,
+            &native
+        ));
         assert!(messages_reasoning_starts_in_prefill(
             &prefill,
             &thinking_on()

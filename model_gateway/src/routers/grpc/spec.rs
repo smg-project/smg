@@ -164,7 +164,8 @@ pub(crate) struct MessagesResponseSpec {
     /// Messages tools pre-converted to Chat tools for parser reuse.
     pub chat_tools: Vec<Tool>,
     pub stop_sequences: Option<Vec<String>>,
-    /// A trailing assistant message with text, continued as a prefill.
+    /// A trailing assistant message with text and no tool call, continued as
+    /// a prefill.
     pub continues_final_assistant: bool,
 }
 
