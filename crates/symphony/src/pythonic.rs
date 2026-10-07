@@ -169,7 +169,8 @@ impl Assembler {
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client; what was held comes back as `Malformed { UnterminatedRegion }`.
+    /// client; what was held comes back as `Malformed { UnterminatedRegion }`, and a call that
+    /// started still ends, with no bytes of its own, as every assembler ends one.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -178,6 +179,15 @@ impl Assembler {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.carried)),
                 why: MalformedReason::UnterminatedRegion,
+            });
+        }
+        if matches!(
+            self.stage,
+            Stage::Arguments | Stage::Key { .. } | Stage::Value { .. }
+        ) {
+            out.push(Event::ToolCallEnd {
+                index: self.index,
+                source: Text::default(),
             });
         }
     }
@@ -470,9 +480,11 @@ mod tests {
         assembler.feed("get_weather(city=\"Par", &mut out);
         assembler.finish(&mut out);
         let events = out.drain();
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, Event::ToolCallEnd { .. })));
+        // The call ends with no bytes of its own; its arguments stay cut.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolCallEnd { index: 3, source } if source.text.is_empty()
+        )));
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Malformed {

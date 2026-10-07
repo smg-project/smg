@@ -122,6 +122,14 @@ fn iquest() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::iquest(), keyed_tools()))
 }
 
+fn olmo3() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::olmo3(), Declared::default()))
+}
+
+fn lfm2_5() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::lfm2_5(), Declared::default()))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -163,6 +171,37 @@ const FORMATS: &[Subject] = &[
         new: iquest,
         outputs: IQUEST_OUTPUTS,
     },
+    Subject {
+        name: "olmo3",
+        new: olmo3,
+        outputs: OLMO3_OUTPUTS,
+    },
+    Subject {
+        name: "lfm2.5",
+        new: lfm2_5,
+        outputs: LFM_OUTPUTS,
+    },
+];
+
+/// Python calls as Olmo 3 writes them: bare, one per line.
+const OLMO3_OUTPUTS: &[&str] = &[
+    "<function_calls>get_weather(city=\"Paris\", days=3, prefs={\"size\": \"large\", \"deep\": \
+     [1, 2.5, true, null]})\nget_stock_price()</function_calls>",
+    "<function_calls>get_weather(city=\"Par",
+    "<function_calls>get_weather(city=\"Paris\"",
+    "<function_calls>I will call:\nget_weather(city=\"a)b\", n=-1.5e3)</function_calls>\nDone.",
+    "<function_calls></function_calls>",
+    "Hello!",
+];
+
+/// Python calls as LFM2.5 writes them: a list, single-quoted strings.
+const LFM_OUTPUTS: &[&str] = &[
+    "<|tool_call_start|>[get_weather(city='Paris', note='it\\'s fine'), get_stock_price()]\
+     <|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(city='Par",
+    "<think>The user asks.</think><|tool_call_start|>[get_weather(city='計画 🌍 \"q\"')]\
+     <|tool_call_end|>",
+    "<|tool_call_start|>[]<|tool_call_end|>Nothing to call.",
 ];
 
 /// Seed-OSS: the tagged syntax under its own markers, a value as Python's repr, and Qwen's
