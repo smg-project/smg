@@ -46,7 +46,7 @@ aliases is an open question of the design.
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
 | 2026-09-28 | [iquest-q1](https://github.com/smg-project/bellwether/tree/main/fixtures/iquest-q1) | IQuestLab/IQuest-Q1 |  | `iquest` | — | awaiting fixtures | none |
-| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash |  | `deepseek_v4_1` | 54,418 | replaying the set | `deepseek_v41`, `deepseek_v41` |
+| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash |  | `deepseek_v4.1` | 54,418 | replaying the set | `deepseek_v41`, `deepseek_v41` |
 | 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | — | — | pending | none |
 | 2026-09-01 | [k2-horizon-36b](https://github.com/smg-project/bellwether/tree/main/fixtures/k2-horizon-36b) | IFM/K2-Horizon-36B |  | — | — | pending | none |
 | 2026-08-27 | [hy4-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/hy4-preview) | tencent/Hy4-preview |  | `hy4` | 54,195 | replaying the set | `hy_v4`, `hy_v4` |

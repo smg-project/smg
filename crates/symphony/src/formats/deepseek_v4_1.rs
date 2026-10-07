@@ -29,7 +29,7 @@ use crate::{
 
 /// The DeepSeek V4.1 table.
 pub fn deepseek_v4_1() -> Format {
-    Format::new("deepseek_v4_1")
+    Format::new("deepseek_v4.1")
         .terminal("think_open", "<think>")
         .terminal("think_close", "</think>")
         .terminal("calls_open", "<｜DSML｜ calls>")
