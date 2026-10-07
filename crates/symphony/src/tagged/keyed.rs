@@ -221,7 +221,8 @@ impl Assembler {
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
     /// client. A streamed string's open fragment stays open; everything held comes back as
-    /// `Malformed { UnterminatedRegion }`.
+    /// `Malformed { UnterminatedRegion }`; a call that started still ends, with no bytes of its
+    /// own, as every assembler ends one.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -232,6 +233,12 @@ impl Assembler {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.carried)),
                 why: MalformedReason::UnterminatedRegion,
+            });
+        }
+        if self.started() {
+            out.push(Event::ToolCallEnd {
+                index: self.index,
+                source: Text::default(),
             });
         }
     }

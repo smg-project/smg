@@ -94,6 +94,34 @@ fn deepseek_v4_1() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::deepseek_v4_1(), Declared::default()))
 }
 
+fn keyed_tools() -> Declared {
+    Declared::of(&[Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: value!({"type": "object", "properties": {
+                "city": {"type": "string"},
+                "days": {"type": "integer"},
+                "note": {"type": ["string", "null"]},
+            }}),
+            strict: None,
+        },
+    }])
+}
+
+fn hy4() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::hy4(), keyed_tools()))
+}
+
+fn ling() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::ling(), keyed_tools()))
+}
+
+fn iquest() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::iquest(), keyed_tools()))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -120,6 +148,21 @@ const FORMATS: &[Subject] = &[
         new: seed_oss,
         outputs: SEED_OUTPUTS,
     },
+    Subject {
+        name: "hy4",
+        new: hy4,
+        outputs: HY4_OUTPUTS,
+    },
+    Subject {
+        name: "ling",
+        new: ling,
+        outputs: LING_OUTPUTS,
+    },
+    Subject {
+        name: "iquest",
+        new: iquest,
+        outputs: IQUEST_OUTPUTS,
+    },
 ];
 
 /// Seed-OSS: the tagged syntax under its own markers, a value as Python's repr, and Qwen's
@@ -139,6 +182,48 @@ const SEED_OUTPUTS: &[&str] = &[
     "<seed:tool_call>\n<function=get_weather>\n<parameter=city>\n計画 🌍 \"q\" \\ \n</parameter>\n\
      </function>\n</seed:tool_call>",
     "",
+];
+
+/// Keyed arguments in Hy4's spelling: the recorded shapes, a cut stream, a call without
+/// arguments, prose where a call should be.
+const HY4_OUTPUTS: &[&str] = &[
+    "The user asks.</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather\
+     <arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris\
+     </arg_value:opensource><arg_key:opensource>days</arg_key:opensource>\
+     <arg_value:opensource>3</arg_value:opensource>\
+     </tool_call:opensource><tool_call:opensource>get_weather</tool_call:opensource>\
+     </tool_calls:opensource>",
+    "</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather\
+     <arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Par",
+    "</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather\
+     <arg_key:opensource>note</arg_key:opensource><arg_value:opensource>null</arg_value:opensource>\
+     <arg_key:opensource>extra</arg_key:opensource><arg_value:opensource>[1, 2]\
+     </arg_value:opensource>\
+     </tool_call:opensource></tool_calls:opensource>",
+    "</think:opensource><tool_calls:opensource>prose<tool_call:opensource></tool_call:opensource>\
+     </tool_calls:opensource>",
+    "</think:opensource>Hello!",
+];
+
+/// Keyed arguments in Ling's spelling, with its newlines.
+const LING_OUTPUTS: &[&str] = &[
+    "</think><tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\
+     <arg_key>days</arg_key>\n<arg_value>3</arg_value>\n</tool_call>\n<tool_call>get_weather\n\
+     </tool_call>",
+    "</think><tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par",
+    "</think><tool_call>get_weather\n<arg_key>q</arg_key>\n<arg_value>計画 🌍 \"q\" \\ \n\
+     </arg_value>\n</tool_call>",
+    "<think>plan</think>Sure.<tool_call>\n</tool_call>",
+];
+
+/// Keyed arguments in IQuest's spelling, with no whitespace.
+const IQUEST_OUTPUTS: &[&str] = &[
+    "</think><iquest_tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+     <arg_key>days</arg_key><arg_value>3</arg_value></iquest_tool_call><iquest_tool_call>\
+     get_weather</iquest_tool_call>",
+    "</think><iquest_tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+    "</think><iquest_tool_call><arg_key>city</arg_key><arg_value>Paris</arg_value>\
+     </iquest_tool_call>",
 ];
 
 /// Outputs in DeepSeek's DSML: the recorded shapes, and the cuts and faults the assembler and the
