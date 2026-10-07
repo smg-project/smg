@@ -203,6 +203,9 @@ const HY4_OUTPUTS: &[&str] = &[
     "</think:opensource><tool_calls:opensource>prose<tool_call:opensource></tool_call:opensource>\
      </tool_calls:opensource>",
     "</think:opensource>Hello!",
+    "</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather\
+     <arg_key:opensource>city</arg_key:opensource><arg_value:opensource>a <</tool_call:opensource>\
+     </tool_calls:opensource>",
 ];
 
 /// Keyed arguments in Ling's spelling, with its newlines.
@@ -214,6 +217,8 @@ const LING_OUTPUTS: &[&str] = &[
     "</think><tool_call>get_weather\n<arg_key>q</arg_key>\n<arg_value>計画 🌍 \"q\" \\ \n\
      </arg_value>\n</tool_call>",
     "<think>plan</think>Sure.<tool_call>\n</tool_call>",
+    "The syntax is:\n\n```\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \
+     \"Paris\"}}\n</tool_call>\n```\n\nThat is all.",
 ];
 
 /// Keyed arguments in IQuest's spelling, with no whitespace.
@@ -223,7 +228,7 @@ const IQUEST_OUTPUTS: &[&str] = &[
      get_weather</iquest_tool_call>",
     "</think><iquest_tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
     "</think><iquest_tool_call><arg_key>city</arg_key><arg_value>Paris</arg_value>\
-     </iquest_tool_call>",
+     <arg_key>days</arg_key><arg_value>3</arg_value></iquest_tool_call>",
 ];
 
 /// Outputs in DeepSeek's DSML: the recorded shapes, and the cuts and faults the assembler and the

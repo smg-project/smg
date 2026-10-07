@@ -145,29 +145,10 @@ mod tests {
                       <tool_calls:opensource> there?<｜hy_start:opensource｜>assistant\
                       <｜hy_middle:opensource｜><think:opensource>\n";
         let output = "The user asks about the tag.</think:opensource>It opens a call.";
-        let mut parser = Engine::new(hy4(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        let events = out.drain();
+        let events = run(prompt, output);
         assert_eq!(events[0], Event::ReasoningStart);
+        assert_eq!(bytes(&events), output);
+        assert!(arguments(&events).is_empty());
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {

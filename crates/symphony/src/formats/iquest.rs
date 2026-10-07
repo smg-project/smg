@@ -135,29 +135,10 @@ mod tests {
         let prompt =
             "user: Why did you print <iquest_tool_call> there?\n<|iquest_assistant|><think>\n";
         let output = "The user asks about the tag.</think>It opens a call.";
-        let mut parser = Engine::new(iquest(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        let events = out.drain();
+        let events = run(prompt, output);
         assert_eq!(events[0], Event::ReasoningStart);
+        assert_eq!(bytes(&events), output);
+        assert!(arguments(&events).is_empty());
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {

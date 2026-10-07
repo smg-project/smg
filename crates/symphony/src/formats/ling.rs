@@ -135,29 +135,10 @@ mod tests {
         // content (smg #2842, Alex's probe with the rendered prompt).
         let prompt = "user: Why did you print <tool_call> there?\n<role>ASSISTANT</role><think>\n";
         let output = "The user asks about the tag.</think>It opens a call.";
-        let mut parser = Engine::new(ling(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        let events = out.drain();
+        let events = run(prompt, output);
         assert_eq!(events[0], Event::ReasoningStart);
+        assert_eq!(bytes(&events), output);
+        assert!(arguments(&events).is_empty());
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {

@@ -389,7 +389,7 @@ impl Family {
     /// The probe cases known to differ under this syntax: the code fence holds the JSON syntax,
     /// which the JSON assembler reads as a call and the tagged one reports as text between a
     /// call's tags.
-    fn known_differences(self, prompt: GenerationPrompt) -> &'static [KnownDifference] {
+    fn known_differences(self, prompt: GenerationPrompt) -> Vec<KnownDifference> {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
@@ -403,10 +403,10 @@ impl Family {
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
         // read; that case falls under the reasoning allowance instead of the list.
-        match prompt {
-            GenerationPrompt::Plain => list.get(1..).unwrap_or(&[]),
-            _ => list,
-        }
+        list.iter()
+            .copied()
+            .filter(|known| prompt != GenerationPrompt::Plain || known.id != REASONING_PROBE.id)
+            .collect()
     }
 
     /// The corpus classes this syntax meets in sets recorded before bellwether refused them,
@@ -512,6 +512,7 @@ enum Allowance {
 /// A case known to differ from the reference beyond the separator bytes: why, and what the parser
 /// says instead, its call count and finish reason, so that the list allows that difference and no
 /// other. `id` is the case's id after the slug, so one list serves every slug it names.
+#[derive(Clone, Copy)]
 struct KnownDifference {
     id: &'static str,
     reason: &'static str,
@@ -520,13 +521,7 @@ struct KnownDifference {
 }
 
 const KNOWN_DIFFERENCES: &[KnownDifference] = &[
-    KnownDifference {
-        id: "parse/reasoning-with-marker-text",
-        reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every marker \
-                 parser does, and the reference keeps the marker as reasoning text (bellwether #16)",
-        calls: 0,
-        finish: "stop",
-    },
+    REASONING_PROBE,
     KnownDifference {
         id: "parse/content-with-marker-in-code-fence",
         reason: "the content holds a complete `<tool_call>` block inside a code fence; the parser makes \
@@ -760,7 +755,7 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
             &fixtures,
             &|fixture| family.engine(slug, fixture),
             &|fixture| prompt.tail(fixture, family),
-            family.known_differences(prompt),
+            &family.known_differences(prompt),
             &family.allowances(slug, prompt),
             family.think_markers(),
         ));

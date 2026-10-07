@@ -34,7 +34,7 @@
 use crate::tagged::keyed;
 
 /// How the model writes a call between the call markers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallSyntax {
     /// One JSON object, `{"name": …, "arguments": {…}}`: Qwen3.
     Json,
