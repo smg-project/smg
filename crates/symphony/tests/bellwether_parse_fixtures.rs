@@ -47,18 +47,19 @@ use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
     adapt,
-    formats::{qwen2_5, qwen3},
+    formats::{deepseek_v4_1, qwen2_5, qwen3},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 const SLUG: &str = "qwen3-8b";
-/// bellwether's slugs for the Qwen checkpoints, in its manifests' spelling, each with the table
-/// that reads it and how its template ends the generation prompt. The fixtures carry the request
-/// and the output, not the rendered prompt, so the prompt's tail is stated here until bellwether
-/// records it (noted for Simo in STATE.md). A slug bellwether has not recorded is skipped with a
-/// notice; `qwen3-8b` is the one set bellwether's main always holds, and has its own test.
+/// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
+/// the table that reads it and how its template ends the generation prompt. The fixtures carry
+/// the request and the output, not the rendered prompt, so the prompt's tail is stated here until
+/// bellwether records it (noted for Simo in STATE.md). A slug bellwether has not recorded is
+/// skipped with a notice; `qwen3-8b` is the one set bellwether's main always holds, and has its
+/// own test.
 const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // Qwen3: the model writes its own `<think>`; thinking off closes it in the prompt.
     (
@@ -249,6 +250,12 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen3Tagged,
         GenerationPrompt::Plain,
     ),
+    // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
+    (
+        "deepseek-v4.1-flash",
+        Family::DeepSeekV4_1,
+        GenerationPrompt::OpensTheThought,
+    ),
 ];
 
 /// The table that reads a checkpoint's output.
@@ -260,6 +267,8 @@ enum Family {
     Qwen3Tagged,
     /// [`qwen2_5`].
     Qwen2_5,
+    /// [`deepseek_v4_1`]: DSML, whose parameter tags type their own values.
+    DeepSeekV4_1,
 }
 
 /// How the Qwen tables spell the thought's markers, for the reasoning allowance's guard.
@@ -272,6 +281,7 @@ impl Family {
             Self::Qwen3 => Engine::new(qwen3(CallSyntax::Json), declared),
             Self::Qwen3Tagged => Engine::new(qwen3(CallSyntax::Tagged), declared),
             Self::Qwen2_5 => Engine::new(qwen2_5(), declared),
+            Self::DeepSeekV4_1 => Engine::new(deepseek_v4_1(), declared),
         }
     }
 
@@ -282,6 +292,9 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
+            // DSML's code-fence probe holds Qwen's syntax, which the DSML table never reads as a
+            // call: the fence is content, as the reference says.
+            Self::DeepSeekV4_1 => &KNOWN_TAGGED_DIFFERENCES[..1],
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
         // read; that case falls under the reasoning allowance instead of the list.
@@ -635,7 +648,7 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
     }
     if recorded == 0 {
         eprintln!(
-            "skipping: none of the Qwen slugs is recorded under {}",
+            "skipping: none of the table's slugs is recorded under {}",
             root.display()
         );
     }
