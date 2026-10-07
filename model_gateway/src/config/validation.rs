@@ -950,7 +950,44 @@ impl ConfigValidator {
             DiscoveryConfig::Kubernetes(kubernetes) => {
                 Self::validate_kubernetes_discovery(kubernetes, mode)
             }
+            DiscoveryConfig::File(file) => Self::validate_file_discovery(file, mode),
         }
+    }
+
+    /// The manifest's own contents (worker types against the routing mode
+    /// included) are checked each time it is read, not here: it may not exist
+    /// yet, and it changes while the router runs.
+    fn validate_file_discovery(
+        discovery: &FileDiscoveryConfig,
+        mode: &RoutingMode,
+    ) -> ConfigResult<()> {
+        if discovery.path.as_os_str().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "discovery.path".to_string(),
+                value: String::new(),
+                reason: "File discovery needs a manifest path".to_string(),
+            });
+        }
+
+        if discovery.check_interval_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "discovery.check_interval_secs".to_string(),
+                value: discovery.check_interval_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        let unsupported = match mode {
+            RoutingMode::Regular { .. }
+            | RoutingMode::PrefillDecode { .. }
+            | RoutingMode::EncodePrefillDecode { .. } => return Ok(()),
+            RoutingMode::OpenAI { .. } => "OpenAI",
+            RoutingMode::Anthropic { .. } => "Anthropic",
+            RoutingMode::Gemini { .. } => "Gemini",
+        };
+        Err(ConfigError::ValidationFailed {
+            reason: format!("{unsupported} mode does not support service discovery"),
+        })
     }
 
     fn validate_kubernetes_discovery(
@@ -1870,6 +1907,47 @@ mod tests {
 
         // Should pass validation since service discovery is enabled
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_discovery() {
+        let file = |path: &str, check_interval_secs| {
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: path.into(),
+                check_interval_secs,
+            }))
+        };
+
+        let mut config = regular_mode_config();
+        config.discovery = file("/run/smg/workers.json", 30);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for (discovery, field) in [
+            (file("", 30), "discovery.path"),
+            (
+                file("/run/smg/workers.json", 0),
+                "discovery.check_interval_secs",
+            ),
+        ] {
+            config.discovery = discovery;
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::InvalidValue { field: ref actual, .. }) if actual == field
+            ));
+        }
+
+        let mut openai = RouterConfig {
+            mode: RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            ..Default::default()
+        };
+        openai.discovery = file("/run/smg/workers.json", 30);
+        assert!(matches!(
+            ConfigValidator::validate(&openai),
+            Err(ConfigError::ValidationFailed { ref reason })
+                if reason.contains("does not support service discovery")
+        ));
     }
 
     #[test]

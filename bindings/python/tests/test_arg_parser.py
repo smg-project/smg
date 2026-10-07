@@ -37,6 +37,8 @@ class TestRouterArgs:
         assert args.service_discovery is False
         assert args.discovery_provider is None
         assert args.selected_discovery_provider() is None
+        assert args.discovery_file is None
+        assert args.discovery_check_interval_secs is None
         assert args.selector == {}
         assert args.service_discovery_port == 80
         assert args.service_discovery_namespace is None
@@ -1023,6 +1025,23 @@ class TestParseRouterArgs:
         assert router_args.selected_discovery_provider() == "kubernetes"
         assert router_args.selector == {"app": "worker"}
 
+    def test_parse_discovery_provider_file(self):
+        """The file provider's flags parse into RouterArgs."""
+        router_args = parse_router_args(
+            [
+                "--discovery-provider",
+                "file",
+                "--discovery-file",
+                "/run/smg/workers.json",
+                "--discovery-check-interval-secs",
+                "5",
+            ]
+        )
+
+        assert router_args.selected_discovery_provider() == "file"
+        assert router_args.discovery_file == "/run/smg/workers.json"
+        assert router_args.discovery_check_interval_secs == 5
+
     def test_service_discovery_and_discovery_provider_are_exclusive(self):
         """Both spellings of one choice is a usage error, not a precedence rule."""
         with pytest.raises(SystemExit):
@@ -1782,6 +1801,8 @@ class TestRouterArgsFieldOrder:
         "mesh_tls_cert",
         "mesh_tls_key",
         "tokenizer_cache_l0_max_memory",
+        "discovery_file",
+        "discovery_check_interval_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

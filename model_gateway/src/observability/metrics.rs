@@ -721,6 +721,10 @@ pub(crate) fn init_metrics() {
         "smg_discovery_workers_discovered",
         "Workers known via discovery by source"
     );
+    describe_counter!(
+        "smg_discovery_snapshot_errors_total",
+        "Discovery source observations rejected, by source and reason"
+    );
 
     // Layer 5: MCP metrics
     describe_counter!(
@@ -2328,6 +2332,17 @@ impl Metrics {
             "source" => source
         )
         .set(count as f64);
+    }
+
+    /// Record a discovery source observation that was rejected; the provider
+    /// keeps reconciling its last good snapshot meanwhile
+    pub fn record_discovery_snapshot_error(source: &'static str, reason: &'static str) {
+        counter!(
+            "smg_discovery_snapshot_errors_total",
+            "source" => source,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     // ========================================================================

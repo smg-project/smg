@@ -302,16 +302,81 @@ class TestRouterInitialization:
         from_args to pass it on: that must not start the router without
         discovery.
         """
-        args = RouterArgs(discovery_provider="file")
+        args = RouterArgs(discovery_provider="consul")
 
         with (
-            patch("smg.router_args.DISCOVERY_PROVIDER_CHOICES", ["kubernetes", "file"]),
+            patch(
+                "smg.router_args.DISCOVERY_PROVIDER_CHOICES",
+                ["kubernetes", "file", "consul"],
+            ),
             patch("smg.router._Router") as rust_router,
-            pytest.raises(ValueError, match="cannot pass discovery provider 'file'"),
+            pytest.raises(ValueError, match="cannot pass discovery provider 'consul'"),
         ):
             Router.from_args(args)
 
         rust_router.assert_not_called()
+
+    def test_from_args_passes_the_file_provider_as_a_discovery_mapping(self):
+        """The file provider reaches Rust through the tagged `discovery` mapping."""
+        args = RouterArgs(
+            discovery_provider="file",
+            discovery_file="/run/smg/workers.json",
+            worker_urls=["http://worker:8000"],
+        )
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["discovery"] == {"provider": "file", "path": "/run/smg/workers.json"}
+        assert kwargs["service_discovery"] is False
+        assert kwargs["worker_urls"] == []
+        for key in ("discovery_provider", "discovery_file", "discovery_check_interval_secs"):
+            assert key not in kwargs
+
+        args.discovery_check_interval_secs = 5
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+        assert rust_router.call_args.kwargs["discovery"]["check_interval_secs"] == 5
+
+    @pytest.mark.parametrize(
+        "args, message",
+        [
+            (RouterArgs(discovery_provider="file"), "needs discovery_file"),
+            (RouterArgs(discovery_file="/run/smg/workers.json"), "apply only to"),
+            (RouterArgs(discovery_check_interval_secs=5), "apply only to"),
+            (
+                RouterArgs(service_discovery=True, discovery_file="/run/smg/workers.json"),
+                "apply only to",
+            ),
+        ],
+    )
+    def test_from_args_rejects_an_incomplete_file_provider(self, args, message):
+        """The file flags only configure the file provider, which needs a manifest."""
+        with (
+            patch("smg.router._Router") as rust_router,
+            pytest.raises(ValueError, match=message),
+        ):
+            Router.from_args(args)
+
+        rust_router.assert_not_called()
+
+    def test_discovery_provider_file_enables_igw(self):
+        """IGW follows the file provider the same way it follows Kubernetes."""
+        args = RouterArgs(discovery_provider="file", discovery_file="/run/smg/workers.json")
+
+        with patch("smg.launch_router.Router") as router_mod:
+            captured_args = {}
+
+            def fake_from_args(router_args):
+                captured_args["enable_igw"] = router_args.enable_igw
+                return MagicMock()
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
+
+            launch_router(args)
+
+        assert captured_args["enable_igw"] is True
 
     def test_router_initialization_with_retry_config(self):
         """Test router initialization with retry configuration."""
