@@ -1119,6 +1119,50 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+
+        // A prompt that moves the engine out of that state drops the call the start opened: the
+        // output is content, and no call is counted.
+        let table = Format::new("bare")
+            .terminal("end", "<end>")
+            .state("call", Emits::Arguments)
+            .state("content", Emits::Content)
+            .transition("call", "end", "content")
+            .calls(CallSyntax::Json);
+        let mut parser = Engine::new(table, Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: "<end>",
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: "Hello.",
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        assert_eq!(events[0], Event::Content(Text::uncounted("Hello.")));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 0, .. })
+        ));
     }
 
     #[test]

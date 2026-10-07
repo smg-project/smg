@@ -17,6 +17,9 @@
 //! - The template's separator bytes stay where the model put them: the newline after `<think>`, the
 //!   two after `</think>`, and so on are reasoning or content, not dropped. Whether they should be
 //!   is bellwether #17; `Dropped { Whitespace }` exists for the other answer.
+//! - A table whose first state emits arguments starts inside a call (a bare list of calls, with
+//!   no marker before it): the engine opens the call at construction, and the prompt's replay
+//!   drops it when the prompt moves the engine out of that state.
 //! - A terminal with no transition from the current state is text, as the model wrote it:
 //!   `</think>` in content is content. A terminal inside a code fence, or inside a string in a
 //!   call's arguments, is a terminal, as for every parser that reads markers: `</tool_call>` in an
@@ -49,7 +52,8 @@
 //! inside the thought, with `ReasoningStart` pushed for the prompt, and its first `</think>`
 //! closes it; Qwen3 writes its own `<think>`; and a prompt that disables thinking ends with
 //! `<think>\n\n</think>\n\n`, which leaves the engine in content. A prompt that leaves an
-//! arguments state open is read as content for now (a prefilled call is a later step).
+//! arguments state open is read as content for now (a prefilled call is a later step), unless
+//! the table's first state is one, in which case the output starts inside the call.
 //!
 //! [`Declared`]: crate::tagged::Declared
 
@@ -334,6 +338,9 @@ impl Engine {
             }
         }
         if self.format.emits(state) != Emits::Arguments {
+            // A call opened at construction, for a table whose first state emits arguments, is
+            // dropped when the prompt moves the engine out of that state.
+            self.call = None;
             self.enter(state, out);
         }
     }
