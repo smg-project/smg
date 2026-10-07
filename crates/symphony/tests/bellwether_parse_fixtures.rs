@@ -47,7 +47,7 @@ use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
     adapt,
-    formats::{deepseek_v4_1, qwen2_5, qwen3},
+    formats::{deepseek_v4_1, qwen2_5, qwen3, seed_oss},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -256,6 +256,50 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::DeepSeekV4_1,
         GenerationPrompt::OpensTheThought,
     ),
+    // Other families that write Qwen's syntaxes, each as its own template spells the thought.
+    (
+        "webworld-32b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "webworld-14b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "k-exaone-236b-a23b",
+        Family::Qwen3,
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("hermes-4-14b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("granite-4.1-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("ai21-jamba2-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    (
+        "step-3.5-flash",
+        Family::Qwen3Tagged,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "nanbeige4.2-3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "mimo-v2.5",
+        Family::Qwen3Tagged,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "nvidia-nemotron-3-nano-30b-a3b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "seed-oss-36b-instruct",
+        Family::SeedOss,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
 ];
 
 /// The table that reads a checkpoint's output.
@@ -269,6 +313,8 @@ enum Family {
     Qwen2_5,
     /// [`deepseek_v4_1`]: DSML, whose parameter tags type their own values.
     DeepSeekV4_1,
+    /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
+    SeedOss,
 }
 
 /// How the Qwen tables spell the thought's markers, for the reasoning allowance's guard.
@@ -282,6 +328,7 @@ impl Family {
             Self::Qwen3Tagged => Engine::new(qwen3(CallSyntax::Tagged), declared),
             Self::Qwen2_5 => Engine::new(qwen2_5(), declared),
             Self::DeepSeekV4_1 => Engine::new(deepseek_v4_1(), declared),
+            Self::SeedOss => Engine::new(seed_oss(), declared),
         }
     }
 
@@ -292,12 +339,15 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
+            // Seed-OSS reads neither of the probes' Qwen markers: `</think>` stays reasoning text
+            // and the fenced `<tool_call>` block stays content, as the reference says.
+            Self::SeedOss => &[],
             Self::DeepSeekV4_1 => KNOWN_DSML_DIFFERENCES,
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
         // read; that case falls under the reasoning allowance instead of the list.
         match prompt {
-            GenerationPrompt::Plain => &list[1..],
+            GenerationPrompt::Plain => list.get(1..).unwrap_or(&[]),
             _ => list,
         }
     }
@@ -311,7 +361,7 @@ impl Family {
             return Vec::new();
         }
         let mut allowed = Vec::new();
-        if self == Self::Qwen3Tagged {
+        if matches!(self, Self::Qwen3Tagged | Self::SeedOss) {
             allowed.push(Allowance::DeclaredTypeConflict);
         }
         if prompt == GenerationPrompt::Plain {
