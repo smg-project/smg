@@ -47,7 +47,9 @@ use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
     adapt,
-    formats::{deepseek_v4_1, hy4, iquest, lfm2_5, ling, olmo3, qwen2_5, qwen3, seed_oss, xlam},
+    formats::{
+        deepseek_v4_1, hy4, iquest, lfm2_5, ling, minimax_m3, olmo3, qwen2_5, qwen3, seed_oss, xlam,
+    },
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -329,6 +331,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Xlam,
         GenerationPrompt::Plain,
     ),
+    // An XML tree of arguments behind a separator token; the model writes the thought or closes
+    // an empty one, and the generation prompt adds nothing.
+    (
+        "minimax-m3",
+        Family::MinimaxM3,
+        GenerationPrompt::ModelDecides,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -368,6 +377,8 @@ enum Family {
     Lfm2_5,
     /// [`xlam`]: a bare JSON list of calls.
     Xlam,
+    /// [`minimax_m3`]: an XML tree of arguments, typed by the request tools at every depth.
+    MinimaxM3,
 }
 
 impl Family {
@@ -377,6 +388,7 @@ impl Family {
         match self {
             Self::SeedOss => ("<seed:think>", "</seed:think>"),
             Self::Hy4 => ("<think:opensource>", "</think:opensource>"),
+            Self::MinimaxM3 => ("<mm:think>", "</mm:think>"),
             _ => ("<think>", "</think>"),
         }
     }
@@ -404,6 +416,7 @@ impl Family {
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
+            Self::MinimaxM3 => minimax_m3(),
         }
     }
 
@@ -423,6 +436,7 @@ impl Family {
             // `<tool_call>`.
             Self::Ling => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 => KNOWN_REASONING_PROBE,
+            Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
         // read; that case falls under the reasoning allowance instead of the list.
@@ -456,6 +470,10 @@ impl Family {
         if self == Self::Xlam {
             allowed.push(Allowance::ContentNotWritten);
         }
+        if self == Self::MinimaxM3 {
+            allowed.push(Allowance::DeclaredTypeConflict);
+            allowed.push(Allowance::NullNotWritten);
+        }
         allowed
     }
 }
@@ -476,6 +494,10 @@ enum GenerationPrompt {
     /// Qwen3-Coder, Qwen2.5 and the instruct variants: `<|im_start|>assistant\n` and nothing more;
     /// the template has no thought.
     Plain,
+    /// MiniMax M3: nothing, whatever the request says (the template reads `thinking_mode`, which
+    /// the requests do not set), and the template has a thought: the model writes `<mm:think>`
+    /// itself or closes an empty thought with `</mm:think>` at once.
+    ModelDecides,
 }
 
 impl GenerationPrompt {
@@ -484,7 +506,9 @@ impl GenerationPrompt {
     fn tail(self, fixture: &Fixture, family: Family) -> String {
         let (open, close) = family.think_markers();
         match (self, fixture.request.thinking_off()) {
-            (Self::Plain, _) | (Self::ModelWritesTheThought, false) => String::new(),
+            (Self::Plain | Self::ModelDecides, _) | (Self::ModelWritesTheThought, false) => {
+                String::new()
+            }
             (Self::OpensTheThought | Self::ModelWritesTheThought, true) => {
                 format!("{open}\n\n{close}\n\n")
             }
@@ -537,6 +561,12 @@ enum Allowance {
     /// them, so the content the reference carries is not in the output: xLAM (bellwether #68
     /// refuses the case now). Allowed only when the output is the list and nothing else.
     ContentNotWritten,
+    /// The template writes no element for an argument whose value is null (`if v is not none`),
+    /// so the null the reference carries is not in the output: MiniMax M3. Allowed only when the
+    /// output holds no element of that name, so a null the parser lost never passes as one the
+    /// template dropped; with the declared-type class allowed too, a member of either class
+    /// passes.
+    NullNotWritten,
 }
 
 /// A case known to differ from the reference beyond the separator bytes: why, and what the parser
@@ -591,6 +621,12 @@ const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[REASONING_PROBE, FENCE_PR
 /// probe differs: the fence holds Qwen's syntax, which the table never reads as a call, so it is
 /// content, as the reference says.
 const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
+
+/// Under the MiniMax M3 table only the code-fence probe differs: the fence holds `<tool_call>`,
+/// which this table reads as the block's opening, so the JSON inside is text between calls and the
+/// markers are dropped; the reference keeps the fence as content. The reasoning probe's `</think>`
+/// is not this family's marker, so it stays reasoning text, as the reference says.
+const KNOWN_M3_DIFFERENCES: &[KnownDifference] = &[FENCE_PROBE];
 
 /// The case's id after its slug: what [`KnownDifference::id`] names.
 fn after_slug(id: &str) -> &str {
@@ -896,6 +932,7 @@ fn parity(
                 Allowance::ReasoningNotWritten => "allowed: reasoning not written (corpus)",
                 Allowance::CallsNotWritten => "allowed: calls not written (corpus)",
                 Allowance::ContentNotWritten => "allowed: content not written (corpus)",
+                Allowance::NullNotWritten => "allowed: null not written (corpus)",
             }
         } else {
             failures.push(format!(
@@ -987,7 +1024,62 @@ fn allowance_for(
                     },
                 )
         }
+        Allowance::NullNotWritten => {
+            let types_too = allowed.contains(&Allowance::DeclaredTypeConflict);
+            said.content == expected.content
+                && said.reasoning == expected.reasoning
+                && said.finish == expected.finish
+                && said.calls.len() == expected.calls.len()
+                && said.calls.iter().zip(&expected.calls).all(
+                    |((name, arguments), (expected_name, expected_arguments))| {
+                        name == expected_name
+                            && differs_at_most_in_null_members(
+                                arguments,
+                                expected_arguments,
+                                text,
+                                types_too,
+                            )
+                    },
+                )
+        }
     })
+}
+
+/// Whether `said` is `expected` less the members whose value is null, none of which the output
+/// `text` writes an element for; with `types_too`, a member that differs only in its declared
+/// type's spelling passes as well.
+fn differs_at_most_in_null_members(
+    said: &str,
+    expected: &str,
+    text: &str,
+    types_too: bool,
+) -> bool {
+    let (Ok(said), Ok(expected)) = (
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(said),
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(expected),
+    ) else {
+        return false;
+    };
+    if !said.keys().all(|key| expected.contains_key(key)) {
+        return false;
+    }
+    for (key, reference) in &expected {
+        match said.get(key) {
+            Some(value) if value == reference => {}
+            Some(serde_json::Value::String(spelled)) if types_too && !reference.is_string() => {
+                if ![reference.to_string(), python_spelling(reference)].contains(spelled) {
+                    return false;
+                }
+            }
+            Some(_) => return false,
+            None => {
+                if !reference.is_null() || text.contains(&format!("<{key}>")) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Whether two arguments objects differ at most in members where `said` holds a string spelling

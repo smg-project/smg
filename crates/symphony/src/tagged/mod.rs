@@ -11,12 +11,14 @@
 //! streaming a declared string as it arrives and writing every other value at its close; [`dsml`]
 //! does the same for one DeepSeek DSML invoke, whose `string` attribute types each value; and
 //! [`keyed`] for one call written as its name and `<arg_key>`/`<arg_value>` pairs (GLM, Hy4,
-//! Ling, IQuest), typed by the request's tools again.
+//! Ling, IQuest), typed by the request's tools again; and [`xml`] for one MiniMax M3 invoke, whose
+//! arguments are an XML tree, typed by the request's tools at every depth.
 
 pub mod assembler;
 pub mod dsml;
 pub mod keyed;
 pub mod value;
+pub mod xml;
 
 pub use assembler::Assembler;
 pub use value::{json, Declared, Kind};

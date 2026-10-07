@@ -444,7 +444,7 @@ impl Assembler {
             Some(Kind::NullableString) => Mode::Undecided {
                 start: self.carried.len(),
             },
-            Some(Kind::Integer) | None => Mode::Whole {
+            Some(Kind::Integer | Kind::Array | Kind::Object) | None => Mode::Whole {
                 start: self.carried.len(),
             },
         };

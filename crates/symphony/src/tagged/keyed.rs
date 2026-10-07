@@ -390,7 +390,7 @@ impl Assembler {
         let mode = match kind {
             Some(Kind::String) => Mode::Streaming { opened: false },
             Some(Kind::NullableString) => Mode::Undecided,
-            Some(Kind::Integer) | None => Mode::Whole,
+            Some(Kind::Integer | Kind::Array | Kind::Object) | None => Mode::Whole,
         };
         self.stage = Stage::Value(ValueState {
             key,

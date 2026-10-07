@@ -18,6 +18,9 @@
 //!   the next. The terminal itself is `Dropped { Wrapper }` on a transition.
 //! - The **call syntax** says how the model writes a call inside an arguments state, and the
 //!   assembler for it. A format with no arguments state has none.
+//! - An **ignored terminal** is a spelling the engine drops wherever it stands, a call's arguments
+//!   included, without moving: the separator token MiniMax M3's template writes before every tag.
+//!   No transition can name it.
 //!
 //! The first state in the table is where an output starts, unless the prompt moved the engine
 //! before the output began: the engine replays the prompt's terminals over the same table, from
@@ -59,6 +62,11 @@ pub enum CallSyntax {
     /// an arguments state entered at the output's start, and the assembler decides at the first
     /// byte that is not whitespace.
     JsonList,
+    /// An XML tree of arguments: `<invoke name="…">`, then one element per argument, `<key>` to
+    /// `</key>`, nested for an object and with `<item>` elements for a list, typed by the request's
+    /// tools at every depth: MiniMax M3. The terminal that enters the state is the invoke tag's
+    /// opening, and the one that leaves it is `</invoke>`, which the call's end carries.
+    Xml,
 }
 
 /// What the text inside a state is.
@@ -89,6 +97,8 @@ pub struct Format {
 struct Terminal {
     name: String,
     text: String,
+    /// Dropped wherever it stands, never a move.
+    ignored: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +143,19 @@ impl Format {
         self.terminals.push(Terminal {
             name: name.to_string(),
             text: text.to_string(),
+            ignored: false,
+        });
+        self
+    }
+
+    /// A terminal the engine drops wherever it stands, inside a call's arguments too, without
+    /// moving: a template's separator token. No transition can name it.
+    #[must_use]
+    pub fn ignores(mut self, name: &str, text: &str) -> Self {
+        self.terminals.push(Terminal {
+            name: name.to_string(),
+            text: text.to_string(),
+            ignored: true,
         });
         self
     }
@@ -195,7 +218,7 @@ impl Format {
     fn terminal_named(&self, name: &str) -> usize {
         self.terminals
             .iter()
-            .position(|terminal| terminal.name == name)
+            .position(|terminal| terminal.name == name && !terminal.ignored)
             .unwrap_or_else(|| unknown("terminal", name, &self.name))
     }
 
@@ -207,6 +230,11 @@ impl Format {
     /// The text of terminal `index`.
     pub(crate) fn terminal_text(&self, index: usize) -> &str {
         &self.terminals[index].text
+    }
+
+    /// Whether terminal `index` is one the engine drops wherever it stands.
+    pub(crate) fn ignored(&self, index: usize) -> bool {
+        self.terminals[index].ignored
     }
 
     /// What the text in state `index` is.
@@ -334,6 +362,25 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn an_ignored_terminal_is_scanned_for_and_cannot_be_named_in_a_row() {
+        let format = two_states().ignores("sep", "|");
+        assert_eq!(
+            format.terminal_texts().collect::<Vec<_>>(),
+            ["<a>", "</a>", "|"]
+        );
+        assert!(format.ignored(2));
+        assert!(!format.ignored(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no terminal named \"sep\"")]
+    fn a_transition_on_an_ignored_terminal_is_a_programming_error() {
+        let _ = two_states()
+            .ignores("sep", "|")
+            .transition("content", "sep", "inside");
     }
 
     #[test]

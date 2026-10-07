@@ -134,6 +134,26 @@ fn xlam() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::xlam(), Declared::default()))
 }
 
+fn minimax_m3() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        formats::minimax_m3(),
+        Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "opts": {"type": "object", "properties": {"unit": {"type": "string"}}},
+                }}),
+                strict: None,
+            },
+        }]),
+    ))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -190,6 +210,43 @@ const FORMATS: &[Subject] = &[
         new: xlam,
         outputs: XLAM_OUTPUTS,
     },
+    Subject {
+        name: "minimax m3",
+        new: minimax_m3,
+        outputs: M3_OUTPUTS,
+    },
+];
+
+/// MiniMax M3's syntax: the recorded shape with its separators, the tree's shapes, cut streams,
+/// and text where tags should be.
+const M3_OUTPUTS: &[&str] = &[
+    "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"get_weather\">]<]minimax[>[\
+     <city>Paris]<]minimax[>[</city>]<]minimax[>[<days>3]<]minimax[>[</days>]<]minimax[>[\
+     <tags>]<]minimax[>[<item>a]<]minimax[>[</item>]<]minimax[>[<item>b]<]minimax[>[</item>\
+     ]<]minimax[>[</tags>]<]minimax[>[<opts>]<]minimax[>[<unit>C]<]minimax[>[</unit>]<]minimax[>[\
+     </opts>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+    "<mm:think>A plan.</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"f\">\
+     ]<]minimax[>[<pts>]<]minimax[>[<item>]<]minimax[>[<x>1</x>]<]minimax[>[<y>2.5</y>\
+     ]<]minimax[>[</item>]<]minimax[>[</pts>]<]minimax[>[<empty>]<]minimax[>[</empty>\
+     ]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"g\">]<]minimax[>[</invoke>\n\
+     ]<]minimax[>[</tool_call>",
+    "</mm:think><tool_call>\n<invoke name=\"get_weather\"><city>Par",
+    "</mm:think><tool_call>\n<invoke name=\"get_weather\"><opts><unit>C</unit><days>3",
+    "</mm:think><tool_call>\n<invoke name=\"f\"><a>x</a><invoke name=\"g\"><b>y</b></invoke>\n\
+     </tool_call>",
+    "</mm:think><tool_call>\n<invoke name=\"f\"><opts><a>1</a><b>tex</tool_call>Sunny.",
+    "<tool_call>\n<invoke name=\"f\"><expr>a < b and c > d</expr>junk<n>1</n><q>a <b> c</q>\
+     </x></invoke>\n</tool_call>",
+    "<tool_call>\n<invoke name=\"get_weather\"><city> </city><año>2024</año><opts><deep><item>\
+     </item><item>x</item></deep></opts><tags><item><item>a</item></item></tags></invoke>\n\
+     </tool_call>",
+    "<tool_call>\n<invoke name=\"\"><a>1</a></invoke>\n<invoke name=\"g\"></invoke>\n</tool_call>",
+    "<tool_call>\n<invoke name=\"f\" x=\"y\"><a>1</a></invoke>\n</tool_call>",
+    "<tool_call>\nprose where an invoke should be\n</tool_call>",
+    "</mm:think>Hello, no call.]<]minimax[>[ And a stray separator.",
+    "Plain prose with no marker at all.",
+    "<mm:think>Only a thought.",
+    "",
 ];
 
 /// A bare JSON list of calls, or prose.

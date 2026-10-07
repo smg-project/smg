@@ -64,6 +64,10 @@ use serde_json::Value;
 /// for a null argument.
 pub(crate) const NULL_WORDS: [&str; 2] = ["null", "None"];
 
+/// The path segment that selects an array's items in [`Declared::kind_at`]: the tag MiniMax M3
+/// writes around each element of a list.
+pub(crate) const ITEM: &str = "item";
+
 /// The type a tool declares for one parameter, of the types that change how its text is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -74,12 +78,18 @@ pub enum Kind {
     NullableString,
     /// A schema that admits `integer` and nothing else.
     Integer,
+    /// A schema that admits `array` and nothing else. [`json`] infers such a value as it does an
+    /// undeclared one; the kind is for an XML element with no child, which is `[]` under it.
+    Array,
+    /// A schema that admits `object` and nothing else; an XML element with no child is `{}` under
+    /// it.
+    Object,
 }
 
 impl Kind {
     /// The kind a parameter's schema declares. A schema that admits a string declares a string,
-    /// nullable when it admits `null` too; one that admits an integer alone declares an integer;
-    /// any other schema declares nothing here.
+    /// nullable when it admits `null` too; one that admits an integer, an array or an object alone
+    /// declares that; any other schema declares nothing here.
     fn of(schema: &Value) -> Option<Self> {
         let mut admitted = Vec::new();
         admitted_types(schema, &mut admitted);
@@ -91,6 +101,10 @@ impl Kind {
             })
         } else if admitted == ["integer"] {
             Some(Self::Integer)
+        } else if admitted == ["array"] {
+            Some(Self::Array)
+        } else if admitted == ["object"] {
+            Some(Self::Object)
         } else {
             None
         }
@@ -138,6 +152,8 @@ fn admitted_types<'a>(schema: &'a Value, into: &mut Vec<&'a str>) {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Declared {
     functions: HashMap<String, HashMap<String, Kind>>,
+    /// Each function's `parameters` schema, for a kind below the top level.
+    schemas: HashMap<String, Value>,
 }
 
 impl Declared {
@@ -145,17 +161,36 @@ impl Declared {
     /// first one's parameters count.
     pub fn of(tools: &[Tool]) -> Self {
         let mut functions = HashMap::new();
+        let mut schemas = HashMap::new();
         for tool in tools {
             functions
                 .entry(tool.function.name.clone())
                 .or_insert_with(|| parameters_of(&tool.function.parameters));
+            schemas
+                .entry(tool.function.name.clone())
+                .or_insert_with(|| tool.function.parameters.clone());
         }
-        Self { functions }
+        Self { functions, schemas }
     }
 
     /// The kind `function` declares for `parameter`, if it declares one.
     pub fn kind(&self, function: &str, parameter: &str) -> Option<Kind> {
         self.functions.get(function)?.get(parameter).copied()
+    }
+
+    /// The kind `function` declares at `path` below its parameters, for a value inside another: a
+    /// key selects that property's schema, `item` the schema of an array's items. Nothing when the
+    /// path leads nowhere in the schema.
+    pub fn kind_at(&self, function: &str, path: &[&str]) -> Option<Kind> {
+        let mut schema = self.schemas.get(function)?;
+        for segment in path {
+            schema = if *segment == ITEM {
+                schema.get("items")?
+            } else {
+                schema.get("properties")?.get(*segment)?
+            };
+        }
+        Kind::of(schema)
     }
 }
 
@@ -183,7 +218,7 @@ pub fn json(text: &str, kind: Option<Kind>) -> String {
         Some(Kind::Integer) => integer(text.trim())
             .filter(|integer| reads_back_as_an_argument(integer))
             .unwrap_or_else(|| inferred(text)),
-        None => inferred(text),
+        Some(Kind::Array | Kind::Object) | None => inferred(text),
     }
 }
 
@@ -589,14 +624,14 @@ mod tests {
                 "listed": {"type": ["string", "null"], "enum": ["a", "b"]},
             }),
         )]);
-        assert_eq!(declared.kind("f", "members"), None);
+        assert_eq!(declared.kind("f", "members"), Some(Kind::Array));
         assert_eq!(declared.kind("f", "counted"), Some(Kind::Integer));
         assert_eq!(declared.kind("f", "named"), Some(Kind::String));
         assert_eq!(declared.kind("f", "listed"), Some(Kind::NullableString));
     }
 
     #[test]
-    fn an_integer_is_declared_alone_and_every_other_schema_declares_nothing() {
+    fn an_integer_an_array_or_an_object_alone_is_declared_and_every_other_schema_nothing() {
         let declared = Declared::of(&[tool(
             "f",
             value!({
@@ -621,11 +656,11 @@ mod tests {
             }),
         )]);
         assert_eq!(declared.kind("f", "count"), Some(Kind::Integer));
+        assert_eq!(declared.kind("f", "points"), Some(Kind::Array));
+        assert_eq!(declared.kind("f", "style"), Some(Kind::Object));
         for parameter in [
             "ratio",
             "on",
-            "points",
-            "style",
             "nothing",
             "optional_count",
             "untyped",
@@ -639,6 +674,41 @@ mod tests {
         ] {
             assert_eq!(declared.kind("f", parameter), None, "{parameter}");
         }
+    }
+
+    #[test]
+    fn a_kind_below_the_top_level_follows_properties_and_items() {
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                "recipients": {"type": "array", "items": {"type": "string"}},
+                "points": {"type": "array", "items": {"type": "object", "properties": {
+                    "x": {"type": "integer"}, "tags": {"type": "array"}}}},
+                "options": {"type": "object", "properties": {"id": {"type": "string"}}},
+                "loose": {"type": "object"},
+            }),
+        )]);
+        assert_eq!(declared.kind_at("f", &["recipients"]), Some(Kind::Array));
+        assert_eq!(
+            declared.kind_at("f", &["recipients", "item"]),
+            Some(Kind::String)
+        );
+        assert_eq!(
+            declared.kind_at("f", &["points", "item", "x"]),
+            Some(Kind::Integer)
+        );
+        assert_eq!(
+            declared.kind_at("f", &["points", "item", "tags"]),
+            Some(Kind::Array)
+        );
+        assert_eq!(
+            declared.kind_at("f", &["options", "id"]),
+            Some(Kind::String)
+        );
+        assert_eq!(declared.kind_at("f", &["loose", "anything"]), None);
+        assert_eq!(declared.kind_at("f", &["recipients", "x"]), None);
+        assert_eq!(declared.kind_at("g", &["recipients"]), None);
+        assert_eq!(declared.kind_at("f", &[]), Some(Kind::Object));
     }
 
     #[test]

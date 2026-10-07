@@ -21,6 +21,9 @@
 //!   `</think>` in content is content. A terminal inside a code fence, or inside a string in a
 //!   call's arguments, is a terminal, as for every parser that reads markers: `</tool_call>` in an
 //!   argument's text ends the call there. Bellwether #16 is where that policy is judged.
+//! - A terminal the table ignores (MiniMax M3's separator token) is `Dropped { Wrapper }` wherever
+//!   it stands and moves nothing; inside a call the assembler accounts for it, so that its bytes
+//!   keep their place among the bytes the assembler holds.
 //! - A call region that never closes is finished at the end of the stream: a call with what
 //!   arrived, or the bytes as `Malformed { UnterminatedRegion }`. A region whose closing terminal
 //!   comes before a complete call gives what is left as `Malformed` with a reason that says so,
@@ -54,7 +57,7 @@
 //! [`Declared`]: crate::tagged::Declared
 
 use crate::{
-    event::{DropReason, Event, Events, FinishReason, MalformedReason},
+    event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallSyntax, Emits, Format},
     input::{EngineFinish, Input},
     json,
@@ -104,6 +107,7 @@ enum Call {
     Keyed(tagged::keyed::Assembler),
     Pythonic(pythonic::Assembler),
     JsonList(json::list::Assembler),
+    Xml(tagged::xml::Assembler),
 }
 
 impl Call {
@@ -120,6 +124,7 @@ impl Call {
             }
             Some(CallSyntax::Pythonic) => Self::Pythonic(pythonic::Assembler::new(index)),
             Some(CallSyntax::JsonList) => Self::JsonList(json::list::Assembler::new(index)),
+            Some(CallSyntax::Xml) => Self::Xml(tagged::xml::Assembler::new(index, id)),
         }
     }
 
@@ -143,6 +148,23 @@ impl Call {
                 assembler.feed(text, out);
                 text.len()
             }
+            Self::Xml(assembler) => {
+                assembler.feed(text, declared, out);
+                text.len()
+            }
+        }
+    }
+
+    /// The table's ignored terminal arrived inside the call. The XML assembler keeps its bytes in
+    /// place among the bytes it holds; no other syntax's table ignores a terminal, so for them the
+    /// bytes are dropped where they stand.
+    fn ignored(&mut self, text: &str, declared: &Declared, out: &mut Events) {
+        match self {
+            Self::Xml(assembler) => assembler.ignored(text, declared, out),
+            _ => out.push(Event::Dropped {
+                text: Text::uncounted(text),
+                why: DropReason::Wrapper,
+            }),
         }
     }
 
@@ -179,6 +201,11 @@ impl Call {
             (Self::Pythonic(assembler), Closed::ByEnd) => assembler.finish(out),
             (Self::JsonList(assembler), Closed::ByMarker) => assembler.close(out),
             (Self::JsonList(assembler), Closed::ByEnd) => assembler.finish(out),
+            (Self::Xml(assembler), Closed::ByMarker) => {
+                assembler.close(terminal, out);
+                return true;
+            }
+            (Self::Xml(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }
@@ -291,7 +318,24 @@ impl Engine {
     }
 
     /// A terminal arrived: move where the table says, or keep it as text where the model put it.
+    /// A terminal the table ignores is dropped where it stands, and moves nothing.
     fn terminal(&mut self, index: usize, out: &mut Events) {
+        if self.format.ignored(index) {
+            let text = self.format.terminal_text(index).to_string();
+            if self.emits() == Emits::Arguments {
+                if let Some(call) = &mut self.call {
+                    let mut events = Events::new();
+                    call.ignored(&text, &self.declared, &mut events);
+                    self.push_call_events(events, out);
+                    return;
+                }
+            }
+            out.push(Event::Dropped {
+                text: self.tokens.text(&text),
+                why: DropReason::Wrapper,
+            });
+            return;
+        }
         let Some(next) = self.format.next(self.state, index) else {
             let text = self.format.terminal_text(index).to_string();
             self.text(&text, out);
