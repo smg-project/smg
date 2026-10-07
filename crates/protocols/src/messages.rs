@@ -161,6 +161,23 @@ impl CreateMessageRequest {
     pub fn template_thinking(&self) -> Option<bool> {
         template_thinking(&self.model, self.thinking_toggle(), self.reasoning_effort())
     }
+
+    /// The field the request asks for a structured output format with,
+    /// `output_format` or `output_config.format`, if any; `null` asks for none.
+    pub fn output_format_field(&self) -> Option<&'static str> {
+        let set = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
+        if set(self.other.get("output_format")) {
+            Some("output_format")
+        } else if set(self
+            .output_config
+            .as_ref()
+            .and_then(|config| config.other.get("format")))
+        {
+            Some("output_config.format")
+        } else {
+            None
+        }
+    }
 }
 
 impl GenerationRequest for CreateMessageRequest {
@@ -2329,6 +2346,41 @@ mod tests {
         );
         let back = serde_json::to_value(&request).expect("serializes");
         assert_eq!(back["output_config"], with_format["output_config"]);
+    }
+
+    /// A structured output format is asked for under `output_format` or
+    /// `output_config.format`; `null` under either, an `output_config`
+    /// without `format`, and no field at all ask for none.
+    #[test]
+    fn a_request_names_the_field_its_output_format_comes_under() {
+        let request = |extra: Value| -> CreateMessageRequest {
+            let mut body = json!({"model": "m", "max_tokens": 8, "messages": []});
+            body.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            serde_json::from_value(body).expect("a Messages request")
+        };
+        let format = json!({"type": "json_schema", "schema": {"type": "object"}});
+        assert_eq!(
+            request(json!({"output_format": format})).output_format_field(),
+            Some("output_format")
+        );
+        assert_eq!(
+            request(json!({"output_config": {"format": format}})).output_format_field(),
+            Some("output_config.format")
+        );
+        for extra in [
+            json!({}),
+            json!({"output_format": null}),
+            json!({"output_config": {"format": null}}),
+            json!({"output_config": {"effort": "high"}}),
+        ] {
+            assert_eq!(
+                request(extra.clone()).output_format_field(),
+                None,
+                "{extra}"
+            );
+        }
     }
 
     #[test]
