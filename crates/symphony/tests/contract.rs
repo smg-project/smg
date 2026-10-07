@@ -220,6 +220,12 @@ const FORMATS: &[Subject] = &[
 /// MiniMax M3's syntax: the recorded shape with its separators, the tree's shapes, cut streams,
 /// and text where tags should be.
 const M3_OUTPUTS: &[&str] = &[
+    "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"write_file\">]<]minimax[>[\
+     <path>App.vue]<]minimax[>[</path>]<]minimax[>[<content><template>\n  <div>{{ msg }}</div>\n\
+     </template>\n]<]minimax[>[</content>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+    "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"list_users\">]<]minimax[>[\
+     <$filter>startswith(name, 'A')]<]minimax[>[</$filter>]<]minimax[>[<$top>5]<]minimax[>[</$top>\
+     ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
     "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"get_weather\">]<]minimax[>[\
      <city>Paris]<]minimax[>[</city>]<]minimax[>[<days>3]<]minimax[>[</days>]<]minimax[>[\
      <tags>]<]minimax[>[<item>a]<]minimax[>[</item>]<]minimax[>[<item>b]<]minimax[>[</item>\

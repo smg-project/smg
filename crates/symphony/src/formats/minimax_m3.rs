@@ -148,6 +148,29 @@ mod tests {
         out.drain()
     }
 
+    /// One function with `parameters`, as a request declares it.
+    fn declared(name: &str, parameters: serde_json::Value) -> Declared {
+        Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: name.to_string(),
+                description: None,
+                parameters,
+                strict: None,
+            },
+        }])
+    }
+
+    /// The arguments of the first call, parsed, so a test compares values and not separators.
+    fn arguments(events: &[Event]) -> serde_json::Value {
+        serde_json::from_str(&arguments_of(events, 0)).expect("the arguments are JSON")
+    }
+
+    /// `body` with the template's separator before every tag, as the template writes it.
+    fn separated(body: &str) -> String {
+        body.replace('<', "]<]minimax[>[<")
+    }
+
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
         run_with(Declared::default(), prompt, pieces)
     }
@@ -258,18 +281,20 @@ mod tests {
 
     #[test]
     fn leaves_are_typed_by_the_tools_at_every_depth_and_lists_come_from_items() {
-        let output = concat!(
-            "</mm:think><tool_call>\n<invoke name=\"alert\"><name>12</name><threshold>5.0",
+        let body = concat!(
+            "<name>12</name><threshold>5.0",
             "</threshold><count>007</count><enabled>true</enabled><recipients><item>a@x</item>",
             "<item>b@x</item></recipients><points><item><x>1</x><label>7</label></item></points>",
             "<tags></tags><options></options><extra>12</extra>",
-            // A list of objects whose key is `item`: the declared array decides the shapes.
             "<orders><item><item>burgers</item><quantity>5</quantity></item></orders>",
-            // One space is a value; a key in another script; an empty element under an object
-            // the tool declares nothing below is null, the template's spelling of `None` there.
             "<sep> </sep><año>2024</año><meta><deep><item>1</item><item></item></deep></meta>",
-            "</invoke>\n</tool_call>"
         );
+        let output = format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"alert\">{}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+            separated(body)
+        );
+        let output = output.as_str();
         let events = run_with(tools(), "", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(
@@ -396,8 +421,8 @@ mod tests {
     #[test]
     fn the_blocks_close_ends_an_invoke_left_open_and_the_prose_after_it_stays() {
         let output = concat!(
-            "</mm:think><tool_call>\n<invoke name=\"f\"><opts><a>1</a><b>tex",
-            "</tool_call>The weather is sunny."
+            "</mm:think><tool_call>\n<invoke name=\"f\">]<]minimax[>[<opts>]<]minimax[>[<a>1",
+            "]<]minimax[>[</a><b>tex</tool_call>The weather is sunny."
         );
         let events = run("", &[output]);
         assert_eq!(bytes(&events), output);
@@ -542,5 +567,114 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+    }
+
+    /// The review's probes (smg #2850), each rendered offline by MiniMax M3's template at
+    /// f0e1c1e0 from the reference arguments.
+    #[test]
+    fn a_declared_string_that_starts_with_a_tag_is_its_text() {
+        let vue = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"write_file\">",
+            "]<]minimax[>[<path>App.vue]<]minimax[>[</path>]<]minimax[>[<content><template>\n",
+            "  <div>{{ msg }}</div>\n</template>\n]<]minimax[>[</content>]<]minimax[>[</invoke>\n",
+            "]<]minimax[>[</tool_call>"
+        );
+        let tools = value!({"type": "object", "properties": {
+            "path": {"type": "string"}, "content": {"type": "string"}}});
+        let events = run_with(declared("write_file", tools), "", &[vue]);
+        assert_eq!(bytes(&events), vue);
+        let content = "<template>\n  <div>{{ msg }}</div>\n</template>\n";
+        assert_eq!(
+            arguments(&events),
+            value!({"path": "App.vue", "content": content})
+        );
+        let html = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"send_email\">",
+            "]<]minimax[>[<to>a@b.c]<]minimax[>[</to>]<]minimax[>[<body><p>Hello</p><p>Bye</p>",
+            "]<]minimax[>[</body>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+        );
+        let tools = value!({"type": "object", "properties": {
+            "to": {"type": "string"}, "body": {"type": "string"}}});
+        let events = run_with(declared("send_email", tools), "", &[html]);
+        assert_eq!(
+            arguments(&events),
+            value!({"to": "a@b.c", "body": "<p>Hello</p><p>Bye</p>"})
+        );
+    }
+
+    #[test]
+    fn without_a_declaration_a_tag_opens_a_child_only_after_the_separator() {
+        // The template writes its separator before every tag it writes and never inside a
+        // value, so a tag that follows no separator is the value's text.
+        let text = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"f\">",
+            "]<]minimax[>[<body><p>Hi</p>]<]minimax[>[</body>]<]minimax[>[</invoke>\n",
+            "]<]minimax[>[</tool_call>"
+        );
+        let events = run("", &[text]);
+        assert_eq!(arguments(&events), value!({"body": "<p>Hi</p>"}));
+        let child = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"f\">",
+            "]<]minimax[>[<body>]<]minimax[>[<p>Hi]<]minimax[>[</p>]<]minimax[>[</body>",
+            "]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+        );
+        let events = run("", &[child]);
+        assert_eq!(arguments(&events), value!({"body": {"p": "Hi"}}));
+    }
+
+    #[test]
+    fn a_key_is_any_run_of_characters_without_whitespace_or_angle_brackets() {
+        let odata = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"list_users\">",
+            "]<]minimax[>[<$filter>startswith(name, 'A')]<]minimax[>[</$filter>",
+            "]<]minimax[>[<$top>5]<]minimax[>[</$top>]<]minimax[>[</invoke>\n",
+            "]<]minimax[>[</tool_call>"
+        );
+        let tools = value!({"type": "object", "properties": {
+            "$filter": {"type": "string"}, "$top": {"type": "integer"}}});
+        let events = run_with(declared("list_users", tools), "", &[odata]);
+        assert_eq!(bytes(&events), odata);
+        assert_eq!(
+            arguments(&events),
+            value!({"$filter": "startswith(name, 'A')", "$top": 5})
+        );
+        let mongo = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"find\">",
+            "]<]minimax[>[<collection>users]<]minimax[>[</collection>]<]minimax[>[<filter>",
+            "]<]minimax[>[<age>]<]minimax[>[<$gt>30]<]minimax[>[</$gt>]<]minimax[>[</age>",
+            "]<]minimax[>[</filter>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+        );
+        let tools = value!({"type": "object", "properties": {
+            "collection": {"type": "string"}, "filter": {"type": "object"}}});
+        let events = run_with(declared("find", tools), "", &[mongo]);
+        assert_eq!(
+            arguments(&events),
+            value!({"collection": "users", "filter": {"age": {"$gt": 30}}})
+        );
+    }
+
+    #[test]
+    fn an_empty_member_of_an_undeclared_object_is_an_empty_string_and_an_empty_item_null() {
+        // The template skips a mapping's `None` member, so an empty element under an object
+        // is an empty string; only a list writes `None` as an empty element.
+        let member = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"f\">",
+            "]<]minimax[>[<opts>]<]minimax[>[<unit>]<]minimax[>[</unit>]<]minimax[>[<note>x",
+            "]<]minimax[>[</note>]<]minimax[>[</opts>]<]minimax[>[</invoke>\n",
+            "]<]minimax[>[</tool_call>"
+        );
+        let tools = value!({"type": "object", "properties": {"opts": {"type": "object"}}});
+        let events = run_with(declared("f", tools), "", &[member]);
+        assert_eq!(
+            arguments(&events),
+            value!({"opts": {"unit": "", "note": "x"}})
+        );
+        let item = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"f\">",
+            "]<]minimax[>[<tags>]<]minimax[>[<item>]<]minimax[>[</item>]<]minimax[>[</tags>",
+            "]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+        );
+        let events = run("", &[item]);
+        assert_eq!(arguments(&events), value!({"tags": [null]}));
     }
 }

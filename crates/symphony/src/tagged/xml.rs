@@ -23,24 +23,29 @@
 //!   tag makes it a container: a list when the tool declares an array there or, failing a
 //!   declaration, when the child is an `<item>`, else an object (a list's elements are `<item>`
 //!   elements, but so is a member named `item`, which is why the declaration decides first); no
-//!   child at all makes it empty. A list's items and an object's members are elements in turn, so
-//!   the tree nests as deep as the arguments do. Whitespace right after an opening tag is held
-//!   until the element's next byte says what it is: a leaf's text when text or the closing tag
-//!   follows (a value that is one space is one space), the template's when a child tag follows.
-//! - **A value's type comes from the request's tools at every depth** ([`Declared::kind_at`]: a
-//!   key selects a property, `item` the items of an array). A declared string is its text,
-//!   streamed as it arrives; every other leaf is written whole at its closing tag through
-//!   [`json`], which reads the booleans and numbers the template writes as text and infers the
-//!   rest. An empty element is `[]` or `{}` when the tool declares an array or an object there,
-//!   `""` under any other declared type and at the top level, and `null` below it when nothing
-//!   is declared: the template writes `None` inside a value as an empty element, and leaves a
-//!   top-level argument that is `None` out altogether. Nothing is taken from a value: the
-//!   template writes it directly between the tags, with no escaping.
+//!   child at all makes it empty. A tag under an element the tool declares a string or an
+//!   integer is the leaf's text (a file's `<template>`, an e-mail's `<p>`), and with no
+//!   declaration a tag opens a child only after the template's separator, since the template
+//!   writes the separator before every tag it writes and never inside a value. A list's items
+//!   and an object's members are elements in turn, so the tree nests as deep as the arguments
+//!   do. Whitespace right after an opening tag is held until the element's next byte says what
+//!   it is: a leaf's text when text or the closing tag follows (a value that is one space is one
+//!   space), the template's when a child tag follows.
+//! - **A value's type comes from the request's tools at every depth** ([`Declared::kind_at`]:
+//!   below an object a key selects a property, below an array any element selects its items). A
+//!   declared string is its text, streamed as it arrives; every other leaf is written whole at
+//!   its closing tag through [`json`], which reads the booleans and numbers the template writes
+//!   as text and infers the rest. An empty element is `[]` or `{}` when the tool declares an
+//!   array or an object there, `null` when nothing is declared and it is a list's item, and `""`
+//!   everywhere else: the template writes `None` inside a list as an empty element, skips a
+//!   mapping's `None` member, and leaves a top-level argument that is `None` out altogether.
+//!   Nothing is taken from a value: the template writes it directly between the tags, with no
+//!   escaping.
 //! - **A top-level null is never written.** The template leaves an argument whose value is `None`
 //!   out (`for k, v in arguments.items() if v is not none`), so no output carries one; the
 //!   parity test counts that as a corpus class.
-//! - **A tag is `<`, a name and `>`**, the name made of letters and digits of any script, `_`,
-//!   `-`, `.` and `:`, with a leading `/` for a closing tag. A `<` followed by anything else is
+//! - **A tag is `<`, a name and `>`**, the name any run of characters without whitespace or angle
+//!   brackets, with a leading `/` for a closing tag. A `<` followed by anything else is
 //!   text, so a comparison in a value stays text; a `<` that does spell a tag is one, inside a
 //!   value too, as every marker parser reads it. Inside a leaf, a tag other than the leaf's own
 //!   closing tag is the leaf's text; a closing tag that matches nothing open is reported.
@@ -108,6 +113,9 @@ pub struct Assembler {
     written: u32,
     /// A tag being read: the bytes after its `<`, while they still spell a tag.
     tag: Option<String>,
+    /// Whether the last bytes taken were the table's ignored terminal: the separator the
+    /// template writes before every tag, and never inside a value.
+    after_separator: bool,
     done: bool,
 }
 
@@ -154,10 +162,11 @@ enum Mode {
     Undecided,
 }
 
-/// The characters a tag's name is made of (BFCL's keys hold `ñ`); `/` is allowed anywhere here
-/// and judged when the tag is whole.
+/// The characters a tag's name is made of: anything but whitespace and the angle brackets, since
+/// the template writes any key (BFCL's hold `ñ`, OData's `$filter`, MongoDB's `$gt`); `/` is
+/// allowed anywhere here and judged when the tag is whole.
 fn is_tag_byte(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/')
+    !c.is_whitespace() && !matches!(c, '<' | '>')
 }
 
 impl Assembler {
@@ -175,6 +184,7 @@ impl Assembler {
             open: Vec::new(),
             written: 0,
             tag: None,
+            after_separator: false,
             done: false,
         }
     }
@@ -212,6 +222,7 @@ impl Assembler {
         } else {
             self.carried.push_str(bytes);
         }
+        self.after_separator = true;
     }
 
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
@@ -424,17 +435,33 @@ impl Assembler {
         } else {
             self.open_tag(name, &bytes, declared, out);
         }
+        self.after_separator = false;
     }
 
-    /// An opening tag: inside a leaf it is the leaf's text; under an element with no child yet it
-    /// makes that element a container; then it opens an element of its own.
+    /// An opening tag: inside a leaf it is the leaf's text; under an element with no child yet
+    /// it makes that element a container or a leaf, by what the tool declares there, or, with no
+    /// declaration, by whether the template's separator came before it (the template writes the
+    /// separator before every tag it writes and never inside a value); then it opens an element
+    /// of its own.
     fn open_tag(&mut self, key: &str, bytes: &str, declared: &Declared, out: &mut Events) {
         match self.open.last().map(|element| element.shape) {
             Some(Shape::Leaf(_)) => {
                 self.leaf_text(bytes, out);
                 return;
             }
-            Some(Shape::Open) => self.decide_container(key == ITEM, declared, out),
+            Some(Shape::Open) => {
+                let leaf = match self.kind_here(declared) {
+                    Some(Kind::String | Kind::NullableString | Kind::Integer) => true,
+                    Some(Kind::Array | Kind::Object) => false,
+                    None => !self.after_separator,
+                };
+                if leaf {
+                    self.become_leaf(declared, out);
+                    self.leaf_text(bytes, out);
+                    return;
+                }
+                self.decide_container(key == ITEM, declared, out);
+            }
             Some(Shape::Object | Shape::List) | None => {}
         }
         self.carried.push_str(bytes);
@@ -515,6 +542,7 @@ impl Assembler {
     }
 
     fn text(&mut self, text: &str, declared: &Declared, out: &mut Events) {
+        self.after_separator = false;
         match self.open.last().map(|element| element.shape) {
             Some(Shape::Leaf(_)) => self.leaf_text(text, out),
             Some(Shape::Open) => {
@@ -668,11 +696,21 @@ impl Assembler {
                 fragment
             }
             Shape::Open => {
-                let empty = match (self.kind_here(declared), self.open.len()) {
-                    (Some(Kind::Array), _) => "[]",
-                    (Some(Kind::Object), _) => "{}",
-                    (Some(_), _) | (None, 1) => "\"\"",
-                    (None, _) => "null",
+                // The template writes `None` as an empty element only inside a list; a mapping
+                // skips a `None` member, so an empty element anywhere else is an empty string.
+                let in_list = matches!(
+                    self.open.iter().rev().nth(1),
+                    Some(Element {
+                        shape: Shape::List,
+                        ..
+                    })
+                );
+                let empty = match self.kind_here(declared) {
+                    Some(Kind::Array) => "[]",
+                    Some(Kind::Object) => "{}",
+                    Some(_) => "\"\"",
+                    None if in_list => "null",
+                    None => "\"\"",
                 };
                 let mut fragment = self.prefix();
                 fragment.push_str(empty);
