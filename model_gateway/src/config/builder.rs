@@ -5,9 +5,10 @@ use smg_mcp::McpConfig;
 
 use super::{
     CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MetricsConfig, OracleConfig,
-    PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-    RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MetricsConfig,
+    OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
+    RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig,
+    TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -144,6 +145,8 @@ impl RouterConfigBuilder {
             cache_index: CacheIndexKind::Tree,
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         };
         self
     }
@@ -263,6 +266,32 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_stall_secs(mut self, secs: u64) -> Self {
+        self.config.worker_stall_secs = secs;
+        self
+    }
+
+    pub fn worker_wedge_secs(mut self, secs: u64) -> Self {
+        self.config.worker_wedge_secs = secs;
+        self
+    }
+
+    pub fn worker_warmup(
+        mut self,
+        secs: u64,
+        share: f32,
+        blocks: usize,
+        thin_ratio: f32,
+        divert_every: u64,
+    ) -> Self {
+        self.config.worker_warmup_secs = secs;
+        self.config.worker_warmup_share = share;
+        self.config.worker_warmup_blocks = blocks;
+        self.config.worker_warmup_thin_ratio = thin_ratio;
+        self.config.worker_warmup_divert_every = divert_every;
+        self
+    }
+
     pub fn pd_admission_wait_secs(mut self, secs: u64) -> Self {
         self.config.pd_admission_wait_secs = secs;
         self
@@ -283,6 +312,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_overload_shed(mut self, shed: bool) -> Self {
+        self.config.worker_overload_shed = shed;
+        self
+    }
+
     pub fn worker_overload_token_usage(mut self, threshold: Option<f64>) -> Self {
         self.config.worker_overload_token_usage = threshold;
         self
@@ -295,6 +329,11 @@ impl RouterConfigBuilder {
 
     pub fn kv_indexer_max_entries(mut self, max: Option<usize>) -> Self {
         self.config.kv_indexer_max_entries = max;
+        self
+    }
+
+    pub fn kv_index(mut self, kind: KvIndexKind) -> Self {
+        self.config.kv_index = kind;
         self
     }
 

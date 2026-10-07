@@ -13,6 +13,7 @@ pub mod tls_mock_worker;
 
 // Re-export commonly used test builders
 use std::{
+    collections::HashMap,
     fs,
     future::Future,
     path::PathBuf,
@@ -85,7 +86,10 @@ impl WorkerTestContext {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("test client: {e}"))?;
         let worker_url = self
             .first_worker_url()
             .ok_or_else(|| "No workers available".to_string())?;
@@ -114,7 +118,10 @@ impl WorkerTestContext {
     ) -> Result<Vec<String>, String> {
         use futures_util::StreamExt;
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("test client: {e}"))?;
         let worker_url = self
             .first_worker_url()
             .ok_or_else(|| "No workers available".to_string())?;
@@ -172,6 +179,23 @@ pub struct AppTestContext {
     pub router: Arc<dyn RouterTrait>,
     pub config: RouterConfig,
     pub app_context: Arc<AppContext>,
+    /// The URL each worker bound, in the order the configs were given.
+    pub worker_urls: Vec<String>,
+    /// The port each worker's config named, parallel to `worker_urls`.
+    named_ports: Vec<u16>,
+}
+
+/// Rewrite a URL that names one of the started workers by its configured port
+/// to the address that worker actually bound; any other URL is left alone.
+fn rebind_url(url: &mut String, bound_by_named_port: &HashMap<u16, String>) {
+    let named = url
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok());
+    if let Some(bound) = named.and_then(|port| bound_by_named_port.get(&port)) {
+        url.clone_from(bound);
+    }
 }
 
 impl AppTestContext {
@@ -212,10 +236,21 @@ impl AppTestContext {
         Box::pin(async move {
             let mut workers = Vec::new();
             let mut worker_urls = Vec::new();
+            let mut named_ports = Vec::new();
+            // Workers bind ephemeral ports (see `MockWorker::start`); the
+            // ports the configs name are identities. URLs the router config
+            // spells out with those names are rewritten to the bound
+            // addresses below.
+            let mut bound_by_named_port: HashMap<u16, String> = HashMap::new();
 
             for worker_config in worker_configs {
+                let named_port = worker_config.port;
                 let mut worker = MockWorker::new(worker_config);
                 let url = worker.start().await.unwrap();
+                if named_port != 0 {
+                    bound_by_named_port.insert(named_port, url.clone());
+                }
+                named_ports.push(named_port);
                 worker_urls.push(url);
                 workers.push(worker);
             }
@@ -230,10 +265,46 @@ impl AppTestContext {
                 }
                 | RoutingMode::OpenAI {
                     worker_urls: ref mut urls,
-                } if urls.is_empty() => {
-                    urls.clone_from(&worker_urls);
                 }
-                _ => {}
+                | RoutingMode::Anthropic {
+                    worker_urls: ref mut urls,
+                }
+                | RoutingMode::Gemini {
+                    worker_urls: ref mut urls,
+                } => {
+                    if urls.is_empty() {
+                        urls.clone_from(&worker_urls);
+                    } else {
+                        for url in urls.iter_mut() {
+                            rebind_url(url, &bound_by_named_port);
+                        }
+                    }
+                }
+                RoutingMode::PrefillDecode {
+                    prefill_urls,
+                    decode_urls,
+                    ..
+                } => {
+                    for (url, _) in prefill_urls.iter_mut() {
+                        rebind_url(url, &bound_by_named_port);
+                    }
+                    for url in decode_urls.iter_mut() {
+                        rebind_url(url, &bound_by_named_port);
+                    }
+                }
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls,
+                    prefill_urls,
+                    decode_urls,
+                    ..
+                } => {
+                    for (url, _) in encode_urls.iter_mut().chain(prefill_urls.iter_mut()) {
+                        rebind_url(url, &bound_by_named_port);
+                    }
+                    for url in decode_urls.iter_mut() {
+                        rebind_url(url, &bound_by_named_port);
+                    }
+                }
             }
 
             let app_context = create_test_context(config.clone()).await;
@@ -287,8 +358,25 @@ impl AppTestContext {
                 router,
                 config,
                 app_context,
+                worker_urls,
+                named_ports,
             }
         })
+    }
+
+    /// The URL bound by the worker whose config named `port` (the port a
+    /// test spelled in its `MockWorkerConfig`, not the one actually bound).
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper - panicking on failure is intentional"
+    )]
+    pub fn worker_url_for(&self, port: u16) -> &str {
+        let index = self
+            .named_ports
+            .iter()
+            .position(|named| *named == port)
+            .expect("a worker config named this port");
+        &self.worker_urls[index]
     }
 
     pub fn create_app(&self) -> axum::Router {
@@ -326,7 +414,11 @@ async fn build_test_app_context(
 ) -> Arc<AppContext> {
     use smg_mcp::McpOrchestrator;
 
-    let client = reqwest::Client::new();
+    // See `test_app::create_test_app_context`: no environment proxy in a test's path.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     // Initialize rate limiter
     let rate_limiter = match config.max_concurrent_requests {

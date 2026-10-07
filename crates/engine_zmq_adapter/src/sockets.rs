@@ -34,6 +34,27 @@ pub(crate) fn derive_handshake_port(path: &str) -> u16 {
     20000 + (hash % 10000) as u16
 }
 
+/// The handshake endpoint a ZMQ link binds, as its caller names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handshake<'a> {
+    /// The loopback `tcp://` address derived from the worker's `ipc://` base.
+    Derived,
+    /// A registered worker's `zmq_handshake_address` override: `tcp://` only,
+    /// since the engine dials a TCP handshake and can reach nothing else.
+    Tcp(&'a str),
+    /// A servicer's own engine link: `tcp://`, or an `ipc://` socket for a
+    /// loopback engine (the test harness binds one per test instead of a
+    /// probed port two tests can share).
+    TcpOrIpc(&'a str),
+}
+
+impl<'a> Handshake<'a> {
+    /// A registered worker's handshake: its override, or the derived address.
+    pub fn registered(handshake_override: Option<&'a str>) -> Self {
+        handshake_override.map_or(Self::Derived, Self::Tcp)
+    }
+}
+
 /// Derive the ZMQ socket addresses for a worker from its base URL.
 ///
 /// Mirrors vLLM's headless topology: the **handshake is TCP** (the engine dials
@@ -48,20 +69,23 @@ pub(crate) fn derive_handshake_port(path: &str) -> u16 {
 /// `tcp://127.0.0.1:30500` (its `--data-parallel-address`/
 /// `--data-parallel-rpc-port` defaults, outside the derived 20000..=29999
 /// band), so setting the override to that value pairs a bare
-/// `ts serve --headless` with a manually registered worker.
+/// `ts serve --headless` with a manually registered worker. A servicer's own
+/// link may name an `ipc://` handshake instead ([`Handshake::TcpOrIpc`]): its
+/// engine is on the same host, and the test harness binds one socket per test.
 /// Returns `(handshake, input, output)`.
 ///
 /// [`zmq_handshake_address`] exposes just the handshake half, for the
 /// registration-time validation of that address.
 pub(crate) fn zmq_socket_addresses(
     base_url: &str,
-    handshake_override: Option<&str>,
+    handshake: Handshake<'_>,
 ) -> Result<(String, String, String), String> {
     let path = base_url
         .strip_prefix("ipc://")
         .ok_or_else(|| format!("ZMQ worker URL must be ipc://<path>, got '{base_url}'"))?;
-    let handshake = match handshake_override {
-        Some(address) => {
+    let handshake = match handshake {
+        Handshake::Derived => format!("tcp://{ZMQ_LOOPBACK_HOST}:{}", derive_handshake_port(path)),
+        Handshake::Tcp(address) => {
             if !address.starts_with("tcp://") {
                 return Err(format!(
                     "zmq_handshake_address must be a tcp:// address \
@@ -70,7 +94,14 @@ pub(crate) fn zmq_socket_addresses(
             }
             address.to_string()
         }
-        None => format!("tcp://{ZMQ_LOOPBACK_HOST}:{}", derive_handshake_port(path)),
+        Handshake::TcpOrIpc(address) => {
+            if !address.starts_with("tcp://") && !address.starts_with("ipc://") {
+                return Err(format!(
+                    "handshake address must be tcp://host:port or ipc://<path>, got '{address}'"
+                ));
+            }
+            address.to_string()
+        }
     };
     let input = format!("ipc://{path}-in.sock");
     let output = format!("ipc://{path}-out.sock");
@@ -87,7 +118,8 @@ pub fn zmq_handshake_address(
     base_url: &str,
     handshake_override: Option<&str>,
 ) -> Result<String, String> {
-    zmq_socket_addresses(base_url, handshake_override).map(|(handshake, _, _)| handshake)
+    zmq_socket_addresses(base_url, Handshake::registered(handshake_override))
+        .map(|(handshake, _, _)| handshake)
 }
 
 /// Create the parent directory for a worker's `ipc://` sockets. Kept off the
@@ -221,34 +253,64 @@ mod tests {
     #[test]
     fn zmq_socket_addresses_derive_handshake_by_default() {
         let (handshake, input, output) =
-            zmq_socket_addresses("ipc:///tmp/smg-zmq/ts0.ipc", None).unwrap();
+            zmq_socket_addresses("ipc:///tmp/smg-zmq/ts0.ipc", Handshake::Derived).unwrap();
         assert_eq!(handshake, "tcp://127.0.0.1:25152");
         assert_eq!(input, "ipc:///tmp/smg-zmq/ts0.ipc-in.sock");
         assert_eq!(output, "ipc:///tmp/smg-zmq/ts0.ipc-out.sock");
     }
 
     #[test]
-    fn zmq_socket_addresses_honor_handshake_override() {
-        // TokenSpeed's default dial target — outside the derived band; the
-        // override must be bound verbatim while the data plane stays derived.
-        let (handshake, input, output) =
-            zmq_socket_addresses("ipc:///tmp/smg-zmq/ts0.ipc", Some("tcp://127.0.0.1:30500"))
-                .unwrap();
-        assert_eq!(handshake, "tcp://127.0.0.1:30500");
+    fn a_servicers_handshake_may_be_ipc_and_nothing_else_beyond_tcp() {
+        // The servicer's own link binds an ipc:// socket for a loopback engine
+        // (one per test); any other scheme is still a misconfiguration.
+        let (handshake, input, _) = zmq_socket_addresses(
+            "ipc:///tmp/smg-zmq/ts0.ipc",
+            Handshake::TcpOrIpc("ipc:///tmp/t/handshake"),
+        )
+        .unwrap();
+        assert_eq!(handshake, "ipc:///tmp/t/handshake");
         assert_eq!(input, "ipc:///tmp/smg-zmq/ts0.ipc-in.sock");
-        assert_eq!(output, "ipc:///tmp/smg-zmq/ts0.ipc-out.sock");
+        let refused = zmq_socket_addresses(
+            "ipc:///tmp/smg-zmq/ts0.ipc",
+            Handshake::TcpOrIpc("udp://x:1"),
+        )
+        .unwrap_err();
+        assert!(refused.contains("tcp://"), "{refused}");
     }
 
     #[test]
     fn zmq_socket_addresses_reject_non_tcp_override() {
-        // The engine dials a TCP handshake; a non-tcp override is a config
-        // error and must fail loudly rather than bind something unexpected.
-        let err = zmq_socket_addresses("ipc:///tmp/smg-zmq/ts0.ipc", Some("ipc:///tmp/hs.sock"))
-            .unwrap_err();
+        // The engine dials a TCP handshake; a non-tcp override on a registered
+        // worker is a config error and must fail loudly rather than bind
+        // something no engine can reach.
+        let err = zmq_socket_addresses(
+            "ipc:///tmp/smg-zmq/ts0.ipc",
+            Handshake::Tcp("ipc:///tmp/hs.sock"),
+        )
+        .unwrap_err();
         assert!(
             err.contains("tcp://"),
             "error must name the required scheme: {err}"
         );
+        assert!(
+            zmq_handshake_address("ipc:///tmp/smg-zmq/ts0.ipc", Some("ipc:///tmp/hs.sock"))
+                .is_err(),
+            "registration validation keeps the tcp-only rule"
+        );
+    }
+
+    #[test]
+    fn zmq_socket_addresses_honor_handshake_override() {
+        // TokenSpeed's default dial target — outside the derived band; the
+        // override must be bound verbatim while the data plane stays derived.
+        let (handshake, input, output) = zmq_socket_addresses(
+            "ipc:///tmp/smg-zmq/ts0.ipc",
+            Handshake::Tcp("tcp://127.0.0.1:30500"),
+        )
+        .unwrap();
+        assert_eq!(handshake, "tcp://127.0.0.1:30500");
+        assert_eq!(input, "ipc:///tmp/smg-zmq/ts0.ipc-in.sock");
+        assert_eq!(output, "ipc:///tmp/smg-zmq/ts0.ipc-out.sock");
     }
 
     #[tokio::test]

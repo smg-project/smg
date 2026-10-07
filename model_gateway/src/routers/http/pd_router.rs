@@ -572,8 +572,12 @@ impl PDRouter {
 
         // Dispatch-time re-check of both legs, the same one the regular HTTP
         // and gRPC paths take just before their load guards.
-        if let Some(shed) = overload::shed_if_worker_overloaded(prefill.as_ref(), context.model_id)
-            .or_else(|| overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id))
+        let shedding = self.worker_registry.overload_shed_enabled();
+        if let Some(shed) =
+            overload::shed_if_worker_overloaded(prefill.as_ref(), context.model_id, shedding)
+                .or_else(|| {
+                    overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id, shedding)
+                })
         {
             return shed;
         }
@@ -2711,7 +2715,11 @@ impl RouterTrait for PDRouter {
             Ok(bytes) => Bytes::from(bytes),
             Err(e) => return Self::handle_serialization_error(e),
         };
-        if let Some(response) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+        if let Some(response) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
             return response;
         }
         let _load_guard = WorkerLoadGuard::with_key(

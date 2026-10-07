@@ -245,6 +245,8 @@ pub(crate) struct RequestPipeline {
     backend_type: &'static str,
     /// Disaggregation mode, for per-leg retry metric labels.
     mode: Mode,
+    /// The registry, read at dispatch for `--worker-overload-shed`.
+    worker_registry: Arc<WorkerRegistry>,
 }
 
 /// Outcome of one full pipeline run.
@@ -408,6 +410,7 @@ impl RequestPipeline {
             stages: Arc::new(stages),
             backend_type: backend,
             mode,
+            worker_registry: deps.worker_registry.clone(),
         })
     }
 
@@ -460,7 +463,12 @@ impl RequestPipeline {
         )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
-            acquire_clients(workers, &ctx.input.model_id).await
+            acquire_clients(
+                workers,
+                &ctx.input.model_id,
+                self.worker_registry.overload_shed_enabled(),
+            )
+            .await
         )?);
         if let Some(encode) = &stages.encode {
             step!(encode.name(), encode.execute(ctx).await)?;
@@ -498,7 +506,14 @@ impl RequestPipeline {
                     "Worker selection not completed",
                 )
             })?;
-            dctx.clients = Some(acquire_clients(workers, &dctx.model_id).await?);
+            dctx.clients = Some(
+                acquire_clients(
+                    workers,
+                    &dctx.model_id,
+                    self.worker_registry.overload_shed_enabled(),
+                )
+                .await?,
+            );
             let retained = plan.as_mut().ok_or_else(|| {
                 error!(function = "run_attempt", "Execution plan already consumed");
                 error::internal_error("execution_plan_consumed", "Execution plan already consumed")
@@ -1526,7 +1541,10 @@ mod request_release_tests {
         routers::grpc::multimodal::{
             MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
         },
-        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+        worker::{
+            BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker,
+            WorkerType,
+        },
     };
 
     const MODEL: &str = "request-release-test-model";
@@ -1801,20 +1819,27 @@ mod request_release_tests {
         panic!("release-test stub on port {port} never came up");
     }
 
-    fn register_worker(registry: &WorkerRegistry, port: u16, worker_type: WorkerType) {
-        let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-            .worker_type(worker_type)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::TokenSpeed)
-            .model(ModelCard::new(MODEL))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
+    fn register_worker(
+        registry: &WorkerRegistry,
+        port: u16,
+        worker_type: WorkerType,
+    ) -> Arc<dyn Worker> {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .model(ModelCard::new(MODEL))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
         registry
-            .register(Arc::new(worker))
+            .register(Arc::clone(&worker))
             .expect("register release-test worker");
+        worker
     }
 
     async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
@@ -1851,10 +1876,18 @@ mod request_release_tests {
     }
 
     fn completion_pipeline(worker_registry: &Arc<WorkerRegistry>, mode: Mode) -> RequestPipeline {
+        completion_pipeline_with_admission(worker_registry, mode, None)
+    }
+
+    fn completion_pipeline_with_admission(
+        worker_registry: &Arc<WorkerRegistry>,
+        mode: Mode,
+        prefill_admission: Option<Arc<PrefillAdmission>>,
+    ) -> RequestPipeline {
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
+            prefill_admission,
             None,
         );
         RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
@@ -2198,6 +2231,203 @@ mod request_release_tests {
             dispatched.as_slice(),
             "the abort must name the decode leg's own request id"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Request completion on a client cancel. Policies learn that a request
+    // ended through the worker's completion sink, which the load guard
+    // drives; these pin that a client leaving mid-request reaches it on the
+    // gRPC paths, promptly, while the engine still owes its first token.
+    // ------------------------------------------------------------------
+
+    /// Records the worker URLs that reported a request completion.
+    #[derive(Debug, Default)]
+    struct CompletionSpy(Mutex<Vec<String>>);
+
+    impl RequestCompletionSink for CompletionSpy {
+        fn request_completed(&self, worker: &dyn Worker) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(worker.url().to_string());
+        }
+    }
+
+    impl CompletionSpy {
+        fn urls(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        /// Wait for `expected` completions, well inside the stub's five-second
+        /// gate: a completion that only arrives with the engine's tokens is a
+        /// failure, not a late pass.
+        async fn wait_for(&self, expected: usize) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.urls().len() < expected {
+                assert!(
+                    Instant::now() < deadline,
+                    "only {:?} completed in time, expected {expected}",
+                    self.urls()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.urls()
+        }
+    }
+
+    /// Install one spy as the completion sink of every registered worker.
+    fn install_spy(registry: &WorkerRegistry) -> Arc<CompletionSpy> {
+        let spy = Arc::new(CompletionSpy::default());
+        for worker in registry.get_all() {
+            worker.set_completion_sink(Some(Arc::clone(&spy) as Arc<dyn RequestCompletionSink>));
+        }
+        spy
+    }
+
+    /// A stub that accepts the generate RPC at once and withholds every token
+    /// while `hold` lives: the engine has the request and owes its first
+    /// token, the window a client cancel is hardest to account for.
+    fn stalled_while(hold: &Arc<CompletionRequest>) -> GatedScheduler {
+        GatedScheduler {
+            probe: Some(Arc::downgrade(hold)),
+            ..Default::default()
+        }
+    }
+
+    async fn start_stream(
+        pipeline: &RequestPipeline,
+        components: Arc<SharedComponents>,
+    ) -> Response {
+        let started = Instant::now();
+        let response = pipeline
+            .execute_completion(
+                completion_request(true),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the streaming response must open before the engine's first token"
+        );
+        response
+    }
+
+    /// gRPC regular path: the client drops the stream while the engine is
+    /// still prefilling. The load guard rides the response body, so the drop
+    /// releases the worker's load and reports the completion at once.
+    #[tokio::test]
+    async fn cancelled_grpc_stream_reports_the_completion_during_prefill() {
+        let hold = completion_request(true);
+        let port = spawn_stub(stalled_while(&hold)).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let spy = install_spy(&worker_registry);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(Arc::clone(&worker_registry)).await;
+
+        let response = start_stream(&pipeline, components).await;
+        assert_eq!(worker.load(), 1, "the dispatch holds the worker's load");
+        assert!(
+            spy.urls().is_empty(),
+            "nothing completes while the client is connected"
+        );
+
+        drop(response);
+
+        assert_eq!(spy.wait_for(1).await, [worker.url().to_string()]);
+        assert_eq!(worker.load(), 0);
+        drop(hold);
+    }
+
+    /// gRPC PD path: the prefill leg answers on its own and reports when its
+    /// phase ends; the decode leg is still owed its first token when the
+    /// client leaves, and reports with the dropped body. Both legs end with
+    /// their load released, exactly once each.
+    #[tokio::test]
+    async fn cancelled_pd_stream_reports_the_prefill_and_decode_completions() {
+        let hold = completion_request(true);
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_port = spawn_stub(stalled_while(&hold)).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let spy = install_spy(&worker_registry);
+        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+        let components = components(Arc::clone(&worker_registry)).await;
+
+        let response = start_stream(&pipeline, components).await;
+        assert_eq!(
+            decode.load(),
+            1,
+            "the decode leg holds its load until the stream ends"
+        );
+
+        drop(response);
+
+        let mut urls = spy.wait_for(2).await;
+        urls.sort();
+        let mut expected = vec![prefill.url().to_string(), decode.url().to_string()];
+        expected.sort();
+        assert_eq!(urls, expected, "each leg reports exactly once");
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        drop(hold);
+    }
+
+    /// gRPC PD path under prefill admission: the prefill leg's load is a
+    /// reservation in the admission gate rather than a bare guard, and it
+    /// still reports the completion when the phase ends, so a cancelled
+    /// request frees its slot for the next one.
+    #[tokio::test]
+    async fn cancelled_pd_stream_with_admitted_prefill_reports_and_frees_the_slot() {
+        let hold = completion_request(true);
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_port = spawn_stub(stalled_while(&hold)).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let spy = install_spy(&worker_registry);
+        let admission = Arc::new(PrefillAdmission::new(1, 0, Duration::from_secs(1)));
+        let pipeline = completion_pipeline_with_admission(
+            &worker_registry,
+            Mode::PrefillDecode,
+            Some(Arc::clone(&admission)),
+        );
+        let components = components(Arc::clone(&worker_registry)).await;
+
+        let response = start_stream(&pipeline, components).await;
+        drop(response);
+
+        let mut urls = spy.wait_for(2).await;
+        urls.sort();
+        let mut expected = vec![prefill.url().to_string(), decode.url().to_string()];
+        expected.sort();
+        assert_eq!(urls, expected, "each leg reports exactly once");
+        assert_eq!(
+            prefill.load(),
+            0,
+            "the admitted prefill's reservation is released"
+        );
+        assert_eq!(decode.load(), 0);
+        // The one slot is free again: a new admission does not queue.
+        let admitted = tokio::time::timeout(
+            Duration::from_millis(500),
+            admission.admit(None, |capacity| capacity.select(Arc::clone(&prefill), ())),
+        )
+        .await
+        .expect("the freed slot must admit at once")
+        .expect("admitted");
+        drop(admitted);
+        drop(hold);
     }
 
     // ------------------------------------------------------------------

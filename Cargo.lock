@@ -2216,15 +2216,18 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "chrono",
+ "criterion",
  "engine-zmq-adapter",
  "engine-zmq-client",
  "futures",
+ "kv-index",
  "llm-tokenizer",
  "openai-protocol",
  "portpicker",
  "prost",
  "prost-types",
  "rmp-serde",
+ "rmpv",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3823,11 +3826,16 @@ dependencies = [
 name = "kv-index"
 version = "1.5.0"
 dependencies = [
+ "anyhow",
  "bincode",
  "blake3",
  "clap",
  "criterion",
+ "crossbeam-queue",
+ "crossbeam-utils",
  "dashmap",
+ "libc",
+ "mimalloc",
  "once_cell",
  "parking_lot",
  "rand 0.10.2",
@@ -3920,6 +3928,15 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "libredox"
@@ -4297,6 +4314,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4365,9 +4391,16 @@ dependencies = [
 name = "mock-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "clap",
+ "engine-servicer",
  "engine-zmq-client",
  "futures",
+ "reqwest 0.13.4",
+ "rmp-serde",
+ "rmpv",
+ "serde",
  "serde_json",
  "smg-grpc-client",
  "tempfile",
@@ -4376,6 +4409,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "zeromq",
 ]
 
 [[package]]
@@ -7528,6 +7562,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "data-connector",
+ "engine-servicer",
  "engine-zmq-adapter",
  "engine-zmq-client",
  "futures",
@@ -7571,6 +7606,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "rmcp",
+ "rmp-serde",
  "rsa",
  "rustix",
  "rustls",

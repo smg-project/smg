@@ -197,8 +197,9 @@ mod pd_routing_tests {
         .await;
         let app = ctx.create_app();
 
+        // The workers bound ephemeral ports; the registry knows them by those.
         let registry = &ctx.app_context.worker_registry;
-        for url in [&prefill_url, &decode_url] {
+        for url in [ctx.worker_url_for(19840), ctx.worker_url_for(19841)] {
             let worker_id = registry.get_id_by_url(url).unwrap();
             let worker = registry.get(&worker_id).unwrap();
             let mut spec = worker.metadata().spec.as_ref().clone();

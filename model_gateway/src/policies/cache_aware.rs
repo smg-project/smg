@@ -10,10 +10,12 @@
 
     1. Event-Driven (gRPC + KV events)
     -------------------------------------------
-    Uses PositionalIndexer overlap scoring from KvEventMonitor. Routes based
+    Uses the KV index's overlap scoring from KvEventMonitor. Routes based
     on actual backend KV cache state. Selects the worker with the highest
     overlap count; LeastLoad breaks equal-affinity ties atomically.
-    Falls back to LeastLoad when no cache overlap exists.
+    Falls back to LeastLoad when no cache overlap exists. Over a pool larger
+    than 32 workers the decision reads the holders of the request's blocks
+    and a sample of 16 others, not the pool (see `FLEET_SAMPLE`).
 
     2. Approximate Token Tree (gRPC, no KV events)
     -------------------------------------------
@@ -68,23 +70,32 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use kv_index::{compute_request_content_hashes, PositionalIndexer, TenantId, TokenTree, Tree};
+use kv_index::{
+    compute_request_content_hashes, request_prefix_hashes, salt::request_content_hashes_with_seed,
+    ContentHash, OverlapScores, TenantId, TokenTree, Tree,
+};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::{
-    normalize_model_key, utils::PeriodicTask, CacheAwareConfig, CacheNamespace, LeastLoadPolicy,
-    LoadBalancingPolicy, SelectWorkerInfo, TEXT_MARKER_LEN,
+    cost::{
+        self, CandidateInputs, OptimisticAccounting, Pick, RequestInputs, WorkerSelectionPolicy,
+    },
+    normalize_model_key,
+    utils::PeriodicTask,
+    CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo,
+    TEXT_MARKER_LEN,
 };
 /// Latest per-worker backend load snapshot stream, keyed by worker URL.
 pub(crate) use crate::worker::load_state::{LoadReceiver, LoadSnapshot};
@@ -92,8 +103,41 @@ use crate::{
     config::CacheIndexKind,
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::metrics::Metrics,
-    worker::{KvEventMonitor, Worker},
+    worker::{liveness, KvEventMonitor, KvIndex, Worker},
 };
+
+/// An overlap of at most this many blocks counts as a miss for the warm-up
+/// slice: a chat template's head is this long, shared by every holder, and
+/// recomputing it costs less than keeping a returned worker idle.
+const WARMUP_MISS_BLOCKS: f64 = 4.0;
+
+/// A hit whose best overlap is at most this share of the request is a
+/// shallow one: diverting it to a thin worker recomputes little, so these go
+/// first (see [`CacheAwarePolicy::warmup_divert`]).
+const DIVERT_SHALLOW_SHARE: f64 = 0.5;
+
+/// A thin worker with requests in flight gets no second diversion sooner than
+/// this after its last one.
+const DIVERT_WINDOW_MS: u64 = 2_000;
+
+/// How many eligible workers an event-driven decision reads beside the
+/// holders of the request's blocks once the pool is larger than twice this:
+/// they are the miss path's choices, the spill targets, the rows an
+/// all-workers selection policy ranks, and the sample the count-pressure
+/// gate's fleet mean is taken from. Sixteen choices balance as a full scan
+/// does (two already do, the power of d choices), and cost the same at 128
+/// workers as at 10,000. A pool of at most twice this many workers is read
+/// whole, so nothing changes for a small fleet.
+const FLEET_SAMPLE: usize = 16;
+
+/// How long a pool table serves before a decision rebuilds it: a worker the
+/// index interned after the build gains affinity within this, and a worker
+/// that entered the warm-up window is sliced to within this.
+const POOL_TABLE_REFRESH_MS: u64 = 1_000;
+
+/// Pool tables kept at once: one per routing pool the policy sees (a model's
+/// regular pool, the PD legs' pools); past this the oldest goes.
+const POOL_TABLES_KEPT: usize = 8;
 
 /// Cache-aware routing policy
 ///
@@ -113,6 +157,13 @@ pub struct CacheAwarePolicy {
     /// candidate set. It owns backend snapshots and since-poll dispatch credit,
     /// keeping selection and credit atomic under concurrent arrivals.
     load_scorer: LeastLoadPolicy,
+    /// Selection policy run over the per-worker inputs gathered for each
+    /// request (`cost` module); the default reproduces the affinity-group
+    /// decision exactly and the ports of published cost functions replace it.
+    selection: WorkerSelectionPolicy,
+    /// Optimistic self-accounting of dispatches the engines have not yet
+    /// reported; `None` unless `selection_accounting_ttl_ms > 0`.
+    accounting: Option<OptimisticAccounting>,
     /// String-based trees for HTTP connections (text input)
     string_trees: Arc<DashMap<String, Arc<Tree>>>,
     /// Token-based trees for gRPC connections (pre-tokenized input)
@@ -125,6 +176,19 @@ pub struct CacheAwarePolicy {
     /// trigger. `None` until wired by the registry (then the policy stays
     /// count-only, preserving current behavior).
     load_rx: RwLock<Option<LoadReceiver>>,
+    /// Misses seen by the warm-up slice; every `period`th goes to a warming
+    /// worker (see [`liveness::Warmup`]).
+    warmup_misses: AtomicU64,
+    /// Hits seen since the last diversion to a thin worker, and whether a
+    /// shallow one was among them (see [`Self::warmup_divert`]).
+    divert_hits: AtomicU64,
+    divert_shallow_seen: AtomicBool,
+    /// Each routing pool's workers by KV index id and position, built once
+    /// per pool snapshot (see [`PoolTable`]).
+    pool_tables: ArcSwap<Vec<Arc<PoolTable>>>,
+    /// Set while one decision rebuilds a pool table so the others keep
+    /// serving the one they have.
+    pool_table_building: AtomicBool,
     /// Model-scoped hash indexes for resolving tenant delta hashes.
     /// Outer key is the normalized model_id; inner maps hold
     /// `hash → reconstructable prefix/tokens` per tree kind.
@@ -364,14 +428,37 @@ impl CacheAwarePolicy {
             None
         };
 
+        let selection_policy_name = config
+            .selection_policy
+            .as_deref()
+            .unwrap_or(cost::DEFAULT_POLICY);
+        let selection = cost::build(selection_policy_name, config.selection_temperature)
+            .unwrap_or_else(|err| {
+                // Configuration validation rejects this before a policy is built;
+                // a policy constructed outside that path still routes, with the
+                // default decision, rather than failing every request.
+                error!(%err, "Invalid selection policy; using {}", cost::DEFAULT_POLICY);
+                cost::default_policy(config.selection_temperature)
+            });
+        let accounting = (config.selection_accounting_ttl_ms > 0).then(|| {
+            OptimisticAccounting::new(Duration::from_millis(config.selection_accounting_ttl_ms))
+        });
+
         Self {
             config,
             load_scorer: LeastLoadPolicy::new(),
+            selection,
+            accounting,
             string_trees,
             token_trees,
             _eviction_task: eviction_task,
             kv_monitor: RwLock::new(None),
             load_rx: RwLock::new(None),
+            warmup_misses: AtomicU64::new(0),
+            divert_hits: AtomicU64::new(0),
+            divert_shallow_seen: AtomicBool::new(false),
+            pool_tables: ArcSwap::from_pointee(Vec::new()),
+            pool_table_building: AtomicBool::new(false),
             hash_index,
             populate_hash_index: AtomicBool::new(false),
             mesh_tree_sync: RwLock::new(None),
@@ -542,9 +629,7 @@ impl CacheAwarePolicy {
         // Both defaults are 1.0, above the maximum clamped utilization and
         // spread. CacheAware now polls loads for LeastLoad even at defaults,
         // so return before touching the snapshot or scanning the fleet.
-        if self.config.balance_token_usage_threshold >= 1.0
-            && self.config.overload_token_usage_threshold >= 1.0
-        {
+        if !self.kv_pressure_gate_configured() {
             return false;
         }
 
@@ -1093,10 +1178,177 @@ impl TreeHandle for CacheAwarePolicy {
     }
 }
 
-/// One positive-overlap candidate: slice index and possibly decayed score.
+/// One positive-overlap candidate: slice index, undecayed overlap in blocks
+/// (the tree paths report matched units over the block size) and the possibly
+/// decayed score the affinity-group decision ranks on.
 struct OverlapCandidate {
     idx: usize,
+    raw_score: f64,
     effective_score: f64,
+}
+
+/// One routing pool's workers by their KV index ids, built once per pool
+/// snapshot and refreshed every [`POOL_TABLE_REFRESH_MS`]. The registry hands
+/// the policy the same slice until membership changes, so an overlap lookup's
+/// `index id -> blocks` result maps to slice positions through this table
+/// instead of a string lookup per healthy worker per request, and the warm-up
+/// slice reads the workers inside its window from it instead of scanning the
+/// pool on every thin miss.
+#[derive(Debug)]
+struct PoolTable {
+    /// Address and length of the slice the table was built from.
+    slice: (usize, usize),
+    /// Gateway clock at the build, for the refresh.
+    built_ms: u64,
+    /// Address of the worker at each position at the build: a pool rebuilt
+    /// at the same address with other workers fails this check per holder.
+    worker_at: Vec<usize>,
+    /// The index id of the worker at each position; `None` while it is not
+    /// interned.
+    id_at: Vec<Option<u32>>,
+    /// Index id -> position.
+    position_of: HashMap<u32, u32>,
+    /// The fleet's index level at the build: the upper median of the
+    /// workers' index sizes, what a thin worker is thin against.
+    fleet_level: usize,
+    /// Positions of the warm-up slice's candidates at the build: the workers
+    /// thinner than the fleet (an index emptied by a resync, or never fed)
+    /// whatever their age, else the workers inside the warm-up window
+    /// (admitted within it, index still growing) unless every worker was (a
+    /// young fleet slices nothing).
+    warming: Vec<u32>,
+    /// Positions of the thin workers alone, the targets of the hit diversion
+    /// (see [`CacheAwarePolicy::warmup_divert`]).
+    thin: Vec<u32>,
+}
+
+impl PoolTable {
+    fn slice_key(workers: &[Arc<dyn Worker>]) -> (usize, usize) {
+        (workers.as_ptr() as usize, workers.len())
+    }
+
+    fn worker_address(worker: &Arc<dyn Worker>) -> usize {
+        Arc::as_ptr(worker).cast::<()>() as usize
+    }
+
+    /// One pass over the pool: the string lookup per worker happens here,
+    /// once per snapshot and refresh, not per request.
+    fn build(workers: &[Arc<dyn Worker>], indexer: &KvIndex, now_ms: u64) -> Self {
+        let warmup = liveness::warmup();
+        let mut worker_at = Vec::with_capacity(workers.len());
+        let mut id_at = Vec::with_capacity(workers.len());
+        let mut position_of = HashMap::with_capacity(workers.len());
+        let mut sized: Vec<Option<(usize, usize)>> = Vec::with_capacity(workers.len());
+        for (position, worker) in workers.iter().enumerate() {
+            worker_at.push(Self::worker_address(worker));
+            let id = indexer.worker_id(worker.url());
+            id_at.push(id);
+            if let Some(id) = id {
+                position_of.insert(id, position as u32);
+            }
+            // Index size, and its growth since the admission for the age rule
+            // (the baseline restarts when the count drops); thinness is read
+            // against the fleet's level below, whatever the growth.
+            sized.push(id.map(|id| {
+                let indexed = indexer.worker_block_count(id);
+                (indexed, worker.warmup_growth(indexed))
+            }));
+        }
+        // The fleet's level: the upper median of the sizes, so one emptied
+        // worker does not drag it down.
+        let mut sizes: Vec<usize> = sized
+            .iter()
+            .map(|sized| sized.map_or(0, |(indexed, _)| indexed))
+            .collect();
+        sizes.sort_unstable();
+        let fleet_level = sizes.get(sizes.len() / 2).copied().unwrap_or(0);
+        let mut thin = Vec::new();
+        let mut young = Vec::new();
+        if warmup.share > 0.0 {
+            for (position, (worker, sized)) in workers.iter().zip(&sized).enumerate() {
+                let (indexed, grown) = match sized {
+                    Some((indexed, grown)) => (*indexed, Some(*grown)),
+                    None => (0, None),
+                };
+                if !warmup.applies(worker.admitted_age(), grown, indexed, fleet_level) {
+                    continue;
+                }
+                if warmup.is_thin(indexed, fleet_level) {
+                    thin.push(position as u32);
+                } else {
+                    young.push(position as u32);
+                }
+            }
+        }
+        // A thin worker is a candidate whatever the fleet's age; workers
+        // warming only because they are young are candidates only when the
+        // fleet is not all young.
+        let warming = if !thin.is_empty() {
+            thin.clone()
+        } else if young.len() < workers.len() {
+            young
+        } else {
+            Vec::new()
+        };
+        Self {
+            slice: Self::slice_key(workers),
+            built_ms: now_ms,
+            worker_at,
+            id_at,
+            position_of,
+            fleet_level,
+            warming,
+            thin,
+        }
+    }
+
+    /// Whether the table was built from `workers` (the same slice).
+    fn describes(&self, workers: &[Arc<dyn Worker>]) -> bool {
+        self.slice == Self::slice_key(workers)
+    }
+
+    /// Whether the table is within its refresh period.
+    fn fresh(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.built_ms) < POOL_TABLE_REFRESH_MS
+    }
+
+    /// The position holding index worker `id`, when the worker there is
+    /// still the one the table was built from.
+    fn position(&self, id: u32, workers: &[Arc<dyn Worker>]) -> Option<usize> {
+        let position = *self.position_of.get(&id)? as usize;
+        let same_worker = workers
+            .get(position)
+            .is_some_and(|worker| Self::worker_address(worker) == self.worker_at[position]);
+        same_worker.then_some(position)
+    }
+}
+
+/// What the sampled decision made of a request.
+enum Sampled {
+    /// The event-driven decision over the holders and a sample of the pool:
+    /// the selection, or `None` when it declined every candidate.
+    Decided(Option<usize>),
+    /// Not a request for the sampled decision: the pool is small, the request
+    /// carries no tokens or has no event index, the configuration wants the
+    /// KV-pressure gate (a reading of the whole fleet), or the sample held no
+    /// eligible worker. The scan decides.
+    Scan,
+}
+
+/// Which holders a decision gathers from the overlap scores. A shared chat
+/// template puts a shallow overlap on most of a fleet, so the scores name
+/// nearly every worker; the decision must not pay per named worker.
+#[derive(Clone, Copy)]
+enum Gather {
+    /// The eligible holders of the deepest overlap only: what the exact
+    /// maximum-group decision reads (the default policy at temperature zero,
+    /// no decay in effect, no accounting). A tie wider than `cap` (a fleet
+    /// sharing a chat template's head, a prompt reaching no further) is a
+    /// uniform draw of `cap` of them: the expected-wait selector breaks the
+    /// tie among those, as a miss is placed among a sample of the pool.
+    TopGroup { cap: Option<usize> },
+    /// Every eligible holder in slice order, the `cap` deepest when set.
+    All { cap: Option<usize> },
 }
 
 /// Pressure-tuning inputs for [`CacheAwarePolicy::overlap_candidates`]: the two
@@ -1107,12 +1359,118 @@ struct OverlapCandidate {
 /// receiver is wired; workers absent from the snapshot are never decayed.
 struct OverlapTuning<'a> {
     overlap_decay: f32,
+    /// Zero means the exact maximum-overlap group; the policy carries the
+    /// temperature for its draw, the host reads it to know which holders to
+    /// gather (see [`CacheAwarePolicy::exact_maximum_decision`]).
     selection_temperature: f32,
     waiting_prefill_tokens: Option<&'a LoadSnapshot>,
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        // The event-driven decision over a large pool reads the holders of
+        // the request's blocks and a bounded sample of the rest; every other
+        // path, and a pool the sample would cover anyway, reads the pool.
+        if let Sampled::Decided(selected) = self.select_worker_sampled(workers, info) {
+            return selected;
+        }
+        self.select_worker_scanned(workers, info)
+    }
+
+    fn on_request_complete(&self, worker_url: &str, success: bool) {
+        if let Some(accounting) = &self.accounting {
+            accounting.release(worker_url);
+        }
+        self.selection.on_request_complete(worker_url);
+        // Could track success rates per worker for more intelligent routing
+        if !success {
+            // Optionally reduce affinity for failed requests
+            tracing::debug!(
+                "Request to {} completed with success={}",
+                worker_url,
+                success
+            );
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "cache_aware"
+    }
+
+    fn needs_request_text(&self) -> bool {
+        true // Cache-aware policy needs request text for cache affinity
+    }
+
+    fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
+        // WorkerMonitor invokes this immediately before publishing its complete
+        // immutable snapshot (with no await between the two operations). Advance
+        // ExpectedWait here so each successful worker's new load and credit
+        // reset stay atomic. KV-pressure and overlap decay intentionally keep
+        // using the last fully published snapshot during that handoff; scoring
+        // ExpectedWait from its old value would instead pair an
+        // old queue with a new reset and reopen the incast race.
+        self.load_scorer.update_loads(loads);
+    }
+
+    /// Expected-wait selection needs backend snapshots for every CacheAware
+    /// configuration; KV pressure and overlap decay consume them as well.
+    fn needs_backend_loads(&self) -> bool {
+        true
+    }
+
+    fn remove_worker(&self, url: &str) {
+        // The CacheAware-specific removal path already prunes trees and hash
+        // placements before the registry invokes this generic load-aware
+        // hook. Keep this hook scoped to LeastLoad state so worker churn does
+        // not repeat the full all-model cache scan.
+        self.load_scorer.remove_worker(url);
+        if let Some(accounting) = &self.accounting {
+            accounting.forget_worker(url);
+        }
+        self.selection.on_worker_removed(url);
+    }
+
+    fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
+        let released = self
+            .accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.reconcile(worker_url, in_flight));
+        self.selection.reconcile_in_flight(worker_url, in_flight);
+        if released > 0 {
+            Metrics::record_policy_inflight_reconciled(self.name(), released);
+            debug!(
+                worker = worker_url,
+                in_flight, released, "Released bookings whose completion never arrived"
+            );
+        }
+    }
+
+    fn reset(&self) {
+        self.load_scorer.reset();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The event-driven index resolved once per request for the selection.
+struct EventIndex<'a> {
+    indexer: Arc<KvIndex>,
+    block_size: usize,
+    model_id: &'a str,
+}
+
+// Private helper methods for select_worker
+impl CacheAwarePolicy {
+    /// The decision over the whole pool: one eligibility read per worker,
+    /// then the hash, tree or event-driven path. The sampled decision covers
+    /// the event-driven path over a large pool; this is everything else.
+    fn select_worker_scanned(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
         let request_text = info.request_text;
         let request_tokens = info.tokens;
 
@@ -1157,15 +1515,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
 
         // Cache-aware routing when balanced — three types (mutually exclusive):
-        //   1. Event-driven: PositionalIndexer overlap scoring (gRPC + KV events)
+        //   1. Event-driven: KV index overlap scoring (gRPC + KV events)
         //   2. Approximate token tree: TokenTree prefix matching (gRPC, no events)
         //   3. Approximate string tree: Tree prefix matching (HTTP)
         if let Some(tokens) = request_tokens {
             // Event-driven mode re-hashes engine-reported blocks from their
-            // token ids on both sides, so a namespace marker on the request
-            // side alone would break every same-namespace match. It stays
-            // unpartitioned here; the approximate and hash modes below key
-            // under the request's cache namespace.
+            // token ids on both sides, so it keys a namespace through the
+            // hash seed rather than a marker (see cache_namespace.rs); the
+            // approximate and hash modes below key under the marker.
             if let Some(index) = self.event_index_for(model_id) {
                 self.select_worker_event_driven(
                     workers,
@@ -1191,69 +1548,152 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
     }
 
-    fn on_request_complete(&self, worker_url: &str, success: bool) {
-        // Could track success rates per worker for more intelligent routing
-        if !success {
-            // Optionally reduce affinity for failed requests
-            tracing::debug!(
-                "Request to {} completed with success={}",
-                worker_url,
-                success
-            );
+    /// The event-driven decision for a pool larger than twice
+    /// [`FLEET_SAMPLE`]: eligibility is read for a uniform sample of the pool
+    /// (the miss path's choices, the spill targets, the count-pressure gate's
+    /// fleet mean) and for the holders the index names, never for the whole
+    /// pool. A sample without one eligible worker defers to the scan, which
+    /// finds any that remain.
+    fn select_worker_sampled(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Sampled {
+        let Some(tokens) = info.tokens else {
+            return Sampled::Scan;
+        };
+        if workers.len() <= 2 * FLEET_SAMPLE
+            || self.config.cache_index == CacheIndexKind::Hash
+            || self.kv_pressure_gate_configured()
+        {
+            return Sampled::Scan;
         }
+        let mut sample = [0usize; FLEET_SAMPLE];
+        let mut sampled = 0usize;
+        let mut load_sum = 0usize;
+        let mut rng = rand::rng();
+        // Draws with replacement, repeats dropped: above twice the sample
+        // size a repeat costs a slot and nothing else.
+        for _ in 0..2 * FLEET_SAMPLE {
+            if sampled == FLEET_SAMPLE {
+                break;
+            }
+            let idx = rng.random_range(0..workers.len());
+            if sample[..sampled].contains(&idx) {
+                continue;
+            }
+            let state = workers[idx].routing_state();
+            if state.eligible() {
+                sample[sampled] = idx;
+                sampled += 1;
+                load_sum += state.load;
+            }
+        }
+        if sampled == 0 {
+            return Sampled::Scan;
+        }
+        let sample = &mut sample[..sampled];
+        sample.sort_unstable();
+        let avg_load = load_sum as f64 / sampled as f64;
+        let model_id = normalize_model_key(workers[sample[0]].model_id());
+        let Some(index) = self.event_index_for(model_id) else {
+            return Sampled::Scan;
+        };
+        Sampled::Decided(
+            self.select_worker_event_driven(workers, tokens, sample, avg_load, &index, info),
+        )
     }
 
-    fn name(&self) -> &'static str {
-        "cache_aware"
+    /// Whether the decision is the exact maximum-overlap group: the default
+    /// selection policy at temperature zero, no decay in effect and no
+    /// accounting. Then only the deepest holders are gathered; every other
+    /// configuration reads each holder.
+    fn exact_maximum_decision(&self, tuning: &OverlapTuning<'_>) -> bool {
+        self.selection.name() == cost::DEFAULT_POLICY
+            && tuning.selection_temperature <= 0.0
+            && self.accounting.is_none()
+            && (tuning.overlap_decay <= 0.0 || tuning.waiting_prefill_tokens.is_none())
     }
 
-    fn needs_request_text(&self) -> bool {
-        true // Cache-aware policy needs request text for cache affinity
+    /// Whether the KV-pressure gate is configured: it reads the whole
+    /// fleet's token usage, so the decision reads the pool.
+    fn kv_pressure_gate_configured(&self) -> bool {
+        self.config.balance_token_usage_threshold < 1.0
+            || self.config.overload_token_usage_threshold < 1.0
     }
 
-    fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
-        // WorkerMonitor invokes this immediately before publishing its complete
-        // immutable snapshot (with no await between the two operations). Advance
-        // ExpectedWait here so each successful worker's new load and credit
-        // reset stay atomic. KV-pressure and overlap decay intentionally keep
-        // using the last fully published snapshot during that handoff; scoring
-        // ExpectedWait from its old value would instead pair an
-        // old queue with a new reset and reopen the incast race.
-        self.load_scorer.update_loads(loads);
+    /// The pool table for `workers`: the one kept when it is fresh, a stale
+    /// one while another decision rebuilds, else built here and published.
+    fn pool_table(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        indexer: &KvIndex,
+        now_ms: u64,
+    ) -> Arc<PoolTable> {
+        {
+            let tables = self.pool_tables.load();
+            if let Some(table) = tables.iter().find(|table| table.describes(workers)) {
+                if table.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel) {
+                    return Arc::clone(table);
+                }
+            }
+        }
+        let table = Arc::new(PoolTable::build(workers, indexer, now_ms));
+        self.pool_tables.rcu(|tables| {
+            let mut next: Vec<Arc<PoolTable>> = tables
+                .iter()
+                .filter(|kept| kept.slice != table.slice)
+                .cloned()
+                .collect();
+            if next.len() >= POOL_TABLES_KEPT {
+                if let Some(oldest) = next
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, kept)| kept.built_ms)
+                    .map(|(position, _)| position)
+                {
+                    next.swap_remove(oldest);
+                }
+            }
+            next.push(Arc::clone(&table));
+            next
+        });
+        self.pool_table_building.store(false, Ordering::Release);
+        table
     }
 
-    /// Expected-wait selection needs backend snapshots for every CacheAware
-    /// configuration; KV pressure and overlap decay consume them as well.
-    fn needs_backend_loads(&self) -> bool {
-        true
+    /// The union of two ascending position lists, ascending: the eligible
+    /// workers a decision read and the holders, which a sampled decision's
+    /// list need not contain.
+    fn merge_rows(eligible: &[usize], candidates: &[OverlapCandidate]) -> Vec<usize> {
+        let mut rows = Vec::with_capacity(eligible.len() + candidates.len());
+        let (mut i, mut j) = (0, 0);
+        loop {
+            let next = match (eligible.get(i), candidates.get(j)) {
+                (Some(&idx), Some(candidate)) if idx < candidate.idx => {
+                    i += 1;
+                    idx
+                }
+                (Some(&idx), Some(candidate)) if idx == candidate.idx => {
+                    i += 1;
+                    j += 1;
+                    idx
+                }
+                (_, Some(candidate)) => {
+                    j += 1;
+                    candidate.idx
+                }
+                (Some(&idx), None) => {
+                    i += 1;
+                    idx
+                }
+                (None, None) => break,
+            };
+            rows.push(next);
+        }
+        rows
     }
 
-    fn remove_worker(&self, url: &str) {
-        // The CacheAware-specific removal path already prunes trees and hash
-        // placements before the registry invokes this generic load-aware
-        // hook. Keep this hook scoped to LeastLoad state so worker churn does
-        // not repeat the full all-model cache scan.
-        self.load_scorer.remove_worker(url);
-    }
-
-    fn reset(&self) {
-        self.load_scorer.reset();
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-/// The event-driven index resolved once per request for the selection.
-struct EventIndex<'a> {
-    indexer: Arc<PositionalIndexer>,
-    block_size: usize,
-    model_id: &'a str,
-}
-
-// Private helper methods for select_worker
-impl CacheAwarePolicy {
     /// The event-driven index for this model: its indexer and block size.
     /// `None` when there is no monitor or indexer, or the indexer is empty
     /// (startup, reconnect), so routing falls through to the approximate
@@ -1264,7 +1704,7 @@ impl CacheAwarePolicy {
         let guard = self.kv_monitor.read();
         let monitor = guard.as_ref()?;
         let indexer = monitor.get_indexer(model_id)?;
-        if indexer.current_size() == 0 {
+        if indexer.is_empty() {
             return None;
         }
         // Per-model block_size: learned from events > config default
@@ -1294,6 +1734,19 @@ impl CacheAwarePolicy {
         }
         let guard = self.load_rx.read();
         guard.as_ref().map(|rx| rx.borrow().clone())
+    }
+
+    /// Request inputs for the tree paths: units are tokens (token tree) or
+    /// chars (string tree); the trees carry no prefix hashes.
+    fn tree_request(&self, units: usize, avg_load: f64) -> RequestInputs<'static> {
+        let block_size = self.config.block_size.max(1);
+        RequestInputs {
+            prompt_tokens: units,
+            block_size,
+            request_blocks: (units / block_size).max(1),
+            avg_load,
+            prefix_hashes: None,
+        }
     }
 
     /// Select and credit one final worker atomically with LeastLoad's
@@ -1345,6 +1798,169 @@ impl CacheAwarePolicy {
             && load > avg_load + self.config.balance_abs_threshold as f64
     }
 
+    /// The warm-up slice: one cache miss in `1 / share` goes to the
+    /// least-loaded warming worker, so a returned, new or emptied worker
+    /// builds a cache instead of idling behind the fleet's affinity (on the
+    /// real fleet a restarted worker went a minute without a request; in the
+    /// soaks a worker whose index a publisher-restart resync had emptied never
+    /// saw a request again, every prompt holding an overlap elsewhere). The
+    /// candidates are the pool table's, chosen at its build (refreshed every
+    /// second): workers thinner than the fleet (see
+    /// [`liveness::Warmup::is_thin`]) whatever the fleet's age, else the
+    /// workers inside the warm-up window unless every worker is (a young
+    /// fleet slices nothing, a miss getting a load-balanced pick anyway); a
+    /// settled fleet pays nothing here. Each candidate is checked live before
+    /// the pick, and the pick is credited through the expected-wait selector
+    /// like any other.
+    fn warmup_slice(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        table: &PoolTable,
+        indexer: &KvIndex,
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        if table.warming.is_empty() {
+            return None;
+        }
+        let warmup = liveness::warmup();
+        if warmup.share <= 0.0 {
+            return None;
+        }
+        let mut pick: Option<(usize, usize)> = None;
+        let mut tied = 0u32;
+        let mut rng = rand::rng();
+        for &position in &table.warming {
+            let idx = position as usize;
+            let Some(worker) = workers.get(idx) else {
+                continue;
+            };
+            let state = worker.routing_state();
+            if !state.eligible() {
+                continue;
+            }
+            let indexed = table.id_at[idx].map(|id| indexer.worker_block_count(id));
+            let grown = indexed.map(|indexed| worker.warmup_growth(indexed));
+            if !warmup.applies(
+                worker.admitted_age(),
+                grown,
+                indexed.unwrap_or(0),
+                table.fleet_level,
+            ) {
+                continue;
+            }
+            match pick {
+                Some((_, load)) if state.load > load => {}
+                Some((_, load)) if state.load == load => {
+                    // Equal loads draw uniformly: an idle warming fleet must
+                    // not hand every slice to its lowest position.
+                    tied += 1;
+                    if rng.random_range(0..=tied) == 0 {
+                        pick = Some((idx, state.load));
+                    }
+                }
+                _ => {
+                    pick = Some((idx, state.load));
+                    tied = 0;
+                }
+            }
+        }
+        let (idx, _) = pick?;
+        if !self
+            .warmup_misses
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(warmup.period())
+        {
+            return None;
+        }
+        self.select_expected_wait(workers, &[idx], info)
+    }
+
+    /// The thin worker's share of hits. On a replay where every request has
+    /// a holder (the Mooncake trace: a system prompt or a chat template in
+    /// front of everything) the miss path never runs, so a worker whose
+    /// index a resync emptied gets nothing from the slice and idles for good
+    /// (the churn runs c1 and c2, the soaks s6 and s7: one worker lost per
+    /// publisher restart, for half an hour). One hit in
+    /// `Warmup::divert_every` therefore goes to the least-loaded thin worker
+    /// although another holds its prefix, the recompute accepted: shallow
+    /// overlaps first (at most [`DIVERT_SHALLOW_SHARE`] of the request), any
+    /// hit once a window of `divert_every` hits passed without a shallow
+    /// one; never while the thin worker has anything in flight unless its
+    /// last diversion is older than [`DIVERT_WINDOW_MS`] (the stamp lives on
+    /// the worker, so it survives the table's rebuilds), so a hot fleet is
+    /// not disturbed; and only until its index crosses the thinness ratio of
+    /// the fleet's level. Equal loads draw uniformly like the slice. A fleet
+    /// with no thin worker returns before any clock read or counter: this
+    /// costs the steady state nothing. Protection and the liveness vetoes
+    /// apply through the routing state as everywhere; the pick is credited
+    /// through the expected-wait selector like the slice's.
+    fn warmup_divert(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        table: &PoolTable,
+        indexer: &KvIndex,
+        info: &SelectWorkerInfo,
+        overlap_share: f64,
+    ) -> Option<usize> {
+        if table.thin.is_empty() {
+            return None;
+        }
+        let warmup = liveness::warmup();
+        if warmup.divert_every == 0 || warmup.share <= 0.0 {
+            return None;
+        }
+        let shallow = overlap_share <= DIVERT_SHALLOW_SHARE;
+        if shallow {
+            self.divert_shallow_seen.store(true, Ordering::Relaxed);
+        }
+        let hits = self.divert_hits.fetch_add(1, Ordering::Relaxed) + 1;
+        let shallow_seen = self.divert_shallow_seen.load(Ordering::Relaxed);
+        let due = (hits >= warmup.divert_every && (shallow || !shallow_seen))
+            || hits >= 2 * warmup.divert_every;
+        if !due {
+            return None;
+        }
+        let now = liveness::now_ms();
+        let mut pick: Option<(usize, usize)> = None;
+        let mut tied = 0u32;
+        let mut rng = rand::rng();
+        for &position in &table.thin {
+            let idx = position as usize;
+            let Some(worker) = workers.get(idx) else {
+                continue;
+            };
+            let state = worker.routing_state();
+            if !state.eligible() {
+                continue;
+            }
+            let indexed = table.id_at[idx].map_or(0, |id| indexer.worker_block_count(id));
+            if !warmup.is_thin(indexed, table.fleet_level) {
+                continue;
+            }
+            if state.load > 0 && now < worker.divert_until_ms() {
+                continue;
+            }
+            match pick {
+                Some((_, load)) if state.load > load => {}
+                Some((_, load)) if state.load == load => {
+                    tied += 1;
+                    if rng.random_range(0..=tied) == 0 {
+                        pick = Some((idx, state.load));
+                    }
+                }
+                _ => {
+                    pick = Some((idx, state.load));
+                    tied = 0;
+                }
+            }
+        }
+        let (idx, _) = pick?;
+        self.divert_hits.store(0, Ordering::Relaxed);
+        self.divert_shallow_seen.store(false, Ordering::Relaxed);
+        workers[idx].note_diverted(now + DIVERT_WINDOW_MS);
+        self.select_expected_wait(workers, &[idx], info)
+    }
+
     /// Resolve an affinity score group to one final worker. Safe affinity
     /// candidates retain priority; only when every tied holder trips the
     /// pressure gate do we scan the healthy fleet for non-gated spill targets.
@@ -1367,9 +1983,10 @@ impl CacheAwarePolicy {
             return self.select_expected_wait(workers, &safe_affinity, info);
         }
 
-        // A miss has no affinity candidates and is not a spill: every healthy
-        // worker participates. A true spill excludes other workers that trip
-        // the same gate, preventing a fallback from reselecting a hot holder.
+        // A miss has no affinity candidates and is not a spill: every
+        // eligible worker the decision read participates. A true spill
+        // excludes other workers that trip the same gate, preventing a
+        // fallback from reselecting a hot holder.
         if affinity_candidates.is_empty() {
             return self.select_expected_wait(workers, healthy_indices, info);
         }
@@ -1386,11 +2003,139 @@ impl CacheAwarePolicy {
         self.select_expected_wait(workers, candidates, info)
     }
 
+    /// Run the selection policy over this request's inputs and resolve its
+    /// pick with the host's gate, expected-wait selector and credit.
+    ///
+    /// `candidates` are the positive-overlap workers with their decayed
+    /// scores. Policies that also want cold workers or backend loads declare
+    /// it in their `Needs`; the default policy declares neither, so with no
+    /// accounting its hot path gathers exactly what the affinity-group
+    /// decision did and reaches the same `select_final_from_affinity` call.
+    ///
+    /// - `Pick::Group`: the affinity group, resolved as before (pressure
+    ///   gate, then expected wait, which credits the result).
+    /// - `Pick::None`: the miss path (expected wait over the healthy fleet).
+    /// - `Pick::Final`: that worker, credited through the expected-wait
+    ///   selector; the policy owns the load trade-off, so the count-pressure
+    ///   gate does not apply. If the waiting-queue veto drops it, the fleet
+    ///   fallback runs.
+    fn resolve_selection(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        candidates: &[OverlapCandidate],
+        request: &RequestInputs<'_>,
+        avg_load: f64,
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let needs = self.selection.needs();
+        let accounting = self.accounting.as_ref();
+        let wants_all = needs.all_workers || accounting.is_some();
+        if candidates.is_empty() && !wants_all {
+            return self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info);
+        }
+
+        // With `all_workers` the rows are the eligible workers the decision
+        // read merged with the holders, in slice order (a sampled decision
+        // reads eligibility for a bounded sample of the pool beside the
+        // holders, so the two lists differ); otherwise the candidates are
+        // the rows and no list is built.
+        let all_rows: Vec<usize> = if wants_all {
+            Self::merge_rows(healthy_indices, candidates)
+        } else {
+            Vec::new()
+        };
+        let predicted = match (accounting, request.prefix_hashes) {
+            (Some(accounting), Some(hashes)) => accounting.predicted_overlaps(hashes),
+            _ => Vec::new(),
+        };
+        let gather = |idx: usize, raw: f64, effective: f64| {
+            let url = workers[idx].url();
+            let predicted_blocks = predicted
+                .iter()
+                .find(|(predicted_url, _)| &**predicted_url == url)
+                .map_or(0.0, |(_, blocks)| *blocks);
+            // A prediction deeper than the index's view stands in for both
+            // scores: the blocks are expected to be resident by the time the
+            // request lands, so no decay is applied to them.
+            let (device_blocks, effective_score) = if predicted_blocks > raw {
+                (predicted_blocks, predicted_blocks)
+            } else {
+                (raw, effective)
+            };
+            CandidateInputs {
+                idx,
+                url,
+                device_blocks,
+                effective_score,
+            }
+        };
+        let inputs: Vec<CandidateInputs<'_>> = if wants_all {
+            // Rows and candidates are both in slice order, so one merge pass
+            // pairs them.
+            let mut next = candidates.iter().peekable();
+            all_rows
+                .iter()
+                .map(|&idx| {
+                    let (raw, effective) = next
+                        .next_if(|candidate| candidate.idx == idx)
+                        .map_or((0.0, 0.0), |candidate| {
+                            (candidate.raw_score, candidate.effective_score)
+                        });
+                    gather(idx, raw, effective)
+                })
+                .collect()
+        } else {
+            candidates
+                .iter()
+                .map(|candidate| {
+                    gather(
+                        candidate.idx,
+                        candidate.raw_score,
+                        candidate.effective_score,
+                    )
+                })
+                .collect()
+        };
+        let selected = match self.selection.select(request, &inputs) {
+            Pick::None => {
+                self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+            }
+            Pick::Group(rows) => {
+                let group: Vec<usize> = rows.iter().map(|&row| inputs[row].idx).collect();
+                self.select_final_from_affinity(workers, &group, healthy_indices, avg_load, info)
+            }
+            Pick::Final(row) => {
+                let idx = inputs[row].idx;
+                self.select_expected_wait(workers, &[idx], info)
+                    .or_else(|| self.select_expected_wait(workers, healthy_indices, info))
+            }
+        }?;
+
+        if let Some(dispatched) = inputs.iter().find(|candidate| candidate.idx == selected) {
+            self.selection.on_dispatch(request, dispatched);
+            if let Some(accounting) = accounting {
+                let uncached = dispatched.uncached_prompt_tokens(request) as u64;
+                accounting.record_dispatch(
+                    dispatched.url,
+                    uncached,
+                    request.prefix_hashes.unwrap_or(&[]),
+                );
+            }
+        }
+        Some(selected)
+    }
+
     /// Pick an effective-affinity score group while preserving temperature.
     /// At temperature zero this is the exact maximum. With temperature, the
     /// existing softmax samples one worker; expanding that draw back to every
     /// equal-score worker preserves each score group's aggregate probability,
     /// then LeastLoad breaks the tie inside the sampled group.
+    ///
+    /// Kept as the reference for the default selection policy, which must
+    /// reproduce it (see the pin tests); production goes through
+    /// `resolve_selection`.
+    #[cfg(test)]
     fn affinity_score_group(
         candidates: &[OverlapCandidate],
         selection_temperature: f32,
@@ -1428,16 +2173,20 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
         matched_tenants: &[TenantId],
-        request_units: usize,
-        avg_load: f64,
+        matched_units: usize,
+        request: &RequestInputs<'_>,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
+        let avg_load = request.avg_load;
+        let request_units = request.prompt_tokens;
+        let matched_blocks = (matched_units / self.config.block_size.max(1)) as f64;
         let mut candidates: Vec<OverlapCandidate> = Vec::new();
         for &idx in healthy_indices {
             let url = workers[idx].url();
             if matched_tenants.iter().any(|tenant| tenant.as_ref() == url) {
                 candidates.push(OverlapCandidate {
                     idx,
+                    raw_score: matched_blocks,
                     effective_score: 1.0,
                 });
             }
@@ -1456,18 +2205,17 @@ impl CacheAwarePolicy {
             self.config.block_size,
             &tuning,
         );
-        let affinity_candidates =
-            Self::affinity_score_group(&candidates, tuning.selection_temperature);
-        self.select_final_from_affinity(
+        self.resolve_selection(
             workers,
-            &affinity_candidates,
             healthy_indices,
+            &candidates,
+            request,
             avg_load,
             info,
         )
     }
 
-    /// Event-driven routing: PositionalIndexer overlap scoring (Type 1).
+    /// Event-driven routing: KV index overlap scoring (Type 1).
     ///
     /// Self-contained — when overlap is found, selects the worker with the best
     /// cache match. When no overlap (cold start, novel tokens, short request),
@@ -1495,89 +2243,185 @@ impl CacheAwarePolicy {
             waiting_prefill_tokens: waiting_prefill_tokens.as_deref(),
         };
 
-        let candidates = Self::overlap_candidates(
+        // The engines fold the LoRA name and cache salt into their block
+        // hashes and the monitor recomputes stored blocks under the same
+        // seed, so a request in a namespace is hashed under it and matches
+        // only its own blocks; a plain request keeps the plain hash.
+        let content_hashes = match info.cache_namespace {
+            Some(namespace) => {
+                request_content_hashes_with_seed(tokens, block_size, namespace.event_seed())
+            }
+            None => compute_request_content_hashes(tokens, block_size),
+        };
+        let table = self.pool_table(workers, indexer, liveness::now_ms());
+        // Over a sampled pool the candidates read are bounded as the pool
+        // is: a tie among the deepest holders is drawn from, and an
+        // all-workers policy ranks the sample and the deepest holders; a
+        // shallow shared prefix is not a reason to read a thousand workers.
+        let cap = (workers.len() > 2 * FLEET_SAMPLE).then_some(FLEET_SAMPLE);
+        let gather = if self.exact_maximum_decision(&tuning) {
+            Gather::TopGroup { cap }
+        } else {
+            let wants_all = self.selection.needs().all_workers || self.accounting.is_some();
+            Gather::All {
+                cap: cap.filter(|_| wants_all),
+            }
+        };
+        let candidates = Self::overlap_candidates_for_hashes(
             workers,
-            tokens,
-            healthy_indices,
+            &content_hashes,
+            &table,
             indexer,
             block_size,
             &tuning,
+            gather,
         );
-        let affinity_candidates =
-            Self::affinity_score_group(&candidates, tuning.selection_temperature);
-        if !affinity_candidates.is_empty() {
-            let idx = self.select_final_from_affinity(
-                workers,
-                &affinity_candidates,
-                healthy_indices,
-                avg_load,
-                info,
-            )?;
+        // Chain hashes are computed only for policies (or accounting) keyed
+        // on prefixes; the default decision never pays for them.
+        let prefix_hashes: Vec<u64> =
+            if self.selection.needs().prefix_hashes || self.accounting.is_some() {
+                request_prefix_hashes(&content_hashes)
+                    .into_iter()
+                    .map(|hash| hash.0)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let request = RequestInputs {
+            prompt_tokens: tokens.len(),
+            block_size,
+            request_blocks: content_hashes.len().max(1),
+            avg_load,
+            prefix_hashes: (!prefix_hashes.is_empty()).then_some(prefix_hashes.as_slice()),
+        };
+        // A miss for the warm-up slice is no overlap or a thin one: chat requests
+        // share their template's head with every holder, which is affinity in
+        // name only. Thin is at most the tree-mode `cache_threshold` share of
+        // the request, or a few blocks outright when they are under half of
+        // it (the head of a short request; a short request cached whole is a
+        // hit and stays with its holder).
+        let best_overlap = candidates
+            .iter()
+            .map(|candidate| candidate.raw_score)
+            .fold(0.0_f64, f64::max);
+        let request_blocks = request.request_blocks as f64;
+        let thin_overlap = best_overlap / request_blocks <= f64::from(self.config.cache_threshold)
+            || (best_overlap <= WARMUP_MISS_BLOCKS && best_overlap * 2.0 < request_blocks);
+        if thin_overlap {
+            if let Some(idx) = self.warmup_slice(workers, &table, indexer, info) {
+                Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
+                debug!(
+                    worker = workers[idx].url(),
+                    branch = "warmup_slice",
+                    request_blocks = content_hashes.len(),
+                    "Cache miss routed to a warming worker"
+                );
+                return Some(idx);
+            }
+        } else if let Some(idx) = self.warmup_divert(
+            workers,
+            &table,
+            indexer,
+            info,
+            best_overlap / request_blocks,
+        ) {
+            Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
             debug!(
                 worker = workers[idx].url(),
-                branch = if affinity_candidates.contains(&idx) {
-                    "event_hit"
-                } else {
-                    "event_spill"
-                },
-                model_id,
-                "Event-driven routing: overlap match"
+                branch = "warmup_divert",
+                overlap_blocks = best_overlap as u64,
+                request_blocks = content_hashes.len(),
+                "Cache hit diverted to a thin worker"
             );
             return Some(idx);
         }
-
-        // No cache overlap — expected-wait fallback over the healthy fleet.
-        let selected = self.select_expected_wait(workers, healthy_indices, info)?;
+        let had_overlap = !candidates.is_empty();
+        let idx = self.resolve_selection(
+            workers,
+            healthy_indices,
+            &candidates,
+            &request,
+            avg_load,
+            info,
+        )?;
+        // `overlap_blocks` is the chosen worker's undecayed overlap, so a
+        // per-decision join against the engine's `cached_tokens` compares
+        // blocks and not only the branch.
+        let overlap_blocks = candidates
+            .iter()
+            .find(|candidate| candidate.idx == idx)
+            .map_or(0, |candidate| candidate.raw_score as u64);
+        let branch = if !had_overlap {
+            "event_miss"
+        } else if overlap_blocks > 0 {
+            "event_hit"
+        } else {
+            "event_spill"
+        };
+        Metrics::record_worker_cache_aware_policy_branch(branch);
         debug!(
-            worker = workers[selected].url(),
-            model_id, "Event-driven routing: no overlap, expected-wait fallback"
+            worker = workers[idx].url(),
+            branch,
+            overlap_blocks,
+            request_blocks = content_hashes.len(),
+            policy = self.selection.name(),
+            model_id,
+            "Event-driven routing"
         );
-        Some(selected)
+        Some(idx)
     }
 
     /// Build positive-overlap candidates for event-driven routing.
     ///
-    /// Returns each healthy worker with a positive, optionally decayed overlap
-    /// score. This helper neither selects nor credits a worker:
+    /// Returns each eligible worker with a positive, optionally decayed
+    /// overlap score. This helper neither selects nor credits a worker:
     /// `affinity_score_group` chooses the effective-score group (exact maximum
     /// at temperature zero; a softmax-sampled group otherwise), and
     /// `select_final_from_affinity` uses LeastLoad to choose and credit one
-    /// final worker from that group. An empty result means no full-block overlap.
+    /// final worker from that group. An empty result means no full-block
+    /// overlap. The tests name the eligible set themselves.
+    #[cfg(test)]
     fn overlap_candidates(
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
         healthy_indices: &[usize],
-        indexer: &PositionalIndexer,
+        indexer: &KvIndex,
         block_size: usize,
         tuning: &OverlapTuning<'_>,
     ) -> Vec<OverlapCandidate> {
         let content_hashes = compute_request_content_hashes(tokens, block_size);
-        if content_hashes.is_empty() {
-            return Vec::new();
+        let table = PoolTable::build(workers, indexer, liveness::now_ms());
+        let mut candidates = Self::overlap_holders(
+            workers,
+            &content_hashes,
+            &table,
+            indexer,
+            Gather::All { cap: None },
+        );
+        candidates.retain(|candidate| healthy_indices.contains(&candidate.idx));
+        if !candidates.is_empty() {
+            Self::apply_overlap_decay(
+                workers,
+                &mut candidates,
+                content_hashes.len(),
+                block_size,
+                tuning,
+            );
         }
+        candidates
+    }
 
-        let overlap = indexer.find_matches(&content_hashes, false);
-        if overlap.scores.is_empty() {
-            return Vec::new();
-        }
-
-        // Gather the positive-overlap candidates once; both selection modes
-        // and the decay's fleet-floor computation need the full set.
-        let mut candidates: Vec<OverlapCandidate> = Vec::new();
-        for &idx in healthy_indices {
-            let Some(score) = indexer
-                .worker_id(workers[idx].url())
-                .and_then(|id| overlap.scores.get(&id))
-                .copied()
-                .filter(|&s| s > 0)
-            else {
-                continue;
-            };
-            candidates.push(OverlapCandidate {
-                idx,
-                effective_score: f64::from(score),
-            });
-        }
+    /// `overlap_candidates` over already-computed block hashes.
+    fn overlap_candidates_for_hashes(
+        workers: &[Arc<dyn Worker>],
+        content_hashes: &[ContentHash],
+        table: &PoolTable,
+        indexer: &KvIndex,
+        block_size: usize,
+        tuning: &OverlapTuning<'_>,
+        gather: Gather,
+    ) -> Vec<OverlapCandidate> {
+        let mut candidates = Self::overlap_holders(workers, content_hashes, table, indexer, gather);
         if candidates.is_empty() {
             return candidates;
         }
@@ -1590,6 +2434,152 @@ impl CacheAwarePolicy {
             tuning,
         );
 
+        candidates
+    }
+
+    /// The eligible holders of the request's blocks with their undecayed
+    /// overlap, in slice order: the index names them by id, the pool table
+    /// places them, and eligibility is read for them alone, so the cost
+    /// follows the holders gathered and not the pool.
+    fn overlap_holders(
+        workers: &[Arc<dyn Worker>],
+        content_hashes: &[ContentHash],
+        table: &PoolTable,
+        indexer: &KvIndex,
+        gather: Gather,
+    ) -> Vec<OverlapCandidate> {
+        if content_hashes.is_empty() {
+            return Vec::new();
+        }
+
+        let started = Instant::now();
+        let overlap = indexer.find_matches(content_hashes, false);
+        Metrics::record_kv_index_lookup(indexer.name(), started.elapsed().as_secs_f64());
+        if overlap.scores.is_empty() {
+            return Vec::new();
+        }
+
+        let mut candidates = match gather {
+            Gather::TopGroup { cap } => Self::top_group(workers, table, &overlap, cap),
+            Gather::All { cap } => Self::all_holders(workers, table, &overlap, cap),
+        };
+        // Downstream reads candidates in slice order: the all-workers merge
+        // in `resolve_selection` and the tie-breaks.
+        candidates.sort_unstable_by_key(|candidate| candidate.idx);
+        candidates
+    }
+
+    /// The eligible holders of the deepest overlap: one pass over the
+    /// scores for the depth, one to place and read those holders. When none
+    /// of them is in this pool and routable (a PD leg's pool sharing the
+    /// model's index with the other leg, a holder down), the full gather
+    /// decides, so the result is always the deepest group a scan of the pool
+    /// would have found.
+    fn top_group(
+        workers: &[Arc<dyn Worker>],
+        table: &PoolTable,
+        overlap: &OverlapScores,
+        cap: Option<usize>,
+    ) -> Vec<OverlapCandidate> {
+        let deepest = overlap.scores.values().copied().max().unwrap_or(0);
+        if deepest == 0 {
+            return Vec::new();
+        }
+        let group = Self::holders_at(workers, table, overlap, deepest, cap);
+        if !group.is_empty() {
+            return group;
+        }
+        let mut all = Self::all_holders(workers, table, overlap, None);
+        let best = all
+            .iter()
+            .map(|candidate| candidate.raw_score)
+            .fold(0.0_f64, f64::max);
+        all.retain(|candidate| candidate.raw_score == best);
+        Self::draw(&mut all, cap);
+        all
+    }
+
+    /// The eligible holders in this pool whose overlap is exactly `depth`
+    /// blocks; `cap` of the tied holders, drawn uniformly, when they are more.
+    fn holders_at(
+        workers: &[Arc<dyn Worker>],
+        table: &PoolTable,
+        overlap: &OverlapScores,
+        depth: u32,
+        cap: Option<usize>,
+    ) -> Vec<OverlapCandidate> {
+        let mut tied: Vec<u32> = overlap
+            .scores
+            .iter()
+            .filter(|(_, &score)| score == depth)
+            .map(|(&id, _)| id)
+            .collect();
+        Self::draw(&mut tied, cap);
+        let mut group = Vec::with_capacity(tied.len());
+        for id in tied {
+            let Some(idx) = table.position(id, workers) else {
+                continue;
+            };
+            if !workers[idx].routing_state().eligible() {
+                continue;
+            }
+            group.push(OverlapCandidate {
+                idx,
+                raw_score: f64::from(depth),
+                effective_score: f64::from(depth),
+            });
+        }
+        group
+    }
+
+    /// Keep a uniform draw of `cap` items when there are more.
+    fn draw<T>(items: &mut Vec<T>, cap: Option<usize>) {
+        let Some(cap) = cap else {
+            return;
+        };
+        if items.len() <= cap {
+            return;
+        }
+        let mut rng = rand::rng();
+        for i in 0..cap {
+            let j = rng.random_range(i..items.len());
+            items.swap(i, j);
+        }
+        items.truncate(cap);
+    }
+
+    /// Every eligible holder in this pool with a positive overlap; the `cap`
+    /// deepest of them when set.
+    fn all_holders(
+        workers: &[Arc<dyn Worker>],
+        table: &PoolTable,
+        overlap: &OverlapScores,
+        cap: Option<usize>,
+    ) -> Vec<OverlapCandidate> {
+        let mut candidates: Vec<OverlapCandidate> = Vec::with_capacity(overlap.scores.len());
+        for (&id, &score) in &overlap.scores {
+            if score == 0 {
+                continue;
+            }
+            let Some(idx) = table.position(id, workers) else {
+                continue;
+            };
+            if !workers[idx].routing_state().eligible() {
+                continue;
+            }
+            candidates.push(OverlapCandidate {
+                idx,
+                raw_score: f64::from(score),
+                effective_score: f64::from(score),
+            });
+        }
+        if let Some(cap) = cap {
+            if candidates.len() > cap {
+                candidates
+                    .select_nth_unstable_by(cap - 1, |a, b| b.raw_score.total_cmp(&a.raw_score));
+                candidates.truncate(cap);
+            }
+        }
         candidates
     }
 
@@ -1639,6 +2629,7 @@ impl CacheAwarePolicy {
     /// or 2000. The best candidate's exponent is exactly 0 (overflow-safe);
     /// a degenerate spread (all equal) is a uniform draw. Inverse-CDF
     /// sampling with a last-row fallback against floating-point drift.
+    #[cfg(test)]
     fn sample_by_temperature(candidates: &[OverlapCandidate], temperature: f32) -> Option<usize> {
         let first = candidates.first()?;
         let (min, max) = candidates.iter().fold(
@@ -1701,6 +2692,15 @@ impl CacheAwarePolicy {
         };
         Metrics::record_worker_cache_aware_policy_branch(branch);
         Metrics::record_cache_aware_match_ratio(histogram_ratio);
+        // `credited_units` is what the served worker is expected to have
+        // cached: the matched prefix only when it serves the request. On the
+        // fallback and spill branches the match belongs to another tenant, so
+        // a join against the engine's cached tokens must not count it.
+        let credited_units = if branch == "tree_match" {
+            matched_units
+        } else {
+            0
+        };
         debug!(
             index = "tree",
             branch,
@@ -1708,6 +2708,9 @@ impl CacheAwarePolicy {
             model_id,
             matched_ratio = f64::from(matched_ratio),
             threshold = f64::from(self.config.cache_threshold),
+            matched_units,
+            input_units,
+            credited_units,
             "Cache-aware selection"
         );
     }
@@ -2015,17 +3018,18 @@ impl CacheAwarePolicy {
             } else {
                 matched as f32 / input as f32
             };
+            let request = self.tree_request(tokens.len(), avg_load);
             selected_idx = if match_rate > self.config.cache_threshold {
                 self.select_matched_candidate(
                     workers,
                     healthy_indices,
                     &result.matched_tenants,
-                    tokens.len(),
-                    avg_load,
+                    matched,
+                    &request,
                     info,
                 )
             } else {
-                self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+                self.resolve_selection(workers, healthy_indices, &[], &request, avg_load, info)
             };
             selected_idx.map(|idx| workers[idx].url())
         });
@@ -2092,17 +3096,18 @@ impl CacheAwarePolicy {
             } else {
                 matched as f32 / input as f32
             };
+            let request = self.tree_request(input, avg_load);
             selected_idx = if match_rate > self.config.cache_threshold {
                 self.select_matched_candidate(
                     workers,
                     healthy_indices,
                     &result.matched_tenants,
-                    input,
-                    avg_load,
+                    matched,
+                    &request,
                     info,
                 )
             } else {
-                self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+                self.resolve_selection(workers, healthy_indices, &[], &request, avg_load, info)
             };
             selected_idx.map(|idx| workers[idx].url())
         });
@@ -2147,7 +3152,7 @@ impl Default for CacheAwarePolicy {
 
 #[cfg(test)]
 mod tests {
-    use kv_index::{compute_content_hash, SequenceHash, StoredBlock, WorkerBlockMap};
+    use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
     use openai_protocol::worker::{
         HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
@@ -2173,7 +3178,7 @@ mod tests {
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
         healthy_indices: &[usize],
-        indexer: &PositionalIndexer,
+        indexer: &KvIndex,
         block_size: usize,
         tuning: &OverlapTuning<'_>,
     ) -> Vec<usize> {
@@ -2189,7 +3194,7 @@ mod tests {
     }
     use crate::{
         observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
-        worker::{BasicWorkerBuilder, WorkerType},
+        worker::{BasicWorkerBuilder, WorkerBlocks, WorkerType},
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -3855,19 +4860,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Event-driven routing tests (Type 1: PositionalIndexer overlap scoring)
+    // Event-driven routing tests (Type 1: KV index overlap scoring)
     // -----------------------------------------------------------------------
 
-    /// Helper: create a PositionalIndexer and store blocks for a worker.
+    /// Helper: create a positional KV index and store blocks for a worker.
     /// `token_chunks` is a list of token-id slices — each becomes one block.
     fn setup_indexer_with_blocks(
         worker_url: &str,
         token_chunks: &[&[u32]],
         jump_size: usize,
-    ) -> Arc<PositionalIndexer> {
-        let indexer = Arc::new(PositionalIndexer::new(jump_size));
+    ) -> Arc<KvIndex> {
+        let indexer = Arc::new(KvIndex::positional(jump_size));
         let worker_id = indexer.intern_worker(worker_url).unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerBlocks::default();
         let blocks: Vec<StoredBlock> = token_chunks
             .iter()
             .enumerate()
@@ -3958,7 +4963,7 @@ mod tests {
         let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks, 4);
         // Same content cached on w2 under distinct backend seq hashes.
         let w2 = indexer.intern_worker("http://w2:8000").unwrap();
-        let mut wb2 = WorkerBlockMap::default();
+        let mut wb2 = WorkerBlocks::default();
         let blocks: Vec<StoredBlock> = chunks
             .iter()
             .enumerate()
@@ -3984,7 +4989,7 @@ mod tests {
 
     /// Two workers with identical cached blocks (the tie-test topology): both
     /// fully match the request.
-    fn equal_overlap_fixture() -> (Vec<Arc<dyn Worker>>, Arc<PositionalIndexer>) {
+    fn equal_overlap_fixture() -> (Vec<Arc<dyn Worker>>, Arc<KvIndex>) {
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
@@ -4002,7 +5007,7 @@ mod tests {
         let chunks: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 6, 7, 8]];
         let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks, 4);
         let w2 = indexer.intern_worker("http://w2:8000").unwrap();
-        let mut wb2 = WorkerBlockMap::default();
+        let mut wb2 = WorkerBlocks::default();
         let blocks: Vec<StoredBlock> = chunks
             .iter()
             .enumerate()
@@ -4074,7 +5079,7 @@ mod tests {
     }
 
     /// w1 caches both request blocks (score 2), w2 only the first (score 1).
-    fn unequal_overlap_fixture() -> (Vec<Arc<dyn Worker>>, Arc<PositionalIndexer>) {
+    fn unequal_overlap_fixture() -> (Vec<Arc<dyn Worker>>, Arc<KvIndex>) {
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
@@ -4092,7 +5097,7 @@ mod tests {
         let indexer =
             setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
         let w2 = indexer.intern_worker("http://w2:8000").unwrap();
-        let mut wb2 = WorkerBlockMap::default();
+        let mut wb2 = WorkerBlocks::default();
         let blocks = vec![StoredBlock {
             seq_hash: SequenceHash(100),
             content_hash: compute_content_hash(&[1, 2, 3, 4]),
@@ -4218,11 +5223,11 @@ mod tests {
         policy.init_workers(&workers);
 
         // Store same blocks for both workers (equal overlap)
-        let indexer = Arc::new(PositionalIndexer::new(4));
+        let indexer = Arc::new(KvIndex::positional(4));
         let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
         let w2_id = indexer.intern_worker("http://w2:8000").unwrap();
-        let mut wb1 = WorkerBlockMap::default();
-        let mut wb2 = WorkerBlockMap::default();
+        let mut wb1 = WorkerBlocks::default();
+        let mut wb2 = WorkerBlocks::default();
         let blocks = vec![StoredBlock {
             seq_hash: SequenceHash(1),
             content_hash: compute_content_hash(&[1, 2, 3, 4]),
@@ -4270,11 +5275,11 @@ mod tests {
         ];
         policy.init_workers(&workers);
 
-        let indexer = Arc::new(PositionalIndexer::new(4));
+        let indexer = Arc::new(KvIndex::positional(4));
         let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
         let w2_id = indexer.intern_worker("http://w2:8000").unwrap();
-        let mut wb1 = WorkerBlockMap::default();
-        let mut wb2 = WorkerBlockMap::default();
+        let mut wb1 = WorkerBlocks::default();
+        let mut wb2 = WorkerBlocks::default();
 
         // Both workers have block [1,2,3,4] (equal overlap, equal load)
         let block = vec![StoredBlock {
@@ -4350,11 +5355,11 @@ mod tests {
         ];
         policy.init_workers(&workers);
 
-        let indexer = Arc::new(PositionalIndexer::new(4));
+        let indexer = Arc::new(KvIndex::positional(4));
         let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
         let w2_id = indexer.intern_worker("http://w2:8000").unwrap();
-        let mut wb1 = WorkerBlockMap::default();
-        let mut wb2 = WorkerBlockMap::default();
+        let mut wb1 = WorkerBlocks::default();
+        let mut wb2 = WorkerBlocks::default();
 
         // w1 has 4 blocks cached
         let blocks_w1: Vec<StoredBlock> = (0..4)
@@ -4428,6 +5433,347 @@ mod tests {
             Some(0)
         );
         assert_only_final_worker_credited(&policy, &workers, 0, 8);
+    }
+
+    #[test]
+    fn a_worker_with_an_emptied_index_gets_the_warm_up_slice_whatever_its_age() {
+        // The soaks' case in miniature: w1 holds a fleet-sized cache (1,100
+        // blocks), w2's index was cleared by a resync (nothing indexed), and
+        // every request shares a head with w1, so affinity alone would never
+        // send w2 a request again. The slice does, on the thin overlap: w2 is
+        // thin against the fleet's level whatever its age.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        update_expected_wait_loads(&policy, &workers, &[0, 0]);
+        let held: Vec<u32> = (1..=4_400).collect();
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&held], 4);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+        // w1's first block (the shared head) followed by eleven novel blocks.
+        let mut request: Vec<u32> = (1..=4).collect();
+        request.extend(90_000..90_044);
+        let picks: Vec<usize> = (0..8)
+            .map(|_| {
+                policy
+                    .select_worker(
+                        &workers,
+                        &SelectWorkerInfo {
+                            tokens: Some(&request),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            picks.contains(&1),
+            "the emptied worker got its slice of the thin-overlap requests: {picks:?}"
+        );
+        assert!(picks.contains(&0), "the holder kept the rest: {picks:?}");
+    }
+
+    /// Store `tokens` for `worker` as blocks of `block` tokens, with sequence
+    /// hashes from `seq_base` (distinct per call).
+    fn store_blocks(indexer: &KvIndex, worker: u32, tokens: &[u32], block: usize, seq_base: u64) {
+        let mut wb = WorkerBlocks::default();
+        let blocks: Vec<StoredBlock> = tokens
+            .chunks(block)
+            .enumerate()
+            .map(|(i, chunk)| StoredBlock {
+                seq_hash: SequenceHash(seq_base + i as u64),
+                content_hash: compute_content_hash(chunk),
+            })
+            .collect();
+        indexer
+            .apply_stored(worker, &blocks, None, &mut wb)
+            .unwrap();
+    }
+
+    /// A fleet for the diversion tests: the policy, its eight workers, the
+    /// index they share and each holder's head (its first 240 tokens, 60
+    /// blocks); a request made of a head and a four-block tail of its own is
+    /// a deep hit on that holder (60 of 64 blocks) that no other request
+    /// repeats.
+    struct HolderFleet {
+        policy: CacheAwarePolicy,
+        workers: Vec<Arc<dyn Worker>>,
+        indexer: Arc<KvIndex>,
+        heads: Vec<Vec<u32>>,
+    }
+
+    /// Eight workers; the first `holders` hold 1,100 blocks each of their own
+    /// 4,400-token sequence, the rest nothing.
+    fn fleet_with_holders(holders: usize) -> HolderFleet {
+        fleet_with_holders_of(holders, 1_100)
+    }
+
+    /// Eight workers; the first `holders` hold `blocks` blocks each of their
+    /// own sequence, the rest nothing.
+    fn fleet_with_holders_of(holders: usize, blocks: usize) -> HolderFleet {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let workers = make_workers(&refs);
+        policy.init_workers(&workers);
+        update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 0, 0, 0, 0, 0]);
+        let indexer = Arc::new(KvIndex::positional(4));
+        let mut prefixes = Vec::new();
+        for (h, url) in urls.iter().enumerate() {
+            let id = indexer.intern_worker(url).unwrap();
+            if h >= holders {
+                continue;
+            }
+            let tokens: Vec<u32> = (0..blocks as u32 * 4)
+                .map(|i| (h as u32 + 1) * 100_000 + i)
+                .collect();
+            store_blocks(&indexer, id, &tokens, 4, (h as u64 + 1) * 1_000_000);
+            prefixes.push(tokens[..240].to_vec());
+        }
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+        HolderFleet {
+            policy,
+            workers,
+            indexer,
+            heads: prefixes,
+        }
+    }
+
+    #[test]
+    fn an_emptied_worker_gets_its_share_of_hits_until_it_refills() {
+        // The churn runs' case: every request is cached whole on one of seven
+        // holders (a deep hit, never a miss), the eighth worker's index was
+        // emptied by a resync. Affinity alone never sends it anything; the
+        // diversion hands it one hit in eight (no shallow hit ever comes, so
+        // the fallback at the window's end), and each diverted request lands
+        // in its index, until it crosses half the fleet's level (1,100 -> 550).
+        let HolderFleet {
+            policy,
+            workers,
+            indexer,
+            heads,
+        } = fleet_with_holders(7);
+        let emptied = indexer.worker_id("http://w7:8000").unwrap();
+        // A request: a holder's 60-block head and a four-block tail of its own.
+        let request = |i: usize| -> Vec<u32> {
+            let mut tokens = heads[i % 7].clone();
+            tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+            tokens
+        };
+        let mut decisions = 0usize;
+        let mut first = None;
+        let mut received = 0usize;
+        while decisions < 1_000 && indexer.worker_block_count(emptied) < 550 {
+            let tokens = request(decisions);
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            decisions += 1;
+            if idx == 7 {
+                received += 1;
+                first.get_or_insert(decisions);
+                // The request prefills on w7: its blocks join w7's index.
+                store_blocks(
+                    &indexer,
+                    emptied,
+                    &tokens,
+                    4,
+                    9_000_000 + decisions as u64 * 100,
+                );
+            }
+        }
+        assert!(
+            first.is_some_and(|first| first <= 8),
+            "the emptied worker is served within the first eight hits, was {first:?}"
+        );
+        assert!(
+            indexer.worker_block_count(emptied) >= 550,
+            "refilled to the ratio: {} blocks after {decisions} decisions",
+            indexer.worker_block_count(emptied)
+        );
+        assert!(
+            decisions <= 40 * 8 + 16,
+            "about forty requests of 64 blocks (seven heads of 60, then tails of 4) at one in eight: \
+             {decisions} decisions, {received} received"
+        );
+        // At the ratio the diversion stops: the hit counter runs on without a
+        // reset (w7 now holds the heads too and may win a tie as a holder,
+        // which is affinity, not a diversion).
+        let hits_before = policy.divert_hits.load(Ordering::Relaxed);
+        for i in 0..32 {
+            let tokens = request(decisions + i);
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            policy.divert_hits.load(Ordering::Relaxed),
+            hits_before + 32,
+            "no diversion once the worker is no longer thin"
+        );
+    }
+
+    #[test]
+    fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
+        // Churn c3 (6ce84c9e): the fleet's level was 32,767 blocks a worker,
+        // far above the warm-up blocks. Within a minute of the publisher
+        // restart the emptied worker's index had regrown to 1,765 from the
+        // decode blocks of its requests in flight, and the pool table,
+        // applying the age rule's growth cap to a thin worker, dropped it
+        // there after one diversion: idle for the 25 minutes to the next
+        // fault. Here the level is 4,096 (the ratio at 2,048), the worker has
+        // regrown to 1,100 before any diversion, every request is a deep hit
+        // (60 of 64 blocks, held elsewhere), each diverted request stays in
+        // flight for the rest of the test, and the table is rebuilt every
+        // eight decisions as the second's refresh would.
+        let HolderFleet {
+            policy,
+            workers,
+            indexer,
+            heads,
+        } = fleet_with_holders_of(7, 4_096);
+        let thin = indexer.worker_id("http://w7:8000").unwrap();
+        // The growth baselines date from the first table, built on the empty
+        // fleet as on the run; the regrowth comes after.
+        policy.pool_table(&workers, &indexer, liveness::now_ms());
+        let regrown: Vec<u32> = (0..4_400).map(|i| 80_000_000 + i).collect();
+        store_blocks(&indexer, thin, &regrown, 4, 8_000_000);
+        assert_eq!(indexer.worker_block_count(thin), 1_100);
+        let request = |i: usize| -> Vec<u32> {
+            let mut tokens = heads[i % 7].clone();
+            tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+            tokens
+        };
+        let select = |tokens: &[u32]| -> usize {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let mut rebuilds = 1u64;
+        let mut decisions = 0usize;
+        let mut first = None;
+        let mut received = 0usize;
+        while decisions < 2_000 && indexer.worker_block_count(thin) < 2_048 {
+            if decisions.is_multiple_of(8) {
+                rebuilds += 1;
+                policy.pool_table(
+                    &workers,
+                    &indexer,
+                    liveness::now_ms() + rebuilds * POOL_TABLE_REFRESH_MS,
+                );
+            }
+            let tokens = request(decisions);
+            let idx = select(&tokens);
+            decisions += 1;
+            if idx != 7 {
+                continue;
+            }
+            received += 1;
+            store_blocks(
+                &indexer,
+                thin,
+                &tokens,
+                4,
+                9_000_000 + decisions as u64 * 100,
+            );
+            // The diverted request runs on (tens of seconds on the trace).
+            workers[7].increment_load();
+            if first.is_none() {
+                first = Some(decisions);
+                // Inside the window, with that request in flight, no second
+                // diversion: the hit counter runs on without a reset.
+                let hits = policy.divert_hits.load(Ordering::Relaxed);
+                for i in 0..16 {
+                    select(&request(10_000 + i));
+                }
+                assert_eq!(
+                    policy.divert_hits.load(Ordering::Relaxed),
+                    hits + 16,
+                    "no second diversion inside the window while the first is in flight"
+                );
+            }
+            // The window elapses; the request is still in flight.
+            workers[7].note_diverted(0);
+        }
+        assert!(
+            first.is_some_and(|first| first <= 8),
+            "the thin worker is served within the first eight hits although it \
+             regrew past the warm-up blocks, was {first:?}"
+        );
+        assert!(
+            indexer.worker_block_count(thin) >= 2_048,
+            "refilled to the ratio across the rebuilds: {} blocks after {decisions} decisions",
+            indexer.worker_block_count(thin)
+        );
+        assert!(
+            received >= 15 && decisions <= 140 * 8 + 32,
+            "one hit in eight all the way (seven heads of 60 blocks, then tails of 4): \
+             {decisions} decisions, {received} received, {} in flight",
+            workers[7].load()
+        );
+        // At the ratio the table rebuilt lists no thin worker, and with no
+        // thin worker the diversion costs nothing: the hits are not even
+        // counted.
+        let table = policy.pool_table(
+            &workers,
+            &indexer,
+            liveness::now_ms() + (rebuilds + 1) * POOL_TABLE_REFRESH_MS,
+        );
+        assert!(table.thin.is_empty(), "no longer thin: {:?}", table.thin);
+        let hits = policy.divert_hits.load(Ordering::Relaxed);
+        for i in 0..32 {
+            select(&request(20_000 + i));
+        }
+        assert_eq!(
+            policy.divert_hits.load(Ordering::Relaxed),
+            hits,
+            "no hit counted, let alone diverted, once no worker is thin"
+        );
+    }
+
+    #[test]
+    fn a_fleet_without_a_thin_worker_sees_no_diversion() {
+        let fleet = fleet_with_holders(8);
+        for i in 0..64 {
+            let holder = i % 8;
+            let idx = fleet
+                .policy
+                .select_worker(
+                    &fleet.workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&fleet.heads[holder]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                idx, holder,
+                "every hit stays with its holder (decision {i})"
+            );
+        }
     }
 
     #[test]
@@ -4832,9 +6178,9 @@ mod tests {
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
 
         // Store blocks using block_size=8 (tokens chunked in groups of 8)
-        let indexer = Arc::new(PositionalIndexer::new(4));
+        let indexer = Arc::new(KvIndex::positional(4));
         let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerBlocks::default();
         let block = vec![StoredBlock {
             seq_hash: SequenceHash(1),
             content_hash: compute_content_hash(&[1, 2, 3, 4, 5, 6, 7, 8]),
@@ -4933,7 +6279,7 @@ mod tests {
 
         // Set up monitor with an empty indexer
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let empty_indexer = Arc::new(PositionalIndexer::new(4));
+        let empty_indexer = Arc::new(KvIndex::positional(4));
         monitor
             .indexers
             .insert("unknown".to_string(), empty_indexer);
@@ -5708,5 +7054,533 @@ mod tests {
         let mut forged = tenant_a.token_marker().to_vec();
         forged.extend_from_slice(&tokens);
         assert_eq!(route_namespaced(&policy, &workers, &forged, None), 0);
+    }
+
+    // -- selection policy layer --
+
+    /// Random positive-overlap candidate sets, as `overlap_candidates` would
+    /// produce them (healthy order, scores from a small set so ties occur).
+    fn random_overlap_candidates(rng: &mut impl RngExt, workers: usize) -> Vec<OverlapCandidate> {
+        let mut candidates = Vec::new();
+        for idx in 0..workers {
+            if rng.random::<f64>() >= 0.6 {
+                continue;
+            }
+            let score = f64::from(rng.random_range(1..6u32)) * 1.5;
+            let decayed = if rng.random::<f64>() < 0.3 {
+                score / 1.5
+            } else {
+                score
+            };
+            candidates.push(OverlapCandidate {
+                idx,
+                raw_score: score,
+                effective_score: decayed,
+            });
+        }
+        candidates
+    }
+
+    fn policy_inputs<'a>(
+        candidates: &'a [OverlapCandidate],
+        urls: &'a [String],
+    ) -> Vec<CandidateInputs<'a>> {
+        candidates
+            .iter()
+            .map(|candidate| CandidateInputs {
+                idx: candidate.idx,
+                url: &urls[candidate.idx],
+                device_blocks: candidate.raw_score,
+                effective_score: candidate.effective_score,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_policy_reproduces_affinity_score_group_at_zero_temperature() {
+        let policy = cost::build(cost::DEFAULT_POLICY, 0.0).unwrap();
+        let urls: Vec<String> = (0..16).map(|i| format!("http://w{i:02}:8000")).collect();
+        let request = RequestInputs {
+            prompt_tokens: 64,
+            block_size: 4,
+            request_blocks: 16,
+            avg_load: 0.0,
+            prefix_hashes: None,
+        };
+        let mut rng = rand::rng();
+        for _ in 0..2_000 {
+            let candidates = random_overlap_candidates(&mut rng, urls.len());
+            let mut reference = CacheAwarePolicy::affinity_score_group(&candidates, 0.0);
+            reference.sort_unstable();
+            let inputs = policy_inputs(&candidates, &urls);
+            let mut group = match policy.select(&request, &inputs) {
+                Pick::Group(rows) => rows.iter().map(|&row| inputs[row].idx).collect::<Vec<_>>(),
+                Pick::None => Vec::new(),
+                Pick::Final(_) => panic!("the default policy never returns a single pick"),
+            };
+            group.sort_unstable();
+            assert_eq!(group, reference);
+        }
+    }
+
+    #[test]
+    fn default_policy_temperature_groups_are_score_groups() {
+        let policy = cost::build(cost::DEFAULT_POLICY, 0.5).unwrap();
+        let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+        let candidates: Vec<OverlapCandidate> = (0..8)
+            .map(|idx| OverlapCandidate {
+                idx,
+                raw_score: if idx < 4 { 8.0 } else { 2.0 },
+                effective_score: if idx < 4 { 8.0 } else { 2.0 },
+            })
+            .collect();
+        let inputs = policy_inputs(&candidates, &urls);
+        let request = RequestInputs {
+            prompt_tokens: 32,
+            block_size: 4,
+            request_blocks: 8,
+            avg_load: 0.0,
+            prefix_hashes: None,
+        };
+        let mut saw_high = false;
+        let mut saw_low = false;
+        for _ in 0..400 {
+            let Pick::Group(rows) = policy.select(&request, &inputs) else {
+                panic!("expected a group");
+            };
+            let score = inputs[rows[0]].effective_score;
+            assert!(rows.iter().all(|&row| inputs[row].effective_score == score));
+            assert_eq!(rows.len(), 4, "a score group is every equal-score worker");
+            if score == 8.0 {
+                saw_high = true;
+            } else {
+                saw_low = true;
+            }
+        }
+        assert!(
+            saw_high && saw_low,
+            "temperature must reach both score groups"
+        );
+    }
+
+    #[test]
+    fn every_catalog_policy_routes_event_driven_hits_and_misses() {
+        for name in cost::POLICY_NAMES {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                selection_policy: Some((*name).to_string()),
+                ..test_config()
+            });
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            policy.init_workers(&workers);
+            let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+            let indexer =
+                setup_indexer_with_blocks("http://w2:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+            monitor.indexers.insert("unknown".to_string(), indexer);
+            policy.set_kv_event_monitor(Some(monitor));
+
+            let hit = policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(hit, Some(1), "{name}: the holder of every block must win");
+            policy.on_request_complete("http://w2:8000", true);
+
+            let miss = policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&[100, 200, 300, 400]),
+                    ..Default::default()
+                },
+            );
+            assert!(miss.is_some(), "{name}: a miss must still route");
+        }
+    }
+
+    #[test]
+    fn every_catalog_policy_routes_tree_matches() {
+        for name in cost::POLICY_NAMES {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                selection_policy: Some((*name).to_string()),
+                ..test_config()
+            });
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            policy.init_workers(&workers);
+            let text = "a shared system prompt that is long enough to match";
+            let first = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            policy.on_request_complete(workers[first].url(), true);
+            let second = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(first, second, "{name}: an idle holder keeps its prefix");
+        }
+    }
+
+    #[test]
+    fn accounting_books_the_dispatch_until_completion() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            selection_accounting_ttl_ms: 60_000,
+            ..test_config()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+        let accounting = policy.accounting.as_ref().expect("accounting enabled");
+
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, 0);
+        // One block cached, one block (4 tokens) booked as uncached prefill.
+        assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 4);
+        let hashes: Vec<u64> = request_prefix_hashes(&compute_request_content_hashes(&tokens, 4))
+            .into_iter()
+            .map(|hash| hash.0)
+            .collect();
+        let predicted = accounting.predicted_overlaps(&hashes);
+        assert_eq!(predicted.len(), 1);
+        assert_eq!(&*predicted[0].0, "http://w1:8000");
+        assert_eq!(
+            predicted[0].1, 2.0,
+            "the whole two-block prefix is predicted resident"
+        );
+
+        // A sibling that shares the first block but not the second is predicted one block on w1.
+        let sibling: Vec<u64> = request_prefix_hashes(&compute_request_content_hashes(
+            &[1, 2, 3, 4, 9, 9, 9, 9],
+            4,
+        ))
+        .into_iter()
+        .map(|hash| hash.0)
+        .collect();
+        assert_eq!(accounting.predicted_overlaps(&sibling)[0].1, 1.0);
+
+        policy.on_request_complete("http://w1:8000", true);
+        assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 0);
+    }
+
+    #[test]
+    fn reconciliation_releases_bookings_whose_completion_never_arrived() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            selection_accounting_ttl_ms: 60_000,
+            ..test_config()
+        });
+        let accounting = policy.accounting.as_ref().expect("accounting enabled");
+        accounting.record_dispatch("http://w1:8000", 100, &[]);
+        accounting.record_dispatch("http://w1:8000", 200, &[]);
+        accounting.record_dispatch("http://w1:8000", 400, &[]);
+
+        // The router still holds all three: nothing to release.
+        policy.reconcile_in_flight("http://w1:8000", 3);
+        assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 700);
+
+        // Two requests ended without a completion report: the two oldest
+        // bookings go, the one the router still holds stays.
+        policy.reconcile_in_flight("http://w1:8000", 1);
+        assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 400);
+
+        // A worker without bookings is a no-op, with or without accounting.
+        policy.reconcile_in_flight("http://w2:8000", 0);
+        CacheAwarePolicy::with_config(test_config()).reconcile_in_flight("http://w1:8000", 0);
+    }
+
+    #[test]
+    fn invalid_selection_policy_falls_back_to_the_default() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            selection_policy: Some("no-such-policy".to_string()),
+            ..test_config()
+        });
+        assert_eq!(policy.selection.name(), cost::DEFAULT_POLICY);
+    }
+
+    #[test]
+    fn event_driven_salted_request_matches_only_its_namespace() {
+        use kv_index::salt::{content_hash_with_seed, namespace_seed};
+        use openai_protocol::common::CachePartition;
+
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let w1 = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+        let w2 = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+        // w1 carries more live load, so every miss resolves to w2.
+        for _ in 0..3 {
+            w1.increment_load();
+        }
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
+        policy.init_workers(&workers);
+
+        // Blocks stored on w1 under (lora "adapter", salt "tenant-a"), as the
+        // monitor hashes a salted KvBlocksStored event.
+        let indexer = Arc::new(KvIndex::positional(4));
+        let worker_id = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerBlocks::default();
+        let seed = namespace_seed(Some("adapter"), Some("tenant-a"));
+        let blocks: Vec<StoredBlock> = [[1u32, 2, 3, 4], [5, 6, 7, 8]]
+            .iter()
+            .enumerate()
+            .map(|(i, tokens)| StoredBlock {
+                seq_hash: SequenceHash(i as u64 + 1),
+                content_hash: content_hash_with_seed(tokens, seed),
+            })
+            .collect();
+        indexer
+            .apply_stored(worker_id, &blocks, None, &mut wb)
+            .unwrap();
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+
+        let namespace = |salt: &'static str| {
+            CacheNamespace::derive(&CachePartition {
+                cache_salt: Some(salt),
+                extra_key: None,
+                lora_path: Some("adapter"),
+            })
+        };
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let route = |cache_namespace: Option<CacheNamespace>| {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&tokens),
+                        cache_namespace,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(route(namespace("tenant-a")), 0, "same namespace hits w1");
+        assert_eq!(route(namespace("tenant-b")), 1, "another salt misses");
+        assert_eq!(route(None), 1, "a plain request misses salted blocks");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pool tables and the sampled decision over a large pool
+    // -----------------------------------------------------------------------
+
+    /// `count` workers, all interned in an event index that holds `chunks`
+    /// for the worker at `holder`, behind a policy built from `config`.
+    fn large_pool(
+        count: usize,
+        holder: usize,
+        chunks: &[&[u32]],
+        config: CacheAwareConfig,
+    ) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let urls: Vec<String> = (0..count).map(|i| format!("http://w{i}:8000")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let workers = make_workers(&refs);
+        let indexer = setup_indexer_with_blocks(&urls[holder], chunks, 4);
+        for (i, url) in urls.iter().enumerate() {
+            if i != holder {
+                indexer.intern_worker(url).unwrap();
+            }
+        }
+        let policy = CacheAwarePolicy::with_config(config);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        monitor.set_block_size("unknown", 4);
+        policy.set_kv_event_monitor(Some(monitor));
+        (policy, workers)
+    }
+
+    fn tokens_info(tokens: &[u32]) -> SelectWorkerInfo<'_> {
+        SelectWorkerInfo {
+            tokens: Some(tokens),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_large_pool_routes_to_the_holder_the_index_names() {
+        let (policy, workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
+        for _ in 0..8 {
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
+                .unwrap();
+            assert_eq!(
+                idx, 37,
+                "the holder sits outside any sample of {FLEET_SAMPLE}; the index places it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_pool_miss_finds_the_one_eligible_worker_the_sample_missed() {
+        let (policy, workers) = large_pool(40, 0, &[&[1, 2, 3, 4]], test_config());
+        for worker in &workers[..39] {
+            worker.set_status(WorkerStatus::NotReady);
+        }
+        let idx = policy.select_worker(&workers, &tokens_info(&[9, 9, 9, 9, 8, 8, 8, 8]));
+        assert_eq!(idx, Some(39));
+    }
+
+    #[test]
+    fn a_large_pool_miss_spreads_over_the_pool() {
+        let (policy, workers) = large_pool(40, 0, &[&[1, 2, 3, 4]], test_config());
+        let mut picked = HashSet::new();
+        for turn in 0..200u32 {
+            let tokens = [turn + 100, 9, 9, 9, 8, 8, 8, 8];
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&tokens))
+                .unwrap();
+            picked.insert(idx);
+            policy.on_request_complete(workers[idx].url(), true);
+        }
+        assert!(
+            picked.len() > 2 * FLEET_SAMPLE,
+            "200 misses reached {} workers; a fresh sample per decision reaches the pool",
+            picked.len()
+        );
+    }
+
+    #[test]
+    fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]], 4);
+        let w3 = indexer.worker_id("http://w3:8000").unwrap();
+        let table = PoolTable::build(&workers, &indexer, liveness::now_ms());
+        assert!(table.describes(&workers));
+        assert!(table.fresh(liveness::now_ms()));
+        assert_eq!(table.position(w3, &workers), Some(2));
+        assert_eq!(table.id_at, vec![None, None, Some(w3)]);
+        assert_eq!(
+            table.position(w3 + 100, &workers),
+            None,
+            "an id never interned"
+        );
+        // The same url behind a new worker object at the same position: the
+        // table was built from the old one and says so.
+        let mut swapped = workers.clone();
+        swapped[2] = make_workers(&["http://w3:8000"]).remove(0);
+        assert_eq!(table.position(w3, &swapped), None);
+        // Every worker was admitted just now: a young fleet lists nothing to slice.
+        assert!(table.warming.is_empty());
+        assert!(!table.fresh(liveness::now_ms() + POOL_TABLE_REFRESH_MS));
+    }
+
+    /// `count` workers that all hold the shared block `[1, 2, 3, 4]` (a chat
+    /// template's head), the one at `deep` also `[5, 6, 7, 8]`.
+    fn shared_prefix_pool(
+        count: usize,
+        deep: usize,
+        config: CacheAwareConfig,
+    ) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let urls: Vec<String> = (0..count).map(|i| format!("http://w{i}:8000")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let workers = make_workers(&refs);
+        let indexer = Arc::new(KvIndex::positional(4));
+        for (i, url) in urls.iter().enumerate() {
+            let id = indexer.intern_worker(url).unwrap();
+            let mut wb = WorkerBlocks::default();
+            let mut blocks = vec![StoredBlock {
+                seq_hash: SequenceHash(1),
+                content_hash: compute_content_hash(&[1, 2, 3, 4]),
+            }];
+            if i == deep {
+                blocks.push(StoredBlock {
+                    seq_hash: SequenceHash(2),
+                    content_hash: compute_content_hash(&[5, 6, 7, 8]),
+                });
+            }
+            indexer.apply_stored(id, &blocks, None, &mut wb).unwrap();
+        }
+        let policy = CacheAwarePolicy::with_config(config);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        monitor.set_block_size("unknown", 4);
+        policy.set_kv_event_monitor(Some(monitor));
+        (policy, workers)
+    }
+
+    #[test]
+    fn the_default_decision_takes_the_deepest_holder_among_a_fleet_sharing_the_head() {
+        let (policy, workers) = shared_prefix_pool(64, 50, test_config());
+        for _ in 0..4 {
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
+                .unwrap();
+            assert_eq!(idx, 50);
+        }
+        // The deepest holder down: the decision falls to the holders of the
+        // head, never to a worker without the blocks.
+        workers[50].set_status(WorkerStatus::NotReady);
+        let idx = policy
+            .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
+            .unwrap();
+        assert_ne!(idx, 50);
+        assert!(workers[idx].is_healthy());
+    }
+
+    #[test]
+    fn a_fleet_wide_tie_is_drawn_from_not_scored_whole() {
+        let (policy, workers) = shared_prefix_pool(64, 50, test_config());
+        let mut picked = HashSet::new();
+        for _ in 0..200 {
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4]))
+                .unwrap();
+            picked.insert(idx);
+            policy.on_request_complete(workers[idx].url(), true);
+        }
+        assert!(
+            picked.len() > 2 * FLEET_SAMPLE,
+            "200 decisions on a head every worker holds reached {} workers",
+            picked.len()
+        );
+    }
+
+    #[test]
+    fn merge_rows_unions_the_eligible_sample_with_the_holders_in_slice_order() {
+        let candidates: Vec<OverlapCandidate> = [3usize, 7, 20]
+            .iter()
+            .map(|&idx| OverlapCandidate {
+                idx,
+                raw_score: 1.0,
+                effective_score: 1.0,
+            })
+            .collect();
+        assert_eq!(
+            CacheAwarePolicy::merge_rows(&[1, 3, 9, 30], &candidates),
+            vec![1, 3, 7, 9, 20, 30]
+        );
+        assert_eq!(
+            CacheAwarePolicy::merge_rows(&[], &candidates),
+            vec![3, 7, 20]
+        );
+        assert_eq!(CacheAwarePolicy::merge_rows(&[2, 4], &[]), vec![2, 4]);
     }
 }

@@ -147,7 +147,7 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     monkeypatch.setenv("SMG_PAIRING_PROTOCOL", " nixl ")
     args = FakeServerArgs(
         kv_events_config='{"enable_kv_cache_events": true, "publisher": "zmq", '
-        '"endpoint": "tcp://*:5600", "topic": "kv"}',
+        '"endpoint": "tcp://*:5600", "replay_endpoint": "tcp://*:5601", "topic": "kv"}',
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=2)),
     )
     facts = rust.server_facts(args)
@@ -162,6 +162,7 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     assert facts["max_running_requests"] == 64
     assert facts["data_parallel_size"] == 2
     assert (facts["kv_events_endpoint"], facts["kv_events_topic"]) == ("tcp://*:5600", "kv")
+    assert facts["kv_events_replay_endpoint"] == "tcp://*:5601"
 
     monkeypatch.delenv("SMG_PAIRING_PROTOCOL")
     plain = rust.server_facts(FakeServerArgs())
@@ -169,6 +170,7 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     assert "dp_size" not in server_args and "pairing_protocol" not in server_args
     assert plain["data_parallel_size"] == 1
     assert plain["kv_events_endpoint"] == ""
+    assert plain["kv_events_replay_endpoint"] == ""
 
 
 def test_headless_server_args_dial_the_servicer():

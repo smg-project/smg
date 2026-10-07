@@ -543,7 +543,11 @@ impl Router {
         // Dispatch-time re-check of the one chosen worker: O(1), and the only
         // thing that closes the window between selection and dispatch in which
         // a load report can flip the veto.
-        if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+        if let Some(shed) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
             return shed;
         }
 
@@ -841,7 +845,11 @@ impl Router {
             // Judged from the same candidates whether the pre-filter emptied
             // or a self-filtering policy missed on an all-overloaded pool, so
             // a shed keeps its Retry-After, retryability and metric.
-            let resp = match placement::failure_from(&non_dp_workers, model_id) {
+            let resp = match placement::failure_from(
+                &non_dp_workers,
+                model_id,
+                self.worker_registry.overload_shed_enabled(),
+            ) {
                 PlacementFailure::AllOverloaded(shed) => shed,
                 PlacementFailure::NoCandidates
                 | PlacementFailure::Unavailable
@@ -866,7 +874,11 @@ impl Router {
         // occupies its worker for far longer than a chat completion, so a
         // report landing in the selection→dispatch window is the one case where
         // dispatching anyway is measurably worse.
-        if let Some(resp) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+        if let Some(resp) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
             record_pre_send_error(&resp);
             return resp;
         }
@@ -2611,6 +2623,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         }
     }
 

@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeSet, HashSet},
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
 };
@@ -339,6 +339,11 @@ pub struct WorkerRegistry {
     /// reading it costs one map probe and no worker walk.
     model_overloaded: Arc<DashMap<String, AtomicUsize>>,
 
+    /// `--worker-overload-shed`: refuse a request with a 503 when every
+    /// candidate is overloaded instead of steering it to the least-loaded
+    /// one. Read by every router at its overload decision points.
+    overload_shed: Arc<AtomicBool>,
+
     /// Serializes overload *edges* so a flag flip and its counter adjustment
     /// land as one step. Two group loops flipping the same worker in opposite
     /// directions would otherwise be free to apply their deltas in the reverse
@@ -407,6 +412,7 @@ impl WorkerRegistry {
             url_to_id: Arc::new(DashMap::new()),
             worker_mutation_locks: Arc::new(DashMap::new()),
             model_overloaded: Arc::new(DashMap::new()),
+            overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
             model_retry_configs: Arc::new(DashMap::new()),
             worker_origins: Arc::new(DashMap::new()),
@@ -687,6 +693,17 @@ impl WorkerRegistry {
     /// whose model/provider filters are evaluated dynamically.
     pub(crate) fn get_routing_workers(&self) -> Arc<[Arc<dyn Worker>]> {
         Arc::clone(&self.current_global_routing_snapshot().all)
+    }
+
+    /// Whether an all-overloaded candidate pool is refused (`true`) or
+    /// steered to its least-loaded worker (the default).
+    pub fn overload_shed_enabled(&self) -> bool {
+        self.overload_shed.load(Ordering::Relaxed)
+    }
+
+    /// Set `--worker-overload-shed` for every router reading this registry.
+    pub fn set_overload_shed(&self, shed: bool) {
+        self.overload_shed.store(shed, Ordering::Relaxed);
     }
 
     /// Apply the absolute overload veto to `worker`, returning `true` when the
@@ -2351,6 +2368,16 @@ impl WorkerRegistry {
         }
 
         worker.set_status(new_status);
+        if new_status == WorkerStatus::Ready {
+            // The warm-up slice (cache_aware) counts from here.
+            worker.note_admitted();
+            // A worker promoted back from a demotion returns with a closed
+            // circuit breaker: the failures that opened it belong to the
+            // outage its probes just ended.
+            if matches!(old_status, WorkerStatus::NotReady | WorkerStatus::Failed) {
+                worker.reset_circuit_breaker();
+            }
+        }
 
         let _ = self.event_tx.send(WorkerEvent::StatusChanged {
             worker_id: worker_id.clone(),
@@ -3774,6 +3801,35 @@ mod tests {
         assert_eq!(current.status(), WorkerStatus::Ready);
         assert_eq!(current.priority(), 99);
         assert_eq!(current.revision(), stale_revision + 1);
+    }
+
+    #[test]
+    fn test_promotion_back_to_ready_closes_the_circuit_breaker() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8080")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+        let worker_id = registry.register(worker.clone()).unwrap();
+        let revision = worker.revision();
+        assert!(registry
+            .transition_status_if_revision(&worker_id, revision, WorkerStatus::NotReady)
+            .is_some());
+        for _ in 0..8 {
+            worker.record_circuit_breaker_outcome(false);
+        }
+        assert!(!worker.circuit_breaker_can_execute());
+
+        assert!(registry
+            .transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready)
+            .is_some());
+        assert!(
+            worker.circuit_breaker_can_execute(),
+            "a worker that returns starts with a closed breaker"
+        );
     }
 
     #[test]

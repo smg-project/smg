@@ -8,22 +8,42 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Jemalloc's run-time options for a long-running server. With the stock
+// settings a thread's freed pages decay back to the OS only when that thread
+// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
+// resident over ~270 MB of live objects (soak s2, ten hours). A background
+// thread purges on schedule instead; dirty pages are returned after 10 s and
+// muzzy pages at once. This is jemalloc's application-provided `malloc_conf`
+// string under the vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF`
+// environment variable is read after it and overrides it entry by entry.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 61] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0\0";
+
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
         resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MetricsConfig,
-        OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
-        RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, ManualAssignmentMode,
+        MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
+        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
+        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
+        logging::close_logging,
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
+    policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
     server::{self, ServerConfig},
     service_discovery::{ModelIdSource, RuntimeDiscoveryConfig},
     version,
@@ -173,6 +193,12 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
 }
 
+/// Parse the `--kv-index` value into a `KvIndexKind`.
+fn parse_kv_index_kind(value: &str) -> Result<KvIndexKind, String> {
+    KvIndexKind::parse(value)
+        .ok_or_else(|| format!("invalid value '{value}'; expected positional or chain"))
+}
+
 /// Parse the `--mm-processing` value into an `MmProcessingMode`.
 fn parse_mm_processing(value: &str) -> Result<MmProcessingMode, String> {
     MmProcessingMode::parse(value)
@@ -293,50 +319,46 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
-    /// Enable worker overload protection with the gateway default thresholds.
-    ///
-    /// A worker whose load signal crosses a threshold is considered overloaded
-    /// and excluded from routing until the signal recovers; when every worker
-    /// is overloaded, requests are shed immediately rather than queued.
-    ///
-    /// This flag alone applies --worker-overload-token-usage 0.9 and leaves
-    /// --worker-overload-waiting-requests unset: KV token usage means the same
-    /// thing on every engine, while a sensible waiting-requests ceiling is
-    /// workload-dependent, so it has no universal default. Explicit thresholds
-    /// override the default, and either threshold set on its own enables
-    /// protection without this flag — exactly as before it existed. Per-worker
-    /// `overload` blocks on a WorkerSpec override the gateway values per
-    /// signal, and enable protection for that worker even with everything here
-    /// unset.
-    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    /// Worker overload protection (the default; kept so existing command
+    /// lines still parse). A worker whose load report is at or above
+    /// --worker-overload-waiting-requests or --worker-overload-token-usage is
+    /// left out of routing while another worker is under them; when every
+    /// worker is over them the request goes to the least-loaded one, unless
+    /// --worker-overload-shed asks for a 503 instead. Evaluated once per load
+    /// report, never per request. Per-worker `overload` blocks on a WorkerSpec
+    /// override the gateway values per signal
+    #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
 
-    /// Queued-request count at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when
-    /// every worker is overloaded, requests are shed immediately rather than
-    /// queued. Unset disables overload protection.
-    ///
-    /// Queued (waiting) requests, summed across DP ranks. Must be >= 1: the
-    /// comparison is inclusive, so 0 would veto every worker unconditionally.
-    #[arg(long, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
-    worker_overload_waiting_requests: Option<usize>,
+    /// Switch worker overload protection off: no worker is ever left out of
+    /// routing for its waiting queue or KV usage (per-worker `overload` blocks
+    /// on a WorkerSpec still apply)
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    disable_worker_overload_protection: bool,
 
-    /// KV-cache token usage at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when
-    /// every worker is overloaded, requests are shed immediately rather than
-    /// queued. Unset disables overload protection.
-    ///
-    /// Mean KV-cache token usage across DP ranks, the same signal
-    /// `--balance-token-usage-threshold` reads, applied as an absolute
-    /// per-worker ceiling rather than a fleet-relative spread. Backend must
-    /// report token_usage. Must be in (0.0, 1.0]: the comparison is inclusive,
-    /// so 0.0 would veto every worker unconditionally.
-    ///
-    /// Distinct from `--overload-token-usage-threshold`, which only de-ranks
-    /// the hottest backend within cache-aware affinity; this flag removes the
-    /// worker from routing entirely and sheds when every worker crosses it.
-    #[arg(long, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
-    worker_overload_token_usage: Option<f64>,
+    /// Queued (waiting) requests, summed across DP ranks, at or above which a
+    /// worker counts as overloaded. Must be >= 1: the comparison is inclusive,
+    /// so 0 would veto every worker unconditionally
+    #[arg(long, default_value_t = 8, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    worker_overload_waiting_requests: usize,
+
+    /// Mean KV-cache token usage across DP ranks at or above which a worker
+    /// counts as overloaded: the same signal --balance-token-usage-threshold
+    /// reads, applied as an absolute per-worker ceiling rather than a
+    /// fleet-relative spread. Backend must report token_usage. Must be in
+    /// (0.0, 1.0]: the comparison is inclusive, so 0.0 would veto every worker
+    /// unconditionally. Distinct from --overload-token-usage-threshold, which
+    /// only de-ranks the hottest backend within cache-aware affinity
+    #[arg(long, default_value_t = 0.8, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
+    worker_overload_token_usage: f64,
+
+    /// Refuse a request with a 503 (worker_overload_protection_shed,
+    /// Retry-After the load poll interval) when every worker it could use is
+    /// overloaded, instead of routing it to the least-loaded one; also sheds a
+    /// worker that crossed a threshold between selection and dispatch. Off by
+    /// default: steering never turns a load signal into an outage
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    worker_overload_shed: bool,
 
     /// Anti-hotspot decay: de-rank cache-affine candidates by their
     /// waiting-prefill backlog (overlap score divided by 1 + overlap_decay
@@ -350,6 +372,24 @@ struct CliArgs {
     /// argmax.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     selection_temperature: f32,
+
+    /// Worker selection policy for cache_aware, run over the per-worker
+    /// inputs the router gathers (prefix overlap, in-flight requests,
+    /// backend load reports); cache-aware-default, the affinity-group
+    /// decision, is the one policy
+    #[arg(
+        long,
+        default_value = "cache-aware-default",
+        help_heading = "Routing Policy"
+    )]
+    selection_policy: String,
+
+    /// Lifetime in milliseconds of optimistic dispatch bookings for
+    /// cache_aware: predicted prefill and prefix placement are charged to the
+    /// chosen worker until the engine reports them or the booking expires.
+    /// 0 disables; set a little above the engine's KV-event lag
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    selection_accounting_ttl_ms: u64,
 
     /// Interval in seconds between cache-tree eviction cycles
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -577,6 +617,54 @@ struct CliArgs {
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// Seconds without any contact from a worker (a load poll, a health probe,
+    /// a KV event, a response) after which a transport failure excludes it
+    /// from routing; the first successful contact re-admits it.
+    #[arg(long, default_value_t = 2, help_heading = "Load Monitoring")]
+    worker_stall_secs: u64,
+
+    /// Seconds without a token or a completion from a worker with requests
+    /// in flight whose waiting queue grows, or whose in-flight pile grows or
+    /// is four deep, after which new requests stop being routed to it until
+    /// it makes progress. The bound stretches to the time its in-flight
+    /// prompts may still need in prefill, up to 120 seconds. The pile is the
+    /// streaming gRPC generations in flight; HTTP workers, PD legs and
+    /// non-streaming generations give no signal and never form one. 0
+    /// disables the rule.
+    #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
+    worker_wedge_secs: u64,
+
+    /// Warm-up slice for cache-aware routing: for this many seconds after a
+    /// worker becomes routable, until its index has grown by
+    /// --worker-warmup-blocks blocks, one cache miss in 1/--worker-warmup-share
+    /// is routed to it so it builds a cache instead of idling. 0 disables.
+    #[arg(long, default_value_t = 60, help_heading = "Routing Policy")]
+    worker_warmup_secs: u64,
+
+    /// Share of cache misses offered to warming workers (0.0 to 1.0).
+    #[arg(long, default_value_t = 0.25, help_heading = "Routing Policy")]
+    worker_warmup_share: f32,
+
+    /// A worker whose index has grown by this many blocks since it became
+    /// thin is warm.
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
+    worker_warmup_blocks: usize,
+
+    /// A worker whose index holds less than this share of the fleet's median
+    /// (or nothing) is thin and receives the warm-up slice until it has grown
+    /// by --worker-warmup-blocks, whatever emptied it (a resync after a
+    /// publisher restart, an out-of-range or data-loss resubscription, an
+    /// engine that came back empty). 0 keeps the age rule alone.
+    #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
+    worker_warmup_thin_ratio: f32,
+
+    /// One cache hit in this many is diverted to a thin worker although
+    /// another worker holds its prefix (shallow overlaps first, one in flight
+    /// per thin worker), so an index emptied by a resync refills on a
+    /// workload where every request has a holder. 0 disables.
+    #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
+    worker_warmup_divert_every: u64,
+
     /// Only poll worker loads when a load-aware routing policy,
     /// --engine-metrics, or worker overload protection needs the data. By
     /// default every worker group is polled from registration onward; this
@@ -587,6 +675,9 @@ struct CliArgs {
 
     /// Force GetLoads polling for smg_engine_* Prometheus gauges even without
     /// a load-aware routing policy. Routing-owned polls are always re-exported.
+    /// A worker whose KV-event stream pushes its load feeds the gauges from
+    /// those records and is not polled while they flow (GetLoads is the
+    /// fallback).
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
 
@@ -612,6 +703,15 @@ struct CliArgs {
     /// ceiling. Unset or 0 disables the ceiling.
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_max_entries: Option<usize>,
+
+    /// The event-driven KV index behind cache-aware routing: `positional`
+    /// (one entry per block position, the default) or `chain` (chains as runs
+    /// with per-run worker coverage; lock-free, store-free lookups; `run` is
+    /// its deprecated spelling). The --kv-indexer-* prune bounds apply to the
+    /// positional index only; the chain index holds what the engines report
+    /// and shrinks with their removals.
+    #[arg(long, default_value = "positional", value_parser = parse_kv_index_kind, help_heading = "Routing Policy")]
+    kv_index: KvIndexKind,
 
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
     /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
@@ -1560,6 +1660,9 @@ impl CliArgs {
                 cache_index: Self::parse_cache_index(&self.cache_index),
                 cache_ttl_secs: self.cache_ttl_secs,
                 cache_boundaries: self.cache_boundaries.clone(),
+                selection_policy: (self.selection_policy != DEFAULT_SELECTION_POLICY)
+                    .then(|| self.selection_policy.clone()),
+                selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -1967,13 +2070,26 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .worker_stall_secs(self.worker_stall_secs)
+            .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_warmup(
+                self.worker_warmup_secs,
+                self.worker_warmup_share,
+                self.worker_warmup_blocks,
+                self.worker_warmup_thin_ratio,
+                self.worker_warmup_divert_every,
+            )
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)
-            .worker_overload_protection(self.worker_overload_protection)
-            .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
-            .worker_overload_token_usage(self.worker_overload_token_usage)
+            .worker_overload_protection(
+                self.worker_overload_protection && !self.disable_worker_overload_protection,
+            )
+            .worker_overload_waiting_requests(Some(self.worker_overload_waiting_requests))
+            .worker_overload_token_usage(Some(self.worker_overload_token_usage))
+            .worker_overload_shed(self.worker_overload_shed)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
+            .kv_index(self.kv_index)
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
@@ -2261,7 +2377,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::runtime::Runtime::new()?
         }
     };
-    runtime.block_on(Box::pin(server::startup(server_config)))?;
+    let served = runtime.block_on(Box::pin(server::startup(server_config)));
+    // The writer threads outlive `startup` (a process may start more than one
+    // router); flush and stop them now that this process is done logging.
+    close_logging();
+    served?;
     if is_otel_enabled() {
         shutdown_otel();
     }
@@ -2317,6 +2437,33 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_indexer_ttl_secs, None);
         assert_eq!(defaults.kv_indexer_max_entries, None);
+    }
+
+    /// `--kv-index` selects the event-driven index for cache-aware routing;
+    /// the positional indexer stays the default until the chain index has
+    /// passed a soak in the gateway.
+    #[test]
+    fn kv_index_flag_flows_into_router_config() {
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.kv_index, KvIndexKind::Positional);
+
+        let cli = cli_args_from(&["--kv-index", "chain"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.kv_index, KvIndexKind::Chain);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.kv_index, KvIndexKind::Chain);
+        // The spelling before the rename still selects the chain index.
+        assert_eq!(
+            cli_args_from(&["--kv-index", "run"]).kv_index,
+            KvIndexKind::Chain
+        );
+        assert!(KvIndexKind::deprecated_alias_used());
+
+        assert_eq!(
+            cli_args_from(&["--kv-index", "Positional"]).kv_index,
+            KvIndexKind::Positional
+        );
+        assert!(parse_kv_index_kind("tree").is_err());
     }
 
     /// The retry-buffer cap must flow through both conversion paths.
@@ -2835,25 +2982,48 @@ mod tests {
         );
     }
 
-    /// Unset means off on both paths: the feature must be byte-identical to
-    /// pre-feature behavior until an operator opts in.
+    /// Protection is on by default on both signals, steering only, on both
+    /// config paths.
     #[test]
-    fn worker_overload_thresholds_default_to_unset_in_both_configs() {
+    fn worker_overload_protection_defaults_to_on_and_steering_in_both_configs() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.worker_overload_waiting_requests, None);
-        assert_eq!(router_config.worker_overload_token_usage, None);
+        assert!(router_config.worker_overload_protection);
+        assert_eq!(router_config.worker_overload_waiting_requests, Some(8));
+        assert_eq!(router_config.worker_overload_token_usage, Some(0.8));
+        assert!(!router_config.worker_overload_shed);
 
         let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.worker_overload_protection);
         assert_eq!(
             server_config.router_config.worker_overload_waiting_requests,
-            None
+            Some(8)
         );
         assert_eq!(
             server_config.router_config.worker_overload_token_usage,
-            None
+            Some(0.8)
         );
+        assert!(!server_config.router_config.worker_overload_shed);
+    }
+
+    /// The two opt-outs: `--disable-worker-overload-protection` switches the
+    /// gateway thresholds off, `--worker-overload-shed` turns steering into
+    /// refusal; both must survive into `ServerConfig.router_config`.
+    #[test]
+    fn worker_overload_opt_outs_flow_into_both_configs() {
+        let cli = cli_args_from(&["--disable-worker-overload-protection"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.worker_overload_protection);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.worker_overload_protection);
+
+        let cli = cli_args_from(&["--worker-overload-shed"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router_config.worker_overload_shed);
+        assert!(router_config.worker_overload_protection);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.worker_overload_shed);
     }
 
     /// Both thresholds are `>=` comparisons, so the excluded ends of their
@@ -2894,10 +3064,9 @@ mod tests {
             router_config.disable_load_monitoring,
             "disable_load_monitoring must reach RouterConfig via to_router_config"
         );
-        // The flag alone carries no thresholds; the token default is applied
-        // at resolution, not stored in config.
-        assert_eq!(router_config.worker_overload_waiting_requests, None);
-        assert_eq!(router_config.worker_overload_token_usage, None);
+        // The flag changes nothing: the defaults are already on.
+        assert_eq!(router_config.worker_overload_waiting_requests, Some(8));
+        assert_eq!(router_config.worker_overload_token_usage, Some(0.8));
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert!(
@@ -2910,18 +3079,18 @@ mod tests {
         );
     }
 
-    /// Defaults: protection off, monitoring default-on (opt-out false) — the
-    /// behavior change is monitoring, and it is carried by the default here.
+    /// Defaults: protection on, monitoring on (opt-out false) — both carried
+    /// by the defaults here.
     #[test]
-    fn overload_protection_and_monitoring_flags_default_off_in_both_configs() {
+    fn overload_protection_and_monitoring_default_on_in_both_configs() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert!(!router_config.worker_overload_protection);
+        assert!(router_config.worker_overload_protection);
         assert!(!router_config.disable_load_monitoring);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert!(!server_config.router_config.worker_overload_protection);
+        assert!(server_config.router_config.worker_overload_protection);
         assert!(!server_config.router_config.disable_load_monitoring);
     }
 

@@ -8,7 +8,7 @@
 
 use std::{process::ExitCode, sync::Arc};
 
-use mock_worker::{config::Config, grpc, http, replay::Capture, zmq};
+use mock_worker::{admin, config::Config, grpc, http, replay::Capture, zmq};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -63,6 +63,9 @@ async fn main() -> ExitCode {
             break;
         };
         workers.spawn(grpc::serve(cfg.clone(), cfg.host.clone(), port));
+    }
+    if let Some(port) = cfg.admin_port {
+        workers.spawn(admin::serve(cfg.clone(), cfg.host.clone(), port));
     }
     if let Some(handshake) = cfg.zmq_handshake.clone() {
         for i in 0..cfg.zmq_count {

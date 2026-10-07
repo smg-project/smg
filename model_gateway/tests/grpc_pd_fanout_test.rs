@@ -115,6 +115,8 @@ async fn start_mock_grpc_worker() -> u16 {
         .expect("mock gRPC worker address")
         .port();
     let cfg = Arc::new(mock_worker::config::Config {
+        admin_port: None,
+        context_length: 32768,
         host: "127.0.0.1".to_string(),
         http_base_port: 0,
         http_count: 0,
@@ -129,7 +131,7 @@ async fn start_mock_grpc_worker() -> u16 {
         output_tokens: OUTPUT_TOKENS,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
-        replay: Default::default(),
+        ..mock_worker::config::Config::default()
     });
     tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
     port

@@ -17,7 +17,7 @@ use crate::{
         },
         error,
     },
-    worker::{ProviderType, RuntimeType, Worker, WorkerRegistry},
+    worker::{overload::STAGE_SELECTION, ProviderType, RuntimeType, Worker, WorkerRegistry},
 };
 
 /// Holds references to shared infrastructure needed for worker selection.
@@ -69,8 +69,8 @@ impl<'a> WorkerSelector<'a> {
         // each of these requests into three registry walks and up to 5 s of
         // network wait to reach a 503 that carries neither the shed error code
         // nor the shed counter.
-        if let Some(shed) = self.shed_if_all_overloaded(req) {
-            return Err(shed);
+        if let Some(verdict) = self.all_overloaded_verdict(req) {
+            return verdict;
         }
 
         tracing::debug!(
@@ -130,11 +130,23 @@ impl<'a> WorkerSelector<'a> {
             .min_by_key(|w| w.load())
     }
 
-    /// Shed when every worker this request could have selected is vetoed.
-    /// Runs only on the miss path.
-    fn shed_if_all_overloaded(&self, req: &SelectWorkerRequest<'_>) -> Option<Response> {
+    /// The verdict on a pool whose every worker is vetoed, judged on the miss
+    /// path only: a shed when the pool is all-overloaded under
+    /// `--worker-overload-shed`, else the least-loaded routable worker (an
+    /// overloaded one never under shedding; a liveness veto steers either
+    /// way). `None` when the pool is not all-vetoed (or nothing in it is
+    /// routable), so the usual miss handling continues.
+    fn all_overloaded_verdict(
+        &self,
+        req: &SelectWorkerRequest<'_>,
+    ) -> Option<Result<Arc<dyn Worker>, Response>> {
         let candidates = self.candidate_pool(req, false);
-        overload::shed_if_all_overloaded(&candidates, req.model_id)
+        let shedding = self.registry.overload_shed_enabled();
+        if let Some(shed) = overload::shed_if_all_overloaded(&candidates, req.model_id, shedding) {
+            return Some(Err(shed));
+        }
+        overload::fallback_if_all_vetoed(&candidates, req.model_id, STAGE_SELECTION, shedding)
+            .map(Ok)
     }
 
     /// Check if any healthy worker supports the model (regardless of circuit breaker).
@@ -426,5 +438,44 @@ mod tests {
     #[test]
     fn default_request_does_not_require_realtime() {
         assert!(!SelectWorkerRequest::default().require_realtime_capable);
+    }
+
+    /// Every candidate over the thresholds: by default the least-loaded one
+    /// serves; under `--worker-overload-shed` the request is refused.
+    #[tokio::test]
+    async fn all_overloaded_steers_to_the_least_loaded_unless_shedding() {
+        let registry = WorkerRegistry::new();
+        let busy = worker("http://127.0.0.1:18180", false);
+        let quiet = worker("http://127.0.0.1:18181", false);
+        for _ in 0..4 {
+            busy.increment_load();
+        }
+        quiet.increment_load();
+        registry.register_or_replace(Arc::clone(&busy));
+        registry.register_or_replace(Arc::clone(&quiet));
+        registry.set_worker_overloaded(&busy, true);
+        registry.set_worker_overloaded(&quiet, true);
+
+        let picked = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "m",
+                ..Default::default()
+            })
+            .await
+            .expect("steered to the least-loaded worker");
+        assert_eq!(picked.url(), "http://127.0.0.1:18181");
+
+        registry.set_overload_shed(true);
+        let refused = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "m",
+                ..Default::default()
+            })
+            .await
+            .expect_err("shedding refuses the all-overloaded pool");
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            "worker_overload_protection_shed"
+        );
     }
 }

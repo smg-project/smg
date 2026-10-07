@@ -173,6 +173,9 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     except ImportError:  # the launcher's unit tests run without SGLang
         sglang_version = ""
     dp_size = getattr(server_args, "dp_size", None)
+    kv_events_endpoint, kv_events_replay_endpoint, kv_events_topic = kv_events_publisher(
+        server_args
+    )
     return {
         # allow_nan=False: a non-finite float would otherwise become `NaN` text,
         # which the Rust side rejects as a whole object.
@@ -181,7 +184,33 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         "sglang_version": str(sglang_version),
         "max_running_requests": int(getattr(server_args, "max_running_requests", None) or 0),
         "data_parallel_size": int(dp_size) if isinstance(dp_size, int) and dp_size > 0 else 1,
+        "kv_events_endpoint": kv_events_endpoint,
+        "kv_events_replay_endpoint": kv_events_replay_endpoint,
+        "kv_events_topic": kv_events_topic,
     }
+
+
+def kv_events_publisher(server_args: Any) -> tuple[str, str, str]:
+    """The ZMQ KV-event publisher SGLang was told to run (``--kv-events-config``)
+    as ``(endpoint, replay_endpoint, topic)``, with SGLang's defaults filled in;
+    empty strings when events are off or the publisher is not ZMQ, and an empty
+    replay endpoint when SGLang runs no replay socket. The Rust servicer relays
+    this publisher on ``SubscribeKvEvents`` and asks the replay socket for gaps
+    and for the batches published before its subscription joined."""
+    raw = getattr(server_args, "kv_events_config", None)
+    if not raw:
+        return "", "", ""
+    try:
+        config = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError):
+        return "", "", ""
+    if not isinstance(config, dict) or config.get("publisher", "null") != "zmq":
+        return "", "", ""
+    return (
+        str(config.get("endpoint") or "tcp://*:5557"),
+        str(config.get("replay_endpoint") or ""),
+        str(config.get("topic") or ""),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,7 @@
-//! Replay testing: `--capture` records every gRPC `Generate` request the
-//! worker receives, so a test can check what the gateway put on the wire.
+//! Request capture: `--capture` records every gRPC `Generate` request the
+//! worker receives, one JSON object per line, so a test can check what the
+//! gateway put on the wire. (The trace replayer is this crate's `replay`
+//! binary, `src/bin/replay.rs`.)
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;

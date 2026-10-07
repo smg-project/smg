@@ -121,6 +121,35 @@ def test_server_facts_carry_the_router_labels_and_the_window(monkeypatch):
     assert facts["scheduler_info_json"] == "{}"
 
 
+def test_server_facts_carry_the_kv_events_publisher(monkeypatch):
+    monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
+    off = rust.server_facts(_server_args())
+    assert (off["kv_events_endpoint"], off["kv_events_topic"]) == ("", "")
+    assert off["kv_events_replay_endpoint"] == ""
+    null_publisher = rust.server_facts(_server_args(kv_events_config='{"publisher": "null"}'))
+    assert null_publisher["kv_events_endpoint"] == ""
+    zmq_defaults = rust.server_facts(_server_args(kv_events_config='{"publisher": "zmq"}'))
+    assert (zmq_defaults["kv_events_endpoint"], zmq_defaults["kv_events_topic"]) == (
+        "tcp://*:5557",
+        "",
+    )
+    explicit = rust.server_facts(
+        _server_args(
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:6100", "topic": "kv"}'
+        )
+    )
+    assert (explicit["kv_events_endpoint"], explicit["kv_events_topic"]) == ("tcp://*:6100", "kv")
+    assert explicit["kv_events_replay_endpoint"] == "", "no replay socket configured"
+    with_replay = rust.server_facts(
+        _server_args(
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:6100", '
+            '"replay_endpoint": "tcp://*:6101", "topic": "kv"}'
+        )
+    )
+    assert with_replay["kv_events_replay_endpoint"] == "tcp://*:6101"
+    assert rust.kv_events_publisher(_server_args(kv_events_config="not json")) == ("", "", "")
+
+
 def test_disaggregated_workers_are_refused_up_front():
     rust.refuse_disaggregation(_server_args())
     rust.refuse_disaggregation(_server_args(disaggregation_mode="null"))

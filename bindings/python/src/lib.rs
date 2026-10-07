@@ -549,6 +549,17 @@ struct Router {
     prefill_max_inflight_requests_per_worker: i32,
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
+    worker_overload_shed: bool,
+    kv_index: String,
+    worker_stall_secs: u64,
+    worker_wedge_secs: u64,
+    worker_warmup_secs: u64,
+    worker_warmup_share: f32,
+    worker_warmup_blocks: usize,
+    worker_warmup_thin_ratio: f32,
+    worker_warmup_divert_every: u64,
+    selection_policy: String,
+    selection_accounting_ttl_ms: u64,
     /// The keyword-only `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
@@ -663,6 +674,14 @@ impl Router {
             })
             .transpose()?;
 
+        let kv_index = config::KvIndexKind::parse(&self.kv_index).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "kv_index".to_string(),
+                value: self.kv_index.clone(),
+                reason: "expected 'positional' or 'chain'".to_string(),
+            }
+        })?;
+
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
@@ -682,6 +701,9 @@ impl Router {
                     cache_index: self.parse_cache_index()?,
                     cache_ttl_secs: self.cache_ttl_secs,
                     cache_boundaries: self.cache_boundaries.clone(),
+                    selection_policy: (self.selection_policy != policies::cost::DEFAULT_POLICY)
+                        .then(|| self.selection_policy.clone()),
+                    selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: self.load_monitor_interval,
@@ -899,6 +921,17 @@ impl Router {
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
             .worker_overload_protection(self.worker_overload_protection)
+            .worker_overload_shed(self.worker_overload_shed)
+            .worker_stall_secs(self.worker_stall_secs)
+            .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_warmup(
+                self.worker_warmup_secs,
+                self.worker_warmup_share,
+                self.worker_warmup_blocks,
+                self.worker_warmup_thin_ratio,
+                self.worker_warmup_divert_every,
+            )
+            .kv_index(kv_index)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
@@ -1159,9 +1192,9 @@ impl Router {
         cache_ttl_secs = 180,
         job_queue_capacity = 1000,
         job_queue_concurrency = 200,
-        worker_overload_waiting_requests = None,
-        worker_overload_token_usage = None,
-        worker_overload_protection = false,
+        worker_overload_waiting_requests = Some(8),
+        worker_overload_token_usage = Some(0.8),
+        worker_overload_protection = true,
         disable_load_monitoring = false,
         max_buffered_request_bytes = 1_048_576,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
@@ -1184,6 +1217,17 @@ impl Router {
         prefill_max_inflight_requests_per_worker = -1,
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
+        worker_overload_shed = false,
+        kv_index = String::from("positional"),
+        worker_stall_secs = 2,
+        worker_wedge_secs = 3,
+        worker_warmup_secs = 60,
+        worker_warmup_share = 0.25,
+        worker_warmup_blocks = 1024,
+        worker_warmup_thin_ratio = 0.5,
+        worker_warmup_divert_every = 8,
+        selection_policy = String::from("cache-aware-default"),
+        selection_accounting_ttl_ms = 0,
         // Keyword-only, so it never takes a positional slot.
         *,
         discovery = None,
@@ -1352,6 +1396,17 @@ impl Router {
         prefill_max_inflight_requests_per_worker: i32,
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
+        worker_overload_shed: bool,
+        kv_index: String,
+        worker_stall_secs: u64,
+        worker_wedge_secs: u64,
+        worker_warmup_secs: u64,
+        worker_warmup_share: f32,
+        worker_warmup_blocks: usize,
+        worker_warmup_thin_ratio: f32,
+        worker_warmup_divert_every: u64,
+        selection_policy: String,
+        selection_accounting_ttl_ms: u64,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
@@ -1546,6 +1601,17 @@ impl Router {
             prefill_max_inflight_requests_per_worker,
             prefill_queue_size,
             prefill_queue_timeout_secs,
+            worker_overload_shed,
+            kv_index,
+            worker_stall_secs,
+            worker_wedge_secs,
+            worker_warmup_secs,
+            worker_warmup_share,
+            worker_warmup_blocks,
+            worker_warmup_thin_ratio,
+            worker_warmup_divert_every,
+            selection_policy,
+            selection_accounting_ttl_ms,
             discovery,
         })
     }

@@ -162,6 +162,12 @@ async fn submit(
     // comes off; a refusal below leaves the engine without the request (a
     // fan-out's earlier subs are aborted with the error) and still owes one.
     let owed = notice.disarm();
+    let prompt_tokens = match req.input.as_ref() {
+        Some(vllm::generate_request::Input::Tokenized(tokenized)) => {
+            u32::try_from(tokenized.input_ids.len()).unwrap_or(u32::MAX)
+        }
+        _ => 0,
+    };
     let subs = match client
         .generate_vllm_streams_with_media(req, processed_media)
         .await
@@ -173,6 +179,13 @@ async fn submit(
             }
             return Err(status);
         }
+    };
+    // Queued token-work for `GetLoads`: in flight from here until the
+    // engine's first output (or the stream's end).
+    state.loads.submitted(&request_id, prompt_tokens);
+    let loads = LoadsGuard {
+        state: Arc::clone(state),
+        request_id: request_id.clone(),
     };
     let mut choices = SelectAll::new();
     for sub in subs {
@@ -188,6 +201,7 @@ async fn submit(
             streaming,
             min_tokens,
             media_identity.clone(),
+            request_id.clone(),
         ));
     }
     Ok(Box::pin(GenerateStream {
@@ -195,7 +209,21 @@ async fn submit(
         cancel,
         aborted: None,
         _registration: registration,
+        _loads: loads,
     }))
+}
+
+/// Takes the request out of the load tracker's queue when the stream ends,
+/// in case the engine never started it.
+struct LoadsGuard {
+    state: Arc<State>,
+    request_id: String,
+}
+
+impl Drop for LoadsGuard {
+    fn drop(&mut self) {
+        self.state.loads.finished(&self.request_id);
+    }
 }
 
 /// One choice of a generate request: the ZMQ-mapped stream plus the string
@@ -220,6 +248,8 @@ struct ChoiceStream {
     /// A PD prefill leg's account of the media it processed, stamped on
     /// every `Complete` of the request for the decode leg.
     media_identity: Option<Arc<vllm::MediaIdentity>>,
+    /// The request this choice belongs to, for the load tracker.
+    request_id: String,
 }
 
 impl ChoiceStream {
@@ -230,9 +260,11 @@ impl ChoiceStream {
         streaming: bool,
         min_tokens: u32,
         media_identity: Option<Arc<vllm::MediaIdentity>>,
+        request_id: String,
     ) -> Self {
         Self {
             media_identity,
+            request_id,
             state,
             inner: Some(inner),
             stops: StopMatcher::new(decoder, min_tokens),
@@ -243,8 +275,9 @@ impl ChoiceStream {
     }
 
     /// Count the prompt once per request (every choice of an `n > 1` fan-out
-    /// reports the same prompt) for the stats line.
-    fn count_prompt(&mut self, prompt_tokens: u32) {
+    /// reports the same prompt) for the stats line, and tell the load tracker
+    /// the engine started it and how much of the prompt was cached.
+    fn count_prompt(&mut self, prompt_tokens: u32, cached_tokens: u32) {
         if self.prompt_counted || prompt_tokens == 0 {
             return;
         }
@@ -253,6 +286,9 @@ impl ChoiceStream {
                 .stats
                 .prompt_tokens
                 .fetch_add(u64::from(prompt_tokens), Ordering::Relaxed);
+            self.state
+                .loads
+                .first_output(&self.request_id, prompt_tokens, cached_tokens);
         }
         self.prompt_counted = true;
     }
@@ -318,15 +354,18 @@ impl Stream for ChoiceStream {
                 if let Some(vllm::generate_response::Response::Complete(complete)) =
                     item.response.as_ref()
                 {
-                    this.count_prompt(complete.prompt_tokens);
+                    this.count_prompt(complete.prompt_tokens, complete.cached_tokens);
                 }
                 return Poll::Ready(Some(Ok(this.stamped(item))));
             };
-            this.count_prompt(chunk.prompt_tokens);
+            this.count_prompt(chunk.prompt_tokens, chunk.cached_tokens);
             this.state
                 .stats
                 .generation_tokens
                 .fetch_add(chunk.token_ids.len() as u64, Ordering::Relaxed);
+            this.state
+                .loads
+                .generated(u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX));
             let matched = match this.stops.feed(&chunk.token_ids) {
                 Ok(matched) => matched,
                 Err(status) => {
@@ -372,6 +411,7 @@ struct GenerateStream {
     /// at that point, yielded before the stream ends.
     aborted: Option<VecDeque<vllm::GenerateResponse>>,
     _registration: Registration,
+    _loads: LoadsGuard,
 }
 
 impl Stream for GenerateStream {

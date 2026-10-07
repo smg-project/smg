@@ -19,6 +19,8 @@ service TokenSpeedScheduler {
   rpc Abort(AbortRequest) returns (AbortResponse);
   rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  // The gateway's fallback: a servicer that pushes its load on the KV-event
+  // stream (KvEventBatch.load) is not polled while those records flow.
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
 
   // Flush the KV cache on the scheduler

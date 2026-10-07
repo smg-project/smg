@@ -8,7 +8,7 @@
 //! warm tree; "miss" appends a never-seen turn each time; "hit_8_threads"
 //! runs the hit path on eight threads against one tree and reports wall time
 //! divided by operations.
-#![allow(clippy::expect_used, clippy::cast_possible_truncation)]
+#![expect(clippy::expect_used)]
 
 use std::{
     cell::RefCell,
@@ -23,8 +23,9 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use kv_index::{
-    compute_content_hash, compute_request_content_hashes, PositionalIndexer, SequenceHash,
-    StoredBlock, TokenTree, Tree, WorkerBlockMap,
+    compute_content_hash, compute_request_content_hashes, request_prefix_hashes, ChainBlockMap,
+    ChainIndex, ContentHash, PositionalIndexer, SequenceHash, ShardedChainIndex, StoredBlock,
+    TokenTree, Tree, WorkerBlockMap,
 };
 
 const TENANTS: usize = 64;
@@ -280,10 +281,159 @@ fn bench_event_path(c: &mut Criterion) {
     group.finish();
 }
 
+/// Blocks of a content chain as an engine hashes them (the engine hash is the chain hash).
+fn chain_blocks(stream: u64, len: usize) -> Vec<StoredBlock> {
+    let contents: Vec<ContentHash> = (0..len)
+        .map(|p| compute_content_hash(&[stream as u32, (stream >> 32) as u32, p as u32]))
+        .collect();
+    contents
+        .iter()
+        .zip(request_prefix_hashes(&contents))
+        .map(|(&content_hash, seq_hash)| StoredBlock {
+            seq_hash,
+            content_hash,
+        })
+        .collect()
+}
+
+/// A chain index in which `holders` workers hold one 88-block chain: the shape of the Mooncake
+/// replay, where nineteen of twenty stores land on a run another worker built.
+fn shared_run(holders: usize) -> (ChainIndex, Vec<StoredBlock>) {
+    let index = ChainIndex::with_max_workers(64);
+    let blocks = chain_blocks(1, 88);
+    for w in 0..holders {
+        let worker = index.intern_worker(&tenant(w)).expect("worker id");
+        let mut map = ChainBlockMap::default();
+        index
+            .apply_stored(worker, &blocks, None, &mut map)
+            .expect("store");
+    }
+    (index, blocks)
+}
+
+/// The store walk of the chain index per event block: a worker storing a chain other workers
+/// already hold (the walk matches the run and writes the lane map), a store that diverges from
+/// the shared chain halfway (the walk finds the divergence and splits the run), and a fresh
+/// chain under the root (a new run, allocation included) as the control.
+fn bench_chain_index_store(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chain_index_store");
+    group.throughput(Throughput::Elements(88));
+
+    let (index, blocks) = shared_run(19);
+    let worker = index.intern_worker("newcomer").expect("worker id");
+    let hashes: Vec<SequenceHash> = blocks.iter().map(|block| block.seq_hash).collect();
+    group.bench_function("shared_chain/88_blocks/19_holders", |b| {
+        b.iter_batched(
+            || {
+                let mut map = ChainBlockMap::default();
+                index
+                    .apply_stored(worker, &blocks, None, &mut map)
+                    .expect("store");
+                index.apply_removed(worker, &hashes, &mut map);
+                map
+            },
+            |mut map| {
+                index
+                    .apply_stored(worker, &blocks, None, &mut map)
+                    .expect("store");
+                map
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let mut forked = blocks[..44].to_vec();
+    forked.extend(chain_blocks(2, 88).into_iter().skip(44));
+    let forked = {
+        // Re-chain the fork's engine hashes from the shared prefix.
+        let contents: Vec<ContentHash> = forked.iter().map(|block| block.content_hash).collect();
+        contents
+            .iter()
+            .zip(request_prefix_hashes(&contents))
+            .map(|(&content_hash, seq_hash)| StoredBlock {
+                seq_hash,
+                content_hash,
+            })
+            .collect::<Vec<_>>()
+    };
+    group.bench_function("divergent_chain/88_blocks/split_at_44", |b| {
+        b.iter_batched(
+            || {
+                let (index, _) = shared_run(19);
+                let worker = index.intern_worker("forker").expect("worker id");
+                (index, worker)
+            },
+            |(index, worker)| {
+                let mut map = ChainBlockMap::default();
+                index
+                    .apply_stored(worker, &forked, None, &mut map)
+                    .expect("store");
+                (index, map)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("fresh_chain/88_blocks", |b| {
+        b.iter_batched(
+            || {
+                let index = ChainIndex::with_max_workers(64);
+                let worker = index.intern_worker("first").expect("worker id");
+                (index, worker)
+            },
+            |(index, worker)| {
+                let mut map = ChainBlockMap::default();
+                index
+                    .apply_stored(worker, &blocks, None, &mut map)
+                    .expect("store");
+                (index, map)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+/// The lookup of the chain index: a request of 88 blocks that twenty workers hold whole (the
+/// Mooncake shape, one run walked), and the same request against two shards holding it on both.
+fn bench_chain_index_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chain_index_lookup");
+    group.throughput(Throughput::Elements(1));
+    let (index, blocks) = shared_run(20);
+    let request: Vec<ContentHash> = blocks.iter().map(|block| block.content_hash).collect();
+    group.bench_function("88_blocks/20_holders/1_shard", |b| {
+        b.iter(|| {
+            let mut scored = 0usize;
+            index.score_into(&request, |content| content.0, false, |_, _| scored += 1);
+            scored
+        });
+    });
+    let sharded = ShardedChainIndex::new(2, 64);
+    for w in 0..20 {
+        let worker = sharded
+            .intern_worker_in(w % 2, &tenant(w))
+            .expect("worker id");
+        let mut map = ChainBlockMap::default();
+        sharded
+            .apply_stored(worker, &blocks, None, &mut map)
+            .expect("store");
+    }
+    group.bench_function("88_blocks/20_holders/2_shards", |b| {
+        b.iter(|| {
+            let mut scored = 0usize;
+            sharded.score_into(&request, |content| content.0, false, |_, _| scored += 1);
+            scored
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_token_tree,
     bench_string_tree,
-    bench_event_path
+    bench_event_path,
+    bench_chain_index_store,
+    bench_chain_index_lookup
 );
 criterion_main!(benches);

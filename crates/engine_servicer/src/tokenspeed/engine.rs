@@ -5,7 +5,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use engine_zmq_adapter::{connect_with_eos, EosTokenIds};
+use engine_zmq_adapter::{connect_with_eos, EosTokenIds, Handshake};
 use openai_protocol::worker::RuntimeType;
 use tracing::{error, info, warn};
 
@@ -50,7 +50,7 @@ pub(super) async fn connect_engine(
         &ipc_base_url,
         state.model.model_path.clone(),
         RuntimeType::TokenSpeed,
-        Some(&handshake_address),
+        Handshake::TcpOrIpc(&handshake_address),
         engine_count,
         eos,
         startup_timeout,

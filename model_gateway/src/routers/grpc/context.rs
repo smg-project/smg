@@ -1533,4 +1533,74 @@ mod tests {
         assert_eq!(plan.request_type(), "generate");
         assert_eq!(plan.mode_label(), "prefill_decode");
     }
+
+    #[test]
+    fn load_guards_report_completion_for_each_leg_they_hold() {
+        use crate::worker::{BasicWorkerBuilder, RequestCompletionSink, WorkerType};
+        #[derive(Debug, Default)]
+        struct CompletionSpy(std::sync::Mutex<Vec<String>>);
+        impl RequestCompletionSink for CompletionSpy {
+            fn request_completed(&self, worker: &dyn Worker) {
+                self.0.lock().unwrap().push(worker.url().to_string());
+            }
+        }
+
+        let spy = Arc::new(CompletionSpy::default());
+        let sink: Arc<dyn RequestCompletionSink> = spy.clone();
+        let single: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://single")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        for worker in [&single, &prefill, &decode] {
+            worker.set_completion_sink(Some(Arc::clone(&sink)));
+        }
+
+        // The regular gRPC path: one guard, one completion when the stream ends.
+        drop(LoadGuards::new(
+            &WorkerSelection::Single {
+                worker: Arc::clone(&single),
+            },
+            None,
+        ));
+        assert_eq!(spy.0.lock().unwrap().as_slice(), ["grpc://single"]);
+
+        // The disaggregated path: the decode leg completes with the guards,
+        // the prefill leg with its own guard when the prefill phase ends.
+        let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+        };
+        drop(prefill_guard);
+        assert_eq!(
+            spy.0.lock().unwrap().last().map(String::as_str),
+            Some("grpc://prefill")
+        );
+        drop(guards);
+        assert_eq!(
+            spy.0.lock().unwrap().last().map(String::as_str),
+            Some("grpc://decode")
+        );
+
+        // A batched fan-out reports once per sub-request.
+        let before = spy.0.lock().unwrap().len();
+        drop(LoadGuards::scaled(
+            &WorkerSelection::Single {
+                worker: Arc::clone(&single),
+            },
+            None,
+            3,
+        ));
+        assert_eq!(spy.0.lock().unwrap().len(), before + 3);
+    }
 }

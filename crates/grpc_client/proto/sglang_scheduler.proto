@@ -27,7 +27,9 @@ service SglangScheduler {
   // Get server information
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 
-  // Get comprehensive load metrics
+  // Get comprehensive load metrics. The gateway's fallback: a servicer that
+  // pushes its load on the KV-event stream (KvEventBatch.load) is not polled
+  // while those records flow.
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
 
   // Flush the KV cache on all scheduler processes

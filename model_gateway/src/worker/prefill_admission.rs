@@ -1186,4 +1186,37 @@ mod tests {
         ));
         drop(occupied);
     }
+
+    #[tokio::test]
+    async fn an_admitted_prefill_reports_completion_when_its_reservation_drops() {
+        use crate::worker::{BasicWorkerBuilder, RequestCompletionSink, Worker, WorkerType};
+        #[derive(Debug, Default)]
+        struct CompletionSpy(std::sync::Mutex<Vec<String>>);
+        impl RequestCompletionSink for CompletionSpy {
+            fn request_completed(&self, worker: &dyn Worker) {
+                self.0.lock().unwrap().push(worker.url().to_string());
+            }
+        }
+
+        let spy = Arc::new(CompletionSpy::default());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill-admitted")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        worker.set_completion_sink(Some(spy.clone() as Arc<dyn RequestCompletionSink>));
+        let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
+        let admitted = admission
+            .admit(None, |capacity| capacity.select(Arc::clone(&worker), ()))
+            .await
+            .expect("admitted");
+        assert_eq!(worker.load(), 1);
+        assert!(spy.0.lock().unwrap().is_empty());
+        drop(admitted);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            spy.0.lock().unwrap().as_slice(),
+            ["grpc://prefill-admitted"]
+        );
+    }
 }

@@ -12,7 +12,7 @@ use std::{
 use futures::StreamExt;
 use mock_worker::{
     config::{Config, ReplayConfig},
-    engine::EngineParams,
+    engine::{EngineParams, TimingModel},
     grpc::serve_with_listener,
 };
 use serde_json::{json, Value};
@@ -38,6 +38,7 @@ fn config(capture: Option<PathBuf>) -> Config {
         realistic: false,
         engine: EngineParams::default(),
         replay: ReplayConfig { capture },
+        ..Config::default()
     }
 }
 
@@ -145,7 +146,13 @@ async fn line_is_on_disk_before_the_first_frame() {
     let path = dir.path().join("generate.jsonl");
     let mut cfg = config(Some(path.clone()));
     cfg.realistic = true;
-    cfg.engine.decode_base_ms = 200.0;
+    // The linear timing model with a 200 ms decode base holds the first
+    // frame back long enough for the check.
+    cfg.engine.timing = TimingModel::Linear {
+        prefill_tps: 8000.0,
+        decode_base_ms: 200.0,
+        decode_per_req_ms: 0.35,
+    };
     let client = start(cfg).await;
 
     let mut req = request("early", &[1, 2, 3], "early");

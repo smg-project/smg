@@ -469,3 +469,36 @@ class TestDiscoveryMapping:
     def test_unknown_provider_is_rejected(self):
         with pytest.raises(ValueError, match="Invalid discovery mapping"):
             _Router(worker_urls=[], discovery={"provider": "zookeeper"})
+
+
+class TestRouterPositionalSignature:
+    """External callers construct ``_Router(...)`` positionally, so the order
+    of its parameters is a public contract: a new parameter is appended after
+    the last positional one and before the keyword-only ``discovery``."""
+
+    @staticmethod
+    def positional_names():
+        import inspect
+
+        params = list(inspect.signature(_Router).parameters.values())
+        assert params[-1].name == "discovery"
+        assert params[-1].kind is inspect.Parameter.KEYWORD_ONLY
+        return [p.name for p in params if p.kind is not inspect.Parameter.KEYWORD_ONLY]
+
+    def test_appended_parameters_follow_prefill_queue_timeout(self):
+        names = self.positional_names()
+        tail = names[names.index("prefill_queue_timeout_secs") :]
+        assert tail == [
+            "prefill_queue_timeout_secs",
+            "worker_overload_shed",
+            "kv_index",
+            "worker_stall_secs",
+            "worker_wedge_secs",
+            "worker_warmup_secs",
+            "worker_warmup_share",
+            "worker_warmup_blocks",
+            "worker_warmup_thin_ratio",
+            "worker_warmup_divert_every",
+            "selection_policy",
+            "selection_accounting_ttl_ms",
+        ]

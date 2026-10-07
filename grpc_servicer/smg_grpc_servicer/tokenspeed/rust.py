@@ -163,6 +163,7 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         "max_running_requests": running_window(server_args),
         "data_parallel_size": int(dp_size) if isinstance(dp_size, int) and dp_size > 0 else 1,
         "kv_events_endpoint": kv_events.endpoint if kv_events else "",
+        "kv_events_replay_endpoint": kv_events.replay_endpoint if kv_events else "",
         "kv_events_topic": kv_events.topic if kv_events else "",
     }
 

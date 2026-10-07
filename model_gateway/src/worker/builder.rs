@@ -380,6 +380,7 @@ impl BasicWorkerBuilder {
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
             http_client,
             resilience,
+            completion_sink: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 }

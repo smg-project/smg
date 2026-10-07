@@ -14,15 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import grpc
-import msgspec
 import torch
-import zmq
-import zmq.asyncio
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
-from vllm.distributed.kv_events import KVEventBatch
 from vllm.engine.protocol import EngineClient
 from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
 from vllm.inputs.engine import mm_input, tokens_input
@@ -36,14 +32,14 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
+from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
 from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
-    endpoint_for_rank,
+    rank_sources_for,
     resolve_kv_events_config,
-    stream_kv_events,
 )
 from smg_grpc_servicer.vllm.kv_transfer import (
     params_from_request,
@@ -53,6 +49,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 # The launcher imports this module before it defines serve_grpc: the moment
 # the servicer switch has to be in place (see launcher_switch).
 from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
+from smg_grpc_servicer.vllm.loads import LoadTracker, scheduler_load_fields
 from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
@@ -92,6 +89,31 @@ try:
     from vllm.version import __version__ as VLLM_VERSION
 except Exception:  # pragma: no cover - version lookup is best-effort
     VLLM_VERSION = ""
+
+
+def _prompt_length(prompt) -> int:
+    """The token count of an engine prompt (0 when it is text the engine tokenizes)."""
+    if isinstance(prompt, dict):
+        ids = prompt.get("prompt_token_ids")
+        return len(ids) if ids is not None else 0
+    return 0
+
+
+def _kv_capacity_tokens(engine) -> int:
+    """The KV cache's token capacity, when the engine config exposes it."""
+    cache = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
+    blocks = getattr(cache, "num_gpu_blocks", None)
+    block_size = getattr(cache, "block_size", None)
+    if isinstance(blocks, int) and isinstance(block_size, int) and blocks > 0 and block_size > 0:
+        return blocks * block_size
+    return 0
+
+
+def _max_running_requests(engine) -> int:
+    """The scheduler's running window (``max_num_seqs``), when exposed."""
+    scheduler = getattr(getattr(engine, "vllm_config", None), "scheduler_config", None)
+    window = getattr(scheduler, "max_num_seqs", None)
+    return window if isinstance(window, int) and window > 0 else 0
 
 
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
@@ -168,6 +190,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
+        # Queued token-work, generation throughput and hit rate for GetLoads,
+        # from the requests this servicer forwards (vLLM's stats carry none).
+        self._loads = LoadTracker()
         # Flag > env > default, resolved once so each value names its source.
         self._mm_settings = (mm_settings or MmSettings()).resolve()
         # Worker-side media processing (media_refs); None keeps refs rejected.
@@ -403,6 +428,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Track which indices have sent their first chunk
             seen_indices: set[int] = set()
 
+            self._loads.submitted(request_id, _prompt_length(prompt))
             async for output in self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -412,7 +438,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     request.data_parallel_rank if request.HasField("data_parallel_rank") else None
                 ),
             ):
+                if not engine_started:
+                    self._loads.first_output(
+                        request_id,
+                        len(output.prompt_token_ids or ()),
+                        getattr(output, "num_cached_tokens", 0) or 0,
+                    )
                 engine_started = True
+                self._loads.generated(sum(len(c.token_ids) for c in output.outputs))
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -471,6 +504,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 logger.warning("Generate request %s rejected (%s): %s", request_id, code.name, e)
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
             await context.abort(code, str(e))
+        finally:
+            self._loads.finished(request_id)
 
     async def _notify_kv_transfer_rejected(
         self,
@@ -701,7 +736,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Reads the latest SchedulerStats snapshot cached on the engine's stat
         loggers and maps it onto a single-DP-rank SchedulerLoad: ``token_usage``
         carries KV-cache utilization ([0,1)) and ``num_running_reqs`` /
-        ``num_waiting_reqs`` report queue depth.
+        ``num_waiting_reqs`` report queue depth. ``num_waiting_uncached_tokens``,
+        ``gen_throughput`` and ``cache_hit_rate`` come from this servicer's own
+        bookkeeping of the requests it forwards (``smg_grpc_servicer.vllm.loads``),
+        since vLLM's stats do not carry them.
 
         Always returns exactly one SchedulerLoad entry (zero-filled when no
         snapshot is available yet, e.g. with --disable-log-stats or before the
@@ -731,11 +769,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_usage = 0.0
 
         load = vllm_engine_pb2.SchedulerLoad(
-            dp_rank=0,
-            num_running_reqs=num_running,
-            num_waiting_reqs=num_waiting,
-            num_total_reqs=num_running + num_waiting,
-            token_usage=max(0.0, kv_usage),
+            **scheduler_load_fields(
+                num_running,
+                num_waiting,
+                kv_usage,
+                self._loads.estimate(num_waiting),
+                max_total_num_tokens=_kv_capacity_tokens(self.engine),
+                max_running_requests=_max_running_requests(self.engine),
+            )
         )
 
         return vllm_engine_pb2.GetLoadsResponse(
@@ -1274,11 +1315,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: common_pb2.SubscribeKvEventsRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[common_pb2.KvEventBatch]:
-        """Bridge vLLM's in-process ZMQ KV cache events to a gRPC stream.
-
-        The ZMQ publisher's sequence numbers are used directly as the gRPC
-        batch sequence numbers.
-        """
+        """Relay vLLM's ZMQ KV cache events, every DP rank's publisher, as one
+        gRPC stream (see ``smg_grpc_servicer.kv_relay``)."""
         if self._kv_events_config is None:
             await context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
@@ -1288,34 +1326,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             )
 
         config = self._kv_events_config
-
-        # For DP attention each rank publishes on port + rank with independent
-        # sequence counters; subscribing to several on one socket interleaves
-        # them and breaks gap detection. Subscribe to rank 0 only for now.
-        # TODO(phase3): per-rank virtual workers or merged renumbering.
-        pub_endpoint = endpoint_for_rank(config.endpoint, 0)
-
-        zmq_ctx = zmq.asyncio.Context.instance()
-        sub_socket = zmq_ctx.socket(zmq.SUB)
-        sub_socket.subscribe(config.topic.encode("utf-8"))
-        sub_socket.connect(pub_endpoint)
-        logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
-
-        decoder = msgspec.msgpack.Decoder(KVEventBatch)
-
-        try:
-            async for proto_batch in stream_kv_events(
-                sub_socket,
-                decoder.decode,
-                lambda: context.send_initial_metadata(()),
-                context.cancelled,
-            ):
-                yield proto_batch
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.exception("SubscribeKvEvents failed")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
-        finally:
-            sub_socket.close(linger=0)
-            logger.info("SubscribeKvEvents: stream closed")
+        async for proto_batch in relay(
+            rank_sources_for(config, self.engine),
+            Engine.VLLM,
+            request.start_sequence_number,
+            context,
+            topic=str(getattr(config, "topic", "") or ""),
+            hwm=getattr(config, "hwm", None),
+        ):
+            yield proto_batch

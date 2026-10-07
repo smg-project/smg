@@ -37,13 +37,13 @@ use crate::{
 };
 
 /// Per-listener HTTP state: shared config plus an optional engine simulator.
-pub struct AppState {
+struct AppState {
     cfg: Arc<Config>,
     engine: Option<Engine>,
 }
 
 /// Build the router serving the mock HTTP worker contract.
-pub fn router(state: Arc<AppState>) -> Router {
+fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -63,8 +63,11 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
             return;
         }
     };
-    // One simulated engine per listener (i.e. per virtual worker).
-    let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
+    // One simulated engine per listener (i.e. per virtual worker), registered
+    // in the process fleet under `http:<port>` for the oracle and admin API.
+    let engine = cfg
+        .realistic
+        .then(|| Engine::spawn_named(cfg.engine.clone(), format!("http:{port}"), true));
     let state = Arc::new(AppState { cfg, engine });
     // TCP_NODELAY: without it Nagle holds each small SSE frame until the
     // gateway's delayed ACK (~40ms) arrives, which stalls every streamed
@@ -92,14 +95,17 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
             "created": 0,
             "owned_by": "sglang",
             "root": state.cfg.model_id,
-            "max_model_len": 32768,
+            "max_model_len": state.cfg.context_length,
         }],
     }))
     .into_response()
 }
 
 async fn loads(State(state): State<Arc<AppState>>) -> Response {
-    let load = state.engine.as_ref().map(|e| e.load());
+    let load = state
+        .engine
+        .as_ref()
+        .map(|e| e.load().as_reported_by(state.cfg.loads_like));
     let value = match load {
         Some(s) => json!({
             "dp_rank": 0,
@@ -182,8 +188,8 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         };
     }
 
-    // Canned mode: a single up-front delay, then a fixed response. Always
-    // chat-shaped (unchanged) so the existing scale rig is unaffected.
+    // Canned mode: a single up-front delay, then a fixed chat-shaped response,
+    // whichever endpoint was called.
     if !state.cfg.gen_delay.is_zero() {
         tokio::time::sleep(state.cfg.gen_delay).await;
     }
@@ -264,6 +270,7 @@ async fn realistic_completion(
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
         "cached_tokens": cached_tokens,
+        "prompt_tokens_details": { "cached_tokens": cached_tokens },
     });
     Json(match endpoint {
         Endpoint::Chat => json!({

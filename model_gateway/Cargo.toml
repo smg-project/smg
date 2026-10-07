@@ -187,6 +187,10 @@ wasmtime-wasi = { workspace = true }
 lru = { workspace = true }
 wat = "1.252"
 zip = "8.6"
+# The KV-index exactness tests and the decision bench run the mock engine's
+# streams through the relay's decoder and normalizer into the gateway's index.
+engine-servicer.workspace = true
+rmp-serde.workspace = true
 
 [[bench]]
 name = "wasm_middleware_latency"
@@ -251,6 +255,16 @@ path = "benches/scheduler_admission.rs"
 name = "scheduler_load"
 harness = false
 path = "benches/scheduler_load.rs"
+
+[[bench]]
+name = "policy_selection"
+harness = false
+path = "benches/policy_selection.rs"
+
+[[bench]]
+name = "kv_index_decision"
+harness = false
+path = "benches/kv_index_decision.rs"
 
 [lints]
 workspace = true
