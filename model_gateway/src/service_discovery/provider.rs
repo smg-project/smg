@@ -1,7 +1,7 @@
 //! The contract between a worker-discovery provider and the shared reconciler.
 //!
-//! A provider turns its source — Kubernetes Pods today; files, Slurm and Consul
-//! next — into these types and nothing else. The reconciler sees only these, so
+//! A provider turns its source — Kubernetes Pods or a JSON manifest today;
+//! Slurm and Consul next — into these types and nothing else. The reconciler sees only these, so
 //! it never learns which kind of source produced a worker beyond the
 //! [`DiscoveryKind`] it is handed.
 
@@ -15,6 +15,7 @@ use crate::{observability::metrics::metrics_labels, worker::endpoint::Endpoint};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum DiscoveryKind {
     Kubernetes,
+    File,
 }
 
 impl DiscoveryKind {
@@ -27,6 +28,7 @@ impl DiscoveryKind {
     pub(super) fn as_label(self) -> &'static str {
         match self {
             DiscoveryKind::Kubernetes => "kubernetes",
+            DiscoveryKind::File => "file",
         }
     }
 
@@ -34,6 +36,7 @@ impl DiscoveryKind {
     pub(super) fn metric_label(self) -> &'static str {
         match self {
             DiscoveryKind::Kubernetes => metrics_labels::DISCOVERY_KUBERNETES,
+            DiscoveryKind::File => metrics_labels::DISCOVERY_FILE,
         }
     }
 }

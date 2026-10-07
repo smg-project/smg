@@ -53,9 +53,11 @@ impl Default for MeshDiscoveryConfig {
 impl MeshDiscoveryConfig {
     /// Router discovery as configured today: inside Kubernetes worker
     /// discovery, so it runs only alongside it. `None` without a router
-    /// selector.
+    /// selector, and under any other worker provider.
     pub fn from_discovery(discovery: &DiscoveryConfig) -> Option<Self> {
-        let DiscoveryConfig::Kubernetes(kubernetes) = discovery;
+        let DiscoveryConfig::Kubernetes(kubernetes) = discovery else {
+            return None;
+        };
         Some(Self {
             namespace: kubernetes.namespace.clone(),
             router_selector: kubernetes.router_selector.clone(),

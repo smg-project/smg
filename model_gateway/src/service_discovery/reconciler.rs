@@ -48,7 +48,7 @@ pub const DISCOVERY_SPEC_HASH_LABEL: &str = "smg.ai/discovery-spec-hash";
 /// One set. A provider publishes only the workers it considers eligible, so
 /// there is no "present but not yet addable" state for the reconciler to hold
 /// a worker in.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(super) struct DesiredState {
     pub(super) workers: BTreeMap<EndpointKey, DiscoveredWorker>,
 }

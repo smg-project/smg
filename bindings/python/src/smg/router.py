@@ -320,21 +320,38 @@ class Router:
         """Create a router from a RouterArgs instance."""
 
         args_dict = vars(args).copy()
-        # Kubernetes, by either spelling, reaches Rust as service_discovery.
-        # A provider this cannot pass on fails here instead of quietly
-        # starting the router without discovery.
+        # Kubernetes, by either spelling, reaches Rust as service_discovery;
+        # the file provider as the tagged `discovery` mapping. A provider this
+        # cannot pass on fails here instead of quietly starting the router
+        # without discovery.
         provider = args.selected_discovery_provider()
-        if provider not in (None, "kubernetes"):
+        file_flags = (
+            args.discovery_file is not None or args.discovery_check_interval_secs is not None
+        )
+        if file_flags and provider != "file":
+            raise ValueError(
+                "discovery_file and discovery_check_interval_secs apply only to"
+                " discovery_provider='file'"
+            )
+        if provider == "file":
+            if not args.discovery_file:
+                raise ValueError("discovery_provider='file' needs discovery_file")
+            discovery = {"provider": "file", "path": args.discovery_file}
+            if args.discovery_check_interval_secs is not None:
+                discovery["check_interval_secs"] = args.discovery_check_interval_secs
+            args_dict["discovery"] = discovery
+        elif provider not in (None, "kubernetes"):
             raise ValueError(
                 f"Router.from_args cannot pass discovery provider {provider!r} to Rust"
             )
         args_dict["service_discovery"] = provider == "kubernetes"
-        args_dict.pop("discovery_provider")
+        for key in ("discovery_provider", "discovery_file", "discovery_check_interval_secs"):
+            args_dict.pop(key)
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []
             if (
-                args_dict["service_discovery"]
+                provider is not None
                 or args_dict["pd_disaggregation"]
                 or args_dict["epd_disaggregation"]
             )
