@@ -240,9 +240,15 @@ fn resolve<'a>(root: &'a Value, schema: &'a Value) -> &'a Value {
 fn below<'a>(root: &'a Value, schema: &'a Value, segment: &str) -> Option<&'a Value> {
     let mut admitted = Vec::new();
     admitted_types(root, schema, &mut admitted);
+    let (array, object) = (admitted.contains(&"array"), admitted.contains(&"object"));
+    if array && object {
+        // A schema that admits an array and an object alike says nothing about what is below:
+        // the segment could be a list's `item` or a property, so the value is inferred.
+        return None;
+    }
     let mut shapes = Vec::new();
     with_members(root, schema, &mut shapes, 0);
-    if admitted.contains(&"array") {
+    if array {
         shapes.iter().find_map(|shape| shape.get("items"))
     } else {
         shapes
@@ -1205,7 +1211,8 @@ mod tests {
 
     #[test]
     fn a_kind_below_a_wrapped_array_or_object_comes_from_the_member_that_has_the_shape() {
-        // Pydantic's `Optional[List[str]]`, `Optional[Model]` and a wrapper inside a wrapper.
+        // Pydantic's `Optional[List[str]]`, an object inline under `anyOf` (Pydantic refers to a
+        // model through `$defs`, which the `$ref` test covers), and a wrapper inside a wrapper.
         let declared = Declared::of(&[tool(
             "f",
             value!({
@@ -1235,6 +1242,21 @@ mod tests {
         );
         assert_eq!(declared.kind_at("f", &["either", "n"]), Some(Kind::String));
         assert_eq!(declared.kind_at("f", &["meta", "missing"]), None);
+    }
+
+    #[test]
+    fn a_union_of_an_array_and_an_object_leaves_what_is_below_it_to_inference() {
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                "x": {"anyOf": [
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "object", "properties": {"id": {"type": "integer"}}}
+                ]},
+            }),
+        )]);
+        assert_eq!(declared.kind_at("f", &["x", "id"]), None);
+        assert_eq!(declared.kind_at("f", &["x", "item"]), None);
     }
 
     #[test]
