@@ -12,6 +12,7 @@ pub mod chat;
 pub mod classify;
 pub mod common;
 pub mod completion;
+pub mod decisions;
 pub mod embedding;
 pub mod event_types;
 pub mod ext;
