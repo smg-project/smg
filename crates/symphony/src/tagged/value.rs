@@ -55,7 +55,7 @@
 //! - The old functions had a rule each for `number`, `boolean`, `array` and `object`. Each gave
 //!   exactly what inference gives, so they are not carried over.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -93,6 +93,9 @@ impl Kind {
     fn of(root: &Value, schema: &Value) -> Option<Self> {
         let mut admitted = Vec::new();
         admitted_types(root, schema, &mut admitted);
+        // A type named twice (`"type": "integer"` beside a reference to an integer) is one type.
+        admitted.sort_unstable();
+        admitted.dedup();
         if admitted.contains(&"string") {
             Some(if admitted.contains(&"null") {
                 Self::NullableString
@@ -116,7 +119,7 @@ impl Kind {
 /// when `null` is among them (what Pydantic writes for `Literal["a", "b", None]`). A `$ref` into
 /// `root` admits what its target admits.
 fn admitted_types<'a>(root: &'a Value, schema: &'a Value, into: &mut Vec<&'a str>) {
-    admitted_types_within(root, schema, into, &mut Vec::new());
+    admitted_types_within(root, schema, into, &mut HashSet::new());
 }
 
 /// `seen` holds the nodes this lookup has read, so a definition that refers to itself, however
@@ -126,13 +129,14 @@ fn admitted_types_within<'a>(
     root: &'a Value,
     schema: &'a Value,
     into: &mut Vec<&'a str>,
-    seen: &mut Vec<*const Value>,
+    seen: &mut HashSet<*const Value>,
 ) {
-    let schema = resolve(root, schema);
-    if seen.contains(&std::ptr::from_ref(schema)) {
+    let Some(schema) = resolve(root, schema) else {
+        return;
+    };
+    if !seen.insert(std::ptr::from_ref(schema)) {
         return;
     }
-    seen.push(std::ptr::from_ref(schema));
     let typed = match schema.get("type") {
         Some(Value::String(name)) => {
             into.push(name);
@@ -213,24 +217,19 @@ impl Declared {
 const HOPS: usize = 16;
 
 /// `schema` with its `$ref` followed into `root`: a JSON pointer such as `#/$defs/Meta`, which is
-/// how Pydantic writes a model a field refers to, or `#/definitions/Meta`; a reference that leads
-/// nowhere, or one that refers to a reference past the hop limit, stands as it is and admits
-/// nothing. `root` is the function's whole `parameters` schema, where the definitions live.
-fn resolve<'a>(root: &'a Value, schema: &'a Value) -> &'a Value {
+/// how Pydantic writes a model a field refers to, or `#/definitions/Meta`; `root` is the
+/// function's whole `parameters` schema, where the definitions live. A reference that leads
+/// nowhere, or one that refers to a reference past the hop limit, is nothing: it admits no type
+/// and has no members, whatever else stands beside it.
+fn resolve<'a>(root: &'a Value, schema: &'a Value) -> Option<&'a Value> {
     let mut schema = schema;
     for _ in 0..HOPS {
         let Some(pointer) = schema.get("$ref").and_then(Value::as_str) else {
-            return schema;
+            return Some(schema);
         };
-        let Some(path) = pointer.strip_prefix('#') else {
-            return schema;
-        };
-        match root.pointer(path) {
-            Some(target) => schema = target,
-            None => return schema,
-        }
+        schema = root.pointer(pointer.strip_prefix('#')?)?;
     }
-    schema
+    schema.get("$ref").is_none().then_some(schema)
 }
 
 /// The schema one level below `schema` at `segment`: an array's items, or an object's property
@@ -248,27 +247,50 @@ fn below<'a>(root: &'a Value, schema: &'a Value, segment: &str) -> Option<&'a Va
         return None;
     }
     let mut shapes = Vec::new();
-    with_members(root, schema, &mut shapes);
+    with_members(root, schema, &mut shapes, &mut HashSet::new());
     if array {
-        shapes.iter().find_map(|shape| shape.get("items"))
+        shapes
+            .iter()
+            .filter(|shape| may_be(shape, "array"))
+            .find_map(|shape| shape.get("items"))
     } else {
         shapes
             .iter()
+            .filter(|shape| may_be(shape, "object"))
             .find_map(|shape| shape.get("properties")?.get(segment))
+    }
+}
+
+/// Whether `shape`'s own `type` leaves room for `name`: it names it, lists it, or says nothing
+/// (a schema with `items` and no `type` constrains an array when the value is one). A shape typed
+/// as something else does not lend its `items` or `properties` to the value.
+fn may_be(shape: &Value, name: &str) -> bool {
+    match shape.get("type") {
+        None => true,
+        Some(Value::String(typed)) => typed == name,
+        Some(Value::Array(typed)) => typed.iter().any(|typed| typed.as_str() == Some(name)),
+        Some(_) => false,
     }
 }
 
 /// `schema` and, below it, every member of its `anyOf`, `oneOf` and one-member `allOf`,
 /// wrappers inside wrappers included, outermost first, each with its `$ref` followed and each
-/// read once.
-fn with_members<'a>(root: &'a Value, schema: &'a Value, into: &mut Vec<&'a Value>) {
-    let schema = resolve(root, schema);
-    if into.iter().any(|seen| std::ptr::eq(*seen, schema)) {
+/// read once (`seen` holds the nodes read; a wide union stays linear in its members).
+fn with_members<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    into: &mut Vec<&'a Value>,
+    seen: &mut HashSet<*const Value>,
+) {
+    let Some(schema) = resolve(root, schema) else {
+        return;
+    };
+    if !seen.insert(std::ptr::from_ref(schema)) {
         return;
     }
     into.push(schema);
     for member in members(schema) {
-        with_members(root, member, into);
+        with_members(root, member, into, seen);
     }
 }
 
@@ -1386,5 +1408,61 @@ mod tests {
         assert_eq!(declared.kind_at("f", &["meta", "id"]), Some(Kind::Integer));
         // An `allOf` with more than one member is a conjunction the crate does not read.
         assert_eq!(declared.kind("f", "both"), None);
+    }
+
+    #[test]
+    fn a_wide_union_costs_its_size() {
+        // Twenty thousand members: read once each, a lookup is a few milliseconds; searched
+        // again for every member, it would be the square of that.
+        let member = value!({"type": "object", "properties": {"id": {"type": "integer"}}});
+        let members: Vec<Value> = std::iter::repeat_n(member, 20_000).collect();
+        let parameters = value!({
+            "type": "object",
+            "properties": {"x": {"anyOf": members}},
+        });
+        let started = std::time::Instant::now();
+        let declared = Declared::of(&[tool_with(parameters)]);
+        assert_eq!(declared.kind("f", "x"), Some(Kind::Object));
+        assert_eq!(declared.kind_at("f", &["x", "id"]), Some(Kind::Integer));
+        assert!(
+            started.elapsed().as_secs() < 2,
+            "{:?} for a wide union",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_type_named_twice_is_one_type_and_an_unresolved_reference_is_nothing() {
+        let declared = Declared::of(&[tool_with(value!({
+            "type": "object",
+            "properties": {
+                "twice": {"type": "integer", "allOf": [{"$ref": "#/$defs/Int"}]},
+                "nowhere": {"$ref": "#/$defs/Missing", "type": "string"},
+                "mixed": {"anyOf": [
+                    {"type": "array"},
+                    {"type": "integer", "items": {"type": "string"}}
+                ]},
+            },
+            "$defs": {"Int": {"type": "integer"}},
+        }))]);
+        assert_eq!(declared.kind("f", "twice"), Some(Kind::Integer));
+        // A reference that leads nowhere admits nothing, whatever stands beside it.
+        assert_eq!(declared.kind("f", "nowhere"), None);
+        assert_eq!(declared.kind_at("f", &["nowhere", "x"]), None);
+        // The items of a member typed as something else are not the array's.
+        assert_eq!(declared.kind_at("f", &["mixed", "item"]), None);
+    }
+
+    /// The function `f` with `parameters`.
+    fn tool_with(parameters: Value) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "f".to_string(),
+                description: None,
+                parameters,
+                strict: None,
+            },
+        }
     }
 }
