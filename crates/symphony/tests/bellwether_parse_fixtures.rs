@@ -17,12 +17,14 @@
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
 //! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves; it
 //! skips the slugs bellwether has not recorded yet, and says so. When a preview run sets
-//! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows three classes of difference the scale-run
-//! sets of 2026-10-06 have ([`Allowance`]): a reference argument whose type contradicts the one the
-//! tool declares, which the template writes the same way as the string; reasoning in a reference
-//! whose template writes no thought; and calls in a reference whose template writes content or
-//! calls, not both. Each is refused at record time by bellwether now, each allowed case is counted
-//! and printed, and without the switch the classes fail the run, so they cannot hide anything.
+//! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows the classes of difference the recorded
+//! sets have ([`Allowance`]): a reference argument whose type contradicts the one the tool
+//! declares, which the template writes the same way as the string; reasoning in a reference whose
+//! template writes no thought; calls, or content, in a reference whose template writes content or
+//! calls, not both; a null the template writes no element for; and whitespace at the content's
+//! edges that the template trims. Each is refused at record time by bellwether now, or will be
+//! once the issue named on it lands; each allowed case is counted and printed, and without the
+//! switch the classes fail the run, so they cannot hide anything.
 //!
 //! Two policy questions stand between the parser and bitwise parity, and the test declares them
 //! rather than hides them. Bellwether #17: the template's separator bytes (the newline after
@@ -72,6 +74,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // Qwen3: the model writes its own `<think>`; thinking off closes it in the prompt.
     (
         "qwen3-8b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-4b-saferl",
         Family::Qwen3,
         GenerationPrompt::ModelWritesTheThought,
     ),
@@ -257,6 +264,19 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         "qwen3-coder-next",
         Family::Qwen3Tagged,
         GenerationPrompt::Plain,
+    ),
+    // Qwen-AgentWorld and Qwen-Drive write Qwen 3.5's template (their `chat_template.jinja`):
+    // tagged calls, the thought opened in the prompt. Qwen-Drive's `tokenizer_config.json` carries
+    // an older template without a thought; the recorded outputs follow the former.
+    (
+        "qwen-agentworld-35b-a3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen-drive-1.0-4b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
     ),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     (
@@ -454,9 +474,11 @@ impl Family {
     }
 
     /// The corpus classes this syntax meets in sets recorded before bellwether refused them,
-    /// when the run opts in ([`CORPUS_ALLOWANCES_ENV`]): the tagged syntax cannot carry a type
-    /// the text does not say, a template without a thought drops the reference's reasoning, and
-    /// four Qwen2.5 templates write content or calls, not both.
+    /// when the run opts in ([`CORPUS_ALLOWANCES_ENV`]): the tagged syntaxes cannot carry a type
+    /// the text does not say, a template without a thought drops the reference's reasoning, four
+    /// Qwen2.5 templates write content or calls, not both, xLAM's writes the calls and drops the
+    /// content beside them, MiniMax M3's writes no element for a null, and Qwen 3.5's trims the
+    /// content's edges.
     fn allowances(self, slug: &str, prompt: GenerationPrompt) -> Vec<Allowance> {
         if !corpus_allowances_on() {
             return Vec::new();
@@ -480,6 +502,9 @@ impl Family {
         if self == Self::MinimaxM3 {
             allowed.push(Allowance::DeclaredTypeConflict);
             allowed.push(Allowance::NullNotWritten);
+        }
+        if self == Self::Qwen3Tagged {
+            allowed.push(Allowance::ContentTrimmed);
         }
         allowed
     }
@@ -543,10 +568,10 @@ const CONTENT_OR_CALLS: &[&str] = &[
     "qwen2.5-omni-3b",
 ];
 
-/// A class of difference the scale-run sets of 2026-10-06 have, allowed for what the fixture
-/// shows rather than by id, and only when the run opts in. Each is a case bellwether refuses at
-/// record time now; the sets that hold them were recorded before the rule that refuses them, and
-/// the classes go once those sets are recorded again.
+/// A class of difference the recorded sets have, allowed for what the fixture shows rather than
+/// by id, and only when the run opts in. Each is a case bellwether refuses at record time now, or
+/// will once the issue named on it lands; the sets that hold them were recorded before the rule
+/// that refuses them, and the classes go once those sets are recorded again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Allowance {
     /// The reference's argument is a boolean, a number or null for a parameter the tool declares
@@ -574,6 +599,13 @@ enum Allowance {
     /// template dropped; with the declared-type class allowed too, a member of either class
     /// passes.
     NullNotWritten,
+    /// The template trims the content's edges (`content | trim` in Qwen 3.5's), so whitespace at
+    /// the edges of the reference's content is not in the output: two Hermes cases of every Qwen
+    /// 3.5 group end their content with a space (bellwether #81). Allowed only when the content the
+    /// parser gives is the reference's trimmed, the output does not carry the untrimmed content,
+    /// and nothing else differs, so a byte the parser lost, inside the content or at its edge,
+    /// never passes as one the template trimmed.
+    ContentTrimmed,
 }
 
 /// A case known to differ from the reference beyond the separator bytes: why, and what the parser
@@ -980,6 +1012,7 @@ fn parity(
                 Allowance::CallsNotWritten => "allowed: calls not written (corpus)",
                 Allowance::ContentNotWritten => "allowed: content not written (corpus)",
                 Allowance::NullNotWritten => "allowed: null not written (corpus)",
+                Allowance::ContentTrimmed => "allowed: content trimmed (corpus)",
             }
         } else {
             failures.push(format!(
@@ -1072,6 +1105,22 @@ fn allowance_for(
                     },
                 )
         }
+        Allowance::ContentTrimmed => {
+            let trimmed = expected.content.as_deref().map(str::trim);
+            // The output must not carry the untrimmed content either: then the parser lost the
+            // whitespace, not the template.
+            let template_trimmed = expected
+                .content
+                .as_deref()
+                .is_some_and(|content| !text.contains(content));
+            said.content != expected.content
+                && said.content.as_deref() == trimmed
+                && template_trimmed
+                && Said {
+                    content: said.content.clone(),
+                    ..expected.clone()
+                } == said
+        }
         Allowance::NullNotWritten => {
             let types_too = allowed.contains(&Allowance::DeclaredTypeConflict);
             said.content == expected.content
@@ -1091,6 +1140,41 @@ fn allowance_for(
                 )
         }
     })
+}
+
+#[test]
+fn a_content_the_template_trimmed_is_allowed_and_nothing_else_is() {
+    let markers = ("<think>", "</think>");
+    let allowed = [Allowance::ContentTrimmed];
+    let expected = Said {
+        content: Some("Done. ".to_string()),
+        reasoning: None,
+        calls: Vec::new(),
+        finish: "stop".to_string(),
+    };
+    let trimmed = Said {
+        content: Some("Done.".to_string()),
+        ..expected.clone()
+    };
+    assert!(
+        allowance_for(&trimmed, &expected, "Done.", &allowed, markers)
+            == Some(Allowance::ContentTrimmed)
+    );
+    // A byte lost inside the content is not trimming, and neither is a call beside it.
+    let lost = Said {
+        content: Some("Done".to_string()),
+        ..expected.clone()
+    };
+    assert!(allowance_for(&lost, &expected, "Done", &allowed, markers).is_none());
+    let with_call = Said {
+        calls: vec![("f".to_string(), "{}".to_string())],
+        ..trimmed.clone()
+    };
+    assert!(allowance_for(&with_call, &expected, "Done.", &allowed, markers).is_none());
+    // Whitespace the output carries was the parser's to keep, not the template's to trim.
+    assert!(allowance_for(&trimmed, &expected, "Done. ", &allowed, markers).is_none());
+    // Without the allowance, the trimmed content is a difference.
+    assert!(allowance_for(&trimmed, &expected, "Done.", &[], markers).is_none());
 }
 
 /// Whether `said` is `expected` less the members whose value is null, none of which the output
