@@ -47,7 +47,7 @@ use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
     adapt,
-    formats::{deepseek_v4_1, hy4, iquest, ling, qwen2_5, qwen3, seed_oss},
+    formats::{deepseek_v4_1, hy4, iquest, lfm2_5, ling, olmo3, qwen2_5, qwen3, seed_oss},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -316,6 +316,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::IQuest,
         GenerationPrompt::OpensTheThought,
     ),
+    // Python calls: Olmo 3 has no thought; LFM2.5 writes its own `<think>`.
+    ("olmo-3-7b-instruct", Family::Olmo3, GenerationPrompt::Plain),
+    (
+        "lfm2.5-1.2b-instruct",
+        Family::Lfm2_5,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -350,6 +357,9 @@ enum Family {
     Hy4,
     Ling,
     IQuest,
+    /// [`olmo3`], [`lfm2_5`]: Python calls.
+    Olmo3,
+    Lfm2_5,
 }
 
 impl Family {
@@ -383,6 +393,8 @@ impl Family {
             Self::Hy4 => hy4(),
             Self::Ling => ling(),
             Self::IQuest => iquest(),
+            Self::Olmo3 => olmo3(),
+            Self::Lfm2_5 => lfm2_5(),
         }
     }
 
@@ -393,13 +405,15 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS and Hy4 read neither of the probes' Qwen markers: `</think>` stays reasoning
-            // text and the fenced `<tool_call>` block stays content, as the reference says.
-            Self::SeedOss | Self::Hy4 => &[],
-            // Ling reads `<tool_call>` and `</think>`, so its two probes are the tagged ones' (no
-            // call comes of the fence); IQuest and DSML read `</think>` but not `<tool_call>`.
+            // Seed-OSS, Hy4 and Olmo 3 read neither of the probes' Qwen markers: `</think>` stays
+            // reasoning text and the fenced `<tool_call>` block stays content, as the reference
+            // says.
+            Self::SeedOss | Self::Hy4 | Self::Olmo3 => &[],
+            // Ling reads `<tool_call>` and `</think>`, so its two probes are the tagged ones'
+            // (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>` but not
+            // `<tool_call>`.
             Self::Ling => KNOWN_TAGGED_DIFFERENCES,
-            Self::IQuest | Self::DeepSeekV4_1 => KNOWN_REASONING_PROBE,
+            Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 => KNOWN_REASONING_PROBE,
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
         // read; that case falls under the reasoning allowance instead of the list.
