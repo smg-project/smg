@@ -934,7 +934,7 @@ fn parity(
                     &mut new_parser(fixture),
                     Input::Prompt {
                         token_ids: &[],
-                        text: prompt_tail(fixture),
+                        text: &prompt_tail(fixture),
                     },
                     &fixture.output_ids,
                     pieces,
