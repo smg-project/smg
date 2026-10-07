@@ -582,10 +582,14 @@ async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>)
 )]
 async fn generate_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
     let worker_id = format!("worker-{}", config.port);
+    // Before any early return, so a test still sees what arrived even when the
+    // mock is configured to fail the request.
+    record_request(config.port, version, &payload);
 
     if should_fail(&config) {
         return (

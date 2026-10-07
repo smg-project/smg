@@ -16,7 +16,10 @@ use serde_json::json;
 use smg::config::{CircuitBreakerConfig, RetryConfig};
 use tower::ServiceExt;
 
-use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
+use crate::common::{
+    mock_worker::{set_request_recorder, RequestRecorder},
+    AppTestContext, TestRouterConfig, TestWorkerConfig,
+};
 
 #[cfg(test)]
 mod fault_tolerance_tests {
@@ -301,6 +304,215 @@ mod fault_tolerance_tests {
         assert!(
             success_count >= 25,
             "System should maintain stability under partial failure, got {success_count} successes"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// Sticky routing (manual policy) with the circuit breaker and health checks
+    /// disabled: nothing ever marks a failing worker unavailable, so retry
+    /// attempts must route around the worker that already failed the request
+    /// instead of re-selecting it until retries are exhausted.
+    #[tokio::test]
+    async fn test_sticky_retry_reroutes_around_failed_worker_without_circuit_breaker() {
+        let mut config = TestRouterConfig::manual(4104);
+        config.retry = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 50,
+            ..Default::default()
+        };
+        config.disable_circuit_breaker = true;
+
+        // Records every request the failing worker receives, including ones it
+        // fails, so the test can prove healed keys stop being routed to it.
+        let failing_recorder = RequestRecorder::new();
+        set_request_recorder(20160, failing_recorder.clone());
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::flaky(20160, 1.0), // Always fails, never marked unavailable
+                TestWorkerConfig::healthy(20161),
+            ],
+        )
+        .await;
+
+        let app = ctx.create_app();
+
+        // Fresh routing keys: with random assignment some keys land on the
+        // failing worker first. Every request must still succeed via a retry
+        // on the other worker.
+        for i in 0..16 {
+            let payload = json!({
+                "text": format!("Sticky failover test {i}"),
+                "stream": false
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .header("X-SMG-Routing-Key", format!("sticky-key-{i}"))
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "Request with routing key sticky-key-{i} should succeed via retry on the healthy worker"
+            );
+        }
+
+        // The failover must also rewrite each key's sticky assignment: repeat
+        // requests go straight to the healthy worker, without first burning an
+        // attempt (and a retry backoff) on the failed one. The recorder count
+        // freezing proves it — the response header alone only shows the final
+        // attempt's worker.
+        let attempts_on_failed_worker = failing_recorder.bodies().len();
+        assert!(
+            attempts_on_failed_worker > 0,
+            "Setup check: some routing keys should have been assigned to the failing worker first"
+        );
+
+        for i in 0..16 {
+            let payload = json!({
+                "text": format!("Sticky failover repeat {i}"),
+                "stream": false
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .header("X-SMG-Routing-Key", format!("sticky-key-{i}"))
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let routed = resp
+                .headers()
+                .get("x-smg-routed-worker-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                routed.contains(":20161"),
+                "sticky-key-{i} should be remapped to the healthy worker, got {routed}"
+            );
+        }
+
+        assert_eq!(
+            failing_recorder.bodies().len(),
+            attempts_on_failed_worker,
+            "Healed routing keys must not send any further attempts to the failed worker"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// X-SMG-Target-Worker pins a request to a worker by index. The pin must
+    /// resolve to a stable worker identity for the whole request: per-attempt
+    /// selection filtering (retry exclusion of workers that failed the request,
+    /// and availability once the worker's circuit breaker opens) used to shift
+    /// the index, silently routing pinned traffic to a worker the caller never
+    /// asked for. A pinned request fails on its worker, it is never rerouted.
+    ///
+    /// The breaker's failure_threshold (2) is below the attempt count (3), so
+    /// this covers both regimes in one run: exclusion churn within the first
+    /// request, and an open breaker for every request after it.
+    #[tokio::test]
+    async fn test_target_worker_pin_is_never_rerouted() {
+        let mut config = TestRouterConfig::consistent_hashing(4105);
+        config.retry = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 50,
+            ..Default::default()
+        };
+        config.circuit_breaker = CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_duration_secs: 60,
+            window_duration_secs: 60,
+        };
+
+        let failing_recorder = RequestRecorder::new();
+        set_request_recorder(20162, failing_recorder.clone());
+        let healthy_recorder = RequestRecorder::new();
+        set_request_recorder(20163, healthy_recorder.clone());
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::flaky(20162, 1.0), // Always fails
+                TestWorkerConfig::healthy(20163),
+            ],
+        )
+        .await;
+
+        let app = ctx.create_app();
+
+        let pinned_request = |idx: usize, text: String| {
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .header("X-SMG-Target-Worker", idx.to_string())
+                .body(Body::from(
+                    serde_json::to_string(&json!({"text": text, "stream": false})).unwrap(),
+                ))
+                .unwrap()
+        };
+
+        // Find the failing worker's index in the gateway's selection order by
+        // probing both pins; registration order is not deterministic. The
+        // failing probe burns through the breaker's failure threshold, so the
+        // failing worker's circuit is open for everything below.
+        let mut failing_index = None;
+        for idx in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(pinned_request(idx, "pin probe".to_string()))
+                .await
+                .unwrap();
+            if resp.status() != StatusCode::OK {
+                failing_index = Some(idx);
+            }
+        }
+        let failing_index = failing_index.expect("one pinned worker must be the failing one");
+        let healthy_requests_before = healthy_recorder.bodies().len();
+        let failing_requests_before = failing_recorder.bodies().len();
+
+        // Requests pinned to the failing worker must fail there, never be
+        // silently served by the healthy worker via a shifted index.
+        for i in 0..4 {
+            let resp = app
+                .clone()
+                .oneshot(pinned_request(failing_index, format!("pinned {i}")))
+                .await
+                .unwrap();
+            assert!(
+                !resp.status().is_success(),
+                "Request pinned to the failing worker must not succeed elsewhere"
+            );
+        }
+        assert_eq!(
+            healthy_recorder.bodies().len(),
+            healthy_requests_before,
+            "Pinned requests must never be rerouted to the healthy worker"
+        );
+        // Every retry attempt goes to the pinned worker, even with the breaker
+        // open (an explicit pin overrides it). Under index shifting the pinned
+        // worker got at most one attempt per request before the retry either
+        // misrouted (caught above) or went out of bounds.
+        let pinned_attempts = failing_recorder.bodies().len() - failing_requests_before;
+        assert!(
+            pinned_attempts > 4,
+            "Retries of a pinned request must stay on the pinned worker \
+             (got {pinned_attempts} attempts for 4 requests)"
         );
 
         ctx.shutdown().await;
