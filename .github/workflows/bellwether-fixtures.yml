@@ -15,16 +15,11 @@ name: Bellwether Fixtures
 # the pull request that does it runs against the new commit. bellwether keeps
 # its benchmark sets compressed, so the job unpacks the fixture tree with
 # bellwether's own command and the tests read the plain copy. A set that is
-# compressed is fetched from bellwether's LFS store by that command, which
-# needs the token in that step once such sets are pinned; today every pinned
-# set is plain.
+# compressed is fetched from bellwether's LFS store by that command.
 #
-# bellwether is private, so the checkout needs the BELLWETHER_READ_TOKEN secret
-# (read access to that repository's contents). A pull request from a fork, or
-# one Dependabot opened, is not given the repository's secrets: the job says so
-# and passes without running the tests, and the push to main after the merge
-# runs them. Any other run without the token fails, so a secret that is
-# missing or has expired cannot pass for tests that ran.
+# bellwether is public, so the checkout and the LFS fetch need no token, and
+# the job runs the same way for every pull request, forks and Dependabot
+# included.
 on:
   push:
     branches: [ main ]
@@ -86,16 +81,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # A secret cannot be read in an `if:`, so this step turns "is the token
-      # there" into an output the later steps test.
       - name: Read the pinned bellwether commit
         id: pin
-        env:
-          BELLWETHER_READ_TOKEN: ${{ secrets.BELLWETHER_READ_TOKEN }}
-          GIVEN_NO_SECRETS: >-
-            ${{ github.event_name == 'pull_request'
-                && (github.event.pull_request.head.repo.full_name != github.repository
-                    || github.event.pull_request.user.login == 'dependabot[bot]') }}
         run: |
           ref="$(tr -d '[:space:]' < .github/versions/bellwether.ref)"
           if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
@@ -103,23 +90,12 @@ jobs:
             exit 1
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          if [ -n "$BELLWETHER_READ_TOKEN" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          elif [ "$GIVEN_NO_SECRETS" = "true" ]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::A pull request from a fork or from Dependabot is not given BELLWETHER_READ_TOKEN, so the bellwether tests did not run here. The push to main runs them."
-          else
-            echo "::error::BELLWETHER_READ_TOKEN is not set, so the bellwether tests cannot run. Add it as a repository secret with read access to smg-project/bellwether's contents."
-            exit 1
-          fi
 
       - name: Check out bellwether
-        if: steps.pin.outputs.available == 'true'
         uses: actions/checkout@v7
         with:
           repository: smg-project/bellwether
           ref: ${{ steps.pin.outputs.ref }}
-          token: ${{ secrets.BELLWETHER_READ_TOKEN }}
           path: .bellwether
           persist-credentials: false
 
@@ -129,20 +105,17 @@ jobs:
       # commit, and fails if its lock file is out of date, instead of
       # resolving anew against PyPI.
       - name: Install uv
-        if: steps.pin.outputs.available == 'true'
         uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           cache-dependency-glob: .bellwether/uv.lock
 
       - name: Unpack the fixtures
-        if: steps.pin.outputs.available == 'true'
         run: uv run --locked --project .bellwether bellwether unpack --fixtures .bellwether/fixtures --out .bellwether/fixtures-plain
 
       # This job builds three test targets and nothing else, so it keeps its
       # own cache entry instead of racing the full builds for theirs.
       - name: Setup Rust
-        if: steps.pin.outputs.available == 'true'
         uses: ./.github/actions/setup-rust
         with:
           cache-key: bellwether-fixtures
@@ -155,7 +128,6 @@ jobs:
       # and a test that asks for one more file gets a new entry that starts
       # from the old one.
       - name: Cache tokenizer files
-        if: steps.pin.outputs.available == 'true'
         uses: actions/cache@v6
         with:
           path: |
@@ -170,7 +142,6 @@ jobs:
       # enables), and the pattern takes in every test file named bellwether_*
       # in these crates.
       - name: Run the tests that read bellwether
-        if: steps.pin.outputs.available == 'true'
         timeout-minutes: 45
         env:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
@@ -179,5 +150,5 @@ jobs:
           cargo test -p llm-tokenizer -p smg -p smg-symphony --test 'bellwether_*' -- --nocapture
 
       - name: Show sccache stats
-        if: always() && steps.pin.outputs.available == 'true'
+        if: always()
         run: sccache --show-stats
