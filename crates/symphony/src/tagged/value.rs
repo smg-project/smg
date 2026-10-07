@@ -229,6 +229,7 @@ fn python_literal(text: &str) -> Option<String> {
         text,
         at: 0,
         out: String::with_capacity(text.len()),
+        depth: 0,
     };
     reader.value()?;
     reader.skip_space();
@@ -241,7 +242,13 @@ struct Literal<'a> {
     text: &'a str,
     at: usize,
     out: String,
+    /// Containers open around the value being read; past [`DEEPEST`] the literal is refused.
+    depth: usize,
 }
+
+/// The deepest nesting the reader follows: `serde_json`'s own limit, which the result has to pass
+/// anyway. The text is the model's, so a run of ten thousand `[` must not run the stack out.
+const DEEPEST: usize = 128;
 
 impl Literal<'_> {
     fn skip_space(&mut self) {
@@ -281,9 +288,19 @@ impl Literal<'_> {
         }
         match *self.bytes.get(self.at)? {
             b'\'' | b'"' => self.string(),
-            b'[' => self.sequence(b'[', b']'),
-            b'(' => self.sequence(b'(', b')'),
-            b'{' => self.dict(),
+            b'[' | b'(' | b'{' => {
+                if self.depth >= DEEPEST {
+                    return None;
+                }
+                self.depth += 1;
+                let read = match self.bytes[self.at] {
+                    b'[' => self.sequence(b'[', b']'),
+                    b'(' => self.sequence(b'(', b')'),
+                    _ => self.dict(),
+                };
+                self.depth -= 1;
+                read
+            }
             b'-' | b'0'..=b'9' => self.number(),
             _ => None,
         }
@@ -342,7 +359,15 @@ impl Literal<'_> {
                     value.push(char::from_u32(code)?);
                     self.at += digits;
                 }
-                other => value.push(other),
+                '\\' | '\'' | '"' => value.push(escaped),
+                // A backslash before a newline is a continuation Python drops.
+                '\n' => {}
+                // Python keeps the backslash on an escape it does not have: `'\d+'` is three
+                // characters.
+                other => {
+                    value.push('\\');
+                    value.push(other);
+                }
             }
         }
         self.out.push_str(&string(&value));
@@ -870,6 +895,35 @@ mod tests {
         ] {
             assert_eq!(json(text, None), expected, "{text:?}");
         }
+    }
+
+    #[test]
+    fn nesting_past_serde_jsons_depth_is_a_string_and_never_runs_the_stack_out() {
+        // A model can write any number of brackets; the reader stops where serde_json would.
+        for text in [
+            "[".repeat(100_000),
+            "{'a': ".repeat(50_000),
+            "(".repeat(200) + &")".repeat(200),
+        ] {
+            assert_eq!(json(&text, None), string(&text), "{} bytes", text.len());
+        }
+        // Well inside the limit, a literal still reads (serde_json counts the arguments object
+        // around the value too, so the reader's limit is reached a little before it).
+        let nested = "[".repeat(64) + &"]".repeat(64);
+        assert_eq!(json(&nested, None), nested);
+    }
+
+    #[test]
+    fn an_escape_python_does_not_have_keeps_its_backslash() {
+        let written = json(
+            r"{'pattern': '\d+', 'path': 'C:\path', 'cut': 'a\
+b'}",
+            None,
+        );
+        let read: Value = serde_json::from_str(&written).expect("an object");
+        assert_eq!(read["pattern"], "\\d+");
+        assert_eq!(read["path"], "C:\\path");
+        assert_eq!(read["cut"], "ab");
     }
 
     #[test]

@@ -305,7 +305,10 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
 /// The turn opener a model's own chat template writes, for a model that reads another family's
 /// table: the opener is the template's, not the table's, so the prompt's replay has to start at
 /// the model's own. K-EXAONE writes Qwen3's markers under its own template, Granite 4.1 Qwen2.5's;
-/// every other recorded model renders `<|im_start|>assistant` or its own table's opener.
+/// every other recorded model renders `<|im_start|>assistant` or its own table's opener. The
+/// replay below feeds only the generation prompt's tail, so it does not check these spellings:
+/// they were measured against the templates' rendered prompts (smg #2841, Alex's probes), and
+/// `formats/qwen3.rs` holds the K-EXAONE shape as a test.
 const OPENERS: &[(&str, &str)] = &[
     ("k-exaone-236b-a23b", "<|assistant|>"),
     (
