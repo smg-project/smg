@@ -40,7 +40,7 @@ pub use embed::translate_embed_request;
 pub use engine_zmq_client::protocol::vllm::pooling::{PoolerDefaults, PoolingParams};
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sglang::{to_sglang_response, SglangGenerateStream, SglangProfileStart};
-pub use sockets::zmq_handshake_address;
+pub use sockets::{zmq_handshake_address, Handshake};
 pub use stream::ZmqGenerateStream;
 pub use tokenspeed::{to_tokenspeed_response, TokenSpeedGenerateStream};
 pub use vllm::{

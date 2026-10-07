@@ -33,6 +33,22 @@ pub fn normalize_grpc_endpoint(endpoint: &str) -> String {
 /// Matches the upstream HTTP client's connect timeout in `AppContext`.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// HTTP/2 keepalive: a ping every 30 seconds, answered within 10. The
+/// interval is bounded from below by the engines' gRPC servers, not by how
+/// fast a dead peer should be noticed: a grpc-core server (vLLM's and
+/// SGLang's native gRPC servers) answers a ping that arrives within its
+/// `min_ping_interval_without_data` (five minutes by default) of the previous
+/// one with a strike, and the second strike is a GOAWAY "too_many_pings"
+/// that fails every in-flight stream with `UNAVAILABLE`. A ping every second
+/// did exactly that whenever a prefill batch left the connection without
+/// data for two seconds. A peer that drops its connection still fails its
+/// streams at once; one that falls silent is noticed at the keepalive
+/// timeout or at the next poll's deadline, whichever comes first, and the
+/// gateway's liveness veto turns the failure into exclusion from routing.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
 /// Connect a `tonic::Channel` to the given endpoint with the SMG-standard
 /// keep-alive and HTTP/2 window profile applied, using
 /// [`DEFAULT_CONNECT_TIMEOUT`].
@@ -68,10 +84,10 @@ fn configured_endpoint(
     let http_endpoint = normalize_grpc_endpoint(endpoint);
     Ok(Endpoint::from_shared(http_endpoint)?
         .connect_timeout(connect_timeout)
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
         .keep_alive_while_idle(true)
-        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .tcp_keepalive(Some(TCP_KEEPALIVE))
         .tcp_nodelay(true)
         .http2_adaptive_window(false)
         // 16MB stream window, 32MB connection window — sized for the

@@ -34,7 +34,8 @@ use crate::{
         SglangProfileStart,
     },
     sockets::{
-        ensure_ipc_socket_dir, unlink_stale_socket, zmq_socket_addresses, ZMQ_CONNECT_TIMEOUT,
+        ensure_ipc_socket_dir, unlink_stale_socket, zmq_socket_addresses, Handshake,
+        ZMQ_CONNECT_TIMEOUT,
     },
     stream::ZmqGenerateStream,
     tokenspeed::{
@@ -145,7 +146,7 @@ pub async fn connect_for_worker(
         base_url,
         model_id,
         runtime,
-        handshake_override,
+        Handshake::registered(handshake_override),
         engine_count,
         eos,
         ZMQ_CONNECT_TIMEOUT,
@@ -159,17 +160,20 @@ pub async fn connect_for_worker(
 /// the engine's own config (the Rust gRPC servicer) and has no model dir to
 /// read them from. `startup_timeout` bounds the handshake: the gateway's
 /// connector passes [`ZMQ_CONNECT_TIMEOUT`]; a servicer that launches its own
-/// engine passes what that engine's start may take.
+/// engine passes what that engine's start may take. `handshake` is the
+/// endpoint the engine dials: a registered worker's is tcp-only
+/// ([`Handshake::registered`]); a servicer's own link may bind an `ipc://`
+/// socket ([`Handshake::TcpOrIpc`]).
 pub async fn connect_with_eos(
     base_url: &str,
     model_id: String,
     runtime: RuntimeType,
-    handshake_override: Option<&str>,
+    handshake: Handshake<'_>,
     engine_count: usize,
     eos: EosTokenIds,
     startup_timeout: Duration,
 ) -> Result<ZmqEngineClient, String> {
-    let (handshake, input, output) = zmq_socket_addresses(base_url, handshake_override)?;
+    let (handshake, input, output) = zmq_socket_addresses(base_url, handshake)?;
     ensure_ipc_socket_dir(base_url).await?;
     // ZMQ refuses to bind over an existing ipc socket file, so leftovers from
     // a dead gateway would fail every reconnect with a bare transport error.

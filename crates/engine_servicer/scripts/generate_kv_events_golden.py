@@ -1,6 +1,6 @@
 """Golden msgpack bytes for the Rust KV-event relay tests.
 
-Regenerates the hex payloads in `crates/engine_servicer/src/vllm/kv_events.rs`
+Regenerates the hex payloads in `crates/engine_servicer/src/kv_events.rs`
 (`golden` module) from vLLM's own `KVEventBatch` encoder, and prints the
 Python relay's conversion of them, which the tests expect byte for byte.
 Run it whenever vLLM changes the event layout, with a Python that has vllm,

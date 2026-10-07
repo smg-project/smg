@@ -51,6 +51,8 @@ class KindGateway:
                 "127.0.0.1",
                 "--port",
                 str(SMG_PORT),
+                # The legacy spelling; in_cluster.yaml uses the tagged
+                # --discovery-provider kubernetes, so a run covers both.
                 "--service-discovery",
                 "--selector",
                 "app=smg-kind-e2e",

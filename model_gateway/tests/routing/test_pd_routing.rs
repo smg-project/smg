@@ -173,6 +173,8 @@ mod pd_routing_unit_tests {
                     cache_index: Default::default(),
                     cache_ttl_secs: 180,
                     cache_boundaries: Vec::new(),
+                    selection_policy: None,
+                    selection_accounting_ttl_ms: 0,
                 },
             ),
             (

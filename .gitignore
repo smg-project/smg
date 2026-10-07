@@ -116,6 +116,8 @@ work_dirs/
 
 # Rust target directory
 target/
+# Older builds of the kv-index churn bench wrote this into the crate directory under cargo test
+churn_result.json
 
 # VSCode
 .vscode

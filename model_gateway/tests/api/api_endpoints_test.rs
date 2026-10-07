@@ -1487,11 +1487,9 @@ mod cache_tests {
                 .map(|entry| entry["worker"].as_str().expect("worker"))
                 .collect();
             reporters.sort_unstable();
-            assert_eq!(
-                reporters,
-                vec!["http://127.0.0.1:18502", "http://127.0.0.1:18503"],
-                "{uri}"
-            );
+            let mut expected: Vec<&str> = ctx.worker_urls.iter().map(String::as_str).collect();
+            expected.sort_unstable();
+            assert_eq!(reporters, expected, "{uri}");
             for entry in loads {
                 assert_eq!(entry["worker_type"], "regular", "{uri}");
                 assert_eq!(entry["num_running_reqs"], 2, "{uri}");

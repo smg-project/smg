@@ -633,6 +633,8 @@ async fn execute_single(
         proto_request.set_data_parallel_rank(rank as i32);
     }
 
+    let prompt_tokens = u64::try_from(proto_request.prompt_len()).unwrap_or(u64::MAX);
+    let streaming = proto_request.stream();
     let result = client.generate(proto_request).await;
     workers.record_outcome(result.cb_status_code());
 
@@ -644,6 +646,17 @@ async fn execute_single(
             "start_generation_failed",
         )
     })?;
+    // Every generation to one worker is tracked: each response on it is
+    // progress for the worker (liveness), the one answer of a non-streaming
+    // generation included, and its prompt is pending prefill there until the
+    // first response. Only a streaming generation joins the worker's pile: a
+    // non-streaming one shows nothing between dispatch and completion, and
+    // the pile rule never judges a worker by requests it cannot see progress
+    // on.
+    let stream = match workers.single() {
+        Some(worker) => stream.tracked(Arc::clone(worker), prompt_tokens, streaming),
+        None => stream,
+    };
 
     Ok(ExecutionResult::Single { stream })
 }
@@ -1131,10 +1144,10 @@ async fn execute_sequential_pd(
     // on the decode read).
     //
     // A decode worker started with `--language-model-only` (the production
-    // vLLM P/D shape — Dynamo pairs the same way) has no vision encoder and
+    // vLLM P/D shape) has no vision encoder and
     // an encoder-cache budget of 0, so even the identity payload fails to
     // schedule there. Its model info reports supports_vision=false; for such
-    // a worker the decode leg is stripped down to the Dynamo contract: the
+    // a worker the decode leg is stripped down to what such an engine takes: the
     // prefill-expanded input_ids, the KV handoff, and the per-image content
     // hashes that the servicer folds into cache_salt so different images
     // cannot alias in the decode prefix cache.

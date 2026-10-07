@@ -10,6 +10,9 @@ pub mod expected_wait;
 pub mod hash_ring;
 pub mod http_client;
 pub mod kv_event_monitor;
+mod kv_event_recovery;
+pub mod kv_index_backend;
+pub(crate) mod liveness;
 pub(crate) mod load_state;
 pub mod manager;
 pub mod metrics_aggregator;
@@ -42,6 +45,7 @@ pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
 pub use kv_event_monitor::KvEventMonitor;
+pub use kv_index_backend::{KvIndex, WorkerBlocks};
 pub use manager::WorkerManager;
 pub use monitor::{WorkerLoadManager, WorkerMonitor};
 // Re-export UNKNOWN_MODEL_ID from protocols
@@ -66,7 +70,7 @@ pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
 pub use service::WorkerService;
 pub(crate) use worker::ConnectionModeExt;
 pub use worker::{
-    AttachedBody, BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType,
-    DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
-    NIXL_CONNECTOR,
+    AttachedBody, BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker,
+    WorkerLoadGuard, WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR,
+    MORIIO_MODE_LABEL, NIXL_CONNECTOR,
 };

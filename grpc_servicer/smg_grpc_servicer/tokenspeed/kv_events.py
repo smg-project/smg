@@ -24,10 +24,13 @@ _DEFAULT_TOPIC = ""
 
 @dataclass(frozen=True)
 class ResolvedKvEventsConfig:
-    """The subset of KVEventsConfig the bridge needs to open a SUB socket."""
+    """The subset of KVEventsConfig the bridge needs to open a SUB socket, and
+    the replay ROUTER endpoint (empty when the publisher runs none) the relay
+    asks for gaps and for the batches published before its subscription joined."""
 
     endpoint: str
     topic: str
+    replay_endpoint: str = ""
 
 
 def resolve_kv_events_config(server_args: object) -> ResolvedKvEventsConfig | None:
@@ -79,5 +82,16 @@ def resolve_kv_events_config(server_args: object) -> ResolvedKvEventsConfig | No
             topic,
         )
         return None
-    logger.info("TokenSpeed KV events enabled: endpoint=%s", endpoint)
-    return ResolvedKvEventsConfig(endpoint=endpoint, topic=topic)
+    replay_endpoint = cfg.get("replay_endpoint") or ""
+    if not isinstance(replay_endpoint, str):
+        logger.warning(
+            "TokenSpeed kv-events replay_endpoint must be a string (got %r); replay disabled",
+            replay_endpoint,
+        )
+        replay_endpoint = ""
+    logger.info(
+        "TokenSpeed KV events enabled: endpoint=%s replay_endpoint=%s",
+        endpoint,
+        replay_endpoint or "(none)",
+    )
+    return ResolvedKvEventsConfig(endpoint=endpoint, topic=topic, replay_endpoint=replay_endpoint)

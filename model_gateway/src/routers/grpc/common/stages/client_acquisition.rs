@@ -27,10 +27,12 @@ use crate::{
 pub(crate) async fn acquire_clients(
     workers: &WorkerSelection,
     model_id: &str,
+    shed: bool,
 ) -> Result<ClientSelection, Response> {
     match workers {
         WorkerSelection::Single { worker } => {
-            if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+            if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id, shed)
+            {
                 return Err(shed);
             }
             let client = get_backend_client_from_worker(worker).await?;
@@ -46,13 +48,20 @@ pub(crate) async fn acquire_clients(
             // vetoed at selection through the same filter, so leaving it out
             // of the re-check would be the one dispatch path that can send
             // to a worker known to be over the ceiling.
-            if let Some(shed) = overload::shed_if_worker_overloaded(prefill.as_ref(), model_id)
-                .or_else(|| overload::shed_if_worker_overloaded(decode.as_ref(), model_id))
-                .or_else(|| {
-                    encode_assignments.iter().flatten().find_map(|assignment| {
-                        overload::shed_if_worker_overloaded(assignment.worker.as_ref(), model_id)
+            if let Some(shed) =
+                overload::shed_if_worker_overloaded(prefill.as_ref(), model_id, shed)
+                    .or_else(|| {
+                        overload::shed_if_worker_overloaded(decode.as_ref(), model_id, shed)
                     })
-                })
+                    .or_else(|| {
+                        encode_assignments.iter().flatten().find_map(|assignment| {
+                            overload::shed_if_worker_overloaded(
+                                assignment.worker.as_ref(),
+                                model_id,
+                                shed,
+                            )
+                        })
+                    })
             {
                 return Err(shed);
             }

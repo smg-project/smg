@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
     HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
@@ -12,7 +15,10 @@ use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{
+        overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+        ConnectionMode, RuntimeType,
+    },
 };
 
 /// Main router configuration
@@ -96,6 +102,42 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// Seconds without any contact from a worker (a load poll, a health probe,
+    /// a KV event, a response) after which a transport failure excludes it
+    /// from routing; the first successful contact re-admits it.
+    #[serde(default = "default_worker_stall_secs")]
+    pub worker_stall_secs: u64,
+    /// Seconds without a token or a completion from a worker that still
+    /// answers polls, with requests in flight and a growing queue, after which
+    /// new requests stop being routed to it until it makes progress.
+    #[serde(default = "default_worker_wedge_secs")]
+    pub worker_wedge_secs: u64,
+    /// Warm-up slice for cache-aware routing: for this many seconds after a
+    /// worker becomes routable, until its index has grown by
+    /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
+    #[serde(default = "default_worker_warmup_secs")]
+    pub worker_warmup_secs: u64,
+    #[serde(default = "default_worker_warmup_share")]
+    pub worker_warmup_share: f32,
+    #[serde(default = "default_worker_warmup_blocks")]
+    pub worker_warmup_blocks: usize,
+    /// A worker whose index holds less than this share of the fleet's level
+    /// (the median over healthy workers), or nothing, is thin and receives
+    /// the warm-up slice until it has grown by `worker_warmup_blocks`,
+    /// whatever emptied it (a resync after a publisher restart, an
+    /// out-of-range or data-loss resubscription, an engine that came back
+    /// empty). 0 keeps the age rule alone.
+    #[serde(default = "default_worker_warmup_thin_ratio")]
+    pub worker_warmup_thin_ratio: f32,
+    /// One cache hit in this many is diverted to a thin worker although
+    /// another worker holds its prefix, so an index emptied by a resync
+    /// refills on a workload where every request has a holder; shallow
+    /// overlaps first, never while the thin worker has a request in flight
+    /// (unless its last diversion is older than two seconds), until its
+    /// index crosses `worker_warmup_thin_ratio` of the fleet's level. 0
+    /// disables.
+    #[serde(default = "default_worker_warmup_divert_every")]
+    pub worker_warmup_divert_every: u64,
     /// How long a disaggregated (PD) dispatch waits for a slot in the decode
     /// engine's running window before shedding. Must stay well under the
     /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
@@ -111,28 +153,34 @@ pub struct RouterConfig {
     /// always fed regardless of this flag.
     #[serde(default)]
     pub disable_load_monitoring: bool,
-    /// Enable absolute worker overload protection with the gateway default of
-    /// `worker_overload_token_usage = 0.9` (KV token usage is engine-universal;
-    /// a waiting-requests default would be workload-dependent, so that signal
-    /// stays unset). Redundant when either explicit threshold below is set —
-    /// those enable protection on their own, exactly as before this flag.
-    #[serde(default)]
+    /// Absolute worker overload protection, on by default. A worker whose load
+    /// report is at or above either threshold below is left out of routing
+    /// while another worker is under them; when every worker is over them the
+    /// request goes to the least-loaded one (see `worker_overload_shed` for
+    /// refusing instead). Evaluated once per ingested load report, never per
+    /// request. `false` switches both gateway thresholds off; per-worker
+    /// `overload` blocks on a WorkerSpec still apply.
+    #[serde(default = "default_worker_overload_protection")]
     pub worker_overload_protection: bool,
-    /// Queued-request count at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when all
-    /// workers are overloaded, requests are shed immediately rather than
-    /// queued. Evaluated once per ingested load report, never per request.
-    /// `None` (default) disables this signal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Queued (waiting) requests, summed across DP ranks, at or above which a
+    /// worker counts as overloaded. Default 8; `null` switches this signal off.
+    #[serde(default = "default_worker_overload_waiting_requests")]
     pub worker_overload_waiting_requests: Option<usize>,
     /// KV-cache token usage (0.0-1.0, averaged across DP ranks) at or above
-    /// which a worker is considered overloaded — the same signal
+    /// which a worker counts as overloaded — the same signal
     /// `balance_token_usage_threshold` reads, applied as an absolute per-worker
-    /// ceiling instead of a fleet-relative spread. `None` (default) disables
-    /// this signal; with both signals unset, overload protection is off and
-    /// routing behaves exactly as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// ceiling instead of a fleet-relative spread. Default 0.8; `null`
+    /// switches this signal off.
+    #[serde(default = "default_worker_overload_token_usage")]
     pub worker_overload_token_usage: Option<f64>,
+    /// Refuse a request with a 503 (`worker_overload_protection_shed`,
+    /// Retry-After the poll interval) when every worker it could use is
+    /// overloaded, instead of steering it to the least-loaded one. Off by
+    /// default: a fleet that is uniformly over the thresholds is still a
+    /// fleet, and the dispatch-time re-check that sheds a worker flagged
+    /// between selection and dispatch is part of the same opt-in.
+    #[serde(default)]
+    pub worker_overload_shed: bool,
     /// TTL in seconds for entries in the event-driven cache-aware positional
     /// indexer: entries neither stored to nor read by a query within this
     /// window are evicted by a periodic background prune. Bounds index growth
@@ -145,9 +193,16 @@ pub struct RouterConfig {
     /// to 90% of the ceiling. `None`/`0` disables the ceiling (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_indexer_max_entries: Option<usize>,
+    /// Which event-driven KV index cache-aware routing reads: the positional
+    /// indexer (default) or the chain index. The prune bounds above
+    /// apply to the positional indexer only.
+    #[serde(default)]
+    pub kv_index: KvIndexKind,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
     /// load-aware routing policy is active. Successful routing-owned polls are
-    /// always re-exported without an additional Engine RPC.
+    /// always re-exported without an additional Engine RPC. A worker whose
+    /// KV-event stream pushes its load feeds the gauges from those records
+    /// and is not polled while they flow; the poll is its fallback.
     #[serde(default)]
     pub engine_metrics: bool,
     /// Global multimodal tensor transport mode (`inline` | `shm` | `auto` | `rdma`).
@@ -205,6 +260,7 @@ pub struct RouterConfig {
     /// `api_key` rather than replacing it.
     #[serde(default)]
     pub tenant_api_keys: Vec<TenantApiKeyEntry>,
+    #[serde(default, deserialize_with = "deserialize_discovery")]
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
@@ -392,6 +448,55 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_worker_overload_protection() -> bool {
+    true
+}
+
+// A serde default returns the field's type, `Option` included.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default for an optional field"
+)]
+fn default_worker_overload_waiting_requests() -> Option<usize> {
+    Some(DEFAULT_WAITING_REQUESTS)
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default for an optional field"
+)]
+fn default_worker_overload_token_usage() -> Option<f64> {
+    Some(DEFAULT_TOKEN_USAGE_CEILING)
+}
+
+fn default_worker_stall_secs() -> u64 {
+    2
+}
+
+fn default_worker_wedge_secs() -> u64 {
+    3
+}
+
+fn default_worker_warmup_secs() -> u64 {
+    60
+}
+
+fn default_worker_warmup_share() -> f32 {
+    0.25
+}
+
+fn default_worker_warmup_blocks() -> usize {
+    1024
+}
+
+fn default_worker_warmup_thin_ratio() -> f32 {
+    0.5
+}
+
+fn default_worker_warmup_divert_every() -> u64 {
+    8
 }
 
 fn default_pd_admission_wait_secs() -> u64 {
@@ -689,6 +794,55 @@ impl Default for RoutingKeyOverrideConfig {
     }
 }
 
+/// The event-driven KV index behind cache-aware routing (`--kv-index`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvIndexKind {
+    /// The positional indexer: one entry per `(position, content hash)`,
+    /// probed per block of a request (default).
+    #[default]
+    Positional,
+    /// The chain index: chains stored as runs with per-run worker coverage;
+    /// lock-free, store-free lookups, memory proportional to the blocks the
+    /// engines report. `run`, its name before 2026-10-06, is accepted as a
+    /// deprecated alias until the positional indexer is removed.
+    #[serde(alias = "run")]
+    Chain,
+}
+
+/// Whether the deprecated `run` spelling of the chain index was given on the
+/// command line; read once at startup to log the deprecation.
+static DEPRECATED_KV_INDEX_ALIAS: AtomicBool = AtomicBool::new(false);
+
+impl KvIndexKind {
+    /// Parse from a case-insensitive string (`positional` | `chain`, with
+    /// `run` as the deprecated spelling of `chain`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "positional" => Some(Self::Positional),
+            "chain" => Some(Self::Chain),
+            "run" => {
+                DEPRECATED_KV_INDEX_ALIAS.store(true, Ordering::Relaxed);
+                Some(Self::Chain)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `parse` was given the deprecated `run` spelling.
+    pub fn deprecated_alias_used() -> bool {
+        DEPRECATED_KV_INDEX_ALIAS.load(Ordering::Relaxed)
+    }
+
+    /// Canonical lowercase name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Positional => "positional",
+            Self::Chain => "chain",
+        }
+    }
+}
+
 /// Under-layer index the cache_aware policy keeps per model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -766,6 +920,15 @@ pub enum PolicyConfig {
         /// shared `cache_boundaries` config).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cache_boundaries: Vec<usize>,
+        /// Worker selection policy run over the gathered per-worker inputs
+        /// (`cache-aware-default`). Unset is the cache-aware default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection_policy: Option<String>,
+        /// Lifetime in milliseconds of optimistic dispatch bookings
+        /// (predicted prefill and prefix placement charged to the chosen
+        /// worker before the engine reports it). `0` disables.
+        #[serde(default)]
+        selection_accounting_ttl_ms: u64,
     },
 
     /// Power-of-two choices policy: samples two workers and routes to the one
@@ -966,10 +1129,78 @@ impl PolicyConfig {
     }
 }
 
-/// Service discovery configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveryConfig {
-    pub enabled: bool,
+/// Worker discovery: the one provider that finds this router's workers, and
+/// that provider's settings. Presence means discovery is on; there is no
+/// `enabled` flag.
+///
+/// Serialized as a `provider` tag beside the provider's own flat fields:
+///
+/// ```yaml
+/// discovery:
+///   provider: kubernetes
+///   selector: { app: sglang }
+///   port: 8000
+/// ```
+///
+/// [`RouterConfig::discovery`] also reads the flat Kubernetes object that
+/// predates the tag; see [`deserialize_discovery`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum DiscoveryConfig {
+    Kubernetes(KubernetesDiscoveryConfig),
+}
+
+impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
+    fn from(config: KubernetesDiscoveryConfig) -> Self {
+        Self::Kubernetes(config)
+    }
+}
+
+/// Deserialize [`RouterConfig::discovery`] from either shape it has had.
+///
+/// The flat Kubernetes object that predates the `provider` tag has no tag and
+/// carries an `enabled` flag. A missing tag means Kubernetes, the only
+/// provider that object could describe. `enabled: false` becomes `None` here,
+/// at deserialization, because canonical output has no `enabled` to carry the
+/// `false`: a disabled config that is read and written back must stay
+/// disabled.
+///
+/// Fields are read only after the object is buffered to find its tag, so a
+/// YAML scalar keeps the type YAML gave it: a label value that looks like a
+/// number or boolean must be quoted (`version: "1"`), as in a Kubernetes
+/// manifest. The flat struct once read such values as strings.
+///
+/// Public so every input surface — the Python binding's `discovery` mapping
+/// included — reads discovery by the same rules.
+pub fn deserialize_discovery<'de, D>(deserializer: D) -> Result<Option<DiscoveryConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(mut value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let Some(fields) = value.as_object_mut() {
+        match fields.remove("enabled") {
+            None | Some(serde_json::Value::Bool(true)) => {}
+            Some(serde_json::Value::Bool(false)) => return Ok(None),
+            Some(other) => {
+                return Err(de::Error::custom(format!(
+                    "discovery.enabled must be a boolean, got {other}"
+                )));
+            }
+        }
+        fields
+            .entry("provider")
+            .or_insert_with(|| serde_json::Value::from("kubernetes"));
+    }
+    DiscoveryConfig::deserialize(value)
+        .map(Some)
+        .map_err(de::Error::custom)
+}
+
+/// Kubernetes worker discovery: Pods matching a selector become workers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KubernetesDiscoveryConfig {
     /// None = all namespaces
     pub namespace: Option<String>,
     pub port: u16,
@@ -1019,10 +1250,9 @@ fn default_kv_engine_id_annotation() -> String {
     "smg.ai/kv-engine-id".to_string()
 }
 
-impl Default for DiscoveryConfig {
+impl Default for KubernetesDiscoveryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             namespace: None,
             port: 8000,
             check_interval_secs: 120,
@@ -1187,13 +1417,22 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            worker_stall_secs: default_worker_stall_secs(),
+            worker_wedge_secs: default_worker_wedge_secs(),
+            worker_warmup_secs: default_worker_warmup_secs(),
+            worker_warmup_share: default_worker_warmup_share(),
+            worker_warmup_blocks: default_worker_warmup_blocks(),
+            worker_warmup_thin_ratio: default_worker_warmup_thin_ratio(),
+            worker_warmup_divert_every: default_worker_warmup_divert_every(),
             pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
-            worker_overload_protection: false,
-            worker_overload_waiting_requests: None,
-            worker_overload_token_usage: None,
+            worker_overload_protection: default_worker_overload_protection(),
+            worker_overload_waiting_requests: default_worker_overload_waiting_requests(),
+            worker_overload_token_usage: default_worker_overload_token_usage(),
+            worker_overload_shed: false,
             kv_indexer_ttl_secs: None,
             kv_indexer_max_entries: None,
+            kv_index: KvIndexKind::default(),
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
@@ -1295,7 +1534,7 @@ impl RouterConfig {
 
     /// Check if service discovery is enabled
     pub fn has_service_discovery(&self) -> bool {
-        self.discovery.as_ref().is_some_and(|d| d.enabled)
+        self.discovery.is_some()
     }
 
     /// Check if metrics are enabled
@@ -1423,6 +1662,44 @@ mod tests {
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
+    }
+
+    /// A switched-off overload signal (`null`) must come back off from a
+    /// serialize/deserialize round-trip. The field's default is `Some`, so
+    /// skipping `None` on serialize would hand the default back on
+    /// deserialize and turn the signal on again.
+    #[test]
+    fn disabled_overload_signals_survive_a_serde_round_trip() {
+        let config = RouterConfig {
+            worker_overload_waiting_requests: None,
+            worker_overload_token_usage: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            value["worker_overload_waiting_requests"].is_null(),
+            "a disabled signal is written as null, not left out"
+        );
+        assert!(value["worker_overload_token_usage"].is_null());
+
+        let back: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.worker_overload_waiting_requests, None);
+        assert_eq!(back.worker_overload_token_usage, None);
+
+        // A document that does not mention the signals still gets the defaults.
+        let mut without = value;
+        without
+            .as_object_mut()
+            .unwrap()
+            .remove("worker_overload_waiting_requests");
+        without
+            .as_object_mut()
+            .unwrap()
+            .remove("worker_overload_token_usage");
+        let defaulted: RouterConfig = serde_json::from_value(without).unwrap();
+        assert_eq!(defaulted.worker_overload_waiting_requests, Some(8));
+        assert_eq!(defaulted.worker_overload_token_usage, Some(0.8));
     }
 
     #[test]
@@ -1815,6 +2092,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1844,6 +2123,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1874,6 +2155,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         };
 
         match cache_aware {
@@ -2040,9 +2323,8 @@ mod tests {
 
     #[test]
     fn test_discovery_config_default() {
-        let config = DiscoveryConfig::default();
+        let config = KubernetesDiscoveryConfig::default();
 
-        assert!(!config.enabled);
         assert!(config.namespace.is_none());
         assert_eq!(config.port, 8000);
         assert_eq!(config.check_interval_secs, 120);
@@ -2061,8 +2343,7 @@ mod tests {
         selector.insert("app".to_string(), "sglang".to_string());
         selector.insert("role".to_string(), "worker".to_string());
 
-        let config = DiscoveryConfig {
-            enabled: true,
+        let config = KubernetesDiscoveryConfig {
             namespace: Some("default".to_string()),
             port: 9000,
             check_interval_secs: 30,
@@ -2079,7 +2360,6 @@ mod tests {
             model_id_source: None,
         };
 
-        assert!(config.enabled);
         assert_eq!(config.namespace, Some("default".to_string()));
         assert_eq!(config.port, 9000);
         assert_eq!(config.selector.len(), 2);
@@ -2088,17 +2368,145 @@ mod tests {
 
     #[test]
     fn test_discovery_config_namespace() {
-        let config = DiscoveryConfig {
+        let config = KubernetesDiscoveryConfig {
             namespace: None,
             ..Default::default()
         };
         assert!(config.namespace.is_none());
 
-        let config = DiscoveryConfig {
+        let config = KubernetesDiscoveryConfig {
             namespace: Some("production".to_string()),
             ..Default::default()
         };
         assert_eq!(config.namespace, Some("production".to_string()));
+    }
+
+    /// `discovery` as `RouterConfig` reads it, from a JSON object.
+    fn read_discovery(discovery: serde_json::Value) -> Option<DiscoveryConfig> {
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        config["discovery"] = discovery;
+        serde_json::from_value::<RouterConfig>(config)
+            .unwrap()
+            .discovery
+    }
+
+    /// The fields the discovery object has always required.
+    fn kubernetes_fields() -> serde_json::Value {
+        serde_json::json!({
+            "namespace": "prod",
+            "port": 8000,
+            "check_interval_secs": 60,
+            "selector": { "app": "sglang" },
+            "prefill_selector": {},
+            "decode_selector": {},
+            "bootstrap_port_annotation": "sglang.ai/bootstrap-port",
+        })
+    }
+
+    fn with(mut base: serde_json::Value, key: &str, value: serde_json::Value) -> serde_json::Value {
+        base[key] = value;
+        base
+    }
+
+    #[test]
+    fn legacy_flat_discovery_reads_as_kubernetes() {
+        let legacy = with(kubernetes_fields(), "enabled", true.into());
+        let Some(DiscoveryConfig::Kubernetes(kubernetes)) = read_discovery(legacy) else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(kubernetes.namespace.as_deref(), Some("prod"));
+        assert_eq!(
+            kubernetes.selector.get("app").map(String::as_str),
+            Some("sglang")
+        );
+    }
+
+    /// A missing tag means Kubernetes even without the legacy `enabled`:
+    /// presence alone turns discovery on.
+    #[test]
+    fn untagged_discovery_without_enabled_reads_as_kubernetes() {
+        assert!(matches!(
+            read_discovery(kubernetes_fields()),
+            Some(DiscoveryConfig::Kubernetes(_))
+        ));
+    }
+
+    #[test]
+    fn tagged_kubernetes_discovery_reads_as_kubernetes() {
+        let tagged = with(kubernetes_fields(), "provider", "kubernetes".into());
+        assert!(matches!(
+            read_discovery(tagged),
+            Some(DiscoveryConfig::Kubernetes(_))
+        ));
+    }
+
+    /// `enabled: false` is dropped at deserialization, so writing the config
+    /// back out cannot turn discovery on.
+    #[test]
+    fn disabled_legacy_discovery_reads_as_none_and_stays_none() {
+        let disabled = with(kubernetes_fields(), "enabled", false.into());
+        assert!(read_discovery(disabled.clone()).is_none());
+
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        config["discovery"] = disabled;
+        let config: RouterConfig = serde_json::from_value(config).unwrap();
+        let reread: RouterConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(reread.discovery.is_none());
+    }
+
+    /// Canonical output carries the tag and no `enabled`, and reads back to
+    /// the same config.
+    #[test]
+    fn discovery_serializes_tagged_without_enabled() {
+        let discovery = DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
+            namespace: Some("prod".to_string()),
+            ..Default::default()
+        });
+        let written = serde_json::to_value(&discovery).unwrap();
+        assert_eq!(written["provider"], "kubernetes");
+        assert!(written.get("enabled").is_none());
+        assert_eq!(read_discovery(written), Some(discovery));
+    }
+
+    #[test]
+    fn legacy_flat_discovery_reads_from_yaml() {
+        let yaml = "
+discovery:
+  enabled: true
+  port: 8000
+  check_interval_secs: 60
+  selector: { app: sglang }
+  prefill_selector: {}
+  decode_selector: {}
+  bootstrap_port_annotation: sglang.ai/bootstrap-port
+";
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        let overlay: serde_json::Value = serde_yaml::from_str(yaml).unwrap();
+        for (key, value) in overlay.as_object().unwrap() {
+            config[key] = value.clone();
+        }
+        let config: RouterConfig = serde_json::from_value(config).unwrap();
+        assert!(matches!(
+            config.discovery,
+            Some(DiscoveryConfig::Kubernetes(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_discovery_provider_is_rejected() {
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        config["discovery"] = with(kubernetes_fields(), "provider", "zookeeper".into());
+        let err = serde_json::from_value::<RouterConfig>(config).unwrap_err();
+        assert!(err.to_string().contains("zookeeper"), "{err}");
+    }
+
+    #[test]
+    fn non_boolean_discovery_enabled_is_rejected() {
+        let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
+        config["discovery"] = with(kubernetes_fields(), "enabled", "yes".into());
+        let err = serde_json::from_value::<RouterConfig>(config).unwrap_err();
+        assert!(err.to_string().contains("discovery.enabled"), "{err}");
     }
 
     #[test]
@@ -2155,14 +2563,6 @@ mod tests {
     #[test]
     fn test_has_service_discovery() {
         let config = RouterConfig::default();
-        assert!(!config.has_service_discovery());
-
-        let config = RouterConfig::builder()
-            .discovery_config(DiscoveryConfig {
-                enabled: false,
-                ..Default::default()
-            })
-            .build_unchecked();
         assert!(!config.has_service_discovery());
 
         let config = RouterConfig::builder().enable_discovery().build_unchecked();
@@ -2269,8 +2669,7 @@ mod tests {
             .request_timeout_secs(120)
             .worker_startup_timeout_secs(60)
             .worker_startup_check_interval_secs(5)
-            .discovery_config(DiscoveryConfig {
-                enabled: true,
+            .discovery_config(KubernetesDiscoveryConfig {
                 namespace: Some("sglang".to_string()),
                 ..Default::default()
             })
@@ -2307,8 +2706,7 @@ mod tests {
             .request_timeout_secs(300)
             .worker_startup_timeout_secs(180)
             .worker_startup_check_interval_secs(15)
-            .discovery_config(DiscoveryConfig {
-                enabled: true,
+            .discovery_config(KubernetesDiscoveryConfig {
                 namespace: None,
                 port: 8080,
                 check_interval_secs: 45,
@@ -2344,8 +2742,7 @@ mod tests {
             .request_timeout_secs(900)
             .worker_startup_timeout_secs(600)
             .worker_startup_check_interval_secs(20)
-            .discovery_config(DiscoveryConfig {
-                enabled: true,
+            .discovery_config(KubernetesDiscoveryConfig {
                 namespace: Some("production".to_string()),
                 port: 8443,
                 check_interval_secs: 120,
@@ -2378,10 +2775,10 @@ mod tests {
 
         assert_eq!(deserialized.host, "::1");
         assert_eq!(deserialized.port, 8888);
-        assert_eq!(
-            deserialized.discovery.unwrap().namespace,
-            Some("production".to_string())
-        );
+        let Some(DiscoveryConfig::Kubernetes(discovery)) = deserialized.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(discovery.namespace, Some("production".to_string()));
     }
 
     #[test]
@@ -2403,6 +2800,8 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -2441,6 +2840,8 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
             }),
             decode_policy: None,
         };
@@ -2505,6 +2906,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

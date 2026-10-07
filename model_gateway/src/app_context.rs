@@ -13,10 +13,10 @@ use smg_data_connector::{
 use smg_mcp::McpOrchestrator;
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
-    config::RouterConfig,
+    config::{KvIndexKind, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -30,8 +30,8 @@ use crate::{
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
-        WorkerService,
+        liveness, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor,
+        WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, WorkflowEngines},
 };
@@ -687,6 +687,21 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        if let Some(registry) = self.worker_registry.as_ref() {
+            registry.set_overload_shed(config.worker_overload_shed);
+        }
+        // Progress-based liveness thresholds (see `worker::liveness`).
+        liveness::configure(
+            Duration::from_secs(config.worker_stall_secs),
+            Duration::from_secs(config.worker_wedge_secs),
+        );
+        liveness::configure_warmup(liveness::Warmup {
+            secs: Duration::from_secs(config.worker_warmup_secs),
+            share: config.worker_warmup_share,
+            blocks: config.worker_warmup_blocks,
+            thin_ratio: config.worker_warmup_thin_ratio,
+            divert_every: config.worker_warmup_divert_every,
+        });
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
@@ -778,8 +793,18 @@ impl AppContextBuilder {
             };
 
         if is_cache_aware {
-            let monitor = Arc::new(KvEventMonitor::new(None));
-            debug!("Created KV event monitor for event-driven cache-aware routing");
+            let monitor = Arc::new(KvEventMonitor::with_kind(config.kv_index, None));
+            debug!(
+                kv_index = config.kv_index.as_str(),
+                "Created KV event monitor for event-driven cache-aware routing"
+            );
+            // The load records on the event streams are polls of the worker.
+            if let Some(worker_monitor) = &self.worker_monitor {
+                monitor.set_load_sink(worker_monitor);
+            }
+            if KvIndexKind::deprecated_alias_used() {
+                warn!("--kv-index run is the deprecated spelling of --kv-index chain");
+            }
 
             // Optional indexer bounding: prune entries by last-touch TTL and/or
             // capacity ceiling. Both default off (unbounded, prior behavior).
@@ -787,6 +812,7 @@ impl AppContextBuilder {
                 config.kv_indexer_ttl_secs.unwrap_or(0),
                 config.kv_indexer_max_entries.unwrap_or(0),
             );
+            monitor.start_stats_task();
 
             // Inject monitor into PolicyRegistry — propagates to default_policy
             // and any other existing cache-aware policies.
@@ -982,6 +1008,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         });
         let builder = AppContextBuilder::new()
             .with_client(&config, 5)
@@ -1025,6 +1053,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         }));
     }
 
@@ -1048,6 +1078,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);

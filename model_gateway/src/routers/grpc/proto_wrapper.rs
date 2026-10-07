@@ -14,7 +14,7 @@ use std::{
     process,
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Arc, OnceLock,
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -42,9 +42,12 @@ use smg_grpc_client::{
 };
 use smg_mm_rdma::RdmaExporter;
 
-use crate::routers::grpc::{
-    multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
-    zmq_client::ZmqGenerateStream,
+use crate::{
+    routers::grpc::{
+        multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+        zmq_client::ZmqGenerateStream,
+    },
+    worker::{liveness, Worker},
 };
 
 /// How a streaming response's per-token payloads (token ids, sampled
@@ -1466,6 +1469,18 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Whether the engine streams this request's responses as it produces
+    /// them, or answers once at the end.
+    pub fn stream(&self) -> bool {
+        match self {
+            Self::Vllm(req) => req.stream,
+            Self::Sglang(req) => req.stream,
+            Self::Trtllm(req) => req.streaming,
+            Self::Mlx(req) => req.stream,
+            Self::TokenSpeed(req) => req.stream,
+        }
+    }
+
     /// Serialized wire size, for the release metric.
     pub fn wire_len(&self) -> usize {
         use prost::Message;
@@ -1536,7 +1551,7 @@ impl ProtoGenerateRequest {
     /// every multimodal payload beyond the content hashes goes: pixels,
     /// placeholders, grid tensors and media references. The decode engine
     /// then sees a pure-text TokensPrompt and never touches its (zero-budget)
-    /// encoder cache, mirroring the Dynamo P/D contract; the kept hashes ride
+    /// encoder cache, as the language-model-only P/D contract requires; the kept hashes ride
     /// into `cache_salt` servicer-side so different images cannot alias in
     /// the decode prefix cache. Non-vLLM backends have no language-model-only
     /// mode, so they take the pixel-stripping clone.
@@ -1644,6 +1659,34 @@ impl ProtoGenerateRequest {
             Self::Sglang(req) => req.data_parallel_rank = rank,
             Self::TokenSpeed(req) => req.data_parallel_rank = Some(rank),
             Self::Trtllm(_) | Self::Mlx(_) => {}
+        }
+    }
+
+    /// Prompt tokens the engine has to prefill for this request: the
+    /// tokenized input's length (zero for a text input, which the engine
+    /// tokenizes itself).
+    pub fn prompt_len(&self) -> usize {
+        match self {
+            Self::Sglang(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(0, |input| input.input_ids.len()),
+            Self::Vllm(req) => match &req.input {
+                Some(vllm::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
+                _ => 0,
+            },
+            Self::Trtllm(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(0, |input| input.input_token_ids.len()),
+            Self::Mlx(req) => match &req.input {
+                Some(mlx::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
+                _ => 0,
+            },
+            Self::TokenSpeed(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(0, |input| input.input_ids.len()),
         }
     }
 
@@ -2160,6 +2203,26 @@ impl ProtoGenerateStreamChunk {
             Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
         }
     }
+
+    /// Weight version the engine reported for this chunk. Only TokenSpeed
+    /// carries it on the wire; see [`is_reported_version`] for what counts.
+    pub fn weight_version(&self) -> Option<&str> {
+        match self {
+            Self::TokenSpeed(c) => c
+                .weight_version
+                .as_deref()
+                .filter(|v| is_reported_version(v)),
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+        }
+    }
+}
+
+/// Whether an engine-stamped `weight_version` names a real version. TokenSpeed
+/// always stamps `server_args.weight_version`, whose default is the literal
+/// `"default"`: that is the engine saying it was never given a version, so it
+/// must not shadow a registration label, exactly like an empty string.
+fn is_reported_version(version: &str) -> bool {
+    !version.is_empty() && version != "default"
 }
 
 /// Unified GenerateComplete response
@@ -2384,6 +2447,18 @@ impl ProtoGenerateComplete {
         }
     }
 
+    /// Weight version the engine reported for this completion. Only TokenSpeed
+    /// carries it on the wire; see [`is_reported_version`] for what counts.
+    pub fn weight_version(&self) -> Option<&str> {
+        match self {
+            Self::TokenSpeed(c) => c
+                .weight_version
+                .as_deref()
+                .filter(|v| is_reported_version(v)),
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+        }
+    }
+
     /// Get accepted speculative draft tokens.
     pub fn spec_accepted_tokens(&self) -> u32 {
         match self {
@@ -2519,6 +2594,118 @@ pub enum ProtoStream {
     /// An n>1 fan-out over rendezvous-room PD pairs: one child per sample,
     /// each response stamped with its sample's index (see [`FanoutStream`]).
     Fanout(FanoutStream),
+    /// Any of the above, with the worker it came from: every response is a
+    /// sign of life for that worker (see [`crate::worker::liveness`]).
+    Tracked(Box<TrackedStream>),
+}
+
+/// A [`ProtoStream`] paired with the worker serving it, so each response it
+/// yields counts as token progress for that worker, and its prompt counts as
+/// pending prefill on the worker until the first response.
+pub struct TrackedStream {
+    inner: ProtoStream,
+    worker: Arc<dyn Worker>,
+    prefill: Option<PrefillTicket>,
+    /// The request's place in the worker's pile; a non-streaming generation
+    /// holds none.
+    progress: Option<ProgressTicket>,
+}
+
+/// The request's place in its worker's tracked pile (see
+/// [`Worker::tracked_load`]), held for the stream's life.
+struct ProgressTicket {
+    worker: Arc<dyn Worker>,
+}
+
+impl Drop for ProgressTicket {
+    fn drop(&mut self) {
+        self.worker.note_tracked_ended();
+    }
+}
+
+/// The prompt tokens a dispatched request adds to its worker's prefill
+/// backlog (see [`Worker::prefill_backlog`]), released by the first response
+/// or, failing that, when the stream is dropped.
+struct PrefillTicket {
+    worker: Arc<dyn Worker>,
+    tokens: u64,
+    released: bool,
+}
+
+impl PrefillTicket {
+    fn first_response(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.worker.note_prefill_ended(self.tokens, true);
+        }
+    }
+}
+
+impl Drop for PrefillTicket {
+    fn drop(&mut self) {
+        if !self.released {
+            self.worker.note_prefill_ended(self.tokens, false);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tracked_tests {
+    use std::sync::Arc;
+
+    use super::{FanoutStream, ProtoStream};
+    use crate::worker::{BasicWorkerBuilder, Worker};
+
+    #[test]
+    fn a_tracked_stream_is_one_of_its_workers_pile_for_its_life() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new())).tracked(
+            Arc::clone(&worker),
+            0,
+            true,
+        );
+        assert_eq!(worker.tracked_load(), 1, "counted at dispatch");
+        let stream = stream.defer_abort_until_first_item();
+        assert_eq!(worker.tracked_load(), 1, "and across the stream's rewraps");
+        drop(stream);
+        assert_eq!(worker.tracked_load(), 0, "released with the stream");
+    }
+
+    #[test]
+    fn a_non_streaming_generation_joins_no_pile_but_keeps_its_prefill_and_its_progress() {
+        // Review finding on the pushed head: left untracked altogether, a
+        // non-streaming generation's one answer no longer counted as progress
+        // and its prompt left the prefill backlog, so a saturated engine
+        // finishing such requests while streaming ones waited was wedged. It
+        // is tracked like any other, minus the pile slot.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new())).tracked(
+            Arc::clone(&worker),
+            64,
+            false,
+        );
+        assert_eq!(
+            worker.tracked_load(),
+            0,
+            "nothing to see progress on until it answers"
+        );
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.progress.is_none(), "no pile slot");
+                assert!(
+                    tracked.prefill.is_some(),
+                    "its prompt is pending prefill there like any other"
+                );
+                // Its one answer goes through the same `Tracked` arm of
+                // `next` as a token, which is where progress is recorded.
+            }
+            _ => panic!("a tracked stream"),
+        }
+        let stream = stream.defer_abort_until_first_item();
+        assert_eq!(worker.tracked_load(), 0);
+        drop(stream);
+        assert_eq!(worker.tracked_load(), 0);
+    }
 }
 
 /// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
@@ -2534,6 +2721,38 @@ fn reject_engine_error(
 }
 
 impl ProtoStream {
+    /// Count this stream's responses as progress for `worker` (a response is
+    /// progress whether it is a token of a streaming generation or the one
+    /// answer of a non-streaming one), its `prompt_tokens` as pending prefill
+    /// there until the first response, and, when the engine streams the
+    /// generation (`streaming`), the request as one of the worker's tracked
+    /// pile while the stream lives. A non-streaming generation shows nothing
+    /// between dispatch and completion, so it joins no pile: the pile rule
+    /// never judges a worker by requests it cannot see progress on.
+    #[must_use]
+    pub fn tracked(self, worker: Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
+        let progress = streaming.then(|| {
+            worker.note_tracked_started();
+            ProgressTicket {
+                worker: Arc::clone(&worker),
+            }
+        });
+        let prefill = (prompt_tokens > 0).then(|| {
+            worker.note_prefill_started(prompt_tokens);
+            PrefillTicket {
+                worker: Arc::clone(&worker),
+                tokens: prompt_tokens,
+                released: false,
+            }
+        });
+        Self::Tracked(Box::new(TrackedStream {
+            inner: self,
+            worker,
+            prefill,
+            progress,
+        }))
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let item = match self {
@@ -2570,6 +2789,17 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
+            Self::Tracked(tracked) => {
+                let item = Box::pin(tracked.inner.next()).await;
+                if matches!(item, Some(Ok(_))) {
+                    liveness::on_token_progress(&tracked.worker);
+                    if let Some(ticket) = tracked.prefill.as_mut() {
+                        ticket.first_response();
+                    }
+                    tracked.prefill = None;
+                }
+                return item;
+            }
         };
         item.map(reject_engine_error)
     }
@@ -2584,6 +2814,7 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
+            Self::Tracked(stream) => stream.inner.mark_completed(),
         }
     }
 
@@ -2605,6 +2836,20 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
             Self::Zmq(stream) => Self::Zmq(stream),
             Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+            Self::Tracked(stream) => {
+                let TrackedStream {
+                    inner,
+                    worker,
+                    prefill,
+                    progress,
+                } = *stream;
+                Self::Tracked(Box::new(TrackedStream {
+                    inner: inner.defer_abort_until_first_item(),
+                    worker,
+                    prefill,
+                    progress,
+                }))
+            }
         }
     }
 }
@@ -3540,5 +3785,42 @@ mod tests {
         ] {
             assert_eq!(complete.chunk_semantics(), ChunkSemantics::Cumulative);
         }
+    }
+
+    #[test]
+    fn tokenspeed_generate_messages_expose_the_engine_weight_version() {
+        let complete = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some("v7".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(complete.weight_version(), Some("v7"));
+        let empty = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some(String::new()),
+            ..Default::default()
+        });
+        assert_eq!(empty.weight_version(), None, "empty is the same as unset");
+        let placeholder = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some("default".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            placeholder.weight_version(),
+            None,
+            "the engine's own placeholder is not a version and must not shadow a label"
+        );
+        let unset = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete::default());
+        assert_eq!(unset.weight_version(), None);
+
+        let chunk = ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+            weight_version: Some("v7".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(chunk.weight_version(), Some("v7"));
+        let sglang = ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default());
+        assert_eq!(
+            sglang.weight_version(),
+            None,
+            "no other proto carries the field"
+        );
     }
 }

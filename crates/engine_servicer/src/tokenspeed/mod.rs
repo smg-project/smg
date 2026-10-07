@@ -80,6 +80,10 @@ pub struct TokenSpeedModelInfo {
     /// TokenSpeed's ZMQ KV-event publisher endpoint and topic; an empty
     /// endpoint means `SubscribeKvEvents` is UNIMPLEMENTED.
     pub kv_events_endpoint: String,
+    /// The same config's `replay_endpoint` (the publisher's replay ROUTER),
+    /// or empty when it runs none: what the relay asks for gaps in flight
+    /// and for the batches published before its subscription joined.
+    pub kv_events_replay_endpoint: String,
     pub kv_events_topic: String,
 }
 
@@ -93,6 +97,8 @@ pub struct TokenSpeedServicerConfig {
     pub ipc_base_url: String,
     /// `tcp://host:port` the headless scheduler dials for the handshake (its
     /// `--data-parallel-address`/`--data-parallel-rpc-port`).
+    /// An `ipc://<path>` endpoint is accepted too: one per test, so parallel
+    /// tests never share a probed TCP port.
     pub handshake_address: String,
     /// Engines that will dial in (the attention data-parallel size).
     pub engine_count: usize,
@@ -105,8 +111,26 @@ pub struct TokenSpeedServicerConfig {
     pub engine_startup_timeout: Duration,
 }
 
+/// The servicer's `GetLoads` figures, read for the load record the relay
+/// attaches to every batch it streams.
+struct LoadFromState(std::sync::Weak<State>);
+
+impl crate::kv_events::LoadSource for LoadFromState {
+    fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+        let state = self.0.upgrade()?;
+        let response = info::loads(&state, dp_rank).ok()?;
+        let load = response.loads.first()?;
+        // The engine reports no queued token-work on this wire yet: the
+        // record's `waiting_uncached_tokens` stays unset.
+        Some(smg_grpc_client::common_proto::EngineLoad::from(load))
+    }
+}
+
 pub(super) struct State {
     pub(super) model: TokenSpeedModelInfo,
+    /// The KV-event relay for the engine's ZMQ publisher; `None` when events
+    /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
+    pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
     /// The local tokenizer directory the servicer loaded (`GetTokenizer`
     /// bundles it); `None` when none resolved.
     pub(super) tokenizer_dir: Option<String>,
@@ -194,8 +218,12 @@ impl TokenSpeedServicerServer {
         if !config.ipc_base_url.starts_with("ipc://") {
             return Err(invalid("ipc_base_url must be ipc://<path>"));
         }
-        if !config.handshake_address.starts_with("tcp://") {
-            return Err(invalid("handshake_address must be tcp://host:port"));
+        if !config.handshake_address.starts_with("tcp://")
+            && !config.handshake_address.starts_with("ipc://")
+        {
+            return Err(invalid(
+                "handshake_address must be tcp://host:port or ipc://<path>",
+            ));
         }
         if config.engine_count == 0 {
             return Err(invalid("engine_count must be positive"));
@@ -206,9 +234,15 @@ impl TokenSpeedServicerServer {
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
+        let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
+            &config.model.kv_events_endpoint,
+            Some(&config.model.kv_events_replay_endpoint),
+            &config.model.kv_events_topic,
+        );
         let state = Arc::new(State {
             tokenizer_dir: config.tokenizer_dir.clone(),
             model: config.model,
+            kv_relay,
             engine: EngineLink::default(),
             tokenizer: OnceLock::new(),
             registry: Arc::new(RequestRegistry::default()),
@@ -216,6 +250,9 @@ impl TokenSpeedServicerServer {
             started: Instant::now(),
             started_at: SystemTime::now(),
         });
+        if let Some(relay) = &state.kv_relay {
+            relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(&state))));
+        }
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
         }
@@ -228,6 +265,7 @@ impl TokenSpeedServicerServer {
             Arc::new(move || health_state.is_serving()),
         );
         let connect_state = Arc::clone(&state);
+        let kv_relay = state.kv_relay.clone();
         let TokenSpeedServicerConfig {
             bind_address,
             ipc_base_url,
@@ -241,6 +279,12 @@ impl TokenSpeedServicerServer {
             "smg-tokenspeed-servicer",
             &bind_address,
             move |listener: TcpListener, shutdown: Shutdown, last_error| async move {
+                // The KV-event relay follows the publisher from the start,
+                // before any gateway asks, so its history and live-block
+                // record cover the engine's whole life.
+                if let Some(relay) = &kv_relay {
+                    relay.start_at_boot();
+                }
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "engine connect is fire-and-forget; the runtime drop cancels it"

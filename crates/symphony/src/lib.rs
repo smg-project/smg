@@ -16,22 +16,33 @@
 //! The standard this crate is held to is craftsmanship: code that reads as well as it runs, with no
 //! compromise kept for convenience. A change whose only reason is "this can be better" is welcome.
 //!
-//! Status: the public types below are the contract, and [`adapt`] renders them for the Chat
-//! Completions, Responses and Messages APIs, streamed and whole; the engine and the format
-//! definitions follow in later changes.
+//! Status: the public types below are the contract, [`adapt`] renders them for the Chat
+//! Completions, Responses and Messages APIs, streamed and whole, and [`Engine`] runs a [`Format`]
+//! table: the tables in [`formats`] are the families recorded so far, and more follow.
 
 #![forbid(unsafe_code)]
 
 pub mod adapt;
+pub mod engine;
 pub mod event;
+pub mod format;
 pub mod formats;
 pub mod input;
 pub mod json;
 pub mod markers;
 pub mod parser;
+pub mod pythonic;
+pub mod tagged;
+pub mod tokens;
 
+pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
-pub use formats::Qwen3;
+pub use format::{CallSyntax, Emits, Format};
+pub use formats::{
+    deepseek_v4_1, hy4, iquest, lfm2_5, ling, minimax_m3, olmo3, qwen2_5, qwen3, seed_oss, xlam,
+};
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};
+pub use tagged::Declared;
+pub use tokens::Ledger;

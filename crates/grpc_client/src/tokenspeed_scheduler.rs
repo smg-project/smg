@@ -745,6 +745,7 @@ impl From<tokenspeed_proto::GetLoadsResponse> for openai_protocol::worker::Worke
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
             aggregate,
+            sampled_at: None,
         }
     }
 }

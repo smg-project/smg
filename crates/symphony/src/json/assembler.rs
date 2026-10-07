@@ -16,11 +16,17 @@
 //!
 //! The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form
 //! a valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is
-//! checked with [`PartialJson`] in prefix mode before it is emitted, and from the first byte the
-//! parser cannot take, the argument bytes come back as `Malformed` with `InvalidArguments` instead,
-//! nothing already emitted being revised. The prefix parser tolerates what the old crate tolerated
-//! (a bracket closed by the wrong kind, a literal's prefix), so the promise is exactly as strong as
-//! that parser.
+//! judged by [`Prefix`], which accepts what [`PartialJson`](super::PartialJson) accepts in prefix
+//! mode, before it is emitted, and from the first byte it cannot take, the argument bytes come
+//! back as `Malformed` with `InvalidArguments` instead, nothing already emitted being revised. The
+//! prefix parser tolerates what the old crate tolerated (a literal's prefix, a bracket closed by
+//! the wrong kind where the parent can take it), so the promise is exactly as strong as that
+//! parser.
+//!
+//! Every byte is read once. The outline is taken by a [`Scanner`] that keeps its place between
+//! pieces, and the prefix is judged on the bytes that arrived, so a call's cost is linear in its
+//! length however the text is cut: the first version read the whole text again on every piece,
+//! and a 259 KB argument string fed by the character took 800 s against 0.03 s whole.
 //!
 //! A started call whose object never closes is closed at `finish` with what arrived, and the bytes
 //! after its arguments value (a comma cut short, a complete member, or bytes that are no member)
@@ -38,8 +44,8 @@
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::{
-        outline::{outline, Span},
-        partial::PartialJson,
+        outline::{Scanner, Span},
+        prefix::Prefix,
     },
 };
 
@@ -49,9 +55,15 @@ pub struct Assembler {
     index: u32,
     id: String,
     text: String,
+    /// The outline of `text`, read as it grows.
+    scanner: Scanner,
     started: bool,
     /// Argument bytes accounted for so far, as fragments or as malformed text.
     emitted: usize,
+    /// Argument bytes the prefix has judged so far.
+    judged: usize,
+    /// Whether the argument bytes are still a JSON prefix, judged as they arrive.
+    prefix: Prefix,
     /// The argument byte from which the arguments stopped being a valid JSON prefix, if they did.
     invalid_from: Option<usize>,
     done: bool,
@@ -64,8 +76,11 @@ impl Assembler {
             index,
             id: id.into(),
             text: String::new(),
+            scanner: Scanner::default(),
             started: false,
             emitted: 0,
+            judged: 0,
+            prefix: Prefix::default(),
             invalid_from: None,
             done: false,
         }
@@ -92,18 +107,22 @@ impl Assembler {
         }
         let before = self.text.len();
         self.text.push_str(bytes);
-        let mut found = outline(&self.text);
-        let taken = match found.close {
+        self.scanner.advance(&self.text);
+        let taken = match self.scanner.found().close {
             Some(close) => {
+                // The scanner stopped at the brace; what follows it is not the object's.
                 self.text.truncate(close);
-                found = outline(&self.text);
                 close - before
             }
             None => bytes.len(),
         };
+        // Two offsets and a span: nothing of the outline is copied per piece but what this
+        // piece needs, and the name only once, when the call starts.
+        let close = self.scanner.found().close;
+        let arguments = self.scanner.found().arguments.clone();
         if !self.started {
-            let Some(name) = found.name.clone() else {
-                if let Some(close) = found.close {
+            let Some(name) = self.scanner.found().name.clone() else {
+                if let Some(close) = close {
                     // Closed without a name: not a call. Said now, so `done` is true at the close.
                     out.push(Event::Malformed {
                         text: Text::uncounted(&self.text[..close]),
@@ -113,7 +132,7 @@ impl Assembler {
                 }
                 return taken;
             };
-            let head_end = match (&found.arguments, found.close) {
+            let head_end = match (&arguments, close) {
                 (Some(span), _) => span.start,
                 (None, Some(close)) => close,
                 (None, None) => return taken,
@@ -126,10 +145,9 @@ impl Assembler {
             });
             self.started = true;
         }
-        self.emit_new_argument_bytes(found.arguments.as_ref(), out);
-        if let Some(close) = found.close {
-            let tail_start = found
-                .arguments
+        self.emit_new_argument_bytes(arguments.as_ref(), out);
+        if let Some(close) = close {
+            let tail_start = arguments
                 .as_ref()
                 .and_then(|span| span.end)
                 .unwrap_or(close);
@@ -149,7 +167,7 @@ impl Assembler {
         if self.done {
             return;
         }
-        let found = outline(&self.text);
+        let found = self.scanner.found().clone();
         if self.started {
             // `feed` has emitted every argument byte that arrived, as fragments or as malformed
             // text. The object never closed, so what follows the arguments value is the tail of an
@@ -192,12 +210,14 @@ impl Assembler {
         if bytes.len() <= self.emitted {
             return;
         }
+        // Only the bytes that arrived are judged; the prefix keeps its place between pieces.
+        let verdict = self.prefix.feed(&bytes[self.judged..]);
+        self.judged = bytes.len();
         let valid_end = match self.invalid_from {
             Some(from) => from,
-            None => match PartialJson::default().parse(bytes, true) {
-                Ok((_, consumed)) if consumed == bytes.len() => bytes.len(),
-                Ok((_, consumed)) => *self.invalid_from.insert(consumed.max(self.emitted)),
-                Err(_) => *self.invalid_from.insert(self.emitted),
+            None => match verdict {
+                None => bytes.len(),
+                Some(from) => *self.invalid_from.insert(from.max(self.emitted)),
             },
         };
         if self.emitted < valid_end {
@@ -548,6 +568,50 @@ mod tests {
             .collect();
         assert_eq!(malformed, " junk}");
         assert_eq!(sources(&events), text);
+    }
+
+    #[test]
+    fn a_long_arguments_string_fed_by_the_character_costs_time_linear_in_its_length() {
+        // 200 KB of arguments, the size of a code patch a model writes as one call. Read once per
+        // byte, this takes well under a second in a debug build; read again on every piece, as
+        // the first version did, it took minutes.
+        let patch: String = (0..4_000)
+            .map(|i| format!("line {i}: let value = compute(input[{i}]) + {i};\\n"))
+            .collect();
+        let call = format!(
+            r#"{{"name": "write", "arguments": {{"path": "a.rs", "content": "{patch}"}}}}"#
+        );
+        assert!(call.len() > 200_000, "{} bytes", call.len());
+        let started = std::time::Instant::now();
+        let mut assembler = Assembler::new(0, "call_0");
+        let mut out = Events::new();
+        for (i, c) in call.char_indices() {
+            assembler.feed(&call[i..i + c.len_utf8()], &mut out);
+        }
+        let by_char = out.drain();
+        let elapsed = started.elapsed();
+        let mut whole = Events::new();
+        Assembler::new(0, "call_0").feed(&call, &mut whole);
+        let whole = whole.drain();
+        let arguments = |events: &[Event]| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(arguments(&by_char), arguments(&whole));
+        assert!(
+            matches!(by_char.last(), Some(Event::ToolCallEnd { .. })),
+            "{:?}",
+            by_char.last()
+        );
+        assert!(
+            elapsed.as_secs() < 10,
+            "a character at a time took {elapsed:?}; the cost is not linear"
+        );
     }
 
     #[test]

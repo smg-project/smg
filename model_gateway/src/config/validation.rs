@@ -2,6 +2,7 @@ use axum::http::HeaderName;
 use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::policies::cost as selection_cost;
 
 /// Validate a user-supplied mesh server name. The name keys rate-limit
 /// shards as `rl:{counter}:{name}`, so an empty name or one containing the
@@ -515,8 +516,25 @@ impl ConfigValidator {
                 cache_index,
                 cache_ttl_secs,
                 cache_boundaries,
+                selection_policy,
+                selection_accounting_ttl_ms: _,
             } => {
                 Self::validate_cache_boundaries(cache_boundaries)?;
+
+                // Build the selection policy once here so a bad name or
+                // parameter fails configuration instead of routing.
+                let selection_policy_name = selection_policy
+                    .as_deref()
+                    .unwrap_or(selection_cost::DEFAULT_POLICY);
+                if let Err(err) =
+                    selection_cost::build(selection_policy_name, *selection_temperature)
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "selection_policy".to_string(),
+                        value: selection_policy_name.to_string(),
+                        reason: err.to_string(),
+                    });
+                }
 
                 if *cache_ttl_secs == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -892,10 +910,17 @@ impl ConfigValidator {
     }
 
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
-        if !discovery.enabled {
-            return Ok(());
+        match discovery {
+            DiscoveryConfig::Kubernetes(kubernetes) => {
+                Self::validate_kubernetes_discovery(kubernetes, mode)
+            }
         }
+    }
 
+    fn validate_kubernetes_discovery(
+        discovery: &KubernetesDiscoveryConfig,
+        mode: &RoutingMode,
+    ) -> ConfigResult<()> {
         if discovery.port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "discovery.port".to_string(),
@@ -1151,7 +1176,7 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
-        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
+        let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {
             RoutingMode::PrefillDecode { decode_policy, .. } if !config.enable_igw => {
                 !has_service_discovery && matches!(decode_policy, Some(PolicyConfig::Bucket { .. }))
@@ -1270,10 +1295,7 @@ mod tests {
             bucket_adjust_interval_secs: 5,
         };
         let mut config = RouterConfig {
-            discovery: Some(DiscoveryConfig {
-                enabled: true,
-                ..Default::default()
-            }),
+            discovery: Some(KubernetesDiscoveryConfig::default().into()),
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: vec![],
                 decode_urls: vec![],
@@ -1649,13 +1671,15 @@ mod tests {
         );
 
         // Enable service discovery
-        config.discovery = Some(DiscoveryConfig {
-            enabled: true,
-            selector: vec![("app".to_string(), "test".to_string())]
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        });
+        config.discovery = Some(
+            KubernetesDiscoveryConfig {
+                selector: vec![("app".to_string(), "test".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            }
+            .into(),
+        );
 
         // Should pass validation since service discovery is enabled
         assert!(ConfigValidator::validate(&config).is_ok());
@@ -1676,13 +1700,15 @@ mod tests {
             ),
         ] {
             let mut config = regular_mode_config();
-            config.discovery = Some(DiscoveryConfig {
-                enabled: true,
-                selector: [("app".to_string(), "worker".to_string())].into(),
-                kv_connector_annotation: kv_connector_annotation.to_string(),
-                kv_engine_id_annotation: kv_engine_id_annotation.to_string(),
-                ..Default::default()
-            });
+            config.discovery = Some(
+                KubernetesDiscoveryConfig {
+                    selector: [("app".to_string(), "worker".to_string())].into(),
+                    kv_connector_annotation: kv_connector_annotation.to_string(),
+                    kv_engine_id_annotation: kv_engine_id_annotation.to_string(),
+                    ..Default::default()
+                }
+                .into(),
+            );
 
             assert!(matches!(
                 ConfigValidator::validate(&config),
@@ -1726,6 +1752,8 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
             },
         );
 
@@ -1756,6 +1784,8 @@ mod tests {
                     cache_index: Default::default(),
                     cache_ttl_secs: 180,
                     cache_boundaries: Vec::new(),
+                    selection_policy: None,
+                    selection_accounting_ttl_ms: 0,
                 },
             )
         };
@@ -1791,6 +1821,8 @@ mod tests {
                     cache_index,
                     cache_ttl_secs,
                     cache_boundaries: boundaries,
+                    selection_policy: None,
+                    selection_accounting_ttl_ms: 0,
                 },
             )
         };
@@ -1843,6 +1875,8 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
             },
         );
 
@@ -1964,6 +1998,8 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
             },
         );
 
@@ -2016,6 +2052,8 @@ mod tests {
                     cache_index: Default::default(),
                     cache_ttl_secs: 180,
                     cache_boundaries: Vec::new(),
+                    selection_policy: None,
+                    selection_accounting_ttl_ms: 0,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
@@ -2147,6 +2185,8 @@ mod tests {
                     cache_index: Default::default(),
                     cache_ttl_secs: 180,
                     cache_boundaries: Vec::new(),
+                    selection_policy: None,
+                    selection_accounting_ttl_ms: 0,
                 }),
                 prefill_policy: None,
                 decode_policy: None,

@@ -23,10 +23,6 @@ from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.kv_events import (
-    AllBlocksCleared,
-    BlockRemoved,
-    BlockStored,
-    KVEventBatch,
     KVEventsConfig,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -162,7 +158,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Parse KV events config for SubscribeKvEvents support
         self._kv_events_config: KVEventsConfig | None = None
-        self._kv_event_id_counter = 0
         if server_args.kv_events_config:
             try:
                 self._kv_events_config = KVEventsConfig.from_cli(server_args.kv_events_config)
@@ -734,11 +729,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         request: common_pb2.SubscribeKvEventsRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[common_pb2.KvEventBatch]:
-        """Bridge internal ZMQ KV cache events to gRPC server-streaming.
-
-        Uses the ZMQ publisher's native sequence numbers as gRPC sequence
-        numbers directly.
-        """
+        """Relay the scheduler's ZMQ KV cache events, every DP rank's publisher,
+        as one gRPC stream (see ``smg_grpc_servicer.kv_relay``)."""
         if self._kv_events_config is None:
             await context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
@@ -747,71 +739,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
             return
 
-        decoder = msgspec.msgpack.Decoder(KVEventBatch)
         async for batch in subscribe_kv_events(
             self._kv_events_config,
+            self.server_args,
             request.start_sequence_number,
             context,
-            decoder.decode,
-            self._convert_kv_event_batch,
         ):
             yield batch
-
-    def _convert_kv_event_batch(
-        self, raw_batch: KVEventBatch, seq_num: int
-    ) -> common_pb2.KvEventBatch:
-        """Convert a ZMQ KVEventBatch to proto KvEventBatch."""
-        proto_batch = common_pb2.KvEventBatch(
-            sequence_number=seq_num,
-            timestamp=raw_batch.ts,
-        )
-        if raw_batch.attn_dp_rank is not None:
-            proto_batch.dp_rank = raw_batch.attn_dp_rank
-
-        for event in raw_batch.events:
-            proto_event = self._convert_kv_event(event)
-            if proto_event is not None:
-                proto_batch.events.append(proto_event)
-
-        return proto_batch
-
-    def _convert_kv_event(self, event) -> common_pb2.KvCacheEvent | None:
-        """Convert a single raw KV event to proto KvCacheEvent."""
-        self._kv_event_id_counter += 1
-        event_id = self._kv_event_id_counter
-
-        if isinstance(event, BlockStored):
-            # SGLang emits one BlockStored per page with block_hashes=[single_hash]
-            # and token_ids containing only that page's tokens.
-            blocks = []
-            for i, bh in enumerate(event.block_hashes):
-                start = i * event.block_size
-                end = start + event.block_size
-                block = common_pb2.KvBlock(
-                    block_hash=bh,
-                    token_ids=event.token_ids[start:end],
-                    block_size=event.block_size,
-                )
-                if event.lora_id is not None:
-                    block.lora_id = event.lora_id
-                blocks.append(block)
-
-            stored = common_pb2.KvBlocksStored(blocks=blocks)
-            if event.parent_block_hash is not None:
-                stored.parent_block_hash = event.parent_block_hash
-
-            return common_pb2.KvCacheEvent(event_id=event_id, stored=stored)
-
-        elif isinstance(event, BlockRemoved):
-            return common_pb2.KvCacheEvent(
-                event_id=event_id,
-                removed=common_pb2.KvBlocksRemoved(block_hashes=event.block_hashes),
-            )
-
-        elif isinstance(event, AllBlocksCleared):
-            return common_pb2.KvCacheEvent(event_id=event_id, cleared=common_pb2.KvCacheCleared())
-
-        return None
 
     def _handle_epd_disaggregation_encode_request(
         self,

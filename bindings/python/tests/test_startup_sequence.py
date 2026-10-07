@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.launch_router import RouterArgs, launch_router
-from smg.router import policy_from_str
+from smg.router import Router, policy_from_str
 
 
 # Local helper mirroring the router logger setup used in production
@@ -260,6 +260,58 @@ class TestRouterInitialization:
             assert captured_args["epd_disaggregation"] is epd_disaggregation
             assert captured_args["enable_igw"] is True
             mock_router_instance.start.assert_called_once()
+
+    def test_discovery_provider_kubernetes_enables_igw(self):
+        """IGW follows the selected provider, whichever spelling selected it."""
+        args = RouterArgs(discovery_provider="kubernetes", selector={"app": "worker"})
+
+        with patch("smg.launch_router.Router") as router_mod:
+            captured_args = {}
+
+            def fake_from_args(router_args):
+                captured_args["enable_igw"] = router_args.enable_igw
+                return MagicMock()
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
+
+            launch_router(args)
+
+        assert captured_args["enable_igw"] is True
+
+    def test_from_args_passes_discovery_provider_as_service_discovery(self):
+        """The Rust binding receives Kubernetes discovery by its legacy name."""
+        args = RouterArgs(
+            discovery_provider="kubernetes",
+            selector={"app": "worker"},
+            worker_urls=["http://worker:8000"],
+        )
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["service_discovery"] is True
+        assert "discovery_provider" not in kwargs
+        # Discovery supplies the workers, exactly as under --service-discovery.
+        assert kwargs["worker_urls"] == []
+
+    def test_from_args_rejects_a_provider_it_cannot_pass(self):
+        """A provider accepted on the CLI but not wired through fails loudly.
+
+        Simulates adding a provider to the CLI choices without teaching
+        from_args to pass it on: that must not start the router without
+        discovery.
+        """
+        args = RouterArgs(discovery_provider="file")
+
+        with (
+            patch("smg.router_args.DISCOVERY_PROVIDER_CHOICES", ["kubernetes", "file"]),
+            patch("smg.router._Router") as rust_router,
+            pytest.raises(ValueError, match="cannot pass discovery provider 'file'"),
+        ):
+            Router.from_args(args)
+
+        rust_router.assert_not_called()
 
     def test_router_initialization_with_retry_config(self):
         """Test router initialization with retry configuration."""

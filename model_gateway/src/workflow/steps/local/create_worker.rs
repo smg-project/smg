@@ -277,13 +277,13 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 if let Some(group_size) = zmq_engine_group {
                     builder = builder.zmq_engine_group(group_size);
                 }
-                // ZMQ promotion is event-driven: the worker signals the manager
-                // the instant its handshake completes, so wire the registry's
-                // connect signal. Other transports promote via polling.
-                if *connection_mode == ConnectionMode::Zmq {
-                    builder = builder
-                        .connect_signal_tx(app_context.worker_registry.connect_signal_sender());
-                }
+                // Promotion can be event-driven: a ZMQ worker signals the
+                // manager the instant its handshake completes, and any worker
+                // demoted by health is signalled on its first successful
+                // contact (see `worker::liveness`), so every worker gets the
+                // registry's connect signal.
+                builder =
+                    builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
 
                 // Builder sets initial status: Pending if health-checked, Ready if not.
                 Arc::new(builder.build()) as Arc<dyn Worker>

@@ -41,6 +41,7 @@ from smg_grpc_servicer.rust_lifecycle import (
 )
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
+from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -157,12 +158,15 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     except ImportError:  # the launcher's unit tests run without TokenSpeed
         tokenspeed_version = ""
     return {
-        "server_args_json": json.dumps(_make_json_serializable(args_dict), sort_keys=True),
+        "server_args_json": json.dumps(
+            redact_secrets(_make_json_serializable(args_dict)), sort_keys=True
+        ),
         "scheduler_info_json": json.dumps({"shm_namespace_id": _shm_namespace_id()}),
         "tokenspeed_version": str(tokenspeed_version),
         "max_running_requests": running_window(server_args),
         "data_parallel_size": int(dp_size) if isinstance(dp_size, int) and dp_size > 0 else 1,
         "kv_events_endpoint": kv_events.endpoint if kv_events else "",
+        "kv_events_replay_endpoint": kv_events.replay_endpoint if kv_events else "",
         "kv_events_topic": kv_events.topic if kv_events else "",
     }
 

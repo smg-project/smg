@@ -26,6 +26,123 @@ message KvEventBatch {
   double timestamp = 2;
   repeated KvCacheEvent events = 3;
   optional int32 dp_rank = 4;
+  reserved 5, 6;
+  // Set when this batch is one chunk of a relay state snapshot rather than a
+  // batch the publisher sent (see KvSnapshotChunk).
+  KvSnapshotChunk snapshot = 7;
+  // The engine's load as the servicer knows it when it sends this batch (see
+  // EngineLoad); absent from servicers that predate the field.
+  EngineLoad load = 8;
+}
+
+// The servicer's load record, attached to every KvEventBatch it streams so a
+// subscriber learns the engine's queue, running set, KV usage and rate at
+// every scheduler step instead of at its GetLoads poll: the same numbers
+// GetLoads answers with, for the batch's dp_rank. A batch with `load_only`
+// set carries no events and repeats the last sequence sent on its stream;
+// the servicer sends one when the record changed without a KV event (an
+// admission served from cache, a completion), coalesced per stream, and as
+// a heartbeat while the engine is idle; the subscriber reads the load and
+// admits nothing.
+message EngineLoad {
+  uint32 running_requests = 1;
+  uint32 waiting_requests = 2;
+  // Queued token-work: prompt tokens of waiting requests not served from the
+  // prefix cache; absent when the servicer cannot tell (distinct from 0).
+  optional uint32 waiting_uncached_tokens = 3;
+  // KV-cache utilization in [0, 1], as GetLoads reports it.
+  double token_usage = 4;
+  // Tokens generated per second, as GetLoads reports it (0 when not known).
+  double gen_throughput = 5;
+  // The engine's admission window (max running requests); 0 when unknown.
+  uint32 max_running_requests = 6;
+  // Age of the sample behind this record in milliseconds (0 when the
+  // servicer reads the engine's current stats).
+  uint32 age_ms = 7;
+  // Monotonic per stream: the subscriber can order records.
+  uint64 sample = 8;
+  bool load_only = 9;
+  // The engine's telemetry beyond the routing core, filled by each servicer
+  // with what its engine reports and left unset otherwise (absent is
+  // distinct from zero): what the gateway's smg_engine_* gauges and GET
+  // /loads show under pushes exactly as under a GetLoads poll. Sent on the
+  // heartbeat cadence (load_only batches and a stream's first record), not
+  // on every event batch; no routing input reads these fields.
+  optional double cache_hit_rate = 10;
+  optional int32 num_used_tokens = 11;
+  optional int32 max_total_num_tokens = 12;
+  optional EngineMemory memory = 13;
+  optional EngineQueues queues = 14;
+  optional EngineSpeculative speculative = 15;
+  optional EngineLora lora = 16;
+  optional EngineDisaggregation disaggregation = 17;
+}
+
+// The sections below mirror the SGLang scheduler's GetLoads messages field
+// for field (TokenSpeed reports memory and queues in the same shape; vLLM
+// reports none), so a servicer copies them through.
+message EngineMemory {
+  double weight_gb = 1;
+  double kv_cache_gb = 2;
+  double graph_gb = 3;
+  int32 token_capacity = 4;
+}
+
+message EngineQueues {
+  int32 waiting = 1;
+  int32 grammar = 2;
+  int32 paused = 3;
+  int32 retracted = 4;
+}
+
+message EngineSpeculative {
+  double accept_length = 1;
+  double accept_rate = 2;
+}
+
+message EngineLora {
+  int32 slots_used = 1;
+  int32 slots_total = 2;
+  double utilization = 3;
+}
+
+message EngineDisaggregation {
+  string mode = 1;  // "prefill", "decode", or "null"
+  int32 prefill_prealloc_queue_reqs = 2;
+  int32 prefill_inflight_queue_reqs = 3;
+  int32 decode_prealloc_queue_reqs = 4;
+  int32 decode_transfer_queue_reqs = 5;
+  int32 decode_retracted_queue_reqs = 6;
+  double kv_transfer_speed_gb_s = 7;
+  double kv_transfer_latency_ms = 8;
+}
+
+// One chunk of a state snapshot. A relay that keeps a bounded history serves a
+// subscriber without a usable cursor (start_sequence_number 0 once the history
+// no longer reaches back to the publisher's first batch) the engine's live
+// blocks as it recorded them from the stream, instead of live events only. The
+// `count` chunks of one snapshot carry consecutive sequence numbers ending at
+// the sequence the state was taken at, so live events continue after the last
+// chunk with no gap and no duplicate. Chunk 0 begins with an AllBlocksCleared
+// for the rank; the Stored events that follow list every live block, one event
+// per physical copy, parents before children, with the fields the original
+// store carried. Synthesized events have event_id 0. A subscriber applies the
+// chunks as a resync of the worker's state and sets its cursor to each chunk's
+// sequence number.
+message KvSnapshotChunk {
+  // 0-based position of this chunk in the snapshot.
+  uint32 index = 1;
+  // Chunks in the snapshot.
+  uint32 count = 2;
+  // Live blocks in the whole snapshot, physical copies counted.
+  uint64 blocks = 3;
+  // Publisher sequences before the relay's record that it never saw: 0 when
+  // the record covers the engine's whole life (the relay joined before the
+  // publisher's second batch, or the engine's replay reached back to the
+  // start); otherwise the snapshot lacks whatever those batches stored and
+  // did not remove since, and the subscriber should treat the worker as
+  // partially known.
+  uint64 unknown_before = 4;
 }
 
 message KvCacheEvent {
@@ -37,9 +154,65 @@ message KvCacheEvent {
   }
 }
 
+// Storage tier of a KV block, from the engine's `medium` (vLLM: GPU, CPU,
+// STORAGE; SGLang: GPU, CPU_PINNED, DISK, EXTERNAL). `KvBlock.cache_level`
+// mirrors it for older consumers: 0 device, 1 host, 2 disk, 3 external; a
+// block with neither set is on the device.
+enum KvCacheTier {
+  KV_CACHE_TIER_UNSPECIFIED = 0;
+  KV_CACHE_TIER_DEVICE = 1;
+  KV_CACHE_TIER_HOST = 2;
+  KV_CACHE_TIER_DISK = 3;
+  KV_CACHE_TIER_EXTERNAL = 4;
+}
+
+// Where the publishing engine says the blocks live relative to itself. Only
+// local blocks belong in a per-worker prefix index; remote ones describe a
+// shared pool.
+enum KvCacheLocality {
+  KV_CACHE_LOCALITY_UNSPECIFIED = 0;
+  KV_CACHE_LOCALITY_LOCAL = 1;
+  KV_CACHE_LOCALITY_REMOTE = 2;
+}
+
 message KvBlocksStored {
   repeated KvBlock blocks = 1;
   optional int64 parent_block_hash = 2;
+  // Tier the blocks were stored in (see KvCacheTier) and the engine's raw
+  // medium string it was derived from.
+  optional KvCacheTier tier = 3;
+  optional string medium = 4;
+  // KV cache group the blocks belong to (hybrid models publish one group per
+  // attention kind; only full-attention groups feed a prefix index).
+  optional uint32 group_idx = 5;
+  optional string kv_cache_spec_kind = 6;
+  optional uint32 kv_cache_spec_sliding_window = 7;
+  optional KvCacheLocality locality = 8;
+  // Who manages the blocks: the engine itself, or a residency agent.
+  optional string ownership = 9;
+  // Request context that stored the blocks (attribution only).
+  optional string session_id = 10;
+  // Cache namespace: LoRA adapter and cache salt the block hashes were
+  // computed under. Consumers fold them into their own content hashes.
+  optional string lora_name = 11;
+  optional string cache_salt = 12;
+}
+
+// One entry of vLLM's per-block `extra_keys`: the inputs beyond token ids
+// that went into the block hash, published untagged (a LoRA name or cache
+// salt as text, multimodal items as (identifier, offset), digests as bytes).
+message KvBlockExtraKey {
+  oneof key {
+    string text = 1;
+    bytes blob = 2;
+    int64 number = 3;
+    KvMultimodalKey multimodal = 4;
+  }
+}
+
+message KvMultimodalKey {
+  string identifier = 1;
+  int64 offset = 2;
 }
 
 message KvBlock {
@@ -48,14 +221,22 @@ message KvBlock {
   int32 block_size = 3;
   optional int64 lora_id = 4;
   optional int32 cache_level = 5;
+  repeated KvBlockExtraKey extra_keys = 6;
 }
 
 message KvBlocksRemoved {
   repeated int64 block_hashes = 1;
   optional int32 cache_level = 2;
+  optional KvCacheTier tier = 3;
+  optional string medium = 4;
+  optional uint32 group_idx = 5;
+  optional KvCacheLocality locality = 6;
+  optional string ownership = 7;
 }
 
-message KvCacheCleared {}
+message KvCacheCleared {
+  optional string ownership = 1;
+}
 
 // =====================
 // Admin Operations

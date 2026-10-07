@@ -73,6 +73,8 @@ class FakeServerArgs:
     )
     zmq_msgpack: bool = False
     skip_tokenizer_init: bool = False
+    rl_control_api_key: str | None = None
+    hf_token: str | None = None
     data_parallel_address: str = "127.0.0.1"
     data_parallel_rpc_port: int = 30500
     zmq_engine_index: int = 0
@@ -147,7 +149,7 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     monkeypatch.setenv("SMG_PAIRING_PROTOCOL", " nixl ")
     args = FakeServerArgs(
         kv_events_config='{"enable_kv_cache_events": true, "publisher": "zmq", '
-        '"endpoint": "tcp://*:5600", "topic": "kv"}',
+        '"endpoint": "tcp://*:5600", "replay_endpoint": "tcp://*:5601", "topic": "kv"}',
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=2)),
     )
     facts = rust.server_facts(args)
@@ -162,6 +164,7 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     assert facts["max_running_requests"] == 64
     assert facts["data_parallel_size"] == 2
     assert (facts["kv_events_endpoint"], facts["kv_events_topic"]) == ("tcp://*:5600", "kv")
+    assert facts["kv_events_replay_endpoint"] == "tcp://*:5601"
 
     monkeypatch.delenv("SMG_PAIRING_PROTOCOL")
     plain = rust.server_facts(FakeServerArgs())
@@ -169,6 +172,19 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     assert "dp_size" not in server_args and "pairing_protocol" not in server_args
     assert plain["data_parallel_size"] == 1
     assert plain["kv_events_endpoint"] == ""
+    assert plain["kv_events_replay_endpoint"] == ""
+
+
+def test_server_facts_never_carry_credentials(monkeypatch):
+    """The Rust server reports the same server args as the Python one, so the
+    in-engine RL control key and tokens must not leave the engine here either.
+    """
+    _stub_servicer_module(monkeypatch)
+    facts = rust.server_facts(FakeServerArgs(rl_control_api_key="s3cret", hf_token="hf_abc"))
+    server_args = json.loads(facts["server_args_json"])
+    assert "rl_control_api_key" not in server_args
+    assert "hf_token" not in server_args
+    assert server_args["model"] == "org/m", "non-secrets stay"
 
 
 def test_headless_server_args_dial_the_servicer():

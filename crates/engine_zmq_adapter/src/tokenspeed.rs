@@ -136,6 +136,7 @@ pub fn to_tokenspeed_response(
             completion_tokens: chunk.completion_tokens,
             cached_tokens: chunk.cached_tokens,
             output_logprobs: logprobs(chunk.output_logprobs),
+            weight_version: None,
             index: chunk.index,
         }),
         Response::Complete(complete) => {

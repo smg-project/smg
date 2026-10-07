@@ -544,7 +544,11 @@ impl WorkerSelectionStage {
             if capable.is_empty() {
                 return self.media_refs_shed(model_id);
             }
-            match placement::failure_from(&capable, model_id) {
+            match placement::failure_from(
+                &capable,
+                model_id,
+                self.worker_registry.overload_shed_enabled(),
+            ) {
                 PlacementFailure::AllOverloaded(shed) => return shed,
                 PlacementFailure::Unavailable
                 | PlacementFailure::PolicyDeclined(_)
@@ -668,7 +672,11 @@ impl WorkerSelectionStage {
             .filter(|w| wire.is_none_or(|c| w.metadata().spec.runtime_type == c.runtime))
             .cloned()
             .collect();
-        placement::failure_from(&candidates, model_id)
+        placement::failure_from(
+            &candidates,
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        )
     }
 
     #[expect(
@@ -1358,6 +1366,7 @@ mod tests {
     fn a_fully_vetoed_prefill_leg_sheds_rather_than_404s() {
         let model_id = "test-model-prefill-veto";
         let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.set_overload_shed(true);
         let (prefill_urls, _) = register_pd_workers(&worker_registry, model_id, 4);
 
         let stage = WorkerSelectionStage::new(
@@ -1658,6 +1667,7 @@ mod tests {
 
         let model_id = "test-model-overload-shed";
         let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.set_overload_shed(true);
         let mut workers = Vec::new();
         for i in 0..2 {
             let worker: Arc<dyn Worker> = Arc::new(
@@ -2012,6 +2022,9 @@ mod tests {
             }
         }
         worker_registry.set_worker_overloaded(&pinned.expect("vllm worker registered"), true);
+        // Under shedding; the steering default would route the retry to the
+        // vetoed worker instead, which is the other test's subject.
+        worker_registry.set_overload_shed(true);
 
         let stage = WorkerSelectionStage::new(
             worker_registry,
@@ -2081,6 +2094,8 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
             })),
             WorkerSelectionMode::Regular,
             None,
@@ -2262,12 +2277,75 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// The steering default: with every worker over the thresholds the gRPC
+    /// path routes to the least-loaded one instead of refusing, on the single
+    /// path and on both PD legs.
+    #[test]
+    fn grpc_all_overloaded_steers_to_the_least_loaded_by_default() {
+        let model_id = "test-model-overload-steer";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let mut workers = Vec::new();
+        for i in 0..2 {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", 8450 + i))
+                    .model(ModelCard::new(model_id))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .build(),
+            );
+            worker_registry.register(Arc::clone(&worker)).unwrap();
+            workers.push(worker);
+        }
+        workers[0].increment_load();
+        workers[0].increment_load();
+        workers[1].increment_load();
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        for worker in &workers {
+            worker_registry.set_worker_overloaded(worker, true);
+        }
+        let selected = stage
+            .select_single_worker(model_id, None, None, None, None, None, None, false)
+            .expect("the all-overloaded pool is steered, not refused");
+        assert_eq!(
+            selected.url(),
+            "grpc://127.0.0.1:8451",
+            "the least-loaded serves"
+        );
+
+        // PD: both legs vetoed still pair up.
+        let pd_model = "test-model-overload-steer-pd";
+        let pd_registry = Arc::new(WorkerRegistry::new());
+        let (prefill_urls, decode_urls) = register_pd_workers(&pd_registry, pd_model, 2);
+        let pd_stage = WorkerSelectionStage::new(
+            Arc::clone(&pd_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+        for url in prefill_urls.iter().chain(decode_urls.iter()) {
+            let worker = pd_registry.get_by_url(url).expect("registered");
+            pd_registry.set_worker_overloaded(&worker, true);
+        }
+        let (prefill, decode, _) = pd_stage
+            .select_pd_pair(pd_model, PlacementInputs::default(), None, None)
+            .expect("both legs over the thresholds still pair");
+        assert!(prefill_urls.contains(&prefill.url().to_string()));
+        assert!(decode_urls.contains(&decode.url().to_string()));
+    }
+
     /// Capable but overloaded workers keep the overload shed: its code,
     /// Retry-After and non-retryable marking survive worker mode.
     #[test]
     fn media_refs_overloaded_capable_workers_keep_the_overload_shed() {
         let model_id = "test-model-media-refs-overload";
         let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.set_overload_shed(true);
         let mut workers = Vec::new();
         for i in 0..2 {
             let worker = vllm_grpc_worker(

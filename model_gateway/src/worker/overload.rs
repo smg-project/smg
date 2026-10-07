@@ -2,16 +2,27 @@
 //!
 //! The predicate is evaluated once per ingested load report, never per request;
 //! the verdict is latched into routing state, which selection already reads.
+//!
+//! On by default, steering only: a worker over either threshold is left out
+//! of selection while another worker is under them, and when every worker is
+//! over them the request goes to the least-loaded of them (see
+//! `routers::common::overload`). Refusing requests with a 503 instead is the
+//! opt-in `--worker-overload-shed`.
 
 use openai_protocol::worker::{OverloadUpdate, WorkerLoadResponse};
 
 use crate::config::types::RouterConfig;
 
-/// Token-usage ceiling applied when protection is enabled by
-/// `--worker-overload-protection` alone. KV token usage means the same thing
-/// on every engine; a waiting-requests default would be workload-dependent, so
-/// that signal stays unset unless configured.
-pub const DEFAULT_TOKEN_USAGE_CEILING: f64 = 0.9;
+/// Default KV token-usage ceiling (mean across DP ranks). On the replay
+/// harness this is the setting that keeps `cache_aware`'s hit rate while
+/// cutting its tail; the hardware fleet sits near 0.9 under load, so a
+/// higher ceiling never fires there.
+pub const DEFAULT_TOKEN_USAGE_CEILING: f64 = 0.8;
+
+/// Default waiting-requests ceiling (summed across DP ranks): the signal that
+/// trips first on the hardware fleet, where the KV pools fill slowly and the
+/// queue forms in front of the engine.
+pub const DEFAULT_WAITING_REQUESTS: usize = 8;
 
 /// Decision-log branch: every worker selection could have used is overloaded,
 /// so the request is shed immediately instead of queued.
@@ -21,6 +32,17 @@ pub const BRANCH_ALL_OVERLOADED_SHED: &str = "all_overloaded_shed";
 /// between selection and dispatch. Distinct from the fleet-wide shed above —
 /// here every other worker may well be idle.
 pub const BRANCH_OVERLOADED_AT_DISPATCH: &str = "overloaded_at_dispatch";
+
+/// Decision-log branch: every worker selection could have used is over the
+/// thresholds and shedding is off, so the request goes to the least-loaded
+/// of them instead of being refused.
+pub const BRANCH_ALL_OVERLOADED_FALLBACK: &str = "all_overloaded_fallback";
+
+/// Decision-log branch: every worker selection could have used is vetoed and
+/// the only ones left ready are vetoed by the liveness tracker, so the request
+/// goes to the least-loaded of them instead of being refused: a veto steers,
+/// it never empties the pool.
+pub const BRANCH_ALL_STALLED_FALLBACK: &str = "all_stalled_fallback";
 
 /// Decision-log branch: the decode leg of a disaggregated pair was already
 /// running its full engine window and no slot freed inside the admission wait.
@@ -59,19 +81,18 @@ impl OverloadThresholds {
         self.waiting_requests.is_some() || self.token_usage.is_some()
     }
 
-    /// Gateway-level thresholds: the explicit `--worker-overload-*` values,
-    /// with the token ceiling defaulted to [`DEFAULT_TOKEN_USAGE_CEILING`]
-    /// when `--worker-overload-protection` enables the feature without one.
-    /// Everything unset with the flag off disables protection — exact #2220
-    /// behavior.
+    /// Gateway-level thresholds: the `--worker-overload-*` values, which
+    /// default to [`DEFAULT_WAITING_REQUESTS`] and
+    /// [`DEFAULT_TOKEN_USAGE_CEILING`]. `--disable-worker-overload-protection`
+    /// (`worker_overload_protection: false`) switches both off whatever the
+    /// thresholds say; per-worker `overload` blocks still apply on top.
     pub fn from_gateway_config(config: &RouterConfig) -> Self {
+        if !config.worker_overload_protection {
+            return Self::default();
+        }
         Self {
             waiting_requests: config.worker_overload_waiting_requests,
-            token_usage: config.worker_overload_token_usage.or_else(|| {
-                config
-                    .worker_overload_protection
-                    .then_some(DEFAULT_TOKEN_USAGE_CEILING)
-            }),
+            token_usage: config.worker_overload_token_usage,
         }
     }
 
@@ -175,41 +196,42 @@ mod tests {
         }
     }
 
-    /// The flag alone enables protection with the engine-universal token
-    /// ceiling and no waiting-requests threshold.
+    /// The gateway defaults enable protection on both signals.
     #[test]
-    fn protection_flag_alone_defaults_the_token_ceiling() {
-        let thresholds = OverloadThresholds::from_gateway_config(&gateway_config(true, None, None));
+    fn protection_is_on_by_default_on_both_signals() {
+        let thresholds = OverloadThresholds::from_gateway_config(&RouterConfig::default());
         assert_eq!(
             thresholds,
             OverloadThresholds {
-                waiting_requests: None,
+                waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
                 token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
             }
         );
         assert!(thresholds.is_enabled());
+        assert!(!RouterConfig::default().worker_overload_shed);
     }
 
-    /// Explicit thresholds override the flag's default; without either, the
-    /// feature stays exactly off (#2220 back-compat).
+    /// Explicit thresholds replace the defaults; disabling protection switches
+    /// both signals off whatever the thresholds say.
     #[test]
-    fn explicit_thresholds_override_the_flag_default() {
+    fn explicit_thresholds_replace_the_defaults_and_disabling_wins() {
         let explicit =
-            OverloadThresholds::from_gateway_config(&gateway_config(true, Some(8), Some(0.5)));
+            OverloadThresholds::from_gateway_config(&gateway_config(true, Some(64), Some(0.5)));
         assert_eq!(explicit.token_usage, Some(0.5));
-        assert_eq!(explicit.waiting_requests, Some(8));
+        assert_eq!(explicit.waiting_requests, Some(64));
 
-        let no_flag =
-            OverloadThresholds::from_gateway_config(&gateway_config(false, Some(8), None));
+        let one_signal =
+            OverloadThresholds::from_gateway_config(&gateway_config(true, None, Some(0.5)));
         assert_eq!(
-            no_flag,
+            one_signal,
             OverloadThresholds {
-                waiting_requests: Some(8),
-                token_usage: None,
+                waiting_requests: None,
+                token_usage: Some(0.5),
             }
         );
 
-        let off = OverloadThresholds::from_gateway_config(&gateway_config(false, None, None));
+        let off =
+            OverloadThresholds::from_gateway_config(&gateway_config(false, Some(8), Some(0.8)));
         assert!(!off.is_enabled());
     }
 

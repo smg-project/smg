@@ -246,7 +246,10 @@ runs the scheduler(s) headless in a spawned child over the msgpack ZMQ wire,
 and supervises both. What that wire does not carry is reported, not emulated:
 `FlushCache` and profiling answer UNIMPLEMENTED, ranked `top_logprobs` and
 prompt logprobs are refused, and PD/EPD disaggregation stays with the Python
-implementation. Tuning: `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
+implementation, as do the RL control-plane extras (the `rl.*` advertisement,
+the live `weight_version` on generate responses, `is_paused`); the Rust server
+redacts credentials from `server_args` the same way. Tuning:
+`SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800, as for vLLM
 above), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS` (default 4).
@@ -269,14 +272,25 @@ To retain cache knowledge across a recoverable event gap, configure SGLang's
 The bridge subscribes to live events before requesting missed batches from the
 replay endpoint, preserves publisher sequence numbers, and removes overlap at
 handoff. Both subscriptions currently use DP rank 0; allocate non-overlapping
-port ranges if multiple DP ranks publish events.
+port ranges if multiple DP ranks publish events. The Rust servicer's relay
+uses the same replay endpoint (the vLLM, SGLang and TokenSpeed launchers all
+pass `replay_endpoint` from the engine's kv-events config) for gaps in flight
+and for the batches published before its subscription joined the publisher;
+without one those are counted as lost or unknown, never silently skipped.
 
 Without replay, or when history is expired, empty, malformed, or unavailable
 (timeout: five seconds), the bridge reports `OUT_OF_RANGE` before streaming or
 `DATA_LOSS` after streaming starts. SMG discards that worker's stale mappings and
 resubscribes with zero. A zero cursor rebuilds knowledge from subsequent live
-events; it is not a complete cache snapshot. An empty replay is conservatively
-reset because it cannot distinguish an idle publisher from a restarted one.
+events; it is not a complete cache snapshot: this bridge relays per call and
+keeps no history or block record between calls, so it has nothing older to
+serve. The Rust servicer's relay (`crates/engine_servicer`, the vLLM servicer
+and `SMG_SGLANG_SERVICER_IMPL=rust`) does: it keeps a bounded history and the
+engine's live blocks for the servicer's lifetime, serves the history to a
+subscription from zero while it is complete, and a state snapshot
+(`KvSnapshotChunk`) before live events once the window has rolled. An empty
+replay is conservatively reset because it cannot distinguish an idle publisher
+from a restarted one.
 
 #### Rust request path (`SMG_SGLANG_SERVICER_IMPL=rust`)
 

@@ -68,128 +68,249 @@ const ARGUMENTS_KEYS: [&str; 2] = ["arguments", "parameters"];
 /// outline. Members are read in order; a member whose key or value has not finished arriving ends
 /// the reading, with the arguments span open if that member is the arguments.
 pub fn outline(text: &str) -> Outline {
-    let mut found = Outline::default();
-    let Some(open) = after_whitespace(text, 0) else {
-        return found;
-    };
-    if !text[open..].starts_with('{') {
-        return found;
+    let mut scanner = Scanner::default();
+    scanner.advance(text);
+    scanner.found().clone()
+}
+
+/// The outline taken as the object arrives: it keeps its place and its state between pieces, so
+/// the text grows by appending and each byte is read once. `advance` takes the whole text so
+/// far, reads only what came after the last call, and the outline in `found` is the one
+/// [`outline`] gives for that text.
+#[derive(Clone, Debug, Default)]
+pub struct Scanner {
+    found: Outline,
+    /// Bytes read so far.
+    at: usize,
+    stage: Stage,
+}
+
+#[derive(Clone, Debug, Default)]
+enum Stage {
+    /// Before the opening brace.
+    #[default]
+    Start,
+    /// After the brace or a comma, before a key.
+    Member,
+    /// Inside the key's string, which opened at `start`.
+    Key { start: usize, escaped: bool },
+    /// After the key, before the colon.
+    Colon { key: Member },
+    /// After the colon, before the value.
+    ValueStart { key: Member },
+    /// Inside the value, which started at `start`.
+    Value {
+        key: Member,
+        start: usize,
+        shape: Shape,
+    },
+    /// Nothing more is read: the object closed, or the outline stopped where it could say nothing
+    /// it would have to take back.
+    Done,
+}
+
+/// Which of the call's members a key names, decided once the key is whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Member {
+    Name,
+    Arguments,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Shape {
+    String {
+        escaped: bool,
+    },
+    /// A container, with the brackets open inside it and the string state.
+    Container {
+        depth: usize,
+        in_string: bool,
+        escaped: bool,
+    },
+    /// A number or a literal: it ends at a delimiter or whitespace, and may still grow at the
+    /// end of the text.
+    Scalar,
+}
+
+impl Scanner {
+    /// What the text so far reveals.
+    pub fn found(&self) -> &Outline {
+        &self.found
     }
-    let mut at = open + 1;
-    loop {
-        let Some(key_start) = after_whitespace(text, at) else {
-            return found;
-        };
-        if text[key_start..].starts_with('}') {
-            found.close = Some(key_start + 1);
-            return found;
-        }
-        if text[key_start..].starts_with(',') {
-            at = key_start + 1;
-            continue;
-        }
-        let Some(key_end) = string_end(text, key_start) else {
-            return found;
-        };
-        let Some(colon) = after_whitespace(text, key_end) else {
-            return found;
-        };
-        if !text[colon..].starts_with(':') {
-            return found;
-        }
-        let Some(value_start) = after_whitespace(text, colon + 1) else {
-            return found;
-        };
-        if text[value_start..].starts_with([',', '}', ']', ':']) {
-            // A delimiter where a value should start: the object is malformed from here, and the
-            // outline says nothing it would have to take back.
-            return found;
-        }
-        let value_end = value_end(text, value_start);
-        let key = decode_string(&text[key_start..key_end]);
-        if found.name.is_none() && key.as_deref().is_some_and(|k| NAME_KEYS.contains(&k)) {
-            if let Some(end) = value_end {
-                found.name = decode_string(&text[value_start..end]);
+
+    /// Read the bytes of `text` that came after the last call; `text` holds every byte fed so
+    /// far, in order.
+    pub fn advance(&mut self, text: &str) {
+        while self.at < text.len() {
+            if matches!(self.stage, Stage::Done) {
+                return;
+            }
+            let c = text[self.at..].chars().next().unwrap_or('\0');
+            let consumed = self.step(text, c);
+            if consumed {
+                self.at += c.len_utf8();
             }
         }
-        if found.arguments.is_none() && key.as_deref().is_some_and(|k| ARGUMENTS_KEYS.contains(&k))
-        {
-            found.arguments = Some(Span {
-                start: value_start,
-                end: value_end,
-            });
-        }
-        match value_end {
-            Some(end) => at = end,
-            None => return found,
-        }
     }
-}
 
-/// The first byte at or after `at` that is not whitespace, if any.
-fn after_whitespace(text: &str, at: usize) -> Option<usize> {
-    text[at..]
-        .char_indices()
-        .find(|(_, c)| !c.is_whitespace())
-        .map(|(i, _)| at + i)
-}
-
-/// One past the closing quote of the string starting at `at`, if the string is complete.
-fn string_end(text: &str, at: usize) -> Option<usize> {
-    if !text[at..].starts_with('"') {
-        return None;
-    }
-    let mut escaped = false;
-    for (i, c) in text[at + 1..].char_indices() {
-        match (escaped, c) {
-            (true, _) => escaped = false,
-            (false, '\\') => escaped = true,
-            (false, '"') => return Some(at + 1 + i + 1),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// One past the last byte of the value starting at `at`, if the value is complete.
-///
-/// Objects and arrays end at their matching bracket, strings at their closing quote, and numbers
-/// and literals at the first byte that cannot continue them, which exists only once something
-/// follows them: a number cut at the end of the text may still grow. Bracket kinds are not told
-/// apart (a `]` closes a `{` at the same depth) and any Unicode whitespace separates: the outline
-/// finds where the model's value ends, and whether that value is valid JSON is for the format to
-/// decide when it parses the bytes.
-fn value_end(text: &str, at: usize) -> Option<usize> {
-    let rest = &text[at..];
-    match rest.chars().next()? {
-        '"' => string_end(text, at),
-        '{' | '[' => {
-            let mut depth = 0usize;
-            let mut in_string = false;
-            let mut escaped = false;
-            for (i, c) in rest.char_indices() {
-                match (in_string, escaped, c) {
-                    (true, true, _) => escaped = false,
-                    (true, false, '\\') => escaped = true,
-                    (true, false, '"') => in_string = false,
-                    (true, false, _) => {}
-                    (false, _, '"') => in_string = true,
-                    (false, _, '{' | '[') => depth += 1,
-                    (false, _, '}' | ']') => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(at + i + c.len_utf8());
-                        }
+    /// One character; whether it was consumed, or is to be read again in the next stage.
+    fn step(&mut self, text: &str, c: char) -> bool {
+        let at = self.at;
+        match &mut self.stage {
+            Stage::Start => {
+                if c.is_whitespace() {
+                    return true;
+                }
+                self.stage = if c == '{' { Stage::Member } else { Stage::Done };
+                c == '{'
+            }
+            Stage::Member => match c {
+                _ if c.is_whitespace() || c == ',' => true,
+                '}' => {
+                    self.found.close = Some(at + 1);
+                    self.stage = Stage::Done;
+                    true
+                }
+                '"' => {
+                    self.stage = Stage::Key {
+                        start: at,
+                        escaped: false,
+                    };
+                    true
+                }
+                _ => {
+                    self.stage = Stage::Done;
+                    false
+                }
+            },
+            Stage::Key { start, escaped } => {
+                match (*escaped, c) {
+                    (true, _) => *escaped = false,
+                    (false, '\\') => *escaped = true,
+                    (false, '"') => {
+                        let key = match decode_string(&text[*start..=at]).as_deref() {
+                            Some(key) if NAME_KEYS.contains(&key) && self.found.name.is_none() => {
+                                Member::Name
+                            }
+                            Some(key)
+                                if ARGUMENTS_KEYS.contains(&key)
+                                    && self.found.arguments.is_none() =>
+                            {
+                                Member::Arguments
+                            }
+                            _ => Member::Other,
+                        };
+                        self.stage = Stage::Colon { key };
                     }
                     _ => {}
                 }
+                true
             }
-            None
+            Stage::Colon { key } => {
+                if c.is_whitespace() {
+                    return true;
+                }
+                self.stage = if c == ':' {
+                    Stage::ValueStart { key: *key }
+                } else {
+                    Stage::Done
+                };
+                c == ':'
+            }
+            Stage::ValueStart { key } => {
+                if c.is_whitespace() {
+                    return true;
+                }
+                if matches!(c, ',' | '}' | ']' | ':') {
+                    // A delimiter where a value should start: the object is malformed from
+                    // here, and the outline says nothing it would have to take back.
+                    self.stage = Stage::Done;
+                    return false;
+                }
+                let key = *key;
+                if key == Member::Arguments {
+                    self.found.arguments = Some(Span {
+                        start: at,
+                        end: None,
+                    });
+                }
+                let shape = match c {
+                    '"' => Shape::String { escaped: false },
+                    '{' | '[' => Shape::Container {
+                        depth: 1,
+                        in_string: false,
+                        escaped: false,
+                    },
+                    _ => Shape::Scalar,
+                };
+                self.stage = Stage::Value {
+                    key,
+                    start: at,
+                    shape,
+                };
+                true
+            }
+            Stage::Value { key, start, shape } => {
+                let (key, start) = (*key, *start);
+                match shape {
+                    Shape::String { escaped } => {
+                        match (*escaped, c) {
+                            (true, _) => *escaped = false,
+                            (false, '\\') => *escaped = true,
+                            (false, '"') => self.value_ends(text, key, start, at + 1),
+                            _ => {}
+                        }
+                        true
+                    }
+                    Shape::Container {
+                        depth,
+                        in_string,
+                        escaped,
+                    } => {
+                        match (*in_string, *escaped, c) {
+                            (true, true, _) => *escaped = false,
+                            (true, false, '\\') => *escaped = true,
+                            (true, false, '"') => *in_string = false,
+                            (true, false, _) => {}
+                            (false, _, '"') => *in_string = true,
+                            (false, _, '{' | '[') => *depth += 1,
+                            (false, _, '}' | ']') => {
+                                *depth -= 1;
+                                if *depth == 0 {
+                                    self.value_ends(text, key, start, at + c.len_utf8());
+                                }
+                            }
+                            _ => {}
+                        }
+                        true
+                    }
+                    Shape::Scalar => {
+                        if matches!(c, ',' | '}' | ']') || c.is_whitespace() {
+                            self.value_ends(text, key, start, at);
+                            return false;
+                        }
+                        true
+                    }
+                }
+            }
+            Stage::Done => false,
         }
-        _ => rest
-            .char_indices()
-            .find(|(_, c)| matches!(c, ',' | '}' | ']') || c.is_whitespace())
-            .map(|(i, _)| at + i),
+    }
+
+    /// The value from `start` is complete at `end`: the name is decoded, the arguments span
+    /// closes, and the next member follows.
+    fn value_ends(&mut self, text: &str, key: Member, start: usize, end: usize) {
+        match key {
+            Member::Name => self.found.name = decode_string(&text[start..end]),
+            Member::Arguments => {
+                if let Some(span) = &mut self.found.arguments {
+                    span.end = Some(end);
+                }
+            }
+            Member::Other => {}
+        }
+        self.stage = Stage::Member;
     }
 }
 

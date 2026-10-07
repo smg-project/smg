@@ -218,7 +218,9 @@ pub fn create_test_app_with_context(
 )]
 pub async fn create_test_app_context() -> Arc<AppContext> {
     let router_config = RouterConfig::default();
-    let client = Client::new();
+    // A test's upstreams are its own loopback servers; the environment's
+    // proxy would otherwise sit in the path of every request.
+    let client = Client::builder().no_proxy().build().expect("test client");
 
     // Initialize empty OnceLocks
     let worker_job_queue = Arc::new(OnceLock::new());

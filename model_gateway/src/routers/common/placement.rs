@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use axum::{http::HeaderMap, response::Response};
+use rand::RngExt;
 use tracing::{debug, warn};
 
 use crate::{
@@ -25,6 +26,7 @@ use crate::{
     },
     routers::common::{header_utils, overload},
     worker::{
+        overload::{BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION},
         ConnectionMode, ConnectionModeExt, PdPairIndex, PrefillCandidateError,
         PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry,
     },
@@ -229,7 +231,7 @@ pub(crate) fn select_from(
         &filtered
     };
     if available.is_empty() {
-        return None;
+        return overload_fallback(registry, policy.name(), model_id, candidates);
     }
 
     // Cached hash ring for consistent hashing (O(log n) lookup).
@@ -237,7 +239,7 @@ pub(crate) fn select_from(
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
-    let idx = policies.select_worker_for_model(
+    let Some(idx) = policies.select_worker_for_model(
         &policy,
         model_id,
         available,
@@ -251,7 +253,11 @@ pub(crate) fn select_from(
             hash_ring,
             leg: WorkerLeg::Single,
         },
-    )?;
+    ) else {
+        // A policy that filters availability itself misses on an
+        // all-overloaded pool the same way the pre-filter empties.
+        return overload_fallback(registry, policy.name(), model_id, candidates);
+    };
     let selected = available[idx].clone();
 
     Metrics::record_worker_selection(
@@ -264,6 +270,33 @@ pub(crate) fn select_from(
     Some(selected)
 }
 
+/// The steering default for a pool whose every worker is vetoed, by the
+/// overload thresholds or by the liveness tracker: its least-loaded routable
+/// worker, recorded as a selection under `policy`. Under
+/// `--worker-overload-shed` an overloaded worker is never taken (the caller
+/// sheds an all-overloaded pool); `None` when the pool is not all-vetoed or
+/// has nothing routable.
+fn overload_fallback(
+    registry: &WorkerRegistry,
+    policy: &'static str,
+    model_id: &str,
+    candidates: &[Arc<dyn Worker>],
+) -> Option<Arc<dyn Worker>> {
+    let selected = overload::fallback_if_all_vetoed(
+        candidates,
+        model_id,
+        STAGE_SELECTION,
+        registry.overload_shed_enabled(),
+    )?;
+    Metrics::record_worker_selection(
+        metrics_labels::WORKER_REGULAR,
+        selected.connection_mode().as_metric_label(),
+        model_id,
+        policy,
+    );
+    Some(selected)
+}
+
 /// Classify a failed single-worker placement from the same pool it drew from.
 pub(crate) fn single_failure(
     registry: &WorkerRegistry,
@@ -272,18 +305,131 @@ pub(crate) fn single_failure(
     wire: Option<WireConstraint>,
 ) -> PlacementFailure {
     let candidates = candidates(registry, model_id, pool, wire);
-    failure_from(candidates.as_slice(), model_id)
+    failure_from(
+        candidates.as_slice(),
+        model_id,
+        registry.overload_shed_enabled(),
+    )
 }
 
-/// Classify a failed placement from the candidates it drew from.
-pub(crate) fn failure_from(candidates: &[Arc<dyn Worker>], model_id: &str) -> PlacementFailure {
+/// Classify a failed placement from the candidates it drew from. `shed` is
+/// `--worker-overload-shed`: without it an all-overloaded pool was already
+/// steered by the placement, so reaching here means nothing was routable.
+pub(crate) fn failure_from(
+    candidates: &[Arc<dyn Worker>],
+    model_id: &str,
+    shedding: bool,
+) -> PlacementFailure {
     if candidates.is_empty() {
         return PlacementFailure::NoCandidates;
     }
-    if let Some(shed) = overload::shed_if_all_overloaded(candidates, model_id) {
+    if let Some(shed) = overload::shed_if_all_overloaded(candidates, model_id, shedding) {
         return PlacementFailure::AllOverloaded(shed);
     }
     PlacementFailure::Unavailable
+}
+
+/// The steering default for a disaggregated placement whose failed leg is
+/// vetoed on every worker, by the overload thresholds or by the liveness
+/// tracker: the least-loaded routable prefill that has a routable partner,
+/// paired with its least-loaded routable partner. Pairs vetoed by overload
+/// alone come first; a liveness veto is crossed only when nothing else pairs,
+/// and never onto an overloaded worker under `--worker-overload-shed`.
+/// `None` when the failed leg is not all-vetoed (an unhealthy leg keeps its
+/// unavailable answer), when it is all-overloaded under shedding (the caller
+/// sheds), or when nothing pairs; a prefill admission gate still has the last
+/// word.
+fn relaxed_pair(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    inputs: &PlacementInputs<'_>,
+    failed_leg: &[Arc<dyn Worker>],
+) -> Option<Result<Pair, Box<PairFailure>>> {
+    let shedding = registry.overload_shed_enabled();
+    if !overload::all_vetoed(failed_leg) || (shedding && overload::all_overloaded(failed_leg)) {
+        return None;
+    }
+    let eligible = |w: &Arc<dyn Worker>| {
+        w.is_healthy()
+            && w.circuit_breaker_can_execute()
+            && wire.is_none_or(|wire| {
+                w.metadata().spec.runtime_type == wire.runtime
+                    && *w.connection_mode() == wire.connection
+            })
+            && inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(w.as_ref()))
+    };
+    // Equal loads draw uniformly (partner and pair alike), so an equally
+    // loaded leg does not send every fallback to its first pair.
+    let mut rng = rand::rng();
+    let mut search = |routable: &dyn Fn(&Arc<dyn Worker>) -> bool| {
+        let mut best: Option<(Arc<dyn Worker>, Arc<dyn Worker>)> = None;
+        let mut tied = 0u32;
+        for (i, prefill) in pairs.prefill.iter().enumerate() {
+            if !routable(prefill) {
+                continue;
+            }
+            let Some(decode) = overload::least_loaded_uniform(
+                pairs.partners[i].iter().filter(|d| routable(d)),
+                &mut rng,
+            ) else {
+                continue;
+            };
+            let loads = (prefill.load(), decode.load());
+            match best.as_ref().map(|(p, d)| (p.load(), d.load())) {
+                Some(best_loads) if loads > best_loads => {}
+                Some(best_loads) if loads == best_loads => {
+                    tied += 1;
+                    if rng.random_range(0..=tied) == 0 {
+                        best = Some((Arc::clone(prefill), Arc::clone(decode)));
+                    }
+                }
+                _ => {
+                    best = Some((Arc::clone(prefill), Arc::clone(decode)));
+                    tied = 0;
+                }
+            }
+        }
+        best
+    };
+    let overloaded_first = (!shedding)
+        .then(|| search(&|w| eligible(w) && w.stall_reason().is_none()))
+        .flatten();
+    let ((prefill, decode), branch) = match overloaded_first {
+        Some(pair) => (pair, BRANCH_ALL_OVERLOADED_FALLBACK),
+        None => (
+            search(&|w| eligible(w) && !(shedding && w.is_overloaded()))?,
+            BRANCH_ALL_STALLED_FALLBACK,
+        ),
+    };
+    if prefill_capacity.is_some_and(|capacity| !capacity.has_capacity(&prefill)) {
+        return Some(Err(Box::new(PairFailure {
+            leg: WorkerLeg::Prefill,
+            verdict: PlacementFailure::PrefillAtCapacity,
+        })));
+    }
+    if branch == BRANCH_ALL_OVERLOADED_FALLBACK {
+        Metrics::record_worker_overload_fallback(STAGE_SELECTION);
+    } else {
+        Metrics::record_worker_liveness_fallback(STAGE_SELECTION);
+    }
+    debug!(
+        branch,
+        prefill = %prefill.url(),
+        decode = %decode.url(),
+        model_id,
+        "Veto fallback"
+    );
+    let runtime = prefill.metadata().spec.runtime_type;
+    Some(Ok(Pair {
+        prefill,
+        decode,
+        runtime,
+    }))
 }
 
 /// Pick a prefill/decode pair for `model_id`, one worker per leg, each under
@@ -367,10 +513,21 @@ pub(crate) fn select_pair(
         pairs.partners[i].iter().any(|d| partner_open(d, runtime))
     };
     if !pairs.prefill.iter().any(&eligible) {
+        if let Some(pair) = relaxed_pair(
+            registry,
+            model_id,
+            pairs,
+            wire,
+            prefill_capacity,
+            &inputs,
+            &pairs.prefill,
+        ) {
+            return pair;
+        }
         debug!("No available prefill workers");
         return Err(fail(
             WorkerLeg::Prefill,
-            failure_from(&pairs.prefill, model_id),
+            failure_from(&pairs.prefill, model_id, registry.overload_shed_enabled()),
         ));
     }
     let leg_runtime = homogeneous_runtime
@@ -409,10 +566,25 @@ pub(crate) fn select_pair(
         );
     }
     if open.is_empty() {
+        if let Some(pair) = relaxed_pair(
+            registry,
+            model_id,
+            pairs,
+            wire,
+            prefill_capacity,
+            &inputs,
+            &pairs.decode_pool,
+        ) {
+            return pair;
+        }
         debug!(?leg_runtime, "No available PD pair");
         return Err(fail(
             WorkerLeg::Decode,
-            failure_from(&pairs.decode_pool, model_id),
+            failure_from(
+                &pairs.decode_pool,
+                model_id,
+                registry.overload_shed_enabled(),
+            ),
         ));
     }
 
@@ -1059,7 +1231,7 @@ mod tests {
         .expect("the narrowed slice still has a worker");
         assert_eq!(selected.url(), "http://h:2");
         assert!(matches!(
-            failure_from(&[], MODEL),
+            failure_from(&[], MODEL, false),
             PlacementFailure::NoCandidates
         ));
     }

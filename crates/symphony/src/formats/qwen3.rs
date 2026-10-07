@@ -1,287 +1,52 @@
-//! Qwen3: reasoning between `<think>` and `</think>`, each tool call a JSON object between
-//! `<tool_call>` and `</tool_call>`, everything else content.
+//! Qwen3: reasoning between `<think>` and `</think>`, each tool call between `<tool_call>` and
+//! `</tool_call>`, everything else content. Inside the call markers the family writes one of two
+//! syntaxes ([`CallSyntax`]): Qwen3 a JSON object, `{"name": …, "arguments": {…}}`; Qwen 3.5
+//! and later and Qwen3-Coder the tags `<function=NAME>` and `<parameter=KEY>` around each value's
+//! text, which the request's tools type.
 //!
-//! [`Qwen3`] is the first format and the first [`Parser`]. The scanner splits the model's text into
-//! content and the four markers, holding back a half-arrived marker; a region says what the text
-//! between markers is; inside a call region the [`Assembler`] turns the object into the call's
-//! events, streaming the model's own argument bytes. Every byte of the output lands in exactly one
-//! event: the markers as `Dropped { Wrapper }`, the whitespace between a call's object and its
-//! closing marker as `Dropped { Wrapper }` too, any other text there as `Malformed`, run by run so
-//! that where the chunks were cut changes nothing, and the rest as content, reasoning, or the
-//! call's events.
+//! The definition is the table below; the [`Engine`](crate::Engine) runs it, and decides
+//! everything the module doc of [`engine`](crate::engine) lists. Two things are Qwen3's own:
 //!
-//! What this format decides, and what it leaves open:
+//! - `calls + call_open = calls`: a new `<tool_call>` before the previous block closed ends the
+//!   call that was open and starts the next.
+//! - No row leaves reasoning on a call marker: Qwen3 closes its thought with `</think>` before a
+//!   call, so a `<tool_call>` inside the thought is reasoning text.
+//! - The turn opener is ChatML's `<|im_start|>assistant`.
 //!
-//! - Prose before a call, between two calls, and after the last call is content, and every complete
-//!   call in a chunk is emitted; the old parser dropped the first and stopped after one (smg #2788).
-//! - The template's separator bytes stay where the model put them: the newline after `<think>`, the
-//!   two after `</think>`, and so on are reasoning or content, not dropped. Whether they should be
-//!   is bellwether #17; `Dropped { Whitespace }` exists for the other answer.
-//! - A closing marker with nothing open (`</think>` in content) is content, as the model wrote it.
-//!   A marker inside a code fence, or inside a string in a call's arguments, is a marker, as for
-//!   every parser that reads markers: `</tool_call>` in an argument's text ends the call there.
-//!   Bellwether #16 is where that policy is judged.
-//! - A `<tool_call>` that never closes is finished at the end of the stream: a call with what
-//!   arrived, or the bytes as `Malformed { UnterminatedRegion }`. A block whose closing marker comes
-//!   before a complete call gives what is left as `Malformed` with a reason that says so, since
-//!   `UnterminatedRegion` means the stream ended inside the region.
-//! - Call ids are `call_<index>` for now; the id scheme is Simo's decision (deterministic or carrying
-//!   the conversation's history) and changes only this one line.
-//! - Text is `Text::uncounted`: token attribution from the input spans comes with the engine work;
-//!   `Finish::reasoning_tokens` is zero until then.
-//! - Tool names are not checked against the request's tools; the format has no tool list yet.
-//!
-//! The prompt is accepted first in the lifecycle and otherwise ignored: Qwen3 writes its own
-//! `<think>` into the output, so nothing about the prompt decides where the output starts.
+//! The tests here are the engine's as much as this format's: they were written against the
+//! hand-written parser this table replaced, and hold the table to the same events.
 
-use crate::{
-    event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
-    input::{EngineFinish, Input},
-    json::Assembler,
-    markers::{Piece, Scanner},
-    parser::{ParseError, Parser},
-};
+use crate::format::{CallSyntax, Emits, Format};
 
-const THINK_OPEN: usize = 0;
-const THINK_CLOSE: usize = 1;
-const CALL_OPEN: usize = 2;
-const CALL_CLOSE: usize = 3;
-const MARKERS: [&str; 4] = ["<think>", "</think>", "<tool_call>", "</tool_call>"];
-const BLOCK_WITHOUT_A_COMPLETE_CALL: &str = "a tool-call block that closed without a complete call";
-const TEXT_AFTER_THE_OBJECT: &str = "text between a call's object and its closing marker";
-
-/// Why a call region closed: its closing marker (or the next opener) arrived, or the stream ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Closed {
-    ByMarker,
-    ByEnd,
-}
-
-/// The Qwen3 format as a parser. One per generated choice.
-#[derive(Debug)]
-pub struct Qwen3 {
-    scanner: Scanner,
-    region: Region,
-    calls: u32,
-    stage: Stage,
-}
-
-#[derive(Debug)]
-enum Region {
-    Content,
-    Reasoning,
-    Call(Assembler),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stage {
-    Fresh,
-    Streaming,
-    Ended,
-}
-
-impl Default for Qwen3 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Qwen3 {
-    /// A parser at the start of an output.
-    pub fn new() -> Self {
-        Self {
-            scanner: Scanner::new(MARKERS),
-            region: Region::Content,
-            calls: 0,
-            stage: Stage::Fresh,
-        }
-    }
-
-    fn take(&mut self, piece: Piece, out: &mut Events) {
-        match piece {
-            Piece::Text(text) => self.text(&text, out),
-            Piece::Marker(index) => self.marker(index, out),
-        }
-    }
-
-    fn text(&mut self, text: &str, out: &mut Events) {
-        match &mut self.region {
-            Region::Content => out.push_content(Text::uncounted(text)),
-            Region::Reasoning => out.push_reasoning(Text::uncounted(text)),
-            Region::Call(assembler) => {
-                let taken = assembler.feed(text, out);
-                Self::surplus(&text[taken..], out);
-            }
-        }
-    }
-
-    /// Text after a call's object and before its closing marker: each run of whitespace is the
-    /// template's wrapping and is dropped, each run of anything else is malformed. Classifying run
-    /// by run keeps the result the same wherever the chunks were cut.
-    fn surplus(surplus: &str, out: &mut Events) {
-        let mut rest = surplus;
-        while let Some(first) = rest.chars().next() {
-            let space = first.is_whitespace();
-            let length = rest
-                .char_indices()
-                .find(|(_, c)| c.is_whitespace() != space)
-                .map_or(rest.len(), |(at, _)| at);
-            let run = Text::uncounted(&rest[..length]);
-            out.push(if space {
-                Event::Dropped {
-                    text: run,
-                    why: DropReason::Wrapper,
-                }
-            } else {
-                Event::Malformed {
-                    text: run,
-                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
-                }
-            });
-            rest = &rest[length..];
-        }
-    }
-
-    fn marker(&mut self, index: usize, out: &mut Events) {
-        let marker = MARKERS[index];
-        match (&mut self.region, index) {
-            (Region::Content, THINK_OPEN) => {
-                Self::drop_marker(marker, out);
-                out.push(Event::ReasoningStart);
-                self.region = Region::Reasoning;
-            }
-            (Region::Reasoning, THINK_CLOSE) => {
-                Self::drop_marker(marker, out);
-                out.push(Event::ReasoningEnd);
-                self.region = Region::Content;
-            }
-            (Region::Content, CALL_OPEN) => {
-                Self::drop_marker(marker, out);
-                self.open_call();
-            }
-            (Region::Call(_), CALL_CLOSE) => {
-                // The call's remaining events come before the marker that closed it, so the events'
-                // bytes stay in the output's order.
-                self.close_call(Closed::ByMarker, out);
-                Self::drop_marker(marker, out);
-            }
-            (Region::Call(_), CALL_OPEN) => {
-                // A new call before the previous one closed: finish what arrived, then start.
-                self.close_call(Closed::ByMarker, out);
-                Self::drop_marker(marker, out);
-                self.open_call();
-            }
-            // A closing marker with nothing open, or an opener inside a region that does not nest:
-            // the model's bytes, where the model put them.
-            (Region::Content, _) => out.push_content(Text::uncounted(marker)),
-            (Region::Reasoning, _) => out.push_reasoning(Text::uncounted(marker)),
-            (Region::Call(_), _) => self.text(marker, out),
-        }
-    }
-
-    /// The next call takes the next free index; the index is spent only if the region produces a
-    /// call, so a `<tool_call>` block that held no call does not count and does not leave a gap.
-    fn open_call(&mut self) {
-        let index = self.calls;
-        self.region = Region::Call(Assembler::new(index, format!("call_{index}")));
-    }
-
-    /// Ends the call region: the assembler closes what arrived. A region its marker closed reports
-    /// leftover bytes as a block without a complete call; `UnterminatedRegion` is kept for a region
-    /// the end of the stream cut.
-    fn close_call(&mut self, closed: Closed, out: &mut Events) {
-        if let Region::Call(assembler) = std::mem::replace(&mut self.region, Region::Content) {
-            if assembler.started() {
-                self.calls += 1;
-            }
-            let mut finished = Events::new();
-            assembler.finish(&mut finished);
-            for event in finished.drain() {
-                out.push(match event {
-                    Event::Malformed {
-                        text,
-                        why: MalformedReason::UnterminatedRegion,
-                    } if closed == Closed::ByMarker => Event::Malformed {
-                        text,
-                        why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
-                    },
-                    event => event,
-                });
-            }
-        }
-    }
-
-    fn drop_marker(marker: &str, out: &mut Events) {
-        out.push(Event::Dropped {
-            text: Text::uncounted(marker),
-            why: DropReason::Wrapper,
-        });
-    }
-
-    fn end(&mut self, finish: EngineFinish, out: &mut Events) {
-        let scanner = std::mem::replace(&mut self.scanner, Scanner::new(MARKERS));
-        for piece in scanner.finish() {
-            self.take(piece, out);
-        }
-        match &self.region {
-            Region::Reasoning => {
-                out.push(Event::ReasoningEnd);
-                self.region = Region::Content;
-            }
-            Region::Call(_) => self.close_call(Closed::ByEnd, out),
-            Region::Content => {}
-        }
-        let reason = match finish {
-            EngineFinish::Stop => FinishReason::Stop,
-            EngineFinish::Length => FinishReason::Length,
-            EngineFinish::Abort => FinishReason::Abort,
-            EngineFinish::Other(other) => FinishReason::Other(other),
-        };
-        out.push(Event::Finish {
-            reason,
-            tool_calls: self.calls,
-            reasoning_tokens: 0,
-        });
-    }
-}
-
-impl Parser for Qwen3 {
-    fn feed(&mut self, input: Input<'_>, out: &mut Events) -> Result<(), ParseError> {
-        match input {
-            Input::Prompt { .. } => {
-                if self.stage != Stage::Fresh {
-                    return Err(ParseError::Lifecycle(
-                        "prompt after output began".to_string(),
-                    ));
-                }
-                self.stage = Stage::Streaming;
-                Ok(())
-            }
-            Input::Delta { text, .. } => {
-                if self.stage == Stage::Ended {
-                    return Err(ParseError::Lifecycle("delta after end".to_string()));
-                }
-                self.stage = Stage::Streaming;
-                for piece in self.scanner.feed(text) {
-                    self.take(piece, out);
-                }
-                Ok(())
-            }
-            Input::End { finish } => {
-                if self.stage == Stage::Ended {
-                    return Err(ParseError::Lifecycle("end after end".to_string()));
-                }
-                self.stage = Stage::Ended;
-                self.end(finish, out);
-                Ok(())
-            }
-        }
-    }
+/// The Qwen3 table, with the call syntax the checkpoint writes.
+pub fn qwen3(syntax: CallSyntax) -> Format {
+    Format::new("qwen3")
+        .terminal("think_open", "<think>")
+        .terminal("think_close", "</think>")
+        .terminal("call_open", "<tool_call>")
+        .terminal("call_close", "</tool_call>")
+        .state("content", Emits::Content)
+        .state("reasoning", Emits::Reasoning)
+        .state("calls", Emits::Arguments)
+        .transition("content", "think_open", "reasoning")
+        .transition("reasoning", "think_close", "content")
+        .transition("content", "call_open", "calls")
+        .transition("calls", "call_close", "content")
+        .transition("calls", "call_open", "calls")
+        .calls(syntax)
+        .opens_turn("<|im_start|>assistant")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        engine::{Engine, BLOCK_WITHOUT_A_COMPLETE_CALL, TEXT_AFTER_THE_OBJECT},
+        event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
+        input::{EngineFinish, Input, TokenSpan},
+        parser::{ParseError, Parser},
+        tagged::Declared,
+    };
 
     const CALL: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
 
@@ -294,7 +59,7 @@ mod tests {
     }
 
     fn run(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
-        let mut parser = Qwen3::new();
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
@@ -675,6 +440,300 @@ mod tests {
         );
     }
 
+    /// The spans of `tokens`, each a run of bytes, as one delta's spans.
+    fn spans_of(tokens: &[&str]) -> Vec<TokenSpan> {
+        let mut at = 0;
+        tokens
+            .iter()
+            .map(|token| {
+                let span = TokenSpan {
+                    token_id: 0,
+                    start: at,
+                    end: at + token.len(),
+                    continued: false,
+                };
+                at += token.len();
+                span
+            })
+            .collect()
+    }
+
+    fn counted(events: &[Event]) -> Vec<(String, Option<u32>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Content(t) | Event::Reasoning(t) => Some((t.text.clone(), t.tokens)),
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => {
+                    Some((text.text.clone(), text.tokens))
+                }
+                Event::ToolCallStart { source, .. }
+                | Event::ToolCallArguments { source, .. }
+                | Event::ToolCallEnd { source, .. } => Some((source.text.clone(), source.tokens)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_token_is_counted_once_in_the_event_that_carries_its_first_byte() {
+        let tokens = [
+            "<think>",
+            "\nplan",
+            "\n</think>",
+            "\n\nHi",
+            "<tool_call>",
+            "{\"name\": \"f\", ",
+            "\"arguments\": {}}",
+            "</tool_call>",
+        ];
+        let text: String = tokens.concat();
+        let spans = spans_of(&tokens);
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: &text,
+                    spans: &spans,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        assert_eq!(
+            counted(&events),
+            vec![
+                ("<think>".into(), Some(1)),
+                ("\nplan\n".into(), Some(2)),
+                ("</think>".into(), Some(0)),
+                ("\n\nHi".into(), Some(1)),
+                ("<tool_call>".into(), Some(1)),
+                ("{\"name\": \"f\", \"arguments\": ".into(), Some(2)),
+                ("{}".into(), Some(0)),
+                ("}".into(), Some(0)),
+                ("</tool_call>".into(), Some(1)),
+            ]
+        );
+        assert_eq!(
+            counted(&events)
+                .iter()
+                .map(|(_, n)| n.unwrap_or(0))
+                .sum::<u32>(),
+            tokens.len() as u32,
+            "every token exactly once"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reasoning_tokens: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn held_halves_of_a_character_count_as_reasoning_and_a_trailing_special_token_is_reported_once()
+    {
+        // The emoji is three tokens: two held halves with no bytes and a third carrying it.
+        let pieces: [(&str, &[(usize, usize)]); 8] = [
+            ("<think>", &[(0, 7)]),
+            ("\n", &[(0, 1)]),
+            ("", &[(0, 0)]),
+            ("", &[(0, 0)]),
+            ("🌍", &[(0, 4)]),
+            ("\n", &[(0, 1)]),
+            ("</think>", &[(0, 8)]),
+            ("", &[(0, 0)]),
+        ];
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        for (text, ranges) in pieces {
+            let spans: Vec<TokenSpan> = ranges
+                .iter()
+                .map(|&(start, end)| TokenSpan {
+                    token_id: 0,
+                    start,
+                    end,
+                    continued: false,
+                })
+                .collect();
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text,
+                        spans: &spans,
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+        }
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        assert_eq!(
+            counted(&events),
+            vec![
+                ("<think>".into(), Some(1)),
+                ("\n🌍\n".into(), Some(5)),
+                ("</think>".into(), Some(1)),
+                (String::new(), Some(1)),
+            ],
+            "the held halves count into the character they began; \
+             the trailing token is reported at the end"
+        );
+        assert_eq!(
+            events[events.len() - 2],
+            Event::Dropped {
+                text: Text::new("", 1),
+                why: DropReason::ControlToken,
+            }
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reasoning_tokens: 5,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_token_cut_by_a_delta_boundary_is_counted_once_and_a_special_token_counts_into_what_follows(
+    ) {
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        let first = [TokenSpan {
+            token_id: 1,
+            start: 0,
+            end: 4,
+            continued: false,
+        }];
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[1],
+                    text: "<thi",
+                    spans: &first,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        let second = [
+            TokenSpan {
+                token_id: 1,
+                start: 0,
+                end: 3,
+                continued: true,
+            },
+            TokenSpan {
+                token_id: 2,
+                start: 3,
+                end: 3,
+                continued: false,
+            },
+            TokenSpan {
+                token_id: 3,
+                start: 3,
+                end: 4,
+                continued: false,
+            },
+        ];
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[1, 2, 3],
+                    text: "nk>x",
+                    spans: &second,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        assert_eq!(
+            counted(&events),
+            vec![("<think>".into(), Some(1)), ("x".into(), Some(2))],
+            "the cut token once, where its first byte landed; \
+             the byte-less token into the text after it"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_turns_uncounted_reports_no_reasoning_count() {
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        let spans = [TokenSpan {
+            token_id: 0,
+            start: 0,
+            end: 8,
+            continued: false,
+        }];
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: "<think>a",
+                    spans: &spans,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(delta("b</think>"), &mut out)
+            .expect("a delta without spans");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        assert!(matches!(
+            out.as_slice().last(),
+            Some(Event::Finish {
+                reasoning_tokens: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn deltas_without_spans_leave_the_text_uncounted() {
+        let events = run(&["<think>a</think>b"], EngineFinish::Stop);
+        assert!(counted(&events).iter().all(|(_, n)| n.is_none()));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reasoning_tokens: 0,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn an_empty_output_is_only_its_finish() {
         assert_eq!(
@@ -687,9 +746,422 @@ mod tests {
         );
     }
 
+    /// A tool `get_weather` with a string `city` and an integer `days`.
+    fn declared() -> Declared {
+        use openai_protocol::common::{Function, Tool};
+        use serde_json::json as value;
+        Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                }}),
+                strict: None,
+            },
+        }])
+    }
+
+    const TAGGED_CALL: &str = concat!(
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>",
+        "\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
+    );
+
+    fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
+        let mut parser = Engine::new(qwen3(CallSyntax::Tagged), declared());
+        let mut out = Events::new();
+        for piece in pieces {
+            parser.feed(delta(piece), &mut out).expect("delta");
+        }
+        parser.feed(Input::End { finish }, &mut out).expect("end");
+        out.drain()
+    }
+
+    fn arguments_of(events: &[Event], call: u32) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { index, json, .. } if *index == call => {
+                    Some(json.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tagged_call_after_thinking_streams_its_string_and_writes_its_integer() {
+        let output = format!("<think>\nThe user asks.\n</think>\n\n{TAGGED_CALL}");
+        let events = run_tagged(&[&output], EngineFinish::Stop);
+        assert_eq!(
+            events[6..],
+            [
+                dropped("<tool_call>"),
+                Event::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "get_weather".into(),
+                    source: Text::uncounted("\n<function=get_weather>"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "{\"city\": \"".into(),
+                    source: Text::uncounted("\n<parameter=city>"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "Paris".into(),
+                    source: Text::uncounted("\nParis"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "\"".into(),
+                    source: Text::uncounted("\n</parameter>"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: ", \"days\": 3".into(),
+                    source: Text::uncounted("\n<parameter=days>\n3\n</parameter>"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "}".into(),
+                    source: Text::uncounted("\n"),
+                },
+                Event::ToolCallEnd {
+                    index: 0,
+                    source: Text::uncounted("</function>"),
+                },
+                dropped("\n"),
+                dropped("</tool_call>"),
+                Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 1,
+                    reasoning_tokens: 0,
+                },
+            ]
+        );
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris", "days": 3}"#);
+        assert_eq!(bytes(&events), output);
+    }
+
+    #[test]
+    fn two_tagged_calls_each_get_their_own_index_and_a_call_to_an_undeclared_tool_is_inferred() {
+        let second = concat!(
+            "<tool_call>\n<function=lookup>\n<parameter=id>\n42\n</parameter>",
+            "\n</function>\n</tool_call>"
+        );
+        let output = format!("{TAGGED_CALL}\n{second}");
+        let events = run_tagged(&[&output], EngineFinish::Stop);
+        let starts: Vec<(u32, String, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart {
+                    index, id, name, ..
+                } => Some((*index, id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (0, "call_0".to_string(), "get_weather".to_string()),
+                (1, "call_1".to_string(), "lookup".to_string()),
+            ]
+        );
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris", "days": 3}"#);
+        assert_eq!(arguments_of(&events, 1), r#"{"id": 42}"#);
+        assert_eq!(bytes(&events), output);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn a_tagged_block_its_marker_closes_early_ends_the_call_closed_and_a_cut_stream_leaves_it_open()
+    {
+        // The block's closing marker arrives before `</function>`: the string and the object close.
+        let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar</tool_call>";
+        let events = run_tagged(&[output], EngineFinish::Stop);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"}"#);
+        assert_eq!(bytes(&events), output);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "nothing was held when the marker came"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+        // The stream is cut instead: nothing closes, and the region is unterminated.
+        let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar";
+        let events = run_tagged(&[output], EngineFinish::Length);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"#);
+        assert_eq!(bytes(&events), output);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reason: FinishReason::Length,
+                tool_calls: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn every_chunking_of_a_tagged_output_says_the_same_and_accounts_for_every_byte() {
+        let output = format!("<think>\nplan\n</think>\n\nSure.\n{TAGGED_CALL}\nDone.");
+        let whole = joined(run_tagged(&[&output], EngineFinish::Stop));
+        let mut chunkings: Vec<Vec<&str>> = (1..output.len())
+            .map(|cut| vec![&output[..cut], &output[cut..]])
+            .collect();
+        chunkings.push(
+            output
+                .char_indices()
+                .map(|(i, c)| &output[i..i + c.len_utf8()])
+                .collect(),
+        );
+        for pieces in chunkings {
+            let events = run_tagged(&pieces, EngineFinish::Stop);
+            assert_eq!(bytes(&events), output, "{pieces:?}");
+            assert_eq!(joined(events), whole, "{pieces:?}");
+        }
+        assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris", "days": 3}"#);
+    }
+
+    /// The prompt, then the whole output in one delta, then the engine's stop.
+    fn after_prompt(prompt: &str, output: &str) -> Vec<Event> {
+        let mut parser = Engine::new(qwen3(CallSyntax::Tagged), declared());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser.feed(delta(output), &mut out).expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        out.drain()
+    }
+
+    #[test]
+    fn a_prompt_that_opens_the_thought_starts_the_output_in_reasoning() {
+        // Qwen 3.5's generation prompt ends with `<think>\n`. bellwether's qwen3.5-27b parse
+        // cases: an empty thought, closed at once, then the call.
+        let output = format!("\n</think>\n\n{TAGGED_CALL}");
+        let events = after_prompt("<|im_start|>assistant\n<think>\n", &output);
+        assert_eq!(
+            events[..5],
+            [
+                Event::ReasoningStart,
+                Event::Reasoning(Text::uncounted("\n")),
+                dropped("</think>"),
+                Event::ReasoningEnd,
+                Event::Content(Text::uncounted("\n\n")),
+            ]
+        );
+        assert_eq!(bytes(&events), output);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris", "days": 3}"#);
+
+        // A thought the stream ends inside is closed at the end, as one the model opened is.
+        let events = after_prompt("<think>\n", "still");
+        assert_eq!(
+            events[..3],
+            [
+                Event::ReasoningStart,
+                Event::Reasoning(Text::uncounted("still")),
+                Event::ReasoningEnd,
+            ]
+        );
+
+        // Thinking disabled: the prompt closed the thought itself, and the output is content.
+        let events = after_prompt("<|im_start|>assistant\n<think>\n\n</think>\n\n", "Hello");
+        assert_eq!(events[0], Event::Content(Text::uncounted("Hello")));
+
+        // Qwen3's prompt opens nothing, and the model's own `<think>` is read as before; a
+        // thought in an earlier turn of the prompt is closed there and opens nothing either.
+        for prompt in [
+            "<|im_start|>assistant\n",
+            "<think>\nearlier\n</think>\n\nHi<|im_end|>\n<|im_start|>assistant\n",
+        ] {
+            let events = after_prompt(prompt, "<think>\nplan\n</think>\n\nHi");
+            assert_eq!(
+                events[..2],
+                [dropped("<think>"), Event::ReasoningStart],
+                "{prompt:?}"
+            );
+        }
+    }
+
+    /// The prompt, then the whole output in one delta, then the engine's stop, under the JSON
+    /// syntax.
+    fn after_prompt_json(prompt: &str, output: &str) -> Vec<Event> {
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser.feed(delta(output), &mut out).expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        out.drain()
+    }
+
+    fn reasoning_of(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_prompt_is_replayed_from_the_turn_the_model_writes_not_from_its_start() {
+        // A stray `<tool_call>` in the user's turn, and the generation prompt opens the thought:
+        // the output is the thought, not content (smg #2839, Alex's probe against the parser
+        // this table replaced, which read the prompt's tail by its last `<think>`).
+        let output = "The user asks about the marker.\n</think>\n\nIt opens a tool call.";
+        for prompt in [
+            "<|im_start|>user\nWhy did you print <tool_call> there?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n",
+            "<|im_start|>user\n<tool_response>\nsee <tool_call> in src\n</tool_response>\
+             <|im_end|>\n\
+             <|im_start|>assistant\n<think>\n",
+        ] {
+            for events in [
+                after_prompt(prompt, output),
+                after_prompt_json(prompt, output),
+            ] {
+                assert_eq!(events[0], Event::ReasoningStart, "{prompt:?}");
+                assert_eq!(
+                    reasoning_of(&events),
+                    "The user asks about the marker.\n",
+                    "{prompt:?}"
+                );
+            }
+        }
+        // An earlier call whose arguments hold `<think>`, closed in its own turn: the output is
+        // content, as the model wrote no thought (the replaced parser read it as reasoning).
+        let prompt = "<|im_start|>assistant\n<tool_call>\n\
+                      {\"name\": \"write\", \"arguments\": {\"text\": \"<think>\"}}\n\
+                      </tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n\
+                      </tool_response><|im_end|>\n<|im_start|>assistant\n";
+        let events = after_prompt_json(prompt, "Done.");
+        assert_eq!(events[0], Event::Content(Text::uncounted("Done.")));
+    }
+
+    #[test]
+    fn a_table_whose_first_state_emits_arguments_starts_inside_a_call() {
+        // No marker before the call: the engine opens it at the start, and the output's first
+        // bytes are the call's.
+        let bare = Format::new("bare")
+            .state("call", Emits::Arguments)
+            .calls(CallSyntax::Json);
+        let mut parser = Engine::new(bare, Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: "{\"name\": \"f\", \"arguments\": {\"a\": 1}}",
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        assert!(matches!(
+            events.first(),
+            Some(Event::ToolCallStart { index: 0, name, .. }) if name == "f"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_model_with_another_chat_template_names_its_own_turn_opener() {
+        // K-EXAONE writes Qwen3's markers under its own template: a turn opens with
+        // `<|assistant|>`, and the generation prompt ends `<|assistant|>\n<think>\n`. With the
+        // table's ChatML opener the whole prompt would be replayed, and a stray `<tool_call>` in
+        // the user's turn would leave the engine in content (smg #2841, Alex's probe).
+        let prompt = "<|user|>\nWhy did you print <tool_call> there?<|endofturn|>\n\
+                      <|assistant|>\n<think>\n";
+        let output = "The user asks about the marker.\n</think>\n\nIt opens a tool call.";
+        let mut parser = Engine::new(
+            qwen3(CallSyntax::Json).opens_turn("<|assistant|>"),
+            Declared::default(),
+        );
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        let events = out.drain();
+        assert_eq!(events[0], Event::ReasoningStart);
+        assert_eq!(reasoning_of(&events), "The user asks about the marker.\n");
+    }
+
     #[test]
     fn inputs_out_of_order_are_lifecycle_errors() {
-        let mut parser = Qwen3::new();
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         parser
             .feed(

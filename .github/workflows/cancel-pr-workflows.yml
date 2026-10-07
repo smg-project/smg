@@ -36,6 +36,8 @@ jobs:
             group: benchmark-request-processing-refs/pull/{0}/merge
           - workflow: Benchmark - Manual Policy
             group: benchmark-manual-policy-refs/pull/{0}/merge
+          - workflow: Bellwether Fixtures
+            group: bellwether-fixtures-pr-{0}
     concurrency:
       group: ${{ format(matrix.group, github.event.pull_request.number) }}
       cancel-in-progress: true

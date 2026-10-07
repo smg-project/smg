@@ -91,7 +91,6 @@ impl ModelIdSource {
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
-    pub enabled: bool,
     pub selector: HashMap<String, String>,
     pub check_interval: Duration,
     pub port: u16,
@@ -177,7 +176,6 @@ fn build_watcher_config(label_selector: &str) -> Config {
 impl Default for ServiceDiscoveryConfig {
     fn default() -> Self {
         ServiceDiscoveryConfig {
-            enabled: false,
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
             port: 8000,
@@ -461,18 +459,10 @@ fn resolve_bootstrap_ports(
     }
 }
 
-pub async fn start_service_discovery(
+pub(super) async fn start_kubernetes_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
-    if !config.enabled {
-        return Err(kube::Error::Api(
-            kube::core::Status::failure("Service discovery is disabled", "ConfigurationError")
-                .with_code(400)
-                .boxed(),
-        ));
-    }
-
     let _ = ring::default_provider().install_default();
 
     let client = Client::try_default().await?;
@@ -793,7 +783,6 @@ mod tests {
         decode_selector.insert("component".to_string(), "decode".to_string());
 
         ServiceDiscoveryConfig {
-            enabled: true,
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
             port: 8080,
@@ -861,7 +850,6 @@ mod tests {
     #[test]
     fn test_service_discovery_config_default() {
         let config = ServiceDiscoveryConfig::default();
-        assert!(!config.enabled);
         assert!(config.selector.is_empty());
         assert_eq!(config.check_interval, Duration::from_secs(60));
         assert_eq!(config.port, 8000);
@@ -1635,7 +1623,6 @@ mod tests {
         let mut selector = HashMap::new();
         selector.insert("app".to_string(), "sglang".to_string());
         ServiceDiscoveryConfig {
-            enabled: true,
             selector,
             disaggregated_mode: false,
             ..Default::default()
