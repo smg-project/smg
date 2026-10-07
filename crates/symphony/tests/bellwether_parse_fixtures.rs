@@ -9,7 +9,14 @@
 //! with every other replay of the same case.
 //!
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory of a bellwether
-//! checkout; without it the test prints a skip notice and passes.
+//! checkout; without it the test prints a skip notice and passes. A second parity test replays the
+//! models that write their calls as tags (Qwen 3.5 and later, Qwen3-Coder) through the same parser
+//! with the tagged call syntax, typed by each case's request tools, after the prompt tail each
+//! template leaves ([`TAGGED`]); it skips the slugs bellwether has not recorded yet, and says so.
+//! That test also allows two classes of difference the corpus itself has ([`Allowance`]): a
+//! reference argument whose type contradicts the one the tool declares, which the template writes
+//! the same way as the string, and reasoning in a reference whose template writes no thought.
+//! Each allowed case is counted and printed, so the classes cannot hide anything else.
 //!
 //! Two policy questions stand between the parser and bitwise parity, and the test declares them
 //! rather than hides them. Bellwether #17: the template's separator bytes (the newline after
@@ -32,18 +39,68 @@ mod common;
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
-use common::{bytes_of, chunkings, prompt, replay};
+use common::{bytes_of, chunkings, prompt, replay, replay_after};
+use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
-    adapt, DropReason, EngineFinish, Event, Events, Input, ParseError, Parser, Qwen3, TokenSpan,
+    adapt, Declared, DropReason, EngineFinish, Event, Events, Input, ParseError, Parser, Qwen3,
+    TokenSpan,
 };
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 const SLUG: &str = "qwen3-8b";
+/// bellwether's slugs for the checkpoints that write a call as tags, in its manifests' spelling,
+/// each with how its template ends the generation prompt. The fixtures carry the request and the
+/// output, not the rendered prompt, so this is stated here until bellwether records the prompt's
+/// tail (noted for Simo in STATE.md).
+const TAGGED: &[(&str, GenerationPrompt)] = &[
+    ("qwen3.5-9b", GenerationPrompt::OpensTheThought),
+    ("qwen3.5-27b", GenerationPrompt::OpensTheThought),
+    ("qwen3.6-27b", GenerationPrompt::OpensTheThought),
+    ("qwen3.8-27b", GenerationPrompt::OpensTheThought),
+    ("qwen3-coder-30b-a3b-instruct", GenerationPrompt::Plain),
+    ("qwen3-coder-next", GenerationPrompt::Plain),
+];
+
+/// How a template ends the generation prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationPrompt {
+    /// Qwen 3.5 and later: `<think>\n`, so the output starts inside the thought; when the request
+    /// turns thinking off, `<think>\n\n</think>\n\n`, and the output starts in content.
+    OpensTheThought,
+    /// Qwen3-Coder: `<|im_start|>assistant\n` and nothing more; the template has no thought.
+    Plain,
+}
+
+impl GenerationPrompt {
+    /// The bytes after `<|im_start|>assistant\n` for the case's request.
+    fn tail(self, fixture: &Fixture) -> &'static str {
+        match self {
+            Self::Plain => "",
+            Self::OpensTheThought if fixture.request.thinking_off() => "<think>\n\n</think>\n\n",
+            Self::OpensTheThought => "<think>\n",
+        }
+    }
+}
+
+/// A class of difference the corpus has, allowed for what the fixture shows rather than by id.
+/// Both are cases bellwether refuses or tracks on its side; fixtures recorded before those rules
+/// still hold them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Allowance {
+    /// The reference's argument is a boolean, a number or null for a parameter the tool declares
+    /// `string`, so the template writes it as it writes the string, and the parser gives the
+    /// string back, as vLLM does (BFCL declares `smoking_allowed` an enum of `"True"`, `"False"`
+    /// and `"dontcare"` and answers `false`). Bellwether #56 refuses such a case at record time.
+    DeclaredTypeConflict,
+    /// The template writes no thought, so the reasoning the reference carries is not in the output
+    /// (bellwether #52: a case recorded although the template drops a part of the message).
+    ReasoningNotWritten,
+}
 
 /// A case known to differ from the reference beyond the separator bytes: why, and what the parser
 /// says instead, its call count and finish reason, so that the list allows that difference and no
-/// other.
+/// other. `id` is the case's id after the slug, so one list serves every slug it names.
 struct KnownDifference {
     id: &'static str,
     reason: &'static str,
@@ -53,14 +110,14 @@ struct KnownDifference {
 
 const KNOWN_DIFFERENCES: &[KnownDifference] = &[
     KnownDifference {
-        id: "qwen3-8b/parse/reasoning-with-marker-text",
+        id: "parse/reasoning-with-marker-text",
         reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every marker \
                  parser does, and the reference keeps the marker as reasoning text (bellwether #16)",
         calls: 0,
         finish: "stop",
     },
     KnownDifference {
-        id: "qwen3-8b/parse/content-with-marker-in-code-fence",
+        id: "parse/content-with-marker-in-code-fence",
         reason: "the content holds a complete `<tool_call>` block inside a code fence; the parser makes \
                  a call of it, as every marker parser does, and the reference keeps it as content \
                  (bellwether #16)",
@@ -69,9 +126,38 @@ const KNOWN_DIFFERENCES: &[KnownDifference] = &[
     },
 ];
 
+/// The same two probe cases under the tagged syntax. The code fence holds the JSON syntax, which
+/// the tagged assembler reports as text between a call's tags, so no call comes of it; the marker
+/// in the reasoning ends the thought where it stands, for the models that write one.
+const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[
+    KnownDifference {
+        id: "parse/reasoning-with-marker-text",
+        reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every \
+                 marker parser does, and the reference keeps the marker as reasoning text \
+                 (bellwether #16)",
+        calls: 0,
+        finish: "stop",
+    },
+    KnownDifference {
+        id: "parse/content-with-marker-in-code-fence",
+        reason: "the content holds a complete `<tool_call>` block inside a code fence; the parser \
+                 reads the block, as every marker parser does, and the reference keeps it as \
+                 content (bellwether #16)",
+        calls: 0,
+        finish: "stop",
+    },
+];
+
+/// The case's id after its slug: what [`KnownDifference::id`] names.
+fn after_slug(id: &str) -> &str {
+    id.split_once('/').map_or(id, |(_, rest)| rest)
+}
+
 #[derive(Deserialize)]
 struct Fixture {
     id: String,
+    #[serde(default)]
+    request: Request,
     reference: Reference,
     #[serde(default)]
     output_ids: Vec<u32>,
@@ -81,6 +167,30 @@ struct Fixture {
     /// Chunk sizes in tokens by plan name; `whole` and `per_token` carry none and are derived.
     #[serde(default)]
     chunk_plans: BTreeMap<String, Option<Vec<usize>>>,
+}
+
+/// The parts of the case's request the replay needs: the tools, which type a tagged call's values,
+/// and whether the request turned thinking off, which decides the prompt's tail.
+#[derive(Default, Deserialize)]
+struct Request {
+    #[serde(default)]
+    tools: Vec<Tool>,
+    #[serde(default)]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+impl Request {
+    fn thinking_off(&self) -> bool {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.enable_thinking)
+            == Some(false)
+    }
+}
+
+#[derive(Deserialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -176,8 +286,7 @@ impl Said {
 #[test]
 #[expect(
     clippy::print_stderr,
-    clippy::print_stdout,
-    reason = "the skip notice and the per-case report are test diagnostic output"
+    reason = "the skip notice is test diagnostic output"
 )]
 fn qwen3_parse_fixtures_match_the_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
@@ -193,18 +302,109 @@ fn qwen3_parse_fixtures_match_the_reference() {
         "no parse fixtures under {}",
         root.display()
     );
+    let failures = parity(
+        &fixtures,
+        &|_| Qwen3::new(),
+        &|_| "",
+        KNOWN_DIFFERENCES,
+        &[],
+    );
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
 
-    let known = |id: &str| KNOWN_DIFFERENCES.iter().find(|known| known.id == id);
+#[test]
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "the skip notice and the per-case report are test diagnostic output"
+)]
+fn tagged_parse_fixtures_match_the_reference() {
+    let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
+        );
+        return;
+    };
     let mut failures = Vec::new();
-    let (mut bitwise, mut separators_only, mut listed) = (0, 0, 0);
-    for fixture in &fixtures {
+    let mut recorded = 0;
+    for &(slug, prompt) in TAGGED {
+        let dir = root.join(slug).join("parse");
+        if !dir.is_dir() {
+            eprintln!("skipping {slug}: bellwether has not recorded its parse sets yet");
+            continue;
+        }
+        let fixtures = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
+        println!("{slug}:");
+        // A template without a thought leaves the reasoning out, so the marker inside it is never
+        // read; that case falls under the reasoning allowance instead of the list.
+        let known = match prompt {
+            GenerationPrompt::OpensTheThought => KNOWN_TAGGED_DIFFERENCES,
+            GenerationPrompt::Plain => &KNOWN_TAGGED_DIFFERENCES[1..],
+        };
+        let allowed: &[Allowance] = match prompt {
+            GenerationPrompt::OpensTheThought => &[Allowance::DeclaredTypeConflict],
+            GenerationPrompt::Plain => &[
+                Allowance::DeclaredTypeConflict,
+                Allowance::ReasoningNotWritten,
+            ],
+        };
+        failures.extend(parity(
+            &fixtures,
+            &|fixture| Qwen3::with_tagged_calls(Declared::of(&fixture.request.tools)),
+            &|fixture| prompt.tail(fixture),
+            known,
+            allowed,
+        ));
+        recorded += 1;
+    }
+    if recorded == 0 {
+        eprintln!(
+            "skipping: none of the tagged slugs is recorded under {}",
+            root.display()
+        );
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
+/// case's `prompt_tail`, on every chunking, prints one line per case, and returns every difference
+/// that neither `known_differences` nor `allowed` allows.
+#[expect(
+    clippy::print_stdout,
+    clippy::panic,
+    reason = "the per-case report is diagnostic output; a fixture that cannot be replayed ends \
+              the test with its id"
+)]
+fn parity(
+    fixtures: &[Fixture],
+    new_parser: &dyn Fn(&Fixture) -> Qwen3,
+    prompt_tail: &dyn Fn(&Fixture) -> &'static str,
+    known_differences: &[KnownDifference],
+    allowed: &[Allowance],
+) -> Vec<String> {
+    let known = |id: &str| {
+        known_differences
+            .iter()
+            .find(|known| known.id == after_slug(id))
+    };
+    let mut failures = Vec::new();
+    let (mut bitwise, mut separators_only, mut listed, mut allowed_count) = (0, 0, 0, 0);
+    for fixture in fixtures {
         let text = fixture.reference.text.as_str();
         let expected = Said::of_reference(&fixture.reference);
         let mut saids = Vec::new();
         let finish = engine_finish(&fixture.reference.finish_reason);
         for plan in chunkings(text) {
-            let events = replay(&mut Qwen3::new(), text, &plan, &finish, false)
-                .unwrap_or_else(|e| panic!("{}: plan {plan:?}: {e}", fixture.id));
+            let events = replay_after(
+                &mut new_parser(fixture),
+                prompt_tail(fixture),
+                text,
+                &plan,
+                &finish,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{}: plan {plan:?}: {e}", fixture.id));
             let conserved: String = events.iter().map(bytes_of).collect();
             if conserved != text {
                 failures.push(format!(
@@ -253,6 +453,12 @@ fn qwen3_parse_fixtures_match_the_reference() {
             }
             listed += 1;
             "listed (bellwether #16)"
+        } else if let Some(allowance) = allowance_for(&said, &expected, allowed) {
+            allowed_count += 1;
+            match allowance {
+                Allowance::DeclaredTypeConflict => "allowed: declared-type conflict (corpus)",
+                Allowance::ReasoningNotWritten => "allowed: reasoning not written (corpus)",
+            }
         } else {
             failures.push(format!(
                 "{}: differs from the reference\n    said:      {said:?}\n    reference: {expected:?}",
@@ -271,8 +477,11 @@ fn qwen3_parse_fixtures_match_the_reference() {
             println!("  {:34} {}", "", listed_case.reason);
         }
     }
-    for listed_case in KNOWN_DIFFERENCES {
-        if !fixtures.iter().any(|fixture| fixture.id == listed_case.id) {
+    for listed_case in known_differences {
+        if !fixtures
+            .iter()
+            .any(|fixture| after_slug(&fixture.id) == listed_case.id)
+        {
             failures.push(format!(
                 "{}: listed in KNOWN_DIFFERENCES but not among the fixtures; remove it",
                 listed_case.id
@@ -280,10 +489,80 @@ fn qwen3_parse_fixtures_match_the_reference() {
         }
     }
     println!(
-        "{} cases: {bitwise} bitwise, {separators_only} separators only, {listed} listed",
+        "{} cases: {bitwise} bitwise, {separators_only} separators only, {listed} listed, \
+         {allowed_count} allowed for the corpus",
         fixtures.len()
     );
-    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    failures
+}
+
+/// The allowance that covers the difference between `said` and `expected`, if one of `allowed`
+/// does: the two agree once the separators are trimmed, except as the allowance says.
+fn allowance_for(said: &Said, expected: &Said, allowed: &[Allowance]) -> Option<Allowance> {
+    let (said, expected) = (said.trimmed(), expected.trimmed());
+    allowed.iter().copied().find(|allowance| match allowance {
+        Allowance::ReasoningNotWritten => {
+            said.reasoning.is_none()
+                && expected.reasoning.is_some()
+                && Said {
+                    reasoning: None,
+                    ..expected.clone()
+                } == said
+        }
+        Allowance::DeclaredTypeConflict => {
+            said.content == expected.content
+                && said.reasoning == expected.reasoning
+                && said.finish == expected.finish
+                && said.calls.len() == expected.calls.len()
+                && said.calls.iter().zip(&expected.calls).all(
+                    |((name, arguments), (expected_name, expected_arguments))| {
+                        name == expected_name
+                            && differs_at_most_in_declared_type(arguments, expected_arguments)
+                    },
+                )
+        }
+    })
+}
+
+/// Whether two arguments objects differ at most in members where `said` holds a string spelling
+/// the value `expected` holds, in JSON or as Python writes it. The caller knows the two messages
+/// differ somewhere; a call of theirs that is the same on both sides passes.
+fn differs_at_most_in_declared_type(said: &str, expected: &str) -> bool {
+    let (Ok(said), Ok(expected)) = (
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(said),
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(expected),
+    ) else {
+        return false;
+    };
+    if said.len() != expected.len() || said.keys().ne(expected.keys()) {
+        return false;
+    }
+    for (key, value) in &said {
+        let reference = &expected[key];
+        if value == reference {
+            continue;
+        }
+        let spelled_the_same = match (value, reference) {
+            (serde_json::Value::String(text), reference) if !reference.is_string() => {
+                [reference.to_string(), python_spelling(reference)].contains(text)
+            }
+            _ => false,
+        };
+        if !spelled_the_same {
+            return false;
+        }
+    }
+    true
+}
+
+/// How Qwen 3.5's and Qwen3-Coder's templates write a boolean or null: Python's spelling.
+fn python_spelling(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Bool(true) => "True".to_string(),
+        serde_json::Value::Bool(false) => "False".to_string(),
+        serde_json::Value::Null => "None".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// The engine's finish for a reference's finish reason. The adapter turns `stop` after a call into

@@ -57,7 +57,7 @@ pub fn prompt() -> Input<'static> {
     }
 }
 
-/// Feed `text` to `parser` cut at `cuts`, after the prompt, then the end with the engine's
+/// Feed `text` to `parser` cut at `cuts`, after an empty prompt, then the end with the engine's
 /// `finish`, and return the events. With `empty_between`, an empty delta comes before every piece
 /// and after the last.
 pub fn replay(
@@ -67,8 +67,27 @@ pub fn replay(
     finish: &EngineFinish,
     empty_between: bool,
 ) -> Result<Vec<Event>, ParseError> {
+    replay_after(parser, "", text, cuts, finish, empty_between)
+}
+
+/// [`replay`] after a prompt whose text is `prompt_text`: the tail a template leaves before the
+/// output, such as Qwen 3.5's `<think>\n`.
+pub fn replay_after(
+    parser: &mut dyn Parser,
+    prompt_text: &str,
+    text: &str,
+    cuts: &[usize],
+    finish: &EngineFinish,
+    empty_between: bool,
+) -> Result<Vec<Event>, ParseError> {
     let mut out = Events::new();
-    parser.feed(prompt(), &mut out)?;
+    parser.feed(
+        Input::Prompt {
+            token_ids: &[],
+            text: prompt_text,
+        },
+        &mut out,
+    )?;
     let mut from = 0;
     for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
         if cut > from {

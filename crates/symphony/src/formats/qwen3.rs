@@ -1,14 +1,17 @@
-//! Qwen3: reasoning between `<think>` and `</think>`, each tool call a JSON object between
-//! `<tool_call>` and `</tool_call>`, everything else content.
+//! Qwen: reasoning between `<think>` and `</think>`, each tool call between `<tool_call>` and
+//! `</tool_call>`, everything else content. Inside the call markers the family writes one of two
+//! syntaxes ([`CallSyntax`]): Qwen3 a JSON object, `{"name": …, "arguments": {…}}`; Qwen 3.5
+//! and later and Qwen3-Coder the tags `<function=NAME>` and `<parameter=KEY>` around each value's
+//! text, which the request's tools type.
 //!
 //! [`Qwen3`] is the first format and the first [`Parser`]. The scanner splits the model's text into
 //! content and the four markers, holding back a half-arrived marker; a region says what the text
-//! between markers is; inside a call region the [`Assembler`] turns the object into the call's
-//! events, streaming the model's own argument bytes. Every byte of the output lands in exactly one
-//! event: the markers as `Dropped { Wrapper }`, the whitespace between a call's object and its
-//! closing marker as `Dropped { Wrapper }` too, any other text there as `Malformed`, run by run so
-//! that where the chunks were cut changes nothing, and the rest as content, reasoning, or the
-//! call's events.
+//! between markers is; inside a call region the call syntax's assembler ([`json::Assembler`] or
+//! [`tagged::Assembler`]) turns the call into its events, streaming the model's own argument bytes.
+//! Every byte of the output lands in exactly one event: the markers as `Dropped { Wrapper }`, the
+//! whitespace between a call and its closing marker as `Dropped { Wrapper }` too, any other text
+//! there as `Malformed`, run by run so that where the chunks were cut changes nothing, and the
+//! rest as content, reasoning, or the call's events.
 //!
 //! What this format decides, and what it leaves open:
 //!
@@ -25,7 +28,11 @@
 //! - A `<tool_call>` that never closes is finished at the end of the stream: a call with what
 //!   arrived, or the bytes as `Malformed { UnterminatedRegion }`. A block whose closing marker
 //!   comes before a complete call gives what is left as `Malformed` with a reason that says so,
-//!   since `UnterminatedRegion` means the stream ended inside the region.
+//!   since `UnterminatedRegion` means the stream ended inside the region; with the tagged syntax
+//!   the call is closed for the client first, as [`tagged::Assembler::close`] says.
+//! - With the tagged syntax, a value's type comes from the request's tools ([`Declared`]): a
+//!   declared string streams, every other value is written at its close. A call to a function the
+//!   request did not declare has every value inferred.
 //! - Call ids are `call_<index>` for now; the id scheme is Simo's decision (deterministic or
 //!   carrying the conversation's history) and changes only this one line.
 //! - Every text event says how many tokens it carries, counted by the [`Ledger`] from the deltas'
@@ -37,15 +44,20 @@
 //!   place where zero does not mean none (rule 7 keeps `Finish` as it is for now).
 //! - Tool names are not checked against the request's tools; the format has no tool list yet.
 //!
-//! The prompt is accepted first in the lifecycle and otherwise ignored: Qwen3 writes its own
-//! `<think>` into the output, so nothing about the prompt decides where the output starts.
+//! The prompt decides one thing: whether the output starts inside the thinking region. Qwen 3.5's
+//! template opens `<think>` in the generation prompt, so the output starts with the thought and
+//! its first `</think>` closes it; Qwen3 writes its own `<think>`; and in both families a prompt
+//! that disables thinking ends with `<think>\n\n</think>\n\n`, which leaves nothing open. So a
+//! prompt whose last `<think>` comes after its last `</think>` starts the output in reasoning, with
+//! `ReasoningStart` pushed for the prompt, and any other prompt starts it in content.
 
 use crate::{
     event::{DropReason, Event, Events, FinishReason, MalformedReason},
     input::{EngineFinish, Input},
-    json::Assembler,
+    json,
     markers::{Piece, Scanner},
     parser::{ParseError, Parser},
+    tagged::{self, Declared},
     tokens::Ledger,
 };
 
@@ -64,10 +76,21 @@ enum Closed {
     ByEnd,
 }
 
-/// The Qwen3 format as a parser. One per generated choice.
+/// How the model writes a call between the call markers.
+#[derive(Clone, Debug)]
+pub enum CallSyntax {
+    /// One JSON object, `{"name": …, "arguments": {…}}`: Qwen3.
+    Json,
+    /// `<function=NAME>` and then `<parameter=KEY>` around each value's text, typed by the
+    /// request's tools: Qwen 3.5 and later, Qwen3-Coder.
+    Tagged(Declared),
+}
+
+/// The Qwen format as a parser. One per generated choice.
 #[derive(Debug)]
 pub struct Qwen3 {
     scanner: Scanner,
+    syntax: CallSyntax,
     region: Region,
     calls: u32,
     tokens: Ledger,
@@ -79,7 +102,56 @@ pub struct Qwen3 {
 enum Region {
     Content,
     Reasoning,
-    Call(Assembler),
+    Call(Call),
+}
+
+/// The assembler of the call region, one per call syntax.
+#[derive(Debug)]
+enum Call {
+    Json(json::Assembler),
+    Tagged(tagged::Assembler),
+}
+
+impl Call {
+    fn new(syntax: &CallSyntax, index: u32) -> Self {
+        let id = format!("call_{index}");
+        match syntax {
+            CallSyntax::Json => Self::Json(json::Assembler::new(index, id)),
+            CallSyntax::Tagged(_) => Self::Tagged(tagged::Assembler::new(index, id)),
+        }
+    }
+
+    fn feed(&mut self, text: &str, syntax: &CallSyntax, out: &mut Events) -> usize {
+        match (self, syntax) {
+            (Self::Json(assembler), _) => assembler.feed(text, out),
+            (Self::Tagged(assembler), CallSyntax::Tagged(declared)) => {
+                assembler.feed(text, declared, out)
+            }
+            // A tagged assembler exists only under the tagged syntax; the arm is unreachable, and
+            // the text is kept as the call's rather than lost.
+            (Self::Tagged(assembler), CallSyntax::Json) => {
+                assembler.feed(text, &Declared::default(), out)
+            }
+        }
+    }
+
+    fn started(&self) -> bool {
+        match self {
+            Self::Json(assembler) => assembler.started(),
+            Self::Tagged(assembler) => assembler.started(),
+        }
+    }
+
+    /// Ends the call the way the region closed: the JSON assembler has one ending, and the format
+    /// names a block its marker closed (`close_call`); the tagged one closes the call for the
+    /// client when the block ended, and leaves it open when the stream was cut.
+    fn end(self, closed: Closed, out: &mut Events) {
+        match (self, closed) {
+            (Self::Json(assembler), _) => assembler.finish(out),
+            (Self::Tagged(assembler), Closed::ByMarker) => assembler.close(out),
+            (Self::Tagged(assembler), Closed::ByEnd) => assembler.finish(out),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,10 +168,21 @@ impl Default for Qwen3 {
 }
 
 impl Qwen3 {
-    /// A parser at the start of an output.
+    /// A parser at the start of an output, for a model that writes each call as a JSON object.
     pub fn new() -> Self {
+        Self::with_calls(CallSyntax::Json)
+    }
+
+    /// A parser at the start of an output, for a model that writes each call as tags; `declared`
+    /// holds the request's tools, which type the values.
+    pub fn with_tagged_calls(declared: Declared) -> Self {
+        Self::with_calls(CallSyntax::Tagged(declared))
+    }
+
+    fn with_calls(syntax: CallSyntax) -> Self {
         Self {
             scanner: Scanner::new(MARKERS),
+            syntax,
             region: Region::Content,
             calls: 0,
             tokens: Ledger::new(),
@@ -123,9 +206,9 @@ impl Qwen3 {
                 self.reasoning_tokens += counted.tokens.unwrap_or(0);
                 out.push_reasoning(counted);
             }
-            Region::Call(assembler) => {
+            Region::Call(call) => {
                 let mut assembled = Events::new();
-                let taken = assembler.feed(text, &mut assembled);
+                let taken = call.feed(text, &self.syntax, &mut assembled);
                 for event in assembled.drain() {
                     out.push(self.tokens.relabel(event));
                 }
@@ -134,9 +217,9 @@ impl Qwen3 {
         }
     }
 
-    /// Text after a call's object and before its closing marker: each run of whitespace is the
-    /// template's wrapping and is dropped, each run of anything else is malformed. Classifying run
-    /// by run keeps the result the same wherever the chunks were cut.
+    /// Text after a call and before its closing marker: each run of whitespace is the template's
+    /// wrapping and is dropped, each run of anything else is malformed. Classifying run by run
+    /// keeps the result the same wherever the chunks were cut.
     fn surplus(&mut self, surplus: &str, out: &mut Events) {
         let mut rest = surplus;
         while let Some(first) = rest.chars().next() {
@@ -201,20 +284,19 @@ impl Qwen3 {
     /// The next call takes the next free index; the index is spent only if the region produces a
     /// call, so a `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
-        let index = self.calls;
-        self.region = Region::Call(Assembler::new(index, format!("call_{index}")));
+        self.region = Region::Call(Call::new(&self.syntax, self.calls));
     }
 
     /// Ends the call region: the assembler closes what arrived. A region its marker closed reports
     /// leftover bytes as a block without a complete call; `UnterminatedRegion` is kept for a region
     /// the end of the stream cut.
     fn close_call(&mut self, closed: Closed, out: &mut Events) {
-        if let Region::Call(assembler) = std::mem::replace(&mut self.region, Region::Content) {
-            if assembler.started() {
+        if let Region::Call(call) = std::mem::replace(&mut self.region, Region::Content) {
+            if call.started() {
                 self.calls += 1;
             }
             let mut finished = Events::new();
-            assembler.finish(&mut finished);
+            call.end(closed, &mut finished);
             for event in finished.drain() {
                 let event = match event {
                     Event::Malformed {
@@ -270,16 +352,33 @@ impl Qwen3 {
     }
 }
 
+/// Whether the prompt ends inside the thinking region: its last `<think>` comes after its last
+/// `</think>`.
+fn leaves_thinking_open(prompt: &str) -> bool {
+    match (
+        prompt.rfind(MARKERS[THINK_OPEN]),
+        prompt.rfind(MARKERS[THINK_CLOSE]),
+    ) {
+        (Some(open), Some(close)) => open > close,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 impl Parser for Qwen3 {
     fn feed(&mut self, input: Input<'_>, out: &mut Events) -> Result<(), ParseError> {
         match input {
-            Input::Prompt { .. } => {
+            Input::Prompt { text, .. } => {
                 if self.stage != Stage::Fresh {
                     return Err(ParseError::Lifecycle(
                         "prompt after output began".to_string(),
                     ));
                 }
                 self.stage = Stage::Streaming;
+                if leaves_thinking_open(text) {
+                    out.push(Event::ReasoningStart);
+                    self.region = Region::Reasoning;
+                }
                 Ok(())
             }
             Input::Delta { text, spans, .. } => {
@@ -1006,6 +1105,272 @@ mod tests {
                 reasoning_tokens: 0,
             }]
         );
+    }
+
+    /// A tool `get_weather` with a string `city` and an integer `days`.
+    fn declared() -> Declared {
+        use openai_protocol::common::{Function, Tool};
+        use serde_json::json as value;
+        Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                }}),
+                strict: None,
+            },
+        }])
+    }
+
+    const TAGGED_CALL: &str = concat!(
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>",
+        "\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
+    );
+
+    fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
+        let mut parser = Qwen3::with_tagged_calls(declared());
+        let mut out = Events::new();
+        for piece in pieces {
+            parser.feed(delta(piece), &mut out).expect("delta");
+        }
+        parser.feed(Input::End { finish }, &mut out).expect("end");
+        out.drain()
+    }
+
+    fn arguments_of(events: &[Event], call: u32) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { index, json, .. } if *index == call => {
+                    Some(json.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tagged_call_after_thinking_streams_its_string_and_writes_its_integer() {
+        let output = format!("<think>\nThe user asks.\n</think>\n\n{TAGGED_CALL}");
+        let events = run_tagged(&[&output], EngineFinish::Stop);
+        assert_eq!(
+            events[6..],
+            [
+                dropped("<tool_call>"),
+                Event::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "get_weather".into(),
+                    source: Text::uncounted("\n<function=get_weather>"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "{\"city\": \"".into(),
+                    source: Text::uncounted("\n<parameter=city>"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "Paris".into(),
+                    source: Text::uncounted("\nParis"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "\"".into(),
+                    source: Text::uncounted("\n</parameter>"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: ", \"days\": 3".into(),
+                    source: Text::uncounted("\n<parameter=days>\n3\n</parameter>"),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "}".into(),
+                    source: Text::uncounted("\n"),
+                },
+                Event::ToolCallEnd {
+                    index: 0,
+                    source: Text::uncounted("</function>"),
+                },
+                dropped("\n"),
+                dropped("</tool_call>"),
+                Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 1,
+                    reasoning_tokens: 0,
+                },
+            ]
+        );
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris", "days": 3}"#);
+        assert_eq!(bytes(&events), output);
+    }
+
+    #[test]
+    fn two_tagged_calls_each_get_their_own_index_and_a_call_to_an_undeclared_tool_is_inferred() {
+        let second = concat!(
+            "<tool_call>\n<function=lookup>\n<parameter=id>\n42\n</parameter>",
+            "\n</function>\n</tool_call>"
+        );
+        let output = format!("{TAGGED_CALL}\n{second}");
+        let events = run_tagged(&[&output], EngineFinish::Stop);
+        let starts: Vec<(u32, String, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart {
+                    index, id, name, ..
+                } => Some((*index, id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (0, "call_0".to_string(), "get_weather".to_string()),
+                (1, "call_1".to_string(), "lookup".to_string()),
+            ]
+        );
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris", "days": 3}"#);
+        assert_eq!(arguments_of(&events, 1), r#"{"id": 42}"#);
+        assert_eq!(bytes(&events), output);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn a_tagged_block_its_marker_closes_early_ends_the_call_closed_and_a_cut_stream_leaves_it_open()
+    {
+        // The block's closing marker arrives before `</function>`: the string and the object close.
+        let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar</tool_call>";
+        let events = run_tagged(&[output], EngineFinish::Stop);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"}"#);
+        assert_eq!(bytes(&events), output);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "nothing was held when the marker came"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+        // The stream is cut instead: nothing closes, and the region is unterminated.
+        let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar";
+        let events = run_tagged(&[output], EngineFinish::Length);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"#);
+        assert_eq!(bytes(&events), output);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reason: FinishReason::Length,
+                tool_calls: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn every_chunking_of_a_tagged_output_says_the_same_and_accounts_for_every_byte() {
+        let output = format!("<think>\nplan\n</think>\n\nSure.\n{TAGGED_CALL}\nDone.");
+        let whole = joined(run_tagged(&[&output], EngineFinish::Stop));
+        let mut chunkings: Vec<Vec<&str>> = (1..output.len())
+            .map(|cut| vec![&output[..cut], &output[cut..]])
+            .collect();
+        chunkings.push(
+            output
+                .char_indices()
+                .map(|(i, c)| &output[i..i + c.len_utf8()])
+                .collect(),
+        );
+        for pieces in chunkings {
+            let events = run_tagged(&pieces, EngineFinish::Stop);
+            assert_eq!(bytes(&events), output, "{pieces:?}");
+            assert_eq!(joined(events), whole, "{pieces:?}");
+        }
+        assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris", "days": 3}"#);
+    }
+
+    /// The prompt, then the whole output in one delta, then the engine's stop.
+    fn after_prompt(prompt: &str, output: &str) -> Vec<Event> {
+        let mut parser = Qwen3::with_tagged_calls(declared());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser.feed(delta(output), &mut out).expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        out.drain()
+    }
+
+    #[test]
+    fn a_prompt_that_opens_the_thought_starts_the_output_in_reasoning() {
+        // Qwen 3.5's generation prompt ends with `<think>\n`. bellwether's qwen3.5-27b parse
+        // cases: an empty thought, closed at once, then the call.
+        let output = format!("\n</think>\n\n{TAGGED_CALL}");
+        let events = after_prompt("<|im_start|>assistant\n<think>\n", &output);
+        assert_eq!(
+            events[..5],
+            [
+                Event::ReasoningStart,
+                Event::Reasoning(Text::uncounted("\n")),
+                dropped("</think>"),
+                Event::ReasoningEnd,
+                Event::Content(Text::uncounted("\n\n")),
+            ]
+        );
+        assert_eq!(bytes(&events), output);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris", "days": 3}"#);
+
+        // A thought the stream ends inside is closed at the end, as one the model opened is.
+        let events = after_prompt("<think>\n", "still");
+        assert_eq!(
+            events[..3],
+            [
+                Event::ReasoningStart,
+                Event::Reasoning(Text::uncounted("still")),
+                Event::ReasoningEnd,
+            ]
+        );
+
+        // Thinking disabled: the prompt closed the thought itself, and the output is content.
+        let events = after_prompt("<|im_start|>assistant\n<think>\n\n</think>\n\n", "Hello");
+        assert_eq!(events[0], Event::Content(Text::uncounted("Hello")));
+
+        // Qwen3's prompt opens nothing, and the model's own `<think>` is read as before; a
+        // thought in an earlier turn of the prompt is closed there and opens nothing either.
+        for prompt in [
+            "<|im_start|>assistant\n",
+            "<think>\nearlier\n</think>\n\nHi<|im_end|>\n<|im_start|>assistant\n",
+        ] {
+            let events = after_prompt(prompt, "<think>\nplan\n</think>\n\nHi");
+            assert_eq!(
+                events[..2],
+                [dropped("<think>"), Event::ReasoningStart],
+                "{prompt:?}"
+            );
+        }
     }
 
     #[test]
