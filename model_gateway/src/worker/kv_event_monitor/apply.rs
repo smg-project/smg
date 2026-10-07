@@ -201,7 +201,7 @@ const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sin
 /// at most this many extra removals before the block leaves the index.
 const COPIES_CAP: u8 = 8;
 
-/// What the positional index did not take at face value, by reason; logged
+/// What the index did not take at face value, by reason; logged
 /// when the worker's subscription ends.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkerIndexCounters {
@@ -259,7 +259,7 @@ impl Copies {
     }
 }
 
-/// A worker's share of the positional index: the indexer's reverse map plus
+/// A worker's share of the index: its reverse map plus
 /// the physical copies of each block per tier, once the worker reports more
 /// than one copy or a tier other than the device.
 ///
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn a_root_store_indexes_its_blocks() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let stored = KvBlocksStored {
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn a_chained_store_extends_its_parent() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
 
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn a_store_with_an_unknown_parent_starts_a_new_chain() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://new-worker:8000").unwrap();
         let mut wb = WorkerIndexState::default();
 
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn a_removal_takes_the_block_out() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
 
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_clear_empties_the_worker() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
 
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn apply_event_dispatches_a_store() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let event = KvCacheEvent {
@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn apply_event_dispatches_a_removal() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
 
@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn apply_event_dispatches_a_clear() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
 
@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn an_event_without_data_is_ignored() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let event = KvCacheEvent {
@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn salted_stores_match_only_their_namespace() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let mut stored = stored_event(1, &TOKENS);
@@ -751,7 +751,7 @@ mod tests {
 
     #[test]
     fn device_removal_keeps_a_block_still_on_the_host() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let hashes = compute_request_content_hashes(&TOKENS, 4);
@@ -778,7 +778,7 @@ mod tests {
 
     #[test]
     fn cache_level_stands_in_for_the_tier() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let hashes = compute_request_content_hashes(&TOKENS, 4);
@@ -802,7 +802,7 @@ mod tests {
 
     #[test]
     fn host_removal_without_a_host_copy_evicts_nothing() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let hashes = compute_request_content_hashes(&TOKENS, 4);
@@ -817,7 +817,7 @@ mod tests {
 
     #[test]
     fn disk_and_external_tiers_are_counted_not_indexed() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
 
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn non_main_attention_groups_are_skipped_once_their_kind_is_known() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
 
@@ -876,7 +876,7 @@ mod tests {
 
     #[test]
     fn remote_and_residency_agent_events_are_skipped() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
 
@@ -907,7 +907,7 @@ mod tests {
 
     #[test]
     fn clearing_forgets_copies_and_residency() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let hashes = compute_request_content_hashes(&TOKENS, 4);
@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn two_copies_need_two_removals() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let hashes = compute_request_content_hashes(&TOKENS, 4);
@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn device_and_host_copies_are_counted_per_tier() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let hashes = compute_request_content_hashes(&TOKENS, 4);
@@ -991,7 +991,7 @@ mod tests {
 
     #[test]
     fn clearing_forgets_copy_counts() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let hashes = compute_request_content_hashes(&TOKENS, 4);
@@ -1011,7 +1011,7 @@ mod tests {
 
     #[test]
     fn copy_counts_are_capped() {
-        let indexer = KvIndex::positional(64);
+        let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let hashes = compute_request_content_hashes(&TOKENS, 4);

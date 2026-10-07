@@ -491,7 +491,6 @@ class TestRouterPositionalSignature:
         assert tail == [
             "prefill_queue_timeout_secs",
             "worker_overload_shed",
-            "kv_index",
             "worker_stall_secs",
             "worker_wedge_secs",
             "worker_warmup_secs",

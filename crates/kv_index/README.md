@@ -12,14 +12,14 @@ changes around it. Benchmarks and how to run them: `benches/README.md`.
 
 ## The problem with one entry per block
 
-The positional indexer (`src/event_tree.rs`, the default) keys one entry per (position, content
-hash) with the set of holding workers, and a lookup probes one entry per request block. It is
-exact (its jump search was not: the first commits of this series fixed it against the reference
-indexer and made it verify every position), but exactness costs it one dependent memory access per
-block per lookup, the per-entry worker set grows with every holder, and every store or removal is
-a hash-map write per block under a shard lock. A fleet of engines sharing long prefixes makes all
-three worse at once: the same chain is stored by many workers, requests are hundreds of blocks
-long, and the engines evict and re-store at the rate they serve.
+The positional indexer this crate shipped until 1.5 (`PositionalIndexer`, removed in 2.0) keyed
+one entry per (position, content hash) with the set of holding workers, and a lookup probed one
+entry per request block. It was exact (its jump search was not: the first commits of this series
+fixed it against the reference indexer and made it verify every position), but exactness cost it
+one dependent memory access per block per lookup, the per-entry worker set grew with every holder,
+and every store or removal was a hash-map write per block under a shard lock. A fleet of engines
+sharing long prefixes makes all three worse at once: the same chain is stored by many workers,
+requests are hundreds of blocks long, and the engines evict and re-store at the rate they serve.
 
 ## The chain index
 
@@ -160,11 +160,10 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
 
 ## Routing and recovery in the gateway
 
-- **Two backends, one type.** `KvIndex` (`model_gateway/src/worker/kv_index_backend.rs`) holds the
-  positional indexer or the chain index, selected by `--kv-index {positional,chain}`; the monitor
-  and the policy see the operations they used before. An in-gateway exactness test replays the
-  recorded engine streams and a synthetic hole corpus through the monitor's own apply path into
-  both backends and the reference indexer.
+- **One index, one type.** `KvIndex` (`model_gateway/src/worker/kv_index_backend.rs`) holds the
+  chain index; the monitor and the policy see the operations they used before. An in-gateway
+  exactness test replays generated engine streams and a synthetic hole corpus through the
+  monitor's own apply path into the index and the reference indexer.
 - **Per-rank admission.** One cursor per (worker, dp_rank): contiguous batches apply, duplicates
   skip, a gap gets one replay request and is otherwise settled (a small one keeps the blocks and
   marks the rank degraded, a large one clears the worker), a publisher restart clears the worker's
@@ -194,8 +193,8 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
 
 ## Flags and settings
 
-Gateway: `--kv-index {positional,chain}` (default `positional`; `run` is accepted as a deprecated
-alias of `chain`); `--kv-indexer-ttl-secs`, `--kv-indexer-max-entries` (positional only);
+Gateway: `--kv-indexer-ttl-secs`, `--kv-indexer-max-entries` (deprecated, accepted and ignored:
+the chain index has no prune);
 `--worker-stall-secs` (2), `--worker-wedge-secs` (3); `--worker-warmup-secs` (60),
 `--worker-warmup-share` (0.25), `--worker-warmup-blocks` (1024), `--worker-warmup-thin-ratio`
 (0.5); `--worker-overload-protection` (on), `--disable-worker-overload-protection`,

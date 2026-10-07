@@ -105,7 +105,7 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
         .worker_monitor
         .clone()
         .expect("the test context builds a worker monitor");
-    let kv_monitor = Arc::new(KvEventMonitor::new(None));
+    let kv_monitor = Arc::new(KvEventMonitor::new());
     kv_monitor.set_load_sink(&worker_monitor);
 
     let mut urls = Vec::with_capacity(WORKERS);

@@ -1,4 +1,4 @@
-//! Trace-driven throughput benchmark for PositionalIndexer.
+//! Trace-driven throughput benchmark for the chain index.
 //!
 //! Measures block throughput (blocks/sec):
 //! - Synthetic trace generation with shared prefixes and multi-turn sessions
@@ -27,10 +27,13 @@ use std::{
 
 use clap::Parser;
 use kv_index::{
-    compute_content_hash, ContentHash, OverlapScores, PositionalIndexer, SequenceHash, StoredBlock,
-    WorkerBlockMap,
+    compute_content_hash, ChainBlockMap, ContentHash, OverlapScores, SequenceHash,
+    ShardedChainIndex, StoredBlock,
 };
 use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+/// Worker slots per chain index shard: the index's own ceiling.
+const CHAIN_WORKERS_PER_SHARD: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -39,7 +42,7 @@ use rand::{rngs::StdRng, RngExt, SeedableRng};
 #[derive(Parser, Debug)]
 #[command(
     name = "throughput_bench",
-    about = "Block throughput benchmark for PositionalIndexer"
+    about = "Block throughput benchmark for the chain index"
 )]
 struct Args {
     /// Ignored — passed by `cargo bench` harness.
@@ -49,10 +52,6 @@ struct Args {
     /// Number of workers (concurrent replay tasks). Must be >= 1.
     #[arg(long, default_value_t = 256)]
     num_workers: usize,
-
-    /// Jump size for the positional indexer.
-    #[arg(long, default_value_t = 8)]
-    jump_size: usize,
 
     /// Number of content-hash blocks per find_matches request.
     #[arg(long, default_value_t = 128)]
@@ -142,7 +141,7 @@ struct TimedEntry {
 
 /// Per-task state for processing trace entries against the indexer.
 struct TaskState {
-    worker_blocks: WorkerBlockMap,
+    worker_blocks: ChainBlockMap,
     req_blocks: u64,
     evt_blocks: u64,
     errors: u64,
@@ -153,7 +152,7 @@ struct TaskState {
 impl TaskState {
     fn new(count_events: bool) -> Self {
         Self {
-            worker_blocks: WorkerBlockMap::default(),
+            worker_blocks: ChainBlockMap::default(),
             req_blocks: 0,
             evt_blocks: 0,
             errors: 0,
@@ -163,7 +162,7 @@ impl TaskState {
     }
 
     #[inline]
-    fn process(&mut self, entry: &TraceEntry, indexer: &PositionalIndexer, worker_id: u32) {
+    fn process(&mut self, entry: &TraceEntry, indexer: &ShardedChainIndex, worker_id: u32) {
         match entry {
             TraceEntry::Request { content_hashes } => {
                 let start = Instant::now();
@@ -524,8 +523,8 @@ async fn main() {
     println!("=== Throughput Benchmark ===");
     if let Some(ref path) = args.trace_path {
         println!(
-            "Trace: {path} | Workers: {}, Jump: {}, Seed: {}",
-            args.num_workers, args.jump_size, args.seed,
+            "Trace: {path} | Workers: {}, Seed: {}",
+            args.num_workers, args.seed,
         );
         if args.trace_length_factor > 1 || args.trace_duplication_factor > 1 {
             println!(
@@ -535,12 +534,8 @@ async fn main() {
         }
     } else {
         println!(
-            "Workers: {}, Jump: {}, Blocks/req: {}, Event blocks: {}, Duplication: {}x",
-            args.num_workers,
-            args.jump_size,
-            args.blocks_per_request,
-            args.event_blocks,
-            args.duplication_factor,
+            "Workers: {}, Blocks/req: {}, Event blocks: {}, Duplication: {}x",
+            args.num_workers, args.blocks_per_request, args.event_blocks, args.duplication_factor,
         );
         println!(
             "Sessions: {}, Turns/session: {}, Seed: {}",
@@ -663,9 +658,12 @@ async fn run_sweep(args: &Args, base_traces: &[Vec<TimedEntry>]) {
 }
 
 async fn run_benchmark(args: &Args, traces: Vec<Vec<TimedEntry>>) -> BenchmarkResults {
-    let indexer = Arc::new(PositionalIndexer::new(args.jump_size));
-
+    // A chain index shard holds up to 1,024 workers and the replay interns one
+    // worker per task, so the index gets as many shards as the tasks need; the
+    // gateway's own index is this type at one shard.
     let num_total_workers = args.num_workers * args.duplication_factor;
+    let shards = num_total_workers.div_ceil(CHAIN_WORKERS_PER_SHARD).max(1);
+    let indexer = Arc::new(ShardedChainIndex::new(shards, CHAIN_WORKERS_PER_SHARD));
     for w in 0..num_total_workers {
         indexer
             .intern_worker(&format!("worker-{w}"))

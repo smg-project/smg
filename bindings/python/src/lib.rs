@@ -550,7 +550,6 @@ struct Router {
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
     worker_overload_shed: bool,
-    kv_index: String,
     worker_stall_secs: u64,
     worker_wedge_secs: u64,
     worker_warmup_secs: u64,
@@ -673,14 +672,6 @@ impl Router {
                 })
             })
             .transpose()?;
-
-        let kv_index = config::KvIndexKind::parse(&self.kv_index).ok_or_else(|| {
-            config::ConfigError::InvalidValue {
-                field: "kv_index".to_string(),
-                value: self.kv_index.clone(),
-                reason: "expected 'positional' or 'chain'".to_string(),
-            }
-        })?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
@@ -931,7 +922,6 @@ impl Router {
                 self.worker_warmup_thin_ratio,
                 self.worker_warmup_divert_every,
             )
-            .kv_index(kv_index)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
@@ -1218,7 +1208,6 @@ impl Router {
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
         worker_overload_shed = false,
-        kv_index = String::from("positional"),
         worker_stall_secs = 2,
         worker_wedge_secs = 3,
         worker_warmup_secs = 60,
@@ -1397,7 +1386,6 @@ impl Router {
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
         worker_overload_shed: bool,
-        kv_index: String,
         worker_stall_secs: u64,
         worker_wedge_secs: u64,
         worker_warmup_secs: u64,
@@ -1602,7 +1590,6 @@ impl Router {
             prefill_queue_size,
             prefill_queue_timeout_secs,
             worker_overload_shed,
-            kv_index,
             worker_stall_secs,
             worker_wedge_secs,
             worker_warmup_secs,

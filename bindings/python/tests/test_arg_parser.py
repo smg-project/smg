@@ -705,14 +705,12 @@ class TestParseRouterArgs:
         disabled = parse_router_args(["--disable-worker-overload-protection"])
         assert disabled.worker_overload_protection is False
 
-    def test_parse_overload_shed_liveness_warmup_index_and_selection_flags(self):
+    def test_parse_overload_shed_liveness_warmup_and_selection_flags(self):
         """Every RouterConfig field the Rust CLI exposes reaches RouterArgs,
         with the CLI's defaults when the flags are absent."""
         router_args = parse_router_args(
             [
                 "--worker-overload-shed",
-                "--kv-index",
-                "chain",
                 "--worker-stall-secs",
                 "5",
                 "--worker-wedge-secs",
@@ -734,7 +732,6 @@ class TestParseRouterArgs:
             ]
         )
         assert router_args.worker_overload_shed is True
-        assert router_args.kv_index == "chain"
         assert router_args.worker_stall_secs == 5
         assert router_args.worker_wedge_secs == 7
         assert router_args.worker_warmup_secs == 30
@@ -747,7 +744,6 @@ class TestParseRouterArgs:
 
         defaults = parse_router_args([])
         assert defaults.worker_overload_shed is False
-        assert defaults.kv_index == "positional"
         assert defaults.worker_stall_secs == 2
         assert defaults.worker_wedge_secs == 3
         assert defaults.worker_warmup_secs == 60
@@ -1646,7 +1642,6 @@ class TestRouterArgsFieldOrder:
         "prefill_queue_timeout_secs",
         "discovery_provider",
         "worker_overload_shed",
-        "kv_index",
         "worker_stall_secs",
         "worker_wedge_secs",
         "worker_warmup_secs",
@@ -1695,7 +1690,6 @@ class TestRouterArgsFieldOrder:
             "rl_control_timeout_secs",
             "rl_fanout_concurrency",
             "worker_overload_shed",
-            "kv_index",
             "worker_stall_secs",
             "worker_wedge_secs",
             "worker_warmup_secs",

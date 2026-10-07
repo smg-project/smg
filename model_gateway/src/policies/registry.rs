@@ -2273,7 +2273,7 @@ mod tests {
         }));
 
         for round in 0..64 {
-            let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+            let monitor = Arc::new(KvEventMonitor::new());
             let barrier = Arc::new(Barrier::new(ADDERS + 1));
             let handles: Vec<_> = (0..ADDERS)
                 .map(|k| {
@@ -2321,7 +2321,7 @@ mod tests {
         use crate::{mesh::MeshAdapters, worker::WorkerRegistry};
 
         let registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new(Some(4)))));
+        registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new())));
         let (_load_tx, load_rx) = watch::channel(LoadSnapshot::from_loads_for_test(Vec::new()));
         registry.set_load_receiver(Some(load_rx));
         let mesh = MeshKV::new("node-a".into());

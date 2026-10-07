@@ -58,7 +58,7 @@ const RECONNECT_FLOOR: Duration = Duration::from_millis(INITIAL_RECONNECT_DELAY_
 /// after the cursor and never resend them). A connect attempt is cheap.
 const MAX_RECONNECT_DELAY_MS: u64 = 5_000;
 
-/// Positional-index cleanup is CPU-bound and can touch many blocks. Keep it
+/// Index cleanup is CPU-bound and can touch many blocks. Keep it
 /// off Tokio workers and bound concurrent purges during fleet-wide drains.
 pub(super) const MAX_CONCURRENT_INDEX_REMOVALS: usize = 4;
 pub(super) static INDEX_REMOVAL_PERMITS: Semaphore =
@@ -121,7 +121,7 @@ impl KvEventMonitor {
         worker_blocks: WorkerIndexState,
     ) {
         let Ok(permit) = INDEX_REMOVAL_PERMITS.acquire().await else {
-            error!(worker_id, "Positional-index cleanup semaphore closed");
+            error!(worker_id, "Index cleanup semaphore closed");
             return;
         };
         let WorkerIndexState {
@@ -131,7 +131,7 @@ impl KvEventMonitor {
             debug!(
                 worker_id,
                 ?counters,
-                "KV events the positional index did not take as is"
+                "KV events the index did not take as is"
             );
         }
         let result = tokio::task::spawn_blocking(move || {
@@ -141,7 +141,7 @@ impl KvEventMonitor {
         .await;
 
         if let Err(error) = result {
-            error!(worker_id, %error, "Positional-index worker cleanup task failed");
+            error!(worker_id, %error, "Index worker cleanup task failed");
         }
         Metrics::set_kv_index_blocks(worker_url, 0);
     }
@@ -673,7 +673,7 @@ mod tests {
         wait_until_listening(addr).await;
 
         let worker = grpc_worker(addr);
-        let monitor = KvEventMonitor::new(None);
+        let monitor = KvEventMonitor::new();
         monitor.on_worker_added(&worker).await;
         // Let the task connect and park in the subscribe call.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -706,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_removed_workers_blocks_leave_the_index_off_the_runtime() {
-        let indexer = Arc::new(KvIndex::positional(64));
+        let indexer = Arc::new(KvIndex::chain());
         let worker_id = indexer.intern_worker("http://w1:8000").unwrap();
         let mut worker_blocks = WorkerIndexState::default();
         indexer

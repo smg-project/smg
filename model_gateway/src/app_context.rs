@@ -16,7 +16,7 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, warn};
 
 use crate::{
-    config::{KvIndexKind, RouterConfig},
+    config::RouterConfig,
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -793,25 +793,21 @@ impl AppContextBuilder {
             };
 
         if is_cache_aware {
-            let monitor = Arc::new(KvEventMonitor::with_kind(config.kv_index, None));
-            debug!(
-                kv_index = config.kv_index.as_str(),
-                "Created KV event monitor for event-driven cache-aware routing"
-            );
+            let monitor = Arc::new(KvEventMonitor::new());
+            debug!("Created KV event monitor for event-driven cache-aware routing");
             // The load records on the event streams are polls of the worker.
             if let Some(worker_monitor) = &self.worker_monitor {
                 monitor.set_load_sink(worker_monitor);
             }
-            if KvIndexKind::deprecated_alias_used() {
-                warn!("--kv-index run is the deprecated spelling of --kv-index chain");
+            if config.kv_indexer_ttl_secs.is_some_and(|ttl| ttl > 0)
+                || config.kv_indexer_max_entries.is_some_and(|max| max > 0)
+            {
+                warn!(
+                    "--kv-indexer-ttl-secs and --kv-indexer-max-entries are ignored: the chain \
+                     index has no prune, it holds what the engines report and shrinks with \
+                     their removals"
+                );
             }
-
-            // Optional indexer bounding: prune entries by last-touch TTL and/or
-            // capacity ceiling. Both default off (unbounded, prior behavior).
-            monitor.start_prune_task(
-                config.kv_indexer_ttl_secs.unwrap_or(0),
-                config.kv_indexer_max_entries.unwrap_or(0),
-            );
             monitor.start_stats_task();
 
             // Inject monitor into PolicyRegistry — propagates to default_policy

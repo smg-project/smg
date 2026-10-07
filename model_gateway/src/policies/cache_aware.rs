@@ -4863,14 +4863,10 @@ mod tests {
     // Event-driven routing tests (Type 1: KV index overlap scoring)
     // -----------------------------------------------------------------------
 
-    /// Helper: create a positional KV index and store blocks for a worker.
+    /// Helper: create a KV index and store blocks for a worker.
     /// `token_chunks` is a list of token-id slices — each becomes one block.
-    fn setup_indexer_with_blocks(
-        worker_url: &str,
-        token_chunks: &[&[u32]],
-        jump_size: usize,
-    ) -> Arc<KvIndex> {
-        let indexer = Arc::new(KvIndex::positional(jump_size));
+    fn setup_indexer_with_blocks(worker_url: &str, token_chunks: &[&[u32]]) -> Arc<KvIndex> {
+        let indexer = Arc::new(KvIndex::chain());
         let worker_id = indexer.intern_worker(worker_url).unwrap();
         let mut wb = WorkerBlocks::default();
         let blocks: Vec<StoredBlock> = token_chunks
@@ -4925,7 +4921,6 @@ mod tests {
                 &[9, 10, 11, 12],
                 &[13, 14, 15, 16],
             ],
-            4,
         );
 
         // Query with matching tokens — should select w1
@@ -4960,7 +4955,7 @@ mod tests {
         ];
 
         let chunks: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 6, 7, 8]];
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks, 4);
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks);
         // Same content cached on w2 under distinct backend seq hashes.
         let w2 = indexer.intern_worker("http://w2:8000").unwrap();
         let mut wb2 = WorkerBlocks::default();
@@ -5005,7 +5000,7 @@ mod tests {
             ),
         ];
         let chunks: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 6, 7, 8]];
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks, 4);
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks);
         let w2 = indexer.intern_worker("http://w2:8000").unwrap();
         let mut wb2 = WorkerBlocks::default();
         let blocks: Vec<StoredBlock> = chunks
@@ -5094,8 +5089,7 @@ mod tests {
                     .build(),
             ),
         ];
-        let indexer =
-            setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
         let w2 = indexer.intern_worker("http://w2:8000").unwrap();
         let mut wb2 = WorkerBlocks::default();
         let blocks = vec![StoredBlock {
@@ -5186,8 +5180,7 @@ mod tests {
         )];
         policy.init_workers(&workers);
 
-        let indexer =
-            setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
 
         // Completely different tokens — no overlap → None
         let result = overlap_affinity_group(
@@ -5223,7 +5216,7 @@ mod tests {
         policy.init_workers(&workers);
 
         // Store same blocks for both workers (equal overlap)
-        let indexer = Arc::new(KvIndex::positional(4));
+        let indexer = Arc::new(KvIndex::chain());
         let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
         let w2_id = indexer.intern_worker("http://w2:8000").unwrap();
         let mut wb1 = WorkerBlocks::default();
@@ -5275,7 +5268,7 @@ mod tests {
         ];
         policy.init_workers(&workers);
 
-        let indexer = Arc::new(KvIndex::positional(4));
+        let indexer = Arc::new(KvIndex::chain());
         let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
         let w2_id = indexer.intern_worker("http://w2:8000").unwrap();
         let mut wb1 = WorkerBlocks::default();
@@ -5328,7 +5321,7 @@ mod tests {
                 .build(),
         )];
 
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]);
 
         // Request shorter than block_size → no full blocks → None
         let result =
@@ -5355,7 +5348,7 @@ mod tests {
         ];
         policy.init_workers(&workers);
 
-        let indexer = Arc::new(KvIndex::positional(4));
+        let indexer = Arc::new(KvIndex::chain());
         let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
         let w2_id = indexer.intern_worker("http://w2:8000").unwrap();
         let mut wb1 = WorkerBlocks::default();
@@ -5415,9 +5408,8 @@ mod tests {
         workers[1].increment_load();
         update_expected_wait_loads(&policy, &workers, &[10_000, 0]);
 
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer =
-            setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -5447,8 +5439,8 @@ mod tests {
         policy.init_workers(&workers);
         update_expected_wait_loads(&policy, &workers, &[0, 0]);
         let held: Vec<u32> = (1..=4_400).collect();
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&held], 4);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&held]);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
         // w1's first block (the shared head) followed by eleven novel blocks.
@@ -5518,7 +5510,7 @@ mod tests {
         let workers = make_workers(&refs);
         policy.init_workers(&workers);
         update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 0, 0, 0, 0, 0]);
-        let indexer = Arc::new(KvIndex::positional(4));
+        let indexer = Arc::new(KvIndex::chain());
         let mut prefixes = Vec::new();
         for (h, url) in urls.iter().enumerate() {
             let id = indexer.intern_worker(url).unwrap();
@@ -5531,7 +5523,7 @@ mod tests {
             store_blocks(&indexer, id, &tokens, 4, (h as u64 + 1) * 1_000_000);
             prefixes.push(tokens[..240].to_vec());
         }
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
         monitor
             .indexers
             .insert("unknown".to_string(), Arc::clone(&indexer));
@@ -5786,8 +5778,8 @@ mod tests {
         }
         update_expected_wait_loads(&policy, &workers, &[10_000, 0]);
 
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -5818,8 +5810,8 @@ mod tests {
         }
         update_expected_wait_loads(&policy, &workers, &[20_000, 10_000, 0]);
 
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -5848,7 +5840,7 @@ mod tests {
         }
         update_expected_wait_loads(&policy, &workers, &[10_000, 0, 0]);
 
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -5892,7 +5884,7 @@ mod tests {
         let (_tx, rx) = watch::channel(complete_load_snapshot(overlap_loads));
         policy.set_load_receiver(Some(rx));
 
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -5923,7 +5915,7 @@ mod tests {
         }
         update_expected_wait_loads(&policy, &workers, &[10_000, 0]);
 
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -5961,9 +5953,8 @@ mod tests {
         policy.init_workers(&workers);
 
         // Set up monitor with indexer data for "unknown" model
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer =
-            setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -6001,8 +5992,8 @@ mod tests {
         policy.init_workers(&workers);
 
         // Monitor has indexer with data, but tokens don't match
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -6039,8 +6030,8 @@ mod tests {
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
         policy.init_workers(&workers);
 
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -6076,8 +6067,8 @@ mod tests {
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
         policy.init_workers(&workers);
 
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -6137,7 +6128,7 @@ mod tests {
         assert!(policy.kv_monitor.read().is_none());
 
         // Set monitor (works via &self thanks to interior mutability)
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
         policy.set_kv_event_monitor(Some(Arc::clone(&monitor)));
         assert!(policy.kv_monitor.read().is_some());
 
@@ -6175,10 +6166,10 @@ mod tests {
         ];
         policy.init_workers(&workers);
 
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
 
         // Store blocks using block_size=8 (tokens chunked in groups of 8)
-        let indexer = Arc::new(KvIndex::positional(4));
+        let indexer = Arc::new(KvIndex::chain());
         let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerBlocks::default();
         let block = vec![StoredBlock {
@@ -6239,7 +6230,7 @@ mod tests {
         policy.init_workers(&workers);
 
         // Even though we set up event monitor, imbalance check fires first
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
         policy.set_kv_event_monitor(Some(monitor));
 
         // With imbalance, select_worker should pick expected wait (w2), not event-driven.
@@ -6278,8 +6269,8 @@ mod tests {
         policy.init_workers(&workers);
 
         // Set up monitor with an empty indexer
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let empty_indexer = Arc::new(KvIndex::positional(4));
+        let monitor = Arc::new(KvEventMonitor::new());
+        let empty_indexer = Arc::new(KvIndex::chain());
         monitor
             .indexers
             .insert("unknown".to_string(), empty_indexer);
@@ -7172,9 +7163,9 @@ mod tests {
             });
             let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
             policy.init_workers(&workers);
-            let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+            let monitor = Arc::new(KvEventMonitor::new());
             let indexer =
-                setup_indexer_with_blocks("http://w2:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+                setup_indexer_with_blocks("http://w2:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
             monitor.indexers.insert("unknown".to_string(), indexer);
             policy.set_kv_event_monitor(Some(monitor));
 
@@ -7240,8 +7231,8 @@ mod tests {
         });
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
         let accounting = policy.accounting.as_ref().expect("accounting enabled");
@@ -7342,7 +7333,7 @@ mod tests {
 
         // Blocks stored on w1 under (lora "adapter", salt "tenant-a"), as the
         // monitor hashes a salted KvBlocksStored event.
-        let indexer = Arc::new(KvIndex::positional(4));
+        let indexer = Arc::new(KvIndex::chain());
         let worker_id = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerBlocks::default();
         let seed = namespace_seed(Some("adapter"), Some("tenant-a"));
@@ -7357,7 +7348,7 @@ mod tests {
         indexer
             .apply_stored(worker_id, &blocks, None, &mut wb)
             .unwrap();
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -7401,7 +7392,7 @@ mod tests {
         let urls: Vec<String> = (0..count).map(|i| format!("http://w{i}:8000")).collect();
         let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
         let workers = make_workers(&refs);
-        let indexer = setup_indexer_with_blocks(&urls[holder], chunks, 4);
+        let indexer = setup_indexer_with_blocks(&urls[holder], chunks);
         for (i, url) in urls.iter().enumerate() {
             if i != holder {
                 indexer.intern_worker(url).unwrap();
@@ -7409,7 +7400,7 @@ mod tests {
         }
         let policy = CacheAwarePolicy::with_config(config);
         policy.init_workers(&workers);
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
         monitor.indexers.insert("unknown".to_string(), indexer);
         monitor.set_block_size("unknown", 4);
         policy.set_kv_event_monitor(Some(monitor));
@@ -7469,7 +7460,7 @@ mod tests {
     #[test]
     fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-        let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]], 4);
+        let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]]);
         let w3 = indexer.worker_id("http://w3:8000").unwrap();
         let table = PoolTable::build(&workers, &indexer, liveness::now_ms());
         assert!(table.describes(&workers));
@@ -7501,7 +7492,7 @@ mod tests {
         let urls: Vec<String> = (0..count).map(|i| format!("http://w{i}:8000")).collect();
         let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
         let workers = make_workers(&refs);
-        let indexer = Arc::new(KvIndex::positional(4));
+        let indexer = Arc::new(KvIndex::chain());
         for (i, url) in urls.iter().enumerate() {
             let id = indexer.intern_worker(url).unwrap();
             let mut wb = WorkerBlocks::default();
@@ -7519,7 +7510,7 @@ mod tests {
         }
         let policy = CacheAwarePolicy::with_config(config);
         policy.init_workers(&workers);
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let monitor = Arc::new(KvEventMonitor::new());
         monitor.indexers.insert("unknown".to_string(), indexer);
         monitor.set_block_size("unknown", 4);
         policy.set_kv_event_monitor(Some(monitor));

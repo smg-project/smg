@@ -26,10 +26,8 @@ use std::{
 };
 
 use crate::{
+    block::{ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock, WorkerIdExhausted},
     chain_index::{ChainIndex, ChainIndexStats},
-    event_tree::{
-        ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock, WorkerIdExhausted,
-    },
     lane_map::ChainBlockMap,
 };
 

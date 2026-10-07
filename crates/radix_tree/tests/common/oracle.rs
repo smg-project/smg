@@ -1,25 +1,25 @@
-//! The differential oracle: `kv_index::PositionalIndexer` behind the
-//! same glue the service engine holds today (per-holder caller-owned
+//! The differential oracle: `kv_index::ChainIndex` behind the same
+//! glue the service engine holds today (per-holder caller-owned
 //! reverse maps, worker interning, id->holder resolution), driven by
 //! the harness's operation stream.
 
 use std::collections::BTreeMap;
 
-use kv_index::{ContentHash, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap};
+use kv_index::{ChainBlockMap, ChainIndex, ContentHash, SequenceHash, StoredBlock};
 
 use super::Op;
 
 pub struct Oracle {
-    index: PositionalIndexer,
+    index: ChainIndex,
     /// worker_id by holder index (dense).
     ids: Vec<u32>,
     /// The engine-side caller-owned reverse maps, one per holder.
-    blocks: Vec<WorkerBlockMap>,
+    blocks: Vec<ChainBlockMap>,
 }
 
 impl Oracle {
     pub fn new(holder_count: usize) -> Self {
-        let index = PositionalIndexer::new(64);
+        let index = ChainIndex::with_max_workers(holder_count);
         let mut ids = Vec::with_capacity(holder_count);
         let mut blocks = Vec::with_capacity(holder_count);
         for h in 0..holder_count {
@@ -27,7 +27,7 @@ impl Oracle {
                 .intern_worker(&format!("holder-{h}"))
                 .expect("id space");
             ids.push(id);
-            blocks.push(WorkerBlockMap::default());
+            blocks.push(ChainBlockMap::default());
         }
         Self { index, ids, blocks }
     }

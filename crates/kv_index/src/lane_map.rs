@@ -14,7 +14,7 @@
 //! absent key is a no-op, iteration yields every entry once. A differential test against a hash
 //! map model under random operations keeps the backshift right.
 
-use crate::{chain_index::BlockRef, event_tree::SequenceHash};
+use crate::{block::SequenceHash, chain_index::BlockRef};
 
 /// Smallest table a non-empty map allocates.
 const MIN_SLOTS: usize = 16;

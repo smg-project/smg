@@ -32,10 +32,10 @@ use smg::{
     config::{
         resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, ManualAssignmentMode,
-        MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
-        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MetricsConfig,
+        OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
+        RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        TokenizerCacheConfig, TraceConfig,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
@@ -191,12 +191,6 @@ enum Commands {
 fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
     TransportMode::parse(value)
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
-}
-
-/// Parse the `--kv-index` value into a `KvIndexKind`.
-fn parse_kv_index_kind(value: &str) -> Result<KvIndexKind, String> {
-    KvIndexKind::parse(value)
-        .ok_or_else(|| format!("invalid value '{value}'; expected positional or chain"))
 }
 
 /// Parse the `--mm-processing` value into an `MmProcessingMode`.
@@ -691,27 +685,17 @@ struct CliArgs {
     #[arg(long, default_value_t = 30, help_heading = "Load Monitoring")]
     pd_admission_wait_secs: u64,
 
-    /// TTL in seconds for event-driven cache-aware indexer entries: entries
-    /// neither stored nor read by a query within this window are pruned.
-    /// Bounds index growth when a backend stops emitting removal events.
-    /// Unset or 0 disables the TTL pass.
+    /// Deprecated and ignored: the TTL prune of the positional indexer, which
+    /// the chain index replaced. The chain index holds what the engines report
+    /// and shrinks with their removals, so it has no prune; the flag is still
+    /// accepted so that existing launch lines keep working.
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_ttl_secs: Option<u64>,
 
-    /// Capacity ceiling per model for the event-driven cache-aware indexer;
-    /// beyond it, oldest-touched entries are pruned down to 90% of the
-    /// ceiling. Unset or 0 disables the ceiling.
+    /// Deprecated and ignored: the capacity ceiling of the positional
+    /// indexer's prune; see --kv-indexer-ttl-secs.
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_max_entries: Option<usize>,
-
-    /// The event-driven KV index behind cache-aware routing: `positional`
-    /// (one entry per block position, the default) or `chain` (chains as runs
-    /// with per-run worker coverage; lock-free, store-free lookups; `run` is
-    /// its deprecated spelling). The --kv-indexer-* prune bounds apply to the
-    /// positional index only; the chain index holds what the engines report
-    /// and shrinks with their removals.
-    #[arg(long, default_value = "positional", value_parser = parse_kv_index_kind, help_heading = "Routing Policy")]
-    kv_index: KvIndexKind,
 
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
     /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
@@ -2089,7 +2073,6 @@ impl CliArgs {
             .worker_overload_shed(self.worker_overload_shed)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
-            .kv_index(self.kv_index)
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
@@ -2420,8 +2403,8 @@ mod tests {
         }
     }
 
-    /// The indexer prune flags are router-only settings and must flow into
-    /// `RouterConfig` (unset by default so the indexer stays unbounded).
+    /// The deprecated indexer prune flags are still accepted and flow into
+    /// `RouterConfig`, where nothing reads them but the startup warning.
     #[test]
     fn kv_indexer_prune_flags_flow_into_router_config() {
         let cli = cli_args_from(&[
@@ -2437,33 +2420,6 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_indexer_ttl_secs, None);
         assert_eq!(defaults.kv_indexer_max_entries, None);
-    }
-
-    /// `--kv-index` selects the event-driven index for cache-aware routing;
-    /// the positional indexer stays the default until the chain index has
-    /// passed a soak in the gateway.
-    #[test]
-    fn kv_index_flag_flows_into_router_config() {
-        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(defaults.kv_index, KvIndexKind::Positional);
-
-        let cli = cli_args_from(&["--kv-index", "chain"]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_index, KvIndexKind::Chain);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.router_config.kv_index, KvIndexKind::Chain);
-        // The spelling before the rename still selects the chain index.
-        assert_eq!(
-            cli_args_from(&["--kv-index", "run"]).kv_index,
-            KvIndexKind::Chain
-        );
-        assert!(KvIndexKind::deprecated_alias_used());
-
-        assert_eq!(
-            cli_args_from(&["--kv-index", "Positional"]).kv_index,
-            KvIndexKind::Positional
-        );
-        assert!(parse_kv_index_kind("tree").is_err());
     }
 
     /// The retry-buffer cap must flow through both conversion paths.

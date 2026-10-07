@@ -24,8 +24,7 @@ use std::{
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use kv_index::{
     compute_content_hash, compute_request_content_hashes, request_prefix_hashes, ChainBlockMap,
-    ChainIndex, ContentHash, PositionalIndexer, SequenceHash, ShardedChainIndex, StoredBlock,
-    TokenTree, Tree, WorkerBlockMap,
+    ChainIndex, ContentHash, SequenceHash, ShardedChainIndex, StoredBlock, TokenTree, Tree,
 };
 
 const TENANTS: usize = 64;
@@ -260,10 +259,10 @@ fn bench_event_path(c: &mut Criterion) {
 
     // An indexer with 64 workers each holding 32 blocks: the size check the
     // policy runs per request before taking the event-driven path.
-    let indexer = PositionalIndexer::new(64);
+    let indexer = ChainIndex::new();
     for w in 0..TENANTS {
         let worker_id = indexer.intern_worker(&tenant(w)).expect("worker id");
-        let mut worker_blocks = WorkerBlockMap::default();
+        let mut worker_blocks = ChainBlockMap::default();
         let blocks: Vec<StoredBlock> = (0..32usize)
             .map(|p| StoredBlock {
                 seq_hash: SequenceHash::from(mix((w as u64) << 8 | p as u64)),

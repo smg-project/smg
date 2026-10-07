@@ -409,7 +409,7 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         "smg_kv_index_lookup_seconds",
         "Time of one KV index lookup (overlap scoring of a request's block hashes) \
-         in cache-aware routing, by index kind (positional, chain)"
+         in cache-aware routing, by index kind"
     );
     describe_gauge!(
         "smg_kv_event_degraded_ranks",
@@ -431,8 +431,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_kv_index_entries",
-        "Distinct entries in the KV index, by model: (position, content hash) pairs in \
-         the positional indexer, distinct blocks on a chain in the chain index"
+        "Distinct entries in the KV index, by model: distinct blocks on a chain"
     );
     describe_gauge!(
         "smg_kv_index_runs_live",
@@ -468,7 +467,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_kv_index_blocks",
-        "Blocks the positional index holds for a worker, as the index counts them; \
+        "Blocks the index holds for a worker, as the index counts them; \
          set when a KV event batch is applied, when the worker's state is reset \
          and when the worker is removed"
     );
@@ -1827,7 +1826,7 @@ impl Metrics {
         gauge!("smg_kv_event_tail_depth", "worker" => intern_string(worker_url)).set(depth as f64);
     }
 
-    /// Publish the blocks the positional index holds for a worker. Called from
+    /// Publish the blocks the index holds for a worker. Called from
     /// the KV event subscriber where it already counts applied batches, never
     /// from the lookup path, so routing reads nothing that writes.
     pub fn set_kv_index_blocks(worker_url: &str, blocks: usize) {

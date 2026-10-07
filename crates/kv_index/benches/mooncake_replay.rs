@@ -43,9 +43,8 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 use kv_index::{
-    ChainBlockMap, Claimed, ContentHash, Control, LaneHooks, LanePool, LanePoolConfig,
-    PositionalIndexer, QueueFull, ReferenceIndexer, SequenceHash, ShardedChainIndex, StoredBlock,
-    WorkerBlockMap,
+    ChainBlockMap, Claimed, ContentHash, Control, LaneHooks, LanePool, LanePoolConfig, QueueFull,
+    ReferenceIndexer, SequenceHash, ShardedChainIndex, StoredBlock,
 };
 use rustc_hash::FxHashMap;
 use serde_json::json;
@@ -408,71 +407,6 @@ struct EventMsg {
     /// The worker's slot (its rank of first appearance in the corpus), the lane pool's key.
     slot: u32,
     payload: Payload,
-}
-
-struct Positional {
-    inner: PositionalIndexer,
-}
-
-struct PositionalLane {
-    workers: FxHashMap<(u64, u32), (u32, WorkerBlockMap)>,
-}
-
-impl ReplayBackend for Positional {
-    type Lane = PositionalLane;
-
-    fn name(&self) -> &'static str {
-        "smg-positional"
-    }
-
-    fn new_lane(&self) -> Self::Lane {
-        PositionalLane {
-            workers: FxHashMap::default(),
-        }
-    }
-
-    fn apply_stored(
-        &self,
-        lane: &mut Self::Lane,
-        worker: (u64, u32),
-        blocks: &[StoredBlock],
-        parent: Option<SequenceHash>,
-    ) -> bool {
-        let (smg_id, blocks_map) = lane.workers.entry(worker).or_insert_with(|| {
-            let id = self
-                .inner
-                .intern_worker(&format!("{}:{}", worker.0, worker.1))
-                .expect("worker id space");
-            (id, WorkerBlockMap::default())
-        });
-        self.inner
-            .apply_stored(*smg_id, blocks, parent, blocks_map)
-            .is_ok()
-    }
-
-    fn apply_removed(
-        &self,
-        lane: &mut Self::Lane,
-        worker: (u64, u32),
-        hashes: &[SequenceHash],
-    ) -> bool {
-        let Some((smg_id, blocks_map)) = lane.workers.get_mut(&worker) else {
-            return false;
-        };
-        self.inner.apply_removed(*smg_id, hashes, blocks_map);
-        true
-    }
-
-    fn apply_cleared(&self, lane: &mut Self::Lane, worker: (u64, u32)) -> bool {
-        if let Some((smg_id, blocks_map)) = lane.workers.get_mut(&worker) {
-            self.inner.apply_cleared(*smg_id, blocks_map);
-        }
-        true
-    }
-
-    fn lookup(&self, hashes: &[ContentHash]) -> usize {
-        self.inner.find_matches(hashes, false).scores.len()
-    }
 }
 
 struct Chain {
@@ -1753,13 +1687,9 @@ enum Lookups {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BackendKind {
-    /// This crate's event-driven PositionalIndexer.
-    Positional,
     /// The single-threaded reference indexer (small corpora only).
     Reference,
-    /// This crate's run-compressed ChainIndex (worker slots from `--max-workers`); `run` is the
-    /// name it had and stays accepted until the positional indexer's removal.
-    #[value(alias = "run")]
+    /// This crate's run-compressed ChainIndex (worker slots from `--max-workers`).
     Chain,
     /// No indexer: the harness's own ceiling on this layout.
     Null,
@@ -1773,11 +1703,8 @@ struct Args {
     /// Corpus file in the export format described in benches/README.md: a prepared schedule of
     /// the Mooncake trace.
     corpus: String,
-    #[arg(long, value_enum, default_value = "positional")]
+    #[arg(long, value_enum, default_value = "chain")]
     backend: BackendKind,
-    /// Jump size of the positional indexer's lookup.
-    #[arg(long, default_value = "8")]
-    jump_size: usize,
     /// Worker slots of the chain index (one coverage bit per slot per run, at most 1024).
     #[arg(long, default_value = "256")]
     max_workers: usize,
@@ -1886,14 +1813,6 @@ fn main() -> anyhow::Result<()> {
         (None, None) => corpus.reference_window_ns,
     };
     match args.backend {
-        BackendKind::Positional => run(
-            &args,
-            corpus,
-            window_ns,
-            Arc::new(Positional {
-                inner: PositionalIndexer::new(args.jump_size),
-            }),
-        ),
         BackendKind::Reference => {
             if corpus.ops.len() > 2_000_000 {
                 eprintln!(
@@ -2653,7 +2572,6 @@ fn run<B: ReplayBackend>(
             "trace_length_factor": corpus.trace_length_factor,
             "inference_worker_duplication_factor": corpus.inference_worker_duplication_factor,
             "num_unique_inference_workers": corpus.logical_workers,
-            "jump_size": args.jump_size,
             "issuer_spin_us": args.issuer_spin_us,
             "issue_lag_diagnostic_threshold_us": args.issue_lag_diagnostic_threshold_us,
         },

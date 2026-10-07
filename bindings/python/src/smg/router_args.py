@@ -296,9 +296,6 @@ class RouterArgs:
     # Refuse with a 503 when every worker a request could use is overloaded,
     # instead of routing it to the least-loaded one
     worker_overload_shed: bool = False
-    # The event-driven KV index behind cache-aware routing: "positional"
-    # (one entry per block position) or "chain" (chains as runs)
-    kv_index: str = "positional"
     # Liveness: seconds without contact after a transport failure before a
     # worker is vetoed; seconds without progress before a loaded one is wedged
     worker_stall_secs: int = 2
@@ -686,16 +683,6 @@ class RouterArgs:
                 " use is overloaded, instead of routing it to the least-loaded one;"
                 " also sheds a worker that crossed a threshold between selection"
                 " and dispatch. Off by default."
-            ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}kv-index",
-            type=str,
-            default=RouterArgs.kv_index,
-            help=(
-                "The event-driven KV index behind cache-aware routing: 'positional'"
-                " (one entry per block position, the default) or 'chain' (chains as"
-                " runs with per-run worker coverage; lock-free, store-free lookups)."
             ),
         )
         routing_group.add_argument(

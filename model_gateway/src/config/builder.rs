@@ -5,10 +5,9 @@ use smg_mcp::McpConfig;
 
 use super::{
     CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MetricsConfig,
-    OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
-    RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig,
-    TraceConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MetricsConfig, OracleConfig,
+    PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+    RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -329,11 +328,6 @@ impl RouterConfigBuilder {
 
     pub fn kv_indexer_max_entries(mut self, max: Option<usize>) -> Self {
         self.config.kv_indexer_max_entries = max;
-        self
-    }
-
-    pub fn kv_index(mut self, kind: KvIndexKind) -> Self {
-        self.config.kv_index = kind;
         self
     }
 
