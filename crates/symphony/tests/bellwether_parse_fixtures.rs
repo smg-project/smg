@@ -393,14 +393,13 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS reads neither of the probes' Qwen markers: `</think>` stays reasoning text
-            // and the fenced `<tool_call>` block stays content, as the reference says.
-            Self::SeedOss => &[],
-            // Hy4 and IQuest read neither probe's Qwen markers; Ling reads `<tool_call>` and
-            // `</think>`, so its two probes are the tagged ones' (no call comes of the fence).
-            Self::Hy4 | Self::IQuest => &[],
+            // Seed-OSS and Hy4 read neither of the probes' Qwen markers: `</think>` stays reasoning
+            // text and the fenced `<tool_call>` block stays content, as the reference says.
+            Self::SeedOss | Self::Hy4 => &[],
+            // Ling reads `<tool_call>` and `</think>`, so its two probes are the tagged ones' (no
+            // call comes of the fence); IQuest and DSML read `</think>` but not `<tool_call>`.
             Self::Ling => KNOWN_TAGGED_DIFFERENCES,
-            Self::DeepSeekV4_1 => KNOWN_DSML_DIFFERENCES,
+            Self::IQuest | Self::DeepSeekV4_1 => KNOWN_REASONING_PROBE,
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
         // read; that case falls under the reasoning allowance instead of the list.
@@ -538,38 +537,35 @@ const KNOWN_DIFFERENCES: &[KnownDifference] = &[
     },
 ];
 
-/// The same two probe cases under the tagged syntax. The code fence holds the JSON syntax, which
-/// the tagged assembler reports as text between a call's tags, so no call comes of it; the marker
-/// in the reasoning ends the thought where it stands, for the models that write one.
-const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[
-    KnownDifference {
-        id: "parse/reasoning-with-marker-text",
-        reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every \
-                 marker parser does, and the reference keeps the marker as reasoning text \
-                 (bellwether #16)",
-        calls: 0,
-        finish: "stop",
-    },
-    KnownDifference {
-        id: "parse/content-with-marker-in-code-fence",
-        reason: "the content holds a complete `<tool_call>` block inside a code fence; the parser \
-                 reads the block, as every marker parser does, and the reference keeps it as \
-                 content (bellwether #16)",
-        calls: 0,
-        finish: "stop",
-    },
-];
-
-/// Under the DSML table only the reasoning probe differs: the code fence holds Qwen's syntax,
-/// which this table never reads as a call, so the fence is content, as the reference says.
-const KNOWN_DSML_DIFFERENCES: &[KnownDifference] = &[KnownDifference {
+/// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
+/// reads as the thought's end.
+const REASONING_PROBE: KnownDifference = KnownDifference {
     id: "parse/reasoning-with-marker-text",
     reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every \
              marker parser does, and the reference keeps the marker as reasoning text \
              (bellwether #16)",
     calls: 0,
     finish: "stop",
-}];
+};
+
+/// The code-fence probe: its content holds a complete `<tool_call>` block inside a code fence,
+/// which every table with that marker reads as a block.
+const FENCE_PROBE: KnownDifference = KnownDifference {
+    id: "parse/content-with-marker-in-code-fence",
+    reason: "the content holds a complete `<tool_call>` block inside a code fence; the parser \
+             reads the block, as every marker parser does, and the reference keeps it as \
+             content (bellwether #16)",
+    calls: 0,
+    finish: "stop",
+};
+
+/// Under the tagged syntax both probes differ.
+const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[REASONING_PROBE, FENCE_PROBE];
+
+/// Under a table that reads `</think>` but not `<tool_call>` (DSML, IQuest), only the reasoning
+/// probe differs: the fence holds Qwen's syntax, which the table never reads as a call, so it is
+/// content, as the reference says.
+const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
 
 /// The case's id after its slug: what [`KnownDifference::id`] names.
 fn after_slug(id: &str) -> &str {

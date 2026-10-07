@@ -1,7 +1,8 @@
 //! IQuest: reasoning between `<think>` and `</think>`, each call between `<iquest_tool_call>` and
 //! `</iquest_tool_call>` as its name and keyed arguments (`<arg_key>`, `<arg_value>`), typed by
 //! the request's tools, with no newline anywhere. Everything else is content. The prompt opens
-//! the thought. Recorded as `iquest-q1` (IQuestLab/IQuest-Q1).
+//! the thought, and a turn opens with `<|iquest_assistant|>`, so the prompt's replay starts there.
+//! Recorded as `iquest-q1` (IQuestLab/IQuest-Q1).
 
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -24,6 +25,7 @@ pub fn iquest() -> Format {
         .transition("call", "call_close", "content")
         .transition("call", "call_open", "call")
         .calls(CallSyntax::Keyed(keyed::Tags::PLAIN))
+        .opens_turn("<|iquest_assistant|>")
 }
 
 #[cfg(test)]
@@ -123,6 +125,55 @@ mod tests {
             }
         }
         calls
+    }
+
+    #[test]
+    fn the_prompt_is_replayed_from_iquests_own_turn_opener() {
+        // A call marker quoted in the user's turn, then the generation prompt opening the thought:
+        // the replay starts at IQuest's own turn opener, so the output is the thought and then
+        // content (smg #2842, Alex's probe with the rendered prompt).
+        let prompt =
+            "user: Why did you print <iquest_tool_call> there?\n<|iquest_assistant|><think>\n";
+        let output = "The user asks about the tag.</think>It opens a call.";
+        let mut parser = Engine::new(iquest(), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        let events = out.drain();
+        assert_eq!(events[0], Event::ReasoningStart);
+        let reasoning: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let content: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "The user asks about the tag.");
+        assert_eq!(content, "It opens a call.");
     }
 
     #[test]

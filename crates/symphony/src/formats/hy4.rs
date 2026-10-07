@@ -3,7 +3,8 @@
 //! `<tool_call:opensource>` and `</tool_call:opensource>` as its name and keyed arguments in Hy4's
 //! spelling of the tags ([`keyed::Tags::HY4`]), typed by the request's tools. Everything else is
 //! content. The prompt opens the thought, and an empty thought writes `</think:opensource>` at
-//! once. Recorded as `hy4-preview` (tencent/Hy4-preview).
+//! once. A turn opens with `<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>`, so the
+//! prompt's replay starts there. Recorded as `hy4-preview` (tencent/Hy4-preview).
 
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -30,6 +31,7 @@ pub fn hy4() -> Format {
         .transition("call", "call_close", "calls")
         .transition("calls", "calls_close", "content")
         .calls(CallSyntax::Keyed(keyed::Tags::HY4))
+        .opens_turn("<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>")
 }
 
 #[cfg(test)]
@@ -132,6 +134,56 @@ mod tests {
             }
         }
         calls
+    }
+
+    #[test]
+    fn the_prompt_is_replayed_from_hy4s_own_turn_opener() {
+        // A call marker quoted in the user's turn, then the generation prompt opening the thought:
+        // the replay starts at Hy4's own turn opener, so the output is the thought and then
+        // content (smg #2842, Alex's probe with the rendered prompt).
+        let prompt = "<｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Why did you print \
+                      <tool_calls:opensource> there?<｜hy_start:opensource｜>assistant\
+                      <｜hy_middle:opensource｜><think:opensource>\n";
+        let output = "The user asks about the tag.</think:opensource>It opens a call.";
+        let mut parser = Engine::new(hy4(), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        let events = out.drain();
+        assert_eq!(events[0], Event::ReasoningStart);
+        let reasoning: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let content: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "The user asks about the tag.");
+        assert_eq!(content, "It opens a call.");
     }
 
     #[test]
