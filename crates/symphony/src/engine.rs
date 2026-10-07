@@ -144,8 +144,12 @@ impl Call {
             (Self::Tagged(assembler), Closed::ByMarker) => assembler.close(out),
             (Self::Tagged(assembler), Closed::ByEnd) => assembler.finish(out),
             // Only the invoke's closing tag is the call's end; the next invoke's opening and the
-            // block's close end the call too, and the engine drops them as the region's.
-            (Self::Dsml(assembler), Closed::ByMarker) if terminal == tagged::dsml::INVOKE_CLOSE => {
+            // block's close end the call too, and the engine drops them as the region's. An
+            // invoke that named no call takes whichever terminal ended it, so that it is reported
+            // the same way however it ended.
+            (Self::Dsml(assembler), Closed::ByMarker)
+                if terminal == tagged::dsml::INVOKE_CLOSE || !assembler.started() =>
+            {
                 assembler.close(terminal, out);
                 return true;
             }

@@ -380,11 +380,59 @@ mod tests {
             })
             .collect();
         assert_eq!(ends, ["</｜DSML｜ invoke>", "", ""]);
-        assert!(events.contains(&dropped("<｜DSML｜ invoke name=\"")));
+        // All three openers are dropped: `f`'s and `g`'s by the `calls + invoke_open` row, `h`'s by
+        // the `invoke + invoke_open` row, which this test pins.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == dropped("<｜DSML｜ invoke name=\""))
+                .count(),
+            3
+        );
         assert!(events.contains(&dropped("</｜DSML｜ calls>")));
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn an_invoke_that_named_nothing_is_reported_however_it_ended() {
+        // The invoke tag cut short before its name, ended by the block's close, by the next
+        // invoke's opening, or by its own closing tag: each ending's bytes come back as
+        // `Malformed`, and no call is counted for it.
+        for (output, ending) in [
+            (
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"</｜DSML｜ calls>",
+                "</｜DSML｜ calls>",
+            ),
+            (
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"<｜DSML｜ invoke name=\"g\">\n\
+                 </｜DSML｜ invoke>\n</｜DSML｜ calls>",
+                "<｜DSML｜ invoke name=\"",
+            ),
+            (
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+                "</｜DSML｜ invoke>",
+            ),
+        ] {
+            let events = run("<think>\n\n</think>\n\n", &[output]);
+            assert_eq!(bytes(&events), output, "{ending}");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, .. } if text.text == ending
+                )),
+                "{ending}: {events:?}"
+            );
+        }
+        let events = run(
+            "<think>\n\n</think>\n\n",
+            &["<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"</｜DSML｜ calls>"],
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 0, .. })
         ));
     }
 
