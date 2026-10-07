@@ -130,6 +130,10 @@ fn lfm2_5() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::lfm2_5(), Declared::default()))
 }
 
+fn xlam() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::xlam(), Declared::default()))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -181,6 +185,23 @@ const FORMATS: &[Subject] = &[
         new: lfm2_5,
         outputs: LFM_OUTPUTS,
     },
+    Subject {
+        name: "xlam",
+        new: xlam,
+        outputs: XLAM_OUTPUTS,
+    },
+];
+
+/// A bare JSON list of calls, or prose.
+const XLAM_OUTPUTS: &[&str] = &[
+    "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, \
+     {\"name\": \"get_stock_price\", \"arguments\": {}}]",
+    "[{\"name\": \"get_weather\", \"argu",
+    "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}",
+    "  [ ]",
+    "[{\"name\": \"f\", \"arguments\": {}} junk {\"name\": \"g\", \"arguments\": {}}] after",
+    "Hello, [not a list].",
+    "",
 ];
 
 /// Python calls as Olmo 3 writes them: bare, one per line.
