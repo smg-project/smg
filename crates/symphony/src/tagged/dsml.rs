@@ -35,10 +35,12 @@
 //!   engine's terminals, so they end the call wherever they stand, a value included, as
 //!   `</tool_call>` does for Qwen (the table's `invoke + invoke_open` and `invoke + calls_close`
 //!   rows).
-//! - **Two endings.** [`Assembler::close`] is the invoke's closing tag, or the block's end before
-//!   it: after the last parameter it closes the object and pushes `ToolCallEnd` with the tag's
-//!   bytes; inside a value it closes an open string and the object and reports what was held, as
-//!   the Qwen assembler does. [`Assembler::finish`] is a stream that was cut: nothing is closed.
+//! - **Two endings.** [`Assembler::close`] is the invoke's closing tag ([`INVOKE_CLOSE`], the one
+//!   terminal the call's end carries), or the next invoke's opening or the block's close, which
+//!   end the call with no bytes of their own: after the last parameter it closes the object and
+//!   pushes `ToolCallEnd`; inside a value it reports what was held, closes an open string and the
+//!   object, as the Qwen assembler does. [`Assembler::finish`] is a stream that was cut: nothing
+//!   is closed.
 //! - **Every byte of the invoke lands in exactly one event**, with the same accounting as the Qwen
 //!   assembler: the name's bytes in `ToolCallStart`, each tag's and value's bytes in the
 //!   fragments they produce, text where the syntax has tags as `Malformed` run by run with the
@@ -61,6 +63,10 @@ use crate::{
         value::json,
     },
 };
+
+/// The invoke's closing tag: the one terminal the call's end carries. The next invoke's opening
+/// and the block's close end a call too, but they belong to the region, and the engine drops them.
+pub const INVOKE_CLOSE: &str = "</｜DSML｜ invoke>";
 
 const PARAMETER_OPEN: usize = 0;
 const PARAMETER_CLOSE: usize = 1;
@@ -474,8 +480,10 @@ impl Assembler {
     /// back as `Malformed`, since its member was never written.
     fn cut_value(&mut self, value: &ValueState, out: &mut Events) {
         if value.string && value.opened {
-            let source = Text::uncounted(std::mem::take(&mut self.carried));
-            self.push_fragment("\"".to_string(), source, out);
+            // Bytes the end cut short (the beginning of a tag) are reported, not hidden in the
+            // quote's source.
+            self.report(TAG_CUT_SHORT, out);
+            self.push_fragment("\"".to_string(), Text::default(), out);
         } else {
             self.leftover(TAG_CUT_SHORT, out);
         }
