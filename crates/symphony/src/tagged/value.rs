@@ -26,11 +26,13 @@
 //! - A parameter declared `integer` is that integer when its text is a sign and digits, with the
 //!   whitespace around it ignored. It may be spelled `+5` or `007`; it is written in JSON's
 //!   spelling, with the digits the model wrote.
-//! - Everything else is inferred: text that is JSON is that JSON, Python's `True`, `False` and
-//!   `None` are `true`, `false` and `null`, and the rest is a string holding the text exactly.
+//! - Everything else is inferred: text that is JSON is that JSON; text that is a Python literal
+//!   (`True`, `None`, `{'size': 'large'}`, `['n1', 'n2']`, a tuple) is the JSON it stands for,
+//!   written with `json.dumps`'s separators; and the rest is a string holding the text exactly.
 //!   That covers a parameter the tool does not declare, a declared integer whose text is not one,
-//!   and every other declared type. The templates write an array or object as JSON and a boolean
-//!   or null as Python's `True`, `False` and `None`, which is what inference reads, so declaring a
+//!   and every other declared type. Most templates write an array or object with `tojson` and a
+//!   boolean or null as Python's `True`, `False` and `None`; Seed-OSS's writes every value with
+//!   `{{ value }}`, so an object comes as Python's repr. Inference reads both, so declaring a
 //!   `number`, `boolean`, `array` or `object` changes nothing.
 //!
 //! A value read as JSON keeps the model's own bytes: `[1, 2.5]` stays spaced as written, and
@@ -210,11 +212,211 @@ fn inferred(text: &str) -> String {
     if reads_back_as_an_argument(trimmed) {
         return trimmed.to_string();
     }
-    match trimmed {
-        "True" => "true".to_string(),
-        "False" => "false".to_string(),
-        "None" => "null".to_string(),
+    match python_literal(trimmed) {
+        Some(json) if reads_back_as_an_argument(&json) => json,
         _ => string(text),
+    }
+}
+
+/// The JSON a Python literal stands for, written with `json.dumps`'s separators, or `None` when
+/// `text` is not one. The literals a template's `{{ value }}` writes for a JSON value: `None`,
+/// `True`, `False`, numbers, strings in single or double quotes with Python's escapes, lists,
+/// tuples and dicts, with trailing commas allowed. Anything else, a bare word or an apostrophe in
+/// prose among them, is not a literal.
+fn python_literal(text: &str) -> Option<String> {
+    let mut reader = Literal {
+        bytes: text.as_bytes(),
+        text,
+        at: 0,
+        out: String::with_capacity(text.len()),
+    };
+    reader.value()?;
+    reader.skip_space();
+    (reader.at == text.len()).then_some(reader.out)
+}
+
+/// A reader over one Python literal, writing its JSON as it goes.
+struct Literal<'a> {
+    bytes: &'a [u8],
+    text: &'a str,
+    at: usize,
+    out: String,
+}
+
+impl Literal<'_> {
+    fn skip_space(&mut self) {
+        while self.bytes.get(self.at).is_some_and(u8::is_ascii_whitespace) {
+            self.at += 1;
+        }
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        if self.bytes.get(self.at) == Some(&byte) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn word(&mut self, word: &str, json: &str) -> bool {
+        if self.text[self.at..].starts_with(word)
+            && !self
+                .bytes
+                .get(self.at + word.len())
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            self.at += word.len();
+            self.out.push_str(json);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn value(&mut self) -> Option<()> {
+        self.skip_space();
+        if self.word("None", "null") || self.word("True", "true") || self.word("False", "false") {
+            return Some(());
+        }
+        match *self.bytes.get(self.at)? {
+            b'\'' | b'"' => self.string(),
+            b'[' => self.sequence(b'[', b']'),
+            b'(' => self.sequence(b'(', b')'),
+            b'{' => self.dict(),
+            b'-' | b'0'..=b'9' => self.number(),
+            _ => None,
+        }
+    }
+
+    fn string(&mut self) -> Option<()> {
+        let quote = *self.bytes.get(self.at)?;
+        self.at += 1;
+        let mut value = String::new();
+        loop {
+            let rest = &self.text[self.at..];
+            let mut chars = rest.char_indices();
+            let (_, c) = chars.next()?;
+            self.at += c.len_utf8();
+            if c == char::from(quote) {
+                break;
+            }
+            if c != '\\' {
+                value.push(c);
+                continue;
+            }
+            let (_, escaped) = chars.next()?;
+            self.at += escaped.len_utf8();
+            match escaped {
+                'n' => value.push('\n'),
+                't' => value.push('\t'),
+                'r' => value.push('\r'),
+                '0' => value.push('\0'),
+                'x' | 'u' | 'U' => {
+                    let digits = match escaped {
+                        'x' => 2,
+                        'u' => 4,
+                        _ => 8,
+                    };
+                    let hex = self.text.get(self.at..self.at + digits)?;
+                    let code = u32::from_str_radix(hex, 16).ok()?;
+                    value.push(char::from_u32(code)?);
+                    self.at += digits;
+                }
+                other => value.push(other),
+            }
+        }
+        self.out.push_str(&string(&value));
+        Some(())
+    }
+
+    fn number(&mut self) -> Option<()> {
+        let start = self.at;
+        if self.eat(b'-') {
+            self.skip_space();
+        }
+        let digits = self.at;
+        while self
+            .bytes
+            .get(self.at)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'_')
+        {
+            self.at += 1;
+        }
+        if self.at == digits {
+            return None;
+        }
+        // Python allows a sign before a number and `_` between digits; JSON allows neither, and a
+        // leading `+` or zeros are not written by `repr`, so the digits are checked as JSON.
+        let text: String = self.text[digits..self.at].replace('_', "");
+        let json = if self.text[start..].starts_with('-') {
+            format!("-{text}")
+        } else {
+            text
+        };
+        serde_json::from_str::<serde_json::Number>(&json).ok()?;
+        self.out.push_str(&json);
+        Some(())
+    }
+
+    fn sequence(&mut self, open: u8, close: u8) -> Option<()> {
+        self.eat(open).then_some(())?;
+        self.out.push('[');
+        let mut first = true;
+        loop {
+            self.skip_space();
+            if self.eat(close) {
+                break;
+            }
+            if !first {
+                self.out.push_str(", ");
+            }
+            first = false;
+            self.value()?;
+            self.skip_space();
+            if !self.eat(b',') {
+                self.skip_space();
+                self.eat(close).then_some(())?;
+                break;
+            }
+        }
+        self.out.push(']');
+        Some(())
+    }
+
+    fn dict(&mut self) -> Option<()> {
+        self.eat(b'{').then_some(())?;
+        self.out.push('{');
+        let mut first = true;
+        loop {
+            self.skip_space();
+            if self.eat(b'}') {
+                break;
+            }
+            if !first {
+                self.out.push_str(", ");
+            }
+            first = false;
+            // A key is written as a JSON string, as `json.dumps` writes a non-string key.
+            let key_start = self.out.len();
+            self.value()?;
+            if !self.out[key_start..].starts_with('"') {
+                let key = self.out.split_off(key_start);
+                self.out.push_str(&string(&key));
+            }
+            self.skip_space();
+            self.eat(b':').then_some(())?;
+            self.out.push_str(": ");
+            self.value()?;
+            self.skip_space();
+            if !self.eat(b',') {
+                self.skip_space();
+                self.eat(b'}').then_some(())?;
+                break;
+            }
+        }
+        self.out.push('}');
+        Some(())
     }
 }
 
@@ -449,7 +651,8 @@ mod tests {
             ("", r#""""#),
             ("+", r#""+""#),
             ("-", r#""-""#),
-            ("1_000", r#""1_000""#),
+            // Python reads `1_000` as a number, and so does inference now.
+            ("1_000", "1000"),
             ("٣", r#""٣""#),
         ] {
             assert_eq!(json(text, Some(Kind::Integer)), expected, "{text:?}");
@@ -486,7 +689,8 @@ mod tests {
             ("", r#""""#),
             // Text that looks like JSON and is not one value: a string.
             ("[1, 2", r#""[1, 2""#),
-            ("{'a': 1}", r#""{'a': 1}""#),
+            // Python's repr of an object, as Seed-OSS's template writes it.
+            ("{'a': 1}", r#"{"a": 1}"#),
             ("1 2", r#""1 2""#),
         ] {
             assert_eq!(json(text, None), expected, "{text:?}");
@@ -595,6 +799,69 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             (self.0 >> 33) as usize
         }
+    }
+
+    #[test]
+    fn a_python_literal_is_the_json_it_stands_for_with_json_dumps_separators() {
+        // Seed-OSS's template writes every value with `{{ value }}`: bellwether's
+        // seed-oss-36b-instruct/parse/bfcl-live-multiple-0-0-0 and -146-58-0.
+        for (text, expected) in [
+            (
+                "{'size': 'large', 'milk_type': 'coconut'}",
+                r#"{"size": "large", "milk_type": "coconut"}"#,
+            ),
+            ("['n1', 'n2']", r#"["n1", "n2"]"#),
+            ("[]", "[]"),
+            ("{}", "{}"),
+            ("(1, 2)", "[1, 2]"),
+            ("('solo',)", r#"["solo"]"#),
+            (
+                "{'a': None, 'b': True, 'c': False}",
+                r#"{"a": null, "b": true, "c": false}"#,
+            ),
+            (
+                "{'n': -3, 'x': 2.5, 'big': 1_000}",
+                r#"{"n": -3, "x": 2.5, "big": 1000}"#,
+            ),
+            (
+                "{'q': \"it's\", 'e': 'a\\'b\\n'}",
+                r#"{"q": "it's", "e": "a'b\n"}"#,
+            ),
+            ("{'u': '\\u00e9\\x41'}", r#"{"u": "éA"}"#),
+            (
+                "[{'k': [1, {'d': 'e'}]}, 'tail',]",
+                r#"[{"k": [1, {"d": "e"}]}, "tail"]"#,
+            ),
+            ("{1: 'one'}", r#"{"1": "one"}"#),
+            ("None", "null"),
+        ] {
+            assert_eq!(json(text, None), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn text_that_is_not_a_literal_stays_a_string() {
+        for text in [
+            "it's",
+            "don't do that",
+            "{'a': 1",
+            "['a' 'b']",
+            "{'a' 1}",
+            "Nones",
+            "1 2",
+            "[1,, 2]",
+            "{'a': }",
+            "'unterminated",
+            "x = {'a': 1}",
+            "{'a': 1} and more",
+            "- 5 apples",
+        ] {
+            assert_eq!(json(text, None), string(text), "{text:?}");
+        }
+        // JSON stays as the model wrote it, spacing and digits included; the literal reader does
+        // not get to rewrite it.
+        assert_eq!(json("[1,2]", None), "[1,2]");
+        assert_eq!(json("9007199254740993", None), "9007199254740993");
     }
 
     #[test]
