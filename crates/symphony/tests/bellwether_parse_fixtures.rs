@@ -57,9 +57,8 @@ const SLUG: &str = "qwen3-8b";
 /// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
 /// the table that reads it and how its template ends the generation prompt. The fixtures carry
 /// the request and the output, not the rendered prompt, so the prompt's tail is stated here until
-/// bellwether records it (noted for the maintainer in STATE.md). A slug bellwether has not
-/// recorded is skipped with a notice; `qwen3-8b` is the one set bellwether's main always holds,
-/// and has its own test.
+/// bellwether records it. A slug bellwether has not recorded is skipped with a notice; `qwen3-8b`
+/// is the one set bellwether's main always holds, and has its own test.
 const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // Qwen3: the model writes its own `<think>`; thinking off closes it in the prompt.
     (
