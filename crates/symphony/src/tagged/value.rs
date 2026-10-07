@@ -907,10 +907,11 @@ mod tests {
         ] {
             assert_eq!(json(&text, None), string(&text), "{} bytes", text.len());
         }
-        // Well inside the limit, a literal still reads (serde_json counts the arguments object
-        // around the value too, so the reader's limit is reached a little before it).
-        let nested = "[".repeat(64) + &"]".repeat(64);
-        assert_eq!(json(&nested, None), nested);
+        // Well inside the limit, a literal still reads. Tuples are not JSON, so this goes through
+        // the Python reader; serde_json counts the arguments object around the value too, so the
+        // read-back refuses a little before the reader's own limit would.
+        let nested = "(".repeat(100) + &")".repeat(100);
+        assert_eq!(json(&nested, None), "[".repeat(100) + &"]".repeat(100));
     }
 
     #[test]
