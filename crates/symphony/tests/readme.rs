@@ -997,7 +997,7 @@ fn the_readme_models_table_is_what_groups_says() {
 }
 
 #[test]
-fn every_named_table_builds_and_every_ready_group_has_its_set() {
+fn every_named_table_builds_and_every_status_has_what_it_claims() {
     for group in GROUPS {
         if let Some(table) = group.table {
             table
@@ -1005,35 +1005,70 @@ fn every_named_table_builds_and_every_ready_group_has_its_set() {
                 .validate()
                 .unwrap_or_else(|why| panic!("{}: {why}", group.slug));
         }
+        // Every status but pending claims a table; ready and replaying claim a recorded set too.
+        assert_eq!(
+            group.table.is_some(),
+            group.status != Status::Pending,
+            "{}: a table and a status that disagree",
+            group.slug
+        );
         if matches!(group.status, Status::Ready | Status::Replaying) {
-            assert!(group.table.is_some(), "{} has no table", group.slug);
             assert!(group.set.is_some(), "{} has no recorded set", group.slug);
-        }
-        if group.status == Status::Pending {
-            assert!(
-                group.table.is_none(),
-                "{} is pending with a table",
-                group.slug
-            );
         }
     }
 }
 
+/// Whether `date` is a calendar day written `YYYY-MM-DD`, from 2020 on: the month in its range,
+/// the day in the month's, February's 29th in a leap year only.
+fn is_a_day(date: &str) -> bool {
+    let Some((year, rest)) = date.split_once('-') else {
+        return false;
+    };
+    let Some((month, day)) = rest.split_once('-') else {
+        return false;
+    };
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        year.parse::<u32>(),
+        month.parse::<u32>(),
+        day.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year >= 2020 && (1..=days).contains(&day)
+}
+
 #[test]
-fn every_release_date_is_a_day() {
+fn every_release_date_is_a_calendar_day() {
     for group in GROUPS {
-        let date = group.released.as_bytes();
         assert!(
-            date.len() == 10
-                && date.iter().enumerate().all(|(i, b)| match i {
-                    4 | 7 => *b == b'-',
-                    _ => b.is_ascii_digit(),
-                }),
-            "{}: released {:?} is not a YYYY-MM-DD day",
+            is_a_day(group.released),
+            "{}: released {:?} is not a day written YYYY-MM-DD",
             group.slug,
             group.released
         );
     }
+    for not_a_day in [
+        "2026-02-30",
+        "2025-13-01",
+        "2024-04-31",
+        "2019-12-31",
+        "2026-9-1",
+        "today",
+    ] {
+        assert!(!is_a_day(not_a_day), "{not_a_day:?} is not a day");
+    }
+    assert!(is_a_day("2024-02-29") && !is_a_day("2023-02-29"));
 }
 
 #[test]
