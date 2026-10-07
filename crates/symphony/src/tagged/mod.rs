@@ -9,10 +9,13 @@
 //!
 //! [`value`] is that decision; [`assembler`] turns one Qwen call's tags into its events,
 //! streaming a declared string as it arrives and writing every other value at its close; [`dsml`]
-//! does the same for one DeepSeek DSML invoke, whose `string` attribute types each value.
+//! does the same for one DeepSeek DSML invoke, whose `string` attribute types each value; and
+//! [`keyed`] for one call written as its name and `<arg_key>`/`<arg_value>` pairs (GLM, Hy4,
+//! Ling, IQuest), typed by the request's tools again.
 
 pub mod assembler;
 pub mod dsml;
+pub mod keyed;
 pub mod value;
 
 pub use assembler::Assembler;

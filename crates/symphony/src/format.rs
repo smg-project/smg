@@ -31,8 +31,10 @@
 //! [`Engine`]: crate::Engine
 //! [`formats`]: crate::formats
 
+use crate::tagged::keyed;
+
 /// How the model writes a call between the call markers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallSyntax {
     /// One JSON object, `{"name": …, "arguments": {…}}`: Qwen3.
     Json,
@@ -44,6 +46,11 @@ pub enum CallSyntax {
     /// the state is the invoke tag's opening, and the one that leaves it is the invoke's closing
     /// tag, which the call's end carries.
     Dsml,
+    /// The call's name as text, then `<arg_key>` and `<arg_value>` pairs, in the family's spelling
+    /// of the four tags, typed by the request's tools: GLM, Hy4, Ling, IQuest. The terminals that
+    /// enter and leave the state are the call's own markers, and the call's end carries the
+    /// closing one.
+    Keyed(keyed::Tags),
 }
 
 /// What the text inside a state is.
