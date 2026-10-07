@@ -874,7 +874,10 @@ mod tests {
 
     #[test]
     fn pythons_other_escapes_are_read_though_repr_never_writes_them() {
-        let written = json(r"{'e': 'A z'}", None);
+        // The text holds backslashes, written here as escapes so that no tool turns them into
+        // the control characters themselves.
+        let text = concat!("{'e': '", "\\a\\b\\f\\v\\101\\7\\0z", "'}");
+        let written = json(text, None);
         let read: Value = serde_json::from_str(&written).expect("an object");
         assert_eq!(read["e"], "\u{7}\u{8}\u{c}\u{b}A\u{7}\0z");
         assert_eq!(
