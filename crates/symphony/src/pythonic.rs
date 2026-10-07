@@ -34,10 +34,14 @@
 //! - **Every byte lands in exactly one event**, as in the other assemblers: the key, the `=`, the
 //!   value and the separator after it in the fragment they produce.
 //! - **Two endings.** [`Assembler::close`] is the region's closing marker (or the next opener):
-//!   a call still open is closed for the client, an open argument's bytes come back as
-//!   `Malformed`, and the bytes before any call as well. [`Assembler::finish`] is a stream that
-//!   was cut: nothing is closed, and what was held comes back as
-//!   `Malformed { UnterminatedRegion }`.
+//!   a call still open is closed for the client, an open argument's bytes and a name that never
+//!   got its `(` come back as `Malformed`, and the list's wrapping before any call is dropped.
+//!   [`Assembler::finish`] is a stream that was cut: nothing is closed, what was held comes back
+//!   as `Malformed { UnterminatedRegion }`, and a call that started still ends, with no bytes of
+//!   its own, as every assembler ends one.
+//! - **Python's whitespace is allowed** between a name and its `(`, around the `=`, and around a
+//!   value, as the old parser's regular expression allowed it; a name or a key is the text less
+//!   that whitespace.
 //!
 //! Ported in spirit from the old crate's pythonic parser, which compiled a regular expression per
 //! call and read the arguments with a Python-literal evaluator at the end; here the arguments are
@@ -49,6 +53,7 @@ use crate::{
 };
 
 const TEXT_BETWEEN_CALLS: &str = "text where a call should begin";
+const TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN: &str = "text where an argument should begin";
 const NAME_WITHOUT_A_CALL: &str = "a name without a call";
 const ARGUMENT_CUT_SHORT: &str = "an argument the call's end cut short";
 const KEY_WITHOUT_A_VALUE: &str = "a key without a value";
@@ -65,19 +70,20 @@ pub struct Assembler {
     stage: Stage,
     /// Members written to the current call's arguments object so far.
     written: u32,
-    done: bool,
 }
 
 #[derive(Clone, Debug)]
 enum Stage {
     /// Before a call's name: the list's brackets, separators and whitespace pass as wrapping.
     Between,
-    /// Inside a name: `carried` holds it so far.
-    Name,
+    /// Inside a name: `carried` holds it so far; `spaced` once whitespace followed it, after which
+    /// only `(` can continue the call.
+    Name { spaced: bool },
     /// After `(` or an argument's `,`: a key or `)` comes next.
     Arguments,
-    /// Inside a key: the key is `carried[start..]`.
-    Key { start: usize },
+    /// Inside a key: the key is `carried[start..]`, less whitespace before the `=`; `spaced` once
+    /// whitespace followed it.
+    Key { start: usize, spaced: bool },
     /// Inside a value: its text is `carried[start..]`, scanned for its extent.
     Value {
         key: String,
@@ -127,31 +133,25 @@ impl Assembler {
             carried: String::new(),
             stage: Stage::Between,
             written: 0,
-            done: false,
         }
     }
 
     /// Append the next bytes of the region and push the events they complete. Every byte is the
     /// region's until the engine says otherwise, so this takes them all.
     pub fn feed(&mut self, bytes: &str, out: &mut Events) {
-        if self.done {
-            return;
-        }
         for c in bytes.chars() {
             self.take(c, out);
         }
     }
 
-    /// The region's end: a call still open is closed for the client, and bytes that made no call
-    /// come back as `Malformed`. `terminal` is the marker that closed the region; the engine
-    /// drops it, since it belongs to the region and not to the last call.
+    /// The region's end: a call still open is closed for the client, a name that never got its
+    /// `(` comes back as `Malformed`, and wrapping before any call is dropped. The marker that
+    /// closed the region is not passed: it belongs to the region, not to the last call, and the
+    /// engine drops it.
     pub fn close(mut self, out: &mut Events) {
-        if self.done {
-            return;
-        }
         match std::mem::replace(&mut self.stage, Stage::Between) {
             Stage::Between => self.drop_carried(out),
-            Stage::Name => self.report(NAME_WITHOUT_A_CALL, out),
+            Stage::Name { .. } => self.report(NAME_WITHOUT_A_CALL, out),
             Stage::Arguments => {
                 let source = Text::uncounted(std::mem::take(&mut self.carried));
                 self.end_call(source, "", out);
@@ -165,16 +165,12 @@ impl Assembler {
                 self.end_call(Text::uncounted(String::new()), "", out);
             }
         }
-        self.done = true;
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
     /// client; what was held comes back as `Malformed { UnterminatedRegion }`, and a call that
     /// started still ends, with no bytes of its own, as every assembler ends one.
     pub fn finish(mut self, out: &mut Events) {
-        if self.done {
-            return;
-        }
         if !self.carried.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.carried)),
@@ -199,7 +195,7 @@ impl Assembler {
                 c if c.is_alphanumeric() || c == '_' => {
                     self.drop_carried(out);
                     self.carried.push(c);
-                    self.stage = Stage::Name;
+                    self.stage = Stage::Name { spaced: false };
                 }
                 c => {
                     self.drop_carried(out);
@@ -209,20 +205,26 @@ impl Assembler {
                     });
                 }
             },
-            Stage::Name => match c {
-                c if c.is_alphanumeric() || c == '_' || c == '.' || c == '-' => {
+            Stage::Name { spaced } => match c {
+                c if !*spaced && (c.is_alphanumeric() || c == '_' || c == '.' || c == '-') => {
+                    self.carried.push(c);
+                }
+                // Python allows whitespace between the name and its `(`.
+                c if c.is_whitespace() => {
+                    *spaced = true;
                     self.carried.push(c);
                 }
                 '(' => {
-                    let name = std::mem::take(&mut self.carried);
+                    let source = std::mem::take(&mut self.carried);
+                    let name = source.trim_end().to_string();
                     self.index = self.next_index;
                     self.next_index += 1;
                     self.written = 0;
                     out.push(Event::ToolCallStart {
                         index: self.index,
                         id: format!("call_{}", self.index),
-                        name: name.clone(),
-                        source: Text::uncounted(format!("{name}(")),
+                        name,
+                        source: Text::uncounted(format!("{source}(")),
                     });
                     self.stage = Stage::Arguments;
                 }
@@ -244,20 +246,31 @@ impl Assembler {
                 c if c.is_alphanumeric() || c == '_' => {
                     let start = self.carried.len();
                     self.carried.push(c);
-                    self.stage = Stage::Key { start };
+                    self.stage = Stage::Key {
+                        start,
+                        spaced: false,
+                    };
                 }
+                // A positional argument, a spread, or anything else where a key should begin.
                 c => {
                     self.drop_carried(out);
                     out.push(Event::Malformed {
                         text: Text::uncounted(c.to_string()),
-                        why: MalformedReason::Other(TEXT_BETWEEN_CALLS.to_string()),
+                        why: MalformedReason::Other(
+                            TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN.to_string(),
+                        ),
                     });
                 }
             },
-            Stage::Key { start } => match c {
-                c if c.is_alphanumeric() || c == '_' => self.carried.push(c),
+            Stage::Key { start, spaced } => match c {
+                c if !*spaced && (c.is_alphanumeric() || c == '_') => self.carried.push(c),
+                // Python allows whitespace around the `=`; the value's extent trims its own.
+                c if c.is_whitespace() => {
+                    *spaced = true;
+                    self.carried.push(c);
+                }
                 '=' => {
-                    let key = self.carried[*start..].to_string();
+                    let key = self.carried[*start..].trim_end().to_string();
                     self.carried.push('=');
                     let start = self.carried.len();
                     self.stage = Stage::Value {
@@ -504,5 +517,34 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, Event::Malformed { .. })));
+    }
+
+    #[test]
+    fn pythons_whitespace_around_the_parenthesis_and_the_equals_sign_is_allowed() {
+        let output = "get_weather (city = \"Paris\", days= 3 )";
+        let events = run(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            calls(&events),
+            [(
+                0,
+                "get_weather".to_string(),
+                r#"{"city": "Paris", "days": 3}"#.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_positional_argument_is_reported_as_text_where_an_argument_should_begin() {
+        let events = run(&["get_weather(\"Paris\", days=3)"]);
+        assert_eq!(
+            calls(&events),
+            [(0, "get_weather".to_string(), r#"{"days": 3}"#.to_string())]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed { why: MalformedReason::Other(why), .. }
+                if why == TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN
+        )));
     }
 }
