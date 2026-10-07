@@ -22,6 +22,7 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
@@ -588,6 +589,43 @@ impl RouterTrait for Gateway {
         .await
     }
 
+    async fn route_decisions(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: DecisionsRequest,
+        model_id: &str,
+    ) -> Response {
+        let router = if self.enable_igw {
+            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+            if snapshot.is_empty() {
+                return route_error::model_not_found(model_id);
+            }
+            // Decisions is supported only by regular HTTP workers. General
+            // weighted dispatch could send the same model to PD or gRPC.
+            if snapshot.pool(RoutingPool::HttpRegular).is_empty() {
+                return route_error::not_implemented(
+                    "decisions_not_supported",
+                    "Decisions requires a regular HTTP worker for this model",
+                );
+            }
+            self.routers.load().get(&router_ids::HTTP_REGULAR).cloned()
+        } else {
+            self.select_router_for_request(Some(model_id))
+        };
+        match router {
+            Some(router) => {
+                router
+                    .route_decisions(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => route_error::not_implemented(
+                "decisions_not_supported",
+                "Decisions requires a regular HTTP router",
+            ),
+        }
+    }
+
     async fn route_audio_transcriptions(
         &self,
         headers: Option<&HeaderMap>,
@@ -877,6 +915,101 @@ mod tests {
 
     fn test_tenant_meta() -> TenantRequestMeta {
         RouteRequestMeta::new(TenantKey::from("test-tenant"))
+    }
+
+    #[derive(Debug)]
+    struct DecisionsStubRouter;
+
+    #[async_trait]
+    impl RouterTrait for DecisionsStubRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_decisions(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: DecisionsRequest,
+            _model_id: &str,
+        ) -> Response {
+            StatusCode::OK.into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "decisions"
+        }
+    }
+
+    async fn decision_status(gateway: &Gateway, model: &str) -> StatusCode {
+        let body = serde_json::from_value(serde_json::json!({
+            "model": model, "input": "evidence",
+            "questions": [{"type": "predicate", "instructions": "Is it evidence?"}]
+        }))
+        .unwrap();
+        gateway
+            .route_decisions(None, &test_tenant_meta(), body, model)
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn decisions_use_only_regular_http_workers_in_mixed_fleets() {
+        for has_http_regular in [true, false] {
+            let gateway = test_gateway(true);
+            gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(DecisionsStubRouter));
+            gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+            gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
+            gateway.set_default_router(router_ids::GRPC_REGULAR);
+            let workers = [
+                (ConnectionMode::Http, WorkerType::Regular),
+                (ConnectionMode::Http, WorkerType::Prefill),
+                (ConnectionMode::Http, WorkerType::Decode),
+                (ConnectionMode::Grpc, WorkerType::Regular),
+                (ConnectionMode::Zmq, WorkerType::Regular),
+            ];
+            for (index, (mode, role)) in workers.into_iter().enumerate() {
+                if index == 0 && !has_http_regular {
+                    continue;
+                }
+                gateway
+                    .worker_registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::new(format!("http://worker-{index}:8080"))
+                            .connection_mode(mode)
+                            .worker_type(role)
+                            .model(ModelCard::new("m").with_alias("alias"))
+                            .build(),
+                    ))
+                    .unwrap();
+            }
+            let expected = if has_http_regular {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            };
+            for _ in 0..32 {
+                assert_eq!(decision_status(&gateway, "m").await, expected);
+                assert_eq!(decision_status(&gateway, "alias").await, expected);
+            }
+            assert_eq!(
+                decision_status(&gateway, "missing").await,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn decisions_respect_single_router_configuration() {
+        let gateway = test_gateway(false);
+        gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(DecisionsStubRouter));
+        assert_eq!(decision_status(&gateway, "m").await, StatusCode::OK);
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        gateway.set_default_router(router_ids::HTTP_PD);
+        assert_eq!(
+            decision_status(&gateway, "m").await,
+            StatusCode::NOT_IMPLEMENTED
+        );
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ use openai_protocol::{
     classify::ClassifyRequest,
     common::GenerationRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
@@ -74,15 +75,18 @@ use crate::{
         gateway::Gateway,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         http::{
-            request_body::{serialize_request_body, RequestBodyError},
+            decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
+            request_body::{
+                serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
+            },
             request_stream::{CappedBodyStream, StreamProgress},
         },
         BodyPolicy, RouterTrait,
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        AttachedBody, ConnectionMode, RoutingPool, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType,
+        AttachedBody, ConnectionMode, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
+        WorkerRegistry, WorkerType,
     },
 };
 
@@ -551,6 +555,36 @@ impl Router {
             return shed;
         }
 
+        // Select the adapter for the chosen worker. Native Decisions workers
+        // keep the original typed serialization path, including extensions.
+        let mut decision_adapter = if route == "/v1/decisions"
+            && worker.metadata().spec.runtime_type == RuntimeType::Sglang
+        {
+            let adapter = lease.with_view(|view| {
+                let request = serde_json::to_value(view.request)
+                    .and_then(serde_json::from_value::<DecisionsRequest>)
+                    .map_err(|error| {
+                        error::bad_request(
+                            "serialization_failed",
+                            format!("Failed to serialize Decisions request: {error}"),
+                        )
+                    })?;
+                SglangDecisionAdapter::new(&request)
+                    .map_err(|message| error::bad_request("unsupported_decisions_request", message))
+            });
+            match adapter {
+                Ok(adapter) => Some(adapter),
+                Err(response) => return response,
+            }
+        } else {
+            None
+        };
+        let upstream_route = if decision_adapter.is_some() {
+            UPSTREAM_ROUTE
+        } else {
+            route
+        };
+
         let load_guard = lease.with_view(|view| {
             WorkerLoadGuard::with_key(
                 worker.clone(),
@@ -575,18 +609,37 @@ impl Router {
                 })
             });
         let response = match lease.serialize_with(|view| {
-            serialize_request_body(view.request, canonical_model, worker.as_ref(), raw_body_len)
+            if let Some(adapter) = &decision_adapter {
+                serialize_request_body(
+                    adapter.request(),
+                    canonical_model,
+                    worker.as_ref(),
+                    raw_body_len,
+                )
+            } else if route == "/v1/decisions" {
+                serialize_request_body_preserving_fields(
+                    view.request,
+                    canonical_model,
+                    worker.as_ref(),
+                    raw_body_len,
+                )
+            } else {
+                serialize_request_body(view.request, canonical_model, worker.as_ref(), raw_body_len)
+            }
         }) {
             Ok(body) => {
                 // Past this point dispatch needs only the serialized bytes;
                 // the lease frees the parsed request and its routing
                 // derivatives now when retries are disabled.
                 lease.release_dispatch();
+                if let Some(adapter) = decision_adapter.as_mut() {
+                    adapter.release_request();
+                }
                 let mode = StreamRelayMode { is_stream, rechunk };
                 self.send_serialized_request(
                     headers,
                     body,
-                    route,
+                    upstream_route,
                     worker.as_ref(),
                     mode,
                     load_guard,
@@ -601,6 +654,16 @@ impl Router {
                 "request_preparation_failed",
                 format!("Failed to prepare request: {e}"),
             ),
+        };
+
+        // Judge the converted result so malformed successes become backend
+        // failures and follow the same outcome accounting and retry policy.
+        let response = if let Some(adapter) = decision_adapter {
+            adapter
+                .convert_response(response, self.max_payload_size)
+                .await
+        } else {
+            response
         };
 
         events::RequestReceivedEvent {}.emit();
@@ -2051,6 +2114,17 @@ impl RouterTrait for Router {
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/classify", model_id)
+            .await
+    }
+
+    async fn route_decisions(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: DecisionsRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/decisions", model_id)
             .await
     }
 
