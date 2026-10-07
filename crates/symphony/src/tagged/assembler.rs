@@ -864,6 +864,36 @@ mod tests {
     }
 
     #[test]
+    fn a_type_beside_an_enum_decides_and_an_array_stays_one() {
+        // bellwether's qwen3-coder-next/parse/bfcl-live-multiple-146-58-0: BFCL declares the list
+        // `{"type": "array", "items": {"type": "string"}, "enum": [...]}`, and vLLM reads it as an
+        // array; before this the enum made it a string holding `[]`.
+        let declared = Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "f".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {
+                    "metrics": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "enum": ["temperature", "humidity"],
+                    },
+                }}),
+                strict: None,
+            },
+        }]);
+        let call = "<function=f>\n<parameter=metrics>\n[]\n</parameter>\n</function>";
+        let mut assembler = Assembler::new(0, "call_0");
+        let mut out = Events::new();
+        assembler.feed(call, &declared, &mut out);
+        assembler.finish(&mut out);
+        let events = out.drain();
+        assert_eq!(arguments(&events), r#"{"metrics": []}"#);
+        assert_eq!(bytes(&events), call);
+    }
+
+    #[test]
     fn a_string_that_may_be_null_streams_once_its_text_rules_null_out() {
         for (text, expected) in [
             ("null", "null"),

@@ -15,10 +15,14 @@
 //! - A parameter declared `string` is its text, every byte of it. Nothing is trimmed and nothing is
 //!   decoded: `"exact phrase"` keeps its quotes, indentation and a trailing newline stay, and
 //!   `&amp;` is five characters. A parameter is declared `string` when its schema admits that
-//!   type at all: `"type": "string"`, a list of types or an `anyOf` that includes it, or an `enum`
-//!   of strings, with or without `null` among them. When the same schema admits `null`, the text
-//!   `null`, and the `None` a template writes for a null argument, are null; any other text is the
-//!   string.
+//!   type at all: `"type": "string"`, a list of types or an `anyOf` that includes it, or, when the
+//!   schema has no `type`, an `enum` of strings, with or without `null` among them. A `type`
+//!   decides alone when it is there, as it does for vLLM: BFCL declares
+//!   `{"type": "array", "enum": [...]}` for a list whose members come from the enum, and that is
+//!   an array. When the schema admits `null` as well as `string`, the text `null`, and the `None`
+//!   a template writes for a null argument, are null; any other text is the string. A string
+//!   declared alone keeps `null` as its text, as vLLM's readers do; bellwether #56 refuses a case
+//!   whose reference holds a null there, since no output carries it.
 //! - A parameter declared `integer` is that integer when its text is a sign and digits, with the
 //!   whitespace around it ignored. It may be spelled `+5` or `007`; it is written in JSON's
 //!   spelling, with the digits the model wrote.
@@ -92,19 +96,28 @@ impl Kind {
 }
 
 /// The type names `schema` admits: its `type`, as one name or a list; the types of its `anyOf` or
-/// `oneOf` members; and for an `enum` of strings, `string`, and `null` too when `null` is among
-/// them (what Pydantic writes for `Literal["a", "b", None]`).
+/// `oneOf` members; and, when it has no `type`, `string` for an `enum` of strings, and `null` too
+/// when `null` is among them (what Pydantic writes for `Literal["a", "b", None]`).
 fn admitted_types<'a>(schema: &'a Value, into: &mut Vec<&'a str>) {
-    match schema.get("type") {
-        Some(Value::String(name)) => into.push(name),
-        Some(Value::Array(names)) => into.extend(names.iter().filter_map(Value::as_str)),
-        _ => {}
-    }
+    let typed = match schema.get("type") {
+        Some(Value::String(name)) => {
+            into.push(name);
+            true
+        }
+        Some(Value::Array(names)) => {
+            into.extend(names.iter().filter_map(Value::as_str));
+            true
+        }
+        _ => false,
+    };
     for key in ["anyOf", "oneOf"] {
         let members = schema.get(key).and_then(Value::as_array);
         for member in members.into_iter().flatten() {
             admitted_types(member, into);
         }
+    }
+    if typed {
+        return;
     }
     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
         let strings_or_null = values
@@ -283,6 +296,24 @@ mod tests {
         ] {
             assert_eq!(declared.kind("f", parameter), Some(kind), "{parameter}");
         }
+    }
+
+    #[test]
+    fn a_type_decides_alone_and_an_enum_beside_it_adds_nothing() {
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                // BFCL's shape for a list whose members come from the enum.
+                "members": {"type": "array", "items": {"type": "string"}, "enum": ["a", "b"]},
+                "counted": {"type": "integer", "enum": ["one", "two"]},
+                "named": {"type": "string", "enum": [1, 2]},
+                "listed": {"type": ["string", "null"], "enum": ["a", "b"]},
+            }),
+        )]);
+        assert_eq!(declared.kind("f", "members"), None);
+        assert_eq!(declared.kind("f", "counted"), Some(Kind::Integer));
+        assert_eq!(declared.kind("f", "named"), Some(Kind::String));
+        assert_eq!(declared.kind("f", "listed"), Some(Kind::NullableString));
     }
 
     #[test]
