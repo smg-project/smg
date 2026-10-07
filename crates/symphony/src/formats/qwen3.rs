@@ -1122,6 +1122,44 @@ mod tests {
     }
 
     #[test]
+    fn a_model_with_another_chat_template_names_its_own_turn_opener() {
+        // K-EXAONE writes Qwen3's markers under its own template: a turn opens with
+        // `<|assistant|>`, and the generation prompt ends `<|assistant|>\n<think>\n`. With the
+        // table's ChatML opener the whole prompt would be replayed, and a stray `<tool_call>` in
+        // the user's turn would leave the engine in content (smg #2841, Alex's probe).
+        let prompt = "<|user|>\nWhy did you print <tool_call> there?<|endofturn|>\n\
+                      <|assistant|>\n<think>\n";
+        let output = "The user asks about the marker.\n</think>\n\nIt opens a tool call.";
+        let mut parser = Engine::new(
+            qwen3(CallSyntax::Json).opens_turn("<|assistant|>"),
+            Declared::default(),
+        );
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        let events = out.drain();
+        assert_eq!(events[0], Event::ReasoningStart);
+        assert_eq!(reasoning_of(&events), "The user asks about the marker.\n");
+    }
+
+    #[test]
     fn inputs_out_of_order_are_lifecycle_errors() {
         let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();

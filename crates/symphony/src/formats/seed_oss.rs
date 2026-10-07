@@ -3,7 +3,8 @@
 //! `<function=NAME>` and `<parameter=KEY>` tags, typed by the request's tools (which reach the
 //! engine with the request), everything else content. The same five rows as
 //! [`qwen3()`](crate::formats::qwen3()), with the spellings ByteDance-Seed/Seed-OSS-36B-Instruct
-//! writes; a plain `<tool_call>` is text here.
+//! writes; a plain `<tool_call>` is text here. The template is not ChatML: a turn opens with
+//! `<seed:bos>assistant`, so the prompt's replay starts there.
 
 use crate::format::{CallSyntax, Emits, Format};
 
@@ -23,7 +24,7 @@ pub fn seed_oss() -> Format {
         .transition("calls", "call_close", "content")
         .transition("calls", "call_open", "calls")
         .calls(CallSyntax::Tagged)
-        .opens_turn("<|im_start|>assistant")
+        .opens_turn("<seed:bos>assistant")
 }
 
 #[cfg(test)]
@@ -41,6 +42,40 @@ mod tests {
         "<seed:tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n",
         "</function>\n</seed:tool_call>"
     );
+
+    #[test]
+    fn the_prompt_is_replayed_from_seeds_own_turn_opener() {
+        // A stray `<seed:think>` in the user's turn: the replay starts at `<seed:bos>assistant`,
+        // so the answer is content (smg #2841, Alex's probe).
+        let prompt = "<seed:bos>user\nWhy did you print <seed:think> there?<seed:eos>\
+                      <seed:bos>assistant\n";
+        let mut parser = Engine::new(seed_oss(), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: "It opens a thought.",
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        let events = out.drain();
+        assert_eq!(
+            events[0],
+            Event::Content(Text::uncounted("It opens a thought."))
+        );
+    }
 
     #[test]
     fn seeds_markers_are_read_and_qwens_are_text() {

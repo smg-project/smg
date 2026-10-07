@@ -71,6 +71,25 @@ fn qwen2_5() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::qwen2_5(), Declared::default()))
 }
 
+fn seed_oss() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        formats::seed_oss(),
+        Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "note": {"type": ["string", "null"]},
+                }}),
+                strict: None,
+            },
+        }]),
+    ))
+}
+
 fn deepseek_v4_1() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::deepseek_v4_1(), Declared::default()))
 }
@@ -96,6 +115,30 @@ const FORMATS: &[Subject] = &[
         new: deepseek_v4_1,
         outputs: DSML_OUTPUTS,
     },
+    Subject {
+        name: "seed-oss",
+        new: seed_oss,
+        outputs: SEED_OUTPUTS,
+    },
+];
+
+/// Seed-OSS: the tagged syntax under its own markers, a value as Python's repr, and Qwen's
+/// markers as text.
+const SEED_OUTPUTS: &[&str] = &[
+    "<seed:think>plan</seed:think>Sure.\n<seed:tool_call>\n<function=get_weather>\n\
+     <parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n\
+     </seed:tool_call>",
+    "<seed:tool_call>\n<function=get_weather>\n<parameter=extra>\n{'size': 'large', 'n': [1, \
+     2.5e-07, None, True]}\n</parameter>\n<parameter=note>\nNone\n</parameter>\n</function>\n\
+     </seed:tool_call>\n<seed:tool_call>\n<function=other>\n</function>\n</seed:tool_call>",
+    "<seed:tool_call>\n<function=get_weather>\n<parameter=city>\nPar",
+    "<seed:tool_call>\n<function=f<parameter=city>\nx\n</parameter>\n</function>\n\
+     </seed:tool_call>",
+    "<seed:tool_call>\nprose <parameter=city>\nParis\n</parameter>\n</function>\n</seed:tool_call>",
+    "<think>not a thought</think><tool_call>not a call</tool_call><seed:think>a thought",
+    "<seed:tool_call>\n<function=get_weather>\n<parameter=city>\n計画 🌍 \"q\" \\ \n</parameter>\n\
+     </function>\n</seed:tool_call>",
+    "",
 ];
 
 /// Outputs in DeepSeek's DSML: the recorded shapes, and the cuts and faults the assembler and the

@@ -302,6 +302,18 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     ),
 ];
 
+/// The turn opener a model's own chat template writes, for a model that reads another family's
+/// table: the opener is the template's, not the table's, so the prompt's replay has to start at
+/// the model's own. K-EXAONE writes Qwen3's markers under its own template, Granite 4.1 Qwen2.5's;
+/// every other recorded model renders `<|im_start|>assistant` or its own table's opener.
+const OPENERS: &[(&str, &str)] = &[
+    ("k-exaone-236b-a23b", "<|assistant|>"),
+    (
+        "granite-4.1-3b",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
+];
+
 /// The table that reads a checkpoint's output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
@@ -321,14 +333,23 @@ enum Family {
 const THINK_MARKERS: (&str, &str) = ("<think>", "</think>");
 
 impl Family {
-    fn engine(self, fixture: &Fixture) -> Engine {
-        let declared = Declared::of(&fixture.request.tools);
+    /// The engine for one of the model's cases: the family's table, with the model's own turn
+    /// opener when its template is not the table's ([`OPENERS`]), and the case's tools.
+    fn engine(self, slug: &str, fixture: &Fixture) -> Engine {
+        let mut format = self.format();
+        if let Some((_, opener)) = OPENERS.iter().find(|(model, _)| *model == slug) {
+            format = format.opens_turn(opener);
+        }
+        Engine::new(format, Declared::of(&fixture.request.tools))
+    }
+
+    fn format(self) -> symphony::Format {
         match self {
-            Self::Qwen3 => Engine::new(qwen3(CallSyntax::Json), declared),
-            Self::Qwen3Tagged => Engine::new(qwen3(CallSyntax::Tagged), declared),
-            Self::Qwen2_5 => Engine::new(qwen2_5(), declared),
-            Self::DeepSeekV4_1 => Engine::new(deepseek_v4_1(), declared),
-            Self::SeedOss => Engine::new(seed_oss(), declared),
+            Self::Qwen3 => qwen3(CallSyntax::Json),
+            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged),
+            Self::Qwen2_5 => qwen2_5(),
+            Self::DeepSeekV4_1 => deepseek_v4_1(),
+            Self::SeedOss => seed_oss(),
         }
     }
 
@@ -662,7 +683,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
     );
     let failures = parity(
         &fixtures,
-        &|fixture| Family::Qwen3.engine(fixture),
+        &|fixture| Family::Qwen3.engine(SLUG, fixture),
         &|_| "",
         KNOWN_DIFFERENCES,
         &[],
@@ -697,7 +718,7 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
         println!("{slug} ({family:?}, {prompt:?}):");
         failures.extend(parity(
             &fixtures,
-            &|fixture| family.engine(fixture),
+            &|fixture| family.engine(slug, fixture),
             &|fixture| prompt.tail(fixture),
             family.known_differences(prompt),
             &family.allowances(slug, prompt),

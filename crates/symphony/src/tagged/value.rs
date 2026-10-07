@@ -311,7 +311,26 @@ impl Literal<'_> {
                 'n' => value.push('\n'),
                 't' => value.push('\t'),
                 'r' => value.push('\r'),
-                '0' => value.push('\0'),
+                'a' => value.push('\u{7}'),
+                'b' => value.push('\u{8}'),
+                'f' => value.push('\u{c}'),
+                'v' => value.push('\u{b}'),
+                // An octal escape: up to three octal digits, the first already read.
+                '0'..='7' => {
+                    let mut code = escaped.to_digit(8)?;
+                    for _ in 0..2 {
+                        let Some(digit) = self
+                            .bytes
+                            .get(self.at)
+                            .and_then(|b| char::from(*b).to_digit(8))
+                        else {
+                            break;
+                        };
+                        code = code * 8 + digit;
+                        self.at += 1;
+                    }
+                    value.push(char::from_u32(code)?);
+                }
                 'x' | 'u' | 'U' => {
                     let digits = match escaped {
                         'x' => 2,
@@ -342,6 +361,16 @@ impl Literal<'_> {
             .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'_')
         {
             self.at += 1;
+        }
+        // An exponent's sign: `1e-05` is how repr writes 0.00001.
+        if self.at > digits
+            && matches!(self.bytes.get(self.at - 1), Some(b'e' | b'E'))
+            && matches!(self.bytes.get(self.at), Some(b'+' | b'-'))
+        {
+            self.at += 1;
+            while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
         }
         if self.at == digits {
             return None;
@@ -834,9 +863,26 @@ mod tests {
             ),
             ("{1: 'one'}", r#"{"1": "one"}"#),
             ("None", "null"),
+            // repr's spellings of small and large floats, with the exponent's sign.
+            ("{'x': 1e-05}", r#"{"x": 1e-05}"#),
+            ("{'x': 1.5e-07, 'n': 'a'}", r#"{"x": 1.5e-07, "n": "a"}"#),
+            ("[-2.5e-05, 1e+16, 2E3]", "[-2.5e-05, 1e+16, 2E3]"),
         ] {
             assert_eq!(json(text, None), expected, "{text:?}");
         }
+    }
+
+    #[test]
+    fn pythons_other_escapes_are_read_though_repr_never_writes_them() {
+        let written = json(r"{'e': 'A z'}", None);
+        let read: Value = serde_json::from_str(&written).expect("an object");
+        assert_eq!(read["e"], "\u{7}\u{8}\u{c}\u{b}A\u{7}\0z");
+        assert_eq!(
+            json(r"1e-", None),
+            string("1e-"),
+            "an exponent with no digits"
+        );
+        assert_eq!(json(r"1e", None), string("1e"));
     }
 
     #[test]
