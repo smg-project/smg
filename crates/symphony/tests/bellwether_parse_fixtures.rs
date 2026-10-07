@@ -12,7 +12,10 @@
 //! a case of any size replays forty-odd times.
 //!
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory of a bellwether
-//! checkout; without it the test prints a skip notice and passes. A second parity test replays
+//! checkout; without it the test prints a skip notice and passes. `SYMPHONY_SAMPLE_EVERY=n`
+//! replays every n-th case of each recorded set, the same slice every run, for a CI job that
+//! cannot afford a benchmark-scale set whole, and the hand-written `common` set whole; a run
+//! that leaves it unset or empty replays every case. A second parity test replays
 //! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
 //! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves; it
@@ -58,6 +61,14 @@ use symphony::{
 };
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
+/// Replay every n-th case of each recorded set, counted from the set's first, when this is set
+/// and not empty: a deterministic slice of a benchmark-scale set, so CI can replay a set of fifty
+/// thousand cases in minutes, and a nightly run, which leaves it unset, replays them all. The
+/// hand-written [`COMMON_SET`] is replayed whole whatever the step. The run says so.
+const SAMPLE_ENV: &str = "SYMPHONY_SAMPLE_EVERY";
+/// The hand-written set in every slug's directory: the probes (bellwether #16) and the parallel
+/// calls, a few cases that a sample must not thin.
+const COMMON_SET: &str = "common";
 /// Up to this many bytes an output is also replayed at every two-way split, which costs as many
 /// replays as it has characters; past it the sampled plans alone keep a case's cost linear in
 /// its size (a 252 KB swebench case took 80 minutes and 13 GB under every split).
@@ -783,7 +794,8 @@ fn qwen3_parse_fixtures_match_the_reference() {
         );
         return;
     };
-    let fixtures = read_fixtures(&root.join(SLUG).join("parse")).unwrap_or_else(|e| panic!("{e}"));
+    let Cases { fixtures, ids } =
+        read_fixtures(&root.join(SLUG).join("parse")).unwrap_or_else(|e| panic!("{e}"));
     assert!(
         !fixtures.is_empty(),
         "no parse fixtures under {}",
@@ -791,6 +803,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
     );
     let failures = parity(
         &fixtures,
+        &ids,
         &|fixture| Family::Qwen3.engine(SLUG, fixture),
         &|_| String::new(),
         KNOWN_DIFFERENCES,
@@ -822,10 +835,11 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
             eprintln!("skipping {slug}: bellwether has not recorded its parse sets yet");
             continue;
         }
-        let fixtures = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
         println!("{slug} ({family:?}, {prompt:?}):");
         failures.extend(parity(
             &fixtures,
+            &ids,
             &|fixture| family.engine(slug, fixture),
             &|fixture| prompt.tail(fixture, family),
             &family.known_differences(prompt),
@@ -845,7 +859,9 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
 
 /// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
 /// case's `prompt_tail`, on every chunking, prints one line per case, and returns every difference
-/// that neither `known_differences` nor `allowed` allows.
+/// that neither `known_differences` nor `allowed` allows. `every_id` is the id of every case the
+/// set files hold, before any sample thinned them: a listed difference no longer among them is a
+/// failure too, so the list cannot rot.
 #[expect(
     clippy::print_stdout,
     clippy::panic,
@@ -854,6 +870,7 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
 )]
 fn parity(
     fixtures: &[Fixture],
+    every_id: &[String],
     new_parser: &dyn Fn(&Fixture) -> Engine,
     prompt_tail: &dyn Fn(&Fixture) -> String,
     known_differences: &[KnownDifference],
@@ -999,21 +1016,21 @@ fn parity(
             println!("  {:34} {}", "", listed_case.reason);
         }
     }
+    // A listed case that is no longer among the fixtures would let the list rot. The check reads
+    // every id the set files hold, before the sample thinned them, so it holds for a sampled run.
     for listed_case in known_differences {
-        if !fixtures
-            .iter()
-            .any(|fixture| after_slug(&fixture.id) == listed_case.id)
-        {
+        if !every_id.iter().any(|id| after_slug(id) == listed_case.id) {
             failures.push(format!(
                 "{}: listed in KNOWN_DIFFERENCES but not among the fixtures; remove it",
                 listed_case.id
             ));
         }
     }
+    let sample = sample_note(sample_every());
     println!(
-        "{} cases: {bitwise} bitwise, {separators_only} separators only, {listed} listed, \
-         {allowed_count} allowed for the corpus; {token_plans_run} token plans replayed, \
-         {without_pieces} cases without output_pieces",
+        "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, \
+         {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} token plans \
+         replayed, {without_pieces} cases without output_pieces",
         fixtures.len()
     );
     failures
@@ -1194,7 +1211,8 @@ fn qwen3_token_plans_count_every_token_where_its_first_byte_lands() {
         );
         return;
     };
-    let fixtures = read_fixtures(&root.join(SLUG).join("parse")).unwrap_or_else(|e| panic!("{e}"));
+    let Cases { fixtures, .. } =
+        read_fixtures(&root.join(SLUG).join("parse")).unwrap_or_else(|e| panic!("{e}"));
     assert!(
         !fixtures.is_empty(),
         "no parse fixtures under {}",
@@ -1301,9 +1319,10 @@ fn qwen3_token_plans_count_every_token_where_its_first_byte_lands() {
         }
     }
     println!(
-        "{} cases, {plans_run} token plans, {tokens_counted} tokens counted, \
+        "{} cases{}, {plans_run} token plans, {tokens_counted} tokens counted, \
          {reasoning_counted} of them reasoning",
-        fixtures.len()
+        fixtures.len(),
+        sample_note(sample_every())
     );
 }
 
@@ -1438,7 +1457,62 @@ fn tokens_of(event: &Event) -> Option<u32> {
     }
 }
 
-fn read_fixtures(dir: &std::path::Path) -> Result<Vec<Fixture>, String> {
+/// The sample's step from [`SAMPLE_ENV`]: 1 when it is unset or empty, as the allowances switch
+/// reads an empty value as off. A value that is not a positive integer is a mistake in the run's
+/// setup, not a smaller sample.
+fn sample_every() -> usize {
+    sample_step(std::env::var(SAMPLE_ENV).ok().as_deref())
+}
+
+/// [`sample_every`]'s reading of the variable's value.
+fn sample_step(value: Option<&str>) -> usize {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return 1;
+    };
+    let every: usize = value.parse().unwrap_or(0);
+    assert!(
+        every > 0,
+        "{SAMPLE_ENV}={value:?} is not a positive integer"
+    );
+    every
+}
+
+/// What a run's summary says of its sample: nothing for a whole run.
+fn sample_note(every: usize) -> String {
+    match every {
+        1 => String::new(),
+        every => {
+            format!(" (1 in {every} cases of each recorded set, {COMMON_SET} whole, {SAMPLE_ENV})")
+        }
+    }
+}
+
+/// The step for one set's file: the hand-written [`COMMON_SET`] is never thinned.
+fn step_for(file: &std::path::Path, every: usize) -> usize {
+    if file.file_stem().is_some_and(|stem| stem == COMMON_SET) {
+        1
+    } else {
+        every
+    }
+}
+
+/// Every `every`-th of `items`, the first included: the same slice of a set every run.
+fn sampled<T>(items: Vec<T>, every: usize) -> Vec<T> {
+    items.into_iter().step_by(every.max(1)).collect()
+}
+
+/// The cases a slug's set files gave.
+struct Cases {
+    /// The cases to replay, in the files' order, each recorded set sampled by [`SAMPLE_ENV`] and
+    /// the [`COMMON_SET`] whole.
+    fixtures: Vec<Fixture>,
+    /// Every case's id, in the same order, before the sample thinned them: what the check that a
+    /// listed difference is still among the cases reads, so that a sample never fails it.
+    ids: Vec<String>,
+}
+
+/// Reads every `.jsonl` set under `dir`, in the files' order, into [`Cases`].
+fn read_fixtures(dir: &std::path::Path) -> Result<Cases, String> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
         .filter_map(Result::ok)
@@ -1446,18 +1520,60 @@ fn read_fixtures(dir: &std::path::Path) -> Result<Vec<Fixture>, String> {
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
     files.sort();
+    let every = sample_every();
     let mut fixtures = Vec::new();
+    let mut ids = Vec::new();
     for file in files {
         let text = fs::read_to_string(&file)
             .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+        let mut of_this_set = Vec::new();
         for (number, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
             let fixture: Fixture = serde_json::from_str(line)
                 .map_err(|e| format!("{}:{}: {e}", file.display(), number + 1))?;
-            fixtures.push(fixture);
+            of_this_set.push(fixture);
         }
+        ids.extend(of_this_set.iter().map(|fixture| fixture.id.clone()));
+        fixtures.extend(sampled(of_this_set, step_for(&file, every)));
     }
-    Ok(fixtures)
+    Ok(Cases { fixtures, ids })
+}
+
+#[test]
+fn a_sample_keeps_every_nth_case_of_a_set_from_its_first() {
+    assert_eq!(sampled((0..10).collect::<Vec<_>>(), 3), [0, 3, 6, 9]);
+    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 1), [0, 1, 2, 3]);
+    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 10), [0]);
+    assert!(sampled(Vec::<u8>::new(), 2).is_empty());
+}
+
+#[test]
+fn the_sample_step_is_one_when_the_variable_is_unset_or_empty() {
+    assert_eq!(sample_step(None), 1);
+    assert_eq!(sample_step(Some("")), 1);
+    assert_eq!(sample_step(Some("10")), 10);
+}
+
+#[test]
+fn a_summary_names_its_sample_and_a_whole_run_says_nothing() {
+    assert_eq!(sample_note(1), "");
+    assert_eq!(
+        sample_note(2),
+        " (1 in 2 cases of each recorded set, common whole, SYMPHONY_SAMPLE_EVERY)"
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not a positive integer")]
+fn a_sample_step_that_is_not_a_positive_integer_is_refused() {
+    sample_step(Some("0"));
+}
+
+#[test]
+fn the_common_set_is_replayed_whole_whatever_the_step() {
+    let parse = std::path::Path::new("fixtures/qwen3-8b/parse");
+    assert_eq!(step_for(&parse.join("common.jsonl"), 10), 1);
+    assert_eq!(step_for(&parse.join("gsm8k-test-content.jsonl"), 10), 10);
 }
