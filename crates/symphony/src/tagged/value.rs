@@ -178,13 +178,17 @@ impl Declared {
         self.functions.get(function)?.get(parameter).copied()
     }
 
-    /// The kind `function` declares at `path` below its parameters, for a value inside another: a
-    /// key selects that property's schema, `item` the schema of an array's items. Nothing when the
-    /// path leads nowhere in the schema.
+    /// The kind `function` declares at `path` below its parameters, for a value inside another:
+    /// below an object a segment selects that property's schema, below an array any segment
+    /// selects the items' schema (MiniMax writes a list's elements as `<item>` elements, and a
+    /// property may be named `item` too, so the schema's shape decides, not the segment). Nothing
+    /// when the path leads nowhere in the schema.
     pub fn kind_at(&self, function: &str, path: &[&str]) -> Option<Kind> {
         let mut schema = self.schemas.get(function)?;
         for segment in path {
-            schema = if *segment == ITEM {
+            let mut admitted = Vec::new();
+            admitted_types(schema, &mut admitted);
+            schema = if admitted.contains(&"array") {
                 schema.get("items")?
             } else {
                 schema.get("properties")?.get(*segment)?
@@ -686,6 +690,7 @@ mod tests {
                     "x": {"type": "integer"}, "tags": {"type": "array"}}}},
                 "options": {"type": "object", "properties": {"id": {"type": "string"}}},
                 "loose": {"type": "object"},
+                "cart": {"type": "object", "properties": {"item": {"type": "string"}}},
             }),
         )]);
         assert_eq!(declared.kind_at("f", &["recipients"]), Some(Kind::Array));
@@ -706,7 +711,13 @@ mod tests {
             Some(Kind::String)
         );
         assert_eq!(declared.kind_at("f", &["loose", "anything"]), None);
-        assert_eq!(declared.kind_at("f", &["recipients", "x"]), None);
+        // Below an array any segment is an item; below an object `item` is a property like any.
+        assert_eq!(
+            declared.kind_at("f", &["recipients", "x"]),
+            Some(Kind::String)
+        );
+        assert_eq!(declared.kind_at("f", &["cart", "item"]), Some(Kind::String));
+        assert_eq!(declared.kind_at("f", &["cart", "item", "x"]), None);
         assert_eq!(declared.kind_at("g", &["recipients"]), None);
         assert_eq!(declared.kind_at("f", &[]), Some(Kind::Object));
     }

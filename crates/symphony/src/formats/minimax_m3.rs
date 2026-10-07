@@ -24,7 +24,10 @@
 //!   ([`tagged::xml`](crate::tagged::xml)); a second invoke before the first closed ends the first,
 //!   and the block's close ends an invoke still open.
 
-use crate::format::{CallSyntax, Emits, Format};
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    tagged::xml,
+};
 
 /// The MiniMax M3 table.
 pub fn minimax_m3() -> Format {
@@ -34,7 +37,7 @@ pub fn minimax_m3() -> Format {
         .terminal("calls_open", "<tool_call>")
         .terminal("calls_close", "</tool_call>")
         .terminal("invoke_open", "<invoke name=\"")
-        .terminal("invoke_close", "</invoke>")
+        .terminal("invoke_close", xml::INVOKE_CLOSE)
         .ignores("separator", "]<]minimax[>[")
         .state("start", Emits::Content)
         .state("reasoning", Emits::Reasoning)
@@ -103,6 +106,7 @@ mod tests {
                     "sep": {"type": "string"},
                     "meta": {"type": "object"},
                     "año": {"type": "integer"},
+                    "cart": {"type": "object", "properties": {"item": {"type": "string"}}},
                 }}),
                 strict: None,
             },
@@ -440,6 +444,87 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Malformed { text, .. } if text.text == "junk"
+        )));
+    }
+
+    #[test]
+    fn a_property_named_item_keeps_its_type_below_an_object() {
+        let output = concat!(
+            "</mm:think><tool_call>\n<invoke name=\"alert\"><cart><item>123</item></cart>",
+            "</invoke>\n</tool_call>"
+        );
+        let events = run_with(tools(), "", &[output]);
+        assert_eq!(arguments_of(&events, 0), r#"{"cart": {"item": "123"}}"#);
+    }
+
+    #[test]
+    fn a_separator_inside_the_invoke_tag_is_carried_and_never_splits_a_character() {
+        // The separator arriving between the name's quote and the `>`, after a multi-byte
+        // character: the tail is reported whole, and the call starts (smg #2850, claude[bot]).
+        let output = concat!(
+            "</mm:think><tool_call>\n<invoke name=\"add\" ñ]<]minimax[>[x><a>1</a></invoke>\n",
+            "</tool_call>"
+        );
+        let events = run("", &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(names(&events), ["add"]);
+        assert_eq!(arguments_of(&events, 0), r#"{"a": 1}"#);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, .. } if text.text == " ñ]<]minimax[>[x"
+        )));
+    }
+
+    #[test]
+    fn only_the_invokes_closing_tag_is_a_started_calls_end() {
+        let output = concat!(
+            "</mm:think><tool_call>\n<invoke name=\"f\"><a>1</a></invoke>\n",
+            "<invoke name=\"g\"><b>2</b><invoke name=\"h\"><c>3</c></tool_call>Done."
+        );
+        let events = run("", &[output]);
+        assert_eq!(bytes(&events), output);
+        let ends: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, ["</invoke>", "", ""]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == dropped("<invoke name=\""))
+                .count(),
+            3
+        );
+        assert!(events.contains(&dropped("</tool_call>")));
+        assert_eq!(content(&events), "Done.");
+        // An invoke that named no call is reported with whichever terminal ended it.
+        let output = "<tool_call>\n<invoke name=\"</tool_call>";
+        let events = run("", &[output]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, .. } if text.text.ends_with("</tool_call>")
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_tag_the_invokes_close_cut_short_inside_a_string_is_reported() {
+        let output = concat!(
+            "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</na</invoke>\n",
+            "</tool_call>"
+        );
+        let events = run_with(tools(), "", &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(arguments_of(&events, 0), r#"{"name": "Par"}"#);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, .. } if text.text == "</na"
         )));
     }
 

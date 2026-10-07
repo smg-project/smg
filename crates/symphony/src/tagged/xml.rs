@@ -49,10 +49,13 @@
 //! - **The separator keeps its place.** When nothing is held before it, it is `Dropped { Wrapper }`
 //!   at once; when a value's text or an opening tag is held, its bytes go into the next
 //!   fragment's source, so every event's bytes stay in the output's order.
-//! - **Two endings.** [`Assembler::close`] is the invoke's closing tag, or the block's end before
-//!   it: every open container is closed, an open streamed string gets its quote, a leaf never
-//!   written and an element without a child come back as `Malformed`, the arguments object is
-//!   closed, and `ToolCallEnd` carries the tag's bytes. [`Assembler::finish`] is a stream that was
+//! - **Two endings.** [`Assembler::close`] is the invoke's closing tag ([`INVOKE_CLOSE`], the one
+//!   terminal a started call's end carries), or the next invoke's opening or the block's close,
+//!   which end the call with no bytes of their own: every open container is closed, a tag the
+//!   end cut short is reported and an open streamed string gets its quote, a leaf never written
+//!   and an element without a child come back as `Malformed`, and the arguments object is
+//!   closed. An invoke that named no call takes whichever terminal ended it, so that it is
+//!   reported the same way however it ended. [`Assembler::finish`] is a stream that was
 //!   cut: nothing is closed, what was held comes back as `Malformed { UnterminatedRegion }`, and a
 //!   call that started still ends, with no bytes of its own, as every assembler ends one.
 //! - **Every byte of the invoke lands in exactly one event**, with the tagged assemblers'
@@ -73,6 +76,11 @@ use crate::{
     },
 };
 
+/// The invoke's closing tag: the one terminal a started call's end carries. The next invoke's
+/// opening and the block's close end a call too, but they belong to the region, and the engine
+/// drops them.
+pub const INVOKE_CLOSE: &str = "</invoke>";
+
 const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
 const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";
 const TAG_CUT_SHORT: &str = "a tag that another tag cut short";
@@ -87,8 +95,10 @@ pub struct Assembler {
     id: String,
     /// Bytes no event has accounted for yet, in order; the next event takes them as its source.
     carried: String,
-    /// The name while it is read, then the tail of the invoke tag, then the open leaf's text.
+    /// The name while it is read, then the open leaf's text.
     value: String,
+    /// Where the bytes after the name's quote start in `carried`, while the invoke tag is read.
+    name_end: usize,
     stage: Stage,
     /// The function's name once `ToolCallStart` was pushed.
     function: Option<String>,
@@ -159,6 +169,7 @@ impl Assembler {
             id: id.into(),
             carried: String::new(),
             value: String::new(),
+            name_end: 0,
             stage: Stage::Name,
             function: None,
             open: Vec::new(),
@@ -223,8 +234,9 @@ impl Assembler {
                     mode: Mode::Streaming,
                     ..
                 }) => {
-                    let source = Text::uncounted(std::mem::take(&mut self.carried));
-                    self.push_fragment("\"".to_string(), source, out);
+                    // A tag the end cut short is reported, not hidden in the quote's source.
+                    self.report(TAG_CUT_SHORT, out);
+                    self.push_fragment("\"".to_string(), Text::default(), out);
                 }
                 Shape::Object => {
                     let source = Text::uncounted(std::mem::take(&mut self.carried));
@@ -282,6 +294,7 @@ impl Assembler {
                 Some(at) => {
                     self.carried.push_str(&text[..=at]);
                     self.value.push_str(&text[..at]);
+                    self.name_end = self.carried.len();
                     self.stage = Stage::Tail;
                     &text[at + 1..]
                 }
@@ -294,13 +307,11 @@ impl Assembler {
             Stage::Tail => match text.find('>') {
                 Some(at) => {
                     self.carried.push_str(&text[..at]);
-                    let tail = &text[..at];
-                    self.start_call(tail, out);
+                    self.start_call(out);
                     &text[at + 1..]
                 }
                 None => {
                     self.carried.push_str(text);
-                    self.tail_so_far(text);
                     ""
                 }
             },
@@ -308,27 +319,15 @@ impl Assembler {
         }
     }
 
-    /// Tail bytes that arrived before the `>`, kept apart from the name in `value` by a `"`.
-    fn tail_so_far(&mut self, text: &str) {
-        if !self.value.contains('"') {
-            self.value.push('"');
-        }
-        self.value.push_str(text);
-    }
-
     /// The invoke tag is whole: the call starts with the name's bytes and its quote as the start's
     /// source; a tail between the quote and `>` is reported; the `>` is carried into the next
     /// source. An invoke with no name starts no call, and the tag's bytes are reported.
-    fn start_call(&mut self, last_tail_piece: &str, out: &mut Events) {
-        self.tail_so_far(last_tail_piece);
-        let (name, tail) = match self.value.split_once('"') {
-            Some((name, tail)) => (name.to_string(), tail.to_string()),
-            None => (std::mem::take(&mut self.value), String::new()),
-        };
-        self.value.clear();
+    fn start_call(&mut self, out: &mut Events) {
+        let name = std::mem::take(&mut self.value);
         self.stage = Stage::Body;
-        let tail_start = self.carried.len() - tail.len();
-        let tail_bytes = self.carried.split_off(tail_start);
+        // The tail is every byte after the name's quote, a separator that arrived meanwhile
+        // included; `name_end` is a character boundary, so the split never lands inside one.
+        let tail_bytes = self.carried.split_off(self.name_end);
         if name.is_empty() {
             self.carried.push_str(&tail_bytes);
             self.carried.push('>');

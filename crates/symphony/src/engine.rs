@@ -201,10 +201,15 @@ impl Call {
             (Self::Pythonic(assembler), Closed::ByEnd) => assembler.finish(out),
             (Self::JsonList(assembler), Closed::ByMarker) => assembler.close(out),
             (Self::JsonList(assembler), Closed::ByEnd) => assembler.finish(out),
-            (Self::Xml(assembler), Closed::ByMarker) => {
+            // As for DSML: only the invoke's closing tag is a started call's end, and an invoke
+            // that named no call takes whichever terminal ended it.
+            (Self::Xml(assembler), Closed::ByMarker)
+                if terminal == tagged::xml::INVOKE_CLOSE || !assembler.started() =>
+            {
                 assembler.close(terminal, out);
                 return true;
             }
+            (Self::Xml(assembler), Closed::ByMarker) => assembler.close("", out),
             (Self::Xml(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
