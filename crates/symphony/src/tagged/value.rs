@@ -604,7 +604,8 @@ mod tests {
                 "empty": {"enum": []},
                 "only_null": {"enum": [null]},
                 // Aliases and other spellings of a type name are not read today; vLLM reads
-                // these as string and integer. Whether Symphony follows is Simo's decision.
+                // these as string and integer. Whether Symphony follows is the maintainer's
+                // decision.
                 "alias": {"type": "str"},
                 "cased": {"type": "String"},
                 "padded": {"type": " integer "},
