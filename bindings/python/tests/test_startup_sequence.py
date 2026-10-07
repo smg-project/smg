@@ -295,6 +295,24 @@ class TestRouterInitialization:
         # Discovery supplies the workers, exactly as under --service-discovery.
         assert kwargs["worker_urls"] == []
 
+    def test_from_args_rejects_a_provider_it_cannot_pass(self):
+        """A provider accepted on the CLI but not wired through fails loudly.
+
+        Simulates adding a provider to the CLI choices without teaching
+        from_args to pass it on: that must not start the router without
+        discovery.
+        """
+        args = RouterArgs(discovery_provider="file")
+
+        with (
+            patch("smg.router_args.DISCOVERY_PROVIDER_CHOICES", ["kubernetes", "file"]),
+            patch("smg.router._Router") as rust_router,
+            pytest.raises(ValueError, match="cannot pass discovery provider 'file'"),
+        ):
+            Router.from_args(args)
+
+        rust_router.assert_not_called()
+
     def test_router_initialization_with_retry_config(self):
         """Test router initialization with retry configuration."""
         args = RouterArgs(

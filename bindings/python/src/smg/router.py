@@ -318,7 +318,14 @@ class Router:
 
         args_dict = vars(args).copy()
         # Kubernetes, by either spelling, reaches Rust as service_discovery.
-        args_dict["service_discovery"] = args.selected_discovery_provider() == "kubernetes"
+        # A provider this cannot pass on fails here instead of quietly
+        # starting the router without discovery.
+        provider = args.selected_discovery_provider()
+        if provider not in (None, "kubernetes"):
+            raise ValueError(
+                f"Router.from_args cannot pass discovery provider {provider!r} to Rust"
+            )
+        args_dict["service_discovery"] = provider == "kubernetes"
         args_dict.pop("discovery_provider")
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
