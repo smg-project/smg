@@ -158,6 +158,48 @@ fn pd_fanout_width(request: &ProtoGenerateRequest, protocol: PdProtocol) -> Opti
     (n > 1).then_some(n)
 }
 
+fn pd_sub_request_id(base_id: &str, index: u32) -> String {
+    format!("{base_id}-{index}")
+}
+
+fn trace_engine_ids(
+    plan: &mut ExecutionPlan,
+    workers: Option<&WorkerSelection>,
+) -> (Vec<String>, bool) {
+    let protocol = if matches!(
+        plan,
+        ExecutionPlan::Single(_)
+            | ExecutionPlan::Batch {
+                kind: ExecutionPlanKind::Single,
+                ..
+            }
+    ) {
+        None
+    } else {
+        workers
+            .and_then(WorkerSelection::disaggregated_runtime_type)
+            .and_then(|runtime| PdProtocol::for_runtime(*runtime))
+    };
+    let mut ids: Vec<_> = plan
+        .generate_requests_mut()
+        .flat_map(|request| {
+            let width = protocol.and_then(|protocol| pd_fanout_width(request, protocol));
+            let base_id = request.request_id().to_owned();
+            (0..width.unwrap_or(1)).map(move |index| {
+                if width.is_some() {
+                    pd_sub_request_id(&base_id, index)
+                } else {
+                    base_id.clone()
+                }
+            })
+        })
+        .take(33)
+        .collect();
+    let complete = !ids.is_empty() && ids.len() <= 32;
+    ids.truncate(32);
+    (ids, complete)
+}
+
 /// Give the decode leg the media identity the prefill leg produced, so it
 /// is served without pixels or references. Only on a leg that will pull its
 /// prompt KV from prefill: it must hold a KV handoff (`handed_off`) and be
@@ -209,7 +251,7 @@ fn fan_out_pd_request(
     (0..n)
         .map(|i| {
             let mut sub = request.clone();
-            sub.set_request_id(format!("{base_id}-{i}"));
+            sub.set_request_id(pd_sub_request_id(&base_id, i));
             sub.set_sampling_n(1);
             sub.offset_sampling_seed(i);
             remint(&mut sub);
@@ -316,13 +358,8 @@ pub(crate) async fn execute_plan(
     let request_type = execution_plan.request_type();
     let mode = execution_plan.mode_label();
     if cache_trace::enabled() {
-        let mut engine_ids: Vec<_> = execution_plan
-            .generate_requests_mut()
-            .take(33)
-            .map(|request| request.request_id().to_owned())
-            .collect();
-        let engine_ids_complete = !engine_ids.is_empty() && engine_ids.len() <= 32;
-        engine_ids.truncate(32);
+        let (engine_ids, engine_ids_complete) =
+            trace_engine_ids(&mut execution_plan, Some(workers));
         ctx.cache_trace = cache_trace::dispatch(
             ctx.root_request_id.as_deref(),
             ctx.attempt,
@@ -1637,6 +1674,19 @@ mod tests {
         let workers = tokenspeed_pair();
         let fanned = ExecutionPlan::PrefillDecode(tokenspeed_request(4, None));
         assert_eq!(plan_sub_requests(&fanned, Some(&workers)), 4);
+        let (ids, complete) = trace_engine_ids(&mut fanned.clone(), Some(&workers));
+        let dispatched: Vec<_> = fan_out_pd_request(&tokenspeed_request(4, None), 4, |_| {})
+            .iter()
+            .map(|request| request.request_id().to_owned())
+            .collect();
+        assert_eq!(ids, dispatched);
+        assert!(complete);
+        let (ids, complete) = trace_engine_ids(
+            &mut ExecutionPlan::PrefillDecode(tokenspeed_request(33, None)),
+            Some(&workers),
+        );
+        assert_eq!(ids.len(), 32);
+        assert!(!complete);
         // Without a disaggregated selection there is no PD protocol to fan out on.
         assert_eq!(plan_sub_requests(&fanned, None), 1);
 
