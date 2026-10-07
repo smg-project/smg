@@ -23,14 +23,18 @@
 //!   [`json`]'s inference (`null`, `true`, `[1, 2]`, `{"a": 1}` as written; text that is not JSON
 //!   is a string holding it, so one odd value never costs a call its other arguments). The
 //!   request's tools are not consulted: the model says the type. A parameter tag with another
-//!   attribute, or none, is read as `string="true"` and its tail reported as `Malformed`.
+//!   attribute, or none, is no parameter tag: it comes back whole as `Malformed`, and what
+//!   follows it is text between tags until the next tag the syntax has.
 //! - **No template newline around a value.** The template writes the value directly between the
 //!   tags, so nothing is taken away from it; the newline between tags is the template's and goes
 //!   into the next event's source, as in the Qwen assembler.
 //! - **A name ends at its quote.** The function name runs to `"`, the key to `"`; the rest of the
 //!   tag runs to `>`.
-//! - **Inside a value only `</｜DSML｜ parameter>` is a tag**; a parameter tag or an invoke tag
-//!   there is the value's text, as for Qwen.
+//! - **Inside a value only `</｜DSML｜ parameter>` is a tag for the assembler**; a parameter tag
+//!   there is the value's text, as for Qwen. The invoke tags and the block's close are the
+//!   engine's terminals, so they end the call wherever they stand, a value included, as
+//!   `</tool_call>` does for Qwen (the table's `invoke + invoke_open` and `invoke + calls_close`
+//!   rows).
 //! - **Two endings.** [`Assembler::close`] is the invoke's closing tag, or the block's end before
 //!   it: after the last parameter it closes the object and pushes `ToolCallEnd` with the tag's
 //!   bytes; inside a value it closes an open string and the object and reports what was held, as
@@ -38,7 +42,10 @@
 //! - **Every byte of the invoke lands in exactly one event**, with the same accounting as the Qwen
 //!   assembler: the name's bytes in `ToolCallStart`, each tag's and value's bytes in the
 //!   fragments they produce, text where the syntax has tags as `Malformed` run by run with the
-//!   whitespace before it as `Dropped { Wrapper }`.
+//!   whitespace before it as `Dropped { Wrapper }`, as the Qwen assembler reports it. A client
+//!   that shows malformed text sees such words without the spaces between them (an invoke whose
+//!   name never closed shows as `name="a"string="true"`); the bytes are all accounted for, in the
+//!   dropped and malformed events.
 //!
 //! This is the second tagged assembler beside the Qwen one; the two share the value module and the
 //! escaping, and will share one core when a third dialect (GLM, MiniMax, Hy4) arrives and shows
@@ -381,24 +388,18 @@ impl Assembler {
         self.stage = Stage::Between;
     }
 
-    /// The parameter tag is whole: the value begins, typed by its `string` attribute.
+    /// The parameter tag is whole: the value begins, typed by its `string` attribute. A tag with
+    /// any other tail (`<｜DSML｜ parameter name="x" kind="y">`) is not a parameter tag the
+    /// syntax has: the whole tag comes back as `Malformed`, and no parameter opens, so a tag the
+    /// syntax does not spell is never read as one.
     fn open_value(&mut self, key: String, tail: &str, out: &mut Events) {
         let string = match tail {
             STRING_TRUE => true,
             STRING_FALSE => false,
-            other => {
-                let tag_end = self.carried.len() - other.len() - 1;
-                let mut after = self.carried.split_off(tag_end);
-                let close = after.pop();
-                if !after.is_empty() {
-                    self.drop_carried(out);
-                    out.push(Event::Malformed {
-                        text: Text::uncounted(after),
-                        why: MalformedReason::Other(TAG_TAIL.to_string()),
-                    });
-                }
-                self.carried.extend(close);
-                true
+            _ => {
+                self.report(TAG_TAIL, out);
+                self.stage = Stage::Between;
+                return;
             }
         };
         self.stage = Stage::Value(ValueState {

@@ -312,8 +312,11 @@ mod tests {
 
     #[test]
     fn a_missing_quote_on_the_name_starts_no_call_and_the_next_invoke_takes_index_zero() {
+        // Two parameters: the first arrives while the name is still open and cuts it short, the
+        // second arrives between tags with no call started, which is the guard this test holds.
         let output = concat!(
             "</think>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f>\n",
+            "<｜DSML｜ parameter name=\"a\" string=\"true\">x</｜DSML｜ parameter>\n",
             "<｜DSML｜ parameter name=\"b\" string=\"true\">y</｜DSML｜ parameter>\n",
             "</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
         );
@@ -356,8 +359,56 @@ mod tests {
     }
 
     #[test]
-    fn a_calls_block_in_the_prompt_is_not_entered_and_thinking_off_starts_in_content() {
+    fn thinking_off_starts_in_content() {
         let events = run("<think>\n\n</think>\n\n", &["Hello"]);
         assert_eq!(events[0], Event::Content(Text::uncounted("Hello")));
+    }
+
+    #[test]
+    fn a_calls_block_in_an_earlier_turn_of_the_prompt_is_not_entered() {
+        // The replay starts at the last `<｜Assistant｜>`, so the earlier turn's block, closed or
+        // not, moves nothing; the thought the prompt opens is where the output starts.
+        for earlier in [
+            "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+            "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
+        ] {
+            let prompt = format!(
+                "<｜User｜>q<｜Assistant｜></think>{earlier}<｜end▁of▁sentence｜>\
+                 <｜User｜>r<｜Assistant｜><think>"
+            );
+            let events = run(&prompt, &["A thought.</think>\n\nAn answer."]);
+            assert_eq!(events[0], Event::ReasoningStart, "{earlier:?}");
+            assert_eq!(
+                events[1],
+                Event::Reasoning(Text::uncounted("A thought.")),
+                "{earlier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parameter_tag_with_another_attribute_is_no_parameter() {
+        let output = concat!(
+            "</think>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
+            "<｜DSML｜ parameter name=\"x\" kind=\"y\">v</｜DSML｜ parameter>\n",
+            "<｜DSML｜ parameter name=\"a\" string=\"true\">1</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+        );
+        let events = run("<think>", &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(arguments_of(&events, 0), r#"{"a": "1"}"#);
+        let malformed: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            malformed
+                .iter()
+                .any(|text| text.ends_with("<｜DSML｜ parameter name=\"x\" kind=\"y\">")),
+            "{malformed:?}"
+        );
     }
 }

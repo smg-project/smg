@@ -111,8 +111,12 @@ const DSML_OUTPUTS: &[&str] = &[
      </｜DSML｜ calls>",
     "</think>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" \
      string=\"true\">x</｜DSML｜ parameter>\n</｜DSML｜ calls>\nThe weather is sunny.",
-    "</think>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f>\n<｜DSML｜ parameter name=\"b\" \
-     string=\"true\">y</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n\
+    "</think>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f>\n<｜DSML｜ parameter name=\"a\" \
+     string=\"true\">x</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"b\" string=\"true\">y\
+     </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n</｜DSML｜ invoke>\n\
+     </｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x\" kind=\"y\">v\
+     </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">1</｜DSML｜ parameter>\n\
      </｜DSML｜ invoke>\n</｜DSML｜ calls>",
     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"o\" string=\"false\">\
      {\"size\": \"large\", \"deep\": [1, 2.5, true, null]}</｜DSML｜ parameter>\n<｜DSML｜ parameter \

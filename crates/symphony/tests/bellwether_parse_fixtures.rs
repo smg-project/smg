@@ -292,9 +292,7 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
-            // DSML's code-fence probe holds Qwen's syntax, which the DSML table never reads as a
-            // call: the fence is content, as the reference says.
-            Self::DeepSeekV4_1 => &KNOWN_TAGGED_DIFFERENCES[..1],
+            Self::DeepSeekV4_1 => KNOWN_DSML_DIFFERENCES,
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
         // read; that case falls under the reasoning allowance instead of the list.
@@ -446,6 +444,17 @@ const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[
         finish: "stop",
     },
 ];
+
+/// Under the DSML table only the reasoning probe differs: the code fence holds Qwen's syntax,
+/// which this table never reads as a call, so the fence is content, as the reference says.
+const KNOWN_DSML_DIFFERENCES: &[KnownDifference] = &[KnownDifference {
+    id: "parse/reasoning-with-marker-text",
+    reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every \
+             marker parser does, and the reference keeps the marker as reasoning text \
+             (bellwether #16)",
+    calls: 0,
+    finish: "stop",
+}];
 
 /// The case's id after its slug: what [`KnownDifference::id`] names.
 fn after_slug(id: &str) -> &str {
