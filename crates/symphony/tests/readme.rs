@@ -93,11 +93,10 @@ impl Table {
 /// Where a group stands.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
-    /// The table is on main, bellwether's benchmark-scale set is recorded, and the fixture test
-    /// replays every case of it at every chunking with no difference.
+    /// The table is on main, bellwether's benchmark-scale set is recorded, and a local run of the
+    /// fixture test on main's code replayed every case of it at every chunking with no
+    /// difference; CI guards the set once its bellwether pin holds it.
     Ready,
-    /// The table is in the open pull request named.
-    InReview { pr: u32 },
     /// The table is on main and bellwether's set is recorded; the fixture test has not yet
     /// replayed the whole of it.
     Replaying,
@@ -111,9 +110,6 @@ impl Status {
     fn cell(self) -> String {
         match self {
             Self::Ready => "ready".to_string(),
-            Self::InReview { pr } => {
-                format!("in review ([#{pr}](https://github.com/smg-project/smg/pull/{pr}))")
-            }
             Self::Replaying => "replaying the set".to_string(),
             Self::AwaitingFixtures => "awaiting fixtures".to_string(),
             Self::Pending => "pending".to_string(),
@@ -181,7 +177,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("deepseek_v41"), Some("deepseek_v41")),
         table: Some(Table::DeepSeekV4_1),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "dots3-note-prev",
@@ -281,7 +277,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("hy_v4"), Some("hy_v4")),
         table: Some(Table::Hy4),
         set: Some(54_195),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "inkling",
@@ -421,7 +417,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("minimax_m3"), Some("minimax_m3")),
         table: Some(Table::MinimaxM3),
         set: Some(54_180),
-        status: Status::InReview { pr: 2850 },
+        status: Status::Replaying,
     },
     Group {
         slug: "mistral-7b-instruct-v0.3",
@@ -627,7 +623,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-coder-30b-a3b-instruct",
@@ -931,12 +927,11 @@ fn render() -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{} groups, {} checkpoints, newest first.\n{} ready, {} in review, {} replaying a recorded \
+        "{} groups, {} checkpoints, newest first.\n{} ready, {} replaying a recorded \
          set, {} on main awaiting fixtures, {} pending.",
         groups.len(),
         checkpoints,
         tally(|s| *s == Status::Ready),
-        tally(|s| matches!(s, Status::InReview { .. })),
         tally(|s| *s == Status::Replaying),
         tally(|s| *s == Status::AwaitingFixtures),
         tally(|s| *s == Status::Pending),

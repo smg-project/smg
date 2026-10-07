@@ -18,17 +18,17 @@ is written from `tests/readme.rs` and checked by `cargo test`, so it says what t
 and a stale table fails the build. It runs newest first: **Released** is the day the primary's
 Hugging Face repository was created.
 
-A group is **ready** when its table is on main, bellwether's benchmark-scale set for it is
-recorded, and the fixture test (`tests/bellwether_parse_fixtures.rs`) replays every case of that
-set at every chunking with no difference; SMG's CI runs that test on every change to the crate,
-against the bellwether commit pinned in `.github/versions/bellwether.ref`. **In review** names
-the pull request that holds the table. **Replaying the set** means the table is on main and
-bellwether's `main` holds the group's set (the count in **bellwether set**), and a local run of the
-fixture test over the whole set has not finished; the commit CI reads is pinned in
-`.github/versions/bellwether.ref` and does not hold these sets yet. **Awaiting fixtures** means
-the table is on main and bellwether has not recorded the group's set yet; every such table was
-previewed against bellwether's scale run of 2026-10-06 with no difference. **Pending** means no
-table yet.
+A group is **ready** when its table is on main, bellwether's `main` holds the group's
+benchmark-scale set (the count in **bellwether set**), and a run of the fixture test
+(`tests/bellwether_parse_fixtures.rs`) on main's code has replayed every case of that set at every
+chunking with no difference. That run is local, and the pull request that marked the group ready
+records it: SMG's CI runs the fixture test on every change to the crate against the bellwether
+commit pinned in `.github/versions/bellwether.ref`, which holds the hand-written sets only, so CI
+guards a ready group's set once the pin moves to a commit that holds it. **Replaying the set**
+means the table is on main and bellwether's `main` holds the set, and that run has not finished.
+**Awaiting fixtures** means the table is on main and bellwether has not recorded the group's set
+yet; every such table was previewed against bellwether's scale run of 2026-10-06 with no
+difference. **Pending** means no table yet.
 
 **SMG today** is what the gateway takes for the group's primary before Symphony is wired in: the
 `--tool-call-parser` and `--reasoning-parser` names its registries resolve from the model id, as
@@ -41,15 +41,15 @@ aliases is an open question of the design.
 
 <!-- models: begin -->
 77 groups, 106 checkpoints, newest first.
-0 ready, 1 in review, 12 replaying a recorded set, 30 on main awaiting fixtures, 34 pending.
+3 ready, 10 replaying a recorded set, 30 on main awaiting fixtures, 34 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
 | 2026-09-28 | [iquest-q1](https://github.com/smg-project/bellwether/tree/main/fixtures/iquest-q1) | IQuestLab/IQuest-Q1 |  | `iquest` | — | awaiting fixtures | none |
-| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash |  | `deepseek_v4.1` | 54,418 | replaying the set | `deepseek_v41`, `deepseek_v41` |
+| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash |  | `deepseek_v4.1` | 54,418 | ready | `deepseek_v41`, `deepseek_v41` |
 | 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | — | — | pending | none |
 | 2026-09-01 | [k2-horizon-36b](https://github.com/smg-project/bellwether/tree/main/fixtures/k2-horizon-36b) | IFM/K2-Horizon-36B |  | — | — | pending | none |
-| 2026-08-27 | [hy4-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/hy4-preview) | tencent/Hy4-preview |  | `hy4` | 54,195 | replaying the set | `hy_v4`, `hy_v4` |
+| 2026-08-27 | [hy4-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/hy4-preview) | tencent/Hy4-preview |  | `hy4` | 54,195 | ready | `hy_v4`, `hy_v4` |
 | 2026-08-27 | [qwen-drive-1.0-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-drive-1.0-4b) | Qwen/Qwen-Drive-1.0-4B |  | — | 54,181 | pending | `qwen`, `qwen3` |
 | 2026-08-25 | [glm-5.3-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.3-flash) | zai-org/GLM-5.3-Flash |  | — | — | pending | `glm47_moe`, `glm45` |
 | 2026-08-24 | [qwen3.8-flash-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-flash-next) | Qwen/Qwen3.8-Flash-Next |  | — | — | pending | `qwen_xml`, `qwen3` |
@@ -61,7 +61,7 @@ aliases is an open question of the design.
 | 2026-07-21 | [nanbeige4.2-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/nanbeige4.2-3b) | Nanbeige/Nanbeige4.2-3B |  | `qwen3`, tagged calls | — | awaiting fixtures | none |
 | 2026-07-14 | [inkling](https://github.com/smg-project/bellwether/tree/main/fixtures/inkling) | thinkingmachines/Inkling |  | — | — | pending | `inkling`, `inkling` |
 | 2026-06-22 | [qwen-agentworld-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-agentworld-35b-a3b) | Qwen/Qwen-AgentWorld-35B-A3B |  | — | 54,195 | pending | `qwen`, `qwen3` |
-| 2026-06-02 | [minimax-m3](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m3) | MiniMaxAI/MiniMax-M3 |  | `minimax_m3` | 54,180 | in review ([#2850](https://github.com/smg-project/smg/pull/2850)) | `minimax_m3`, `minimax_m3` |
+| 2026-06-02 | [minimax-m3](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m3) | MiniMaxAI/MiniMax-M3 |  | `minimax_m3` | 54,180 | replaying the set | `minimax_m3`, `minimax_m3` |
 | 2026-04-27 | [mimo-v2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.5) | XiaomiMiMo/MiMo-V2.5 |  | `qwen3`, tagged calls | — | awaiting fixtures | none |
 | 2026-04-23 | [laguna-xs.2](https://github.com/smg-project/bellwether/tree/main/fixtures/laguna-xs.2) | poolside/Laguna-XS.2 |  | — | — | pending | none |
 | 2026-04-21 | [qwen3.6-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-27b) | Qwen/Qwen3.6-27B |  | `qwen3`, tagged calls | — | awaiting fixtures | `qwen_xml`, `qwen3` |
@@ -108,7 +108,7 @@ aliases is an open question of the design.
 | 2025-07-28 | [step3](https://github.com/smg-project/bellwether/tree/main/fixtures/step3) | stepfun-ai/step3 |  | — | — | pending | `step3`, `step3` |
 | 2025-06-25 | [hunyuan-a13b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/hunyuan-a13b-instruct) | tencent/Hunyuan-A13B-Instruct |  | — | — | pending | none |
 | 2025-04-27 | [qwen3-30b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-30b-a3b) | Qwen/Qwen3-30B-A3B | Qwen3-235B-A22B | `qwen3` | 54,418 | replaying the set | `qwen`, `qwen3` |
-| 2025-04-27 | [qwen3-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-8b) | Qwen/Qwen3-8B | Qwen3-0.6B, Qwen3-1.7B, Qwen3-4B, Qwen3-14B, Qwen3-32B | `qwen3` | 54,418 | replaying the set | `qwen`, `qwen3` |
+| 2025-04-27 | [qwen3-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-8b) | Qwen/Qwen3-8B | Qwen3-0.6B, Qwen3-1.7B, Qwen3-4B, Qwen3-14B, Qwen3-32B | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-03-27 | [llama-xlam-2-8b-fc-r](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-xlam-2-8b-fc-r) | Salesforce/Llama-xLAM-2-8b-fc-r |  | `xlam` | — | awaiting fixtures | `json`, none |
 | 2025-03-24 | [deepseek-v3-0324](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3-0324) | deepseek-ai/DeepSeek-V3-0324 |  | — | — | pending | `deepseek`, none |
 | 2025-03-22 | [qwen2.5-omni-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-omni-7b) | Qwen/Qwen2.5-Omni-7B | Qwen2.5-Omni-3B | `qwen2.5` | — | awaiting fixtures | `qwen`, `qwen3` |
