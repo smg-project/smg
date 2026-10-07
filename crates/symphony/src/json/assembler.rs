@@ -19,8 +19,9 @@
 //! judged by [`Prefix`], which accepts what [`PartialJson`](super::PartialJson) accepts in prefix
 //! mode, before it is emitted, and from the first byte it cannot take, the argument bytes come
 //! back as `Malformed` with `InvalidArguments` instead, nothing already emitted being revised. The
-//! prefix parser tolerates what the old crate tolerated (a bracket closed by the wrong kind, a
-//! literal's prefix), so the promise is exactly as strong as that parser.
+//! prefix parser tolerates what the old crate tolerated (a literal's prefix, a bracket closed by
+//! the wrong kind where the parent can take it), so the promise is exactly as strong as that
+//! parser.
 //!
 //! Every byte is read once. The outline is taken by a [`Scanner`] that keeps its place between
 //! pieces, and the prefix is judged on the bytes that arrived, so a call's cost is linear in its
@@ -115,10 +116,13 @@ impl Assembler {
             }
             None => bytes.len(),
         };
-        let found = self.scanner.found().clone();
+        // Two offsets and a span: nothing of the outline is copied per piece but what this
+        // piece needs, and the name only once, when the call starts.
+        let close = self.scanner.found().close;
+        let arguments = self.scanner.found().arguments.clone();
         if !self.started {
-            let Some(name) = found.name.clone() else {
-                if let Some(close) = found.close {
+            let Some(name) = self.scanner.found().name.clone() else {
+                if let Some(close) = close {
                     // Closed without a name: not a call. Said now, so `done` is true at the close.
                     out.push(Event::Malformed {
                         text: Text::uncounted(&self.text[..close]),
@@ -128,7 +132,7 @@ impl Assembler {
                 }
                 return taken;
             };
-            let head_end = match (&found.arguments, found.close) {
+            let head_end = match (&arguments, close) {
                 (Some(span), _) => span.start,
                 (None, Some(close)) => close,
                 (None, None) => return taken,
@@ -141,10 +145,9 @@ impl Assembler {
             });
             self.started = true;
         }
-        self.emit_new_argument_bytes(found.arguments.as_ref(), out);
-        if let Some(close) = found.close {
-            let tail_start = found
-                .arguments
+        self.emit_new_argument_bytes(arguments.as_ref(), out);
+        if let Some(close) = close {
+            let tail_start = arguments
                 .as_ref()
                 .and_then(|span| span.end)
                 .unwrap_or(close);

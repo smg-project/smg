@@ -14,10 +14,11 @@
 //! out before a comma or a closing brace (`[,,]`, `{"a": }`), an escape JSON lacks (`\q` is `q`),
 //! a `\u` escape with fewer than four hex digits, and any Unicode whitespace between tokens. What
 //! it refuses, where that parser stops: a word that is no literal (judged from the word's first
-//! letter, as the parser rolls back to it), a bracket closed by the wrong kind, a surrogate
-//! escape without its other half, a container nested past the depth limit, and anything after the
-//! value. Inside a string the only error is a broken surrogate pair; a string cut anywhere else is
-//! a prefix.
+//! letter, as the parser rolls back to it), a bracket closed by the wrong kind where the parent
+//! cannot take it (`{"a": [1}` is whole, the array ending at the brace that closes the object;
+//! `[1, 2}` stops at the brace), a surrogate escape without its other half, a container nested
+//! past the depth limit, and anything after the value. Inside a string the only error is a broken
+//! surrogate pair; a string cut anywhere else is a prefix.
 
 /// The nesting the prefix parser allows, which is [`PartialJson::DEFAULT_MAX_DEPTH`].
 const DEEPEST: usize = 32;
@@ -130,9 +131,12 @@ impl Default for Prefix {
 
 impl Prefix {
     /// Judge the next bytes, which follow every byte judged before, and return where the bytes
-    /// stopped being a prefix of a value, if they have: an offset into the whole text, never
-    /// past what has been fed and never earlier than a previous answer except for a word that
-    /// turned out to be no literal, which is refused from its first letter.
+    /// stopped being a prefix of a value, if they have: an offset into the whole text, never past
+    /// what has been fed, but anywhere at or after the start, bytes judged sound before included,
+    /// since the parser rolls back to a word's first letter when the word is no literal, to the
+    /// backslash before a surrogate's missing other half, and to the value's start when a
+    /// top-level string breaks. A caller that has already passed on the sound bytes clamps the
+    /// answer to what it passed on, as the assembler does.
     pub fn feed(&mut self, bytes: &str) -> Option<usize> {
         for (offset, c) in bytes.char_indices() {
             if self.invalid.is_some() {
