@@ -23,20 +23,24 @@ recorded, and the fixture test (`tests/bellwether_parse_fixtures.rs`) replays ev
 set at every chunking with no difference; SMG's CI runs that test on every change to the crate,
 against the bellwether commit pinned in `.github/versions/bellwether.ref`. **In review** names
 the pull request that holds the table. **Replaying the set** means the table is on main and
-bellwether's set is recorded, and the fixture test has not yet replayed the whole of it.
-**Awaiting fixtures** means the table is on main and bellwether has not recorded the group's set
-yet; every such table was previewed against bellwether's scale run of 2026-10-06 with no
-difference. **Pending** means no table yet.
+bellwether's `main` holds the group's set (the count in **bellwether set**), and a local run of the
+fixture test over the whole set has not finished; the commit CI reads is pinned in
+`.github/versions/bellwether.ref` and does not hold these sets yet. **Awaiting fixtures** means
+the table is on main and bellwether has not recorded the group's set yet; every such table was
+previewed against bellwether's scale run of 2026-10-06 with no difference. **Pending** means no
+table yet.
 
 **SMG today** is what the gateway takes for the group's primary before Symphony is wired in: the
 `--tool-call-parser` and `--reasoning-parser` names its registries resolve from the model id, as
 in `smg serve --model-path Qwen/Qwen3-8B --tool-call-parser qwen --reasoning-parser qwen3`; none
 means passthrough, the output read as content. Symphony's tables carry one name each, the
-**Table** column, and once the gateway selects a table that name is the one to pass; whether it
-replaces the two flags with one or keeps them as aliases is an open question of the design.
+**Table** column, and the Qwen3 table takes its call syntax as a second selector (JSON calls, or
+the tagged calls of Qwen 3.5 and later and Qwen3-Coder); once the gateway selects a table, the
+name and that selector are what to pass, and whether they replace the two flags or keep them as
+aliases is an open question of the design.
 
 <!-- models: begin -->
-77 groups, 106 checkpoints, newest first:
+77 groups, 106 checkpoints, newest first.
 0 ready, 1 in review, 12 replaying a recorded set, 30 on main awaiting fixtures, 34 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |

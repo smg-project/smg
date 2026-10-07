@@ -84,7 +84,7 @@ impl Table {
     /// How the README names it: the function, and the call syntax where the function takes one.
     fn cell(self) -> String {
         match self {
-            Self::Qwen3Tagged => "`qwen3`, tagged calls".to_string(),
+            Self::Qwen3Tagged => format!("`{}`, tagged calls", self.format().name()),
             other => format!("`{}`", other.format().name()),
         }
     }
@@ -931,7 +931,7 @@ fn render() -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{} groups, {} checkpoints, newest first:\n{} ready, {} in review, {} replaying a recorded \
+        "{} groups, {} checkpoints, newest first.\n{} ready, {} in review, {} replaying a recorded \
          set, {} on main awaiting fixtures, {} pending.",
         groups.len(),
         checkpoints,
@@ -983,7 +983,7 @@ fn the_readme_models_table_is_what_groups_says() {
     let end = readme.find(END).expect("the end marker in README.md");
     assert!(begin <= end, "the markers in README.md are out of order");
     let expected = format!("\n{}", render());
-    if std::env::var_os(WRITE_ENV).is_some() {
+    if std::env::var(WRITE_ENV).is_ok_and(|value| value == "1") {
         let written = format!("{}{}{}", &readme[..begin], expected, &readme[end..]);
         fs::write(&path, written).expect("README.md written");
         return;
@@ -1015,6 +1015,13 @@ fn every_named_table_builds_and_every_status_has_what_it_claims() {
         if matches!(group.status, Status::Ready | Status::Replaying) {
             assert!(group.set.is_some(), "{} has no recorded set", group.slug);
         }
+        if group.status == Status::AwaitingFixtures {
+            assert!(
+                group.set.is_none(),
+                "{} awaits fixtures with a recorded set",
+                group.slug
+            );
+        }
     }
 }
 
@@ -1027,7 +1034,13 @@ fn is_a_day(date: &str) -> bool {
     let Some((month, day)) = rest.split_once('-') else {
         return false;
     };
-    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+    if year.len() != 4
+        || month.len() != 2
+        || day.len() != 2
+        || ![year, month, day]
+            .iter()
+            .all(|part| part.bytes().all(|b| b.is_ascii_digit()))
+    {
         return false;
     }
     let (Ok(year), Ok(month), Ok(day)) = (
@@ -1064,6 +1077,7 @@ fn every_release_date_is_a_calendar_day() {
         "2024-04-31",
         "2019-12-31",
         "2026-9-1",
+        "2026-+9-01",
         "today",
     ] {
         assert!(!is_a_day(not_a_day), "{not_a_day:?} is not a day");
