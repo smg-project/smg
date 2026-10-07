@@ -602,7 +602,7 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
 #[test]
 fn every_byte_of_every_output_lands_in_exactly_one_event_in_order() {
     for (subject, text) in corpus() {
-        for cuts in chunkings(text) {
+        for (_, cuts) in chunkings(text, usize::MAX) {
             let events = replay(subject, text, &cuts, false)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
             let conserved: String = events.iter().map(bytes_of).collect();
@@ -622,7 +622,7 @@ fn what_the_parser_says_does_not_depend_on_the_chunking() {
         let whole = replay(subject, text, &[], false)
             .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
         let expected = Said::of(&whole);
-        for cuts in chunkings(text) {
+        for (_, cuts) in chunkings(text, usize::MAX) {
             let events = replay(subject, text, &cuts, false)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
             assert_eq!(
@@ -659,7 +659,7 @@ fn empty_deltas_between_the_pieces_change_nothing() {
 #[test]
 fn the_event_stream_is_well_formed_under_every_chunking() {
     for (subject, text) in corpus() {
-        for cuts in chunkings(text) {
+        for (_, cuts) in chunkings(text, usize::MAX) {
             let events = replay(subject, text, &cuts, false)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
             check_well_formed(subject.name, text, &cuts, &events);
@@ -781,7 +781,7 @@ fn every_token_is_counted_in_the_event_that_carries_its_first_byte_whatever_the_
         // Where each synthetic token starts, and the byte-less one at the end.
         let mut starts: Vec<usize> = boundaries[..boundaries.len() - 1].to_vec();
         starts.push(text.len());
-        for cuts in chunkings(text) {
+        for (_, cuts) in chunkings(text, usize::MAX) {
             let events = replay_counted(subject, text, &cuts)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
             let place = || format!("{}: {text:?} cut at {cuts:?}", subject.name);
