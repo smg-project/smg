@@ -179,6 +179,10 @@ impl ResponseProcessor {
             }
         }
 
+        if original_request.first_tool_call_only {
+            utils::keep_first_tool_call(&mut tool_calls);
+        }
+
         // Step 3: Determine finish reason. A local stop-decoder match takes
         // precedence over the engine's reason (which is "length" when stop
         // strings are enforced gateway-side rather than by the backend).
@@ -697,6 +701,10 @@ impl ResponseProcessor {
             }
         }
 
+        if messages_request.first_tool_call_only {
+            utils::keep_first_tool_call(&mut tool_calls);
+        }
+
         // Step 3: Build content blocks
         let mut content_blocks: Vec<messages::ContentBlock> = Vec::new();
 
@@ -1070,6 +1078,62 @@ mod responses_finish_reason_tests {
                 .unwrap();
             assert_eq!(choice.finish_reason.as_deref(), Some(expected));
             assert_eq!(choice.message.tool_calls.as_ref().unwrap().len(), 1);
+        }
+    }
+
+    /// `parallel_tool_calls: false` returns the first of the calls a model
+    /// writes; unset or true, all of them.
+    #[tokio::test]
+    async fn parallel_tool_calls_false_returns_the_first_call() {
+        let call = |q: u32| {
+            format!(
+                "<tool_call>\n{{\"name\":\"user_tool\",\"arguments\":{{\"q\":{q}}}}}\n</tool_call>"
+            )
+        };
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
+            &format!("{}\n{}", call(1), call(2)),
+        ));
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for (parallel, calls) in [(None, 2), (Some(true), 2), (Some(false), 1)] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"test-model","messages":[{"role":"user","content":"call the tool"}],
+                "tools":[{"type":"function","function":{"name":"user_tool","parameters":{"type":"object","properties":{"q":{"type":"integer"}}}}}],
+                "parallel_tool_calls": parallel
+            })).unwrap();
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: "stop".into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let choice = processor
+                .process_single_choice(
+                    &complete,
+                    0,
+                    &ChatResponseSpec::from(&request),
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    false,
+                    true,
+                    None,
+                    Some("qwen"),
+                )
+                .await
+                .unwrap();
+            let got = choice.message.tool_calls.unwrap();
+            assert_eq!(got.len(), calls, "{parallel:?}");
+            assert_eq!(got[0].function.arguments.as_deref(), Some("{\"q\":1}"));
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
         }
     }
 }

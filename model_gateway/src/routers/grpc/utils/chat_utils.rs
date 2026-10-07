@@ -25,6 +25,7 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
+use tool_parser::types::ToolCallItem;
 use tracing::{debug, error};
 use uuid::Uuid;
 
@@ -716,6 +717,25 @@ pub fn create_stop_decoder(
     }
 
     builder.build()
+}
+
+/// With parallel tool calls turned off (`parallel_tool_calls: false`, or
+/// Messages `disable_parallel_tool_use: true`) a response returns only its
+/// first tool call; the calls a model writes after it are dropped.
+pub(crate) fn keep_first_tool_call(calls: &mut Option<Vec<ToolCall>>) {
+    if let Some(calls) = calls.as_mut().filter(|calls| calls.len() > 1) {
+        debug!(
+            dropped = calls.len() - 1,
+            "parallel tool calls are off: returning the first call"
+        );
+        calls.truncate(1);
+    }
+}
+
+/// The streamed form of [`keep_first_tool_call`]: keeps the parsed items of
+/// the first call (tool index 0) only.
+pub(crate) fn keep_first_tool_call_items(items: &mut Vec<ToolCallItem>) {
+    items.retain(|item| item.tool_index == 0);
 }
 
 /// Parse tool calls from JSON schema constrained response

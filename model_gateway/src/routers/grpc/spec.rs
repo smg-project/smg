@@ -72,6 +72,8 @@ pub(crate) struct ChatResponseSpec {
     pub thinking: Option<bool>,
     /// `continue_final_message` on a trailing assistant message.
     pub continues_final_assistant: bool,
+    /// `parallel_tool_calls: false`: only the first tool call is returned.
+    pub first_tool_call_only: bool,
     /// `n`, normalized.
     pub expected_choices: u32,
     pub logprobs: bool,
@@ -108,6 +110,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             reasoning_effort: request.effective_reasoning_effort().map(str::to_string),
             thinking: request.thinking_toggle(),
             continues_final_assistant: utils::continues_final_assistant(request),
+            first_tool_call_only: request.parallel_tool_calls == Some(false),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
             stop: request.stop.clone(),
@@ -164,6 +167,9 @@ pub(crate) struct MessagesResponseSpec {
     /// Messages tools pre-converted to Chat tools for parser reuse.
     pub chat_tools: Vec<Tool>,
     pub stop_sequences: Option<Vec<String>>,
+    /// `disable_parallel_tool_use: true`: only the first tool call is
+    /// returned.
+    pub first_tool_call_only: bool,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -181,6 +187,9 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .map(utils::message_utils::extract_chat_tools)
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
+            first_tool_call_only: utils::message_utils::disables_parallel_tool_use(
+                request.tool_choice.as_ref(),
+            ),
         }
     }
 }
