@@ -6,9 +6,10 @@
 //!
 //! - A **terminal** is a spelling the model writes, `<think>` or `</tool_call>`, named so that a
 //!   transition can speak of it. Token ids come in a later step; today a terminal is its text.
-//! - A **state** says what the text inside it is: content, reasoning, or a call's arguments. Text
-//!   in a content state is `Content`; in a reasoning state `Reasoning`; in an arguments state it
-//!   is fed to the call syntax's assembler and becomes the call's events.
+//! - A **state** says what the text inside it is: content, reasoning, a call's arguments, or the
+//!   template's wrapping between calls. Text in a content state is `Content`; in a reasoning
+//!   state `Reasoning`; in an arguments state it is fed to the call syntax's assembler and becomes
+//!   the call's events; in a wrapper state whitespace is dropped and anything else is malformed.
 //! - A **transition** `from + terminal = to` moves the engine between states when the terminal
 //!   arrives in `from`. A terminal with no transition from the current state is text, where the
 //!   model put it: `</think>` in content is content. Entering a reasoning state pushes
@@ -38,6 +39,11 @@ pub enum CallSyntax {
     /// `<function=NAME>` and then `<parameter=KEY>` around each value's text, typed by the
     /// request's tools, which reach the engine with the request: Qwen 3.5 and later, Qwen3-Coder.
     Tagged,
+    /// DeepSeek's DSML: the arguments state is one `<｜DSML｜ invoke name="…">` block, whose
+    /// parameter tags carry a `string` attribute that types each value. The terminal that enters
+    /// the state is the invoke tag's opening, and the one that leaves it is the invoke's closing
+    /// tag, which the call's end carries.
+    Dsml,
 }
 
 /// What the text inside a state is.
@@ -47,6 +53,9 @@ pub enum Emits {
     Reasoning,
     /// A call's arguments, assembled by the format's call syntax.
     Arguments,
+    /// The template's wrapping between calls: whitespace is `Dropped { Wrapper }`, anything else
+    /// `Malformed`.
+    Wrapper,
 }
 
 /// One format's table. Built with [`Format::new`] and the methods that add a row each; the

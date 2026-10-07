@@ -608,7 +608,7 @@ impl Assembler {
 }
 
 /// Appends `text` as a JSON string, quotes included.
-fn push_quoted(out: &mut String, text: &str) {
+pub(crate) fn push_quoted(out: &mut String, text: &str) {
     out.push('"');
     push_escaped(out, text);
     out.push('"');
@@ -616,7 +616,7 @@ fn push_quoted(out: &mut String, text: &str) {
 
 /// Appends `text` as the inside of a JSON string, escaped as `serde_json` escapes it: the quote,
 /// the backslash and the control characters, nothing else.
-fn push_escaped(out: &mut String, text: &str) {
+pub(crate) fn push_escaped(out: &mut String, text: &str) {
     for c in text.chars() {
         match c {
             '"' => out.push_str("\\\""),

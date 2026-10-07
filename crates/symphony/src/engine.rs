@@ -68,6 +68,7 @@ pub(crate) const BLOCK_WITHOUT_A_COMPLETE_CALL: &str =
     "a tool-call block that closed without a complete call";
 pub(crate) const TEXT_AFTER_THE_OBJECT: &str =
     "text between a call's object and its closing marker";
+const TEXT_BETWEEN_CALLS: &str = "text between a block's calls";
 
 /// Why a call region closed: its closing terminal (or the next opener) arrived, or the stream
 /// ended.
@@ -98,6 +99,7 @@ pub struct Engine {
 enum Call {
     Json(json::Assembler),
     Tagged(tagged::Assembler),
+    Dsml(tagged::dsml::Assembler),
 }
 
 impl Call {
@@ -108,6 +110,7 @@ impl Call {
             // with an arguments state and no call syntax. The arm keeps the match total.
             Some(CallSyntax::Json) | None => Self::Json(json::Assembler::new(index, id)),
             Some(CallSyntax::Tagged) => Self::Tagged(tagged::Assembler::new(index, id)),
+            Some(CallSyntax::Dsml) => Self::Dsml(tagged::dsml::Assembler::new(index, id)),
         }
     }
 
@@ -115,6 +118,10 @@ impl Call {
         match self {
             Self::Json(assembler) => assembler.feed(text, out),
             Self::Tagged(assembler) => assembler.feed(text, declared, out),
+            Self::Dsml(assembler) => {
+                assembler.feed(text, out);
+                text.len()
+            }
         }
     }
 
@@ -122,18 +129,27 @@ impl Call {
         match self {
             Self::Json(assembler) => assembler.started(),
             Self::Tagged(assembler) => assembler.started(),
+            Self::Dsml(assembler) => assembler.started(),
         }
     }
 
-    /// Ends the call the way the region closed: the JSON assembler has one ending, and the engine
-    /// names a block its terminal closed (`close_call`); the tagged one closes the call for the
-    /// client when the block ended, and leaves it open when the stream was cut.
-    fn end(self, closed: Closed, out: &mut Events) {
+    /// Ends the call the way the region closed, and says whether the terminal that closed it was
+    /// taken as the call's end. The JSON assembler has one ending, and the engine names a block its
+    /// terminal closed (`close_call`); the Qwen tagged one closes the call for the client when the
+    /// block ended, and leaves it open when the stream was cut; the DSML one takes the invoke's
+    /// closing tag as `ToolCallEnd`'s bytes.
+    fn end(self, closed: Closed, terminal: &str, out: &mut Events) -> bool {
         match (self, closed) {
             (Self::Json(assembler), _) => assembler.finish(out),
             (Self::Tagged(assembler), Closed::ByMarker) => assembler.close(out),
             (Self::Tagged(assembler), Closed::ByEnd) => assembler.finish(out),
+            (Self::Dsml(assembler), Closed::ByMarker) => {
+                assembler.close(terminal, out);
+                return true;
+            }
+            (Self::Dsml(assembler), Closed::ByEnd) => assembler.finish(out),
         }
+        false
     }
 }
 
@@ -211,15 +227,17 @@ impl Engine {
                 for event in assembled.drain() {
                     out.push(self.tokens.relabel(event));
                 }
-                self.surplus(&text[taken..], out);
+                self.wrapping(&text[taken..], TEXT_AFTER_THE_OBJECT, out);
             }
+            Emits::Wrapper => self.wrapping(text, TEXT_BETWEEN_CALLS, out),
         }
     }
 
-    /// Text after a call and before its closing terminal: each run of whitespace is the template's
-    /// wrapping and is dropped, each run of anything else is malformed. Classifying run by run
-    /// keeps the result the same wherever the chunks were cut.
-    fn surplus(&mut self, surplus: &str, out: &mut Events) {
+    /// Text where the template only wraps: after a call and before its closing terminal, or
+    /// between a block's calls. Each run of whitespace is the template's and is dropped, each run
+    /// of anything else is malformed with `why`. Classifying run by run keeps the result the same
+    /// wherever the chunks were cut.
+    fn wrapping(&mut self, surplus: &str, why: &str, out: &mut Events) {
         let mut rest = surplus;
         while let Some(first) = rest.chars().next() {
             let space = first.is_whitespace();
@@ -236,7 +254,7 @@ impl Engine {
             } else {
                 Event::Malformed {
                     text: run,
-                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
+                    why: MalformedReason::Other(why.to_string()),
                 }
             });
             rest = &rest[length..];
@@ -252,14 +270,16 @@ impl Engine {
         };
         // The call's remaining events come before the terminal that closed it, so the events'
         // bytes stay in the output's order; a new call before the previous one closed finishes
-        // what arrived, then starts.
-        if self.emits() == Emits::Arguments {
-            self.close_call(Closed::ByMarker, out);
+        // what arrived, then starts. A call syntax may take the terminal as the call's end.
+        let terminal = self.format.terminal_text(index).to_string();
+        let taken =
+            self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
+        if !taken {
+            out.push(Event::Dropped {
+                text: self.tokens.text(&terminal),
+                why: DropReason::Wrapper,
+            });
         }
-        out.push(Event::Dropped {
-            text: self.tokens.text(self.format.terminal_text(index)),
-            why: DropReason::Wrapper,
-        });
         self.enter(next, out);
     }
 
@@ -284,18 +304,19 @@ impl Engine {
         self.call = Some(Call::new(self.format.call_syntax().copied(), self.calls));
     }
 
-    /// Ends the call region: the assembler closes what arrived. A region its terminal closed
-    /// reports leftover bytes as a block without a complete call; `UnterminatedRegion` is kept for
-    /// a region the end of the stream cut.
-    fn close_call(&mut self, closed: Closed, out: &mut Events) {
+    /// Ends the call region: the assembler closes what arrived, and the result says whether it took
+    /// `terminal`, the bytes that closed the region, as the call's end. A region its terminal
+    /// closed reports leftover bytes as a block without a complete call; `UnterminatedRegion` is
+    /// kept for a region the end of the stream cut.
+    fn close_call(&mut self, closed: Closed, terminal: &str, out: &mut Events) -> bool {
         let Some(call) = self.call.take() else {
-            return;
+            return false;
         };
         if call.started() {
             self.calls += 1;
         }
         let mut finished = Events::new();
-        call.end(closed, &mut finished);
+        let taken = call.end(closed, terminal, &mut finished);
         for event in finished.drain() {
             let event = match event {
                 Event::Malformed {
@@ -309,6 +330,7 @@ impl Engine {
             };
             out.push(self.tokens.relabel(event));
         }
+        taken
     }
 
     /// Where the prompt leaves the engine: its terminals replayed over the table from the initial
@@ -348,8 +370,10 @@ impl Engine {
         }
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
-            Emits::Arguments => self.close_call(Closed::ByEnd, out),
-            Emits::Content => {}
+            Emits::Arguments => {
+                self.close_call(Closed::ByEnd, "", out);
+            }
+            Emits::Content | Emits::Wrapper => {}
         }
         self.state = 0;
         self.tokens.finish(out);

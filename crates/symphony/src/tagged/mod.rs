@@ -7,10 +7,12 @@
 //! passed through: the model writes no JSON object, so the parser writes one, and it has to decide
 //! what type each value's text is.
 //!
-//! [`value`] is that decision; [`assembler`] turns one call's tags into its events, streaming a
-//! declared string as it arrives and writing every other value at its close.
+//! [`value`] is that decision; [`assembler`] turns one Qwen call's tags into its events,
+//! streaming a declared string as it arrives and writing every other value at its close; [`dsml`]
+//! does the same for one DeepSeek DSML invoke, whose `string` attribute types each value.
 
 pub mod assembler;
+pub mod dsml;
 pub mod value;
 
 pub use assembler::Assembler;
