@@ -22,6 +22,7 @@ use openai_protocol::{
     messages::CreateMessageRequest,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use smg_external_router::header_utils::insert_routed_worker_id;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::error;
 
@@ -620,7 +621,7 @@ impl RequestPipeline {
                             attempt_start.elapsed(),
                         );
                     }
-                    return Ok(RunOutcome::Early(response));
+                    return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
                 }
                 Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
                 Err(response) => response,
@@ -661,6 +662,18 @@ impl RequestPipeline {
             tokio::time::sleep(delay).await;
             attempt = next_attempt;
         }
+    }
+
+    /// Attribute a response to the worker from the successful dispatch attempt.
+    fn routed_response(ctx: &DispatchContext, mut response: Response) -> Response {
+        if let Some(workers) = ctx.workers.as_ref() {
+            let worker = match workers {
+                WorkerSelection::Single { worker } => worker,
+                WorkerSelection::Disaggregated { decode, .. } => decode,
+            };
+            insert_routed_worker_id(response.headers_mut(), worker.url());
+        }
+        response
     }
 
     fn record_error(&self, endpoint: Option<&'static str>, model: &str, response: &Response) {
@@ -846,7 +859,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_chat",
@@ -893,7 +906,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -937,7 +950,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_completion",
@@ -980,7 +993,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_messages",
@@ -1013,7 +1026,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Embedding(response)) => {
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_embeddings",
@@ -1050,7 +1063,10 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Transcription { text, format }) => {
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    super::regular::stages::transcription::render(format, text)
+                    Self::routed_response(
+                        &dctx,
+                        super::regular::stages::transcription::render(format, text),
+                    )
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_transcription",
@@ -1085,7 +1101,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Classify(response)) => {
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_classify",
@@ -1858,6 +1874,7 @@ mod request_release_tests {
         pipeline: RequestPipeline,
         components: Arc<SharedComponents>,
         request: Arc<CompletionRequest>,
+        worker_url: &str,
     ) -> bytes::Bytes {
         let response = pipeline
             .execute_completion(
@@ -1871,6 +1888,7 @@ mod request_release_tests {
             )
             .await;
         assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers()["x-smg-routed-worker-id"], worker_url);
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("drain SSE body")
@@ -1895,7 +1913,13 @@ mod request_release_tests {
         let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
         let components = components(worker_registry).await;
 
-        let body = run_and_drain(pipeline, components, request).await;
+        let body = run_and_drain(
+            pipeline,
+            components,
+            request,
+            &format!("grpc://127.0.0.1:{port}"),
+        )
+        .await;
 
         assert!(
             released.load(Ordering::SeqCst),
@@ -1925,7 +1949,13 @@ mod request_release_tests {
         let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
         let components = components(worker_registry).await;
 
-        let body = run_and_drain(pipeline, components, request).await;
+        let body = run_and_drain(
+            pipeline,
+            components,
+            request,
+            &format!("grpc://127.0.0.1:{decode_port}"),
+        )
+        .await;
 
         assert!(
             released.load(Ordering::SeqCst),
@@ -1969,6 +1999,10 @@ mod request_release_tests {
             .await;
 
         assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-smg-routed-worker-id"],
+            format!("grpc://127.0.0.1:{port}")
+        );
         assert!(
             released.load(Ordering::SeqCst),
             "the parsed request must be freed before the upstream answers"
@@ -2009,6 +2043,10 @@ mod request_release_tests {
             .await;
 
         assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-smg-routed-worker-id"],
+            format!("grpc://127.0.0.1:{decode_port}")
+        );
         assert!(
             released.load(Ordering::SeqCst),
             "the parsed request must be freed before the decode leg answers"
