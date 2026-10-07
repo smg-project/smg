@@ -867,6 +867,7 @@ fn parity(
     };
     let mut failures = Vec::new();
     let (mut bitwise, mut separators_only, mut listed, mut allowed_count) = (0, 0, 0, 0);
+    let (mut token_plans_run, mut without_pieces) = (0, 0);
     for fixture in fixtures {
         let text = fixture.reference.text.as_str();
         let expected = Said::of_reference(&fixture.reference);
@@ -899,8 +900,35 @@ fn parity(
                 ));
             }
         }
-        if let Some(pieces) = fixture.output_pieces.as_deref() {
+        // The token plans need the pieces bellwether records with the case: one per id, giving
+        // back the text. A case that lacks them is counted, and one whose pieces are wrong is a
+        // failure of the fixture, not of the parser.
+        let pieces = match fixture.output_pieces.as_deref() {
+            None => {
+                without_pieces += 1;
+                None
+            }
+            Some(pieces) if pieces.len() != fixture.output_ids.len() => {
+                failures.push(format!(
+                    "{}: {} output_pieces for {} output_ids",
+                    fixture.id,
+                    pieces.len(),
+                    fixture.output_ids.len()
+                ));
+                None
+            }
+            Some(pieces) if pieces.concat() != text => {
+                failures.push(format!(
+                    "{}: the output_pieces do not give back the text",
+                    fixture.id
+                ));
+                None
+            }
+            Some(pieces) => Some(pieces),
+        };
+        if let Some(pieces) = pieces {
             for (name, sizes) in token_plans(fixture) {
+                token_plans_run += 1;
                 let plan = format!("token plan {name}");
                 let events = replay_tokens(
                     &mut new_parser(fixture),
@@ -984,7 +1012,8 @@ fn parity(
     }
     println!(
         "{} cases: {bitwise} bitwise, {separators_only} separators only, {listed} listed, \
-         {allowed_count} allowed for the corpus",
+         {allowed_count} allowed for the corpus; {token_plans_run} token plans replayed, \
+         {without_pieces} cases without output_pieces",
         fixtures.len()
     );
     failures
