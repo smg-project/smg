@@ -194,8 +194,9 @@ impl Declared {
 
 /// The schema one level below `schema` at `segment`: an array's items, or an object's property
 /// `segment`. A schema that admits the array or the object through `anyOf` or `oneOf` (Pydantic
-/// writes `Optional[List[T]]` and `Optional[Model]` so) is looked into for the member that has
-/// the items or the properties, since the wrapper itself has neither.
+/// writes `Optional[List[T]]` so, with the array inline) is looked into for the member that has
+/// the items or the properties, since the wrapper itself has neither. A member that is a `$ref`
+/// into the schema's `$defs` (Pydantic's `Optional[Model]`) is not followed yet.
 fn below<'a>(schema: &'a Value, segment: &str) -> Option<&'a Value> {
     let mut admitted = Vec::new();
     admitted_types(schema, &mut admitted);

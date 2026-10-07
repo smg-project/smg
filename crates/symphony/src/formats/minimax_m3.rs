@@ -680,8 +680,10 @@ mod tests {
 
     #[test]
     fn a_leaf_below_a_nullable_list_or_object_keeps_its_declared_type() {
-        // Pydantic writes `Optional[List[str]]` as an `anyOf` around the array; the items' type
-        // reaches the leaves below it, so a numeric-looking string stays a string.
+        // Pydantic writes `Optional[List[str]]` as an `anyOf` around the inline array; the items'
+        // type reaches the leaves below it, so a numeric-looking string stays a string. The
+        // object is written inline here too (Pydantic refers to a model through `$defs`, which
+        // the descent does not follow yet).
         let output = concat!(
             "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"f\">",
             "]<]minimax[>[<tags>]<]minimax[>[<item>01234]<]minimax[>[</item>]<]minimax[>[</tags>",
