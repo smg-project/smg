@@ -316,15 +316,18 @@ pub(crate) async fn execute_plan(
     let request_type = execution_plan.request_type();
     let mode = execution_plan.mode_label();
     if cache_trace::enabled() {
-        let engine_ids = execution_plan
+        let mut engine_ids: Vec<_> = execution_plan
             .generate_requests_mut()
-            .take(32)
+            .take(33)
             .map(|request| request.request_id().to_owned())
             .collect();
+        let engine_ids_complete = !engine_ids.is_empty() && engine_ids.len() <= 32;
+        engine_ids.truncate(32);
         ctx.cache_trace = cache_trace::dispatch(
             ctx.root_request_id.as_deref(),
             ctx.attempt,
             engine_ids,
+            engine_ids_complete,
             mode,
         );
     }

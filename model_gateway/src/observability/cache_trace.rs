@@ -27,6 +27,21 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("SMG_CACHE_TRACE").is_ok_and(|v| v == "1"))
 }
 
+fn header_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1"))
+}
+
+pub(crate) fn begin_selection() {
+    if enabled() {
+        let _ = CAPTURE.try_with(|capture| {
+            let mut capture = capture.borrow_mut();
+            capture.prediction = Value::Null;
+            capture.gates.clear();
+        });
+    }
+}
+
 pub(crate) async fn scope<F: Future>(future: F) -> F::Output {
     if enabled() {
         CAPTURE
@@ -93,6 +108,7 @@ pub(crate) fn dispatch(
     root_id: Option<&str>,
     attempt: u32,
     engine_ids: Vec<String>,
+    engine_ids_complete: bool,
     mode: &str,
 ) -> Option<String> {
     if !enabled() {
@@ -103,14 +119,45 @@ pub(crate) fn dispatch(
         let value = json!({
             "schema": 1, "root_id": root_id, "dispatch_id": uuid::Uuid::now_v7().to_string(),
             "attempt": attempt, "engine_ids": engine_ids, "mode": mode,
-            "engine_ids_complete": engine_ids.len() < 32,
+            "engine_ids_complete": engine_ids_complete,
             "selections": std::mem::take(&mut capture.selections), "truncated": std::mem::take(&mut capture.truncated),
+            "unattributed_gates": std::mem::take(&mut capture.gates),
+            "unattributed_prediction": std::mem::take(&mut capture.prediction),
             "cache_evidence": "unknown",
         });
         let encoded = value.to_string();
         tracing::info!(target: "smg::cache_trace", evidence = %encoded, "Cache routing dispatch");
-        (encoded.len() <= 16384).then_some(encoded)
+        if header_enabled() {
+            let header = gateway_header(&value);
+            if header.is_none() {
+                tracing::info!(target: "smg::cache_trace", "Cache trace header omitted: size or encoding limit");
+            }
+            header
+        } else {
+            None
+        }
     }).ok().flatten()
+}
+
+fn gateway_header(value: &Value) -> Option<String> {
+    let selections: Vec<_> = value["selections"]
+        .as_array()?
+        .iter()
+        .map(|selection| {
+            json!({
+                "policy": selection["policy"], "origin": selection["origin"],
+                "prediction": selection["prediction"],
+            })
+        })
+        .collect();
+    let header = json!({
+        "schema": value["schema"], "root_id": value["root_id"],
+        "dispatch_id": value["dispatch_id"], "attempt": value["attempt"],
+        "engine_ids": value["engine_ids"], "engine_ids_complete": value["engine_ids_complete"],
+        "selections": selections, "truncated": value["truncated"],
+    })
+    .to_string();
+    (header.len() <= 2048 && header.is_ascii()).then_some(header)
 }
 
 pub(crate) fn failure(root_id: Option<&str>, status: u16) {
@@ -122,5 +169,30 @@ pub(crate) fn failure(root_id: Option<&str>, status: u16) {
                 "truncated": capture.truncated});
             tracing::info!(target: "smg::cache_trace", evidence = %evidence, "Cache routing failure");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_header_keeps_join_fields_without_candidate_state() {
+        let mut evidence = json!({
+            "schema": 1, "root_id": "root", "dispatch_id": "dispatch", "attempt": 1,
+            "engine_ids": ["engine"], "engine_ids_complete": true, "truncated": false,
+            "selections": [{"policy": "cache_aware", "origin": "policy",
+                "prediction": {"source": "approximate_tree"},
+                "worker": "selected-worker", "candidates": [{"worker": "candidate-worker", "load": 99}],
+                "gates": [{"spill": true}]}],
+        });
+        let encoded = gateway_header(&evidence).unwrap();
+        assert!(!encoded.contains("worker"));
+        assert!(!encoded.contains("gates"));
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded["engine_ids"], json!(["engine"]));
+        assert_eq!(decoded["attempt"], 1);
+        evidence["root_id"] = Value::String("x".repeat(2049));
+        assert!(gateway_header(&evidence).is_none());
     }
 }
