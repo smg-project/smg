@@ -419,19 +419,23 @@ impl Literal<'_> {
         Some(())
     }
 
+    /// A list or a tuple. A parenthesis around one item with no comma is grouping, as Python
+    /// reads it: `(1)` is `1`, and only `(1,)` is a tuple.
     fn sequence(&mut self, open: u8, close: u8) -> Option<()> {
         self.eat(open).then_some(())?;
+        let bracket = self.out.len();
         self.out.push('[');
-        let mut first = true;
+        let mut items = 0;
+        let mut comma = false;
         loop {
             self.skip_space();
             if self.eat(close) {
                 break;
             }
-            if !first {
+            if items > 0 {
                 self.out.push_str(", ");
             }
-            first = false;
+            items += 1;
             self.value()?;
             self.skip_space();
             if !self.eat(b',') {
@@ -439,8 +443,13 @@ impl Literal<'_> {
                 self.eat(close).then_some(())?;
                 break;
             }
+            comma = true;
         }
-        self.out.push(']');
+        if open == b'(' && items == 1 && !comma {
+            self.out.remove(bracket);
+        } else {
+            self.out.push(']');
+        }
         Some(())
     }
 
@@ -874,6 +883,12 @@ mod tests {
             ("[]", "[]"),
             ("{}", "{}"),
             ("(1, 2)", "[1, 2]"),
+            ("()", "[]"),
+            // A parenthesis around one item is grouping, not a tuple.
+            ("(1)", "1"),
+            ("('a')", "\"a\""),
+            ("((1))", "1"),
+            ("{'x': (1), 'y': (1,)}", "{\"x\": 1, \"y\": [1]}"),
             ("('solo',)", r#"["solo"]"#),
             (
                 "{'a': None, 'b': True, 'c': False}",
@@ -913,11 +928,14 @@ mod tests {
         ] {
             assert_eq!(json(&text, None), string(&text), "{} bytes", text.len());
         }
-        // Well inside the limit, a literal still reads. Tuples are not JSON, so this goes through
+        // Well inside the limit, a literal still reads. `None` is not JSON, so this goes through
         // the Python reader; serde_json counts the arguments object around the value too, so the
         // read-back refuses a little before the reader's own limit would.
-        let nested = "(".repeat(100) + &")".repeat(100);
-        assert_eq!(json(&nested, None), "[".repeat(100) + &"]".repeat(100));
+        let nested = "[".repeat(100) + "None" + &"]".repeat(100);
+        assert_eq!(
+            json(&nested, None),
+            "[".repeat(100) + "null" + &"]".repeat(100)
+        );
     }
 
     #[test]
