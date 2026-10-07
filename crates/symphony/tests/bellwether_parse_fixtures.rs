@@ -51,7 +51,8 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, hy4, iquest, lfm2_5, ling, minimax_m3, olmo3, qwen2_5, qwen3, seed_oss, xlam,
+        deepseek_v4_1, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, qwen2_5, qwen3,
+        seed_oss, xlam,
     },
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
@@ -264,6 +265,14 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::DeepSeekV4_1,
         GenerationPrompt::OpensTheThought,
     ),
+    // Kimi K3 writes XTML and opens the thought in the prompt, whatever the request says: its
+    // recorded requests carry no switch. The shared tail adds a newline the template does not
+    // write; it is prompt text inside the thought and moves nothing.
+    (
+        "kimi-k3",
+        Family::KimiK3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
     // Other families that write Qwen's syntaxes, each as its own template spells the thought.
     (
         "webworld-32b",
@@ -386,6 +395,8 @@ enum Family {
     Xlam,
     /// [`minimax_m3`]: an XML tree of arguments, typed by the request tools at every depth.
     MinimaxM3,
+    /// [`kimi_k3`]: XTML, whose argument tags name their own values' types.
+    KimiK3,
 }
 
 impl Family {
@@ -396,6 +407,7 @@ impl Family {
             Self::SeedOss => ("<seed:think>", "</seed:think>"),
             Self::Hy4 => ("<think:opensource>", "</think:opensource>"),
             Self::MinimaxM3 => ("<mm:think>", "</mm:think>"),
+            Self::KimiK3 => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
             _ => ("<think>", "</think>"),
         }
     }
@@ -424,6 +436,7 @@ impl Family {
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
             Self::MinimaxM3 => minimax_m3(),
+            Self::KimiK3 => kimi_k3(),
         }
     }
 
@@ -434,10 +447,10 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4, Olmo 3 and xLAM read neither of the probes' Qwen markers: `</think>`
-            // stays reasoning text and the fenced `<tool_call>` block stays content, as the
-            // reference says.
-            Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam => &[],
+            // Seed-OSS, Hy4, Olmo 3, xLAM and Kimi K3 read neither of the probes' Qwen markers:
+            // `</think>` stays reasoning text and the fenced `<tool_call>` block stays content, as
+            // the reference says.
+            Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam | Self::KimiK3 => &[],
             // Ling reads `<tool_call>` and `</think>`, so its two probes are the tagged ones'
             // (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>` but not
             // `<tool_call>`.

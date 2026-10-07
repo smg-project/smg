@@ -154,6 +154,10 @@ fn minimax_m3() -> Box<dyn Parser> {
     ))
 }
 
+fn kimi_k3() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::kimi_k3(), Declared::default()))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -215,6 +219,11 @@ const FORMATS: &[Subject] = &[
         new: minimax_m3,
         outputs: M3_OUTPUTS,
     },
+    Subject {
+        name: "kimi k3",
+        new: kimi_k3,
+        outputs: KIMI_K3_OUTPUTS,
+    },
 ];
 
 /// MiniMax M3's syntax: the recorded shape with its separators, the tree's shapes, cut streams,
@@ -252,6 +261,83 @@ const M3_OUTPUTS: &[&str] = &[
     "</mm:think>Hello, no call.]<]minimax[>[ And a stray separator.",
     "Plain prose with no marker at all.",
     "<mm:think>Only a thought.",
+    "",
+];
+
+/// Kimi K3's syntax: the recorded shape, a thought with text, every value type, calls ended every
+/// way the table has, a tag the syntax lacks, a call without its index, and text where tags should
+/// be. The contract feeds no prompt, so each entry opens its thought itself, as the template's
+/// generation prompt does, and the rows that leave the thought are exercised, two of them by a
+/// region opened inside the thought.
+const KIMI_K3_OUTPUTS: &[&str] = &[
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"ChaDri_change_drink\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"drink_id\" type=\"string\"<|sep|>latte<|close|>argument<|sep|>\
+     <|open|>argument key=\"new_preferences\" type=\"object\"<|sep|>\
+     {\"size\": \"large\", \"temperature\": \"hot\"}<|close|>argument<|sep|>\
+     <|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
+    "<|open|>think<|sep|>Janet sells 9 eggs.\nShe makes $18.<|close|>think<|sep|>\
+     <|open|>response<|sep|>18<|close|>response<|sep|><|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|>\
+     <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"s\" type=\"string\"<|sep|>a \"quoted\" line\nand a \\ backslash\
+     <|close|>argument<|sep|>\
+     <|open|>argument key=\"n\" type=\"number\"<|sep|>1.5<|close|>argument<|sep|>\
+     <|open|>argument key=\"b\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|>\
+     <|open|>argument key=\"z\" type=\"null\"<|sep|>null<|close|>argument<|sep|>\
+     <|open|>argument key=\"a\" type=\"array\"<|sep|>[1, \"x\"]<|close|>argument<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>{\"k\": null}<|close|>argument<|sep|>\
+     <|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"a\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|>\
+     <|close|>call<|sep|><|open|>call tool=\"g\" index=\"2\"<|sep|>\
+     <|open|>call tool=\"h\" index=\"3\"<|sep|>\
+     <|open|>argument key=\"b\" type=\"string\"<|sep|>x<|close|>tools<|sep|>\
+     <|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>tools<|sep|><|open|>call tool=\"f\"<|sep|>\
+     <|open|>argument key=\"a\" type=\"number\"<|sep|>1<|close|>argument<|sep|>\
+     <|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"x\"<|sep|>\
+     <|open|>argument key=\"a\" type=\"date\"<|sep|>2026<|close|>argument<|sep|>\
+     <|open|>argument key=\"b\" type=\"number\"<|sep|>2<|close|>argument<|sep|>\
+     <|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"city\" type=\"string\"<|sep|>Par",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"n\" type=\"number\"<|sep|>12",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"a\" type=\"null\"<|sep|>null<|close|>argument<|sep|>\
+     <|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|>Hi<|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|>\
+     <|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>tools<|sep|><|open|>call tool=\"<|close|>tools<|sep|>\
+     <|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>tools<|sep|>prose where a call should be<|close|>tools<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     \nHello<|open|>response<|sep|>Hi<|close|>response<|sep|>\
+     <|close|>message<|sep|>",
+    "<|open|>think<|sep|>A thought cut by the end of the turn.\
+     <|close|>message<|sep|>",
+    "<|close|>message<|sep|>",
+    "<|open|>think<|sep|>A plan.<|open|>response<|sep|>Hi<|close|>response<|sep|>\
+     <|close|>message<|sep|>",
+    "<|open|>think<|sep|>A plan.<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"a\" type=\"string\"<|sep|>x<|close|>argument<|sep|><|close|>call<|sep|>\
+     <|close|>tools<|sep|><|close|>message<|sep|>",
+    "<|open|>think<|sep|>Only a thought.",
+    "Plain prose with no marker at all.",
     "",
 ];
 

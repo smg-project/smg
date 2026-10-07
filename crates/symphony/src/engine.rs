@@ -108,6 +108,7 @@ enum Call {
     Pythonic(pythonic::Assembler),
     JsonList(json::list::Assembler),
     Xml(tagged::xml::Assembler),
+    Xtml(tagged::xtml::Assembler),
 }
 
 impl Call {
@@ -125,6 +126,7 @@ impl Call {
             Some(CallSyntax::Pythonic) => Self::Pythonic(pythonic::Assembler::new(index)),
             Some(CallSyntax::JsonList) => Self::JsonList(json::list::Assembler::new(index)),
             Some(CallSyntax::Xml) => Self::Xml(tagged::xml::Assembler::new(index, id)),
+            Some(CallSyntax::Xtml) => Self::Xtml(tagged::xtml::Assembler::new(index, id)),
         }
     }
 
@@ -150,6 +152,10 @@ impl Call {
             }
             Self::Xml(assembler) => {
                 assembler.feed(text, declared, out);
+                text.len()
+            }
+            Self::Xtml(assembler) => {
+                assembler.feed(text, out);
                 text.len()
             }
         }
@@ -211,6 +217,15 @@ impl Call {
             }
             (Self::Xml(assembler), Closed::ByMarker) => assembler.close("", out),
             (Self::Xml(assembler), Closed::ByEnd) => assembler.finish(out),
+            // And for Kimi K3: only the call's closing tag is a started call's end.
+            (Self::Xtml(assembler), Closed::ByMarker)
+                if terminal == tagged::xtml::CALL_CLOSE || !assembler.started() =>
+            {
+                assembler.close(terminal, out);
+                return true;
+            }
+            (Self::Xtml(assembler), Closed::ByMarker) => assembler.close("", out),
+            (Self::Xtml(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }

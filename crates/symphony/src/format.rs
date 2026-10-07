@@ -67,6 +67,11 @@ pub enum CallSyntax {
     /// tools at every depth: MiniMax M3. The terminal that enters the state is the invoke tag's
     /// opening, and the one that leaves it is `</invoke>`, which the call's end carries.
     Xml,
+    /// Kimi K3's XTML: the arguments state is one `<|open|>call tool="…" index="N"<|sep|>` block,
+    /// whose argument tags carry a `type` attribute that types each value (`string`, `number`,
+    /// `boolean`, `null`, `array`, `object`). The terminal that enters the state is the call tag's
+    /// opening, and the one that leaves it is `<|close|>call<|sep|>`, which the call's end carries.
+    Xtml,
 }
 
 /// What the text inside a state is.

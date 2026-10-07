@@ -10,7 +10,9 @@
 //! call as its name and keyed arguments, each under its own markers. [`olmo3()`] and [`lfm2_5()`]
 //! write their calls as Python. [`xlam()`] is a bare JSON list of calls, or content.
 //! [`minimax_m3()`] is MiniMax M3: `<mm:think>` blocks, `<tool_call>` blocks of `invoke` blocks
-//! whose arguments are an XML tree, and a separator token the table ignores.
+//! whose arguments are an XML tree, and a separator token the table ignores. [`kimi_k3()`] is
+//! Kimi K3: a turn of tagged regions, `think`, `response` and `tools`, the last holding `call`
+//! blocks whose argument tags name each value's type.
 //!
 //! [`Format`]: crate::Format
 //! [`Engine`]: crate::Engine
@@ -18,6 +20,7 @@
 pub mod deepseek_v4_1;
 pub mod hy4;
 pub mod iquest;
+pub mod kimi_k3;
 pub mod lfm2_5;
 pub mod ling;
 pub mod minimax_m3;
@@ -30,6 +33,7 @@ pub mod xlam;
 pub use deepseek_v4_1::deepseek_v4_1;
 pub use hy4::hy4;
 pub use iquest::iquest;
+pub use kimi_k3::kimi_k3;
 pub use lfm2_5::lfm2_5;
 pub use ling::ling;
 pub use minimax_m3::minimax_m3;
