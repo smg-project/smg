@@ -51,6 +51,10 @@ pub enum CallSyntax {
     /// enter and leave the state are the call's own markers, and the call's end carries the
     /// closing one.
     Keyed(keyed::Tags),
+    /// Python calls, `name(key=value, ...)`, one or several, bare or in a list: Olmo 3, LFM2.5,
+    /// Llama 3.2's pythonic template. The region's markers are the terminals; each call ends at
+    /// its own `)`, and the region's closing marker is wrapping.
+    Pythonic,
 }
 
 /// What the text inside a state is.

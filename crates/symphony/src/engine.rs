@@ -60,6 +60,7 @@ use crate::{
     json,
     markers::{Piece, Scanner},
     parser::{ParseError, Parser},
+    pythonic,
     tagged::{self, Declared},
     tokens::Ledger,
 };
@@ -101,6 +102,7 @@ enum Call {
     Tagged(tagged::Assembler),
     Dsml(tagged::dsml::Assembler),
     Keyed(tagged::keyed::Assembler),
+    Pythonic(pythonic::Assembler),
 }
 
 impl Call {
@@ -115,6 +117,7 @@ impl Call {
             Some(CallSyntax::Keyed(tags)) => {
                 Self::Keyed(tagged::keyed::Assembler::new(index, id, tags))
             }
+            Some(CallSyntax::Pythonic) => Self::Pythonic(pythonic::Assembler::new(index)),
         }
     }
 
@@ -128,6 +131,10 @@ impl Call {
             }
             Self::Keyed(assembler) => {
                 assembler.feed(text, declared, out);
+                text.len()
+            }
+            Self::Pythonic(assembler) => {
+                assembler.feed(text, out);
                 text.len()
             }
         }
@@ -161,6 +168,9 @@ impl Call {
                 return true;
             }
             (Self::Keyed(assembler), Closed::ByEnd) => assembler.finish(out),
+            // The region's marker belongs to the region, not to its last call.
+            (Self::Pythonic(assembler), Closed::ByMarker) => assembler.close(out),
+            (Self::Pythonic(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }
