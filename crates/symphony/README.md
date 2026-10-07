@@ -7,8 +7,8 @@ given, each decoded delta, the end of the stream. Every byte of output lands in 
 including bytes that were dropped or could not be parsed.
 
 Status: the public types are the contract, the adapters render them for the Chat Completions,
-Responses and Messages APIs, and the engine runs a format table; the Qwen family's tables are in,
-and the other families follow one table each.
+Responses and Messages APIs, and the engine runs a format table; the tables under `formats` are
+the families recorded so far, and more follow.
 
 Why the crate has a name: the community has spent years on many parser implementations, and none
 of them is right the way we want it, SMG's own two crates included. Not right as working code;

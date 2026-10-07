@@ -22,7 +22,10 @@
 //!   `</think>\n\n`; the engine's prompt replay puts the output inside the thought first. The
 //!   turn opener is `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
 
-use crate::format::{CallSyntax, Emits, Format};
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    tagged::dsml,
+};
 
 /// The DeepSeek V4.1 table.
 pub fn deepseek_v4_1() -> Format {
@@ -32,7 +35,7 @@ pub fn deepseek_v4_1() -> Format {
         .terminal("calls_open", "<｜DSML｜ calls>")
         .terminal("calls_close", "</｜DSML｜ calls>")
         .terminal("invoke_open", "<｜DSML｜ invoke name=\"")
-        .terminal("invoke_close", "</｜DSML｜ invoke>")
+        .terminal("invoke_close", dsml::INVOKE_CLOSE)
         .state("content", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("calls", Emits::Wrapper)
@@ -356,6 +359,49 @@ mod tests {
             events[1],
             Event::Reasoning(Text::uncounted("The user asks about the tag."))
         );
+    }
+
+    #[test]
+    fn only_the_invokes_closing_tag_is_a_calls_end() {
+        // Three ways an invoke ends: its own closing tag, which the end carries; the next invoke's
+        // opening and the block's close, which the engine drops as the region's, so the end
+        // carries nothing.
+        let output = concat!(
+            "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n",
+            "<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ invoke name=\"h\">\n</｜DSML｜ calls>"
+        );
+        let events = run("<think>\n\n</think>\n\n", &[output]);
+        assert_eq!(bytes(&events), output);
+        let ends: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, ["</｜DSML｜ invoke>", "", ""]);
+        assert!(events.contains(&dropped("<｜DSML｜ invoke name=\"")));
+        assert!(events.contains(&dropped("</｜DSML｜ calls>")));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn a_tag_the_invokes_close_cut_short_inside_a_string_is_reported() {
+        let output = concat!(
+            "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
+            "<｜DSML｜ parameter name=\"a\" string=\"true\">x</｜DSML｜ par</｜DSML｜ invoke>\n",
+            "</｜DSML｜ calls>"
+        );
+        let events = run("<think>\n\n</think>\n\n", &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, .. } if text.text == "</｜DSML｜ par"
+        )));
     }
 
     #[test]

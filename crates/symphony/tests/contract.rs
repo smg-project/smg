@@ -123,6 +123,9 @@ const DSML_OUTPUTS: &[&str] = &[
      name=\"q\" string=\"true\">計画 🌍 \"q\" \\ </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n\
      </｜DSML｜ calls>",
     "<think>plan</think>Hello, no call.",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">x\
+     </｜DSML｜ par</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ invoke name=\"h\">\n\
+     </｜DSML｜ calls>",
     "<｜DSML｜ calls>\nprose where an invoke should be\n</｜DSML｜ calls>",
     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
 ];

@@ -137,16 +137,19 @@ impl Call {
     /// taken as the call's end. The JSON assembler has one ending, and the engine names a block its
     /// terminal closed (`close_call`); the Qwen tagged one closes the call for the client when the
     /// block ended, and leaves it open when the stream was cut; the DSML one takes the invoke's
-    /// closing tag as `ToolCallEnd`'s bytes.
+    /// closing tag, and only that terminal, as `ToolCallEnd`'s bytes.
     fn end(self, closed: Closed, terminal: &str, out: &mut Events) -> bool {
         match (self, closed) {
             (Self::Json(assembler), _) => assembler.finish(out),
             (Self::Tagged(assembler), Closed::ByMarker) => assembler.close(out),
             (Self::Tagged(assembler), Closed::ByEnd) => assembler.finish(out),
-            (Self::Dsml(assembler), Closed::ByMarker) => {
+            // Only the invoke's closing tag is the call's end; the next invoke's opening and the
+            // block's close end the call too, and the engine drops them as the region's.
+            (Self::Dsml(assembler), Closed::ByMarker) if terminal == tagged::dsml::INVOKE_CLOSE => {
                 assembler.close(terminal, out);
                 return true;
             }
+            (Self::Dsml(assembler), Closed::ByMarker) => assembler.close("", out),
             (Self::Dsml(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false

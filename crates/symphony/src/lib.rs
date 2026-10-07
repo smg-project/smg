@@ -18,7 +18,7 @@
 //!
 //! Status: the public types below are the contract, [`adapt`] renders them for the Chat
 //! Completions, Responses and Messages APIs, streamed and whole, and [`Engine`] runs a [`Format`]
-//! table: the Qwen family's tables are in, the other families follow one table each.
+//! table: the tables in [`formats`] are the families recorded so far, and more follow.
 
 #![forbid(unsafe_code)]
 
