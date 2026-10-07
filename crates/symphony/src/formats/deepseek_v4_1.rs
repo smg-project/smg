@@ -3,7 +3,7 @@
 //! `</｜DSML｜ invoke>`, everything else content. The design's section 4 example, as recorded for
 //! `deepseek-ai/DeepSeek-V4.1-Flash`.
 //!
-//! Three things are this table's own:
+//! What this table says beyond the Qwen ones:
 //!
 //! - **Two states for the calls.** `calls` is the template's wrapping between invokes (a newline,
 //!   dropped; anything else malformed), and `invoke` is one call's arguments, read by the DSML
@@ -11,14 +11,16 @@
 //!   calls, each with its own index, through the same two rows.
 //! - **The invoke tag's opening is the terminal** that enters the arguments state, so the
 //!   assembler starts inside the function's name; the closing tag is the terminal that leaves it,
-//!   and the call's end carries its bytes.
+//!   and the call's end carries its bytes. A second invoke before the first closed ends the first
+//!   and starts the second (`invoke + invoke_open = invoke`), and the block's close ends an invoke
+//!   still open (`invoke + calls_close = content`), so the call closes into an object and the
+//!   prose after the block stays prose.
+//! - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
+//!   and SMG's V4.1 reasoning parser have it; the recorded outputs close the thought first.
 //! - **The prompt opens the thought.** The template ends the generation prompt with `<think>`, and
 //!   an empty thought writes `</think>` at once, so most recorded outputs start with
-//!   `</think>\n\n`; the engine's prompt replay puts the output inside the thought first.
-//!
-//! No row leaves reasoning on `<｜DSML｜ calls>`: the recorded outputs close the thought before a
-//! call, and whether a call inside the thought should end it is a question for the fixtures to
-//! raise, not a row to add in advance.
+//!   `</think>\n\n`; the engine's prompt replay puts the output inside the thought first. The
+//!   turn opener is `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
 
 use crate::format::{CallSyntax, Emits, Format};
 
@@ -38,10 +40,14 @@ pub fn deepseek_v4_1() -> Format {
         .transition("content", "think_open", "reasoning")
         .transition("reasoning", "think_close", "content")
         .transition("content", "calls_open", "calls")
+        .transition("reasoning", "calls_open", "calls")
         .transition("calls", "invoke_open", "invoke")
         .transition("invoke", "invoke_close", "calls")
+        .transition("invoke", "invoke_open", "invoke")
+        .transition("invoke", "calls_close", "content")
         .transition("calls", "calls_close", "content")
         .calls(CallSyntax::Dsml)
+        .opens_turn("<｜Assistant｜>")
 }
 
 #[cfg(test)]
@@ -230,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_cut_inside_an_invoke_leaves_the_call_open_and_the_rest_malformed() {
+    fn a_stream_cut_inside_an_invoke_ends_the_call_with_its_arguments_cut() {
         let events = run(
             "<think>",
             &[concat!(
@@ -245,13 +251,108 @@ mod tests {
                 ..
             }
         )));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, Event::ToolCallEnd { .. })));
+        // The call ends, with no bytes of its own, as every assembler ends a started call at the
+        // end of the stream; its arguments stay cut, `{` without its `}`.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
+        )));
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+    }
+
+    #[test]
+    fn a_calls_block_inside_the_thought_ends_it_and_a_second_invoke_ends_the_first() {
+        let output = concat!(
+            "Let me call.<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
+            "<｜DSML｜ parameter name=\"a\" string=\"true\">x</｜DSML｜ parameter>\n",
+            "<｜DSML｜ invoke name=\"g\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+        );
+        let events = run("<think>", &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            events[..4],
+            [
+                Event::ReasoningStart,
+                Event::Reasoning(Text::uncounted("Let me call.")),
+                dropped("<｜DSML｜ calls>"),
+                Event::ReasoningEnd,
+            ]
+        );
+        assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
+        assert_eq!(arguments_of(&events, 1), "{}");
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn the_blocks_close_ends_an_invoke_left_open_and_the_prose_after_it_stays() {
+        let output = concat!(
+            "</think>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
+            "<｜DSML｜ parameter name=\"a\" string=\"true\">x</｜DSML｜ parameter>\n",
+            "</｜DSML｜ calls>\nThe weather is sunny."
+        );
+        let events = run("<think>", &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
+        let content: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // The newline after `</think>` is content too.
+        assert_eq!(content, "\n\nThe weather is sunny.");
+    }
+
+    #[test]
+    fn a_missing_quote_on_the_name_starts_no_call_and_the_next_invoke_takes_index_zero() {
+        let output = concat!(
+            "</think>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f>\n",
+            "<｜DSML｜ parameter name=\"b\" string=\"true\">y</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+        );
+        let events = run("<think>", &[output]);
+        assert_eq!(bytes(&events), output);
+        let starts: Vec<(u32, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { index, name, .. } => Some((*index, name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, [(0, "g")]);
+        // No fragment before the start: everything of the unnamed invoke is reported.
+        let first_start = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallStart { .. }))
+            .expect("g starts");
+        assert!(!events[..first_start]
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallArguments { .. })));
+        assert_eq!(arguments_of(&events, 0), "{}");
+    }
+
+    #[test]
+    fn a_marker_quoted_in_an_earlier_turn_moves_nothing() {
+        let prompt = concat!(
+            "<｜User｜>Why did you write <｜DSML｜ calls> and <｜DSML｜ invoke name=\" there?",
+            "<｜Assistant｜><think>"
+        );
+        let events = run(
+            prompt,
+            &["The user asks about the tag.</think>\n\nIt opens a calls block."],
+        );
+        assert_eq!(events[0], Event::ReasoningStart);
+        assert_eq!(
+            events[1],
+            Event::Reasoning(Text::uncounted("The user asks about the tag."))
+        );
     }
 
     #[test]

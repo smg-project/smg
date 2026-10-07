@@ -184,7 +184,8 @@ impl Assembler {
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
     /// client. A streamed string's open fragment stays open; a whole value never written, a name
-    /// and the held bytes come back as `Malformed { UnterminatedRegion }`.
+    /// and the held bytes come back as `Malformed { UnterminatedRegion }`; a call that started
+    /// still ends, with no bytes of its own, as every assembler ends one.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -195,6 +196,12 @@ impl Assembler {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.carried)),
                 why: MalformedReason::UnterminatedRegion,
+            });
+        }
+        if self.started() {
+            out.push(Event::ToolCallEnd {
+                index: self.index,
+                source: Text::default(),
             });
         }
     }
@@ -230,10 +237,12 @@ impl Assembler {
         }
     }
 
-    /// A tag between parameters: the parameter tag opens a key, the closing tag has no place.
+    /// A tag between parameters: the parameter tag opens a key, once the function is named; the
+    /// closing tag has no place, and neither does a parameter before the function's name closed
+    /// (a missing quote on the name), so no fragment comes before the call's start.
     fn tag_between(&mut self, tag: usize, out: &mut Events) {
         let bytes = TAGS[tag];
-        if tag == PARAMETER_OPEN {
+        if tag == PARAMETER_OPEN && self.started() {
             self.carried.push_str(bytes);
             self.stage = Stage::ParameterName {
                 start: self.carried.len(),
