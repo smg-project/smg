@@ -50,7 +50,9 @@ enum Stage {
     /// Inside the list, between objects.
     Between,
     /// Inside an object.
-    Object(json::Assembler),
+    /// Boxed: the assembler holds the object's scanner and its prefix, far more than the other
+    /// stages carry.
+    Object(Box<json::Assembler>),
     /// After the `]`.
     After,
 }
@@ -148,8 +150,10 @@ impl Assembler {
                         self.drop_carried(out);
                         let index = self.next_index;
                         self.objects += 1;
-                        self.stage =
-                            Stage::Object(json::Assembler::new(index, format!("call_{index}")));
+                        self.stage = Stage::Object(Box::new(json::Assembler::new(
+                            index,
+                            format!("call_{index}"),
+                        )));
                         &text[at..]
                     }
                     ']' => {
