@@ -55,6 +55,10 @@ pub enum CallSyntax {
     /// Llama 3.2's pythonic template. The region's markers are the terminals; each call ends at
     /// its own `)`, and the region's closing marker is wrapping.
     Pythonic,
+    /// A JSON list of calls with no markers around it, or content: xLAM. The table's one state is
+    /// an arguments state entered at the output's start, and the assembler decides at the first
+    /// byte that is not whitespace.
+    JsonList,
 }
 
 /// What the text inside a state is.

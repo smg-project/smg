@@ -7,6 +7,7 @@
 //! growing object into the events of that call, on top of the outline.
 
 pub mod assembler;
+pub mod list;
 pub mod outline;
 pub mod partial;
 

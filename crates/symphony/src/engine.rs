@@ -103,6 +103,7 @@ enum Call {
     Dsml(tagged::dsml::Assembler),
     Keyed(tagged::keyed::Assembler),
     Pythonic(pythonic::Assembler),
+    JsonList(json::list::Assembler),
 }
 
 impl Call {
@@ -118,6 +119,7 @@ impl Call {
                 Self::Keyed(tagged::keyed::Assembler::new(index, id, tags))
             }
             Some(CallSyntax::Pythonic) => Self::Pythonic(pythonic::Assembler::new(index)),
+            Some(CallSyntax::JsonList) => Self::JsonList(json::list::Assembler::new(index)),
         }
     }
 
@@ -134,6 +136,10 @@ impl Call {
                 text.len()
             }
             Self::Pythonic(assembler) => {
+                assembler.feed(text, out);
+                text.len()
+            }
+            Self::JsonList(assembler) => {
                 assembler.feed(text, out);
                 text.len()
             }
@@ -171,6 +177,8 @@ impl Call {
             // The region's marker belongs to the region, not to its last call.
             (Self::Pythonic(assembler), Closed::ByMarker) => assembler.close(out),
             (Self::Pythonic(assembler), Closed::ByEnd) => assembler.finish(out),
+            (Self::JsonList(assembler), Closed::ByMarker) => assembler.close(out),
+            (Self::JsonList(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }
