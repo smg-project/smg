@@ -223,7 +223,7 @@ fn inferred(text: &str) -> String {
 /// `True`, `False`, numbers, strings in single or double quotes with Python's escapes, lists,
 /// tuples and dicts, with trailing commas allowed. Anything else, a bare word or an apostrophe in
 /// prose among them, is not a literal.
-fn python_literal(text: &str) -> Option<String> {
+pub(crate) fn python_literal(text: &str) -> Option<String> {
     let mut reader = Literal {
         bytes: text.as_bytes(),
         text,
@@ -283,7 +283,15 @@ impl Literal<'_> {
 
     fn value(&mut self) -> Option<()> {
         self.skip_space();
-        if self.word("None", "null") || self.word("True", "true") || self.word("False", "false") {
+        // JSON's atoms are accepted inside a literal too: a template that writes a nested value
+        // with `tojson` inside a call it writes as Python puts `null` in a Python list.
+        if self.word("None", "null")
+            || self.word("True", "true")
+            || self.word("False", "false")
+            || self.word("null", "null")
+            || self.word("true", "true")
+            || self.word("false", "false")
+        {
             return Some(());
         }
         match *self.bytes.get(self.at)? {
