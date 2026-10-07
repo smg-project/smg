@@ -360,8 +360,14 @@ impl Literal<'_> {
                     self.at += digits;
                 }
                 '\\' | '\'' | '"' => value.push(escaped),
-                // A backslash before a newline is a continuation Python drops.
+                // A backslash before a line ending is the continuation Python drops; Python reads
+                // `\r\n` and a lone `\r` as line endings too.
                 '\n' => {}
+                '\r' => {
+                    if self.bytes.get(self.at) == Some(&b'\n') {
+                        self.at += 1;
+                    }
+                }
                 // Python keeps the backslash on an escape it does not have: `'\d+'` is three
                 // characters.
                 other => {
@@ -917,14 +923,23 @@ mod tests {
     #[test]
     fn an_escape_python_does_not_have_keeps_its_backslash() {
         let written = json(
-            r"{'pattern': '\d+', 'path': 'C:\path', 'cut': 'a\
-b'}",
+            concat!(
+                r"{'pattern': '\d+', 'path': 'C:\path', 'cut': 'a\",
+                "\n",
+                r"b', 'crlf': 'a\",
+                "\r\n",
+                r"b', 'cr': 'a\",
+                "\r",
+                r"b'}"
+            ),
             None,
         );
         let read: Value = serde_json::from_str(&written).expect("an object");
         assert_eq!(read["pattern"], "\\d+");
         assert_eq!(read["path"], "C:\\path");
         assert_eq!(read["cut"], "ab");
+        assert_eq!(read["crlf"], "ab");
+        assert_eq!(read["cr"], "ab");
     }
 
     #[test]
