@@ -33,6 +33,7 @@ use openai_protocol::{
     },
     rerank::{RerankRequest, RerankResponse, RerankResult},
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
 use reqwest::multipart::{Form, Part};
@@ -616,7 +617,7 @@ impl Router {
                     worker.as_ref(),
                     raw_body_len,
                 )
-            } else if route == "/v1/decisions" {
+            } else if matches!(route, "/v1/decisions" | "/v1/systemone") {
                 serialize_request_body_preserving_fields(
                     view.request,
                     canonical_model,
@@ -2125,6 +2126,28 @@ impl RouterTrait for Router {
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/decisions", model_id)
+            .await
+    }
+
+    async fn route_systemone(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: SystemOneRequest,
+        model_id: &str,
+    ) -> Response {
+        // Direct HTTP routers must enforce the same explicit-model contract
+        // as Gateway before shared routing can interpret its wildcard.
+        if model_id == crate::worker::UNKNOWN_MODEL_ID
+            || self
+                .worker_registry
+                .resolve_model_alias(model_id)
+                .as_deref()
+                == Some(crate::worker::UNKNOWN_MODEL_ID)
+        {
+            return error::model_not_found(model_id);
+        }
+        self.route_typed_request(headers, body, "/v1/systemone", model_id)
             .await
     }
 

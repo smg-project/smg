@@ -48,7 +48,7 @@ pub(crate) fn serialize_request_body<T: Serialize>(
 }
 
 /// Preserve explicitly supplied backend fields while applying model aliases
-/// and worker preparation. Decisions extensions have no shared defaults.
+/// and worker preparation. Decisions and SystemOne extensions have no shared defaults.
 pub(crate) fn serialize_request_body_preserving_fields<T: Serialize>(
     typed_req: &T,
     canonical_model: Option<&str>,

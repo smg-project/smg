@@ -31,6 +31,7 @@ use openai_protocol::{
     },
     rerank::{RerankRequest, V1RerankReqInput},
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::ValidatedJson,
     worker::{
@@ -280,6 +281,23 @@ async fn v1_decisions(
             state
                 .router
                 .route_decisions(Some(&headers), &tenant_meta, body, &model),
+        )
+        .await
+}
+
+async fn v1_systemone(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    ValidatedJson(body): ValidatedJson<SystemOneRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_systemone(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -898,6 +916,7 @@ pub fn build_app(
             .route("/v1/interactions", post(v1_interactions))
             .route("/v1/classify", post(v1_classify))
             .route("/v1/decisions", post(v1_decisions))
+            .route("/v1/systemone", post(v1_systemone))
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
             // declined requests pass to the handlers untouched.
             .route_layer(axum::middleware::from_fn_with_state(

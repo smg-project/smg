@@ -33,6 +33,7 @@ use openai_protocol::{
     },
     rerank::RerankRequest,
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
     UNKNOWN_MODEL_ID,
 };
@@ -626,6 +627,54 @@ impl RouterTrait for Gateway {
         }
     }
 
+    async fn route_systemone(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: SystemOneRequest,
+        model_id: &str,
+    ) -> Response {
+        // SystemOne requires an explicit model; the internal wildcard must
+        // never select an unrelated model, including after alias resolution.
+        if model_id == UNKNOWN_MODEL_ID
+            || self
+                .worker_registry
+                .resolve_model_alias(model_id)
+                .as_deref()
+                == Some(UNKNOWN_MODEL_ID)
+        {
+            return route_error::model_not_found(model_id);
+        }
+        let router = if self.enable_igw {
+            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+            if snapshot.is_empty() {
+                return route_error::model_not_found(model_id);
+            }
+            // Native SystemOne is supported only by regular HTTP workers.
+            // Weighted family dispatch could select an unsupported transport.
+            if snapshot.pool(RoutingPool::HttpRegular).is_empty() {
+                return route_error::not_implemented(
+                    "systemone_not_supported",
+                    "SystemOne requires a regular HTTP worker for this model",
+                );
+            }
+            self.routers.load().get(&router_ids::HTTP_REGULAR).cloned()
+        } else {
+            self.select_router_for_request(Some(model_id))
+        };
+        match router {
+            Some(router) => {
+                router
+                    .route_systemone(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => route_error::not_implemented(
+                "systemone_not_supported",
+                "SystemOne requires a regular HTTP router",
+            ),
+        }
+    }
+
     async fn route_audio_transcriptions(
         &self,
         headers: Option<&HeaderMap>,
@@ -1008,6 +1057,132 @@ mod tests {
         gateway.set_default_router(router_ids::HTTP_PD);
         assert_eq!(
             decision_status(&gateway, "m").await,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    #[derive(Debug)]
+    struct SystemOneStubRouter;
+
+    #[async_trait]
+    impl RouterTrait for SystemOneStubRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_systemone(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            body: SystemOneRequest,
+            model_id: &str,
+        ) -> Response {
+            assert_eq!(body.model, model_id);
+            StatusCode::OK.into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "systemone"
+        }
+    }
+
+    async fn systemone_status(gateway: &Gateway, model: &str) -> StatusCode {
+        let body = serde_json::from_value(serde_json::json!({
+            "model": model,
+            "state": {"ticket": "evidence"},
+            "questions": {"evidence": {
+                "type": "noul", "criteria": {"true": "Has evidence", "false": "No evidence"}
+            }}
+        }))
+        .unwrap();
+        gateway
+            .route_systemone(None, &test_tenant_meta(), body, model)
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn systemone_uses_only_regular_http_workers_in_mixed_fleets() {
+        for has_http_regular in [true, false] {
+            let gateway = test_gateway(true);
+            gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(SystemOneStubRouter));
+            gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+            gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
+            gateway.set_default_router(router_ids::GRPC_REGULAR);
+            let workers = [
+                (ConnectionMode::Http, WorkerType::Regular),
+                (ConnectionMode::Http, WorkerType::Prefill),
+                (ConnectionMode::Http, WorkerType::Decode),
+                (ConnectionMode::Grpc, WorkerType::Regular),
+                (ConnectionMode::Zmq, WorkerType::Regular),
+            ];
+            for (index, (mode, role)) in workers.into_iter().enumerate() {
+                if index == 0 && !has_http_regular {
+                    continue;
+                }
+                gateway
+                    .worker_registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::new(format!("http://worker-{index}:8080"))
+                            .connection_mode(mode)
+                            .worker_type(role)
+                            .model(ModelCard::new("m").with_alias("alias"))
+                            .build(),
+                    ))
+                    .unwrap();
+            }
+            let expected = if has_http_regular {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            };
+            for _ in 0..32 {
+                assert_eq!(systemone_status(&gateway, "m").await, expected);
+                assert_eq!(systemone_status(&gateway, "alias").await, expected);
+            }
+            for unregistered_model in ["missing", "jev-latest", UNKNOWN_MODEL_ID] {
+                assert_eq!(
+                    systemone_status(&gateway, unregistered_model).await,
+                    StatusCode::NOT_FOUND
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_respects_single_router_configuration() {
+        let gateway = test_gateway(false);
+        gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(SystemOneStubRouter));
+        assert_eq!(systemone_status(&gateway, "m").await, StatusCode::OK);
+        assert_eq!(
+            systemone_status(&gateway, UNKNOWN_MODEL_ID).await,
+            StatusCode::NOT_FOUND
+        );
+        for unsupported_router in [router_ids::HTTP_PD, router_ids::GRPC_REGULAR] {
+            gateway.register_router(unsupported_router.clone(), Arc::new(PdStubRouter));
+            gateway.set_default_router(unsupported_router);
+            assert_eq!(
+                systemone_status(&gateway, "m").await,
+                StatusCode::NOT_IMPLEMENTED
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_requires_a_registered_regular_http_router() {
+        let mut gateway = Gateway::new(Arc::new(WorkerRegistry::new()));
+        gateway.enable_igw = true;
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://worker:8080")
+                    .model(ModelCard::new("m"))
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(
+            systemone_status(&gateway, "m").await,
             StatusCode::NOT_IMPLEMENTED
         );
     }

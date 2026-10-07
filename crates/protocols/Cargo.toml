@@ -22,6 +22,7 @@ axum = { workspace = true, optional = true }
 bitflags.workspace = true
 bytes = "1.12.0"
 chrono.workspace = true
+indexmap = { version = "2", features = ["serde"] }
 rand.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, features = ["preserve_order"] }

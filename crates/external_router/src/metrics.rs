@@ -127,6 +127,7 @@ pub mod metrics_labels {
     pub const ENDPOINT_GENERATE: &str = "generate";
     pub const ENDPOINT_RESPONSES: &str = "responses";
     pub const ENDPOINT_DECISIONS: &str = "decisions";
+    pub const ENDPOINT_SYSTEMONE: &str = "systemone";
     pub const ENDPOINT_COMPLETIONS: &str = "completions";
     pub const ENDPOINT_RERANK: &str = "rerank";
     pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";

@@ -24,6 +24,7 @@ use openai_protocol::{
     },
     rerank::RerankRequest,
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
 
@@ -204,6 +205,20 @@ pub trait RouterTrait: Send + Sync + Debug {
         error::not_implemented(
             "decisions_not_supported",
             "Decisions is supported only by the regular HTTP router",
+        )
+    }
+
+    /// Route native SystemOne requests on regular HTTP workers.
+    async fn route_systemone(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: SystemOneRequest,
+        _model_id: &str,
+    ) -> Response {
+        error::not_implemented(
+            "systemone_not_supported",
+            "SystemOne is supported only by the regular HTTP router",
         )
     }
 
