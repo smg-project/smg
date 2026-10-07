@@ -38,7 +38,9 @@ pub mod tokens;
 pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
 pub use format::{CallSyntax, Emits, Format};
-pub use formats::{deepseek_v4_1, hy4, iquest, lfm2_5, ling, olmo3, qwen2_5, qwen3, seed_oss};
+pub use formats::{
+    deepseek_v4_1, hy4, iquest, lfm2_5, ling, olmo3, qwen2_5, qwen3, seed_oss, xlam,
+};
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};

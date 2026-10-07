@@ -47,7 +47,7 @@ use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
     adapt,
-    formats::{deepseek_v4_1, hy4, iquest, lfm2_5, ling, olmo3, qwen2_5, qwen3, seed_oss},
+    formats::{deepseek_v4_1, hy4, iquest, lfm2_5, ling, olmo3, qwen2_5, qwen3, seed_oss, xlam},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -323,6 +323,12 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Lfm2_5,
         GenerationPrompt::ModelWritesTheThought,
     ),
+    // A bare JSON list of calls, or content; no thought.
+    (
+        "llama-xlam-2-8b-fc-r",
+        Family::Xlam,
+        GenerationPrompt::Plain,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -360,6 +366,8 @@ enum Family {
     /// [`olmo3`], [`lfm2_5`]: Python calls.
     Olmo3,
     Lfm2_5,
+    /// [`xlam`]: a bare JSON list of calls.
+    Xlam,
 }
 
 impl Family {
@@ -395,6 +403,7 @@ impl Family {
             Self::IQuest => iquest(),
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
+            Self::Xlam => xlam(),
         }
     }
 
@@ -405,10 +414,10 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4 and Olmo 3 read neither of the probes' Qwen markers: `</think>` stays
-            // reasoning text and the fenced `<tool_call>` block stays content, as the reference
-            // says.
-            Self::SeedOss | Self::Hy4 | Self::Olmo3 => &[],
+            // Seed-OSS, Hy4, Olmo 3 and xLAM read neither of the probes' Qwen markers: `</think>`
+            // stays reasoning text and the fenced `<tool_call>` block stays content, as the
+            // reference says.
+            Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam => &[],
             // Ling reads `<tool_call>` and `</think>`, so its two probes are the tagged ones'
             // (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>` but not
             // `<tool_call>`.
@@ -443,6 +452,9 @@ impl Family {
         }
         if CONTENT_OR_CALLS.contains(&slug) {
             allowed.push(Allowance::CallsNotWritten);
+        }
+        if self == Self::Xlam {
+            allowed.push(Allowance::ContentNotWritten);
         }
         allowed
     }
@@ -521,6 +533,10 @@ enum Allowance {
     /// since it merged). Allowed only when the output holds no call marker at all, so a call the
     /// parser missed never passes as one the template dropped.
     CallsNotWritten,
+    /// The other half of the same: the template writes the calls and drops the content beside
+    /// them, so the content the reference carries is not in the output: xLAM (bellwether #68
+    /// refuses the case now). Allowed only when the output is the list and nothing else.
+    ContentNotWritten,
 }
 
 /// A case known to differ from the reference beyond the separator bytes: why, and what the parser
@@ -879,6 +895,7 @@ fn parity(
                 Allowance::DeclaredTypeConflict => "allowed: declared-type conflict (corpus)",
                 Allowance::ReasoningNotWritten => "allowed: reasoning not written (corpus)",
                 Allowance::CallsNotWritten => "allowed: calls not written (corpus)",
+                Allowance::ContentNotWritten => "allowed: content not written (corpus)",
             }
         } else {
             failures.push(format!(
@@ -946,6 +963,15 @@ fn allowance_for(
                 && Said {
                     calls: Vec::new(),
                     finish: "stop".to_string(),
+                    ..expected.clone()
+                } == said
+        }
+        Allowance::ContentNotWritten => {
+            said.content.is_none()
+                && expected.content.is_some()
+                && text.trim_start().starts_with('[')
+                && Said {
+                    content: None,
                     ..expected.clone()
                 } == said
         }

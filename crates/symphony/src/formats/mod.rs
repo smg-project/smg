@@ -8,7 +8,7 @@
 //! blocks, each a call whose parameter tags type their own values. [`seed_oss()`] is the Qwen
 //! tagged syntax under Seed-OSS's own markers. [`hy4()`], [`ling()`] and [`iquest()`] write a
 //! call as its name and keyed arguments, each under its own markers. [`olmo3()`] and [`lfm2_5()`]
-//! write their calls as Python.
+//! write their calls as Python. [`xlam()`] is a bare JSON list of calls, or content.
 //!
 //! [`Format`]: crate::Format
 //! [`Engine`]: crate::Engine
@@ -22,6 +22,7 @@ pub mod olmo3;
 pub mod qwen2_5;
 pub mod qwen3;
 pub mod seed_oss;
+pub mod xlam;
 
 pub use deepseek_v4_1::deepseek_v4_1;
 pub use hy4::hy4;
@@ -32,3 +33,4 @@ pub use olmo3::olmo3;
 pub use qwen2_5::qwen2_5;
 pub use qwen3::qwen3;
 pub use seed_oss::seed_oss;
+pub use xlam::xlam;
