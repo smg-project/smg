@@ -186,15 +186,39 @@ impl Declared {
     pub fn kind_at(&self, function: &str, path: &[&str]) -> Option<Kind> {
         let mut schema = self.schemas.get(function)?;
         for segment in path {
-            let mut admitted = Vec::new();
-            admitted_types(schema, &mut admitted);
-            schema = if admitted.contains(&"array") {
-                schema.get("items")?
-            } else {
-                schema.get("properties")?.get(*segment)?
-            };
+            schema = below(schema, segment)?;
         }
         Kind::of(schema)
+    }
+}
+
+/// The schema one level below `schema` at `segment`: an array's items, or an object's property
+/// `segment`. A schema that admits the array or the object through `anyOf` or `oneOf` (Pydantic
+/// writes `Optional[List[T]]` and `Optional[Model]` so) is looked into for the member that has
+/// the items or the properties, since the wrapper itself has neither.
+fn below<'a>(schema: &'a Value, segment: &str) -> Option<&'a Value> {
+    let mut admitted = Vec::new();
+    admitted_types(schema, &mut admitted);
+    let mut shapes = Vec::new();
+    with_members(schema, &mut shapes);
+    if admitted.contains(&"array") {
+        shapes.iter().find_map(|shape| shape.get("items"))
+    } else {
+        shapes
+            .iter()
+            .find_map(|shape| shape.get("properties")?.get(segment))
+    }
+}
+
+/// `schema` and, below it, every member of its `anyOf` and `oneOf`, wrappers inside wrappers
+/// included, outermost first.
+fn with_members<'a>(schema: &'a Value, into: &mut Vec<&'a Value>) {
+    into.push(schema);
+    for key in ["anyOf", "oneOf"] {
+        let members = schema.get(key).and_then(Value::as_array);
+        for member in members.into_iter().flatten() {
+            with_members(member, into);
+        }
     }
 }
 
@@ -1132,5 +1156,39 @@ mod tests {
             json_but_for_a_surrogate > 0,
             "the generator never wrote text that only a surrogate escape keeps from being JSON"
         );
+    }
+
+    #[test]
+    fn a_kind_below_a_wrapped_array_or_object_comes_from_the_member_that_has_the_shape() {
+        // Pydantic's `Optional[List[str]]`, `Optional[Model]` and a wrapper inside a wrapper.
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                "tags": {"anyOf": [
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "null"}
+                ]},
+                "meta": {"anyOf": [
+                    {"type": "object", "properties": {"id": {"type": "integer"}}},
+                    {"type": "null"}
+                ]},
+                "deep": {"anyOf": [
+                    {"anyOf": [{"type": "array", "items": {"type": "integer"}}]},
+                    {"type": "null"}
+                ]},
+                "either": {"oneOf": [
+                    {"type": "object", "properties": {"n": {"type": "string"}}},
+                    {"type": "null"}
+                ]},
+            }),
+        )]);
+        assert_eq!(declared.kind_at("f", &["tags", "item"]), Some(Kind::String));
+        assert_eq!(declared.kind_at("f", &["meta", "id"]), Some(Kind::Integer));
+        assert_eq!(
+            declared.kind_at("f", &["deep", "item"]),
+            Some(Kind::Integer)
+        );
+        assert_eq!(declared.kind_at("f", &["either", "n"]), Some(Kind::String));
+        assert_eq!(declared.kind_at("f", &["meta", "missing"]), None);
     }
 }

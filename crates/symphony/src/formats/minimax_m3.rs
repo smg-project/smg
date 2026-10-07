@@ -677,4 +677,30 @@ mod tests {
         let events = run("", &[item]);
         assert_eq!(arguments(&events), value!({"tags": [null]}));
     }
+
+    #[test]
+    fn a_leaf_below_a_nullable_list_or_object_keeps_its_declared_type() {
+        // Pydantic writes `Optional[List[str]]` as an `anyOf` around the array; the items' type
+        // reaches the leaves below it, so a numeric-looking string stays a string.
+        let output = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"f\">",
+            "]<]minimax[>[<tags>]<]minimax[>[<item>01234]<]minimax[>[</item>]<]minimax[>[</tags>",
+            "]<]minimax[>[<meta>]<]minimax[>[<id>7]<]minimax[>[</id>]<]minimax[>[<flag>true",
+            "]<]minimax[>[</flag>]<]minimax[>[</meta>]<]minimax[>[</invoke>\n",
+            "]<]minimax[>[</tool_call>"
+        );
+        let tools = value!({"type": "object", "properties": {
+        "tags": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]},
+        "meta": {"anyOf": [
+            {"type": "object", "properties": {
+                "id": {"type": "integer"}, "flag": {"type": "string"}}},
+            {"type": "null"}
+        ]}}});
+        let events = run_with(declared("f", tools), "", &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            arguments(&events),
+            value!({"tags": ["01234"], "meta": {"id": 7, "flag": "true"}})
+        );
+    }
 }
