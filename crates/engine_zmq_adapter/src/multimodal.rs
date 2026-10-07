@@ -823,6 +823,7 @@ mod tests {
     /// A `/dev/shm` payload is read at its offset, cast like an inline one,
     /// and unlinked once read (the Python servicer's `mm_shm` contract).
     #[test]
+    #[cfg(target_os = "linux")]
     fn shm_payloads_are_read_at_offset_and_unlinked() {
         let name = format!(
             "smg-adapter-test-{}-{}",

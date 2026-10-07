@@ -763,6 +763,7 @@ async fn a_duplicate_decode_leg_sends_no_rejection_notice() {
 /// `/dev/shm` payload is read (and unlinked) once, and each engine request
 /// carries the per-item features.
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn shm_media_serves_every_choice_of_a_fan_out() {
     let mut h = harness(model_info(), None).await;
     let name = format!(
