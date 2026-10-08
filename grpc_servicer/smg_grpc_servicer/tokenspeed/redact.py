@@ -16,7 +16,11 @@ SECRET_FRAGMENTS = ("api_key", "secret", "password")
 def is_secret_key(key: str) -> bool:
     """Whether a server-args key names a credential that must not leave the engine."""
     lowered = key.lower()
-    return any(fragment in lowered for fragment in SECRET_FRAGMENTS) or lowered.endswith("_token")
+    return (
+        lowered == "token"
+        or lowered.endswith("_token")
+        or any(fragment in lowered for fragment in SECRET_FRAGMENTS)
+    )
 
 
 def redact_secrets(value: Any) -> Any:
