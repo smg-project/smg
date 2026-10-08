@@ -2,7 +2,7 @@
 //! `</tool_call>`, everything else content. Inside the call markers the family writes one of two
 //! syntaxes ([`CallSyntax`]): Qwen3 a JSON object, `{"name": …, "arguments": {…}}`; Qwen 3.5
 //! and later and Qwen3-Coder the tags `<function=NAME>` and `<parameter=KEY>` around each value's
-//! text, which the request's tools type.
+//! text, which the request's tools type, an object or a list written as JSON.
 //!
 //! The definition is the table below; the [`Engine`](crate::Engine) runs it, and decides
 //! everything the module doc of [`engine`](crate::engine) lists. Two things are Qwen3's own:
@@ -17,6 +17,8 @@
 //! hand-written parser this table replaced, and hold the table to the same events.
 
 use crate::format::{CallSyntax, Emits, Format};
+#[cfg(test)]
+use crate::tagged::Spelling;
 
 /// The Qwen3 table, with the call syntax the checkpoint writes.
 pub fn qwen3(syntax: CallSyntax) -> Format {
@@ -770,7 +772,7 @@ mod tests {
     );
 
     fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
-        let mut parser = Engine::new(qwen3(CallSyntax::Tagged), declared());
+        let mut parser = Engine::new(qwen3(CallSyntax::Tagged(Spelling::Json)), declared());
         let mut out = Events::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
@@ -940,7 +942,7 @@ mod tests {
 
     /// The prompt, then the whole output in one delta, then the engine's stop.
     fn after_prompt(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(qwen3(CallSyntax::Tagged), declared());
+        let mut parser = Engine::new(qwen3(CallSyntax::Tagged(Spelling::Json)), declared());
         let mut out = Events::new();
         parser
             .feed(

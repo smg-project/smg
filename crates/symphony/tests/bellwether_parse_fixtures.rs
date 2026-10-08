@@ -59,6 +59,7 @@ use symphony::{
         deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
         qwen3, seed_oss, xlam,
     },
+    tagged::Spelling,
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -501,7 +502,7 @@ impl Family {
     fn format(self) -> symphony::Format {
         match self {
             Self::Qwen3 => qwen3(CallSyntax::Json),
-            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged),
+            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json)),
             Self::Qwen2_5 => qwen2_5(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::SeedOss => seed_oss(),

@@ -50,7 +50,24 @@ const FUNCTION_OPEN: usize = 0;
 const PARAMETER_OPEN: usize = 1;
 const PARAMETER_CLOSE: usize = 2;
 const FUNCTION_CLOSE: usize = 3;
-const TAGS: [&str; 4] = ["<function=", "<parameter=", "</parameter>", "</function>"];
+/// The four tags of the syntax: a function's opening up to its name, a parameter's opening up to
+/// its key, a parameter's close, a function's close.
+pub const TAGS: [&str; 4] = ["<function=", "<parameter=", "</parameter>", "</function>"];
+
+/// How a family's template writes a value that is not a string. Qwen 3.5, Qwen3-Coder and their
+/// kin write an object or a list as JSON (`tojson`) and a boolean or null as Python's word
+/// (`True`, `None`); Seed-OSS writes every value with Python's `str`, an object or a list as its
+/// repr (`{'size': 'large'}`). The assembler reads all of these as the JSON they stand for
+/// ([`json`]); the grammar derived from a table pins an object's or a list's
+/// shape only where the template writes it as JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spelling {
+    /// An object or a list as JSON, a boolean or null as Python's word: Qwen 3.5 and later,
+    /// Qwen3-Coder.
+    Json,
+    /// Every value as Python's text, an object or a list as its repr: Seed-OSS.
+    Python,
+}
 const WITHOUT_A_FUNCTION: &str = "a tool call without a function tag";
 const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
 const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";

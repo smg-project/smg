@@ -11,6 +11,7 @@ use symphony::{
         deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
         qwen3, seed_oss, xlam,
     },
+    tagged::Spelling,
     CallSyntax, Format,
 };
 
@@ -71,7 +72,7 @@ impl Table {
     fn format(self) -> Format {
         match self {
             Self::Qwen3 => qwen3(CallSyntax::Json),
-            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged),
+            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json)),
             Self::Qwen2_5 => qwen2_5(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::SeedOss => seed_oss(),
@@ -133,8 +134,8 @@ const GROUPS: &[Group] = &[
         released: "2026-01-06",
         smg: (None, None),
         table: Some(Table::Qwen2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(41_533),
+        status: Status::Replaying,
     },
     Group {
         slug: "apertus-8b-instruct-2509",
@@ -244,7 +245,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("glm47_moe"), Some("glm45")),
         table: Some(Table::Glm),
         set: Some(54_193),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "granite-4.1-3b",
@@ -253,8 +254,8 @@ const GROUPS: &[Group] = &[
         released: "2026-04-06",
         smg: (None, None),
         table: Some(Table::Qwen2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(41_533),
+        status: Status::Replaying,
     },
     Group {
         slug: "hermes-4-14b",
@@ -263,8 +264,8 @@ const GROUPS: &[Group] = &[
         released: "2025-08-30",
         smg: (None, None),
         table: Some(Table::Qwen2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(41_533),
+        status: Status::Replaying,
     },
     Group {
         slug: "hunyuan-a13b-instruct",
@@ -303,8 +304,8 @@ const GROUPS: &[Group] = &[
         released: "2026-09-28",
         smg: (None, None),
         table: Some(Table::IQuest),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(54_193),
+        status: Status::Replaying,
     },
     Group {
         slug: "k-exaone-236b-a23b",
@@ -313,8 +314,8 @@ const GROUPS: &[Group] = &[
         released: "2025-12-26",
         smg: (None, None),
         table: Some(Table::Qwen3),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(54_416),
+        status: Status::Replaying,
     },
     Group {
         slug: "k2-horizon-36b",
@@ -353,8 +354,8 @@ const GROUPS: &[Group] = &[
         released: "2026-01-06",
         smg: (None, None),
         table: Some(Table::Lfm2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(54_418),
+        status: Status::Replaying,
     },
     Group {
         slug: "ling-3.0-flash",
@@ -363,8 +364,8 @@ const GROUPS: &[Group] = &[
         released: "2026-08-02",
         smg: (None, None),
         table: Some(Table::Ling),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(54_195),
+        status: Status::Replaying,
     },
     Group {
         slug: "llama-xlam-2-8b-fc-r",
@@ -373,8 +374,8 @@ const GROUPS: &[Group] = &[
         released: "2025-03-27",
         smg: (Some("json"), None),
         table: Some(Table::Xlam),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(40_529),
+        status: Status::Replaying,
     },
     Group {
         slug: "llava-1.5-7b-hf",
@@ -393,8 +394,8 @@ const GROUPS: &[Group] = &[
         released: "2026-04-27",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(54_181),
+        status: Status::Replaying,
     },
     Group {
         slug: "minicpm5-2b",
@@ -463,8 +464,8 @@ const GROUPS: &[Group] = &[
         released: "2026-07-21",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(54_195),
+        status: Status::Replaying,
     },
     Group {
         slug: "nvidia-nemotron-3-nano-30b-a3b-bf16",
@@ -473,8 +474,8 @@ const GROUPS: &[Group] = &[
         released: "2025-12-04",
         smg: (Some("qwen_xml"), Some("nano_v3")),
         table: Some(Table::Qwen3Tagged),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(12_829),
+        status: Status::Replaying,
     },
     Group {
         slug: "olmo-3-7b-instruct",
@@ -483,8 +484,8 @@ const GROUPS: &[Group] = &[
         released: "2025-11-19",
         smg: (None, None),
         table: Some(Table::Olmo3),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(41_533),
+        status: Status::Replaying,
     },
     Group {
         slug: "phi-4-mini-instruct",
@@ -514,7 +515,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_193),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen-drive-1.0-4b",
@@ -524,7 +525,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_179),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen2.5-7b-instruct-1m",
@@ -534,7 +535,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen2_5),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen2.5-omni-7b",
@@ -543,8 +544,8 @@ const GROUPS: &[Group] = &[
         released: "2025-03-22",
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(27_865),
+        status: Status::Replaying,
     },
     Group {
         slug: "qwen2.5-vl-32b-instruct",
@@ -553,8 +554,8 @@ const GROUPS: &[Group] = &[
         released: "2025-03-21",
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(27_865),
+        status: Status::Replaying,
     },
     Group {
         slug: "qwen2.5-vl-7b-instruct",
@@ -563,8 +564,8 @@ const GROUPS: &[Group] = &[
         released: "2025-01-26",
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(27_865),
+        status: Status::Replaying,
     },
     Group {
         slug: "qwen3-30b-a3b",
@@ -710,7 +711,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-vl-30b-a3b-instruct",
@@ -720,7 +721,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-vl-8b-instruct",
@@ -734,7 +735,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-vl-8b-thinking",
@@ -748,7 +749,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3.5-27b",
@@ -758,7 +759,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_179),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3.5-2b",
@@ -768,7 +769,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(41_360),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3.5-35b-a3b",
@@ -778,7 +779,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_179),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3.5-9b",
@@ -788,7 +789,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_179),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3.6-27b",
@@ -798,7 +799,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_193),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3.6-35b-a3b",
@@ -808,7 +809,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_193),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3.8-2.4t-a95b",
@@ -818,7 +819,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_183),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3.8-27b",
@@ -828,7 +829,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_193),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3.8-flash-next",
@@ -838,7 +839,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_193),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3guard-gen-0.6b",
@@ -867,8 +868,8 @@ const GROUPS: &[Group] = &[
         released: "2025-08-20",
         smg: (None, None),
         table: Some(Table::SeedOss),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(53_178),
+        status: Status::Replaying,
     },
     Group {
         slug: "step-3.5-flash",
@@ -877,8 +878,8 @@ const GROUPS: &[Group] = &[
         released: "2026-02-01",
         smg: (Some("step3"), None),
         table: Some(Table::Qwen3Tagged),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(54_181),
+        status: Status::Replaying,
     },
     Group {
         slug: "step3",
@@ -918,7 +919,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
 ];
 

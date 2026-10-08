@@ -71,30 +71,44 @@ fn is_name(text: &str) -> bool {
         .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '{' | '}' | '<' | '>'))
 }
 
-/// The four tags a family spells its keyed arguments with.
+/// The four tags a family spells its keyed arguments with, and `between`: the template's newline,
+/// written after the call's name, after each key's closing tag and before the call's close (Ling,
+/// GLM 4.5 and 4.6), or nothing anywhere (GLM 4.7 and later, IQuest, Hy4). The field tells the two
+/// spellings apart; the places are the spelling's. The assembler reads a call either way; the
+/// grammar derived from a table spells the one its template writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tags {
     pub key_open: &'static str,
     pub key_close: &'static str,
     pub value_open: &'static str,
     pub value_close: &'static str,
+    pub between: &'static str,
 }
 
 impl Tags {
-    /// GLM's, Ling's and most families' spelling.
+    /// The plain tags with nothing between them: GLM 4.7 and later, IQuest.
     pub const PLAIN: Self = Self {
         key_open: "<arg_key>",
         key_close: "</arg_key>",
         value_open: "<arg_value>",
         value_close: "</arg_value>",
+        between: "",
     };
 
-    /// Hy4's spelling, every tag suffixed `:opensource`.
+    /// The plain tags with the template's newline after the call's name, after each `</arg_key>`
+    /// and before `</tool_call>`: Ling, GLM 4.5 and 4.6.
+    pub const LING: Self = Self {
+        between: "\n",
+        ..Self::PLAIN
+    };
+
+    /// Hy4's spelling, every tag suffixed `:opensource`, nothing between them.
     pub const HY4: Self = Self {
         key_open: "<arg_key:opensource>",
         key_close: "</arg_key:opensource>",
         value_open: "<arg_value:opensource>",
         value_close: "</arg_value:opensource>",
+        between: "",
     };
 
     fn text(&self, tag: usize) -> &'static str {

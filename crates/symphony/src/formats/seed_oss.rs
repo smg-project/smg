@@ -1,12 +1,16 @@
 //! Seed-OSS: the Qwen tagged syntax under its own markers. Reasoning between `<seed:think>` and
 //! `</seed:think>`, each call between `<seed:tool_call>` and `</seed:tool_call>` as
 //! `<function=NAME>` and `<parameter=KEY>` tags, typed by the request's tools (which reach the
-//! engine with the request), everything else content. The same five rows as
+//! engine with the request), every value written with Python's `str` where Qwen writes an object
+//! or a list as JSON, everything else content. The same five rows as
 //! [`qwen3()`](crate::formats::qwen3()), with the spellings ByteDance-Seed/Seed-OSS-36B-Instruct
 //! writes; a plain `<tool_call>` is text here. The template is not ChatML: a turn opens with
 //! `<seed:bos>assistant`, so the prompt's replay starts there.
 
-use crate::format::{CallSyntax, Emits, Format};
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    tagged::Spelling,
+};
 
 /// The Seed-OSS table.
 pub fn seed_oss() -> Format {
@@ -23,7 +27,7 @@ pub fn seed_oss() -> Format {
         .transition("content", "call_open", "calls")
         .transition("calls", "call_close", "content")
         .transition("calls", "call_open", "calls")
-        .calls(CallSyntax::Tagged)
+        .calls(CallSyntax::Tagged(Spelling::Python))
         .opens_turn("<seed:bos>assistant")
 }
 

@@ -597,18 +597,23 @@ class GrpcRequestManager:
         return True
 
     async def _handle_tokenizer_loop(self):
-        """Process communicator responses from the scheduler's send_to_tokenizer path.
+        """Process outputs from the scheduler's send_to_tokenizer path.
 
         The scheduler sends communicator responses (ProfileReqOutput,
-        FlushCacheReqOutput, ...) directly to tokenizer_ipc_name, not through
-        the detokenizer. This loop only runs when recv_from_tokenizer is a
-        dedicated socket — in skip_tokenizer_init mode those responses arrive
-        on recv_from_scheduler and are dispatched by handle_loop instead.
+        FlushCacheReqOutput, ...) and busy-path health signals directly to
+        tokenizer_ipc_name, not through the detokenizer. This loop only runs
+        when recv_from_tokenizer is a dedicated socket — in skip_tokenizer_init
+        mode those responses arrive on recv_from_scheduler and are dispatched
+        by handle_loop instead.
         """
         while not self.gracefully_exit:
             try:
                 recv_obj = await self.recv_from_tokenizer.recv_pyobj()
-                if not self._dispatch_communicator_output(recv_obj):
+                if isinstance(recv_obj, HealthCheckOutput):
+                    self.last_receive_tstamp = real_time()
+                    if getattr(recv_obj, "rid", None):
+                        await self._handle_health_check_output(recv_obj)
+                elif not self._dispatch_communicator_output(recv_obj):
                     logger.warning(f"Unknown type on tokenizer socket: {type(recv_obj)}")
             except zmq.error.Again:
                 if self.gracefully_exit:

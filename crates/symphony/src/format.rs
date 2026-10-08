@@ -34,7 +34,7 @@
 //! [`Engine`]: crate::Engine
 //! [`formats`]: crate::formats
 
-use crate::tagged::keyed;
+use crate::tagged::{self, keyed};
 
 /// How the model writes a call between the call markers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,8 +42,9 @@ pub enum CallSyntax {
     /// One JSON object, `{"name": …, "arguments": {…}}`: Qwen3.
     Json,
     /// `<function=NAME>` and then `<parameter=KEY>` around each value's text, typed by the
-    /// request's tools, which reach the engine with the request: Qwen 3.5 and later, Qwen3-Coder.
-    Tagged,
+    /// request's tools, which reach the engine with the request, with the family's spelling of a
+    /// value that is not a string: Qwen 3.5 and later, Qwen3-Coder, Seed-OSS.
+    Tagged(tagged::Spelling),
     /// DeepSeek's DSML: the arguments state is one `<｜DSML｜ invoke name="…">` block, whose
     /// parameter tags carry a `string` attribute that types each value. The terminal that enters
     /// the state is the invoke tag's opening, and the one that leaves it is the invoke's closing
@@ -247,12 +248,24 @@ impl Format {
         self.states[index].emits
     }
 
+    /// How many states the table has; the first is the one the turn opener leaves the engine in.
+    pub(crate) fn states(&self) -> usize {
+        self.states.len()
+    }
+
     /// Where terminal `on` takes the engine from state `from`, if the table says.
     pub(crate) fn next(&self, from: usize, on: usize) -> Option<usize> {
         self.transitions
             .iter()
             .find(|transition| transition.from == from && transition.on == on)
             .map(|transition| transition.to)
+    }
+
+    /// Every row of the table as `(from, on, to)`, in the order the rows were added.
+    pub(crate) fn transitions(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        self.transitions
+            .iter()
+            .map(|transition| (transition.from, transition.on, transition.to))
     }
 
     /// The call syntax, for a format with an arguments state.

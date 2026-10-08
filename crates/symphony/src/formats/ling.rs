@@ -26,7 +26,7 @@ pub fn ling() -> Format {
         .transition("content", "call_open", "call")
         .transition("call", "call_close", "content")
         .transition("call", "call_open", "call")
-        .calls(CallSyntax::Keyed(keyed::Tags::PLAIN))
+        .calls(CallSyntax::Keyed(keyed::Tags::LING))
         .opens_turn("<role>ASSISTANT</role>")
 }
 

@@ -68,9 +68,13 @@ use crate::{
 /// and the block's close end a call too, but they belong to the region, and the engine drops them.
 pub const INVOKE_CLOSE: &str = "</｜DSML｜ invoke>";
 
-const PARAMETER_OPEN: usize = 0;
-const PARAMETER_CLOSE: usize = 1;
-const TAGS: [&str; 2] = ["<｜DSML｜ parameter name=\"", "</｜DSML｜ parameter>"];
+const OPEN: usize = 0;
+const CLOSE: usize = 1;
+/// The parameter tag's opening, up to the name's quote, and its closing tag: the two markers the
+/// assembler reads inside an invoke, and the ones a grammar for the syntax spells.
+pub const PARAMETER_OPEN: &str = "<｜DSML｜ parameter name=\"";
+pub const PARAMETER_CLOSE: &str = "</｜DSML｜ parameter>";
+const TAGS: [&str; 2] = [PARAMETER_OPEN, PARAMETER_CLOSE];
 const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
 const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";
 const TAG_CUT_SHORT: &str = "a tag that another tag cut short";
@@ -230,7 +234,7 @@ impl Assembler {
         let bytes = TAGS[tag];
         match &self.stage {
             Stage::Between => self.tag_between(tag, out),
-            Stage::Value(_) if tag == PARAMETER_CLOSE => self.close_value(bytes, out),
+            Stage::Value(_) if tag == CLOSE => self.close_value(bytes, out),
             // Inside a value, the other tag is the value's text.
             Stage::Value(_) => self.text(bytes, out),
             // A tag cuts a name or a tag's tail short: the bytes so far are reported, and the tag
@@ -255,7 +259,7 @@ impl Assembler {
     /// (a missing quote on the name), so no fragment comes before the call's start.
     fn tag_between(&mut self, tag: usize, out: &mut Events) {
         let bytes = TAGS[tag];
-        if tag == PARAMETER_OPEN && self.started() {
+        if tag == OPEN && self.started() {
             self.carried.push_str(bytes);
             self.stage = Stage::ParameterName {
                 start: self.carried.len(),

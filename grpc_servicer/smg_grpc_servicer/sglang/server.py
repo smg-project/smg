@@ -479,6 +479,10 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
                 ),
                 "sampling_params": sglang_scheduler_pb2.SamplingParams(
                     temperature=0.0,
+                    top_p=1.0,
+                    top_k=1,
+                    repetition_penalty=1.0,
+                    n=1,
                     max_new_tokens=max_new_tokens,
                 ),
                 "stream": False,

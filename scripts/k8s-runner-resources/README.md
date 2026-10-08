@@ -27,7 +27,8 @@ Grant only the permissions required by ARC:
 - Organization permissions:
   - **Self-hosted runners**: Read and write
 
-Install the App on `smg-project` and grant it access to the `smg` repository. Record
+Install the App on `smg-project` and grant it access to the `smg` repository, and to `bellwether`,
+whose recording runners (`bellwether-record`) are registered to that repository. Record
 the App ID and the installation ID, then generate and securely store a private key.
 The installation ID is the final number in the installation settings URL:
 
@@ -144,6 +145,20 @@ helm upgrade --install 4-gpu-h100 \
   --create-namespace \
   --version 0.14.2 \
   -f scripts/k8s-runner-resources/runner-values-4-gpu-h100.yaml \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+```
+
+`bellwether-record` runs bellwether's `record` workflow, one job per checkpoint group. It is registered to the
+`bellwether` repository alone, so no organization runner group is involved. Its pods have 8 CPU, 64 GiB and a
+40 GiB disk request, with no docker and no credentials, since the repository is public. They prefer CPU-only nodes
+and overflow onto GPU nodes.
+
+```bash
+helm upgrade --install bellwether-record \
+  --namespace actions-runner-system \
+  --create-namespace \
+  --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-bellwether-record.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 ```
 
