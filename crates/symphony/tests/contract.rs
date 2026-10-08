@@ -118,6 +118,10 @@ fn ling() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::ling(), keyed_tools()))
 }
 
+fn glm() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::glm(), keyed_tools()))
+}
+
 fn iquest() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::iquest(), keyed_tools()))
 }
@@ -193,6 +197,11 @@ const FORMATS: &[Subject] = &[
         name: "ling",
         new: ling,
         outputs: LING_OUTPUTS,
+    },
+    Subject {
+        name: "glm",
+        new: glm,
+        outputs: GLM_OUTPUTS,
     },
     Subject {
         name: "iquest",
@@ -428,6 +437,23 @@ const LING_OUTPUTS: &[&str] = &[
     "<think>plan</think>Sure.<tool_call>\n</tool_call>",
     "The syntax is:\n\n```\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \
      \"Paris\"}}\n</tool_call>\n```\n\nThat is all.",
+];
+
+/// Keyed arguments in GLM's spelling: nothing between the tags, the calls right after the content.
+const GLM_OUTPUTS: &[&str] = &[
+    "<think>plan</think>Sure.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris\
+     </arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>get_weather\
+     </tool_call>",
+    "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+    "<think></think><tool_call>get_weather<arg_key>q</arg_key><arg_value>計画 🌍 \"q\" \\ \
+     </arg_value></tool_call>",
+    "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>three</arg_value>\
+     <arg_key>note</arg_key><arg_value></arg_value></tool_call>",
+    "<think>Only a thought.",
+    "<think></think>Hello!",
+    "The syntax is:\n\n```\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris\
+     </arg_value></tool_call>\n```\n\nThat is all.",
+    "",
 ];
 
 /// Keyed arguments in IQuest's spelling, with no whitespace.

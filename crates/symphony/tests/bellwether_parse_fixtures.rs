@@ -56,7 +56,7 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, qwen2_5, qwen3,
+        deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, qwen2_5, qwen3,
         seed_oss, xlam,
     },
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -360,6 +360,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Ling,
         GenerationPrompt::OpensTheThought,
     ),
+    // GLM writes Ling's syntax with nothing between the tags; its prompt opens the thought
+    // whatever the request says (the template has no thinking switch).
+    (
+        "glm-5.3-flash",
+        Family::Glm,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
     (
         "iquest-q1",
         Family::IQuest,
@@ -415,10 +422,11 @@ enum Family {
     DeepSeekV4_1,
     /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
     SeedOss,
-    /// [`hy4`], [`ling`], [`iquest`]: keyed arguments, typed by the request tools.
+    /// [`hy4`], [`ling`], [`iquest`], [`glm`]: keyed arguments, typed by the request tools.
     Hy4,
     Ling,
     IQuest,
+    Glm,
     /// [`olmo3`], [`lfm2_5`]: Python calls.
     Olmo3,
     Lfm2_5,
@@ -462,6 +470,7 @@ impl Family {
             Self::SeedOss => seed_oss(),
             Self::Hy4 => hy4(),
             Self::Ling => ling(),
+            Self::Glm => glm(),
             Self::IQuest => iquest(),
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
@@ -482,10 +491,10 @@ impl Family {
             // `</think>` stays reasoning text and the fenced `<tool_call>` block stays content, as
             // the reference says.
             Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam | Self::KimiK3 => &[],
-            // Ling reads `<tool_call>` and `</think>`, so its two probes are the tagged ones'
-            // (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>` but not
-            // `<tool_call>`.
-            Self::Ling => KNOWN_TAGGED_DIFFERENCES,
+            // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
+            // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
+            // but not `<tool_call>`.
+            Self::Ling | Self::Glm => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 => KNOWN_REASONING_PROBE,
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
@@ -510,7 +519,7 @@ impl Family {
         let mut allowed = Vec::new();
         if matches!(
             self,
-            Self::Qwen3Tagged | Self::SeedOss | Self::Hy4 | Self::Ling | Self::IQuest
+            Self::Qwen3Tagged | Self::SeedOss | Self::Hy4 | Self::Ling | Self::IQuest | Self::Glm
         ) {
             allowed.push(Allowance::DeclaredTypeConflict);
         }
