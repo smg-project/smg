@@ -2,8 +2,11 @@
 //!
 //! URL attribution is unchanged: a late event after the same URL is registered
 //! again belongs to that URL. Events for absent URLs cannot recreate storage.
+//! Request counters use the model from the latest successful mutation among live
+//! registry owners; removing that owner restores the latest surviving owner.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt,
     sync::{
@@ -25,10 +28,65 @@ use parking_lot::RwLock;
 
 static INSTALLED: OnceLock<Weak<WorkerMetrics>> = OnceLock::new();
 
+struct RequestModel {
+    owner: Arc<()>,
+    model: Arc<str>,
+}
+
 struct Scope {
     url: Arc<str>,
+    public_label: Arc<str>,
+    request_models: RwLock<Vec<RequestModel>>,
     active: Arc<AtomicBool>,
     recorder: PrometheusRecorder,
+}
+
+impl Scope {
+    /// Resolve ownership using the raw URL, then transform only its public label.
+    fn metric_key<'a>(&self, key: &'a Key) -> Cow<'a, Key> {
+        if self.public_label == self.url {
+            return Cow::Borrowed(key);
+        }
+        Cow::Owned(Key::from_parts(
+            key.name().to_owned(),
+            key.labels()
+                .map(|label| {
+                    if label.key() == "worker" {
+                        metrics::Label::new("worker", self.public_label.clone())
+                    } else {
+                        label.clone()
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn record_request(&self, value: u64) {
+        // Keep the identity stable through registration and increment. A
+        // replacement cannot commit between choosing the model and recording.
+        let models = self.request_models.read();
+        self.record_request_with_models(&models, value);
+    }
+
+    fn record_request_with_models(&self, models: &[RequestModel], value: u64) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(current) = models.last() else {
+            return;
+        };
+        let key = Key::from_parts(
+            "smg_worker_requests_total",
+            vec![
+                metrics::Label::new("worker", self.url.clone()),
+                metrics::Label::new("model", current.model.clone()),
+            ],
+        );
+        let metadata = Metadata::new(module_path!(), metrics::Level::INFO, Some(module_path!()));
+        self.recorder
+            .register_counter(self.metric_key(&key).as_ref(), &metadata)
+            .increment(value);
+    }
 }
 
 struct OwnedScope {
@@ -55,11 +113,34 @@ impl fmt::Debug for WorkerMetrics {
 pub(crate) struct WorkerMetricsLease {
     metrics: Weak<WorkerMetrics>,
     url: Arc<str>,
+    owner: Arc<()>,
 }
 
 impl fmt::Debug for WorkerMetricsLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorkerMetricsLease").finish_non_exhaustive()
+    }
+}
+
+impl WorkerMetricsLease {
+    /// The write guard spans the registry insertion, making the model update
+    /// and publication one ordered operation for request-counter observers.
+    pub(crate) fn with_model_update<T>(&self, model: &str, commit: impl FnOnce() -> T) -> T {
+        let Some(metrics) = self.metrics.upgrade() else {
+            return commit();
+        };
+        let Some(scope) = metrics.scope(&self.url) else {
+            return commit();
+        };
+        let mut models = scope.request_models.write();
+        models.retain(|entry| !Arc::ptr_eq(&entry.owner, &self.owner));
+        models.push(RequestModel {
+            owner: self.owner.clone(),
+            model: super::metrics::intern_model_label(model),
+        });
+        let result = commit();
+        scope.record_request_with_models(&models, 0);
+        result
     }
 }
 
@@ -71,8 +152,11 @@ impl Drop for WorkerMetricsLease {
         let retired = match metrics.scopes.entry(self.url.clone()) {
             Entry::Occupied(mut entry) => {
                 entry.get_mut().owners -= 1;
+                let mut models = entry.get().scope.request_models.write();
+                models.retain(|model| !Arc::ptr_eq(&model.owner, &self.owner));
                 if entry.get().owners == 0 {
                     entry.get().scope.active.store(false, Ordering::Release);
+                    drop(models);
                     Some(entry.remove().scope)
                 } else {
                     None
@@ -99,6 +183,8 @@ impl WorkerMetrics {
             Entry::Vacant(entry) => {
                 let scope = Arc::new(Scope {
                     url: Arc::from(url),
+                    public_label: super::worker_identity::public_worker_label(url),
+                    request_models: RwLock::new(Vec::new()),
                     active: Arc::new(AtomicBool::new(true)),
                     recorder: (self.factory)(),
                 });
@@ -112,6 +198,7 @@ impl WorkerMetrics {
         WorkerMetricsLease {
             metrics: Arc::downgrade(self),
             url: scope.url.clone(),
+            owner: Arc::new(()),
         }
     }
 
@@ -139,6 +226,18 @@ pub(crate) fn acquire_registered_worker(url: &str) -> Option<WorkerMetricsLease>
         .get()?
         .upgrade()
         .map(|metrics| metrics.acquire(url))
+}
+
+/// Return true when the installed lifecycle handled the write, including an
+/// absent URL. Only standalone recorders fall back to the caller's model.
+pub(crate) fn record_registered_request(url: &str, value: u64) -> bool {
+    let Some(metrics) = INSTALLED.get().and_then(Weak::upgrade) else {
+        return false;
+    };
+    if let Some(scope) = metrics.scope(url) {
+        scope.record_request(value);
+    }
+    true
 }
 
 pub(crate) fn worker_label(url: &str) -> Arc<str> {
@@ -258,7 +357,9 @@ impl Recorder for WorkerRecorder {
         self.workers.scope(url).map_or_else(Counter::noop, |scope| {
             Counter::from_arc(Arc::new(ActiveCounter {
                 active: scope.active.clone(),
-                inner: scope.recorder.register_counter(key, metadata),
+                inner: scope
+                    .recorder
+                    .register_counter(scope.metric_key(key).as_ref(), metadata),
             }))
         })
     }
@@ -269,7 +370,9 @@ impl Recorder for WorkerRecorder {
         self.workers.scope(url).map_or_else(Gauge::noop, |scope| {
             Gauge::from_arc(Arc::new(ActiveGauge {
                 active: scope.active.clone(),
-                inner: scope.recorder.register_gauge(key, metadata),
+                inner: scope
+                    .recorder
+                    .register_gauge(scope.metric_key(key).as_ref(), metadata),
             }))
         })
     }
@@ -282,7 +385,9 @@ impl Recorder for WorkerRecorder {
             .map_or_else(Histogram::noop, |scope| {
                 Histogram::from_arc(Arc::new(ActiveHistogram {
                     active: scope.active.clone(),
-                    inner: scope.recorder.register_histogram(key, metadata),
+                    inner: scope
+                        .recorder
+                        .register_histogram(scope.metric_key(key).as_ref(), metadata),
                 }))
             })
     }
@@ -481,6 +586,159 @@ mod tests {
         assert!(rendered.contains("smg_tokio_worker_busy_ratio{worker=\"0\"} 0.5"));
         assert!(!rendered.contains("http://absent-worker"));
         assert!(recorder.workers.scopes.is_empty());
+    }
+
+    #[test]
+    fn request_recording_waits_for_the_registry_model_commit() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let recorder = recorder();
+        let url = "http://request-model-commit-order";
+        let lease = recorder.workers.acquire(url);
+        lease.with_model_update("before", || {});
+        let scope = recorder.workers.scope(url).unwrap();
+        scope.record_request(1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        thread::scope(|threads| {
+            lease.with_model_update("after", || {
+                threads.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    scope.record_request(1);
+                    finished_tx.send(()).unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(
+                    finished_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                    "dispatch crossed an uncommitted model replacement"
+                );
+            });
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let rendered = recorder.handle().render();
+        assert!(rendered
+            .lines()
+            .any(|line| line.starts_with("smg_worker_requests_total{")
+                && line.contains("model=\"before\"")
+                && line.ends_with(" 1")));
+        assert!(rendered
+            .lines()
+            .any(|line| line.starts_with("smg_worker_requests_total{")
+                && line.contains("model=\"after\"")
+                && line.ends_with(" 1")));
+    }
+
+    #[test]
+    fn repeated_replacements_keep_only_live_owner_metadata() {
+        let recorder = recorder();
+        let url = "http://request-model-owner-storage";
+        let first = recorder.workers.acquire(url);
+        let second = recorder.workers.acquire(url);
+        let scope = recorder.workers.scope(url).unwrap();
+        for _ in 0..100 {
+            first.with_model_update("first", || {});
+            second.with_model_update("second", || {});
+        }
+        assert_eq!(scope.request_models.read().len(), 2);
+        drop(first);
+        assert_eq!(scope.request_models.read().len(), 1);
+        drop(second);
+        assert!(scope.request_models.read().is_empty());
+        assert!(recorder.workers.scopes.is_empty());
+        scope.record_request(1);
+        assert!(!recorder.handle().render().contains(url));
+    }
+
+    #[test]
+    fn standalone_request_counter_keeps_the_supplied_model() {
+        use super::super::metrics::Metrics;
+
+        let flat = PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&flat, || {
+            Metrics::initialize_worker_request_series(
+                "http://standalone-request-model",
+                "standalone-model",
+            );
+            Metrics::record_worker_request("http://standalone-request-model", "standalone-model");
+        });
+        let rendered = flat.handle().render();
+        assert!(rendered
+            .lines()
+            .any(|line| line.starts_with("smg_worker_requests_total{")
+                && line.contains("model=\"standalone-model\"")
+                && line.ends_with(" 1")));
+    }
+
+    #[test]
+    fn sensitive_worker_labels_are_private_distinct_and_retire_with_their_scope() {
+        let recorder = recorder();
+        let first_url =
+            "https://alice:private-one@example.com:8443/v1?token=secret-query#private-fragment";
+        let second_url =
+            "https://alice:private-two@example.com:8443/v1?token=secret-query#private-fragment";
+        let first = recorder.workers.acquire(first_url);
+        let second = recorder.workers.acquire(second_url);
+        for url in [first_url, second_url] {
+            metrics::with_local_recorder(&recorder, || {
+                metrics::counter!("smg_worker_cb_outcomes_total", "worker" => url, "outcome" => "failure").increment(1);
+                metrics::gauge!("smg_worker_health", "worker" => url).set(1.0);
+                metrics::histogram!("smg_kv_event_lag_seconds", "worker" => url).record(0.001);
+            });
+        }
+        let rendered = recorder.handle().render();
+        for secret in [
+            "alice",
+            "private-one",
+            "private-two",
+            "secret-query",
+            "private-fragment",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "scrape exposed sensitive worker identity"
+            );
+        }
+        let labels: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_worker_health{"))
+            .map(|line| {
+                line.split("worker=\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(labels.len(), 2, "distinct authenticated backends merged");
+        assert_ne!(labels[0], labels[1]);
+        for family in [
+            "smg_worker_cb_outcomes_total{",
+            "smg_worker_health{",
+            "smg_kv_event_lag_seconds_count{",
+        ] {
+            for label in &labels {
+                assert!(
+                    rendered.lines().any(|line| line.starts_with(family)
+                        && line.contains(&format!("worker=\"{label}\""))),
+                    "worker families used different public identities"
+                );
+            }
+        }
+        drop(first);
+        let remaining = recorder.handle().render();
+        assert_eq!(
+            remaining
+                .lines()
+                .filter(|line| line.starts_with("smg_worker_health{"))
+                .count(),
+            1
+        );
+        drop(second);
+        assert!(recorder.workers.scopes.is_empty());
+        assert!(!recorder.handle().render().contains("smg_worker_health{"));
     }
 
     #[test]

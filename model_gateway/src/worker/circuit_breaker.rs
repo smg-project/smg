@@ -6,7 +6,7 @@ use std::{
 use parking_lot::Mutex;
 use tracing::info;
 
-use crate::observability::metrics::Metrics;
+use crate::observability::{metrics::Metrics, worker_identity::public_worker_label};
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,7 +200,7 @@ impl CircuitBreaker {
                     self.consecutive_successes.store(0, Ordering::Release);
 
                     info!(
-                        worker_url = %self.metric_label,
+                        worker_url = %public_worker_label(&self.metric_label),
                         from = "open",
                         to = "half_open",
                         "Circuit breaker state transition: open -> half_open"
@@ -247,7 +247,7 @@ impl CircuitBreaker {
             CircuitState::Closed => {}
             CircuitState::Open => {
                 tracing::warn!(
-                    worker_url = %self.metric_label,
+                    worker_url = %public_worker_label(&self.metric_label),
                     "Success recorded while circuit is open"
                 );
             }
@@ -303,7 +303,7 @@ impl CircuitBreaker {
             let from = old_state.as_str();
             let to = new_state.as_str();
             info!(
-                worker_url = %self.metric_label,
+                worker_url = %public_worker_label(&self.metric_label),
                 from,
                 to,
                 "Circuit breaker state transition: {from} -> {to}"
@@ -453,6 +453,54 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn circuit_breaker_logs_hide_sensitive_worker_identity() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let writer = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let cb = CircuitBreaker::with_config_and_label(
+                CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    success_threshold: 1,
+                    timeout_duration: Duration::ZERO,
+                    ..Default::default()
+                },
+                "http://alice:password@localhost:8080?token=secret".into(),
+            );
+            cb.record_failure();
+            cb.record_success();
+            assert_eq!(cb.state(), CircuitState::HalfOpen);
+            cb.record_success();
+            assert_eq!(cb.state(), CircuitState::Closed);
+        });
+        let logs = String::from_utf8(bytes.lock().clone()).unwrap();
+        assert!(logs.contains("worker_url=worker:"));
+        assert!(logs.contains("Success recorded while circuit is open"));
+        assert!(logs.contains("open -> half_open"));
+        for secret in ["alice", "password", "secret", "localhost", "token="] {
+            assert!(
+                !logs.contains(secret),
+                "sensitive worker data leaked in logs"
+            );
+        }
+    }
 
     #[test]
     fn test_circuit_breaker_initial_state() {

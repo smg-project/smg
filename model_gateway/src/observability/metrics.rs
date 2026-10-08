@@ -165,6 +165,12 @@ pub(crate) const KV_INDEX_MICRO_BUCKETS: &[f64] = &[
     0.262_144,
 ];
 
+/// Publisher-to-index wall-clock age, including queueing, reconnects and replay.
+/// This is not the microsecond CPU cost of an index lookup or event application.
+pub(crate) const KV_EVENT_LAG_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
 /// Call this before [`start_prometheus`] only from a binary or extension that
@@ -374,7 +380,8 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_kv_event_subscription_state",
         "KV event subscription state by worker: 0=connecting/reconnecting, \
-         1=connected, -1=unsupported, -2=failed, -3=removed"
+         1=connected, -1=unsupported, -2=failed, -3=stopped; \
+         absent after final worker deregistration"
     );
     describe_counter!(
         "smg_kv_event_batches_total",
@@ -795,7 +802,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> MetricsHandle {
             .expect("failed to set KV index lookup buckets")
             .set_buckets_for_metric(kv_apply_matcher, KV_INDEX_MICRO_BUCKETS)
             .expect("failed to set KV event apply buckets")
-            .set_buckets_for_metric(kv_lag_matcher, KV_INDEX_MICRO_BUCKETS)
+            .set_buckets_for_metric(kv_lag_matcher, KV_EVENT_LAG_BUCKETS)
             .expect("failed to set KV event lag buckets")
             .build_recorder()
     });
@@ -1680,6 +1687,9 @@ impl Metrics {
 
     /// Register a real worker/model baseline without changing an existing total.
     pub fn initialize_worker_request_series(worker_url: &str, model_id: &str) {
+        if super::worker_metrics::record_registered_request(worker_url, 0) {
+            return;
+        }
         counter!(
             "smg_worker_requests_total",
             "worker" => super::worker_metrics::worker_label(worker_url),
@@ -1690,7 +1700,12 @@ impl Metrics {
 
     /// Count one polled upstream dispatch attempt, including transport failure.
     /// Selection, admission, response chunks, and health traffic do not count.
+    /// Installed worker scopes use the latest live registration model; model_id
+    /// is retained as the fallback for standalone recorders.
     pub fn record_worker_request(worker_url: &str, model_id: &str) {
+        if super::worker_metrics::record_registered_request(worker_url, 1) {
+            return;
+        }
         counter!(
             "smg_worker_requests_total",
             "worker" => super::worker_metrics::worker_label(worker_url),

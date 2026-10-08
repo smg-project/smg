@@ -144,6 +144,9 @@ struct WorkerSubscription {
 /// Ids for [`WorkerSubscription`]s, unique within the process.
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Status of the KV subscription while a registry owns the worker metrics.
+/// Stopping the subscription can leave a stopped sample for a live worker;
+/// final registry removal retires the entire series instead of keeping a tombstone.
 #[derive(Clone, Copy)]
 #[repr(i8)]
 enum SubscriptionState {
@@ -151,7 +154,7 @@ enum SubscriptionState {
     Connected = 1,
     Unsupported = -1,
     Failed = -2,
-    Removed = -3,
+    Stopped = -3,
 }
 
 impl SubscriptionState {
@@ -451,7 +454,7 @@ impl KvEventMonitor {
         }
         // Publish before freeing the slot, so a new subscription under this
         // URL cannot have its status overwritten by the departing task.
-        SubscriptionState::Removed.record(worker_url);
+        SubscriptionState::Stopped.record(worker_url);
         handles.remove(worker_url);
         // Under the slot lock, which `on_worker_added` holds from its lookup
         // of the model's index to its insert: an add of the model racing

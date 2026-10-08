@@ -63,19 +63,40 @@ fn installed_recorder_exports_kv_event_lag_as_histogram() {
     registry
         .register(Arc::new(BasicWorkerBuilder::new(worker).build()))
         .unwrap();
-    for lag in [0.0, 0.000_001_5, 0.000_1, 0.01, 0.2, 2.0] {
+    for lag in [0.0, 0.001_5, 0.01, 0.2, 2.0, 20.0, 60.0, 90.0] {
         Metrics::record_kv_event_lag(worker, lag);
     }
+    Metrics::record_kv_event_apply(worker, 0.000_001_5);
+    Metrics::record_kv_index_lookup("lag-bucket-isolation", 0.000_001_5);
     let rendered = handle.render();
 
+    for (name, label) in [
+        ("smg_kv_event_apply_seconds", format!("worker=\"{worker}\"")),
+        (
+            "smg_kv_index_lookup_seconds",
+            "index=\"lag-bucket-isolation\"".to_string(),
+        ),
+    ] {
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.starts_with(&format!("{name}_bucket{{"))
+                    && line.contains(&label)
+                    && line.contains("le=\"0.000002\"")
+                    && line.ends_with(" 1")),
+            "lookup/apply must retain microsecond buckets: {rendered}"
+        );
+    }
     assert!(rendered.contains("# TYPE smg_kv_event_lag_seconds histogram\n"));
     for (bound, count) in [
-        ("0.0000005", 1),
-        ("0.000002", 2),
-        ("0.000128", 3),
-        ("0.016384", 4),
-        ("0.262144", 5),
-        ("+Inf", 6),
+        ("0.001", 1),
+        ("0.005", 2),
+        ("0.01", 3),
+        ("0.25", 4),
+        ("2.5", 5),
+        ("30", 6),
+        ("60", 7),
+        ("+Inf", 8),
     ] {
         assert!(
             rendered.lines().any(|line| {
@@ -90,8 +111,21 @@ fn installed_recorder_exports_kv_event_lag_as_histogram() {
     assert!(rendered.lines().any(|line| {
         line.starts_with("smg_kv_event_lag_seconds_count{")
             && line.contains(&format!("worker=\"{worker}\""))
-            && line.ends_with(" 6")
+            && line.ends_with(" 8")
     }));
+    let sum = rendered
+        .lines()
+        .find(|line| {
+            line.starts_with("smg_kv_event_lag_seconds_sum{")
+                && line.contains(&format!("worker=\"{worker}\""))
+        })
+        .unwrap()
+        .rsplit_once(' ')
+        .unwrap()
+        .1
+        .parse::<f64>()
+        .unwrap();
+    assert!((sum - 172.2115).abs() < 1e-9);
     assert!(!rendered.lines().any(|line| {
         line.starts_with("smg_kv_event_lag_seconds{") && line.contains("quantile=")
     }));

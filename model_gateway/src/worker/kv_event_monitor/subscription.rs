@@ -719,12 +719,14 @@ mod tests {
     /// A backend without KV events remains usable for generation, but its
     /// inability to feed cache-aware routing must be visible to a scraper.
     #[tokio::test]
-    async fn unsupported_subscription_is_visible_until_worker_removal() {
+    async fn flat_recorder_tracks_unsupported_and_stopped_subscription() {
         use metrics_exporter_prometheus::PrometheusBuilder;
         use tokio_stream::wrappers::TcpListenerStream;
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
+        // This flat recorder checks subscription state transitions only. Actual
+        // registry ownership and retirement are covered by kv_subscription_status_test.
         // This test and its subscription task use the same current-thread runtime.
         let _recorder = metrics::set_default_local_recorder(&recorder);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -760,11 +762,11 @@ mod tests {
         assert!(worker.is_healthy());
 
         monitor.on_worker_removed(worker.url()).await;
-        let removed = format!("{metric} -3");
-        assert!(handle.render().lines().any(|line| line == removed));
+        let stopped = format!("{metric} -3");
+        assert!(handle.render().lines().any(|line| line == stopped));
 
         // Re-registration must get a fresh status, and stopping the monitor
-        // must retire even a subscription task that has already exited.
+        // must stop even a subscription task that has already exited.
         monitor.on_worker_added(&worker).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -777,7 +779,7 @@ mod tests {
         .await
         .expect("re-registered worker reports its own subscription status");
         monitor.stop().await;
-        assert!(handle.render().lines().any(|line| line == removed));
+        assert!(handle.render().lines().any(|line| line == stopped));
         server.abort();
         let _ = server.await;
     }

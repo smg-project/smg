@@ -1394,10 +1394,15 @@ impl WorkerRegistry {
 
         // Overwrite worker object atomically. The membership-order read
         // guard keeps the rebuild scan from interleaving with this write.
-        {
+        let commit = || {
             let _order = self.global_membership_order.read();
             self.workers.insert(worker_id.clone(), new_worker.clone());
             self.bump_global_routing_epoch();
+        };
+        if let Some(lease) = self.metric_leases.get(worker_id) {
+            lease.with_model_update(new_worker.model_id(), commit);
+        } else {
+            commit();
         }
 
         // The replacement carries its own backend-client slot, so the old
@@ -1931,7 +1936,6 @@ impl WorkerRegistry {
                 worker.connection_mode().as_metric_label(),
             );
             Metrics::initialize_worker_cb_series(worker.url());
-            Metrics::initialize_worker_request_series(worker.url(), worker.model_id());
             for reason in [
                 super::worker::StallReason::Unreachable,
                 super::worker::StallReason::Wedged,
@@ -1957,10 +1961,15 @@ impl WorkerRegistry {
 
         // The membership-order read guard keeps the rebuild scan from
         // interleaving with this write.
-        {
+        let commit = || {
             let _order = self.global_membership_order.read();
             self.workers.insert(worker_id.clone(), worker.clone());
             self.bump_global_routing_epoch();
+        };
+        if let Some(lease) = self.metric_leases.get(&worker_id) {
+            lease.with_model_update(worker.model_id(), commit);
+        } else {
+            commit();
         }
 
         // Update model index for O(1) lookups using copy-on-write.
