@@ -184,6 +184,9 @@ struct CallMarkers<'a> {
     block: Option<Block<'a>>,
     call_open: &'a str,
     call_close: &'a str,
+    /// The terminals the table has a row for out of the arguments state, in the order of the
+    /// rows, each once: what the engine takes wherever it stands inside a call, a value included.
+    call_exits: Vec<&'a str>,
 }
 
 /// A block of calls: its wrapper state, and the terminals into and out of it.
@@ -442,10 +445,21 @@ impl Format {
             }
             None => None,
         };
+        let mut call_exits: Vec<&str> = Vec::new();
+        for (_, on, _) in self
+            .transitions()
+            .filter(|&(source, _, _)| source == arguments)
+        {
+            let text = self.terminal_text(on);
+            if !call_exits.contains(&text) {
+                call_exits.push(text);
+            }
+        }
         Some(CallMarkers {
             block,
             call_open: call.open,
             call_close: call.close,
+            call_exits,
         })
     }
 

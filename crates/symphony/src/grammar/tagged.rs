@@ -6,18 +6,19 @@
 //! A call is the call's opener, a newline, `<function=NAME>` and a newline; then one parameter per
 //! property of the tool's schema, in the schema's order, each optional unless the schema requires
 //! it: `<parameter=KEY>`, the value, `</parameter>` and a newline; then `</function>`, a newline
-//! and the call's close. A newline may stand on either side of the value: Qwen 3.5's template puts
-//! the value on a line of its own, Seed-OSS's and MiMo's write it between the tags directly, and
-//! the assembler takes one newline away on each side when it is there.
+//! and the call's close. A newline may stand on either side of a pinned value: Qwen 3.5's template
+//! puts the value on a line of its own, Seed-OSS's and MiMo's write it between the tags directly,
+//! and the assembler takes one newline away on each side when it is there; a value written as text
+//! takes those newlines into the text, and the assembler takes them away all the same.
 //!
 //! The value follows the property's type. A string is written as it is, any text up to the
-//! parameter's close or a marker that ends the call. A number is JSON. A boolean or null is JSON
-//! or Python's word (`True`, `False`, `None`), both of which the templates write and the assembler
-//! reads. An object or a list is JSON the property's schema accepts where the template writes
-//! JSON (Qwen's `tojson`), and any text where the template writes Python's repr (Seed-OSS's
-//! `str`), which the assembler reads as the JSON it stands for ([`Spelling`]). A property without
-//! a type, or a schema without properties, takes any text. When the calls sit in a block, the
-//! block's ways in frame one or more calls, as Kimi K3's do.
+//! parameter's close or a terminal the table leaves the call on. A number is JSON. A boolean or
+//! null is JSON or Python's word (`True`, `False`, `None`), both of which the templates write and
+//! the assembler reads. An object or a list is JSON the property's schema accepts where the
+//! template writes JSON (Qwen's `tojson`), and any text where the template writes Python's repr
+//! (Seed-OSS's `str`), which the assembler reads as the JSON it stands for ([`Spelling`]). A
+//! property without a type, or a schema without properties, takes any text. When the calls sit in a
+//! block, the block's ways in frame one or more calls, as Kimi K3's do.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -45,9 +46,7 @@ pub(super) fn calls(
 ) -> Grammar {
     let values = Values {
         spelling,
-        call_open: markers.call_open,
-        call_close: markers.call_close,
-        block_close: markers.block.as_ref().map(|block| block.close),
+        call_exits: &markers.call_exits,
     };
     let calls = tools.iter().map(|tool| {
         call(
@@ -88,38 +87,49 @@ pub(super) fn calls(
 }
 
 /// How a table's values are written: the family's spelling of what is not a string, and the
-/// markers that end a value's text, which the engine takes wherever they stand (the call's opener
-/// among them, since a call opened before the last closed ends it).
+/// terminals the table has a row for out of the arguments state, which the engine takes wherever
+/// they stand inside a call (the call's close, its opener where a new call ends the one open, a
+/// block's close where it ends a call).
 struct Values<'a> {
     spelling: Spelling,
-    call_open: &'a str,
-    call_close: &'a str,
-    block_close: Option<&'a str>,
+    call_exits: &'a [&'a str],
+}
+
+/// A parameter's value, and whether a newline may stand on either side of it: a value written as
+/// text takes any newline into the text, a pinned value (JSON, a word, one of an enum's values)
+/// has the template's newline beside it or not, as the checkpoint writes it.
+struct Slot {
+    value: Grammar,
+    newlines: bool,
 }
 
 impl Values<'_> {
-    /// A value written as it is: any text up to the parameter's close or a marker that ends the
+    /// A value written as it is: any text up to the parameter's close or a terminal that ends the
     /// call.
-    fn text(&self) -> Grammar {
-        let mut excludes = vec![
-            PARAMETER_CLOSE.to_string(),
-            self.call_open.to_string(),
-            self.call_close.to_string(),
-        ];
-        excludes.extend(self.block_close.map(str::to_string));
-        Grammar::AnyText { excludes }
+    fn text(&self) -> Slot {
+        let mut excludes = vec![PARAMETER_CLOSE.to_string()];
+        excludes.extend(self.call_exits.iter().map(|exit| exit.to_string()));
+        Slot {
+            value: Grammar::AnyText { excludes },
+            newlines: false,
+        }
     }
 
     /// The value of a property, by the type its schema pins and the family's spelling.
-    fn of(&self, property: &Value, definitions: Definitions<'_>) -> Grammar {
-        match shape(property, definitions, || self.text()) {
-            Some(("boolean", _)) => words(json!({"type": "boolean"}), ["True", "False"]),
-            Some(("null", _)) => words_only(["null", "None"]),
-            Some(("object" | "array", pinned)) => match self.spelling {
-                Spelling::Json => pinned,
+    fn of(&self, property: &Value, definitions: Definitions<'_>) -> Slot {
+        let pinned = |value| Slot {
+            value,
+            newlines: true,
+        };
+        match shape(property, definitions, || self.text().value) {
+            Some(("string", _)) => self.text(),
+            Some(("boolean", _)) => pinned(words(json!({"type": "boolean"}), ["True", "False"])),
+            Some(("null", _)) => pinned(words_only(["null", "None"])),
+            Some(("object" | "array", value)) => match self.spelling {
+                Spelling::Json => pinned(value),
                 Spelling::Python => self.text(),
             },
-            Some((_, pinned)) => pinned,
+            Some((_, value)) => pinned(value),
             None => self.text(),
         }
     }
@@ -178,19 +188,22 @@ fn arguments(values: &Values<'_>, parameters: &Value) -> Grammar {
     })
 }
 
-/// One parameter: the opening tag with the key, the value with a newline allowed on either side,
-/// the close and a newline.
-fn argument(key: Grammar, value: Grammar) -> Grammar {
-    let newline = || Grammar::Optional(Box::new(Grammar::ConstString("\n".to_string())));
-    Grammar::Sequence(vec![
+/// One parameter: the opening tag with the key, the value (a newline allowed on either side of a
+/// pinned one), the close and a newline.
+fn argument(key: Grammar, slot: Slot) -> Grammar {
+    let mut elements = vec![
         Grammar::ConstString(PARAMETER_OPEN.to_string()),
         key,
         Grammar::ConstString(">".to_string()),
-        newline(),
-        value,
-        newline(),
-        Grammar::ConstString(format!("{PARAMETER_CLOSE}\n")),
-    ])
+    ];
+    let newline = || Grammar::Optional(Box::new(Grammar::ConstString("\n".to_string())));
+    if slot.newlines {
+        elements.extend([newline(), slot.value, newline()]);
+    } else {
+        elements.push(slot.value);
+    }
+    elements.push(Grammar::ConstString(format!("{PARAMETER_CLOSE}\n")));
+    Grammar::Sequence(elements)
 }
 
 /// A parameter with any key and any value.
@@ -240,7 +253,8 @@ mod tests {
         ]
     }
 
-    /// A parameter slot as the tag writes it: the tag with the key, the value, the close.
+    /// A parameter slot as the tag writes it: the tag with the key, a pinned value with a newline
+    /// allowed on either side, the close.
     fn slot(key: &str, value: Value) -> Value {
         let newline =
             value!({"type": "optional", "content": {"type": "const_string", "value": "\n"}});
@@ -269,8 +283,9 @@ mod tests {
             .payload();
         let text = value!({
             "type": "any_text",
-            "excludes": ["</parameter>", "<tool_call>", "</tool_call>"],
+            "excludes": ["</parameter>", "</tool_call>", "<tool_call>"],
         });
+        let city = value!({"type": "const_string", "value": "city"});
         let days =
             value!({"type": "json_schema", "json_schema": {"type": "integer", "minimum": 1}});
         let metric = value!({"type": "or", "elements": [
@@ -291,7 +306,7 @@ mod tests {
                         "type": "tag",
                         "begin": "<tool_call>\n<function=get_weather>\n",
                         "content": {"type": "sequence", "elements": [
-                            slot("city", text.clone()),
+                            text_slot(city, text.clone()),
                             slot("days", days),
                             slot("metric", metric),
                             {"type": "optional", "content": slot("where", place)},
@@ -301,7 +316,10 @@ mod tests {
                     {
                         "type": "tag",
                         "begin": "<tool_call>\n<function=ping>\n",
-                        "content": {"type": "star", "content": slot_any(text)},
+                        "content": {"type": "star", "content": text_slot(
+                            value!({"type": "any_text", "excludes": [">"]}),
+                            text
+                        )},
                         "end": "</function>\n</tool_call>",
                     },
                 ],
@@ -310,11 +328,15 @@ mod tests {
         );
     }
 
-    /// The slot of a parameter with any key.
-    fn slot_any(text: Value) -> Value {
-        let mut slot = slot("", text);
-        slot["elements"][1] = value!({"type": "any_text", "excludes": [">"]});
-        slot
+    /// A parameter slot whose value is text: the text takes any newline into itself.
+    fn text_slot(key: Value, text: Value) -> Value {
+        value!({"type": "sequence", "elements": [
+            {"type": "const_string", "value": "<parameter="},
+            key,
+            {"type": "const_string", "value": ">"},
+            text,
+            {"type": "const_string", "value": "</parameter>\n"},
+        ]})
     }
 
     #[test]
@@ -337,15 +359,21 @@ mod tests {
         assert_eq!(weather["end"], "</function>\n</seed:tool_call>");
         let text = value!({
             "type": "any_text",
-            "excludes": ["</parameter>", "<seed:tool_call>", "</seed:tool_call>"],
+            "excludes": ["</parameter>", "</seed:tool_call>", "<seed:tool_call>"],
         });
         let slots = weather["content"]["elements"]
             .as_array()
             .expect("four slots");
-        assert_eq!(slots[0]["elements"][4], text);
-        assert_eq!(slots[2]["elements"][4]["type"], "or");
         assert_eq!(
-            slots[3]["content"]["elements"][4], text,
+            slots[0]["elements"][3], text,
+            "a string, no newline of its own"
+        );
+        assert_eq!(
+            slots[2]["elements"][4]["type"], "or",
+            "a boolean, newlines allowed"
+        );
+        assert_eq!(
+            slots[3]["content"]["elements"][3], text,
             "an object as Python's text"
         );
     }
