@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from smg_grpc_proto import sglang_scheduler_pb2 as pb
 
 
 def _module(name, **attrs):
@@ -222,6 +223,51 @@ def test_scheduler_launch_failure_never_starts_serving(monkeypatch, server_mod):
     grpc_server_factory.assert_not_called()
     health_servicer_factory.assert_not_called()
     warmup_thread_factory.assert_not_called()
+
+
+def test_generation_warmup_sends_valid_sampling_defaults(monkeypatch, server_mod):
+    """Proto scalar defaults must not leak into SGLang sampling validation."""
+    complete = Mock()
+    complete.HasField.return_value = True
+    stub = Mock()
+    stub.GetModelInfo.return_value = pb.GetModelInfoResponse(is_generation=True)
+    stub.Generate.return_value = [complete]
+    channel = Mock()
+
+    monkeypatch.setattr(
+        server_mod.grpc,
+        "insecure_channel",
+        Mock(return_value=channel),
+        raising=False,
+    )
+    monkeypatch.setattr(server_mod, "sglang_scheduler_pb2", pb)
+    monkeypatch.setattr(
+        server_mod,
+        "sglang_scheduler_pb2_grpc",
+        SimpleNamespace(SglangSchedulerStub=lambda _channel: stub),
+    )
+    monkeypatch.setattr(
+        server_mod,
+        "DisaggregationMode",
+        SimpleNamespace(NULL=SimpleNamespace(value="null")),
+    )
+    monkeypatch.setattr(server_mod.time, "sleep", lambda _seconds: None)
+
+    server_args = SimpleNamespace(
+        host="127.0.0.1",
+        port=30000,
+        disaggregation_mode="null",
+    )
+    assert server_mod._execute_grpc_server_warmup(server_args) is True
+
+    params = stub.Generate.call_args.args[0].sampling_params
+    assert params.temperature == 0.0
+    assert params.top_p == 1.0
+    assert params.top_k == 1
+    assert params.repetition_penalty == 1.0
+    assert params.n == 1
+    assert params.max_new_tokens == 8
+    channel.close.assert_called_once()
 
 
 def test_server_waits_for_scheduler_shutdown(monkeypatch, server_mod):
