@@ -253,10 +253,12 @@ mod tests {
 
     #[test]
     fn a_stream_cut_inside_a_call_ends_the_call_with_its_arguments_cut() {
-        let events = run(
-            PROMPT,
-            &["</think><tool_call>ChaDri_change_drink<arg_key>drink_id</arg_key><arg_value>lat"],
-        );
+        let output =
+            "</think><tool_call>ChaDri_change_drink<arg_key>drink_id</arg_key><arg_value>lat";
+        let events = run(PROMPT, &[output]);
+        assert_eq!(bytes(&events), output);
+        // The declared string streamed as it arrived and stays open: the client sees the cut.
+        assert_eq!(arguments_of(&events, 0), r#"{"drink_id": "lat"#);
         assert!(events.iter().any(|event| matches!(
             event,
             Event::ToolCallEnd { index: 0, source } if source.text.is_empty()

@@ -8,7 +8,7 @@
 //! blocks, each a call whose parameter tags type their own values. [`seed_oss()`] is the Qwen
 //! tagged syntax under Seed-OSS's own markers. [`hy4()`], [`ling()`] and [`iquest()`] write a
 //! call as its name and keyed arguments, each under its own markers; [`glm()`] is Ling's syntax
-//! with nothing between the tags, under GLM's markers. [`olmo3()`] and [`lfm2_5()`]
+//! with nothing between the tags, under GLM's turn opener. [`olmo3()`] and [`lfm2_5()`]
 //! write their calls as Python. [`xlam()`] is a bare JSON list of calls, or content.
 //! [`minimax_m3()`] is MiniMax M3: `<mm:think>` blocks, `<tool_call>` blocks of `invoke` blocks
 //! whose arguments are an XML tree, and a separator token the table ignores. [`kimi_k3()`] is

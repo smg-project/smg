@@ -705,8 +705,6 @@ const KNOWN_DIFFERENCES: &[KnownDifference] = &[
     },
 ];
 
-/// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
-/// reads as the thought's end.
 /// Probe cases bellwether refused for a slug, by the slug and the case's id after it: the listed
 /// difference cannot be among that slug's fixtures, so the check that the list has not rotted
 /// skips it there.
@@ -718,6 +716,8 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
     ),
 ];
 
+/// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
+/// reads as the thought's end.
 const REASONING_PROBE: KnownDifference = KnownDifference {
     id: "parse/reasoning-with-marker-text",
     reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every \

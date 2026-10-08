@@ -3,7 +3,8 @@
 //! request's tools, with the template's newline after the name and after `</arg_key>`. Everything
 //! else is content. The prompt opens the thought, and a turn opens with `<role>ASSISTANT</role>`,
 //! so the prompt's replay starts there. Recorded as `ling-3.0-flash` (inclusionAI/Ling-3.0-flash);
-//! GLM 4.5 and later write the same syntax.
+//! GLM 4.5 and 4.6 write the same syntax; GLM 4.7 and later write it with nothing between the
+//! tags, under their own turn opener ([`glm()`](super::glm())).
 
 use crate::{
     format::{CallSyntax, Emits, Format},
