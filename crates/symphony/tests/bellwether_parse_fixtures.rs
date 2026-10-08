@@ -182,6 +182,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         GenerationPrompt::AlwaysOpensTheThought,
     ),
     (
+        "qwen3-vl-8b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
         "qwen3-vl-30b-a3b-thinking",
         Family::Qwen3,
         GenerationPrompt::AlwaysOpensTheThought,
@@ -227,6 +232,12 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // writes tags and has no thought.
     // Qwen3.5-0.8B's template has no thought.
     ("qwen3.5-0.8b", Family::Qwen3Tagged, GenerationPrompt::Plain),
+    // Qwen3.5-2B's opens the thought only when the request asks for it.
+    (
+        "qwen3.5-2b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
     (
         "qwen3.5-4b",
         Family::Qwen3Tagged,
@@ -266,6 +277,18 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         "qwen3.8-27b",
         Family::Qwen3Tagged,
         GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.8-flash-next",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // Qwen3.8-2.4T-A95B's template opens the thought whatever the request says and raises on a
+    // request that turns thinking off, so bellwether refused those cases ([`REFUSED_PROBES`]).
+    (
+        "qwen3.8-2.4t-a95b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::AlwaysOpensTheThought,
     ),
     (
         "qwen3-coder-30b-a3b-instruct",
@@ -474,7 +497,7 @@ impl Family {
     /// The probe cases known to differ under this syntax: the code fence holds the JSON syntax,
     /// which the JSON assembler reads as a call and the tagged one reports as text between a
     /// call's tags.
-    fn known_differences(self, prompt: GenerationPrompt) -> Vec<KnownDifference> {
+    fn known_differences(self, slug: &str, prompt: GenerationPrompt) -> Vec<KnownDifference> {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
@@ -489,11 +512,14 @@ impl Family {
             Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 => KNOWN_REASONING_PROBE,
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
-        // A template without a thought leaves the reasoning out, so the marker inside it is never
-        // read; that case falls under the reasoning allowance instead of the list.
+        // A template that writes no thought for the probe's request leaves the reasoning out, so
+        // the marker inside it is never read; that case falls under the reasoning allowance, or
+        // was refused at record time, instead of the list. A probe a template refused outright is
+        // not among the slug's fixtures either.
         list.iter()
             .copied()
-            .filter(|known| prompt != GenerationPrompt::Plain || known.id != REASONING_PROBE.id)
+            .filter(|known| !prompt.writes_no_thought_unasked() || known.id != REASONING_PROBE.id)
+            .filter(|known| !REFUSED_PROBES.contains(&(slug, known.id)))
             .collect()
     }
 
@@ -544,6 +570,10 @@ enum GenerationPrompt {
     /// the request says; their templates have no switch, so the output always starts inside the
     /// thought.
     AlwaysOpensTheThought,
+    /// Qwen3.5-2B: `<think>\n` only when the request turns thinking on (`enable_thinking: true`);
+    /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
+    /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
+    OpensTheThoughtWhenAsked,
     /// Qwen3: nothing, and the model writes its own `<think>`; thinking off closes it in the
     /// prompt as above.
     ModelWritesTheThought,
@@ -560,18 +590,29 @@ impl GenerationPrompt {
     /// The bytes after the assistant header for the case's request, in the family's spelling of
     /// the thought's markers.
     fn tail(self, fixture: &Fixture, family: Family) -> String {
+        self.tail_for(&fixture.request, family)
+    }
+
+    fn tail_for(self, request: &Request, family: Family) -> String {
         let (open, close) = family.think_markers();
-        match (self, fixture.request.thinking_off()) {
+        let opened = format!("{open}\n");
+        let closed = format!("{open}\n\n{close}\n\n");
+        match (self, request.thinking_off()) {
             (Self::Plain | Self::ModelDecides, _) | (Self::ModelWritesTheThought, false) => {
                 String::new()
             }
-            (Self::OpensTheThought | Self::ModelWritesTheThought, true) => {
-                format!("{open}\n\n{close}\n\n")
-            }
-            (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => {
-                format!("{open}\n")
-            }
+            (Self::OpensTheThought | Self::ModelWritesTheThought, true) => closed,
+            (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => opened,
+            (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
+            (Self::OpensTheThoughtWhenAsked, _) => closed,
         }
+    }
+
+    /// Whether the template writes no thought for a request that leaves the switch alone: the
+    /// reasoning probe's does, so its reasoning is not in the output and the case is refused or
+    /// allowed, not listed.
+    fn writes_no_thought_unasked(self) -> bool {
+        matches!(self, Self::Plain | Self::OpensTheThoughtWhenAsked)
     }
 }
 
@@ -657,6 +698,17 @@ const KNOWN_DIFFERENCES: &[KnownDifference] = &[
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
 /// reads as the thought's end.
+/// Probe cases bellwether refused for a slug, by the slug and the case's id after it: the listed
+/// difference cannot be among that slug's fixtures, so the check that the list has not rotted
+/// skips it there.
+const REFUSED_PROBES: &[(&str, &str)] = &[
+    // Its template raises on a request that turns thinking off, and the content probe's does.
+    (
+        "qwen3.8-2.4t-a95b",
+        "parse/content-with-marker-in-code-fence",
+    ),
+];
+
 const REASONING_PROBE: KnownDifference = KnownDifference {
     id: "parse/reasoning-with-marker-text",
     reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every \
@@ -724,10 +776,17 @@ struct Request {
 
 impl Request {
     fn thinking_off(&self) -> bool {
+        self.enable_thinking() == Some(false)
+    }
+
+    fn thinking_on(&self) -> bool {
+        self.enable_thinking() == Some(true)
+    }
+
+    fn enable_thinking(&self) -> Option<bool> {
         self.chat_template_kwargs
             .as_ref()
             .and_then(|kwargs| kwargs.enable_thinking)
-            == Some(false)
     }
 }
 
@@ -887,7 +946,7 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
             &ids,
             &|fixture| family.engine(slug, fixture),
             &|fixture| prompt.tail(fixture, family),
-            &family.known_differences(prompt),
+            &family.known_differences(slug, prompt),
             &family.allowances(slug, prompt),
             family.think_markers(),
         ));
@@ -1636,6 +1695,41 @@ fn read_fixtures(dir: &std::path::Path) -> Result<Cases, String> {
         fixtures.extend(sampled(of_this_set, step_for(&file, every)));
     }
     Ok(Cases { fixtures, ids })
+}
+
+#[test]
+fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
+    let request = |kwargs: &str| -> Request {
+        serde_json::from_str(&format!("{{\"chat_template_kwargs\": {kwargs}}}")).expect("a request")
+    };
+    let when_asked = GenerationPrompt::OpensTheThoughtWhenAsked;
+    assert_eq!(
+        when_asked.tail_for(&request("{\"enable_thinking\": true}"), Family::Qwen3Tagged),
+        "<think>\n"
+    );
+    for unasked in ["{\"enable_thinking\": false}", "{}", "null"] {
+        assert_eq!(
+            when_asked.tail_for(&request(unasked), Family::Qwen3Tagged),
+            "<think>\n\n</think>\n\n",
+            "{unasked}"
+        );
+    }
+    // The default-on variant reads the same requests the other way round.
+    assert_eq!(
+        GenerationPrompt::OpensTheThought.tail_for(&request("null"), Family::Qwen3Tagged),
+        "<think>\n"
+    );
+    // A slug whose template refused a probe does not list it.
+    let listed: Vec<&str> = Family::Qwen3Tagged
+        .known_differences("qwen3.8-2.4t-a95b", GenerationPrompt::AlwaysOpensTheThought)
+        .iter()
+        .map(|known| known.id)
+        .collect();
+    assert_eq!(listed, [REASONING_PROBE.id]);
+    assert!(Family::Qwen3Tagged
+        .known_differences("qwen3.5-2b", when_asked)
+        .iter()
+        .all(|known| known.id != REASONING_PROBE.id));
 }
 
 #[test]
