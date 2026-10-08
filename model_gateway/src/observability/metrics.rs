@@ -250,6 +250,10 @@ pub(crate) fn init_metrics() {
         "Upstream backend HTTP responses by router_type, status_code, error_code"
     );
     describe_counter!(
+        "smg_router_upstream_send_retries_total",
+        "Single-shot resends after a pre-response transport failure, by router_type"
+    );
+    describe_counter!(
         "smg_router_request_buffers_released_early_bytes_total",
         "Serialized size of request buffers freed at dispatch instead of response completion (retries disabled)"
     );
@@ -317,6 +321,14 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_pd_prefill_admission_rejections_total",
         "Prefill admission rejections by reason"
+    );
+    describe_counter!(
+        "smg_pd_admission_waits_total",
+        "PD dispatches that waited for a decode admission slot"
+    );
+    describe_counter!(
+        "smg_pd_admission_sheds_total",
+        "PD dispatches shed because no decode admission slot freed in time"
     );
 
     // Layer 3: Worker metrics
@@ -502,6 +514,29 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
+    );
+    describe_counter!(
+        "smg_manual_policy_branch_total",
+        "Manual policy selection branch (no_healthy_workers, occupied_hit, occupied_miss, \
+         vacant, no_routing_id, cap_respill)"
+    );
+    describe_counter!(
+        "smg_consistent_hashing_policy_branch_total",
+        "Consistent hashing policy selection branch (no_healthy_workers, target_worker_hit, \
+         target_worker_miss, routing_key_hit, random_fallback)"
+    );
+    describe_counter!(
+        "smg_prefix_hash_policy_branch_total",
+        "Prefix hash policy selection branch (no_healthy_workers, no_routing_key, ring_hit, \
+         load_balance_walk, fallback_least_load)"
+    );
+    describe_counter!(
+        "smg_routing_key_source_total",
+        "Keyed requests by the source that supplied the sticky routing key"
+    );
+    describe_gauge!(
+        "smg_worker_routing_keys_active",
+        "Sticky routing keys currently held by a worker"
     );
     describe_gauge!(
         "smg_cache_tree_chars",
@@ -720,8 +755,6 @@ fn record_tokenizer_cache_activity_snapshot(stats: CacheActivityStats) {
     reason = "startup initialization — metrics exporter must be installed or the process cannot serve metrics"
 )]
 pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
-    init_metrics();
-
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket: Vec<f64> = config.duration_buckets.unwrap_or_else(|| {
         vec![
@@ -755,7 +788,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let kv_lookup_matcher = Matcher::Full(String::from("smg_kv_index_lookup_seconds"));
     let kv_apply_matcher = Matcher::Full(String::from("smg_kv_event_apply_seconds"));
 
-    PrometheusBuilder::new()
+    let handle = PrometheusBuilder::new()
         .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
@@ -783,7 +816,15 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
             ))]
             allocator_stats::start_reporting();
         })
-        .expect("failed to install Prometheus recorder")
+        .expect("failed to install Prometheus recorder");
+
+    // Descriptions are kept by whichever recorder is current when they are
+    // registered. Before `install_recorder()` that is the no-op recorder, so
+    // the `describe_*!` calls must run after it or `/metrics` has `# TYPE`
+    // lines but no `# HELP` text.
+    init_metrics();
+
+    handle
 }
 
 #[cfg(all(
