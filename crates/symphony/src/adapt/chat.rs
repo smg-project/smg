@@ -6,14 +6,16 @@
 //! driver wraps the choices in the response envelope (request id, model, timestamp, usage) and sets
 //! `matched_stop`, and `logprobs` where it has them, since the events carry neither.
 //!
-//! The shapes are the ones SMG's gateway sends today, the same fields in the same places:
+//! Event-local choices use the shared chat protocol types. A complete response driver
+//! is responsible for the initial role/empty-content envelope and repeated-role suppression:
 //!
-//! - content and reasoning deltas carry `role: "assistant"`; reasoning goes to `reasoning_content`;
+//! - event-local content and reasoning deltas carry `role: "assistant"`; reasoning serializes
+//!   through both `reasoning_content` and its `reasoning` alias;
 //! - a call begins with its `id`, `type: "function"` and `name` and no arguments; every later
 //!   fragment carries the call's `index` and `arguments` only;
 //! - the finishing choice has an empty delta without a role;
-//! - the whole message has `content` only when it is not whitespace, `reasoning_content` only when
-//!   there was reasoning, and `tool_calls` only when a call was made, each call with its id, name
+//! - the whole message has `content: null` when content is absent or only whitespace; reasoning
+//!   fields appear only when there was reasoning, and `tool_calls` only when a call was made, with its id, name
 //!   and its argument fragments joined.
 //!
 //! One rule for `finish_reason`, in both shapes: the engine's reason, except that `stop` after at
@@ -134,7 +136,7 @@ pub fn deltas<'a>(
 
 /// One message for the choice at `choice`, folded from a whole event sequence.
 ///
-/// `content` is every content and malformed text in order, absent when it is only whitespace;
+/// `content` is every content and malformed text in order, serialized as null when only whitespace;
 /// `reasoning_content` is every reasoning text, absent when there was none; `tool_calls` lists the
 /// calls in the order they started, absent when there was none; `finish_reason` is set by the
 /// `Finish` event, so a sequence without one gives a message that is not finished. Argument
@@ -237,7 +239,7 @@ mod tests {
             wire(delta(0, &Event::Content(Text::uncounted("Hello")))),
             json!({
                 "index": 0,
-                "delta": {"role": "assistant", "content": "Hello", "reasoning_content": null},
+                "delta": {"role": "assistant", "content": "Hello"},
                 "logprobs": null,
                 "finish_reason": null,
             })
@@ -245,12 +247,12 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_goes_to_reasoning_content() {
+    fn reasoning_serializes_under_both_compatible_names() {
         assert_eq!(
             wire(delta(0, &Event::Reasoning(Text::new("plan", 1)))),
             json!({
                 "index": 0,
-                "delta": {"role": "assistant", "reasoning_content": "plan"},
+                "delta": {"role": "assistant", "reasoning_content": "plan", "reasoning": "plan"},
                 "logprobs": null,
                 "finish_reason": null,
             })
@@ -277,7 +279,6 @@ mod tests {
                         "type": "function",
                         "function": {"name": "get_weather"},
                     }],
-                    "reasoning_content": null,
                 },
                 "logprobs": null,
                 "finish_reason": null,
@@ -299,7 +300,6 @@ mod tests {
                 "delta": {
                     "role": "assistant",
                     "tool_calls": [{"index": 1, "function": {"arguments": "{\"city\":"}}],
-                    "reasoning_content": null,
                 },
                 "logprobs": null,
                 "finish_reason": null,
@@ -318,7 +318,7 @@ mod tests {
             wire(delta(3, &finish)),
             json!({
                 "index": 3,
-                "delta": {"reasoning_content": null},
+                "delta": {},
                 "logprobs": null,
                 "finish_reason": "length",
             })
@@ -445,6 +445,7 @@ mod tests {
                         "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
                     }],
                     "reasoning_content": "plan more",
+                    "reasoning": "plan more",
                 },
                 "finish_reason": "tool_calls",
             })
@@ -452,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_only_content_and_absent_reasoning_and_calls_are_left_out() {
+    fn whitespace_only_content_is_null_and_absent_reasoning_and_calls_are_omitted() {
         let events = [
             Event::Content(Text::uncounted("  \n")),
             finish(FinishReason::Stop, 0),
@@ -461,7 +462,7 @@ mod tests {
             serde_json::to_value(message(0, &events)).expect("serializable"),
             json!({
                 "index": 0,
-                "message": {"role": "assistant", "reasoning_content": null},
+                "message": {"role": "assistant", "content": null},
                 "finish_reason": "stop",
             })
         );

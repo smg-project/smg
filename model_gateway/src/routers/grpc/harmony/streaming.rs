@@ -433,17 +433,28 @@ impl HarmonyStreamingProcessor {
                         .entry(index)
                         .or_insert_with(|| complete_wrapper.cached_tokens());
 
+                    // A router-side stop already closed this choice.
+                    if router_stopped.contains(&index) {
+                        continue;
+                    }
+                    if is_firsts.get(&index).copied().unwrap_or(true) {
+                        Self::emit_choice_initialization(
+                            index,
+                            dispatch,
+                            original_request,
+                            tx,
+                            &mut encoder,
+                        )
+                        .await?;
+                        is_firsts.insert(index, false);
+                    }
+
                     // Finalize parser and emit final chunk
                     if let Some(parser) = parsers.get_mut(&index) {
                         let matched_stop = matched_stops.get(&index).and_then(|m| m.clone());
 
                         let final_output =
                             parser.finalize(complete_wrapper.finish_reason().to_string());
-
-                        // A router-side stop already closed this choice.
-                        if router_stopped.contains(&index) {
-                            continue;
-                        }
 
                         // Release scanner-held text that never became a match.
                         let flushed = HarmonyChannelDelta {
@@ -476,6 +487,18 @@ impl HarmonyStreamingProcessor {
                             index,
                             &final_output.finish_reason,
                             matched_stop.as_ref(),
+                            dispatch,
+                            original_request,
+                            tx,
+                            &mut encoder,
+                        )
+                        .await?;
+                    } else {
+                        // A zero-token choice has no parser to finalize.
+                        Self::emit_final_chunk(
+                            index,
+                            complete_wrapper.finish_reason(),
+                            matched_stops.get(&index).and_then(Option::as_ref),
                             dispatch,
                             original_request,
                             tx,
@@ -562,24 +585,10 @@ impl HarmonyStreamingProcessor {
         encoder: &mut SseEncoder,
         logprobs: Option<ChatLogProbs>,
     ) -> Result<(), String> {
-        // On first chunk, emit role announcement separately
+        // Initialize each choice before its first content, reasoning, or tool delta.
         if is_first {
-            let role_chunk = ChatCompletionStreamResponse::builder(
-                &dispatch.request_id,
-                &original_request.model,
-            )
-            .created(dispatch.created)
-            .add_choice_role(index, "assistant")
-            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-            .build();
-
-            let sse_data = encoder
-                .encode_data(&role_chunk)
-                .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-            tx.send(Ok(sse_data))
-                .await
-                .map_err(|_| "Failed to send role chunk".to_string())?;
+            Self::emit_choice_initialization(index, dispatch, original_request, tx, encoder)
+                .await?;
         }
 
         // Emit content delta (role is always None for content chunks)
@@ -623,6 +632,27 @@ impl HarmonyStreamingProcessor {
             .map_err(|_| "Failed to send chunk".to_string())?;
 
         Ok(())
+    }
+
+    async fn emit_choice_initialization(
+        index: u32,
+        dispatch: &context::DispatchMetadata,
+        original_request: &ChatCompletionRequest,
+        tx: &SseSender,
+        encoder: &mut SseEncoder,
+    ) -> Result<(), String> {
+        let chunk =
+            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
+                .created(dispatch.created)
+                .add_choice_role(index, "assistant")
+                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+                .build();
+        let data = encoder
+            .encode_data(&chunk)
+            .map_err(|e| format!("JSON serialization error: {e}"))?;
+        tx.send(Ok(data))
+            .await
+            .map_err(|_| "Failed to send role chunk".to_string())
     }
 
     /// Emit final chunk with finish_reason
@@ -1322,7 +1352,118 @@ impl Default for HarmonyStreamingProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use serde_json::Value;
+
+    use super::{
+        super::types::{FunctionDelta, ToolCallDelta as HarmonyToolCallDelta},
+        *,
+    };
+
+    #[tokio::test]
+    async fn chat_envelope_harmony_initializes_tool_and_text_choices_once() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "harmony-test", "messages": [], "stream": true, "n": 2
+        }))
+        .unwrap();
+        let dispatch = context::DispatchMetadata {
+            request_id: "chatcmpl-harmony-envelope".into(),
+            model: "harmony-test".into(),
+            created: 1,
+            weight_version: None,
+        };
+        let tool_start = HarmonyChannelDelta {
+            analysis_delta: None,
+            final_delta: None,
+            commentary_delta: Some(HarmonyToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                function: Some(FunctionDelta {
+                    name: Some("lookup".into()),
+                    arguments: Some("{".into()),
+                }),
+            }),
+            is_final: false,
+        };
+        let tool_args = HarmonyChannelDelta {
+            commentary_delta: Some(HarmonyToolCallDelta {
+                index: 0,
+                id: None,
+                function: Some(FunctionDelta {
+                    name: None,
+                    arguments: Some("}".into()),
+                }),
+            }),
+            ..tool_start.clone()
+        };
+        let reasoning = HarmonyChannelDelta {
+            analysis_delta: Some("reason".into()),
+            commentary_delta: None,
+            final_delta: None,
+            is_final: false,
+        };
+        let content = HarmonyChannelDelta {
+            analysis_delta: None,
+            final_delta: Some("answer".into()),
+            ..reasoning.clone()
+        };
+        let (tx, mut rx) = sse_channel();
+        let mut encoder = SseEncoder::new();
+        for (index, first, delta) in [
+            (0, true, tool_start),
+            (1, true, reasoning),
+            (0, false, tool_args),
+            (1, false, content),
+        ] {
+            HarmonyStreamingProcessor::emit_chunk_delta(
+                &delta,
+                index,
+                first,
+                &dispatch,
+                &request,
+                &tx,
+                &mut encoder,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            let frame = frame.unwrap();
+            let text = std::str::from_utf8(&frame).unwrap();
+            let data = text.strip_prefix("data: ").unwrap().trim();
+            events.push(serde_json::from_str::<Value>(data).unwrap());
+        }
+        for index in [0, 1] {
+            let choices: Vec<_> = events
+                .iter()
+                .map(|event| &event["choices"][0])
+                .filter(|choice| choice["index"] == index)
+                .collect();
+            assert_eq!(
+                choices[0]["delta"],
+                json!({"role": "assistant", "content": ""})
+            );
+            for choice in &choices[1..] {
+                assert!(choice["delta"].get("role").is_none(), "{choice}");
+                assert!(
+                    choice["delta"]
+                        .get("reasoning_content")
+                        .is_none_or(Value::is_string),
+                    "{choice}"
+                );
+            }
+        }
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array())
+            .flatten()
+            .collect();
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "lookup");
+        assert_eq!(calls[1]["function"]["arguments"], "}");
+    }
 
     /// Compile-time exhaustiveness anchor.
     ///

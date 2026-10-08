@@ -60,6 +60,10 @@ impl ReasoningParser for Step3Parser {
         self.base.model_type()
     }
 
+    fn reasoning_token_boundaries(&self) -> Option<(&str, &str)> {
+        self.base.reasoning_token_boundaries()
+    }
+
     fn is_in_reasoning(&self) -> bool {
         self.base.is_in_reasoning()
     }

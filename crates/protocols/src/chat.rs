@@ -21,6 +21,77 @@ use crate::{
     validated::Normalizable,
 };
 
+#[cfg(test)]
+#[path = "chat_response_compat_tests.rs"]
+mod response_compat_tests;
+
+/// Keep one internal reasoning value while interoperating with both wire spellings.
+mod reasoning_wire {
+    use serde::{de::Error, ser::SerializeMap, Deserialize, Deserializer, Serializer};
+
+    #[derive(Deserialize, schemars::JsonSchema)]
+    pub(super) struct Fields {
+        /// Parsed reasoning text, using the established SMG/SGLang spelling.
+        reasoning_content: Option<String>,
+        /// Equivalent reasoning text, using the vLLM spelling.
+        reasoning: Option<String>,
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let Fields {
+            reasoning_content,
+            reasoning,
+        } = Fields::deserialize(deserializer)?;
+        match (reasoning_content, reasoning) {
+            (Some(content), Some(reasoning)) if content != reasoning => Err(D::Error::custom(
+                "reasoning and reasoning_content must match when both are provided",
+            )),
+            (Some(content), _) => Ok(Some(content)),
+            (_, reasoning) => Ok(reasoning),
+        }
+    }
+
+    #[expect(
+        clippy::ref_option,
+        reason = "serde field serializers borrow the field type"
+    )]
+    pub(super) fn serialize_response<S>(
+        value: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(if value.is_some() { 2 } else { 0 }))?;
+        if let Some(text) = value {
+            map.serialize_entry("reasoning_content", text)?;
+            map.serialize_entry("reasoning", text)?;
+        }
+        map.end()
+    }
+
+    #[expect(
+        clippy::ref_option,
+        reason = "serde field serializers borrow the field type"
+    )]
+    pub(super) fn serialize_request<S>(
+        value: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(usize::from(value.is_some())))?;
+        if let Some(text) = value {
+            map.serialize_entry("reasoning_content", text)?;
+        }
+        map.end()
+    }
+}
+
 // ============================================================================
 // Chat Messages
 // ============================================================================
@@ -53,7 +124,12 @@ pub enum ChatMessage {
         tool_calls: Option<Vec<ToolCall>>,
         /// Reasoning content for O1-style models (SGLang extension); vLLM's
         /// `reasoning` spelling is accepted on input.
-        #[serde(alias = "reasoning")]
+        #[serde(
+            flatten,
+            serialize_with = "reasoning_wire::serialize_request",
+            deserialize_with = "reasoning_wire::deserialize"
+        )]
+        #[schemars(with = "reasoning_wire::Fields")]
         reasoning_content: Option<String>,
         #[serde(flatten)]
         #[schemars(skip)]
@@ -880,10 +956,16 @@ impl ChatCompletionResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatCompletionMessage {
     pub role: String, // Always "assistant" for responses
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Serialized under both reasoning field names when present; omitted otherwise.
+    #[serde(
+        flatten,
+        serialize_with = "reasoning_wire::serialize_response",
+        deserialize_with = "reasoning_wire::deserialize"
+    )]
+    #[schemars(with = "reasoning_wire::Fields")]
     pub reasoning_content: Option<String>,
     // Note: function_call is deprecated and not included
     // Note: refusal, annotations, audio are not added yet
@@ -935,6 +1017,13 @@ pub struct ChatMessageDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+    /// Serialized under both reasoning field names when present; omitted otherwise.
+    #[serde(
+        flatten,
+        serialize_with = "reasoning_wire::serialize_response",
+        deserialize_with = "reasoning_wire::deserialize"
+    )]
+    #[schemars(with = "reasoning_wire::Fields")]
     pub reasoning_content: Option<String>,
 }
 

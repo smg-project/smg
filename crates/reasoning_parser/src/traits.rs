@@ -85,6 +85,13 @@ pub trait ReasoningParser: Send + Sync {
         false
     }
 
+    /// Literal control markers supported by token-ID usage accounting.
+    /// `None` means this parser needs format-specific accounting; callers must
+    /// not infer token counts by re-encoding its extracted text.
+    fn reasoning_token_boundaries(&self) -> Option<(&str, &str)> {
+        None
+    }
+
     /// Check if the parser is currently in reasoning mode.
     ///
     /// Returns true if the parser is currently parsing reasoning content.

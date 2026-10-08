@@ -232,10 +232,10 @@ impl VllmEngineClient {
         // Detokenization happens on the SMG Rust side (StopDecoder/Sequence).
         let skip_special_tokens = true;
 
-        // Map logprobs: if request.logprobs is true, use top_logprobs value (or 1 if not specified)
+        // Map logprobs: if request.logprobs is true, use the requested candidate count (zero when omitted)
         // OpenAI API only exposes output logprobs, not prompt logprobs, for chat completions
         let logprobs = if request.logprobs {
-            Some(request.top_logprobs.unwrap_or(1).min(20) as i32)
+            Some(request.top_logprobs.unwrap_or(0).min(20) as i32)
         } else {
             None
         };
@@ -779,6 +779,42 @@ mod tests {
             sampling_seed: None,
             rid: None,
             other: Default::default(),
+        }
+    }
+
+    #[test]
+    fn chat_logprobs_do_not_request_unwanted_candidates() {
+        for stream in [false, true] {
+            for (enabled, top, expected) in [
+                (true, None, Some(0)),
+                (true, Some(0), Some(0)),
+                (true, Some(2), Some(2)),
+                (false, None, None),
+                (false, Some(2), None),
+            ] {
+                let mut value = serde_json::json!({
+                    "model": "m", "messages": [], "logprobs": enabled, "stream": stream
+                });
+                if let Some(top) = top {
+                    value["top_logprobs"] = serde_json::json!(top);
+                }
+                let body: ChatCompletionRequest = serde_json::from_value(value).unwrap();
+                let request = VllmEngineClient::build_generate_request_from_chat(
+                    "logprob-default".into(),
+                    &body,
+                    "Hi".into(),
+                    vec![10],
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    request.sampling_params.unwrap().logprobs,
+                    expected,
+                    "stream={stream}, logprobs={enabled}, top_logprobs={top:?}"
+                );
+                assert_eq!(request.stream, stream);
+            }
         }
     }
 

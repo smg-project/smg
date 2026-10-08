@@ -315,6 +315,10 @@ impl ReasoningParser for MinimaxM3Parser {
         "minimax_m3"
     }
 
+    fn reasoning_token_boundaries(&self) -> Option<(&str, &str)> {
+        Some((THINK_START, THINK_END))
+    }
+
     fn is_in_reasoning(&self) -> bool {
         self.state == StreamingState::InReasoning
     }

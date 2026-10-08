@@ -941,6 +941,8 @@ mod tests {
         EngineId,
     };
     use openai_protocol::worker::RuntimeType;
+    use smg_grpc_client::VllmEngineClient;
+    use tokio::time::timeout;
 
     use super::*;
     use crate::{client::ZmqEngineClient, eos::EosTokenIds};
@@ -1166,6 +1168,32 @@ mod tests {
     /// to the requested count (matching the gRPC servicer's `islice` behaviour).
     #[tokio::test]
     async fn generate_shapes_top_logprobs_to_requested_count() {
+        for stream in [false, true] {
+            timeout(
+                Duration::from_secs(20),
+                chat_logprobs_roundtrip(Some(2), stream),
+            )
+            .await
+            .expect("mock EngineCore roundtrip timed out");
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_logprobs_without_top_candidates_preserve_sampled_token() {
+        for top in [None, Some(0)] {
+            for stream in [false, true] {
+                timeout(
+                    Duration::from_secs(20),
+                    chat_logprobs_roundtrip(top, stream),
+                )
+                .await
+                .expect("mock EngineCore roundtrip timed out");
+            }
+        }
+    }
+
+    async fn chat_logprobs_roundtrip(top_logprobs: Option<u32>, stream: bool) {
+        let requested = top_logprobs.unwrap_or(0);
         let dir = tempfile::tempdir().unwrap();
         let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
         let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
@@ -1237,34 +1265,40 @@ mod tests {
                 EngineInbound::Add(request) => request,
                 other => panic!("expected Add, got {other:?}"),
             };
-            assert_eq!(request.sampling_params.as_ref().unwrap().logprobs, Some(2));
+            assert_eq!(
+                request.sampling_params.as_ref().unwrap().logprobs,
+                Some(requested as i32)
+            );
             output.send_outputs(&outputs).await.unwrap();
         });
 
-        let req = vllm::GenerateRequest {
-            request_id: "r1".to_string(),
-            input: Some(vllm::generate_request::Input::Tokenized(
-                vllm::TokenizedInput {
-                    original_text: String::new(),
-                    input_ids: vec![1, 2, 3],
-                },
-            )),
-            sampling_params: Some(vllm::SamplingParams {
-                max_tokens: Some(1),
-                logprobs: Some(2),
-                ..Default::default()
-            }),
-            stream: true,
-            ..Default::default()
-        };
+        let mut body =
+            serde_json::json!({"model": "m", "messages": [], "logprobs": true, "stream": stream});
+        if let Some(top) = top_logprobs {
+            body["top_logprobs"] = serde_json::json!(top);
+        }
+        let body = serde_json::from_value(body).unwrap();
+        let req = VllmEngineClient::build_generate_request_from_chat(
+            "r1".into(),
+            &body,
+            "Hi".into(),
+            vec![1, 2, 3],
+            None,
+            None,
+        )
+        .expect("chat request");
         let mut stream = client.generate_vllm(req).await.expect("generate");
 
-        // The requested count is 2, so `top_logprobs` keeps the sampled entry
-        // plus the leading candidate (the third entry is dropped).
-        let expected_top = vec![vllm::TopLogProbs {
-            values: vec![-0.5, -0.1],
-            token_ids: vec![10, 20],
-        }];
+        // Zero keeps candidates empty while preserving the sampled-token logprob.
+        // Two keeps the sampled entry and the leading distinct candidate.
+        let expected_top = if requested == 0 {
+            Vec::new()
+        } else {
+            vec![vllm::TopLogProbs {
+                values: vec![-0.5, -0.1],
+                token_ids: vec![10, 20],
+            }]
+        };
 
         // The finish tick carried a token, so the delta streams as a chunk.
         let chunk = stream.next().await.expect("chunk item").expect("chunk ok");

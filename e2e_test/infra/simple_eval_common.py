@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
 from typing import Any
 
-import httpx
 import jinja2
 import numpy as np
 import openai
@@ -75,14 +74,14 @@ class Eval:
         raise NotImplementedError()
 
 
-class LargerHttpxClient(httpx.Client):
+class LargerHttpxClient(openai.DefaultHttpxClient):
     def __init__(self):
-        timeout_config = httpx.Timeout(3600)
-        limits = httpx.Limits(
+        # Match the transport used by the installed OpenAI SDK.
+        limits = type(openai.DEFAULT_CONNECTION_LIMITS)(
             max_keepalive_connections=3600,
             max_connections=3600,
         )
-        super().__init__(timeout=timeout_config, limits=limits)
+        super().__init__(timeout=3600, limits=limits, follow_redirects=False)
 
 
 class ChatCompletionSampler(SamplerBase):

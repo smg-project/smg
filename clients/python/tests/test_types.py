@@ -3,13 +3,24 @@
 import json
 
 from smg_client.types import (
+    ChatCompletionMessage,
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
+    ChatMessageDelta,
     CompletionResponse,
     EmbeddingResponse,
     Message,
     RerankResponse,
 )
+
+
+def test_both_reasoning_fields_are_readable_from_generated_types():
+    fields = {"reasoning": "thinking", "reasoning_content": "thinking"}
+    message = ChatCompletionMessage.model_validate({"role": "assistant", "content": None, **fields})
+    delta = ChatMessageDelta.model_validate(fields)
+    for parsed in (message, delta):
+        assert parsed.reasoning == parsed.reasoning_content == "thinking"
+    assert message.content is None
 
 
 def test_chat_completion_response_roundtrip():
@@ -124,7 +135,7 @@ def test_anthropic_message_response():
     }
     msg = Message.model_validate(raw)
     assert msg.id == "msg_abc123"
-    assert msg.content[0].type.value == "text"
+    assert msg.content[0].type == "text"
     assert msg.content[0].text == "Hello!"
     assert msg.usage.input_tokens == 10
 

@@ -3,7 +3,7 @@
 //! This module contains shared streaming logic for both Regular and PD router.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     sync::Arc,
     time::Instant,
 };
@@ -149,6 +149,16 @@ impl ChatStreamUsage {
             self.choices.values().map(|c| c.spec_accepted).sum(),
             self.choices.values().map(|c| c.spec_drafted).sum(),
         )
+    }
+    fn snapshot_for_parser(&self, unbilled_prompt_tokens: u32, parser_active: bool) -> Usage {
+        let usage = self
+            .snapshot()
+            .with_unbilled_prompt_tokens(unbilled_prompt_tokens);
+        if parser_active {
+            utils::reasoning_usage::with_known_reasoning_tokens(usage, None)
+        } else {
+            usage
+        }
     }
 }
 
@@ -443,6 +453,37 @@ impl StreamingProcessor {
         // in reasoning mode.
         let thinking_override = original_request.reasoning_starts_in_prefill(tokenizer.as_ref());
         let think_in_prefill = tokenizer.think_in_prefill();
+        let reasoning_counter = reasoning_parser_available
+            .then(|| {
+                let mut parser = utils::create_reasoning_parser(
+                    &self.reasoning_parser_factory,
+                    reasoning_parser_name.as_deref(),
+                    model,
+                )?;
+                if thinking_override {
+                    parser.mark_reasoning_started();
+                }
+                utils::reasoning_usage::ReasoningTokenCounter::new(
+                    parser.as_ref(),
+                    tokenizer.as_ref(),
+                )
+                .map(|mut counter| {
+                    let mut stops = if original_request.ignore_eos {
+                        Vec::new()
+                    } else {
+                        tokenizer.eos_token_ids().to_vec()
+                    };
+                    if !original_request.no_stop_trim {
+                        stops.extend(original_request.stop_token_ids.iter().flatten().copied());
+                    }
+                    counter.configure(thinking_override && think_in_prefill, stops);
+                    counter
+                })
+            })
+            .flatten();
+        let mut reasoning_counters =
+            HashMap::<u32, utils::reasoning_usage::ReasoningTokenCounter>::new();
+        let mut emitted_reasoning = HashMap::<u32, String>::new();
 
         // Check if JSON schema constraint was used (specific function or required mode)
         let has_structural_tag = self
@@ -529,6 +570,12 @@ impl StreamingProcessor {
                         continue;
                     }
 
+                    if let Some(template) = &reasoning_counter {
+                        reasoning_counters
+                            .entry(index)
+                            .or_insert_with(|| template.clone())
+                            .record(chunk.token_ids());
+                    }
                     completion_tokens.record_chunk(&chunk);
                     if let Some(usage) = &mut continuous_usage {
                         usage.record_chunk(&chunk);
@@ -607,6 +654,13 @@ impl StreamingProcessor {
                         usage.record_complete(&complete);
                     }
 
+                    if let Entry::Vacant(entry) = reasoning_counters.entry(index) {
+                        if let Some(template) = &reasoning_counter {
+                            let mut counter = template.clone();
+                            counter.record(complete.output_ids());
+                            entry.insert(counter);
+                        }
+                    }
                     cached_tokens.insert(index, complete.cached_tokens());
                     reasoning_tokens.insert(index, complete.reasoning_tokens());
                     spec_accepted.insert(index, complete.spec_accepted_tokens());
@@ -633,9 +687,10 @@ impl StreamingProcessor {
             };
 
             let usage = continuous_usage.as_ref().map(|tracker| {
-                tracker
-                    .snapshot()
-                    .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+                tracker.snapshot_for_parser(
+                    original_request.unbilled_prompt_tokens,
+                    reasoning_parser_available,
+                )
             });
             let Some((index, text, choice_logprobs)) = pending else {
                 continue;
@@ -680,6 +735,16 @@ impl StreamingProcessor {
                     )
                     .await;
                 if let Some(mut chunk) = reasoning_chunk {
+                    for choice in &chunk.choices {
+                        if let Some(text) = &choice.delta.reasoning_content {
+                            let observed = emitted_reasoning.entry(index).or_default();
+                            if observed.len().saturating_add(text.len()) <= 4 * 1024 * 1024 {
+                                observed.push_str(text);
+                            } else if let Some(counter) = reasoning_counters.get_mut(&index) {
+                                counter.invalidate();
+                            }
+                        }
+                    }
                     chunk.usage = usage.clone();
                     Self::format_sse_chunk_into(&mut sse_buffer, &chunk, emit_usage_null);
                     tx.send(Ok(Bytes::from(sse_buffer.clone())))
@@ -756,6 +821,7 @@ impl StreamingProcessor {
                 let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
                     .add_choice_content_with_logprobs(index, "assistant", delta, choice_logprobs)
+                    .without_choice_roles()
                     .maybe_system_fingerprint(system_fingerprint)
                     .maybe_usage(usage.clone())
                     .build();
@@ -767,9 +833,10 @@ impl StreamingProcessor {
         }
 
         let usage = continuous_usage.as_ref().map(|tracker| {
-            tracker
-                .snapshot()
-                .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+            tracker.snapshot_for_parser(
+                original_request.unbilled_prompt_tokens,
+                reasoning_parser_available,
+            )
         });
 
         // Phase 3: End-of-stream parser flush: first any text still buffered
@@ -784,6 +851,7 @@ impl StreamingProcessor {
                 let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
                     .add_choice_content(*index, "assistant", leftover_text)
+                    .without_choice_roles()
                     .maybe_system_fingerprint(system_fingerprint)
                     .maybe_usage(usage.clone())
                     .build();
@@ -815,6 +883,7 @@ impl StreamingProcessor {
                     let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_tool_call_delta(*index, tool_call_delta)
+                        .without_choice_roles()
                         .maybe_system_fingerprint(system_fingerprint)
                         .maybe_usage(usage.clone())
                         .build();
@@ -829,18 +898,45 @@ impl StreamingProcessor {
             }
         }
 
+        let known_reasoning = (reasoning_parser_available
+            && prompt_tokens.len() as u32 >= original_request.expected_choices)
+            .then(|| {
+                prompt_tokens.keys().try_fold(0_u32, |total, index| {
+                    let backend = reasoning_tokens.get(index).copied().unwrap_or(0);
+                    let count = if backend > 0 {
+                        Some(backend)
+                    } else if !emitted_reasoning.contains_key(index) {
+                        Some(0)
+                    } else {
+                        reasoning_counters.get(index).and_then(|counter| {
+                            counter.verified_count(tokenizer.as_ref(), &emitted_reasoning[index])
+                        })
+                    };
+                    count.map(|count| total.saturating_add(count))
+                })
+            })
+            .flatten();
+
         // Every choice shares one prompt, so prompt/cache counts take max;
         // completion and reasoning counts sum across choices.
-        let final_usage = (deepseek_usage || include_usage).then(|| {
-            Usage::from_counts(
-                prompt_tokens.values().copied().max().unwrap_or(0),
-                completion_tokens.total(),
-            )
-            .with_cached_tokens(cached_tokens.values().copied().max().unwrap_or(0))
-            .with_reasoning_tokens(reasoning_tokens.values().sum())
-            .with_speculative_tokens(spec_accepted.values().sum(), spec_drafted.values().sum())
-            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
-        });
+        let final_usage = (deepseek_usage || include_usage)
+            .then(|| {
+                Usage::from_counts(
+                    prompt_tokens.values().copied().max().unwrap_or(0),
+                    completion_tokens.total(),
+                )
+                .with_cached_tokens(cached_tokens.values().copied().max().unwrap_or(0))
+                .with_reasoning_tokens(reasoning_tokens.values().sum())
+                .with_speculative_tokens(spec_accepted.values().sum(), spec_drafted.values().sum())
+                .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+            })
+            .map(|usage| {
+                if reasoning_parser_available {
+                    utils::reasoning_usage::with_known_reasoning_tokens(usage, known_reasoning)
+                } else {
+                    usage
+                }
+            });
 
         // Phase 4: Finish reason chunks. Do not advertise partial counters as
         // a final aggregate if the backend omitted a choice's Complete frame.
@@ -855,12 +951,31 @@ impl StreamingProcessor {
 
             let matched_stop_value = matched_stops.get(index).and_then(|v| v.clone());
 
-            let finish_usage =
-                if deepseek_usage && complete_usage && position + 1 == finish_reasons.len() {
-                    final_usage.clone()
-                } else {
-                    usage.clone()
-                };
+            // An empty generation can complete without producing decoded text.
+            // Its choice still starts with the same initialization delta.
+            if is_firsts.get(index).copied().unwrap_or(true) {
+                let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                    .created(created)
+                    .add_choice_role(*index, "assistant")
+                    .maybe_system_fingerprint(system_fingerprint)
+                    .maybe_usage(usage.clone())
+                    .build();
+                Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk, emit_usage_null);
+                tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                    .await
+                    .map_err(|_| "Failed to send first chunk".to_string())?;
+            }
+
+            // Counts have now been verified for every completed choice. Keep
+            // continuous finish frames consistent with the final usage frame.
+            let finish_usage = if complete_usage
+                && ((deepseek_usage && position + 1 == finish_reasons.len())
+                    || (!deepseek_usage && continuous_usage.is_some()))
+            {
+                final_usage.clone()
+            } else {
+                usage.clone()
+            };
             let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                 .created(created)
                 .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
@@ -1614,6 +1729,7 @@ impl StreamingProcessor {
                             ChatCompletionStreamResponse::builder(request_id, model)
                                 .created(created)
                                 .add_choice_reasoning(index, reasoning_text)
+                                .without_choice_roles()
                                 .maybe_system_fingerprint(system_fingerprint)
                                 .build(),
                         )
@@ -1662,6 +1778,7 @@ impl StreamingProcessor {
                     ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_tool_name(index, tool_call_id, function.name.clone())
+                        .without_choice_roles()
                         .maybe_system_fingerprint(system_fingerprint)
                         .build(),
                 );
@@ -1673,6 +1790,7 @@ impl StreamingProcessor {
                     ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_tool_args(index, delta.to_string())
+                        .without_choice_roles()
                         .maybe_system_fingerprint(system_fingerprint)
                         .build(),
                 );
@@ -1729,6 +1847,7 @@ impl StreamingProcessor {
                             ChatCompletionStreamResponse::builder(request_id, model)
                                 .created(created)
                                 .add_choice_content(index, "assistant", normal_text)
+                                .without_choice_roles()
                                 .maybe_system_fingerprint(system_fingerprint)
                                 .build(),
                         );
@@ -1771,6 +1890,7 @@ impl StreamingProcessor {
                             ChatCompletionStreamResponse::builder(request_id, model)
                                 .created(created)
                                 .add_choice_tool_call_delta(index, tool_call_delta)
+                                .without_choice_roles()
                                 .maybe_system_fingerprint(system_fingerprint)
                                 .build(),
                         );
@@ -3621,6 +3741,20 @@ mod tests {
         let details = usage.completion_tokens_details.unwrap();
         assert_eq!(details.accepted_prediction_tokens, Some(2));
         assert_eq!(details.rejected_prediction_tokens, Some(1));
+        let observed = tracker.snapshot_for_parser(0, true);
+        assert_eq!(observed.prompt_tokens_details.unwrap().cached_tokens, 8);
+        let details = observed.completion_tokens_details.unwrap();
+        assert_eq!(details.reasoning_tokens, None);
+        assert_eq!(details.accepted_prediction_tokens, Some(2));
+        assert_eq!(details.rejected_prediction_tokens, Some(1));
+        assert_eq!(
+            tracker
+                .snapshot_for_parser(0, false)
+                .completion_tokens_details
+                .unwrap()
+                .reasoning_tokens,
+            Some(5)
+        );
     }
 
     #[test]

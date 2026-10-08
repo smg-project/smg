@@ -170,6 +170,10 @@ impl ReasoningParser for BaseReasoningParser {
         &self.model_type
     }
 
+    fn reasoning_token_boundaries(&self) -> Option<(&str, &str)> {
+        Some((&self.config.think_start_token, &self.config.think_end_token))
+    }
+
     fn is_in_reasoning(&self) -> bool {
         self.in_reasoning
     }

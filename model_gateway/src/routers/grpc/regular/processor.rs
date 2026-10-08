@@ -281,6 +281,36 @@ impl ResponseProcessor {
             tracing::debug!("No tool parser found for model '{model}', skipping tool call parsing");
         }
 
+        let reasoning_counter = reasoning_parser_available
+            .then(|| {
+                let mut parser = utils::create_reasoning_parser(
+                    &self.reasoning_parser_factory,
+                    reasoning_parser_name.as_deref(),
+                    model,
+                )?;
+                if chat_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
+                    parser.mark_reasoning_started();
+                }
+                utils::reasoning_usage::ReasoningTokenCounter::new(
+                    parser.as_ref(),
+                    tokenizer.as_ref(),
+                )
+                .map(|mut counter| {
+                    let mut stops = if chat_request.ignore_eos {
+                        Vec::new()
+                    } else {
+                        tokenizer.eos_token_ids().to_vec()
+                    };
+                    if !chat_request.no_stop_trim {
+                        stops.extend(chat_request.stop_token_ids.iter().flatten().copied());
+                    }
+                    counter.configure(false, stops);
+                    counter
+                })
+            })
+            .flatten();
+        let mut known_reasoning = reasoning_parser_available.then_some(0_u32);
+
         // Process all choices
         let mut choices = Vec::new();
         for (index, complete) in all_responses.iter().enumerate() {
@@ -300,7 +330,29 @@ impl ResponseProcessor {
                 )
                 .await
             {
-                Ok(choice) => choices.push(choice),
+                Ok(choice) => {
+                    if let Some(total) = known_reasoning {
+                        let count = if complete.reasoning_tokens() > 0 {
+                            Some(complete.reasoning_tokens())
+                        } else if choice.message.reasoning_content.is_none() {
+                            Some(0)
+                        } else {
+                            reasoning_counter.clone().and_then(|mut counter| {
+                                counter.record(complete.output_ids());
+                                counter.verified_count(
+                                    tokenizer.as_ref(),
+                                    choice
+                                        .message
+                                        .reasoning_content
+                                        .as_deref()
+                                        .unwrap_or_default(),
+                                )
+                            })
+                        };
+                        known_reasoning = count.map(|count| total.saturating_add(count));
+                    }
+                    choices.push(choice);
+                }
                 Err(e) => {
                     return Err(error::internal_error(
                         "process_choice_failed",
@@ -313,6 +365,12 @@ impl ResponseProcessor {
         // Build usage from gRPC response counters.
         let usage = response_formatting::build_usage(&all_responses)
             .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens);
+
+        let usage = if reasoning_parser_available {
+            utils::reasoning_usage::with_known_reasoning_tokens(usage, known_reasoning)
+        } else {
+            usage
+        };
 
         // Build final ChatCompletionResponse
         Ok(
@@ -1070,6 +1128,11 @@ mod responses_finish_reason_tests {
                 .unwrap();
             assert_eq!(choice.finish_reason.as_deref(), Some(expected));
             assert_eq!(choice.message.tool_calls.as_ref().unwrap().len(), 1);
+            let wire = serde_json::to_value(&choice).unwrap();
+            assert_eq!(
+                wire["message"].get("content"),
+                Some(&serde_json::Value::Null)
+            );
         }
     }
 }

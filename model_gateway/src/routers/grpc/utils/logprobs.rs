@@ -102,3 +102,56 @@ pub(crate) fn convert_generate_input_logprobs(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::routers::grpc::proto_wrapper::ProtoTopLogProbs;
+
+    #[test]
+    fn chat_logprob_json_retains_sampled_token_with_no_top_candidates() {
+        for top in [
+            Vec::new(),
+            vec![ProtoTopLogProbs {
+                values: Vec::new(),
+                token_ids: Vec::new(),
+            }],
+        ] {
+            let proto = ProtoOutputLogProbs {
+                token_logprobs: vec![-0.5],
+                token_ids: vec![10],
+                top_logprobs: top,
+            };
+            let converted = convert_proto_logprobs(&proto, |_| "Hi".into());
+            assert_eq!(
+                serde_json::to_value(converted).unwrap(),
+                json!({"content": [{
+                    "token": "Hi", "logprob": -0.5, "bytes": [72, 105], "top_logprobs": []
+                }]})
+            );
+        }
+    }
+
+    #[test]
+    fn chat_logprob_json_retains_two_explicit_candidates() {
+        let proto = ProtoOutputLogProbs {
+            token_logprobs: vec![-0.5],
+            token_ids: vec![10],
+            top_logprobs: vec![ProtoTopLogProbs {
+                values: vec![-0.5, -0.125],
+                token_ids: vec![10, 20],
+            }],
+        };
+        let converted =
+            convert_proto_logprobs(&proto, |id| if id == 10 { "Hi" } else { "hey" }.into());
+        assert_eq!(
+            serde_json::to_value(converted).unwrap()["content"][0]["top_logprobs"],
+            json!([
+                {"token": "Hi", "logprob": -0.5, "bytes": [72, 105]},
+                {"token": "hey", "logprob": -0.125, "bytes": [104, 101, 121]},
+            ])
+        );
+    }
+}

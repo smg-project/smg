@@ -9,9 +9,12 @@ use http_body_util::StreamBody;
 use llm_tokenizer::{traits::Encoding, SpecialTokens};
 use openai_protocol::chat::ChatCompletionRequest;
 use prost::Message as ProstMessage;
-use smg_grpc_client::vllm_engine::{
-    proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
-    VllmEngineClient,
+use smg_grpc_client::{
+    sglang_scheduler::proto as sglang_proto,
+    vllm_engine::{
+        proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
+        VllmEngineClient,
+    },
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use tonic::codec::Codec;
@@ -54,6 +57,9 @@ impl llm_tokenizer::traits::Decoder for CharacterTokenizer {
 }
 
 impl Tokenizer for CharacterTokenizer {
+    fn eos_token_ids(&self) -> &[u32] {
+        &[0]
+    }
     fn vocab_size(&self) -> usize {
         128
     }
@@ -167,6 +173,76 @@ async fn scripted_stream(
     (ProtoStream::Vllm(stream), server)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded fixture server is explicitly aborted"
+)]
+async fn scripted_sglang_stream(
+    responses: Vec<sglang_proto::GenerateResponse>,
+    grpc_status: &'static str,
+) -> (ProtoStream, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock worker");
+    let port = listener.local_addr().expect("mock worker address").port();
+    let config = Arc::new(mock_worker::config::Config {
+        admin_port: None,
+        context_length: 32768,
+        host: "127.0.0.1".to_string(),
+        http_base_port: 0,
+        http_count: 0,
+        grpc_base_port: port,
+        grpc_count: 1,
+        zmq_handshake: None,
+        zmq_count: 0,
+        zmq_start_index: 0,
+        model_id: "eof-test".to_string(),
+        tokenizer_path: "eof-test".to_string(),
+        gen_delay: Duration::ZERO,
+        output_tokens: 0,
+        realistic: false,
+        engine: mock_worker::engine::EngineParams::default(),
+        ..mock_worker::config::Config::default()
+    });
+    let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
+    let client = smg_grpc_client::sglang_scheduler::SglangSchedulerClient::connect(&format!(
+        "http://127.0.0.1:{port}"
+    ))
+    .await
+    .expect("connect mock worker");
+    let mut frames = Vec::new();
+    for response in responses {
+        let encoded = response.encode_to_vec();
+        let mut frame = Vec::with_capacity(encoded.len() + 5);
+        frame.put_u8(0);
+        frame.put_u32(encoded.len() as u32);
+        frame.extend_from_slice(&encoded);
+        frames.push(Ok::<_, tonic::Status>(Frame::data(Bytes::from(frame))));
+    }
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static(grpc_status));
+    frames.push(Ok(Frame::trailers(trailers)));
+    let mut codec = tonic_prost::ProstCodec::<
+        sglang_proto::GenerateResponse,
+        sglang_proto::GenerateResponse,
+    >::default();
+    let stream = tonic::Streaming::new_response(
+        codec.decoder(),
+        StreamBody::new(futures::stream::iter(frames)),
+        StatusCode::OK,
+        None,
+        None,
+    );
+    let stream = smg_grpc_client::sglang_scheduler::AbortOnDropStream::new(
+        stream,
+        "eof-test".to_string(),
+        client,
+    );
+    // No generation was sent to the mock, so there is nothing to cancel.
+    stream.mark_completed();
+    (ProtoStream::Sglang(stream), server)
+}
+
 fn processor(with_tools: bool) -> StreamingProcessor {
     StreamingProcessor::new(
         ToolParserFactory::new(),
@@ -244,6 +320,62 @@ async fn chat_events(
     (result, events)
 }
 
+#[tokio::test]
+async fn reasoning_wire_names_match_for_framed_streaming_and_nonstreaming_responses() {
+    for (text, reasoning) in [
+        ("<think>reason</think>answer", Some("reason")),
+        ("answer", None),
+    ] {
+        let (result, events) =
+            chat_events(vec![chunk(0, text), complete(0, "stop")], false, "0").await;
+        result.unwrap();
+        assert_eq!(
+            chat_text(&events, 0, "reasoning"),
+            reasoning.unwrap_or_default()
+        );
+        for delta in events
+            .iter()
+            .flat_map(|event| event["choices"].as_array().unwrap())
+            .map(|choice| &choice["delta"])
+        {
+            assert_eq!(delta.get("reasoning"), delta.get("reasoning_content"));
+            assert!(delta.get("reasoning").is_none_or(Value::is_string));
+        }
+
+        let mut last = complete(0, "stop");
+        if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+            complete.output_ids = text.chars().map(u32::from).collect();
+        }
+        let (stream, server) = scripted_stream(vec![last], "0").await;
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::new(Arc::new(WorkerRegistry::new()), None, Some("qwen3".into())),
+        );
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let response = processor
+            .process_non_streaming_chat_response(
+                context::ExecutionResult::Single { stream },
+                chat_spec(false),
+                dispatch(),
+                tokenizer,
+                &mut decoder,
+                false,
+            )
+            .await
+            .unwrap_or_else(|response| panic!("{}", response.status()));
+        server.abort();
+        let wire = serde_json::to_value(response).unwrap();
+        let message = &wire["choices"][0]["message"];
+        assert_eq!(message.get("reasoning").and_then(Value::as_str), reasoning);
+        assert_eq!(message.get("reasoning"), message.get("reasoning_content"));
+        if reasoning.is_none() {
+            assert!(message.get("reasoning").is_none());
+        }
+    }
+}
+
 fn chat_text(events: &[Value], index: u32, field: &str) -> String {
     events
         .iter()
@@ -256,6 +388,198 @@ fn chat_text(events: &[Value], index: u32, field: &str) -> String {
             }
         })
         .collect()
+}
+
+fn assert_chat_envelope(events: &[Value], indices: &[u32]) {
+    for index in indices {
+        let choices: Vec<_> = events
+            .iter()
+            .flat_map(|event| {
+                assert_eq!(event["id"], "chatcmpl-eof");
+                event["choices"].as_array().expect("choices array")
+            })
+            .filter(|choice| choice["index"] == *index)
+            .collect();
+        assert_eq!(
+            choices.first().expect("choice initialization")["delta"],
+            serde_json::json!({"role": "assistant", "content": ""})
+        );
+        for choice in &choices[1..] {
+            assert!(choice["delta"].get("role").is_none(), "{choice}");
+        }
+        for choice in &choices {
+            assert!(
+                choice["delta"]
+                    .get("reasoning_content")
+                    .is_none_or(Value::is_string),
+                "{choice}"
+            );
+        }
+        let finishes: Vec<_> = choices
+            .iter()
+            .enumerate()
+            .filter(|(_, choice)| !choice["finish_reason"].is_null())
+            .collect();
+        assert_eq!(finishes.len(), 1, "{choices:?}");
+        assert_eq!(finishes[0].0, choices.len() - 1, "{choices:?}");
+    }
+}
+
+#[tokio::test]
+async fn chat_envelope_initializes_each_choice_once_and_preserves_eof_tails() {
+    let (result, events) = chat_events(
+        vec![
+            chunk(0, "<think>reason</think>answer"),
+            chunk(1, "second"),
+            chunk(0, "<thi"),
+            complete(1, "stop"),
+            complete(0, "length"),
+        ],
+        false,
+        "0",
+    )
+    .await;
+    result.expect("successful stream");
+    assert_chat_envelope(&events, &[0, 1]);
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "reason");
+    assert_eq!(chat_text(&events, 0, "content"), "answer<thi");
+    assert_eq!(chat_text(&events, 1, "content"), "second");
+}
+
+#[tokio::test]
+async fn chat_envelope_tool_name_and_arguments_do_not_repeat_role() {
+    let (result, events) = chat_events(
+        vec![
+            chunk(0, r#"{"name":"lookup","arguments":{"city":""#),
+            chunk(0, r#"Paris"}}"#),
+            complete(0, "stop"),
+        ],
+        true,
+        "0",
+    )
+    .await;
+    result.expect("successful tool stream");
+    assert_chat_envelope(&events, &[0]);
+    let calls: Vec<_> = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array())
+        .flatten()
+        .collect();
+    assert!(calls
+        .iter()
+        .any(|call| call["function"]["name"] == "lookup"));
+    let arguments: String = calls
+        .iter()
+        .filter_map(|call| call["function"]["arguments"].as_str())
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<Value>(&arguments).unwrap(),
+        serde_json::json!({"city": "Paris"})
+    );
+}
+
+#[tokio::test]
+async fn chat_envelope_http_body_keeps_empty_choice_usage_and_done_contract() {
+    use axum::body::to_bytes;
+
+    let (stream, server) = scripted_stream(
+        vec![chunk(0, "answer"), complete(1, "stop"), complete(0, "stop")],
+        "0",
+    )
+    .await;
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "eof-test", "messages": [], "stream": true, "n": 2,
+        "stream_options": {"include_usage": true}
+    }))
+    .unwrap();
+    let response = Arc::new(processor(false))
+        .process_streaming_response(
+            context::ExecutionResult::Single { stream },
+            ChatResponseSpec::from(&request),
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            false,
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        to_bytes(response.into_body(), 1 << 20),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let text = std::str::from_utf8(&body).unwrap();
+    let frames: Vec<_> = text
+        .split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .collect();
+    assert_eq!(frames.last(), Some(&"data: [DONE]"));
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| **frame == "data: [DONE]")
+            .count(),
+        1
+    );
+    let events: Vec<Value> = frames[..frames.len() - 1]
+        .iter()
+        .map(|frame| serde_json::from_str(frame.strip_prefix("data: ").unwrap()).unwrap())
+        .collect();
+    assert_chat_envelope(&events, &[0, 1]);
+    assert_eq!(chat_text(&events, 0, "content"), "answer");
+    assert_eq!(chat_text(&events, 1, "content"), "");
+    let usage: Vec<_> = events
+        .iter()
+        .filter(|event| event["choices"].as_array().unwrap().is_empty())
+        .collect();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0], events.last().unwrap());
+    assert!(usage[0]["usage"].is_object());
+}
+
+#[tokio::test]
+async fn chat_envelope_harmony_empty_choices_still_initialize_before_finishing() {
+    use axum::body::to_bytes;
+
+    use crate::routers::grpc::harmony::streaming::HarmonyStreamingProcessor;
+
+    let (stream, server) =
+        scripted_stream(vec![complete(1, "length"), complete(0, "stop")], "0").await;
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "eof-test", "messages": [], "stream": true, "n": 2,
+        "stream_options": {"include_usage": true}
+    }))
+    .unwrap();
+    let response = Arc::new(HarmonyStreamingProcessor::new())
+        .process_streaming_chat_response(
+            context::ExecutionResult::Single { stream },
+            Arc::new(request),
+            dispatch(),
+            Vec::new(),
+            None,
+        )
+        .await;
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        to_bytes(response.into_body(), 1 << 20),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert_eq!(text.matches("data: [DONE]").count(), 1);
+    let events: Vec<Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert_chat_envelope(&events, &[0, 1]);
+    assert_eq!(events.last().unwrap()["choices"], serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -1122,5 +1446,330 @@ async fn messages_tool_arguments_need_an_open_block() {
             ]
         );
         assert_eq!(inputs, [input]);
+    }
+}
+
+#[tokio::test]
+async fn parser_usage_omits_ambiguous_boundaries_and_reports_zero_without_reasoning() {
+    for streaming in [true, false] {
+        for (text, expected) in [
+            ("<think>abc</think>answer", 3),
+            ("answer", 0),
+            ("<think>abc\0answer", 3),
+        ] {
+            let ids: Vec<_> = text.chars().map(u32::from).collect();
+            let mut last = complete(0, "stop");
+            if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+                complete.output_ids = ids.clone();
+                complete.completion_tokens = ids.len() as u32;
+            }
+            let (stream, server) = scripted_stream(vec![chunk(0, text), last], "0").await;
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"eof-test", "messages":[], "stream":streaming,
+                "separate_reasoning":true, "stream_options":{"include_usage":true}
+            }))
+            .unwrap();
+            let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+            let usage = if streaming {
+                let (tx, rx) = sse_channel();
+                processor(false)
+                    .process_streaming_chunks(
+                        stream,
+                        dispatch(),
+                        tokenizer,
+                        (None, None, false, false, false),
+                        ChatResponseSpec::from(&request),
+                        &tx,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                drop(tx);
+                let events = collect_events(rx).await;
+                assert_eq!(
+                    chat_text(&events, 0, "reasoning_content"),
+                    if expected > 0 { "abc" } else { "" }
+                );
+                events.last().unwrap()["usage"].clone()
+            } else {
+                let response_processor = ResponseProcessor::new(
+                    ToolParserFactory::new(),
+                    ReasoningParserFactory::new(),
+                    utils::ParserResolver::new(
+                        Arc::new(WorkerRegistry::new()),
+                        None,
+                        Some("qwen3".into()),
+                    ),
+                );
+                let mut decoder =
+                    utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+                let response = response_processor
+                    .process_non_streaming_chat_response(
+                        context::ExecutionResult::Single { stream },
+                        ChatResponseSpec::from(&request),
+                        dispatch(),
+                        tokenizer,
+                        &mut decoder,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.choices[0]
+                        .message
+                        .reasoning_content
+                        .as_deref()
+                        .unwrap_or(""),
+                    if expected > 0 { "abc" } else { "" }
+                );
+                serde_json::to_value(response.usage).unwrap()
+            };
+            server.abort();
+            assert_eq!(
+                usage["completion_tokens_details"]["reasoning_tokens"],
+                if expected == 0 {
+                    serde_json::json!(0)
+                } else {
+                    Value::Null
+                },
+                "stream={streaming}, usage={usage}"
+            );
+            assert_eq!(usage["completion_tokens"], ids.len() as u32);
+        }
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "shared tokenizer fixture also supports multi-turn tests"
+)]
+mod reasoning_tokenizer {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/common/scripted_tokenizer.rs"
+    ));
+}
+
+#[tokio::test]
+async fn parser_reasoning_usage_counts_engine_word_tokens_for_each_choice() {
+    for streaming in [true, false] {
+        for eos_stop in [false, true] {
+            for mixed_unknown in [false, true] {
+                for parser_enabled in [true, false] {
+                    let tokenizer: Arc<dyn Tokenizer> =
+                        Arc::new(reasoning_tokenizer::ScriptedTokenizer::from_chunks(vec![
+                            "<think>".into(),
+                            "one long reasoning token".into(),
+                            "🦀".into(),
+                            "</think>".into(),
+                            "answer".into(),
+                            "reason</think>answer".into(),
+                        ]));
+                    let mut frames = Vec::new();
+                    for (index, batches) in [
+                        (
+                            0,
+                            if eos_stop {
+                                vec![vec![100, 101], vec![102, 999, 104]]
+                            } else {
+                                vec![vec![100, 101], vec![102, 103, 104]]
+                            },
+                        ),
+                        (
+                            1,
+                            if mixed_unknown {
+                                vec![vec![100, 105]]
+                            } else {
+                                vec![vec![104]]
+                            },
+                        ),
+                    ] {
+                        let ids: Vec<_> = batches.iter().flatten().copied().collect();
+                        for batch in batches {
+                            frames.push(proto::GenerateResponse {
+                                response: Some(GenerationEvent::Chunk(
+                                    proto::GenerateStreamChunk {
+                                        index,
+                                        completion_tokens: batch.len() as u32,
+                                        token_ids: batch,
+                                        ..Default::default()
+                                    },
+                                )),
+                            });
+                        }
+                        if !(streaming && mixed_unknown && eos_stop && index == 1) {
+                            frames.push(proto::GenerateResponse {
+                                response: Some(GenerationEvent::Complete(
+                                    proto::GenerateComplete {
+                                        index,
+                                        output_ids: ids.clone(),
+                                        completion_tokens: ids.len() as u32,
+                                        prompt_tokens: 1,
+                                        finish_reason: "stop".into(),
+                                        ..Default::default()
+                                    },
+                                )),
+                            });
+                        }
+                    }
+                    let (stream, server) = if mixed_unknown {
+                        use smg_grpc_client::sglang_scheduler::proto as sg;
+                        let frames = frames
+                            .into_iter()
+                            .map(|frame| {
+                                let response = match frame.response.unwrap() {
+                                    GenerationEvent::Chunk(c) => {
+                                        sg::generate_response::Response::Chunk(
+                                            sg::GenerateStreamChunk {
+                                                index: c.index,
+                                                token_ids: c.token_ids,
+                                                completion_tokens: c.completion_tokens,
+                                                ..Default::default()
+                                            },
+                                        )
+                                    }
+                                    GenerationEvent::Complete(c) => {
+                                        sg::generate_response::Response::Complete(
+                                            sg::GenerateComplete {
+                                                index: c.index,
+                                                output_ids: c.output_ids,
+                                                prompt_tokens: c.prompt_tokens,
+                                                completion_tokens: c.completion_tokens,
+                                                finish_reason: c.finish_reason,
+                                                reasoning_tokens: if c.index == 0 { 2 } else { 0 },
+                                                ..Default::default()
+                                            },
+                                        )
+                                    }
+                                };
+                                sg::GenerateResponse {
+                                    response: Some(response),
+                                    ..Default::default()
+                                }
+                            })
+                            .collect();
+                        scripted_sglang_stream(frames, "0").await
+                    } else {
+                        scripted_stream(frames, "0").await
+                    };
+                    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"eof-test", "messages":[], "stream":streaming, "n":2, "separate_reasoning":parser_enabled,
+            "stop_token_ids": if eos_stop { vec![999] } else { vec![] },
+            "stream_options":{"include_usage":true,"continuous_usage_stats":true}
+        }))
+        .unwrap();
+                    let usage = if streaming {
+                        let (tx, rx) = sse_channel();
+                        Box::pin(processor(false).process_streaming_chunks(
+                            stream,
+                            dispatch(),
+                            tokenizer,
+                            (None, request.stop_token_ids.clone(), false, false, false),
+                            ChatResponseSpec::from(&request),
+                            &tx,
+                            None,
+                        ))
+                        .await
+                        .unwrap();
+                        drop(tx);
+                        let events = collect_events(rx).await;
+                        assert_eq!(
+                            chat_text(&events, 0, "reasoning_content"),
+                            if parser_enabled {
+                                "one long reasoning token🦀"
+                            } else {
+                                ""
+                            }
+                        );
+                        assert_eq!(
+                            chat_text(&events, 1, "reasoning_content"),
+                            if mixed_unknown && parser_enabled {
+                                "reason"
+                            } else {
+                                ""
+                            }
+                        );
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter_map(|event| event["usage"]["completion_tokens_details"]
+                                    ["reasoning_tokens"]
+                                    .as_u64())
+                                .next_back(),
+                            if parser_enabled {
+                                if mixed_unknown {
+                                    None
+                                } else {
+                                    Some(2)
+                                }
+                            } else if mixed_unknown {
+                                Some(2)
+                            } else {
+                                None
+                            }
+                        );
+                        events.last().unwrap()["usage"].clone()
+                    } else {
+                        let p = ResponseProcessor::new(
+                            ToolParserFactory::new(),
+                            ReasoningParserFactory::new(),
+                            utils::ParserResolver::new(
+                                Arc::new(WorkerRegistry::new()),
+                                None,
+                                Some("qwen3".into()),
+                            ),
+                        );
+                        let mut decoder = utils::create_stop_decoder(
+                            &tokenizer,
+                            None,
+                            request.stop_token_ids.as_ref(),
+                            false,
+                            false,
+                            false,
+                        );
+                        let response = Box::pin(p.process_non_streaming_chat_response(
+                            context::ExecutionResult::Single { stream },
+                            ChatResponseSpec::from(&request),
+                            dispatch(),
+                            tokenizer,
+                            &mut decoder,
+                            false,
+                        ))
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            response.choices[0].message.reasoning_content.as_deref(),
+                            if parser_enabled {
+                                Some("one long reasoning token🦀")
+                            } else {
+                                None
+                            }
+                        );
+                        serde_json::to_value(response.usage).unwrap()
+                    };
+                    server.abort();
+                    assert_eq!(
+                        usage["completion_tokens_details"]["reasoning_tokens"],
+                        if parser_enabled == mixed_unknown {
+                            Value::Null
+                        } else {
+                            serde_json::json!(2)
+                        },
+                        "{usage}"
+                    );
+                    assert_eq!(
+                        usage["completion_tokens"],
+                        if streaming && mixed_unknown && eos_stop {
+                            5 // Preserve existing settlement: only completed choices contribute.
+                        } else if mixed_unknown {
+                            7
+                        } else {
+                            6
+                        }
+                    );
+                    assert_eq!(usage["prompt_tokens"], 1);
+                }
+            }
+        }
     }
 }

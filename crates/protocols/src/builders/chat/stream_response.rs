@@ -141,13 +141,13 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
-    /// Add a choice delta that only sets `role`
+    /// Initialize a choice with its role and empty content.
     pub fn add_choice_role(mut self, index: u32, role: impl Into<String>) -> Self {
         self.choices.push(ChatStreamChoice {
             index,
             delta: ChatMessageDelta {
                 role: Some(role.into()),
-                content: None,
+                content: Some(String::new()),
                 tool_calls: None,
                 reasoning_content: None,
             },
@@ -280,6 +280,14 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
+    /// Omit roles from subsequent deltas after the choice has been initialized.
+    pub fn without_choice_roles(mut self) -> Self {
+        for choice in &mut self.choices {
+            choice.delta.role = None;
+        }
+        self
+    }
+
     /// Build the ChatCompletionStreamResponse
     pub fn build(self) -> ChatCompletionStreamResponse {
         ChatCompletionStreamResponse {
@@ -334,7 +342,7 @@ mod tests {
 
         assert_eq!(chunk.choices.len(), 1);
         assert_eq!(chunk.choices[0].delta.role.as_ref().unwrap(), "assistant");
-        assert!(chunk.choices[0].delta.content.is_none());
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some(""));
     }
 
     #[test]

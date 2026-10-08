@@ -5,6 +5,7 @@ mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
+pub(crate) mod reasoning_usage;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.

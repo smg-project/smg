@@ -62,6 +62,10 @@ impl ReasoningParser for Qwen3Parser {
         self.base.model_type()
     }
 
+    fn reasoning_token_boundaries(&self) -> Option<(&str, &str)> {
+        self.base.reasoning_token_boundaries()
+    }
+
     fn is_in_reasoning(&self) -> bool {
         self.base.is_in_reasoning()
     }
@@ -127,6 +131,10 @@ impl ReasoningParser for QwenThinkingParser {
 
     fn model_type(&self) -> &str {
         self.base.model_type()
+    }
+
+    fn reasoning_token_boundaries(&self) -> Option<(&str, &str)> {
+        self.base.reasoning_token_boundaries()
     }
 
     fn is_in_reasoning(&self) -> bool {
