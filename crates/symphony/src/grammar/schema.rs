@@ -95,17 +95,33 @@ impl<'a> Definitions<'a> {
         self.resolve(schema.get("$ref")?.as_str()?)
     }
 
-    /// Whether every local pointer in `schema` names something.
+    /// Whether every local pointer in `schema` names something, and every pointer in what it
+    /// names, as far as the pointers reach: the definitions travel with the property, so a pointer
+    /// at nothing inside one of them reaches the engine too. A definition that names itself is
+    /// followed once.
     fn pointers_resolve(self, schema: &Value) -> bool {
+        self.pointers_resolve_from(schema, &mut Vec::new())
+    }
+
+    fn pointers_resolve_from(self, schema: &Value, followed: &mut Vec<String>) -> bool {
         match schema {
             Value::Object(map) => map.iter().all(|(key, value)| {
-                let points_at_nothing = is_reference(key)
-                    && value.as_str().is_some_and(|pointer| {
-                        pointer.starts_with('#') && self.resolve(pointer).is_none()
-                    });
-                !points_at_nothing && self.pointers_resolve(value)
+                let local = value
+                    .as_str()
+                    .filter(|pointer| is_reference(key) && pointer.starts_with('#'));
+                let named_resolves = local.is_none_or(|pointer| match self.resolve(pointer) {
+                    None => false,
+                    Some(_) if followed.iter().any(|seen| seen == pointer) => true,
+                    Some(target) => {
+                        followed.push(pointer.to_string());
+                        self.pointers_resolve_from(target, followed)
+                    }
+                });
+                named_resolves && self.pointers_resolve_from(value, followed)
             }),
-            Value::Array(items) => items.iter().all(|item| self.pointers_resolve(item)),
+            Value::Array(items) => items
+                .iter()
+                .all(|item| self.pointers_resolve_from(item, followed)),
             _ => true,
         }
     }

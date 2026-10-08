@@ -375,6 +375,49 @@ mod tests {
     }
 
     #[test]
+    fn a_pointer_inside_a_definition_counts_as_the_propertys_own() {
+        // The definitions travel with the property's schema, so a pointer at nothing, or to the
+        // root, inside a definition the property names reaches the engine as surely as one in the
+        // property itself: that property pins nothing. A definition that names itself is followed
+        // once and resolves, so a recursive tree keeps its schema, the definitions attached.
+        let call = first_call(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": {
+                    "Node": {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node"}}},
+                    "Broken": {"type": "object", "properties": {"x": {"$ref": "#/$defs/Gone"}}},
+                    "Rooted": {"type": "object", "properties": {"up": {"$ref": "#"}}},
+                },
+                "properties": {
+                    "tree": {"$ref": "#/$defs/Node"},
+                    "broken": {"$ref": "#/$defs/Broken"},
+                    "rooted": {"$ref": "#/$defs/Rooted"},
+                },
+                "required": ["tree", "broken", "rooted"],
+            }),
+        )]);
+        let slots = call["elements"][3]["elements"]
+            .as_array()
+            .expect("three slots");
+        assert_eq!(
+            slots[0]["elements"][0]["value"],
+            argument_open("tree", "object")
+        );
+        assert_eq!(
+            slots[0]["elements"][1]["json_schema"]["$ref"],
+            "#/$defs/Node"
+        );
+        for (slot, key) in [(&slots[1], "broken"), (&slots[2], "rooted")] {
+            assert_eq!(
+                slot["elements"][0]["value"],
+                format!("<|open|>argument key=\"{key}\" type=\""),
+                "{key} pins nothing"
+            );
+        }
+    }
+
+    #[test]
     fn attribute_values_are_escaped_as_the_template_writes_them() {
         let parameters = value!({
             "type": "object",
