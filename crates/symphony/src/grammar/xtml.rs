@@ -333,13 +333,14 @@ mod tests {
                     "count": {"$ref": "#/$defs/Count"},
                     "lost": {"$ref": "#/$defs/Missing"},
                     "untyped": {"description": "anything"},
+                    "whole": {"$ref": "#"},
                 },
-                "required": ["count", "lost", "untyped"],
+                "required": ["count", "lost", "untyped", "whole"],
             }),
         )]);
         let slots = call["elements"][3]["elements"]
             .as_array()
-            .expect("three slots");
+            .expect("four slots");
         // The `$ref` lends its target's type, and the definitions travel with the schema.
         assert_eq!(
             slots[0]["elements"][0]["value"],
@@ -352,8 +353,13 @@ mod tests {
                 "$defs": {"Count": {"type": "integer"}, "Unused": {"type": "string"}},
             })
         );
-        // A pointer at nothing, or no type: the key stays, the type and the value are the model's.
-        for (slot, key) in [(&slots[1], "lost"), (&slots[2], "untyped")] {
+        // A pointer at nothing, no type, or a pointer to the root (the property's own document once
+        // the engine compiles it alone): the key stays, the type and the value are the model's.
+        for (slot, key) in [
+            (&slots[1], "lost"),
+            (&slots[2], "untyped"),
+            (&slots[3], "whole"),
+        ] {
             let begin = format!("<|open|>argument key=\"{key}\" type=\"");
             assert_eq!(
                 *slot,

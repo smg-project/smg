@@ -54,13 +54,13 @@ pub(super) fn shape(
     }
 }
 
-/// The definitions at the root of a tool's schema, `$defs` and `definitions`, and the root itself.
-/// Each property's schema goes to the engine as a document of its own, and a `$ref` such as
-/// `#/$defs/Node` points from the root of the document it stands in, so the definitions travel
-/// with the property's schema.
+/// The definitions at the root of a tool's schema, `$defs` and `definitions`. Each property's
+/// schema goes to the engine as a document of its own, and a `$ref` such as `#/$defs/Node` points
+/// from the root of the document it stands in, so the definitions travel with the property's
+/// schema. A pointer to the root itself, `#`, names the tool's schema in the tool and the property
+/// in the property's document, so it resolves to nothing here, and the property takes any value.
 #[derive(Clone, Copy)]
 pub(super) struct Definitions<'a> {
-    root: &'a Value,
     defs: Option<&'a Value>,
     definitions: Option<&'a Value>,
 }
@@ -68,18 +68,15 @@ pub(super) struct Definitions<'a> {
 impl<'a> Definitions<'a> {
     pub(super) fn of(root: &'a Value) -> Self {
         Self {
-            root,
             defs: root.get("$defs"),
             definitions: root.get("definitions"),
         }
     }
 
-    /// The schema a local pointer names: `#` the root, `#/$defs/Name` or `#/definitions/Name` an
-    /// entry, with the pointer's escapes (`~1` for `/`, `~0` for `~`) undone.
+    /// The schema a local pointer names: `#/$defs/Name` or `#/definitions/Name` an entry, with the
+    /// pointer's escapes (`~1` for `/`, `~0` for `~`) undone; `#` itself nothing, since it would
+    /// name the property's own document once the engine compiles it alone.
     fn resolve(self, pointer: &str) -> Option<&'a Value> {
-        if pointer == "#" || pointer == "#/" {
-            return Some(self.root);
-        }
         let mut segments = pointer.strip_prefix("#/")?.split('/');
         let mut node = match segments.next()? {
             "$defs" => self.defs?,
