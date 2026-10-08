@@ -1104,7 +1104,7 @@ mod hy_v4_tests {
             .with_thinking_key_name(ThinkingKeyName::ReasoningEffort)
             .with_native_reasoning_effort_values(&["high"])
             .with_native_reasoning_effort_off_values(&["no_think"]);
-        assert!(should_mark_reasoning_started(None, &tok));
+        assert!(thinking_effectively_on(None, &tok));
         assert_eq!(
             extract_template_effort_thinking(None, Some("no_think"), &tok),
             Some(false)
@@ -1134,6 +1134,38 @@ mod hy_v4_tests {
         assert_eq!(
             resolve_user_thinking(Some(&unknown), None, None, &tok),
             Some(true)
+        );
+    }
+
+    /// Hy4's generation prompt opens the thought and `no_think` closes it at
+    /// once, so the prompt's tail arms the parser or leaves it disarmed.
+    #[test]
+    fn hy4_prompt_tail_arms_the_parser() {
+        let tok =
+            llm_tokenizer::MockTokenizer::new().with_thinking_toggle(ThinkingToggle::DefaultOn);
+        let factory = ReasoningParserFactory::new();
+        let turn = "<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>";
+        let prefill = |tail: &str, user_thinking: Option<bool>| {
+            reasoning_prefill(
+                &factory,
+                Some("hy_v4"),
+                "m",
+                &format!("{turn}{tail}"),
+                user_thinking,
+                false,
+                &tok,
+            )
+        };
+        assert_eq!(
+            prefill("<think:opensource>\n", None),
+            ReasoningPrefill {
+                starts_in_reasoning: true,
+                expects_reasoning: true
+            }
+        );
+        assert_eq!(
+            prefill("<think:opensource></think:opensource>", Some(false)),
+            ReasoningPrefill::default()
         );
     }
 }

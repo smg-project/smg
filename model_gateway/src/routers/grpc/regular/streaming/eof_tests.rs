@@ -491,7 +491,7 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
         "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}]
     }))
     .expect("messages request");
-    let spec = MessagesResponseSpec::from(&request);
+    let spec = MessagesResponseSpec::new(&request, false);
     let mut last = complete(0, finish);
     if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
         complete.output_ids = text.chars().map(u32::from).collect();
@@ -542,7 +542,6 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
                 },
                 spec,
                 dispatch(),
-                tokenizer,
                 &mut decoder,
             )
             .await
@@ -602,7 +601,7 @@ async fn deepseek_usage_rides_on_the_last_finish_chunk() {
                 "stream_options": options, "separate_reasoning": true
             }))
             .unwrap();
-            let mut spec = ChatResponseSpec::from(&req);
+            let mut spec = ChatResponseSpec::new(&req, false);
             spec.unbilled_prompt_tokens = unbilled;
             let result = processor(false)
                 .process_streaming_chunks(
@@ -672,7 +671,7 @@ async fn deepseek_does_not_emit_aggregate_usage_without_complete_frames() {
                 dispatch(),
                 Arc::new(CharacterTokenizer::default()),
                 (None, None, false, false, false),
-                ChatResponseSpec::from(&req),
+                ChatResponseSpec::new(&req, false),
                 &tx,
                 None,
             )
@@ -725,6 +724,10 @@ impl ReasoningParser for ReasoningButText {
     fn mark_reasoning_started(&mut self) {}
 
     fn mark_think_start_stripped(&mut self) {}
+
+    fn prompt_reasoning(&self, _prompt: &str) -> reasoning_parser::PromptReasoning {
+        reasoning_parser::PromptReasoning::Absent
+    }
 }
 
 /// Returns the chunk as normal text and reports one whole `lookup` call on
@@ -810,6 +813,7 @@ async fn messages_blocks_and_inputs(
             budget_tokens: 1024,
             display: None,
         }),
+        starts_in_reasoning: false,
         tool_choice,
         has_tools: true,
         history_tool_calls_count: 0,

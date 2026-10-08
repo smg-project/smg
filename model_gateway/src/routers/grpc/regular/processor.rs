@@ -1044,7 +1044,7 @@ mod responses_finish_reason_tests {
                 .process_single_choice(
                     &complete,
                     0,
-                    &ChatResponseSpec::from(&request),
+                    &ChatResponseSpec::new(&request, false),
                     "test-model",
                     &tokenizer,
                     &mut decoder,

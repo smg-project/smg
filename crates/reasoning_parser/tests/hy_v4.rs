@@ -1,4 +1,7 @@
-use reasoning_parser::{parsers::HyV4Parser, traits::ReasoningParser};
+use reasoning_parser::{
+    parsers::HyV4Parser,
+    traits::{PromptReasoning, ReasoningParser},
+};
 
 #[test]
 fn hy4_every_chunk_boundary_and_prompt_prefill() {
@@ -69,4 +72,46 @@ fn hy4_factory_and_bytewise_stream() {
     }
     assert_eq!(reasoning, "abc");
     assert_eq!(content, "ok");
+}
+
+#[test]
+fn hy4_prompt_reasoning_reads_the_last_think_marker() {
+    let p = HyV4Parser::new();
+    let turn = "<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>";
+    // The generation prompt opens the thought, with or without a checkpoint suffix.
+    assert_eq!(
+        p.prompt_reasoning(&format!("{turn}<think:opensource>\n")),
+        PromptReasoning::Open
+    );
+    assert_eq!(
+        p.prompt_reasoning(&format!("{turn}<think>")),
+        PromptReasoning::Open
+    );
+    // `no_think` prefills an empty thought.
+    assert_eq!(
+        p.prompt_reasoning(&format!("{turn}<think:6124c78e></think:6124c78e>")),
+        PromptReasoning::Closed
+    );
+    assert_eq!(p.prompt_reasoning(turn), PromptReasoning::Absent);
+    // Earlier turns do not count; only the tail does.
+    assert_eq!(
+        p.prompt_reasoning(&format!(
+            "{turn}<think:opensource>old</think:opensource>answer{turn}<think:opensource>\n"
+        )),
+        PromptReasoning::Open
+    );
+    // Text the output parser would not take for a marker is not one here either.
+    for tail in [
+        "<thinking>",
+        "<think:>",
+        "<think: x>",
+        "<think:a<b>",
+        "<think:opensource",
+    ] {
+        assert_eq!(
+            p.prompt_reasoning(&format!("{turn}{tail}")),
+            PromptReasoning::Absent,
+            "{tail}"
+        );
+    }
 }
