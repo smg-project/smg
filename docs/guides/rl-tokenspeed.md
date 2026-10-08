@@ -32,6 +32,10 @@ sends it as the bearer to the control app:
     curl -X PATCH http://smg:30000/workers/<id> -H 'content-type: application/json' \
       -d '{"api_key":"'"$RL_KEY"'"}'
 
+The key travels in that request body, so reach the gateway's admin routes
+over TLS (`--tls-cert-path`/`--tls-key-path` on `smg launch`) or over a
+network you trust.
+
 A gateway started with `--enable-igw` also serves gRPC workers registered
 later through `POST /workers`; there the key goes into the registration
 body (`{"url":"grpc://rollout-1:30000","api_key":"..."}`).
@@ -76,6 +80,12 @@ remote gateway needs it on a routable host, so always set
 ## Older engines
 
 Engines that predate advertisement get SMG's static capability row (`wait`
-and `abort`, `distributed` only) and need the label supplied at
-registration: `{"url":"grpc://…","labels":{"rl.control_url":"http://…:30400"}}`.
-See `crates/rl/NOTES.md` for their route-level drift.
+and `abort`, `distributed` only) and need the `rl.control_url` label
+supplied by the operator. The worker update route merges labels, so it
+rides on the same PATCH as the key:
+
+    curl -X PATCH http://smg:30000/workers/<id> -H 'content-type: application/json' \
+      -d '{"api_key":"'"$RL_KEY"'","labels":{"rl.control_url":"http://rollout-1:30400"}}'
+
+(on an `--enable-igw` gateway, in the `POST /workers` body instead). See
+`crates/rl/NOTES.md` for their route-level drift.
