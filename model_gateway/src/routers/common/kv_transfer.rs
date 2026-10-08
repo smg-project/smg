@@ -6,6 +6,8 @@
 //! up front. The gRPC pipeline and the HTTP PD router both implement that
 //! flow; the connector vocabulary lives here so the two stay in lockstep.
 
+use std::borrow::Cow;
+
 use serde_json::{value::RawValue, Value};
 use tracing::warn;
 
@@ -554,6 +556,17 @@ pub(crate) fn mooncake_prefill_params(transfer_id: &str) -> String {
     .to_string()
 }
 
+/// `host` as it goes into a URL authority: an IPv6 literal in brackets, so
+/// `http://{host}:{port}` parses whether the bootstrap host came bracketed
+/// out of a worker URL or bare from a label or a configured value.
+fn url_host(host: &str) -> Cow<'_, str> {
+    if host.contains(':') && !host.starts_with('[') {
+        Cow::Owned(format!("[{host}]"))
+    } else {
+        Cow::Borrowed(host)
+    }
+}
+
 /// Decode-leg params for Mooncake, synthesized from prefill worker metadata
 /// (the engine returns nothing to relay; the connector is push-based).
 pub(crate) fn mooncake_decode_params(
@@ -567,7 +580,7 @@ pub(crate) fn mooncake_decode_params(
         "do_remote_prefill": true,
         "transfer_id": transfer_id,
         "remote_engine_id": engine_id,
-        "remote_bootstrap_addr": format!("http://{host}:{port}"),
+        "remote_bootstrap_addr": format!("http://{}:{port}", url_host(host)),
     })
     .to_string()
 }
@@ -575,6 +588,27 @@ pub(crate) fn mooncake_decode_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decode leg's bootstrap URL must parse for every spelling the
+    /// bootstrap host arrives in: bracketed from a worker URL, bare from a
+    /// label or a configured value, IPv4, or a hostname.
+    #[test]
+    fn mooncake_decode_params_bracket_an_ipv6_bootstrap_host() {
+        for (host, expected) in [
+            ("fd00::1", "http://[fd00::1]:8998"),
+            ("[fd00::1]", "http://[fd00::1]:8998"),
+            ("::1", "http://[::1]:8998"),
+            ("10.0.0.7", "http://10.0.0.7:8998"),
+            ("prefill-host", "http://prefill-host:8998"),
+        ] {
+            let value: Value =
+                serde_json::from_str(&mooncake_decode_params("t", "e", host, 8998)).unwrap();
+            assert_eq!(value["remote_bootstrap_addr"], expected, "host {host}");
+            let addr = value["remote_bootstrap_addr"].as_str().unwrap();
+            let url = url::Url::parse(addr).unwrap_or_else(|e| panic!("host {host}: {e}"));
+            assert_eq!(url.port(), Some(8998), "host {host}");
+        }
+    }
 
     #[test]
     fn kv_connector_mode_mooncake_uses_bootstrap_metadata() {
