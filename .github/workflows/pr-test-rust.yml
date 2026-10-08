@@ -700,6 +700,40 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
     secrets: inherit
 
+  # The vLLM row of e2e-1gpu-chat on an AMD Instinct self-hosted runner, in
+  # vLLM's ROCm image of the CI's vLLM pin (scripts/ci_install_vllm.sh). Off
+  # until AMD's runner is registered and SMG_RUN_AMD_LEGS is "true"; then it
+  # runs on pushes to main and dispatches, and SMG_RUN_AMD_ON_PRS = "true" adds
+  # the pull requests the vLLM row runs on.
+  e2e-1gpu-chat-amd:
+    name: e2e-1gpu-chat-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true'
+              && needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi325x' }}
+      timeout: 50
+      test_timeout: 30
+      test_dirs: e2e_test/chat_completions
+      min_selected: 202 # the vLLM row's floor: both rows select the same cases
+      servicer_unit_tests: true
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.27.1
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   # The SGLang chat and admin-op cases against the Rust gRPC servicer
   # (SMG_SGLANG_SERVICER_IMPL=rust): the same workers, the Rust request path.
   e2e-1gpu-chat-rust-servicer:
@@ -1538,7 +1572,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1596,6 +1630,7 @@ jobs:
                 "${{ needs.python-unit-tests.result }}" == "failure" || \
                 "${{ needs.unit-tests.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
+                "${{ needs.e2e-1gpu-chat-amd.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \

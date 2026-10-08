@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       engines:
-        description: "Space-separated engines to run (sglang vllm tokenspeed); empty = all"
+        description: "Space-separated engines to run (sglang vllm tokenspeed vllm-amd); empty = all"
         required: false
         default: ""
       filter:
@@ -34,8 +34,14 @@ jobs:
       - id: plan
         env:
           ENGINES: ${{ inputs.engines }}
+          AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
         run: |
           wanted="${ENGINES:-sglang vllm tokenspeed}"
+          # vllm-amd needs AMD's self-hosted runner; until it is online
+          # (SMG_RUN_AMD_LEGS=true) only a dispatch that names it runs it.
+          if [ -z "$ENGINES" ] && [ "$AMD_ENABLED" = true ]; then
+            wanted="$wanted vllm-amd"
+          fi
           # One row per engine, plus each engine's other KV transport: vLLM over
           # Mooncake next to its NIXL default, SGLang over NIXL next to its
           # Mooncake default (TokenSpeed only has Mooncake). The NIXL row skips
@@ -47,6 +53,10 @@ jobs:
                 elif . == "sglang" then [{engine: "sglang"},
                   {engine: "sglang", kv_backend: "nixl",
                    filter: "not sole_leg_outage and not survives_losing"}]
+                elif . == "vllm-amd" then [
+                  {engine: "vllm", kv_backend: "nixl", vendor: "amd"},
+                  {engine: "vllm", kv_backend: "moriio", moriio_mode: "read", vendor: "amd"},
+                  {engine: "vllm", kv_backend: "moriio", moriio_mode: "write", vendor: "amd"}]
                 else [{engine: .}] end) | add')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "matrix: $matrix"
@@ -147,7 +157,7 @@ jobs:
           echo "TokenSpeed image: ${image:-none (nightly wheel install)}"
 
   pd-topologies:
-    name: pd-topologies (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
+    name: pd-topologies (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }}${{ matrix.moriio_mode && format('-{0}', matrix.moriio_mode) || '' }}${{ matrix.vendor && format('-{0}', matrix.vendor) || '' }})
     needs: [plan, build-wheel, tokenspeed-image]
     strategy:
       fail-fast: false
@@ -157,7 +167,17 @@ jobs:
     with:
       engine: ${{ matrix.engine }}
       gpu_tier: "4"
-      runner: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
+      runner: ${{ matrix.vendor == 'amd' && (vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi325x') || (vars.SMG_RUNNER_GPU_4 || '4-gpu-h100') }}
+      # The AMD rows run in vLLM's ROCm image, which ships NIXL, UCX and MoRI:
+      # v0.31.0 rather than the CI's vLLM pin, as vLLM registers its KV cache
+      # with MoRI-IO only from v0.29.0. The container gets the GPUs, the
+      # runner's model cache and its HF_TOKEN, but no RDMA devices, so MoRI-IO
+      # moves KV over XGMI.
+      gpu_vendor: ${{ matrix.vendor || 'nvidia' }}
+      container_image: ${{ matrix.vendor == 'amd' && 'vllm/vllm-openai-rocm:v0.31.0' || '' }}
+      container_options: ${{ matrix.vendor == 'amd' && (vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') || '' }}
+      vllm_moriio_mode: ${{ matrix.moriio_mode || '' }}
+      vllm_moriio_backend: ${{ matrix.kv_backend == 'moriio' && 'xgmi' || '' }}
       # The whole sweep: ten topologies (eight gRPC, two HTTP), eight on
       # TokenSpeed (no HTTP frontend), each with worker restarts; TokenSpeed
       # also extracts its engine image and loads a slower model. Run
@@ -168,8 +188,9 @@ jobs:
       test_dirs: e2e_test/router/test_pd_topologies.py
       kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
-      # The mixed-transport fleet needs both vLLM backends installed whatever the row's own
-      vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
+      # The mixed-transport fleet needs both vLLM backends installed whatever the
+      # row's own; the AMD image has no Mooncake, so those rows skip that fleet.
+      vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && matrix.vendor != 'amd' && 'mooncake' || '' }}
       # A row's own filter always applies; a dispatch filter narrows within it.
       test_filter: >-
         ${{ (inputs.filter != '' && matrix.filter != '')

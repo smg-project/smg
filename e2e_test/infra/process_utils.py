@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import random
 import signal
 import socket
 import subprocess
@@ -57,6 +59,58 @@ def get_open_port(max_attempts: int = 10) -> int:
         )
 
     raise RuntimeError(f"Failed to find available port after {max_attempts} attempts")
+
+
+def reserve_port(port: int) -> None:
+    """Reserve a port again that this process already chose (a restarted worker's)."""
+    _reserved_ports.add(port)
+
+
+_LOW_PORT_FLOOR = 20000
+
+
+def _ephemeral_port_floor() -> int:
+    """Lowest port the kernel hands out to bind(0) and outgoing connections."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 32768
+
+
+def get_open_port_block(count: int, max_attempts: int = 50) -> int:
+    """Reserve ``count`` consecutive free ports below the kernel's ephemeral range; return the first.
+
+    For ports an engine binds long after they are chosen (MoRI-IO's listeners
+    bind once the engine has loaded its model), one per rank from a base. The
+    kernel gives ports in its ephemeral range to any process on the host, so
+    one picked there can be taken before its owner binds it. Release each of
+    the ports with release_port().
+    """
+    ceiling = _ephemeral_port_floor()
+    for _ in range(max_attempts):
+        if ceiling - _LOW_PORT_FLOOR > count:
+            base = random.randrange(_LOW_PORT_FLOOR, ceiling - count)
+        else:  # no room below the ephemeral range on this host
+            base = get_open_port()
+            release_port(base)
+        block = range(base, base + count)
+        if all(p < 65536 and p not in _reserved_ports and _port_is_free(p) for p in block):
+            _reserved_ports.update(block)
+            return base
+    raise RuntimeError(
+        f"Failed to find {count} consecutive free ports after {max_attempts} attempts"
+    )
+
+
+def _port_is_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("", port))
+        except OSError:
+            return False
+    return True
 
 
 def release_port(port: int) -> None:
@@ -163,9 +217,64 @@ def wait_for_process_group_exit(pgid: int, timeout: float, kill_after: float) ->
 
 
 def gpu_memory_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
-    """Used memory per GPU index via ``nvidia-smi``; ``None`` when unavailable."""
+    """Used memory per GPU index via ``nvidia-smi``, else ``amd-smi``; ``None`` when neither works."""
     if not gpu_ids:
         return {}
+    used = _nvidia_smi_used_mib(gpu_ids)
+    return used if used is not None else _amd_smi_used_mib(gpu_ids)
+
+
+def _amd_smi(*args: str) -> list[dict] | None:
+    """The per-GPU entries of ``amd-smi <args> --json``."""
+    try:
+        out = subprocess.run(
+            ["amd-smi", *args, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        ).stdout
+        data = json.loads(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    # ROCm 7 wraps the metric list in {"gpu_data": [...]}; ``list`` prints a bare list.
+    entries = data.get("gpu_data", []) if isinstance(data, dict) else data
+    return entries if isinstance(entries, list) else None
+
+
+def _amd_smi_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
+    """VRAM in use per GPU from ``amd-smi``, which reports MiB under the unit "MB".
+
+    ``gpu_ids`` are HIP device numbers. amd-smi numbers GPUs by PCI address
+    while HIP numbers them in KFD topology order (on an MI355X node HIP's GPU 0
+    is amd-smi's GPU 3), so the two are matched through each GPU's KFD node id,
+    after the visibility variables a worker would also see.
+    """
+    listed, metrics = _amd_smi("list"), _amd_smi("metric", "--mem-usage")
+    if listed is None or metrics is None:
+        return None
+    try:
+        hip_order = [int(e["gpu"]) for e in sorted(listed, key=lambda e: int(e["node_id"]))]
+        for var in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+            if os.environ.get(var, "").strip():
+                hip_order = [hip_order[int(i)] for i in os.environ[var].split(",")]
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    used: dict[int, int] = {}
+    for entry in metrics:
+        try:
+            value = entry["mem_usage"]["used_vram"]
+            used[int(entry["gpu"])] = int(value["value"] if isinstance(value, dict) else value)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return {
+        gpu: used[hip_order[gpu]]
+        for gpu in gpu_ids
+        if gpu < len(hip_order) and hip_order[gpu] in used
+    }
+
+
+def _nvidia_smi_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
     try:
         out = subprocess.run(
             [
@@ -206,9 +315,10 @@ def wait_for_gpu_memory_release(
     exits; a replacement started on the same GPU before that reads the old
     allocation as its own shortfall and dies on its startup memory check.
     Returns the GPUs still above the threshold (empty on success), or ``None``
-    when ``nvidia-smi`` is unavailable. Gives up before ``timeout`` once that
-    set has held the same values for 5 s: a region another live process still
-    maps never drains, so a static figure is the answer, not a wait.
+    when neither ``nvidia-smi`` nor ``amd-smi`` is available. Gives up before
+    ``timeout`` once that set has held the same values for 5 s: a region
+    another live process still maps never drains, so a static figure is the
+    answer, not a wait.
     """
     deadline = time.monotonic() + timeout
     last_over: dict[int, int] | None = None
