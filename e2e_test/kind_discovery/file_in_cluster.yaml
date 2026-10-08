@@ -1,0 +1,101 @@
+# Reference deployment for running smg with **file** discovery inside the
+# cluster: the worker manifest is a ConfigMap mounted as the gateway's
+# --discovery-file. File discovery never calls the Kubernetes API, so the
+# gateway runs with no ServiceAccount token and needs no RBAC.
+#
+# The ConfigMap itself is not created here. Its volume is optional, so the
+# gateway starts before the manifest exists, and the test publishes it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smg-gateway-file
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: smg-gateway-file
+  template:
+    metadata:
+      labels:
+        app: smg-gateway-file
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: smg
+          image: smg-gateway:e2e
+          imagePullPolicy: Never
+          args:
+            - --host
+            - 0.0.0.0
+            - --port
+            - "3009"
+            - --discovery-provider
+            - file
+            - --discovery-file
+            - /etc/smg/workers.json
+            - --discovery-check-interval-secs
+            - "2"
+            - --policy
+            - round_robin
+          volumeMounts:
+            - name: manifest
+              mountPath: /etc/smg
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3009
+            initialDelaySeconds: 1
+            periodSeconds: 2
+      volumes:
+        - name: manifest
+          configMap:
+            name: smg-file-workers
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smg-gateway-file
+spec:
+  selector:
+    app: smg-gateway-file
+  ports:
+    - port: 3009
+      targetPort: 3009
+---
+# Engines the manifest lists by Pod IP. No Kubernetes discovery selector
+# matches them, so whatever the gateway registers came from the file.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engines-file
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: engines-file
+  template:
+    metadata:
+      labels:
+        app: engines-file
+    spec:
+      containers:
+        - name: engine
+          image: smg-mock-worker:e2e
+          imagePullPolicy: Never
+          args:
+            - --host
+            - 0.0.0.0
+            - --http-base-port
+            - "8080"
+            - --http-count
+            - "1"
+            - --model
+            - file-model
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 2
