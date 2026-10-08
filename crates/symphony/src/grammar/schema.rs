@@ -1,11 +1,49 @@
 //! What a tool's JSON schema says about each argument, for the syntaxes that write arguments one
 //! by one with a type of their own (Kimi K3's XTML, the keyed tags): the type a property's schema
 //! pins and the grammar of a value of that type, and the definitions a property's schema carries
-//! along so a `$ref` inside it still resolves when the engine compiles it on its own.
+//! along so a `$ref` inside it still resolves when the engine compiles it on its own; and the walk
+//! over a tool's properties the syntaxes share: one argument per property, in the schema's order,
+//! optional unless the schema requires it.
 
 use serde_json::{json, Value};
 
 use super::Grammar;
+
+/// The arguments a tool's schema asks for, as a syntax writes them: `each` property in the
+/// schema's order, each optional unless the schema requires it; `none` for a schema without
+/// properties, which takes whatever arguments the syntax allows.
+pub(super) fn arguments(
+    parameters: &Value,
+    each: impl Fn(&str, &Value, Definitions<'_>) -> Grammar,
+    none: impl FnOnce() -> Grammar,
+) -> Grammar {
+    let properties = parameters
+        .get("properties")
+        .and_then(Value::as_object)
+        .filter(|properties| !properties.is_empty());
+    let Some(properties) = properties else {
+        return none();
+    };
+    let required: Vec<&str> = parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let definitions = Definitions::of(parameters);
+    Grammar::Sequence(
+        properties
+            .iter()
+            .map(|(key, schema)| {
+                let argument = each(key, schema, definitions);
+                if required.contains(&key.as_str()) {
+                    argument
+                } else {
+                    Grammar::Optional(Box::new(argument))
+                }
+            })
+            .collect(),
+    )
+}
 
 /// The type a property's schema pins, by the name the templates write (`integer` as `number`),
 /// and the grammar of a value of that type: a string as `text`, the syntax's own spelling of a

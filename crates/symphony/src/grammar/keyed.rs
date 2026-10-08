@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use super::{
     block_of,
-    schema::{shape, Definitions},
+    schema::{self, shape, Definitions},
     CallMarkers, Grammar, Tag, WayIn,
 };
 use crate::tagged::keyed::Tags;
@@ -111,34 +111,14 @@ fn call(
 /// The arguments the tool's schema asks for: one pair per property, in the schema's order, each
 /// optional unless required; any pairs at all for a schema without properties.
 fn arguments(tags: &Tags, ends: &Ends<'_>, parameters: &Value) -> Grammar {
-    let properties = parameters
-        .get("properties")
-        .and_then(Value::as_object)
-        .filter(|properties| !properties.is_empty());
-    let Some(properties) = properties else {
-        return Grammar::Star(Box::new(any_argument(tags, ends)));
+    let pair = |key: &str, property: &Value, definitions: Definitions<'_>| {
+        let value = shape(property, definitions, || ends.text())
+            .map_or_else(|| ends.text(), |(_, value)| value);
+        argument(tags, Grammar::ConstString(key.to_string()), value)
     };
-    let required: Vec<&str> = parameters
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|names| names.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let definitions = Definitions::of(parameters);
-    Grammar::Sequence(
-        properties
-            .iter()
-            .map(|(key, schema)| {
-                let value = shape(schema, definitions, || ends.text())
-                    .map_or_else(|| ends.text(), |(_, value)| value);
-                let pair = argument(tags, Grammar::ConstString(key.clone()), value);
-                if required.contains(&key.as_str()) {
-                    pair
-                } else {
-                    Grammar::Optional(Box::new(pair))
-                }
-            })
-            .collect(),
-    )
+    schema::arguments(parameters, pair, || {
+        Grammar::Star(Box::new(any_argument(tags, ends)))
+    })
 }
 
 /// One pair: the key between its tags, the spelling's newline, the value between its tags.
@@ -266,6 +246,57 @@ mod tests {
                 "at_least_one": true,
             }})
         );
+    }
+
+    #[test]
+    fn a_ling_call_without_arguments_writes_both_newlines() {
+        // The template writes the newline after the name and the one before `</tool_call>`
+        // whether or not an argument comes between: every one of the 259 zero-argument calls in
+        // ling-3.0-flash's recorded parse sets reads `<tool_call>NAME\n\n</tool_call>`.
+        let payload = formats::ling()
+            .grammar(&[tool("ping", value!({"type": "object"}))], true, false)
+            .expect("a grammar")
+            .payload();
+        let tag = &payload["format"]["tags"][0];
+        let written = format!(
+            "{}{}",
+            tag["begin"].as_str().expect("begin"),
+            tag["end"].as_str().expect("end")
+        );
+        assert_eq!(written, "<tool_call>ping\n\n</tool_call>");
+    }
+
+    #[test]
+    fn hy4_with_the_reasoning_open_takes_the_prefix_and_its_one_way_in() {
+        // Hy4's prompt opens the thought, so this is the path it takes most: the prefix closes the
+        // thought and can write none of the six terminals nor the four suffixed tags; the block
+        // behind it has its one way in, from content, with no close of its own before the opener.
+        let payload = formats::hy4()
+            .grammar(&weather_tools(), true, true)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(payload["format"]["type"], "sequence");
+        let prefix = &payload["format"]["elements"][0];
+        assert_eq!(prefix["end"], "</think:opensource>");
+        assert_eq!(
+            prefix["content"]["excludes"],
+            value!([
+                "<think:opensource>",
+                "</think:opensource>",
+                "<tool_calls:opensource>",
+                "</tool_calls:opensource>",
+                "<tool_call:opensource>",
+                "</tool_call:opensource>",
+                "<arg_key:opensource>",
+                "</arg_key:opensource>",
+                "<arg_value:opensource>",
+                "</arg_value:opensource>",
+            ])
+        );
+        let block = &payload["format"]["elements"][1];
+        assert_eq!(block["triggers"], value!(["<tool_calls:opensource>"]));
+        assert_eq!(block["tags"][0]["begin"], "<tool_calls:opensource>");
+        assert_eq!(block["at_least_one"], true);
     }
 
     #[test]

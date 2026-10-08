@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use super::{
     block_of,
-    schema::{shape, Definitions},
+    schema::{self, shape, Definitions},
     CallMarkers, Grammar, WayIn,
 };
 
@@ -69,32 +69,9 @@ fn call(markers: &CallMarkers<'_>, name: &str, parameters: &Value) -> Grammar {
 /// The arguments the tool's schema asks for: one tag per property, in the schema's order, each
 /// optional unless required; any arguments at all for a schema without properties.
 fn arguments(parameters: &Value) -> Grammar {
-    let properties = parameters
-        .get("properties")
-        .and_then(Value::as_object)
-        .filter(|properties| !properties.is_empty());
-    let Some(properties) = properties else {
-        return Grammar::Star(Box::new(any_argument()));
-    };
-    let required: Vec<&str> = parameters
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|names| names.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let definitions = Definitions::of(parameters);
-    Grammar::Sequence(
-        properties
-            .iter()
-            .map(|(key, schema)| {
-                let tag = argument(key, schema, definitions);
-                if required.contains(&key.as_str()) {
-                    tag
-                } else {
-                    Grammar::Optional(Box::new(tag))
-                }
-            })
-            .collect(),
-    )
+    schema::arguments(parameters, argument, || {
+        Grammar::Star(Box::new(any_argument()))
+    })
 }
 
 /// One argument tag: the key, the type the property's schema pins and a value of that type, or
