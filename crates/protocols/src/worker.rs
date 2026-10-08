@@ -1365,6 +1365,10 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Non-evictable KV occupancy, excluding retained, reclaimable prefix cache.
+    /// Older backends omit this; pressure then uses their legacy token usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_token_usage: Option<f64>,
     pub gen_throughput: f64,
     pub cache_hit_rate: f64,
     pub utilization: f64,
@@ -1479,6 +1483,18 @@ impl WorkerLoadResponse {
             return 0.0;
         }
         self.loads.iter().map(|l| l.token_usage).sum::<f64>() / self.loads.len() as f64
+    }
+
+    /// Average non-evictable KV pressure, with the legacy fallback per rank.
+    pub fn effective_kv_pressure(&self) -> f64 {
+        if self.loads.is_empty() {
+            return 0.0;
+        }
+        self.loads
+            .iter()
+            .map(|load| load.active_token_usage.unwrap_or(load.token_usage))
+            .sum::<f64>()
+            / self.loads.len() as f64
     }
 
     /// Total used tokens summed across all DP ranks.

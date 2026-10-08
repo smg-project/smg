@@ -139,6 +139,9 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
                 max_total_num_tokens,
                 max_running_requests,
                 token_usage: load.token_usage,
+                // The direct TokenSpeed wire reports active pages, excluding
+                // retained cache (unlike the Python legacy GetLoad projection).
+                active_token_usage: Some(load.token_usage),
                 ..Default::default()
             }
         })

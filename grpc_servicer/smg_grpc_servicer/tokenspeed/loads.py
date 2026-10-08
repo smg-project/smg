@@ -55,3 +55,29 @@ def convert_load_to_protobuf(
         token_usage=(num_used_tokens / max_total_num_tokens if max_total_num_tokens > 0 else 0.0),
         max_running_requests=max_running_requests,
     )
+
+
+def convert_snapshot_to_protobuf(
+    snapshot: Any,
+    *,
+    page_size: int,
+    max_total_num_tokens: int,
+    max_running_requests: int,
+) -> tokenspeed_scheduler_pb2.SchedulerLoad:
+    """Keep allocator occupancy separate from the model's admission capacity.
+
+    Hybrid caches can have several KV pools per logical page. Their usable
+    logical page count cannot be inferred from the advertised token capacity.
+    Cached pages are resident but reclaimable; only active pages exert pressure.
+    """
+    return tokenspeed_scheduler_pb2.SchedulerLoad(
+        dp_rank=int(snapshot.dp_rank),
+        num_running_reqs=int(snapshot.num_running_reqs),
+        num_waiting_reqs=int(snapshot.num_waiting_reqs),
+        num_total_reqs=int(snapshot.num_running_reqs + snapshot.num_waiting_reqs),
+        num_used_tokens=int(snapshot.num_used_pages) * page_size,
+        max_total_num_tokens=max_total_num_tokens,
+        token_usage=snapshot.num_used_pages / snapshot.max_total_pages,
+        active_token_usage=snapshot.num_active_pages / snapshot.max_total_pages,
+        max_running_requests=max_running_requests,
+    )

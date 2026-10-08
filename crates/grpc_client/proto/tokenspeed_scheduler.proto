@@ -401,6 +401,9 @@ message SchedulerLoad {
   int32 num_waiting_uncached_tokens = 14;
 
   double token_usage = 8;
+  // Non-evictable KV occupancy. Retained prefix cache is reclaimable and must
+  // not make an otherwise idle worker appear overloaded. Absent on old workers.
+  optional double active_token_usage = 15;
   double gen_throughput = 9;
   double cache_hit_rate = 10;
   double utilization = 11;

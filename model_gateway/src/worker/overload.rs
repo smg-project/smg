@@ -118,7 +118,7 @@ impl OverloadThresholds {
             }
         }
         if let Some(threshold) = self.token_usage {
-            if load.effective_token_usage() >= threshold {
+            if load.effective_kv_pressure() >= threshold {
                 return true;
             }
         }

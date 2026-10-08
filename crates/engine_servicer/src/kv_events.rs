@@ -228,6 +228,10 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
         || last.waiting_uncached_tokens != current.waiting_uncached_tokens
         || last.max_running_requests != current.max_running_requests
         || (last.token_usage - current.token_usage).abs() > 0.005
+        || (last.active_token_usage.unwrap_or(last.token_usage)
+            - current.active_token_usage.unwrap_or(current.token_usage))
+        .abs()
+            > 0.005
         || {
             let delta = (last.gen_throughput - current.gen_throughput).abs();
             delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)

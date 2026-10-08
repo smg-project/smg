@@ -828,6 +828,7 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         (0, 0)
     );
     assert!((idle.loads[0].token_usage - 0.1).abs() < 1e-9);
+    assert_eq!(idle.loads[0].active_token_usage, Some(0.1));
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

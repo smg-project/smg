@@ -670,7 +670,7 @@ impl CacheAwarePolicy {
         let mut bounds: Option<(f64, f64)> = None;
         for &idx in healthy_indices {
             if let Some(load) = loads.get(workers[idx].url()) {
-                let usage = load.effective_token_usage();
+                let usage = load.effective_kv_pressure();
                 bounds = Some(match bounds {
                     Some((min, max)) => (min.min(usage), max.max(usage)),
                     None => (usage, usage),

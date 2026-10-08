@@ -263,6 +263,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 snapshot_to_scheduler_load(&engine.load().as_reported_by(self.cfg.loads_like))
             }
             None => ts::SchedulerLoad {
+                active_token_usage: None,
                 dp_rank: 0,
                 num_running_reqs: 0,
                 num_waiting_reqs: 0,
@@ -580,6 +581,7 @@ fn with_load_records(
 
 fn snapshot_to_scheduler_load(s: &engine::LoadSnapshot) -> ts::SchedulerLoad {
     ts::SchedulerLoad {
+        active_token_usage: None,
         dp_rank: 0,
         num_running_reqs: s.num_running_reqs,
         num_waiting_reqs: s.num_waiting_reqs,

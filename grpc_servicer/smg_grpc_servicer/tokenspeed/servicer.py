@@ -47,7 +47,11 @@ from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
-from smg_grpc_servicer.tokenspeed.loads import convert_load_to_protobuf, running_window
+from smg_grpc_servicer.tokenspeed.loads import (
+    convert_load_to_protobuf,
+    convert_snapshot_to_protobuf,
+    running_window,
+)
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
 from ..pd_pairing import pairing_protocol_from_env
@@ -705,9 +709,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> tokenspeed_scheduler_pb2.GetLoadsResponse:
         """Return per-DP-rank scheduler load (optionally filtered to one rank).
 
-        ``AsyncLLM.get_load()`` round-trips a ``GetLoadReqInput`` over the
-        scheduler zmq channel; each reply carries ``num_reqs`` (running +
-        waiting), ``num_waiting_reqs``, and ``num_pages`` (KV pages in use).
+        New engines maintain a complete, fresh replica of scheduler snapshots.
+        Preserve its allocator capacity and active/resident page distinction;
+        older engines return only request counts and resident pages.
         """
         # The EPD encode loop has no control-message dispatch: a GetLoadReqInput
         # forwarded over the scheduler channel is submitted to the encode worker
@@ -733,6 +737,18 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             load_outputs = await asyncio.wait_for(
                 self.async_llm.get_load(), timeout=HEALTH_CHECK_TIMEOUT
             )
+            store = getattr(self.async_llm, "load_snapshot_store", None)
+            snapshots = (
+                {int(snapshot.dp_rank): snapshot for snapshot in store.fresh_snapshots()}
+                if store is not None
+                else None
+            )
+            # A snapshot can expire between projection and conversion. A
+            # partial replica is unavailable load, never a zero-filled rank.
+            if snapshots is not None and any(
+                int(lo.dp_rank) not in snapshots for lo in load_outputs
+            ):
+                load_outputs = []
         # asyncio.TimeoutError is a separate exception on Python 3.10.
         except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
@@ -750,7 +766,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             wanted = int(request.dp_rank)
             load_outputs = [lo for lo in load_outputs if int(lo.dp_rank) == wanted]
 
-        page_size = int(getattr(self.async_llm.server_args, "page_size", 1) or 1)
+        # ModelConfig applies the model's effective grain to these same args.
+        page_size = int(
+            getattr(self.async_llm.server_args, "prefix_granularity", 0)
+            or getattr(self.async_llm.server_args, "page_size", 0)
+            or 0
+        )
+        if load_outputs and page_size <= 0:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "KV page geometry is unavailable")
+            return
         # Fall back to ``server_args.max_total_num_tokens`` for SimpleNamespace test stubs.
         max_total_num_tokens = int(
             (self.scheduler_info.get("max_total_num_tokens") if self.scheduler_info else None)
@@ -760,8 +784,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         max_running_requests = running_window(self.async_llm.server_args)
 
         scheduler_loads = [
-            convert_load_to_protobuf(
-                lo,
+            (convert_snapshot_to_protobuf if snapshots is not None else convert_load_to_protobuf)(
+                snapshots[int(lo.dp_rank)] if snapshots is not None else lo,
                 page_size=page_size,
                 max_total_num_tokens=max_total_num_tokens,
                 max_running_requests=max_running_requests,

@@ -52,6 +52,9 @@ message EngineLoad {
   optional uint32 waiting_uncached_tokens = 3;
   // KV-cache utilization in [0, 1], as GetLoads reports it.
   double token_usage = 4;
+  // Non-evictable KV occupancy, excluding reclaimable retained prefix cache.
+  // Part of the routing core: sent on every record when the engine reports it.
+  optional double active_token_usage = 18;
   // Tokens generated per second, as GetLoads reports it (0 when not known).
   double gen_throughput = 5;
   // The engine's admission window (max running requests); 0 when unknown.

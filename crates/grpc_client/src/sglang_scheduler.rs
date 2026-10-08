@@ -859,6 +859,7 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             num_used_tokens: load.num_used_tokens,
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
+            active_token_usage: None,
             gen_throughput: load.gen_throughput,
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,

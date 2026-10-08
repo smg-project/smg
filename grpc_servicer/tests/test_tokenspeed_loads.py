@@ -41,6 +41,26 @@ class TestRunningWindow:
 
 
 class TestLoadConversion:
+    def test_hybrid_page_capacity_and_active_usage_are_distinct(self, loads_mod):
+        snapshot = SimpleNamespace(
+            dp_rank=0,
+            num_running_reqs=1,
+            num_waiting_reqs=0,
+            num_active_pages=4,
+            num_used_pages=8,
+            max_total_pages=16,
+        )
+        load = loads_mod.convert_snapshot_to_protobuf(
+            snapshot,
+            page_size=128,
+            max_total_num_tokens=16384,
+            max_running_requests=16,
+        )
+        assert load.num_used_tokens == 1024
+        assert load.token_usage == 0.5
+        assert load.HasField("active_token_usage")
+        assert load.active_token_usage == 0.25
+
     def test_window_and_derived_counters_reach_the_protobuf(self, loads_mod):
         load_output = SimpleNamespace(dp_rank=1, num_reqs=5, num_waiting_reqs=2, num_pages=8)
 
@@ -60,6 +80,7 @@ class TestLoadConversion:
         assert load.num_used_tokens == 128
         assert load.max_total_num_tokens == 1024
         assert load.token_usage == pytest.approx(0.125)
+        assert not load.HasField("active_token_usage")
 
     def test_unknown_capacity_reports_zero_usage_instead_of_dividing(self, loads_mod):
         load_output = SimpleNamespace(dp_rank=0, num_reqs=1, num_waiting_reqs=0, num_pages=4)

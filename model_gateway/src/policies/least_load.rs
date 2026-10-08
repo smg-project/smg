@@ -76,7 +76,7 @@ impl SincePollDispatch {
 /// time-to-drain plus a convex KV-pressure barrier (argmin, lower is better):
 ///
 /// ```text
-///   score_i = (queued_tokens_i + inflight_tokens_i) / throughput_i
+///   score_i = (queued_tokens_i + running_estimated_tokens_i + inflight_tokens_i) / throughput_i
 ///             + kv_pressure_weight · k_i / (1 − k_i)
 /// ```
 ///
@@ -102,6 +102,9 @@ impl SincePollDispatch {
 ///   `waiting_reqs · p̄`, keeping the queue visible in time units rather than
 ///   scoring a backlogged worker as idle. Only a backend reporting neither
 ///   scores `queued_tokens = 0`;
+/// - running requests are estimated
+///   at `running_reqs · p̄`: a poll releases dispatch credit but does not mean
+///   the request finished. This is a fallback estimate, not remaining prefill;
 /// - zero/absent throughput (backend reports no generation rate): falls back to
 ///   the configured `default_throughput`, so the work term stays in seconds and
 ///   the KV barrier stays relevant;
@@ -289,11 +292,11 @@ impl LeastLoadPolicy {
         match Self::fresh_load(loads, complete_snapshot, url) {
             Some(load) => {
                 let inflight_tokens = inflight.get(url).map_or(0, |dispatch| dispatch.tokens);
-                let queued_tokens = self.queued_tokens(load);
+                let queued_tokens = self.queued_tokens(load) + self.running_estimated_tokens(load);
                 ExpectedWait::new(
                     queued_tokens,
                     self.drain_rate(load),
-                    load.effective_token_usage(),
+                    load.effective_kv_pressure(),
                     self.kv_pressure_weight,
                 )
                 .seconds(inflight_tokens)
@@ -413,6 +416,16 @@ impl LeastLoadPolicy {
         load.total_waiting_reqs().max(0) as f64 * self.mean_prefill_tokens as f64
     }
 
+    /// Load snapshots do not report remaining running token-work. Keep running
+    /// requests visible after the poll resets dispatch credit, including during
+    /// a mixed-version rollout: optional KV fields must not change this cost.
+    fn running_estimated_tokens(&self, load: &WorkerLoadResponse) -> f64 {
+        load.loads
+            .iter()
+            .map(|rank| rank.num_running_reqs.max(0) as f64 * self.mean_prefill_tokens as f64)
+            .sum()
+    }
+
     /// Token-work the request being routed adds to the chosen worker's
     /// in-flight estimate: its token count if known, else the mean prefill.
     fn request_tokens(&self, info: &SelectWorkerInfo) -> u64 {
@@ -513,6 +526,9 @@ impl LeastLoadPolicy {
                     "source": "expected_wait", "worker": url, "score": score,
                     "score_unit": if inputs.fleet_has_loads { "seconds" } else { "requests" },
                     "queued_tokens": load.map(|load| self.queued_tokens(load)),
+                    "running_estimated_tokens": load.map(|load| self.running_estimated_tokens(load)),
+                    "kv_pressure": load.map(WorkerLoadResponse::effective_kv_pressure),
+                    "resident_token_usage": load.map(WorkerLoadResponse::effective_token_usage),
                     "drain_rate": load.map(|load| self.drain_rate(load)),
                     "since_poll_tokens": inflight.get(url).map_or(0, |dispatch| dispatch.tokens),
                     "fresh_load": load.is_some(),
@@ -716,6 +732,44 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
+    }
+
+    #[test]
+    fn running_work_survives_the_poll_credit_reset() {
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut busy = make_load(0, 0.0, 0.0);
+        busy.loads[0].num_running_reqs = 1;
+        let loads = HashMap::from([
+            (workers[0].url().to_string(), busy),
+            (workers[1].url().to_string(), make_load(0, 0.1, 0.0)),
+        ]);
+        // Dispatch credit is gone once the scheduler reports the request.
+        policy.update_loads(&loads);
+        assert_eq!(policy.load_state_for_test(workers[0].url()), (true, 0, 0));
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn reclaimable_prefix_cache_does_not_make_an_idle_worker_busy() {
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut idle = make_load(0, 1.0, 0.0);
+        idle.loads[0].active_token_usage = Some(0.0);
+        let mut busy = make_load(0, 0.5, 0.0);
+        busy.loads[0].active_token_usage = Some(0.5);
+        busy.loads[0].num_running_reqs = 1;
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), idle),
+            (workers[1].url().to_string(), busy),
+        ]));
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
     }
 
     #[test]
