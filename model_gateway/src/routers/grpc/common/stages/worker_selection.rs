@@ -21,15 +21,15 @@ use crate::{
         error,
         grpc::{
             context::{
-                DispatchContext, EncodeWorkerAssignment, RequestContext, RoutingSnapshot,
-                WireConstraint, WorkerSelection,
+                DispatchContext, EncodeWorkerAssignment, RequestContext, RequestType,
+                RoutingSnapshot, WireConstraint, WorkerSelection,
             },
             multimodal,
         },
         prefill_queue_full, prefill_queue_timeout,
     },
     worker::{
-        acquire_prefill, ConnectionModeExt, HashRing, ModelWorkerSnapshot, PdWire,
+        acquire_prefill, ConnectionMode, ConnectionModeExt, HashRing, ModelWorkerSnapshot, PdWire,
         PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection, PrefillCandidateError,
         PrefillLoadGuard, PrefillSelectionContext, RoutingPool, RuntimeType, Worker,
         WorkerRegistry, WorkerType,
@@ -170,6 +170,14 @@ impl PipelineStage for WorkerSelectionStage {
         let sticky_key = ctx.state.sticky_key.as_deref();
 
         let model_id = ctx.input.model_id.as_str();
+        // Decisions needs selected-token scoring, currently supported only by
+        // SGLang gRPC. Retries retain the selected wire via DispatchContext.
+        let wire =
+            matches!(ctx.input.request_type, RequestType::Decisions(_)).then_some(WireConstraint {
+                runtime: RuntimeType::Sglang,
+                connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
+            });
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_single_worker(
@@ -179,7 +187,7 @@ impl PipelineStage for WorkerSelectionStage {
                     headers,
                     rid_key,
                     cache_namespace,
-                    None,
+                    wire,
                     media_refs,
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
@@ -187,7 +195,7 @@ impl PipelineStage for WorkerSelectionStage {
                         return Err(self.selection_failure(
                             model_id,
                             &[WorkerType::Regular],
-                            None,
+                            wire,
                             media_refs,
                         ))
                     }

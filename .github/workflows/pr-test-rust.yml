@@ -263,7 +263,7 @@ jobs:
           # zmq or vllm still skip here (-rs lists them): the zmq ones import
           # engine servicers that need torch, and the vllm cases run on the
           # vLLM e2e lane.
-          pip install ./crates/grpc_client/python msgspec pydantic numpy
+          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
           pytest -q grpc_servicer/tests -rs
 
       - name: Run CI tooling unit tests
@@ -725,7 +725,7 @@ jobs:
             test_timeout: 32
             # Chat lane plus the admin ops the Rust servicer serves through
             # the wire's control calls.
-            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py
             min_selected: 204 # floor ≈ 95% of the chat lane's measured effective (215 of 223 ran on the Rust servicer; audit 2026-10-04)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:

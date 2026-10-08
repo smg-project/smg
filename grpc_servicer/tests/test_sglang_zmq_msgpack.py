@@ -156,6 +156,8 @@ def test_slim_output_pins_its_positional_layout():
         [[], []],  # input_token_logprobs_idx
         [[], []],  # input_top_logprobs_val
         [[], []],  # input_top_logprobs_idx
+        [[], []],  # output_token_ids_logprobs_val
+        [[], []],  # output_token_ids_logprobs_idx
     ]
 
 

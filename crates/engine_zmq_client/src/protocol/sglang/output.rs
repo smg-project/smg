@@ -87,11 +87,18 @@ pub struct BatchTokenIDSlimOutput {
     pub input_token_logprobs_idx: Vec<Vec<u32>>,
     pub input_top_logprobs_val: Vec<Vec<Vec<f64>>>,
     pub input_top_logprobs_idx: Vec<Vec<Vec<u32>>>,
+    /// Requested candidate logprobs per output position, per request. A
+    /// prefill-only score carries one row even with no generated tokens.
+    /// Appended; absent from older plugins.
+    pub output_token_ids_logprobs_val: Vec<Vec<Vec<f64>>>,
+    pub output_token_ids_logprobs_idx: Vec<Vec<Vec<u32>>>,
 }
 
 impl Serialize for BatchTokenIDSlimOutput {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut tuple = serializer.serialize_tuple(24)?;
+        let has_selected = !self.output_token_ids_logprobs_val.is_empty()
+            || !self.output_token_ids_logprobs_idx.is_empty();
+        let mut tuple = serializer.serialize_tuple(if has_selected { 26 } else { 24 })?;
         tuple.serialize_element(BATCH_TOKEN_ID_SLIM_OUTPUT_TAG)?;
         tuple.serialize_element(&self.rids)?;
         tuple.serialize_element(&self.output_ids)?;
@@ -116,6 +123,10 @@ impl Serialize for BatchTokenIDSlimOutput {
         tuple.serialize_element(&self.input_token_logprobs_idx)?;
         tuple.serialize_element(&self.input_top_logprobs_val)?;
         tuple.serialize_element(&self.input_top_logprobs_idx)?;
+        if has_selected {
+            tuple.serialize_element(&self.output_token_ids_logprobs_val)?;
+            tuple.serialize_element(&self.output_token_ids_logprobs_idx)?;
+        }
         tuple.end()
     }
 }
@@ -194,6 +205,8 @@ fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
         input_token_logprobs_idx: appended_column(seq)?,
         input_top_logprobs_val: appended_column(seq)?,
         input_top_logprobs_idx: appended_column(seq)?,
+        output_token_ids_logprobs_val: appended_column(seq)?,
+        output_token_ids_logprobs_idx: appended_column(seq)?,
     };
     drain_trailing(seq)?;
     Ok(batch)
@@ -226,6 +239,14 @@ pub struct SglangOutput {
     pub input_logprobs_idx: Vec<u32>,
     pub input_top_logprobs_val: Vec<Vec<f64>>,
     pub input_top_logprobs_idx: Vec<Vec<u32>>,
+    /// Raw full-vocabulary logprobs for the requested candidates. Independent
+    /// of sampled-token/top-k output, including prefill-only scoring.
+    pub output_token_ids_logprobs_val: Vec<Vec<f64>>,
+    pub output_token_ids_logprobs_idx: Vec<Vec<u32>>,
+    /// A selected-score shape error belongs to this request. Keeping it on
+    /// the routed output prevents isolated malformed batches being dropped
+    /// by the connector and leaving their requests waiting indefinitely.
+    pub selected_logprobs_error: Option<String>,
     /// The pooled vector of an embedding request (its one, finished, output).
     pub embedding: Option<Vec<f32>>,
 }
@@ -296,6 +317,10 @@ impl BatchTokenIDSlimOutput {
                 message: format!("column `{name}` has {len} entries for {n} rids"),
             });
         }
+        let selected_columns_valid = (self.output_token_ids_logprobs_val.is_empty()
+            && self.output_token_ids_logprobs_idx.is_empty())
+            || (self.output_token_ids_logprobs_val.len() == n
+                && self.output_token_ids_logprobs_idx.len() == n);
         let mut finished_reasons = self.finished_reasons.into_iter();
         let mut finished_messages = self.finished_messages.into_iter();
         let mut finished_status = self.finished_status.into_iter();
@@ -312,12 +337,23 @@ impl BatchTokenIDSlimOutput {
         let mut input_idx = self.input_token_logprobs_idx.into_iter();
         let mut input_top_val = self.input_top_logprobs_val.into_iter();
         let mut input_top_idx = self.input_top_logprobs_idx.into_iter();
+        let mut selected_val = self.output_token_ids_logprobs_val.into_iter();
+        let mut selected_idx = self.output_token_ids_logprobs_idx.into_iter();
         Ok(self
             .rids
             .into_iter()
             .zip(self.output_ids)
             .map(|(request_id, output_ids)| {
                 let reason = finished_reasons.next().unwrap_or_default();
+                let selected_values = selected_val.next().unwrap_or_default();
+                let selected_ids = selected_idx.next().unwrap_or_default();
+                let selected_logprobs_error = (!selected_columns_valid
+                    || selected_values.len() != selected_ids.len()
+                    || selected_values
+                        .iter()
+                        .zip(&selected_ids)
+                        .any(|(values, ids)| values.len() != ids.len()))
+                .then(|| "selected-token logprobs have mismatched values and IDs".to_string());
                 SglangOutput {
                     request_id,
                     output_ids,
@@ -337,6 +373,9 @@ impl BatchTokenIDSlimOutput {
                     input_logprobs_idx: input_idx.next().unwrap_or_default(),
                     input_top_logprobs_val: input_top_val.next().unwrap_or_default(),
                     input_top_logprobs_idx: input_top_idx.next().unwrap_or_default(),
+                    output_token_ids_logprobs_val: selected_values,
+                    output_token_ids_logprobs_idx: selected_ids,
+                    selected_logprobs_error,
                     embedding: None,
                 }
             })
@@ -607,10 +646,13 @@ mod tests {
     /// b finished on token 42 with logprobs and two ranked candidates on its
     /// last token, load 2/3/40/400 on engine 1, no abort status.
     const PYTHON_SLIM: &str = "dc0013b64261746368546f6b656e4944536c696d4f757470757492a161a16292910a92141592a0a473746f7092c0c092c02a920304920102920001929092cbbfe0000000000000cbbfd0000000000000929092141501020328cd019092c0c092909192cbbfe0000000000000cbbff0000000000000929091921516";
-    /// The same batch from the current plugin (24 elements): `b` with 4
+    /// The same batch from the earlier 24-element plugin: `b` with 4
     /// reasoning tokens and prompt logprobs for its three prompt tokens (no
     /// value for the first), one ranked candidate per later position.
     const PYTHON_SLIM24: &str = "dc0018b64261746368546f6b656e4944536c696d4f757470757492a161a16292910a92141592a0a473746f7092c0c092c02a920304920102920001929092cbbfe0000000000000cbbfd00000000000009290921415000000000092c0c092909192cbbfe0000000000000cbbff0000000000000929091921516920004929093c0cbbfe6666666666666cbbff199999999999a9290930102039290939091cbbfe666666666666691cbbff199999999999a9290939091029103";
+    /// Python plugin's 26-element score-only result: no generated tokens,
+    /// candidate IDs 42 and 5 with raw logprobs -0.25 and -12.0.
+    const PYTHON_SCORE26: &str = "dc001ab64261746368546f6b656e4944536c696d4f757470757491a573636f7265919091a66c656e67746891c091c091039100910091909190000000000091c09190919091009190919091909190919192cbbfd0000000000000cbc0280000000000009191922a05";
     /// The plugin's embedding batch for rid `e1`: vector `[0.25, -0.5]`, 3
     /// prompt tokens, finished `stop`, engine 1, no load tail.
     const PYTHON_EMBED: &str = "9db84261746368456d62656464696e67536c696d4f757470757491a265319192cb3fd0000000000000cbbfe00000000000009103910091a473746f7091c091c00100000000";
@@ -669,6 +711,8 @@ mod tests {
     fn python_pinned_batch_with_appended_columns_round_trips() {
         let batch: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM24)).unwrap();
         assert_eq!(batch.reasoning_tokens, vec![0, 4]);
+        assert!(batch.output_token_ids_logprobs_val.is_empty());
+        assert!(batch.output_token_ids_logprobs_idx.is_empty());
         assert_eq!(
             batch.input_token_logprobs_val,
             vec![vec![], vec![None, Some(-0.7), Some(-1.1)]]
@@ -693,6 +737,41 @@ mod tests {
             decode_msgpack::<SglangWireOutput>(&hex(PYTHON_SLIM24)).unwrap(),
             SglangWireOutput::Tokens(_)
         ));
+    }
+
+    #[test]
+    fn python_score_only_batch_preserves_selected_candidates() {
+        let batch: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SCORE26)).unwrap();
+        assert_eq!(encode_msgpack(&batch).unwrap(), hex(PYTHON_SCORE26));
+        let outputs = batch.into_outputs().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].output_ids.is_empty());
+        assert!(outputs[0].output_logprobs_val.is_empty());
+        assert_eq!(outputs[0].completion_tokens, 0);
+        assert_eq!(
+            outputs[0].output_token_ids_logprobs_val,
+            vec![vec![-0.25, -12.0]]
+        );
+        assert_eq!(outputs[0].output_token_ids_logprobs_idx, vec![vec![42, 5]]);
+    }
+
+    #[test]
+    fn selected_candidate_shape_mismatch_is_refused() {
+        let batch: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SCORE26)).unwrap();
+        let mut missing_column = batch.clone();
+        missing_column.output_token_ids_logprobs_idx.clear();
+        let mut missing_row = batch.clone();
+        missing_row.output_token_ids_logprobs_idx[0].clear();
+        let mut missing_id = batch;
+        missing_id.output_token_ids_logprobs_idx[0][0].pop();
+        for malformed in [missing_column, missing_row, missing_id] {
+            let outputs = malformed.into_outputs().unwrap();
+            assert_eq!(outputs[0].request_id, "score");
+            assert!(outputs[0]
+                .selected_logprobs_error
+                .as_deref()
+                .is_some_and(|error| error.contains("selected-token logprobs")));
+        }
     }
 
     #[test]

@@ -172,6 +172,36 @@ impl SglangSchedulerClient {
         }
     }
 
+    /// Build a prefill-only next-token scoring request with explicit defaults.
+    pub fn build_score_request(
+        request_id: String,
+        token_ids: Vec<u32>,
+        label_ids: Vec<u32>,
+    ) -> proto::GenerateRequest {
+        proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                input_ids: token_ids,
+                original_text: String::new(),
+            }),
+            sampling_params: Some(proto::SamplingParams {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: -1,
+                repetition_penalty: 1.0,
+                max_new_tokens: Some(0),
+                n: 1,
+                ..Default::default()
+            }),
+            return_logprob: true,
+            logprob_start_len: -1,
+            token_ids_logprob: label_ids,
+            stream: false,
+            require_reasoning: false,
+            ..Default::default()
+        }
+    }
+
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
     #[expect(
         clippy::unused_self,
@@ -879,6 +909,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn score_request_uses_unscaled_prefill_only_logprobs() {
+        let request = SglangSchedulerClient::build_score_request(
+            "score".to_string(),
+            vec![1, 2, 3],
+            vec![42, 5],
+        );
+        assert_eq!(request.request_id, "score");
+        assert_eq!(request.tokenized.unwrap().input_ids, vec![1, 2, 3]);
+        assert_eq!(request.token_ids_logprob, vec![42, 5]);
+        assert!(request.return_logprob);
+        assert_eq!(request.logprob_start_len, -1);
+        assert_eq!(request.top_logprobs_num, 0);
+        assert!(!request.stream && !request.require_reasoning);
+        let params = request.sampling_params.unwrap();
+        assert_eq!(params.max_new_tokens, Some(0));
+        assert_eq!(params.temperature, 1.0);
+        assert_eq!(params.top_p, 1.0);
+        assert_eq!(params.top_k, -1);
+        assert_eq!(params.repetition_penalty, 1.0);
+        assert_eq!(params.n, 1);
+        assert!(params.constraint.is_none() && params.logit_bias.is_empty());
+    }
 
     #[test]
     fn test_proto_types_compilation() {

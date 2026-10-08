@@ -203,7 +203,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     ) -> Response {
         error::not_implemented(
             "decisions_not_supported",
-            "Decisions is supported only by the regular HTTP router",
+            "Decisions is supported by regular HTTP and SGLang gRPC routers",
         )
     }
 

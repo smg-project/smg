@@ -661,6 +661,14 @@ impl ZmqEngineClient {
         &self,
         req: sglang_proto::GenerateRequest,
     ) -> Result<ZmqGenerateStream, tonic::Status> {
+        // This merged direct-ZMQ surface returns vLLM-proto items, which do
+        // not carry selected-token scores. The Rust SGLang servicer uses the
+        // unmerged streams and their native SGLang response conversion.
+        if !req.token_ids_logprob.is_empty() {
+            return Err(tonic::Status::unimplemented(
+                "selected-token logprobs require the SGLang gRPC servicer",
+            ));
+        }
         let mut streams = SelectAll::new();
         for stream in self.generate_sglang_streams(req).await? {
             streams.push(stream);

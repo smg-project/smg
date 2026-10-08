@@ -22,13 +22,15 @@ use serde_json::{json, Map, Value};
 
 use crate::routers::error;
 
-pub(super) const UPSTREAM_ROUTE: &str = "/v1/systemone";
+pub(crate) const UPSTREAM_ROUTE: &str = "/v1/systemone";
 
-pub(super) struct SglangDecisionAdapter {
+#[derive(Clone)]
+pub(crate) struct SglangDecisionAdapter {
     request: Value,
     questions: Vec<MappedQuestion>,
 }
 
+#[derive(Clone)]
 enum MappedQuestion {
     Predicate {
         name: Option<String>,
@@ -282,7 +284,7 @@ impl SglangDecisionAdapter {
         Response::from_parts(parts, body)
     }
 
-    fn map_response(&self, value: &Value) -> Result<DecisionResponse, String> {
+    pub(crate) fn map_response(&self, value: &Value) -> Result<DecisionResponse, String> {
         let model = string_field(value, "model")?.to_owned();
         let upstream_answers = object_field(value, "answers")?;
         if upstream_answers.len() != self.questions.len() {

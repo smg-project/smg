@@ -17,6 +17,7 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::CreateMessageRequest,
@@ -41,6 +42,10 @@ use super::{
             completion::{
                 CompletionPreparationStage, CompletionRequestBuildingStage,
                 CompletionResponseProcessingStage,
+            },
+            decisions::{
+                DecisionsPreparationStage, DecisionsRequestBuildingStage,
+                DecisionsResponseProcessingStage,
             },
             embedding::{
                 preparation::EmbeddingPreparationStage,
@@ -85,6 +90,7 @@ pub(crate) enum Endpoint {
     Harmony,
     Embeddings,
     Classify,
+    Decisions,
     Transcription,
 }
 
@@ -284,6 +290,19 @@ impl RequestPipeline {
         let rate_limit = || RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
         let stages = match endpoint {
+            Endpoint::Decisions => {
+                if !matches!(mode, Mode::Regular) {
+                    return None;
+                }
+                PipelineStages {
+                    preparation: Box::new(DecisionsPreparationStage),
+                    rate_limit: Some(rate_limit()),
+                    worker_selection,
+                    encode: None,
+                    request_building: Box::new(DecisionsRequestBuildingStage),
+                    response_processing: Box::new(DecisionsResponseProcessingStage),
+                }
+            }
             Endpoint::Chat => {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 PipelineStages {
@@ -523,6 +542,12 @@ impl RequestPipeline {
                 decoder.reset();
             }
             dctx.response.execution_result = None;
+        }
+
+        if let ResponseSpec::Decisions(spec) = spec {
+            if let Some(workers) = dctx.workers.as_ref() {
+                enforce_decisions_context_length(spec.max_input_tokens, workers, &dctx.model_id)?;
+            }
         }
 
         // The last allowed attempt moves the plan (no clone); earlier
@@ -1023,6 +1048,51 @@ impl RequestPipeline {
         }
     }
 
+    /// Execute a decision batch and settle its single logical reservation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the rate-limited endpoint entry contract"
+    )]
+    pub async fn execute_decisions(
+        &self,
+        request: Arc<DecisionsRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+        tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
+        retry_config: Option<&RetryConfig>,
+    ) -> Response {
+        let mut ctx = RequestContext::for_decisions(request, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+        ctx.input.rate_limit_cell = rate_limit_cell;
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_DECISIONS;
+        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Decisions(response)) => {
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        u32::try_from(response.usage.input_tokens).unwrap_or(u32::MAX),
+                        0,
+                    )
+                    .await;
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                }
+                Some(other) => self.wrong_response_type(
+                    "execute_decisions",
+                    "Decisions",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => self.no_response_produced("execute_decisions", &dctx.model_id, ENDPOINT),
+            },
+            Err(response) => response,
+        }
+    }
+
     /// Execute the complete pipeline for an embedding request
     pub async fn execute_embeddings(
         &self,
@@ -1337,6 +1407,7 @@ mod build_parity_tests {
                 "EmbeddingRequestBuildingStage".to_string()
             }
             Endpoint::Transcription => "TranscriptionRequestBuildingStage".to_string(),
+            Endpoint::Decisions => "DecisionsRequestBuildingStage".to_string(),
         };
         let rate_limit = !matches!(
             endpoint,
@@ -1393,6 +1464,7 @@ mod build_parity_tests {
             Endpoint::Embeddings,
             Endpoint::Classify,
             Endpoint::Transcription,
+            Endpoint::Decisions,
         ] {
             assert!(
                 RequestPipeline::build(endpoint, Mode::PrefillDecode, &deps).is_none(),

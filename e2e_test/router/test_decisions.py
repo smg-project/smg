@@ -1,9 +1,10 @@
-"""OpenAI Decisions through a regular HTTP gateway and real SGLang inference.
+"""OpenAI Decisions through regular HTTP and gRPC SGLang workers.
 
-Uses raw HTTP because the installed OpenAI SDK can predate Decisions. The
-SGLang adapter performs prefill scoring, so every response has zero output
-usage. Run with E2E_ENGINE=sglang E2E_RUNTIME=sglang pytest
-e2e_test/router/test_decisions.py -v.
+Uses raw HTTP because the installed OpenAI SDK can predate Decisions. SGLang
+scores candidate labels during prefill, so successful responses have zero
+output usage. Run with E2E_ENGINE=sglang E2E_RUNTIME=sglang pytest
+e2e_test/router/test_decisions.py -v. Set E2E_SGLANG_SERVICER_IMPL=rust to
+exercise the Rust gRPC servicer; the default uses the Python servicer.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ def _assert_distribution(answer: dict) -> None:
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
 @pytest.mark.model(_MODEL)
-@pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
+@pytest.mark.parametrize("setup_backend", ["http", "grpc"], indirect=True)
 class TestDecisions:
     def test_all_question_types_order_names_and_prefill_usage(self, setup_backend):
         _, model, _, gateway = setup_backend

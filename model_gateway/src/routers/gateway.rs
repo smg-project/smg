@@ -47,6 +47,7 @@ use crate::{
         common::body_policy::REASON_MODEL_SELECTION,
         error as route_error,
         factory::{router_ids, RouterId},
+        grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
         BodyPolicy, RouterFactory, RouterTrait,
     },
     server::ServerConfig,
@@ -596,20 +597,35 @@ impl RouterTrait for Gateway {
         body: DecisionsRequest,
         model_id: &str,
     ) -> Response {
+        if model_id == UNKNOWN_MODEL_ID
+            || self
+                .worker_registry
+                .resolve_model_alias(model_id)
+                .as_deref()
+                == Some(UNKNOWN_MODEL_ID)
+        {
+            return route_error::model_not_found(model_id);
+        }
         let router = if self.enable_igw {
             let snapshot = self.worker_registry.get_routing_snapshot(model_id);
             if snapshot.is_empty() {
                 return route_error::model_not_found(model_id);
             }
-            // Decisions is supported only by regular HTTP workers. General
-            // weighted dispatch could send the same model to PD or gRPC.
-            if snapshot.pool(RoutingPool::HttpRegular).is_empty() {
+            // Weight only transports that can serve this endpoint. The gRPC
+            // pipeline also filters its initial and retry worker selections.
+            let http = snapshot.pool(RoutingPool::HttpRegular).len();
+            let grpc = snapshot
+                .pool(RoutingPool::GrpcPipelineRegular)
+                .iter()
+                .filter(|worker| supports_decisions_worker(worker.as_ref()))
+                .count();
+            if http == 0 && grpc == 0 {
                 return route_error::not_implemented(
                     "decisions_not_supported",
-                    "Decisions requires a regular HTTP worker for this model",
+                    "Decisions requires a regular HTTP or SGLang gRPC worker for this model",
                 );
             }
-            self.routers.load().get(&router_ids::HTTP_REGULAR).cloned()
+            self.pick_router_by_weights(0, 0, 0, grpc, http)
         } else {
             self.select_router_for_request(Some(model_id))
         };
@@ -621,7 +637,7 @@ impl RouterTrait for Gateway {
             }
             None => route_error::not_implemented(
                 "decisions_not_supported",
-                "Decisions requires a regular HTTP router",
+                "Decisions requires a regular HTTP or SGLang gRPC router",
             ),
         }
     }
@@ -759,7 +775,9 @@ mod tests {
     use crate::{
         middleware::{RouteRequestMeta, TenantKey},
         routers::factory::router_ids,
-        worker::{BasicWorkerBuilder, CircuitBreakerConfig, WorkerRegistry, WorkerType},
+        worker::{
+            BasicWorkerBuilder, CircuitBreakerConfig, RuntimeType, WorkerRegistry, WorkerType,
+        },
     };
 
     #[derive(Debug)]
@@ -997,6 +1015,24 @@ mod tests {
                 StatusCode::NOT_FOUND
             );
         }
+    }
+
+    #[tokio::test]
+    async fn decisions_use_regular_sglang_grpc_workers() {
+        let gateway = test_gateway(true);
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(DecisionsStubRouter));
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://worker:8080")
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Sglang)
+                    .model(ModelCard::new("m").with_alias("alias"))
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(decision_status(&gateway, "m").await, StatusCode::OK);
+        assert_eq!(decision_status(&gateway, "alias").await, StatusCode::OK);
     }
 
     #[tokio::test]

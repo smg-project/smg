@@ -38,6 +38,7 @@
 //!   responses to clients and parsing upstream SSE byte streams
 
 pub mod body_policy;
+pub(crate) mod decisions;
 pub use smg_external_router::header_utils;
 pub(crate) mod kv_transfer;
 pub use smg_external_router::{mcp_utils, openai_bridge};

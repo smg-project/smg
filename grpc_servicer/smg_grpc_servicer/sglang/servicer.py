@@ -49,7 +49,10 @@ from smg_grpc_proto.generated import common_pb2
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
 from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf
-from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
+from smg_grpc_servicer.sglang.request_manager import (
+    GrpcRequestManager,
+    _validate_token_ids_logprobs,
+)
 from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
@@ -978,6 +981,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         token_logprobs_idx = logprobs_data.get("token_logprobs_idx", [])
         top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
         top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
+        selected_values = logprobs_data.get("token_ids_logprobs_val", [])
+        selected_ids = logprobs_data.get("token_ids_logprobs_idx", [])
+        _validate_token_ids_logprobs(selected_values, selected_ids)
 
         # Build TopLogProbs entries
         top_logprobs_proto = []
@@ -994,6 +1000,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             token_logprobs=token_logprobs_val,  # Plain float array
             token_ids=token_logprobs_idx,
             top_logprobs=top_logprobs_proto,
+            token_ids_logprobs=[
+                sglang_scheduler_pb2.TopLogProbs(values=values, token_ids=token_ids)
+                for values, token_ids in zip(selected_values, selected_ids)
+            ],
         )
 
     def _convert_input_logprobs_to_proto(
@@ -1095,10 +1105,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             elif isinstance(matched, str):
                 matched_stop_kwargs["matched_stop_str"] = matched
 
-        # Convert output logprobs if present
-        output_logprobs_proto = self._convert_output_logprobs_to_proto(
-            output.get("output_logprobs")
-        )
+        # Complete includes all selected rows, while the last stream chunk
+        # contains only that scheduler tick's rows.
+        logprobs_data = output.get("output_logprobs")
+        if "complete_token_ids_logprobs" in output:
+            logprobs_data = {
+                **(logprobs_data or {}),
+                **output["complete_token_ids_logprobs"],
+            }
+        output_logprobs_proto = self._convert_output_logprobs_to_proto(logprobs_data)
 
         # Convert input logprobs if present
         input_logprobs_proto = self._convert_input_logprobs_to_proto(output.get("input_logprobs"))

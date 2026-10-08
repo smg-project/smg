@@ -36,6 +36,9 @@ pub(crate) fn enforce_context_length(
     workers: &WorkerSelection,
     model_id: &str,
 ) -> Result<(), Response> {
+    if matches!(prep, PreparationOutput::Decisions { .. }) {
+        return enforce_decisions_context_length(prep.max_input_token_count(), workers, model_id);
+    }
     let Some(limit) = selection_context_length(workers, model_id) else {
         return Ok(());
     };
@@ -54,6 +57,24 @@ pub(crate) fn enforce_context_length(
              {input_tokens} input tokens. Please reduce the length of the input."
         ),
     ))
+}
+
+/// Reject prompts reaching SGLang's advertised context boundary. The engine
+/// can impose a smaller KV capacity limit; response processing also verifies
+/// the scored prompt length to detect any scheduler-side truncation.
+pub(crate) fn enforce_decisions_context_length(
+    input_tokens: usize,
+    workers: &WorkerSelection,
+    model_id: &str,
+) -> Result<(), Response> {
+    let Some(limit) = selection_context_length(workers, model_id) else {
+        return Ok(());
+    };
+    if input_tokens < limit as usize {
+        return Ok(());
+    }
+    Err(error::bad_request(CONTEXT_LENGTH_EXCEEDED,
+        format!("Decision prompt has {input_tokens} tokens and cannot fit the {limit}-token context window with its scoring position intact")))
 }
 
 /// Reject a chat completion budget the model's window could never hold.

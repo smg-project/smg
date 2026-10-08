@@ -22,7 +22,7 @@ use openai_protocol::{
 };
 use serde_json::Value;
 
-use crate::routers::grpc::utils;
+use crate::routers::grpc::{regular::stages::decisions::scoring::DecisionScoring, utils};
 
 /// Response-phase contract for one request, produced by request building.
 #[derive(Clone)]
@@ -34,8 +34,23 @@ pub(crate) enum ResponseSpec {
     /// Embedding/classify response processing needs only dispatch metadata.
     Embedding,
     Classify,
+    Decisions(DecisionsResponseSpec),
     Harmony(HarmonyResponseSpec),
     Transcription(TranscriptionResponseSpec),
+}
+
+#[derive(Clone)]
+pub(crate) struct DecisionsResponseSpec {
+    pub scoring: DecisionScoring,
+    pub questions: Vec<DecisionQuestionSpec>,
+    pub max_input_tokens: usize,
+}
+
+/// The candidate tokens and exact prompt size expected for one scoring RPC.
+#[derive(Clone)]
+pub(crate) struct DecisionQuestionSpec {
+    pub label_ids: Vec<u32>,
+    pub input_tokens: usize,
 }
 
 /// Wire format of a `/v1/audio/transcriptions` response body.

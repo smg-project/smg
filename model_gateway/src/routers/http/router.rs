@@ -58,6 +58,7 @@ use crate::{
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
                 REASON_WORKER_MUTATES_BODY,
             },
+            decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
             placement::{self, PlacementFailure, PlacementInputs},
             realtime::{
@@ -75,7 +76,6 @@ use crate::{
         gateway::Gateway,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         http::{
-            decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             request_body::{
                 serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
             },

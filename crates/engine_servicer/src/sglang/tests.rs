@@ -369,6 +369,132 @@ async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A score-only scheduler result must survive the wire and proto conversion,
+/// even though no sampled-token logprobs exist to carry it.
+#[tokio::test]
+async fn scoring_preserves_selected_logprobs_without_generated_tokens() {
+    let mut h = harness(model_info()).await;
+    let mut request = generate_request("score", false, Vec::new());
+    request.sampling_params.as_mut().unwrap().max_new_tokens = Some(0);
+    request.return_logprob = true;
+    request.token_ids_logprob = vec![42, 5];
+    let mut stream = h.client.generate(request).await.unwrap().into_inner();
+    let sent = recv_add(&mut h.engine_in).await;
+    assert_eq!(sent.token_ids_logprob, Some(vec![42, 5]));
+    assert_eq!(sent.sampling_params.max_new_tokens, Some(0));
+
+    // A scheduler scoring result has no sampled/output tokens. The SMG
+    // plugin appends the selected candidate columns at slots 24 and 25.
+    let encoded = encode_msgpack(&batch("score", vec![], 0, Some("length"), None)).unwrap();
+    let OpaqueValue::Array(mut fields) = decode_msgpack(&encoded).unwrap() else {
+        panic!("expected a positional batch");
+    };
+    fields.truncate(24);
+    fields.push(OpaqueValue::Array(vec![OpaqueValue::Array(vec![
+        OpaqueValue::Array(vec![OpaqueValue::F64(-0.25), OpaqueValue::F64(-12.0)]),
+    ])]));
+    fields.push(OpaqueValue::Array(vec![OpaqueValue::Array(vec![
+        OpaqueValue::Array(vec![OpaqueValue::from(42u32), OpaqueValue::from(5u32)]),
+    ])]));
+    h.engine_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&OpaqueValue::Array(fields)).unwrap(),
+        )])
+        .await
+        .unwrap();
+
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert!(done.output_ids.is_empty());
+    assert_eq!((done.prompt_tokens, done.completion_tokens), (3, 0));
+    let logprobs = done.output_logprobs.expect("prefill-only selected scores");
+    assert!(logprobs.token_ids.is_empty() && logprobs.top_logprobs.is_empty());
+    assert_eq!(logprobs.token_ids_logprobs.len(), 1);
+    assert_eq!(logprobs.token_ids_logprobs[0].token_ids, vec![42, 5]);
+    assert_eq!(logprobs.token_ids_logprobs[0].values, vec![-0.25, -12.0]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Selected rows follow token deltas in chunks and accumulate in the terminal
+/// response, including when the terminal response is parked behind a chunk.
+#[tokio::test]
+async fn selected_logprobs_stream_deltas_and_complete_accumulates() {
+    let mut h = harness(model_info()).await;
+    let request = sg::GenerateRequest {
+        return_logprob: true,
+        token_ids_logprob: vec![42, 5],
+        ..generate_request("scores", true, Vec::new())
+    };
+    let mut stream = h.client.generate(request).await.unwrap().into_inner();
+    recv_add(&mut h.engine_in).await;
+
+    for (token, values, count, finish) in [
+        (10, vec![-0.25, -12.0], 1, None),
+        (11, vec![-2.0, -0.5], 2, Some("length")),
+    ] {
+        send(
+            &mut h.engine_out,
+            &BatchTokenIDSlimOutput {
+                output_token_ids_logprobs_val: vec![vec![values.clone()]],
+                output_token_ids_logprobs_idx: vec![vec![vec![42, 5]]],
+                ..batch("scores", vec![token], count, finish, None)
+            },
+        )
+        .await;
+        let item = chunk(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(item.token_ids, vec![token]);
+        let scores = item.output_logprobs.unwrap().token_ids_logprobs;
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].token_ids, vec![42, 5]);
+        assert_eq!(
+            scores[0].values,
+            values
+                .into_iter()
+                .map(|value| value as f32)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.output_ids, vec![10, 11]);
+    let scores = done.output_logprobs.unwrap().token_ids_logprobs;
+    assert_eq!(scores.len(), 2);
+    assert_eq!(scores[0].values, vec![-0.25, -12.0]);
+    assert_eq!(scores[1].values, vec![-2.0, -0.5]);
+    assert!(scores.iter().all(|row| row.token_ids == vec![42, 5]));
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A malformed terminal batch must fail its request, not disappear in the
+/// connector's tolerance of isolated undecodable batches.
+#[tokio::test]
+async fn malformed_selected_logprobs_fail_without_waiting_for_another_batch() {
+    let mut h = harness(model_info()).await;
+    for (rid, ids) in [("row", vec![vec![vec![42]]]), ("column", vec![])] {
+        let request = sg::GenerateRequest {
+            return_logprob: true,
+            token_ids_logprob: vec![42, 5],
+            ..generate_request(rid, false, Vec::new())
+        };
+        let mut stream = h.client.generate(request).await.unwrap().into_inner();
+        recv_add(&mut h.engine_in).await;
+        send(
+            &mut h.engine_out,
+            &BatchTokenIDSlimOutput {
+                output_token_ids_logprobs_val: vec![vec![vec![-0.25, -12.0]]],
+                output_token_ids_logprobs_idx: ids,
+                ..batch(rid, vec![], 0, Some("length"), None)
+            },
+        )
+        .await;
+        let error = stream.message().bounded().await.unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+        assert!(error.message().contains("selected-token logprobs"));
+    }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Non-streaming delivers exactly the terminal `Complete`.
 #[tokio::test]
 async fn non_streaming_generate_delivers_only_the_complete() {

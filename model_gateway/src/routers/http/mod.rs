@@ -1,6 +1,5 @@
 //! HTTP router implementations
 
-pub(crate) mod decisions;
 pub mod pd_router;
 pub mod pd_types;
 pub(crate) mod request_body;

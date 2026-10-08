@@ -77,14 +77,13 @@ struct ChoiceStream {
 }
 
 impl ChoiceStream {
-    /// The SGLang-proto response, with the scheduler's reasoning-token count
-    /// for this choice (the vLLM-proto intermediate has no slot for it).
+    /// The SGLang-proto response, including the choice's reasoning-token
+    /// count and selected scores, which the vLLM intermediate cannot carry.
     fn convert(&self, response: vllm::GenerateResponse) -> sg::GenerateResponse {
-        let reasoning_tokens = self
-            .inner
-            .as_ref()
-            .map_or(0, SglangGenerateStream::reasoning_tokens);
-        to_sglang_response(&self.request_id, response, reasoning_tokens)
+        match self.inner.as_ref() {
+            Some(inner) => inner.to_sglang_response(&self.request_id, response),
+            None => to_sglang_response(&self.request_id, response, 0),
+        }
     }
 
     /// End this choice on an abort: the engine's parked `Complete` or a

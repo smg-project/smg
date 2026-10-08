@@ -181,6 +181,10 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
     input_token_logprobs_idx: list[list[int]] | None = None
     input_top_logprobs_val: list[list[list[float]]] | None = None
     input_top_logprobs_idx: list[list[list[int]]] | None = None
+    # Requested candidate scores, independently of sampled tokens and top-k.
+    # A prefill-only score has one row even though output_ids is empty.
+    output_token_ids_logprobs_val: list[list[list[float]]] | None = None
+    output_token_ids_logprobs_idx: list[list[list[int]]] | None = None
 
     @classmethod
     def from_full(
@@ -258,6 +262,14 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
             input_top_logprobs_idx=[
                 [list(step or []) for step in (v or [])]
                 for v in column(getattr(out, "input_top_logprobs_idx", None), None)
+            ],
+            output_token_ids_logprobs_val=[
+                [list(step or []) for step in (v or [])]
+                for v in column(getattr(out, "output_token_ids_logprobs_val", None), None)
+            ],
+            output_token_ids_logprobs_idx=[
+                [list(step or []) for step in (v or [])]
+                for v in column(getattr(out, "output_token_ids_logprobs_idx", None), None)
             ],
         )
 

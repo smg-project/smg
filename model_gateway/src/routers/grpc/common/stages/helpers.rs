@@ -91,6 +91,7 @@ impl SamplingDefaultsMask {
             RequestType::Responses(_)
             | RequestType::Embedding(_)
             | RequestType::Classify(_)
+            | RequestType::Decisions(_)
             | RequestType::Transcription { .. } => None,
         }
     }

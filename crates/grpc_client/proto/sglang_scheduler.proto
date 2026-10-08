@@ -292,6 +292,13 @@ message OutputLogProbs {
 
   // Top logprobs at each position
   repeated TopLogProbs top_logprobs = 3;
+
+  // Raw full-vocabulary logprobs for the requested token_ids_logprob,
+  // independent of the sampled token and top-k candidates. One row per output
+  // position; prefill-only scoring (max_new_tokens = 0) returns one next-token
+  // row even though no output token was generated. Chunks carry new rows and
+  // GenerateComplete carries all rows. Empty from older servicers.
+  repeated TopLogProbs token_ids_logprobs = 4;
 }
 
 // Input logprobs - first token has no logprob (None)
