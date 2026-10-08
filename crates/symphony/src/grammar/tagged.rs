@@ -1,20 +1,26 @@
 //! The tagged syntax written from the table: `<function=NAME>`, then `<parameter=KEY>` around
-//! each value, `</function>`, between the call markers, with what the family's template writes
-//! around a value ([`Spelling`]): Qwen 3.5 and Qwen3-Coder put the value on a line of its own,
-//! Seed-OSS writes it between the tags directly. The engines' `qwen_xml_parameter` style writes
-//! Qwen's spelling of the parameters and nothing else, so both are written here from the tags.
+//! each value, `</function>`, between the call markers: Qwen 3.5 and later, Qwen3-Coder,
+//! Seed-OSS. The engines' `qwen_xml_parameter` style writes Qwen's spelling of the parameters and
+//! nothing else, so the tags are written here.
 //!
-//! A call is the call's opener, a newline, `<function=NAME>` and a newline; then one parameter
-//! per property of the tool's schema, in the schema's order, each optional unless the schema
-//! requires it: `<parameter=KEY>`, the value with the spelling's newlines around it,
-//! `</parameter>` and a newline; then `</function>`, a newline and the call's close. The value
-//! follows the property's type as the templates write it (a string as it is, everything else as
-//! JSON, which [`shape`] pins); a property without a type, or a schema without properties, takes
-//! any text up to the parameter's close. When the calls sit in a block, the block's ways in frame
-//! one or more calls, as Kimi K3's do.
+//! A call is the call's opener, a newline, `<function=NAME>` and a newline; then one parameter per
+//! property of the tool's schema, in the schema's order, each optional unless the schema requires
+//! it: `<parameter=KEY>`, the value, `</parameter>` and a newline; then `</function>`, a newline
+//! and the call's close. A newline may stand on either side of the value: Qwen 3.5's template puts
+//! the value on a line of its own, Seed-OSS's and MiMo's write it between the tags directly, and
+//! the assembler takes one newline away on each side when it is there.
+//!
+//! The value follows the property's type. A string is written as it is, any text up to the
+//! parameter's close or a marker that ends the call. A number is JSON. A boolean or null is JSON
+//! or Python's word (`True`, `False`, `None`), both of which the templates write and the assembler
+//! reads. An object or a list is JSON the property's schema accepts where the template writes
+//! JSON (Qwen's `tojson`), and any text where the template writes Python's repr (Seed-OSS's
+//! `str`), which the assembler reads as the JSON it stands for ([`Spelling`]). A property without
+//! a type, or a schema without properties, takes any text. When the calls sit in a block, the
+//! block's ways in frame one or more calls, as Kimi K3's do.
 
 use openai_protocol::common::Tool;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{
     block_of,
@@ -37,15 +43,16 @@ pub(super) fn calls(
     tools: &[&Tool],
     at_least_one: bool,
 ) -> Grammar {
-    let ends = Ends {
+    let values = Values {
+        spelling,
+        call_open: markers.call_open,
         call_close: markers.call_close,
         block_close: markers.block.as_ref().map(|block| block.close),
     };
     let calls = tools.iter().map(|tool| {
         call(
             markers,
-            spelling,
-            &ends,
+            &values,
             &tool.function.name,
             &tool.function.parameters,
         )
@@ -80,70 +87,118 @@ pub(super) fn calls(
     }
 }
 
-/// What ends a value: the parameter's close, and the markers that end the call or the block,
-/// which the engine takes wherever they stand.
-struct Ends<'a> {
+/// How a table's values are written: the family's spelling of what is not a string, and the
+/// markers that end a value's text, which the engine takes wherever they stand (the call's opener
+/// among them, since a call opened before the last closed ends it).
+struct Values<'a> {
+    spelling: Spelling,
+    call_open: &'a str,
     call_close: &'a str,
     block_close: Option<&'a str>,
 }
 
-impl Ends<'_> {
-    /// A value written as it is: any text up to one of the ends.
+impl Values<'_> {
+    /// A value written as it is: any text up to the parameter's close or a marker that ends the
+    /// call.
     fn text(&self) -> Grammar {
-        let mut excludes = vec![PARAMETER_CLOSE.to_string(), self.call_close.to_string()];
+        let mut excludes = vec![
+            PARAMETER_CLOSE.to_string(),
+            self.call_open.to_string(),
+            self.call_close.to_string(),
+        ];
         excludes.extend(self.block_close.map(str::to_string));
         Grammar::AnyText { excludes }
     }
+
+    /// The value of a property, by the type its schema pins and the family's spelling.
+    fn of(&self, property: &Value, definitions: Definitions<'_>) -> Grammar {
+        match shape(property, definitions, || self.text()) {
+            Some(("boolean", _)) => words(json!({"type": "boolean"}), ["True", "False"]),
+            Some(("null", _)) => words_only(["null", "None"]),
+            Some(("object" | "array", pinned)) => match self.spelling {
+                Spelling::Json => pinned,
+                Spelling::Python => self.text(),
+            },
+            Some((_, pinned)) => pinned,
+            None => self.text(),
+        }
+    }
+}
+
+/// JSON the schema accepts, or one of Python's words for it.
+fn words<const N: usize>(schema: Value, python: [&str; N]) -> Grammar {
+    let mut options = vec![Grammar::JsonSchema {
+        schema,
+        style: None,
+    }];
+    options.extend(
+        python
+            .iter()
+            .map(|word| Grammar::ConstString(word.to_string())),
+    );
+    Grammar::Or(options)
+}
+
+/// One of the words.
+fn words_only<const N: usize>(spellings: [&str; N]) -> Grammar {
+    Grammar::Or(
+        spellings
+            .iter()
+            .map(|word| Grammar::ConstString(word.to_string()))
+            .collect(),
+    )
 }
 
 /// One call as its three parts: the opener, the function tag and its newlines; the parameters;
 /// the function's close with the call's.
 fn call(
     markers: &CallMarkers<'_>,
-    spelling: Spelling,
-    ends: &Ends<'_>,
+    values: &Values<'_>,
     name: &str,
     parameters: &Value,
 ) -> (String, Grammar, String) {
     (
         format!("{}\n{FUNCTION_OPEN}{name}>\n", markers.call_open),
-        arguments(spelling, ends, parameters),
+        arguments(values, parameters),
         format!("{FUNCTION_CLOSE}\n{}", markers.call_close),
     )
 }
 
 /// The parameters the tool's schema asks for: one per property, in the schema's order, each
 /// optional unless required; any parameters at all for a schema without properties.
-fn arguments(spelling: Spelling, ends: &Ends<'_>, parameters: &Value) -> Grammar {
+fn arguments(values: &Values<'_>, parameters: &Value) -> Grammar {
     let parameter = |key: &str, property: &Value, definitions: Definitions<'_>| {
-        let value = shape(property, definitions, || ends.text())
-            .map_or_else(|| ends.text(), |(_, value)| value);
-        argument(spelling, Grammar::ConstString(key.to_string()), value)
+        argument(
+            Grammar::ConstString(key.to_string()),
+            values.of(property, definitions),
+        )
     };
     schema::arguments(parameters, parameter, || {
-        Grammar::Star(Box::new(any_argument(spelling, ends)))
+        Grammar::Star(Box::new(any_argument(values)))
     })
 }
 
-/// One parameter: the opening tag with the key, the value with the spelling's text around it, the
-/// close and a newline.
-fn argument(spelling: Spelling, key: Grammar, value: Grammar) -> Grammar {
-    let around = spelling.around_value;
+/// One parameter: the opening tag with the key, the value with a newline allowed on either side,
+/// the close and a newline.
+fn argument(key: Grammar, value: Grammar) -> Grammar {
+    let newline = || Grammar::Optional(Box::new(Grammar::ConstString("\n".to_string())));
     Grammar::Sequence(vec![
         Grammar::ConstString(PARAMETER_OPEN.to_string()),
         key,
-        Grammar::ConstString(format!(">{around}")),
+        Grammar::ConstString(">".to_string()),
+        newline(),
         value,
-        Grammar::ConstString(format!("{around}{PARAMETER_CLOSE}\n")),
+        newline(),
+        Grammar::ConstString(format!("{PARAMETER_CLOSE}\n")),
     ])
 }
 
 /// A parameter with any key and any value.
-fn any_argument(spelling: Spelling, ends: &Ends<'_>) -> Grammar {
+fn any_argument(values: &Values<'_>) -> Grammar {
     let key = Grammar::AnyText {
         excludes: vec![">".to_string()],
     };
-    argument(spelling, key, ends.text())
+    argument(key, values.text())
 }
 
 #[cfg(test)]
@@ -175,28 +230,57 @@ mod tests {
                     "properties": {
                         "city": {"type": "string"},
                         "days": {"type": "integer", "minimum": 1},
-                        "units": {"type": "string", "enum": ["c", "f"]},
+                        "metric": {"type": "boolean"},
+                        "where": {"type": "object", "properties": {"lat": {"type": "number"}}},
                     },
-                    "required": ["city", "days"],
+                    "required": ["city", "days", "metric"],
                 }),
             ),
             tool("ping", value!({"type": "object"})),
         ]
     }
 
+    /// A parameter slot as the tag writes it: the tag with the key, the value, the close.
+    fn slot(key: &str, value: Value) -> Value {
+        let newline =
+            value!({"type": "optional", "content": {"type": "const_string", "value": "\n"}});
+        value!({"type": "sequence", "elements": [
+            {"type": "const_string", "value": "<parameter="},
+            {"type": "const_string", "value": key},
+            {"type": "const_string", "value": ">"},
+            newline,
+            value,
+            newline,
+            {"type": "const_string", "value": "</parameter>\n"},
+        ]})
+    }
+
     #[test]
-    fn qwen_3_5_puts_each_value_on_a_line_of_its_own() {
+    fn qwen_3_5_writes_each_parameter_with_a_newline_allowed_on_either_side_of_the_value() {
         // Qwen 3.5's template: `<tool_call>`, a newline, `<function=` and the name, `>` and a
-        // newline; per argument `<parameter=` and the key, `>` and a newline, the value, a newline
-        // and `</parameter>` and a newline; then `</function>`, a newline and `</tool_call>`. A
-        // string as it is, a mapping or a list as JSON.
-        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::OWN_LINE))
+        // newline; per argument `<parameter=` and the key, `>`, the value on a line of its own,
+        // `</parameter>` and a newline; then `</function>`, a newline and `</tool_call>`. MiMo,
+        // on the same table, writes the value between the tags directly, so the newlines are
+        // allowed, not required. A string as it is; a boolean as JSON or Python's word; an object
+        // as the JSON Qwen's `tojson` writes.
+        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::Json))
             .grammar(&weather_tools(), true, false)
             .expect("a grammar")
             .payload();
-        let text = value!({"type": "any_text", "excludes": ["</parameter>", "</tool_call>"]});
+        let text = value!({
+            "type": "any_text",
+            "excludes": ["</parameter>", "<tool_call>", "</tool_call>"],
+        });
         let days =
             value!({"type": "json_schema", "json_schema": {"type": "integer", "minimum": 1}});
+        let metric = value!({"type": "or", "elements": [
+            {"type": "json_schema", "json_schema": {"type": "boolean"}},
+            {"type": "const_string", "value": "True"},
+            {"type": "const_string", "value": "False"},
+        ]});
+        let place = value!({"type": "json_schema", "json_schema": {
+            "type": "object", "properties": {"lat": {"type": "number"}},
+        }});
         assert_eq!(
             payload,
             value!({"format": {
@@ -207,43 +291,17 @@ mod tests {
                         "type": "tag",
                         "begin": "<tool_call>\n<function=get_weather>\n",
                         "content": {"type": "sequence", "elements": [
-                            {"type": "sequence", "elements": [
-                                {"type": "const_string", "value": "<parameter="},
-                                {"type": "const_string", "value": "city"},
-                                {"type": "const_string", "value": ">\n"},
-                                text,
-                                {"type": "const_string", "value": "\n</parameter>\n"},
-                            ]},
-                            {"type": "sequence", "elements": [
-                                {"type": "const_string", "value": "<parameter="},
-                                {"type": "const_string", "value": "days"},
-                                {"type": "const_string", "value": ">\n"},
-                                days,
-                                {"type": "const_string", "value": "\n</parameter>\n"},
-                            ]},
-                            {"type": "optional", "content": {"type": "sequence", "elements": [
-                                {"type": "const_string", "value": "<parameter="},
-                                {"type": "const_string", "value": "units"},
-                                {"type": "const_string", "value": ">\n"},
-                                {"type": "or", "elements": [
-                                    {"type": "const_string", "value": "c"},
-                                    {"type": "const_string", "value": "f"},
-                                ]},
-                                {"type": "const_string", "value": "\n</parameter>\n"},
-                            ]}},
+                            slot("city", text.clone()),
+                            slot("days", days),
+                            slot("metric", metric),
+                            {"type": "optional", "content": slot("where", place)},
                         ]},
                         "end": "</function>\n</tool_call>",
                     },
                     {
                         "type": "tag",
                         "begin": "<tool_call>\n<function=ping>\n",
-                        "content": {"type": "star", "content": {"type": "sequence", "elements": [
-                            {"type": "const_string", "value": "<parameter="},
-                            {"type": "any_text", "excludes": [">"]},
-                            {"type": "const_string", "value": ">\n"},
-                            text,
-                            {"type": "const_string", "value": "\n</parameter>\n"},
-                        ]}},
+                        "content": {"type": "star", "content": slot_any(text)},
                         "end": "</function>\n</tool_call>",
                     },
                 ],
@@ -252,11 +310,18 @@ mod tests {
         );
     }
 
+    /// The slot of a parameter with any key.
+    fn slot_any(text: Value) -> Value {
+        let mut slot = slot("", text);
+        slot["elements"][1] = value!({"type": "any_text", "excludes": [">"]});
+        slot
+    }
+
     #[test]
-    fn seed_oss_writes_the_value_between_its_tags_under_its_own_markers() {
-        // Seed-OSS's template: `<seed:tool_call>`, a newline, the function tag and a newline; per
-        // argument `<parameter=` and the key, `>`, the value, `</parameter>` and a newline; then
-        // `</function>`, a newline and `</seed:tool_call>`.
+    fn seed_oss_writes_objects_as_pythons_text_under_its_own_markers() {
+        // Seed-OSS's template writes every value with Python's `str`: a string as it is, an object
+        // as its repr, which no JSON schema spells, so the object takes any text, and a boolean
+        // as `True` or `False` beside JSON's words.
         let payload = formats::seed_oss()
             .grammar(&weather_tools(), false, false)
             .expect("a grammar")
@@ -270,20 +335,47 @@ mod tests {
             "<seed:tool_call>\n<function=get_weather>\n"
         );
         assert_eq!(weather["end"], "</function>\n</seed:tool_call>");
-        let city = &weather["content"]["elements"][0]["elements"];
-        assert_eq!(city[0]["value"], "<parameter=");
-        assert_eq!(city[1]["value"], "city");
-        assert_eq!(city[2]["value"], ">");
+        let text = value!({
+            "type": "any_text",
+            "excludes": ["</parameter>", "<seed:tool_call>", "</seed:tool_call>"],
+        });
+        let slots = weather["content"]["elements"]
+            .as_array()
+            .expect("four slots");
+        assert_eq!(slots[0]["elements"][4], text);
+        assert_eq!(slots[2]["elements"][4]["type"], "or");
         assert_eq!(
-            city[3],
-            value!({"type": "any_text", "excludes": ["</parameter>", "</seed:tool_call>"]})
+            slots[3]["content"]["elements"][4], text,
+            "an object as Python's text"
         );
-        assert_eq!(city[4]["value"], "</parameter>\n");
+    }
+
+    #[test]
+    fn null_takes_jsons_word_or_pythons() {
+        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::Json))
+            .grammar(
+                &[tool(
+                    "t",
+                    value!({"type": "object", "properties": {"nothing": {"type": "null"}}}),
+                )],
+                true,
+                false,
+            )
+            .expect("a grammar")
+            .payload();
+        let slot = &payload["format"]["tags"][0]["content"]["elements"][0]["content"];
+        assert_eq!(
+            slot["elements"][4],
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "null"},
+                {"type": "const_string", "value": "None"},
+            ]})
+        );
     }
 
     #[test]
     fn with_the_reasoning_open_the_prefix_excludes_the_four_tags_too() {
-        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::OWN_LINE))
+        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::Json))
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .payload();

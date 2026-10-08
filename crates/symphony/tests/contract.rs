@@ -51,7 +51,7 @@ fn qwen3() -> Box<dyn Parser> {
 
 fn qwen3_tagged() -> Box<dyn Parser> {
     Box::new(Engine::new(
-        formats::qwen3(CallSyntax::Tagged(Spelling::OWN_LINE)),
+        formats::qwen3(CallSyntax::Tagged(Spelling::Json)),
         Declared::of(&[Tool {
             tool_type: "function".to_string(),
             function: Function {

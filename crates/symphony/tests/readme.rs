@@ -72,7 +72,7 @@ impl Table {
     fn format(self) -> Format {
         match self {
             Self::Qwen3 => qwen3(CallSyntax::Json),
-            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::OWN_LINE)),
+            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json)),
             Self::Qwen2_5 => qwen2_5(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::SeedOss => seed_oss(),

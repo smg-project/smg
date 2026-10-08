@@ -33,6 +33,7 @@ pub(super) fn calls(
 ) -> Grammar {
     let ends = Ends {
         value_close: tags.value_close,
+        call_open: markers.call_open,
         call_close: markers.call_close,
         block_close: markers.block.as_ref().map(|block| block.close),
     };
@@ -76,9 +77,11 @@ pub(super) fn calls(
 }
 
 /// What ends a value: its own closing tag, and the markers that end the call or the block, which
-/// the engine takes wherever they stand.
+/// the engine takes wherever they stand; the call's opener among them, since a call opened before
+/// the last closed ends it.
 struct Ends<'a> {
     value_close: &'a str,
+    call_open: &'a str,
     call_close: &'a str,
     block_close: Option<&'a str>,
 }
@@ -86,7 +89,11 @@ struct Ends<'a> {
 impl Ends<'_> {
     /// A value written as it is: any text up to one of the ends.
     fn text(&self) -> Grammar {
-        let mut excludes = vec![self.value_close.to_string(), self.call_close.to_string()];
+        let mut excludes = vec![
+            self.value_close.to_string(),
+            self.call_open.to_string(),
+            self.call_close.to_string(),
+        ];
         excludes.extend(self.block_close.map(str::to_string));
         Grammar::AnyText { excludes }
     }
@@ -190,7 +197,10 @@ mod tests {
             .grammar(&weather_tools(), true, false)
             .expect("a grammar")
             .payload();
-        let text = value!({"type": "any_text", "excludes": ["</arg_value>", "</tool_call>"]});
+        let text = value!({
+            "type": "any_text",
+            "excludes": ["</arg_value>", "<tool_call>", "</tool_call>"],
+        });
         let days =
             value!({"type": "json_schema", "json_schema": {"type": "integer", "minimum": 1}});
         assert_eq!(
@@ -356,7 +366,10 @@ mod tests {
         assert_eq!(
             city[3],
             value!({"type": "any_text", "excludes": [
-                "</arg_value:opensource>", "</tool_call:opensource>", "</tool_calls:opensource>",
+                "</arg_value:opensource>",
+                "<tool_call:opensource>",
+                "</tool_call:opensource>",
+                "</tool_calls:opensource>",
             ]})
         );
         assert_eq!(city[4]["value"], "</arg_value:opensource>");

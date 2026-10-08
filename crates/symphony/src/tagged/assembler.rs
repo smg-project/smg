@@ -54,21 +54,19 @@ const FUNCTION_CLOSE: usize = 3;
 /// its key, a parameter's close, a function's close.
 pub const TAGS: [&str; 4] = ["<function=", "<parameter=", "</parameter>", "</function>"];
 
-/// What a template writes around a parameter's value: Qwen 3.5 and Qwen3-Coder put the value on a
-/// line of its own, a newline after `<parameter=KEY>` and one before `</parameter>`; Seed-OSS
-/// writes it between the two tags directly. The assembler reads a call either way; the grammar
-/// derived from a table spells the one its template writes.
+/// How a family's template writes a value that is not a string. Qwen 3.5, Qwen3-Coder and their
+/// kin write an object or a list as JSON (`tojson`) and a boolean or null as Python's word
+/// (`True`, `None`); Seed-OSS writes every value with Python's `str`, an object or a list as its
+/// repr (`{'size': 'large'}`). The assembler reads all of these as the JSON they stand for
+/// ([`json`]); the grammar derived from a table pins an object's or a list's
+/// shape only where the template writes it as JSON.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Spelling {
-    pub around_value: &'static str,
-}
-
-impl Spelling {
-    /// The value on a line of its own: Qwen 3.5 and later, Qwen3-Coder.
-    pub const OWN_LINE: Self = Self { around_value: "\n" };
-
-    /// The value between its tags directly: Seed-OSS.
-    pub const INLINE: Self = Self { around_value: "" };
+pub enum Spelling {
+    /// An object or a list as JSON, a boolean or null as Python's word: Qwen 3.5 and later,
+    /// Qwen3-Coder.
+    Json,
+    /// Every value as Python's text, an object or a list as its repr: Seed-OSS.
+    Python,
 }
 const WITHOUT_A_FUNCTION: &str = "a tool call without a function tag";
 const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";

@@ -42,8 +42,8 @@ pub enum CallSyntax {
     /// One JSON object, `{"name": …, "arguments": {…}}`: Qwen3.
     Json,
     /// `<function=NAME>` and then `<parameter=KEY>` around each value's text, typed by the
-    /// request's tools, which reach the engine with the request, in the family's spelling of what
-    /// stands around a value: Qwen 3.5 and later, Qwen3-Coder, Seed-OSS.
+    /// request's tools, which reach the engine with the request, with the family's spelling of a
+    /// value that is not a string: Qwen 3.5 and later, Qwen3-Coder, Seed-OSS.
     Tagged(tagged::Spelling),
     /// DeepSeek's DSML: the arguments state is one `<｜DSML｜ invoke name="…">` block, whose
     /// parameter tags carry a `string` attribute that types each value. The terminal that enters
