@@ -604,6 +604,19 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
+        if self.engine == "vllm":
+            # vLLM 0.31.0 runs tensor-parallel all-reduces through FlashInfer,
+            # whose auto backend picks the MNNVL kernel wherever NVLink
+            # multicast exists, H100 included. FlashInfer 0.7.0 ships its
+            # jit-cache as per-architecture wheels, and the Hopper wheel does
+            # not carry that kernel (its AOT list builds it for sm100/sm103
+            # only, where the 0.6.x single wheel carried it for every arch),
+            # so the worker JIT-compiles it with nvcc, which the pods do not
+            # have, and dies at the first all-reduce of the startup memory
+            # profile. The TRT-LLM backend is the same fused all-reduce
+            # integration and is prebuilt for Hopper. An explicit choice wins.
+            env.setdefault("VLLM_FLASHINFER_ALLREDUCE_BACKEND", "trtllm")
+
         # The vLLM gRPC servicer implementation is a flag inside the smg
         # servicer package, read by upstream's entrypoint; the command stays.
         if self.engine == "vllm" and self.mode == ConnectionMode.GRPC:
