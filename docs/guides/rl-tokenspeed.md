@@ -18,20 +18,23 @@ engine advertises `rl.control_url` only for a concrete host: a wildcard bind
 endpoint and every control call would answer 422 `no_control_endpoint`. The
 default, loopback, is right only when SMG runs on the same machine.
 
-The gateway, with no startup workers:
+The gateway, with the engines as startup workers (the router's connection
+mode comes from these URLs, so they have to be the gRPC ones):
 
-    smg launch --policy cache_aware --enable-rl --disable-health-check --disable-circuit-breaker \
+    smg launch --worker-urls grpc://rollout-1:30000 grpc://rollout-2:30000 \
+      --policy cache_aware --enable-rl --disable-health-check --disable-circuit-breaker \
       --request-timeout-secs 14400
 
-Register each engine with its control key, which the proxy sends as the
-bearer to the control app:
+Startup workers register without a key, so give each one its control key
+through the worker update route (the ids are in `GET /workers`); the proxy
+sends it as the bearer to the control app:
 
-    curl -X POST http://smg:30000/workers -H 'content-type: application/json' \
-      -d '{"url":"grpc://rollout-1:30000","api_key":"'"$RL_KEY"'"}'
+    curl -X PATCH http://smg:30000/workers/<id> -H 'content-type: application/json' \
+      -d '{"api_key":"'"$RL_KEY"'"}'
 
-A worker named in `--worker-urls` registers without a key, and registering
-it again this way is a 409, so list no startup workers and register every
-engine as above.
+A gateway started with `--enable-igw` also serves gRPC workers registered
+later through `POST /workers`; there the key goes into the registration
+body (`{"url":"grpc://rollout-1:30000","api_key":"..."}`).
 
 `GET /v1/rl/workers` then shows `engine: tokenspeed`, `connection_mode: grpc`,
 `control_url: http://10.0.0.11:30400` and the engine's advertised capabilities.
