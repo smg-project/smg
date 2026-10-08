@@ -107,8 +107,11 @@ impl ControlPlaneAuthState {
 
     /// Try to initialize control plane auth from config.
     ///
-    /// Returns `Some(state)` if auth is configured and initialized successfully.
-    /// Returns `None` if auth is not configured or initialization fails (with error logged).
+    /// Returns `None` only when authentication is absent or disabled.
+    /// If JWT initialization fails, configured authentication remains required:
+    /// JWT credentials are unavailable, but explicit control-plane API keys
+    /// still work. JWT initialization is not retried; restart after correcting
+    /// the configuration or restoring the identity provider.
     pub async fn try_init(config: Option<&ControlPlaneAuthConfig>) -> Option<Self> {
         let config = config.filter(|c| c.is_enabled())?;
 
@@ -131,10 +134,10 @@ impl ControlPlaneAuthState {
             }
             Err(e) => {
                 error!(
-                    "Failed to initialize control plane auth: {}. Falling back to simple API key auth.",
+                    "Failed to initialize JWT authentication: {}. Control-plane authentication remains required; configured control-plane API keys remain available. Restart to retry JWT initialization.",
                     e
                 );
-                None
+                Some(Self::new(config.clone(), None))
             }
         }
     }
@@ -361,6 +364,67 @@ pub async fn control_plane_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_jwt_initialization_retains_required_authentication() {
+        use crate::config::{ApiKeyEntry, JwtConfig};
+
+        for with_api_key in [false, true] {
+            let config = ControlPlaneAuthConfig {
+                jwt: Some(
+                    JwtConfig::new("https://issuer.example.com", "audience")
+                        .with_jwks_uri("https://127.0.0.1/jwks"),
+                ),
+                api_keys: if with_api_key {
+                    vec![ApiKeyEntry::new(
+                        "admin",
+                        "Admin",
+                        "control-plane-key",
+                        Role::Admin,
+                    )]
+                } else {
+                    vec![]
+                },
+                audit_enabled: false,
+            };
+            let state = ControlPlaneAuthState::try_init(Some(&config)).await;
+            assert!(
+                state.is_some(),
+                "failed JWT setup must retain the configured auth boundary"
+            );
+            let state = state.unwrap();
+            assert!(state.is_auth_required());
+            assert!(state.jwt_validator.is_none());
+            assert_eq!(state.config.has_api_keys(), with_api_key);
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_auth_initialization_preserves_disabled_and_api_key_only_modes() {
+        use crate::config::ApiKeyEntry;
+
+        assert!(ControlPlaneAuthState::try_init(None).await.is_none());
+        assert!(
+            ControlPlaneAuthState::try_init(Some(&ControlPlaneAuthConfig::default()))
+                .await
+                .is_none()
+        );
+        let config = ControlPlaneAuthConfig {
+            jwt: None,
+            api_keys: vec![ApiKeyEntry::new(
+                "admin",
+                "Admin",
+                "control-plane-key",
+                Role::Admin,
+            )],
+            audit_enabled: false,
+        };
+        let state = ControlPlaneAuthState::try_init(Some(&config))
+            .await
+            .unwrap();
+        assert!(state.is_auth_required());
+        assert!(state.config.find_api_key("control-plane-key").is_some());
+    }
 
     #[test]
     fn test_auth_method_display() {
