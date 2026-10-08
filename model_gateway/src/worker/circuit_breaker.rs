@@ -130,6 +130,17 @@ impl CircuitBreaker {
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         let init_state = CircuitState::Closed;
         Metrics::set_worker_cb_state(&metric_label, init_state.as_int());
+        // Every transition this state machine can make, at zero, so the
+        // family is on the first scrape and `increase()` sees the first trip.
+        for (from, to) in [
+            (CircuitState::Closed, CircuitState::Open),
+            (CircuitState::Open, CircuitState::HalfOpen),
+            (CircuitState::Open, CircuitState::Closed),
+            (CircuitState::HalfOpen, CircuitState::Closed),
+            (CircuitState::HalfOpen, CircuitState::Open),
+        ] {
+            Metrics::init_worker_cb_transition(&metric_label, from.as_str(), to.as_str());
+        }
         Self {
             state: AtomicU8::new(STATE_CLOSED),
             consecutive_failures: AtomicU32::new(0),

@@ -697,6 +697,67 @@ pub(crate) fn init_metrics() {
     scheduler_metrics::describe();
 }
 
+/// Publish the protection and retry families at zero.
+///
+/// These counters are otherwise created by their first event, so a fresh
+/// gateway exposes no series for them: dashboards cannot tell "never
+/// happened" from "not exported", `absent()` alerts fire on a healthy
+/// process, and `increase()` misses the first event after a restart. Every
+/// label value the recording paths can emit is enumerated here. Call once the
+/// recorder is installed (see [`start_prometheus`]); `absolute(0)` never
+/// lowers a counter, so calling it again is harmless.
+pub fn init_startup_series() {
+    use metrics_labels::{
+        ENDPOINT_AUDIO_TRANSCRIPTIONS, ENDPOINT_CHAT, ENDPOINT_COMPLETIONS, ENDPOINT_DECISIONS,
+        ENDPOINT_GENERATE, ENDPOINT_MESSAGES, ENDPOINT_RERANK, ENDPOINT_RESPONSES,
+        ENDPOINT_SYSTEMONE, WORKER_DECODE, WORKER_PREFILL, WORKER_REGULAR,
+    };
+
+    use crate::worker::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
+
+    // Shedding happens at every stage; the two fallbacks only while the
+    // candidate pool is assembled.
+    for stage in [STAGE_SELECTION, STAGE_DISPATCH, STAGE_PD_ADMISSION] {
+        counter!("smg_worker_overload_shed_total", "stage" => stage).absolute(0);
+    }
+    counter!("smg_worker_overload_fallback_total", "stage" => STAGE_SELECTION).absolute(0);
+    counter!("smg_worker_liveness_fallback_total", "stage" => STAGE_SELECTION).absolute(0);
+
+    // The retrying dispatch loops label their endpoint through
+    // `route_to_endpoint`, whose values these are, for regular and
+    // prefill/decode workers.
+    for worker_type in [WORKER_REGULAR, WORKER_PREFILL, WORKER_DECODE] {
+        for endpoint in [
+            ENDPOINT_CHAT,
+            ENDPOINT_GENERATE,
+            ENDPOINT_COMPLETIONS,
+            ENDPOINT_RERANK,
+            ENDPOINT_RESPONSES,
+            ENDPOINT_DECISIONS,
+            ENDPOINT_SYSTEMONE,
+            ENDPOINT_MESSAGES,
+            ENDPOINT_AUDIO_TRANSCRIPTIONS,
+            "other",
+        ] {
+            counter!(
+                "smg_worker_retries_total",
+                "worker_type" => worker_type,
+                "endpoint" => endpoint
+            )
+            .absolute(0);
+            counter!(
+                "smg_worker_retries_exhausted_total",
+                "worker_type" => worker_type,
+                "endpoint" => endpoint
+            )
+            .absolute(0);
+        }
+    }
+    // A histogram has no zero to set: registering the first attempt's series
+    // publishes the family with an empty distribution.
+    let _ = histogram!("smg_worker_retry_backoff_seconds", "attempt" => "1");
+}
+
 /// Publish process-lifetime totals without scanning or retaining tokenizer instances.
 pub(super) fn record_tokenizer_cache_activity() {
     for stats in cache_activity_stats() {
@@ -1889,6 +1950,19 @@ impl Metrics {
             "to" => to
         )
         .increment(1);
+    }
+
+    /// Publish a circuit breaker transition counter at zero, so the series
+    /// exists before the breaker first makes that transition.
+    pub fn init_worker_cb_transition(worker: &str, from: &'static str, to: &'static str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_transitions_total",
+            "worker" => worker_interned,
+            "from" => from,
+            "to" => to
+        )
+        .absolute(0);
     }
 
     /// Record circuit breaker outcome

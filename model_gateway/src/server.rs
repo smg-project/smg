@@ -1228,6 +1228,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // port conflicts or bad addresses.
     if let Some(prometheus_config) = &config.prometheus_config {
         let handle = metrics::start_prometheus(prometheus_config.clone());
+        metrics::init_startup_series();
         let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
             handle,
             prometheus_config.host.clone(),
