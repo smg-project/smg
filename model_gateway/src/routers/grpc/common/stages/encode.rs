@@ -13,6 +13,8 @@
 //! Also owns the backend wire details for EPD encode: item assembly,
 //! transport-specific tensor payloads, and the encode-worker RPC.
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use axum::response::Response;
@@ -26,6 +28,7 @@ use uuid::Uuid;
 
 use super::PipelineStage;
 use crate::{
+    observability::metrics::Metrics,
     routers::{
         error,
         grpc::{
@@ -42,7 +45,7 @@ use crate::{
             },
         },
     },
-    worker::{RuntimeType, DEFAULT_BOOTSTRAP_PORT},
+    worker::{RuntimeType, Worker, DEFAULT_BOOTSTRAP_PORT},
 };
 
 /// No-op unless the request is multimodal and worker selection produced encode
@@ -114,7 +117,7 @@ pub(crate) struct EncodeDispatchPlan {
 
 pub(crate) struct PreparedEncodeJob {
     item: PreparedEncodeItem,
-    endpoint: String,
+    worker: Arc<dyn Worker>,
     bootstrap_room: i64,
 }
 
@@ -148,7 +151,7 @@ impl EncodeDispatchPlan {
 
 impl PreparedEncodeJob {
     pub(crate) async fn dispatch(self) -> std::result::Result<(), String> {
-        self.item.dispatch(self.endpoint, self.bootstrap_room).await
+        self.item.dispatch(self.worker, self.bootstrap_room).await
     }
 }
 
@@ -173,7 +176,7 @@ impl PreparedEncodeItem {
 
     pub(crate) async fn dispatch(
         mut self,
-        endpoint: String,
+        worker: Arc<dyn Worker>,
         bootstrap_room: i64,
     ) -> std::result::Result<(), String> {
         match &mut self {
@@ -211,7 +214,7 @@ impl PreparedEncodeItem {
                     .map(collect_tokenspeed_multimodal_inputs_shm_handles)
                     .unwrap_or_default();
                 let _shm_guard = TokenSpeedShmCleanupGuard(shm_handles);
-                send_tokenspeed_encode_rpc(endpoint, request).await
+                send_tokenspeed_encode_rpc(worker, request).await
             }
         }
     }
@@ -293,7 +296,7 @@ fn build_plan(
         });
         jobs.push(PreparedEncodeJob {
             item,
-            endpoint: assignment.worker.url().to_string(),
+            worker: Arc::clone(&assignment.worker),
             bootstrap_room,
         });
     }
@@ -366,10 +369,12 @@ fn backend_name(client: &BackendClient) -> &'static str {
 }
 
 async fn send_tokenspeed_encode_rpc(
-    endpoint: String,
+    worker: Arc<dyn Worker>,
     request: tokenspeed_encoder::EncodeRequest,
 ) -> std::result::Result<(), String> {
-    let client = TokenSpeedEncoderClient::connect_cached(&endpoint)
+    Metrics::record_worker_request(worker.url(), worker.model_id());
+    let endpoint = worker.url();
+    let client = TokenSpeedEncoderClient::connect_cached(endpoint)
         .await
         .map_err(|e| format!("connect to encode worker {endpoint} failed: {e}"))?;
     let response = client
@@ -466,7 +471,9 @@ mod tests {
             let (item, path) = tokenspeed_item_backed_by_shm();
             let dispatch = EncodeDispatchPlan::new(vec![PreparedEncodeJob {
                 item,
-                endpoint: "http://encode-worker:9000".to_string(),
+                worker: Arc::new(
+                    crate::worker::BasicWorkerBuilder::new("http://encode-worker:9000").build(),
+                ),
                 bootstrap_room: 42,
             }]);
             assert!(!dispatch.is_empty());
@@ -508,7 +515,12 @@ mod tests {
 
             // Bogus endpoint: the encode RPC fails, but the send-path guard still
             // reclaims the segment when dispatch() returns.
-            let _ = item.dispatch("http://127.0.0.1:1".to_string(), 7).await;
+            let _ = item
+                .dispatch(
+                    Arc::new(crate::worker::BasicWorkerBuilder::new("http://127.0.0.1:1").build()),
+                    7,
+                )
+                .await;
 
             assert!(
                 !path.exists(),

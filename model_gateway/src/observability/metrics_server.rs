@@ -7,15 +7,14 @@ use std::{
 };
 
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
-use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use super::metrics::UPKEEP_INTERVAL_SECS;
+use super::metrics::{MetricsHandle, UPKEEP_INTERVAL_SECS};
 
 #[derive(Clone)]
 struct MetricsState {
-    handle: PrometheusHandle,
+    handle: MetricsHandle,
 }
 
 async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoResponse {
@@ -39,10 +38,11 @@ async fn bind_metrics_listener(addr: SocketAddr) -> Result<tokio::net::TcpListen
 /// port conflicts or bad addresses; port 0 binds an OS-assigned ephemeral
 /// port. Returns the bound address and the server task handle.
 pub async fn start_metrics_server(
-    handle: PrometheusHandle,
+    handle: impl Into<MetricsHandle>,
     host: String,
     port: u16,
 ) -> Result<(SocketAddr, JoinHandle<()>), String> {
+    let handle = handle.into();
     let ip_addr: IpAddr = host.parse().unwrap_or_else(|e| {
         error!("Failed to parse metrics host '{host}': {e}, falling back to 0.0.0.0");
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))

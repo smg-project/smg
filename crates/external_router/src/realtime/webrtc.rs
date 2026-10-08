@@ -407,7 +407,7 @@ async fn setup_and_spawn_bridge(
         "Creating WebRTC bridge ({label})"
     );
 
-    let (mut bridge, client_sdp_answer) = match WebRtcBridge::setup(
+    let (mut bridge, client_sdp_answer) = match WebRtcBridge::setup_with_worker(
         sdp_str,
         &upstream_url,
         auth_str,
@@ -416,6 +416,7 @@ async fn setup_and_spawn_bridge(
         worker.http_client(),
         bind_addr,
         stun_server,
+        Some(&*worker),
     )
     .await
     {

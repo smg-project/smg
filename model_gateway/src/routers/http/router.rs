@@ -979,7 +979,7 @@ impl Router {
             worker.api_key(),
         );
 
-        let res = match send_with_stale_conn_retry(request_builder).await {
+        let res = match send_worker_request(worker.as_ref(), request_builder).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
@@ -1261,7 +1261,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        let res = match send_with_stale_conn_retry(request_builder).await {
+        let res = match send_worker_request(worker, request_builder).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
@@ -1465,7 +1465,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        let send = send_with_stale_conn_retry(request_builder);
+        let send = send_worker_request(worker, request_builder);
         tokio::pin!(send);
         let sent = tokio::select! {
             sent = &mut send => sent,
@@ -1684,6 +1684,16 @@ fn is_pre_response_transport_error(e: &reqwest::Error) -> bool {
         && !e.is_decode()
         && !e.is_builder()
         && !e.is_redirect()
+}
+
+/// Count when the send future is polled, so a cancelled/unpolled leg does not
+/// count and an internal stale-connection resend remains one dispatch attempt.
+pub(crate) async fn send_worker_request(
+    worker: &dyn Worker,
+    builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    Metrics::record_worker_request(worker.url(), worker.model_id());
+    send_with_stale_conn_retry(builder).await
 }
 
 /// Send with a single retry on pre-response transport failures. Requests
@@ -2377,6 +2387,65 @@ mod tests {
             }
         });
         (addr, accepted)
+    }
+
+    #[tokio::test]
+    async fn worker_send_counts_a_polled_dispatch_once_including_transport_failure() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let (addr, accepted) = flaky_upstream(1).await;
+        let url = format!("http://{addr}");
+        let worker = BasicWorkerBuilder::new(&url).build();
+        Metrics::initialize_worker_request_series(&url, worker.model_id());
+        let value = || {
+            handle
+                .render()
+                .lines()
+                .find(|line| {
+                    line.starts_with("smg_worker_requests_total{")
+                        && line.contains(&format!("worker=\"{url}\""))
+                })
+                .and_then(|line| {
+                    line.rsplit_once(' ')
+                        .and_then(|(_, value)| value.parse::<u64>().ok())
+                })
+        };
+        let unpolled = send_worker_request(
+            &worker,
+            worker
+                .http_client()
+                .post(format!("{url}/generate"))
+                .body("{}"),
+        );
+        drop(unpolled);
+        assert_eq!(value(), Some(0));
+        let response = send_worker_request(
+            &worker,
+            worker
+                .http_client()
+                .post(format!("{url}/generate"))
+                .body("{}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(
+            value(),
+            Some(1),
+            "internal stale-connection resend counted twice"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rejected = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        assert!(
+            send_worker_request(&worker, worker.http_client().post(rejected))
+                .await
+                .is_err()
+        );
+        assert_eq!(value(), Some(2), "transport failure did not count");
     }
 
     #[tokio::test]

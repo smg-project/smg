@@ -25,6 +25,7 @@ use super::{common::worker_selection::WorkerSelector, RouterTrait};
 use crate::{
     app_context::AppContext,
     middleware::TenantRequestMeta,
+    observability::metrics::Metrics,
     worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
@@ -64,6 +65,10 @@ impl ExternalWorker for GatewayWorker {
 
     fn provider_for_model(&self, model_id: &str) -> Option<&ProviderType> {
         self.0.provider_for_model(model_id)
+    }
+
+    fn record_request(&self) {
+        Metrics::record_worker_request(self.0.url(), self.0.model_id());
     }
 
     fn record_outcome(&self, status_code: u16) {

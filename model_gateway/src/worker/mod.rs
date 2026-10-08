@@ -45,6 +45,7 @@ pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
 pub use kv_event_monitor::KvEventMonitor;
+pub(crate) use kv_event_recovery::ResyncReason;
 pub use kv_index_backend::{KvIndex, WorkerBlocks};
 pub use manager::WorkerManager;
 pub use monitor::{WorkerLoadManager, WorkerMonitor};

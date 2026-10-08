@@ -5,7 +5,7 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 use dashmap::DashMap;
 use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use once_cell::sync::Lazy;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
@@ -13,8 +13,10 @@ pub use smg_external_router::metrics::{
     STREAMING_TRUE,
 };
 
-// Interned strings are never freed; only intern low-cardinality, server-controlled
-// labels (model IDs, worker URLs, normalized paths), never user-controlled input.
+pub use super::worker_metrics::MetricsHandle;
+
+// Intern only bounded, server-controlled labels (model IDs and normalized paths).
+// Worker URLs belong to registered recorder scopes and are never cached here.
 
 /// Global string interner for metric labels.
 /// Uses DashMap for lock-free concurrent access.
@@ -23,7 +25,7 @@ static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new
 /// Intern a string, returning a cheaply-cloneable Arc<str>.
 ///
 /// This function is designed for high-throughput scenarios where the same
-/// strings (model IDs, worker URLs) appear repeatedly. The first call allocates,
+/// strings (model IDs, normalized paths) appear repeatedly. The first call allocates,
 /// subsequent calls just clone the Arc (very cheap - just a ref count increment).
 pub(crate) fn intern_string(s: &str) -> Arc<str> {
     // Fast path: check if already interned
@@ -42,6 +44,10 @@ pub(crate) fn intern_string(s: &str) -> Arc<str> {
 #[cfg(test)]
 pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
+}
+
+pub(crate) fn forget_worker_label(worker: &str) {
+    STRING_INTERNER.remove(worker);
 }
 
 // =============================================================================
@@ -328,6 +334,10 @@ pub(crate) fn init_metrics() {
         "smg_worker_connections_active",
         "Active connections to workers by worker_type, connection_mode"
     );
+    describe_counter!(
+        "smg_worker_requests_total",
+        "Upstream dispatch attempts per registered worker and model; each routing retry and PD/encode leg counts once, including transport failures; health checks and internal stale-connection resends are excluded"
+    );
     describe_gauge!(
         "smg_worker_requests_active",
         "Currently running requests per worker"
@@ -360,6 +370,11 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_kv_event_subscriptions_total",
         "KV event streams connected, by worker; a reconnect counts again"
+    );
+    describe_gauge!(
+        "smg_kv_event_subscription_state",
+        "KV event subscription state by worker: 0=connecting/reconnecting, \
+         1=connected, -1=unsupported, -2=failed, -3=removed"
     );
     describe_counter!(
         "smg_kv_event_batches_total",
@@ -715,14 +730,14 @@ fn record_tokenizer_cache_activity_snapshot(stats: CacheActivityStats) {
         .absolute(stats.reused_bytes);
 }
 
+/// Install the process recorder before registering any workers, as server
+/// startup does. Registrations made before installation do not acquire metric
+/// ownership; setup is once per process and does not attach existing registries.
 #[expect(
     clippy::expect_used,
     reason = "startup initialization — metrics exporter must be installed or the process cannot serve metrics"
 )]
-pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
-    init_metrics();
-
-    let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
+pub fn start_prometheus(config: PrometheusConfig) -> MetricsHandle {
     let duration_bucket: Vec<f64> = config.duration_buckets.unwrap_or_else(|| {
         vec![
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
@@ -731,59 +746,72 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         ]
     });
 
-    // The event-loop canary needs its own buckets: its name does not end in
-    // `duration_seconds`, and the request-latency buckets above are far too
-    // coarse for 0-1s wake drift. Without explicit buckets the recorder would
-    // render it as a summary.
-    let canary_matcher = Matcher::Full(super::runtime_metrics::EVENT_LOOP_DELAY_SECONDS.into());
+    // Each worker owns only its metric storage. Bucket configuration is reused;
+    // listeners and process-wide reporting tasks are installed once below.
+    let recorder = super::worker_metrics::WorkerRecorder::new(move || {
+        let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
 
-    // TTFT and TPOT (per-request mean inter-token latency) end in `_seconds`
-    // but NOT `duration_seconds`, so without explicit buckets the recorder
-    // renders them as summaries (quantile lines only) — not heatmap-able. Reuse
-    // the request-latency buckets: they span 0.001-7200s, fine for both the
-    // sub-second-to-seconds TTFT and the tens-of-ms TPOT.
-    let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
-    let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
+        // The event-loop canary needs its own buckets: its name does not end in
+        // `duration_seconds`, and the request-latency buckets above are far too
+        // coarse for 0-1s wake drift. Without explicit buckets the recorder would
+        // render it as a summary.
+        let canary_matcher = Matcher::Full(super::runtime_metrics::EVENT_LOOP_DELAY_SECONDS.into());
 
-    // The cache-aware match ratio is a dimensionless 0..1 value: no `_seconds`
-    // matcher applies, so it also needs its own buckets or it renders as a
-    // summary.
-    let match_ratio_matcher = Matcher::Full(String::from("smg_cache_aware_match_ratio"));
+        // TTFT and TPOT (per-request mean inter-token latency) end in `_seconds`
+        // but NOT `duration_seconds`, so without explicit buckets the recorder
+        // renders them as summaries (quantile lines only) — not heatmap-able. Reuse
+        // the request-latency buckets: they span 0.001-7200s, fine for both the
+        // sub-second-to-seconds TTFT and the tens-of-ms TPOT.
+        let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
+        let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
 
-    // The KV index's lookup and apply times are microseconds: their own
-    // buckets, or the recorder renders them as summaries.
-    let kv_lookup_matcher = Matcher::Full(String::from("smg_kv_index_lookup_seconds"));
-    let kv_apply_matcher = Matcher::Full(String::from("smg_kv_event_apply_seconds"));
+        // The cache-aware match ratio is a dimensionless 0..1 value: no `_seconds`
+        // matcher applies, so it also needs its own buckets or it renders as a
+        // summary.
+        let match_ratio_matcher = Matcher::Full(String::from("smg_cache_aware_match_ratio"));
 
-    PrometheusBuilder::new()
-        .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
-        .set_buckets_for_metric(duration_matcher, &duration_bucket)
-        .expect("failed to set duration bucket")
-        .set_buckets_for_metric(ttft_matcher, &duration_bucket)
-        .expect("failed to set ttft bucket")
-        .set_buckets_for_metric(tpot_matcher, &duration_bucket)
-        .expect("failed to set tpot bucket")
-        .set_buckets_for_metric(
-            canary_matcher,
-            super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
-        )
-        .expect("failed to set event loop delay buckets")
-        .set_buckets_for_metric(match_ratio_matcher, CACHE_AWARE_MATCH_RATIO_BUCKETS)
-        .expect("failed to set cache-aware match ratio buckets")
-        .set_buckets_for_metric(kv_lookup_matcher, KV_INDEX_MICRO_BUCKETS)
-        .expect("failed to set KV index lookup buckets")
-        .set_buckets_for_metric(kv_apply_matcher, KV_INDEX_MICRO_BUCKETS)
-        .expect("failed to set KV event apply buckets")
-        .install_recorder()
-        .inspect(|_| {
-            #[cfg(all(
-                feature = "jemalloc-stats",
-                not(target_env = "msvc"),
-                not(target_env = "musl")
-            ))]
-            allocator_stats::start_reporting();
-        })
-        .expect("failed to install Prometheus recorder")
+        // The KV index's lookup and apply times are microseconds: their own
+        // buckets, or the recorder renders them as summaries.
+        let kv_lookup_matcher = Matcher::Full(String::from("smg_kv_index_lookup_seconds"));
+        let kv_apply_matcher = Matcher::Full(String::from("smg_kv_event_apply_seconds"));
+        let kv_lag_matcher = Matcher::Full(String::from("smg_kv_event_lag_seconds"));
+
+        PrometheusBuilder::new()
+            .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
+            .set_buckets_for_metric(duration_matcher, &duration_bucket)
+            .expect("failed to set duration bucket")
+            .set_buckets_for_metric(ttft_matcher, &duration_bucket)
+            .expect("failed to set ttft bucket")
+            .set_buckets_for_metric(tpot_matcher, &duration_bucket)
+            .expect("failed to set tpot bucket")
+            .set_buckets_for_metric(
+                canary_matcher,
+                super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
+            )
+            .expect("failed to set event loop delay buckets")
+            .set_buckets_for_metric(match_ratio_matcher, CACHE_AWARE_MATCH_RATIO_BUCKETS)
+            .expect("failed to set cache-aware match ratio buckets")
+            .set_buckets_for_metric(kv_lookup_matcher, KV_INDEX_MICRO_BUCKETS)
+            .expect("failed to set KV index lookup buckets")
+            .set_buckets_for_metric(kv_apply_matcher, KV_INDEX_MICRO_BUCKETS)
+            .expect("failed to set KV event apply buckets")
+            .set_buckets_for_metric(kv_lag_matcher, KV_INDEX_MICRO_BUCKETS)
+            .expect("failed to set KV event lag buckets")
+            .build_recorder()
+    });
+    let handle = recorder.handle();
+    metrics::set_global_recorder(recorder).expect("failed to install Prometheus recorder");
+    handle.install_lifecycle();
+    // Descriptions emitted before recorder installation are discarded.
+    init_metrics();
+    Metrics::initialize_static_series();
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    allocator_stats::start_reporting();
+    handle
 }
 
 #[cfg(all(
@@ -905,6 +933,166 @@ pub struct StreamingMetricsParams<'a> {
 }
 
 impl Metrics {
+    /// Make finite protection label sets visible before their first event.
+    /// Registering gauges/histograms leaves existing values and observations intact.
+    pub(crate) fn initialize_static_series() {
+        for stage in ["selection", "dispatch"] {
+            for name in [
+                "smg_worker_overload_shed_total",
+                "smg_worker_overload_fallback_total",
+                "smg_worker_liveness_fallback_total",
+            ] {
+                counter!(name, "stage" => stage).increment(0);
+            }
+        }
+        for source in ["header", "rid"] {
+            counter!("smg_routing_key_source_total", "source" => source).increment(0);
+        }
+        counter!("smg_policy_inflight_reconciled_total", "policy" => "cache_aware").increment(0);
+        for worker_type in [
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::WORKER_PREFILL,
+            metrics_labels::WORKER_DECODE,
+        ] {
+            for endpoint in [
+                metrics_labels::ENDPOINT_CHAT,
+                metrics_labels::ENDPOINT_GENERATE,
+                metrics_labels::ENDPOINT_COMPLETIONS,
+                metrics_labels::ENDPOINT_RERANK,
+                metrics_labels::ENDPOINT_RESPONSES,
+                metrics_labels::ENDPOINT_DECISIONS,
+                metrics_labels::ENDPOINT_SYSTEMONE,
+                metrics_labels::ENDPOINT_MESSAGES,
+                metrics_labels::ENDPOINT_EMBEDDINGS,
+                metrics_labels::ENDPOINT_CLASSIFY,
+                metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS,
+                "other",
+            ] {
+                Self::initialize_retry_series(worker_type, endpoint);
+            }
+        }
+        Self::initialize_retry_series(
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::ENDPOINT_CHAT,
+        );
+        // Attempts and upstream error codes are open label domains. Bootstrap
+        // the first retry and the ordinary HTTP success; further values appear
+        // when actually observed, rather than inventing status/error pairs.
+        let _ = histogram!("smg_worker_retry_backoff_seconds", "attempt" => "1");
+        counter!("smg_router_upstream_responses_total", "router_type" => metrics_labels::ROUTER_HTTP,
+            "status_code" => "200", "error_code" => "").increment(0);
+    }
+
+    fn initialize_retry_series(worker_type: &'static str, endpoint: &'static str) {
+        for name in [
+            "smg_worker_retries_total",
+            "smg_worker_retries_exhausted_total",
+        ] {
+            counter!(name, "worker_type" => worker_type, "endpoint" => endpoint).increment(0);
+        }
+    }
+
+    pub(crate) fn initialize_worker_series(
+        worker_url: &str,
+        worker_type: &'static str,
+        connection_mode: &'static str,
+    ) {
+        use crate::worker::worker::StallReason;
+
+        let worker = super::worker_metrics::worker_label(worker_url);
+        for reason in [StallReason::Unreachable, StallReason::Wedged] {
+            let _ = gauge!("smg_worker_stalled", "worker" => worker.clone(), "reason" => reason.as_str());
+            counter!("smg_worker_stall_transitions_total", "worker" => worker.clone(), "reason" => reason.as_str()).increment(0);
+        }
+        let error_types: &[&str] = if connection_mode == metrics_labels::CONNECTION_HTTP {
+            &[metrics_labels::ERROR_BACKEND, metrics_labels::ERROR_TIMEOUT]
+        } else {
+            &[metrics_labels::ERROR_BACKEND]
+        };
+        for &error_type in error_types {
+            counter!("smg_worker_errors_total", "worker_type" => worker_type,
+                "connection_mode" => connection_mode, "error_type" => error_type)
+            .increment(0);
+        }
+    }
+
+    pub(crate) fn initialize_worker_cb_series(worker_url: &str) {
+        let worker = super::worker_metrics::worker_label(worker_url);
+        for (from, to) in [
+            (metrics_labels::CB_CLOSED, metrics_labels::CB_OPEN),
+            (metrics_labels::CB_OPEN, metrics_labels::CB_HALF_OPEN),
+            (metrics_labels::CB_HALF_OPEN, metrics_labels::CB_CLOSED),
+            (metrics_labels::CB_HALF_OPEN, metrics_labels::CB_OPEN),
+            (metrics_labels::CB_OPEN, metrics_labels::CB_CLOSED),
+        ] {
+            counter!("smg_worker_cb_transitions_total", "worker" => worker.clone(), "from" => from, "to" => to).increment(0);
+        }
+        for outcome in [metrics_labels::CB_SUCCESS, metrics_labels::CB_FAILURE] {
+            counter!("smg_worker_cb_outcomes_total", "worker" => worker.clone(), "outcome" => outcome).increment(0);
+        }
+        for name in [
+            "smg_worker_cb_consecutive_failures",
+            "smg_worker_cb_consecutive_successes",
+        ] {
+            let _ = gauge!(name, "worker" => worker.clone());
+        }
+    }
+
+    pub(crate) fn initialize_model_overload_series(model_id: &str) {
+        let _ = gauge!("smg_workers_overloaded", "model" => intern_model_label(model_id));
+    }
+
+    pub(crate) fn initialize_kv_worker_series(worker_url: &str) {
+        use crate::worker::ResyncReason;
+
+        let worker = super::worker_metrics::worker_label(worker_url);
+        for reason in ["intern_failed", "panic", "join_error"] {
+            counter!("smg_kv_event_subscription_failures_total", "worker" => worker.clone(), "reason" => reason).increment(0);
+        }
+        for outcome in [
+            "replay_requested",
+            "unrecovered_cleared",
+            "unrecovered_kept",
+        ] {
+            counter!("smg_kv_event_gaps_total", "worker" => worker.clone(), "outcome" => outcome)
+                .increment(0);
+        }
+        for reason in [
+            ResyncReason::OutOfRange,
+            ResyncReason::DataLoss,
+            ResyncReason::PublisherRestart,
+            ResyncReason::GapCleared,
+            ResyncReason::Snapshot,
+        ] {
+            counter!("smg_kv_event_resyncs_total", "worker" => worker.clone(), "reason" => reason.as_str()).increment(0);
+        }
+        counter!("smg_kv_event_missed_batches_total", "worker" => worker.clone()).increment(0);
+        counter!("smg_kv_event_parentless_stores_total", "worker" => worker.clone()).increment(0);
+        counter!("smg_kv_event_parentless_blocks_total", "worker" => worker.clone()).increment(0);
+        for name in [
+            "smg_kv_event_degraded_ranks",
+            "smg_kv_event_tail_depth",
+            "smg_kv_index_blocks",
+        ] {
+            let _ = gauge!(name, "worker" => worker.clone());
+        }
+    }
+
+    pub(crate) fn initialize_discovery_series(source: &'static str) {
+        for result in [
+            metrics_labels::REGISTRATION_SUCCESS,
+            metrics_labels::REGISTRATION_FAILED,
+        ] {
+            counter!("smg_discovery_registrations_total", "source" => source, "result" => result)
+                .increment(0);
+        }
+        counter!("smg_discovery_deregistrations_total", "source" => source,
+            "reason" => metrics_labels::DEREGISTRATION_RECONCILED)
+        .increment(0);
+        let _ = gauge!("smg_discovery_workers_discovered", "source" => source);
+        let _ = histogram!("smg_discovery_sync_duration_seconds", "source" => source);
+    }
+
     pub fn record_router_request(
         router_type: &'static str,
         backend_type: &'static str,
@@ -1418,7 +1606,7 @@ impl Metrics {
 
     /// Set the number of requests SMG has admitted to a prefill worker.
     pub fn set_pd_prefill_admission_inflight(worker_url: &str, count: usize) {
-        let worker = intern_string(worker_url);
+        let worker = super::worker_metrics::worker_label(worker_url);
         gauge!(
             "smg_pd_prefill_admission_inflight",
             "worker" => worker
@@ -1486,6 +1674,27 @@ impl Metrics {
             "smg_worker_health_checks_total",
             "worker_type" => worker_type,
             "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Register a real worker/model baseline without changing an existing total.
+    pub fn initialize_worker_request_series(worker_url: &str, model_id: &str) {
+        counter!(
+            "smg_worker_requests_total",
+            "worker" => super::worker_metrics::worker_label(worker_url),
+            "model" => intern_model_label(model_id)
+        )
+        .increment(0);
+    }
+
+    /// Count one polled upstream dispatch attempt, including transport failure.
+    /// Selection, admission, response chunks, and health traffic do not count.
+    pub fn record_worker_request(worker_url: &str, model_id: &str) {
+        counter!(
+            "smg_worker_requests_total",
+            "worker" => super::worker_metrics::worker_label(worker_url),
+            "model" => intern_model_label(model_id)
         )
         .increment(1);
     }
@@ -1653,7 +1862,7 @@ impl Metrics {
 
     /// Set running requests per worker
     pub fn set_worker_requests_active(worker: &str, count: usize) {
-        let worker_interned = intern_string(worker);
+        let worker_interned = super::worker_metrics::worker_label(worker);
         gauge!(
             "smg_worker_requests_active",
             "worker" => worker_interned
@@ -1663,7 +1872,7 @@ impl Metrics {
 
     /// Set active routing keys per worker
     pub fn set_worker_routing_keys_active(worker: &str, count: usize) {
-        let worker_interned = intern_string(worker);
+        let worker_interned = super::worker_metrics::worker_label(worker);
         gauge!(
             "smg_worker_routing_keys_active",
             "worker" => worker_interned
@@ -1674,7 +1883,7 @@ impl Metrics {
     /// Flip the liveness veto gauge for a worker; count the transition when
     /// the veto is set.
     pub fn set_worker_stalled(worker_url: &str, reason: &'static str, stalled: bool) {
-        let worker = intern_string(worker_url);
+        let worker = super::worker_metrics::worker_label(worker_url);
         gauge!(
             "smg_worker_stalled",
             "worker" => Arc::clone(&worker),
@@ -1693,7 +1902,7 @@ impl Metrics {
 
     /// Set worker health status
     pub fn set_worker_health(worker_url: &str, healthy: bool) {
-        let worker_interned = intern_string(worker_url);
+        let worker_interned = super::worker_metrics::worker_label(worker_url);
         gauge!(
             "smg_worker_health",
             "worker" => worker_interned
@@ -1702,7 +1911,7 @@ impl Metrics {
     }
 
     pub fn set_worker_http2(worker_url: &str, http2: bool) {
-        let worker_interned = intern_string(worker_url);
+        let worker_interned = super::worker_metrics::worker_label(worker_url);
         gauge!(
             "smg_worker_http2",
             "worker" => worker_interned
@@ -1713,7 +1922,7 @@ impl Metrics {
     /// Record a KV event subscription task failure (panic, join error, or
     /// worker-id intern failure)
     pub fn record_kv_event_subscription_failure(worker_url: &str, reason: &'static str) {
-        let worker_interned = intern_string(worker_url);
+        let worker_interned = super::worker_metrics::worker_label(worker_url);
         counter!(
             "smg_kv_event_subscription_failures_total",
             "worker" => worker_interned,
@@ -1727,9 +1936,17 @@ impl Metrics {
     pub fn record_kv_event_subscription(worker_url: &str) {
         counter!(
             "smg_kv_event_subscriptions_total",
-            "worker" => intern_string(worker_url)
+            "worker" => super::worker_metrics::worker_label(worker_url)
         )
         .increment(1);
+    }
+
+    pub(crate) fn set_kv_event_subscription_state(worker_url: &str, state: i8) {
+        gauge!(
+            "smg_kv_event_subscription_state",
+            "worker" => super::worker_metrics::worker_label(worker_url)
+        )
+        .set(f64::from(state));
     }
 
     /// Count a KV event batch by what the subscriber did with it.
@@ -1737,7 +1954,7 @@ impl Metrics {
     pub fn record_engine_load_poll(worker_url: &str, mode: &'static str) {
         counter!(
             "smg_engine_load_polls_total",
-            "worker" => intern_string(worker_url),
+            "worker" => super::worker_metrics::worker_label(worker_url),
             "mode" => mode
         )
         .increment(1);
@@ -1746,7 +1963,7 @@ impl Metrics {
     pub fn record_kv_event_batch(worker_url: &str, disposition: &'static str) {
         counter!(
             "smg_kv_event_batches_total",
-            "worker" => intern_string(worker_url),
+            "worker" => super::worker_metrics::worker_label(worker_url),
             "disposition" => disposition
         )
         .increment(1);
@@ -1754,7 +1971,7 @@ impl Metrics {
 
     /// Count a sequence gap and the batches it skipped.
     pub fn record_kv_event_gap(worker_url: &str, outcome: &'static str, missed: u64) {
-        let worker_interned = intern_string(worker_url);
+        let worker_interned = super::worker_metrics::worker_label(worker_url);
         counter!(
             "smg_kv_event_gaps_total",
             "worker" => Arc::clone(&worker_interned),
@@ -1771,7 +1988,7 @@ impl Metrics {
     pub fn record_kv_event_resync(worker_url: &str, reason: &'static str) {
         counter!(
             "smg_kv_event_resyncs_total",
-            "worker" => intern_string(worker_url),
+            "worker" => super::worker_metrics::worker_label(worker_url),
             "reason" => reason
         )
         .increment(1);
@@ -1779,7 +1996,7 @@ impl Metrics {
 
     /// Observe how old a batch was when it was applied.
     pub fn record_kv_event_lag(worker_url: &str, seconds: f64) {
-        histogram!("smg_kv_event_lag_seconds", "worker" => intern_string(worker_url))
+        histogram!("smg_kv_event_lag_seconds", "worker" => super::worker_metrics::worker_label(worker_url))
             .record(seconds);
     }
 
@@ -1789,7 +2006,7 @@ impl Metrics {
     pub fn record_kv_event_blocks(worker_url: &str, op: &'static str, blocks: usize) {
         counter!(
             "smg_kv_event_blocks_total",
-            "worker" => intern_string(worker_url),
+            "worker" => super::worker_metrics::worker_label(worker_url),
             "op" => op
         )
         .increment(blocks as u64);
@@ -1798,7 +2015,7 @@ impl Metrics {
     /// Count the stores a batch placed without their parent (as new chains
     /// from the root) and the blocks they carried.
     pub fn record_kv_event_parentless(worker_url: &str, stores: u64, blocks: u64) {
-        let worker = intern_string(worker_url);
+        let worker = super::worker_metrics::worker_label(worker_url);
         counter!("smg_kv_event_parentless_stores_total", "worker" => worker.clone())
             .increment(stores);
         counter!("smg_kv_event_parentless_blocks_total", "worker" => worker).increment(blocks);
@@ -1806,7 +2023,7 @@ impl Metrics {
 
     /// Time to apply one batch to the index.
     pub fn record_kv_event_apply(worker_url: &str, seconds: f64) {
-        histogram!("smg_kv_event_apply_seconds", "worker" => intern_string(worker_url))
+        histogram!("smg_kv_event_apply_seconds", "worker" => super::worker_metrics::worker_label(worker_url))
             .record(seconds);
     }
 
@@ -1818,20 +2035,21 @@ impl Metrics {
 
     /// Ranks of this worker whose index may be stale.
     pub fn set_kv_event_degraded_ranks(worker_url: &str, count: usize) {
-        gauge!("smg_kv_event_degraded_ranks", "worker" => intern_string(worker_url))
+        gauge!("smg_kv_event_degraded_ranks", "worker" => super::worker_metrics::worker_label(worker_url))
             .set(count as f64);
     }
 
     /// Live batches held for a worker while a snapshot resync is in flight.
     pub fn set_kv_event_tail_depth(worker_url: &str, depth: usize) {
-        gauge!("smg_kv_event_tail_depth", "worker" => intern_string(worker_url)).set(depth as f64);
+        gauge!("smg_kv_event_tail_depth", "worker" => super::worker_metrics::worker_label(worker_url)).set(depth as f64);
     }
 
     /// Publish the blocks the positional index holds for a worker. Called from
     /// the KV event subscriber where it already counts applied batches, never
     /// from the lookup path, so routing reads nothing that writes.
     pub fn set_kv_index_blocks(worker_url: &str, blocks: usize) {
-        gauge!("smg_kv_index_blocks", "worker" => intern_string(worker_url)).set(blocks as f64);
+        gauge!("smg_kv_index_blocks", "worker" => super::worker_metrics::worker_label(worker_url))
+            .set(blocks as f64);
     }
 
     /// Publish the lines a log writer's queue has dropped so far, by sink.
@@ -1871,7 +2089,7 @@ impl Metrics {
 
     /// Set circuit breaker state (0=closed, 1=open, 2=half_open)
     pub fn set_worker_cb_state(worker: &str, state_code: u8) {
-        let worker_interned = intern_string(worker);
+        let worker_interned = super::worker_metrics::worker_label(worker);
         gauge!(
             "smg_worker_cb_state",
             "worker" => worker_interned
@@ -1881,7 +2099,7 @@ impl Metrics {
 
     /// Record circuit breaker state transition
     pub fn record_worker_cb_transition(worker: &str, from: &'static str, to: &'static str) {
-        let worker_interned = intern_string(worker);
+        let worker_interned = super::worker_metrics::worker_label(worker);
         counter!(
             "smg_worker_cb_transitions_total",
             "worker" => worker_interned,
@@ -1893,7 +2111,7 @@ impl Metrics {
 
     /// Record circuit breaker outcome
     pub fn record_worker_cb_outcome(worker: &str, outcome: &'static str) {
-        let worker_interned = intern_string(worker);
+        let worker_interned = super::worker_metrics::worker_label(worker);
         counter!(
             "smg_worker_cb_outcomes_total",
             "worker" => worker_interned,
@@ -1904,7 +2122,7 @@ impl Metrics {
 
     /// Set circuit breaker consecutive failures
     pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
-        let worker_interned = intern_string(worker);
+        let worker_interned = super::worker_metrics::worker_label(worker);
         gauge!(
             "smg_worker_cb_consecutive_failures",
             "worker" => worker_interned
@@ -1914,7 +2132,7 @@ impl Metrics {
 
     /// Set circuit breaker consecutive successes
     pub fn set_worker_cb_consecutive_successes(worker: &str, count: u32) {
-        let worker_interned = intern_string(worker);
+        let worker_interned = super::worker_metrics::worker_label(worker);
         gauge!(
             "smg_worker_cb_consecutive_successes",
             "worker" => worker_interned
@@ -2042,7 +2260,7 @@ impl Metrics {
         model_id: &str,
         response: &openai_protocol::worker::WorkerLoadResponse,
     ) {
-        let worker = intern_string(worker_url);
+        let worker = super::worker_metrics::worker_label(worker_url);
         let model = intern_model_label(model_id);
 
         for load in &response.loads {
@@ -2134,8 +2352,14 @@ impl Metrics {
     // ========================================================================
 
     pub fn remove_worker_metrics(worker_url: &str) {
+        forget_worker_label(worker_url);
+        if super::worker_metrics::installed() {
+            // Registry leases own retirement; another registry may still own
+            // the URL, so this URL-only helper cannot revoke that ownership.
+            return;
+        }
         // Intern once, clone (cheap) for each metric
-        let worker = intern_string(worker_url);
+        let worker = super::worker_metrics::worker_label(worker_url);
 
         gauge!("smg_worker_cb_consecutive_failures", "worker" => Arc::clone(&worker)).set(0.0);
         gauge!("smg_worker_cb_consecutive_successes", "worker" => Arc::clone(&worker)).set(0.0);
@@ -2158,7 +2382,7 @@ impl Metrics {
     /// label set must exactly match `record_engine_load` (including `model` and
     /// `dp_rank`) or a fresh series is created instead of overwriting the live one.
     pub fn remove_engine_load_metrics(worker_url: &str, model_id: &str, dp_size: usize) {
-        let worker = intern_string(worker_url);
+        let worker = super::worker_metrics::worker_label(worker_url);
         let model = intern_model_label(model_id);
 
         for rank in 0..dp_size.max(1) {
@@ -2225,6 +2449,29 @@ mod tests {
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
     use super::{test_support::render_with_recorder, *};
+
+    #[test]
+    fn worker_removal_reclaims_cached_urls_without_late_update_cache_growth() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let worker = "http://retention-interner-regression";
+        // Include entries made by older label paths: retirement must release them too.
+        drop(intern_string(worker));
+        assert!(STRING_INTERNER.contains_key(worker));
+        metrics::with_local_recorder(&recorder, || Metrics::remove_worker_metrics(worker));
+        assert!(
+            !STRING_INTERNER.contains_key(worker),
+            "retired URL remains cached"
+        );
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::set_worker_health(worker, true);
+            Metrics::record_kv_event_lag(worker, 0.001);
+            Metrics::set_kv_event_subscription_state(worker, -3);
+        });
+        assert!(
+            !STRING_INTERNER.contains_key(worker),
+            "late worker labels grew the permanent cache"
+        );
+    }
 
     #[test]
     fn tokenizer_activity_registers_both_layers_on_scrape() {
@@ -2812,6 +3059,42 @@ mod tests {
         let handle = recorder.handle();
         let result = metrics::with_local_recorder(&recorder, f);
         (handle.render(), result)
+    }
+
+    #[test]
+    fn initialization_preserves_existing_values_and_histogram_observations() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::initialize_static_series();
+            Metrics::initialize_worker_series("initialization-worker", "regular", "http");
+            Metrics::initialize_worker_cb_series("initialization-worker");
+            Metrics::initialize_kv_worker_series("initialization-worker");
+            Metrics::record_worker_overload_shed("selection");
+            Metrics::set_worker_stalled("initialization-worker", "unreachable", true);
+            Metrics::record_worker_cb_outcome("initialization-worker", "failure");
+            Metrics::set_worker_cb_consecutive_failures("initialization-worker", 3);
+            Metrics::record_kv_event_gap("initialization-worker", "replay_requested", 4);
+            Metrics::record_kv_event_parentless("initialization-worker", 3, 5);
+            Metrics::set_kv_event_tail_depth("initialization-worker", 7);
+            Metrics::record_worker_retry_backoff(1, Duration::from_millis(7));
+            Metrics::initialize_static_series();
+            Metrics::initialize_worker_series("initialization-worker", "regular", "http");
+            Metrics::initialize_worker_cb_series("initialization-worker");
+            Metrics::initialize_kv_worker_series("initialization-worker");
+        });
+        for sample in [
+            r#"smg_worker_overload_shed_total{stage="selection"} 1"#,
+            r#"smg_worker_stalled{worker="initialization-worker",reason="unreachable"} 1"#,
+            r#"smg_worker_cb_outcomes_total{worker="initialization-worker",outcome="failure"} 1"#,
+            r#"smg_worker_cb_consecutive_failures{worker="initialization-worker"} 3"#,
+            r#"smg_kv_event_missed_batches_total{worker="initialization-worker"} 4"#,
+            r#"smg_kv_event_parentless_stores_total{worker="initialization-worker"} 3"#,
+            r#"smg_kv_event_parentless_blocks_total{worker="initialization-worker"} 5"#,
+            r#"smg_kv_event_tail_depth{worker="initialization-worker"} 7"#,
+            r#"smg_worker_retry_backoff_seconds_count{attempt="1"} 1"#,
+            r#"smg_worker_retry_backoff_seconds_sum{attempt="1"} 0.007"#,
+        ] {
+            assert!(rendered.contains(sample), "missing {sample}:\n{rendered}");
+        }
     }
 
     #[test]

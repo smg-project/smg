@@ -61,6 +61,7 @@ pub(crate) async fn non_stream_request_execution(
     );
 
     // Send the request
+    worker.record_request();
     let response = match request_builder.send().await {
         Ok(r) => r,
         Err(e) => {

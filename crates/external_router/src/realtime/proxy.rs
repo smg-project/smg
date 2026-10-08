@@ -41,6 +41,27 @@ pub async fn run_ws_proxy(
     session_id: String,
     cancel_token: CancellationToken,
 ) -> anyhow::Result<()> {
+    run_ws_proxy_with_worker(
+        client_ws,
+        upstream_url,
+        auth_header,
+        registry,
+        session_id,
+        cancel_token,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_ws_proxy_with_worker(
+    client_ws: WebSocket,
+    upstream_url: &str,
+    auth_header: &str,
+    registry: Arc<RealtimeRegistry>,
+    session_id: String,
+    cancel_token: CancellationToken,
+    worker: Option<&dyn crate::worker::ExternalWorker>,
+) -> anyhow::Result<()> {
     // Connect to upstream WebSocket with auth.
     // Let tungstenite auto-add WebSocket handshake headers (Connection, Upgrade,
     // Sec-WebSocket-Version, Sec-WebSocket-Key); we only add app-specific headers.
@@ -58,6 +79,9 @@ pub async fn run_ws_proxy(
     // process-level CryptoProvider being installed.
     let connector = get_tls_connector();
 
+    if let Some(worker) = worker {
+        worker.record_request();
+    }
     let (upstream_ws, _response) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)),

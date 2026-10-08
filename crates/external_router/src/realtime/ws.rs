@@ -118,13 +118,14 @@ pub async fn handle_realtime_ws(
     );
 
     ws.on_upgrade(move |socket: WebSocket| async move {
-        match proxy::run_ws_proxy(
+        match proxy::run_ws_proxy_with_worker(
             socket,
             &upstream_ws_url,
             &auth_str,
             realtime_registry.clone(),
             session_id.clone(),
             cancel_token,
+            Some(&*worker),
         )
         .await
         {

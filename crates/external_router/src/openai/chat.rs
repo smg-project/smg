@@ -167,6 +167,7 @@ pub(super) async fn route_chat(
                     req = req.header("Accept", "text/event-stream");
                 }
 
+                worker.record_request();
                 let resp = match req.send().await {
                     Ok(r) => r,
                     Err(e) => {

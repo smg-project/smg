@@ -1903,6 +1903,10 @@ impl BasicWorker {
         self.circuit_breaker.load().config().clone()
     }
 
+    pub(crate) fn publish_circuit_breaker_metrics(&self) {
+        self.circuit_breaker.load().publish_metrics();
+    }
+
     fn update_running_requests_metrics(&self) {
         let load = self.load();
         Metrics::set_worker_requests_active(self.url(), load);

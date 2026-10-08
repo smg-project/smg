@@ -13,8 +13,8 @@ use super::{
     overload::OverloadThresholds,
     resilience::ResolvedResilience,
     worker::{
-        BasicWorker, ConnectionMode, LazyHttpClient, RuntimeType, WorkerMetadata, WorkerRuntime,
-        WorkerType,
+        BasicWorker, ConnectionMode, ConnectionModeExt, LazyHttpClient, RuntimeType,
+        WorkerMetadata, WorkerRuntime, WorkerType, WorkerTypeExt,
     },
 };
 use crate::{
@@ -354,6 +354,11 @@ impl BasicWorkerBuilder {
                 });
         Metrics::set_worker_health(&metadata.spec.url, initial_status == WorkerStatus::Ready);
         Metrics::set_worker_http2(&metadata.spec.url, metadata.http2);
+        Metrics::initialize_worker_series(
+            &metadata.spec.url,
+            metadata.spec.worker_type.as_metric_label(),
+            metadata.spec.connection_mode.as_metric_label(),
+        );
 
         let http_client = Arc::new(match self.http_client {
             Some(client) => LazyHttpClient::ready(client),

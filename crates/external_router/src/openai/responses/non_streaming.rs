@@ -103,7 +103,7 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             ctx.components.client(),
             &url,
             ctx.headers(),
-            worker.api_key(),
+            &*worker,
             payload,
             ToolLoopExecutionContext {
                 original_body,
@@ -131,6 +131,7 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         let auth_header = provider.extract_auth_header(ctx.headers(), worker.api_key());
         request_builder = provider.apply_headers(request_builder, auth_header.as_ref());
 
+        worker.record_request();
         let response = match request_builder.send().await {
             Ok(r) => r,
             Err(e) => {

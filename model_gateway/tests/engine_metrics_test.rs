@@ -8,10 +8,15 @@
 //! This file is its own test binary (process), so installing the global
 //! Prometheus recorder here is safe and does not collide with other suites.
 
+use std::sync::Arc;
+
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
-use smg::observability::{
-    metrics::{start_prometheus, Metrics, PrometheusConfig},
-    metrics_server::start_metrics_server,
+use smg::{
+    observability::{
+        metrics::{start_prometheus, Metrics, PrometheusConfig},
+        metrics_server::start_metrics_server,
+    },
+    worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerRegistry, WorkerType},
 };
 
 #[tokio::test]
@@ -28,6 +33,20 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
         .await
         .expect("metrics server binds an ephemeral port");
 
+    // The production load monitor records snapshots only for registered workers.
+    // Registration owns the metric series until the worker leaves the registry.
+    let worker_url = "grpc://prefill-0:30000";
+    let registry = WorkerRegistry::new();
+    let worker_id = registry
+        .register(Arc::new(
+            BasicWorkerBuilder::new(worker_url)
+                .connection_mode(ConnectionMode::Grpc)
+                .worker_type(WorkerType::Prefill)
+                .model(ModelCard::new("test-model"))
+                .build(),
+        ))
+        .expect("register prefill worker");
+
     let response = WorkerLoadResponse {
         timestamp: "t".to_string(),
         dp_rank_count: 1,
@@ -43,7 +62,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
         }],
         ..Default::default()
     };
-    Metrics::record_engine_load("grpc://prefill-0:30000", "test-model", &response);
+    Metrics::record_engine_load(worker_url, "test-model", &response);
 
     let body = reqwest::get(format!("http://{addr}/metrics"))
         .await
@@ -70,5 +89,19 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
     assert!(
         !body.contains("smg_allocator_"),
         "an rlib consumer that did not register jemalloc exposed allocator gauges:\n{body}"
+    );
+
+    registry.remove(&worker_id).expect("remove prefill worker");
+    // A late poll must not resurrect metrics for the retired worker.
+    Metrics::record_engine_load(worker_url, "test-model", &response);
+    let retired_body = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .expect("metrics endpoint reachable after removal")
+        .text()
+        .await
+        .expect("retired metrics body");
+    assert!(
+        !retired_body.contains(&format!("worker=\"{worker_url}\"")),
+        "retired engine metrics returned after a late poll:\n{retired_body}"
     );
 }

@@ -21,6 +21,9 @@ pub trait ExternalWorker: Send + Sync + Debug {
     fn provider_for_model(&self, model_id: &str) -> Option<&ProviderType>;
     /// Report the upstream status so health and circuit state follow it.
     fn record_outcome(&self, status_code: u16);
+    /// Record an upstream request attempt, including transport failures.
+    /// Called when the send future is polled, after local validation.
+    fn record_request(&self) {}
     fn http_client(&self) -> &reqwest::Client;
     /// Hold the worker's load for a long-lived session.
     #[must_use = "dropping the hold releases the worker's load at once"]
@@ -83,4 +86,60 @@ pub trait WorkerSource: Send + Sync + Debug {
     fn stats(&self) -> WorkerStats;
     /// Every worker that fronts a third-party provider.
     fn external_workers(&self) -> Vec<Arc<dyn ExternalWorker>>;
+}
+
+#[cfg(test)]
+pub(crate) mod attempt_test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    #[derive(Debug)]
+    pub(crate) struct RecordingWorker {
+        pub(crate) url: String,
+        pub(crate) attempts: AtomicUsize,
+        client: reqwest::Client,
+    }
+    impl RecordingWorker {
+        pub(crate) fn new(url: String) -> Self {
+            Self {
+                url,
+                attempts: AtomicUsize::new(0),
+                client: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(std::time::Duration::from_secs(2))
+                    .build()
+                    .expect("test client"),
+            }
+        }
+        pub(crate) fn count(&self) -> usize {
+            self.attempts.load(Ordering::Relaxed)
+        }
+    }
+    impl ExternalWorker for RecordingWorker {
+        fn url(&self) -> &str {
+            &self.url
+        }
+        fn api_key(&self) -> Option<&String> {
+            None
+        }
+        fn model_id(&self) -> &str {
+            "registered-model"
+        }
+        fn is_healthy(&self) -> bool {
+            true
+        }
+        fn provider_for_model(&self, _: &str) -> Option<&ProviderType> {
+            None
+        }
+        fn record_outcome(&self, _: u16) {}
+        fn record_request(&self) {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+        }
+        fn http_client(&self) -> &reqwest::Client {
+            &self.client
+        }
+        fn hold_load(&self, _: Option<&HeaderMap>) -> LoadHold {
+            Box::new(())
+        }
+    }
 }

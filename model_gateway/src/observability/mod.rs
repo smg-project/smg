@@ -9,3 +9,4 @@ pub mod metrics;
 pub mod metrics_server;
 pub mod otel_trace;
 pub mod runtime_metrics;
+pub(crate) mod worker_metrics;

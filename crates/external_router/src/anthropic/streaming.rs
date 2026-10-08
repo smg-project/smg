@@ -53,6 +53,7 @@ async fn execute_passthrough(router: &RouterContext, req_ctx: &RequestContext) -
     let (url, req_headers) = worker::build_request(&*req_ctx.worker, req_ctx.headers.as_ref());
     let response = match worker::send_request(
         &router.http_client,
+        &*req_ctx.worker,
         &url,
         &req_headers,
         &req_ctx.request,
@@ -296,6 +297,7 @@ async fn send_streaming_request(
     let (url, req_headers) = worker::build_request(&*req_ctx.worker, req_ctx.headers.as_ref());
     let response = worker::send_request(
         &router.http_client,
+        &*req_ctx.worker,
         &url,
         &req_headers,
         &req_ctx.request,

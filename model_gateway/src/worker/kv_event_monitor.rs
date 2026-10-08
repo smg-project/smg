@@ -144,6 +144,22 @@ struct WorkerSubscription {
 /// Ids for [`WorkerSubscription`]s, unique within the process.
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy)]
+#[repr(i8)]
+enum SubscriptionState {
+    Connecting = 0,
+    Connected = 1,
+    Unsupported = -1,
+    Failed = -2,
+    Removed = -3,
+}
+
+impl SubscriptionState {
+    fn record(self, worker_url: &str) {
+        Metrics::set_kv_event_subscription_state(worker_url, self as i8);
+    }
+}
+
 impl KvEventMonitor {
     /// A monitor whose models get positional indexers.
     ///
@@ -311,8 +327,16 @@ impl KvEventMonitor {
         let indexer = self
             .indexers
             .entry(model_id.clone())
-            .or_insert_with(|| Arc::new(KvIndex::new(self.kind, self.jump_size)))
+            .or_insert_with(|| {
+                let index = Arc::new(KvIndex::new(self.kind, self.jump_size));
+                Metrics::set_kv_index_size(&model_id, index.current_size(), index.entry_count());
+                if let Some(stats) = index.chain_stats() {
+                    Metrics::set_kv_index_chain_stats(&model_id, &stats);
+                }
+                index
+            })
             .clone();
+        Metrics::initialize_kv_worker_series(&url);
         // Seed block_size provisionally from WorkerSpec. The event stream will
         // overwrite this with the backend's actual page size once received.
         if let Some(bs) = worker.metadata().spec.kv_block_size {
@@ -343,6 +367,7 @@ impl KvEventMonitor {
         let slots = Arc::clone(&self.worker_handles);
         let indexers = Arc::clone(&self.indexers);
         let model_block_sizes = Arc::clone(&self.block_sizes);
+        SubscriptionState::Connecting.record(&url);
 
         #[expect(
             clippy::disallowed_methods,
@@ -378,6 +403,7 @@ impl KvEventMonitor {
                      worker no longer feed cache-aware routing"
                 );
                 Metrics::record_kv_event_subscription_failure(&task_url, "panic");
+                SubscriptionState::Failed.record(&task_url);
             }
             Self::complete_removal(
                 &slots,
@@ -410,7 +436,7 @@ impl KvEventMonitor {
     /// model's index with the model's last subscription. The task does this
     /// rather than `on_worker_removed`, whose future a caller may drop
     /// before the task has ended; a slot that is `Active` (the task ended on
-    /// its own, or `stop` took the subscription) is left as it is.
+    /// its own) is left as it is.
     async fn complete_removal(
         slots: &Mutex<HashMap<String, Slot>>,
         indexers: &DashMap<String, Arc<KvIndex>>,
@@ -423,6 +449,9 @@ impl KvEventMonitor {
         if !matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
             return;
         }
+        // Publish before freeing the slot, so a new subscription under this
+        // URL cannot have its status overwritten by the departing task.
+        SubscriptionState::Removed.record(worker_url);
         handles.remove(worker_url);
         // Under the slot lock, which `on_worker_added` holds from its lookup
         // of the model's index to its insert: an add of the model racing
@@ -486,6 +515,17 @@ impl KvEventMonitor {
             );
             Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
         }
+        // A subscription that already ended (for example UNIMPLEMENTED) ran
+        // its completion before the removal reservation existed.
+        Self::complete_removal(
+            &self.worker_handles,
+            &self.indexers,
+            &self.block_sizes,
+            worker_url,
+            sub.id,
+            &sub.model_id,
+        )
+        .await;
     }
 
     /// Stop all subscriptions and clean up.
@@ -495,7 +535,16 @@ impl KvEventMonitor {
             let mut active = Vec::new();
             for (url, slot) in std::mem::take(&mut *handles) {
                 match slot {
-                    Slot::Active(sub) => active.push((url, sub)),
+                    Slot::Active(sub) => {
+                        handles.insert(
+                            url.clone(),
+                            Slot::Removing(Reservation {
+                                id: sub.id,
+                                done: sub.done.clone(),
+                            }),
+                        );
+                        active.push((url, sub));
+                    }
                     // The task behind a removal in flight lifts its own
                     // reservation.
                     reserved @ Slot::Removing(_) => {
@@ -522,6 +571,15 @@ impl KvEventMonitor {
                     );
                     Metrics::record_kv_event_subscription_failure(&url, "join_error");
                 }
+                Self::complete_removal(
+                    &self.worker_handles,
+                    &self.indexers,
+                    &self.block_sizes,
+                    &url,
+                    sub.id,
+                    &sub.model_id,
+                )
+                .await;
             }
         }
 

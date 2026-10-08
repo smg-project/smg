@@ -77,6 +77,7 @@ pub async fn forward_realtime_rest(
 
     let upstream_url = format!("{}{endpoint}", worker.url().trim_end_matches('/'));
 
+    worker.record_request();
     let result = worker
         .http_client()
         .post(&upstream_url)

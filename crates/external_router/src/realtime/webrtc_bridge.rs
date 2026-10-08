@@ -200,6 +200,35 @@ impl WebRtcBridge {
         bind_addr: IpAddr,
         stun_server: Option<SocketAddr>,
     ) -> Result<(Self, String), BridgeSetupError> {
+        Self::setup_with_worker(
+            client_sdp_offer_str,
+            upstream_url,
+            auth_header,
+            session_config,
+            call_id,
+            http_client,
+            bind_addr,
+            stun_server,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "setup requires all connection parameters"
+    )]
+    pub(crate) async fn setup_with_worker(
+        client_sdp_offer_str: &str,
+        upstream_url: &str,
+        auth_header: &str,
+        session_config: Option<serde_json::Value>,
+        call_id: String,
+        http_client: &reqwest::Client,
+        bind_addr: IpAddr,
+        stun_server: Option<SocketAddr>,
+        worker: Option<&dyn crate::worker::ExternalWorker>,
+    ) -> Result<(Self, String), BridgeSetupError> {
         // -- 1. Bind two UDP sockets (ephemeral ports) -----------------------
         // In production, `bind_addr` is typically `0.0.0.0` and both sockets
         // share the same bind/candidate IP (the server's routable address).
@@ -275,6 +304,7 @@ impl WebRtcBridge {
             auth_header,
             &upstream_offer.to_sdp_string(),
             session_config,
+            worker,
         )
         .await?;
 
@@ -871,6 +901,7 @@ async fn send_sdp_to_upstream(
     auth_header: &str,
     sdp_offer: &str,
     session_config: Option<serde_json::Value>,
+    worker: Option<&dyn crate::worker::ExternalWorker>,
 ) -> Result<SdpAnswer, BridgeSetupError> {
     let req = client
         .post(upstream_url)
@@ -887,8 +918,14 @@ async fn send_sdp_to_upstream(
                 "session",
                 reqwest::multipart::Part::text(session.to_string()).mime_str("application/json")?,
             );
+        if let Some(worker) = worker {
+            worker.record_request();
+        }
         req.multipart(form).send().await?
     } else {
+        if let Some(worker) = worker {
+            worker.record_request();
+        }
         req.header("Content-Type", "application/sdp")
             .body(sdp_offer.to_string())
             .send()
@@ -1049,6 +1086,42 @@ fn parse_stun_xor_mapped_address(resp: &[u8], txn_id: &[u8]) -> Option<SocketAdd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "mock server task is aborted by this test"
+    )]
+    async fn direct_and_multipart_sdp_sends_count_one_attempt_each() {
+        use axum::{http::StatusCode, routing::post, Router};
+
+        use crate::worker::{attempt_test_support::RecordingWorker, ExternalWorker};
+        let app = Router::new().route("/calls", post(|| async { StatusCode::BAD_REQUEST }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let worker = RecordingWorker::new(format!(
+            "http://{}/calls",
+            listener.local_addr().expect("address")
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        for (expected, session) in [(1, None), (2, Some(serde_json::json!({"type":"realtime"})))] {
+            assert!(send_sdp_to_upstream(
+                worker.http_client(),
+                &worker.url,
+                "Bearer test",
+                "v=0\r\n",
+                session,
+                Some(&worker)
+            )
+            .await
+            .is_err());
+            assert_eq!(worker.count(), expected);
+        }
+        server.abort();
+    }
 
     #[test]
     fn idle_beyond_max_triggers_timeout() {

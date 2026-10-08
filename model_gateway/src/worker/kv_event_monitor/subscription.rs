@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use super::{
     admission::{BatchOutcome, WorkerStreamState},
     apply::{WorkerIndexCounters, WorkerIndexState},
-    KvEventMonitor,
+    KvEventMonitor, SubscriptionState,
 };
 use crate::{
     observability::metrics::Metrics,
@@ -170,6 +170,7 @@ impl KvEventMonitor {
                      not feed cache-aware routing"
                 );
                 Metrics::record_kv_event_subscription_failure(&worker_url, "intern_failed");
+                SubscriptionState::Failed.record(&worker_url);
                 return;
             }
         };
@@ -199,6 +200,7 @@ impl KvEventMonitor {
         }
 
         loop {
+            SubscriptionState::Connecting.record(&worker_url);
             let backend_client = match worker.get_backend_client().await {
                 Ok(Some(client)) => client,
                 Ok(None) => {
@@ -292,6 +294,7 @@ impl KvEventMonitor {
                         "KV event stream connected"
                     );
                     Metrics::record_kv_event_subscription(&worker_url);
+                    SubscriptionState::Connected.record(&worker_url);
                     reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                     state.reconnected();
                     liveness::on_contact(&worker);
@@ -301,6 +304,7 @@ impl KvEventMonitor {
                     // If the backend doesn't implement SubscribeKvEvents (e.g. vLLM),
                     // stop retrying — this RPC will never succeed.
                     if e.code() == tonic::Code::Unimplemented {
+                        SubscriptionState::Unsupported.record(&worker_url);
                         warn!(
                             worker_url = %worker_url,
                             "Backend does not implement SubscribeKvEvents, \
@@ -389,6 +393,7 @@ impl KvEventMonitor {
                     return;
                 }
             };
+            SubscriptionState::Connecting.record(&worker_url);
 
             if state.abandon_snapshot() {
                 warn!(
@@ -542,7 +547,9 @@ mod tests {
 
     /// A scheduler whose `SubscribeKvEvents` accepts the call and never
     /// answers it, as an engine still starting behind an open port does.
-    struct HangingScheduler;
+    struct HangingScheduler {
+        unsupported: bool,
+    }
 
     type Never<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -598,6 +605,9 @@ mod tests {
             &self,
             _: Request<common::SubscribeKvEventsRequest>,
         ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+            if self.unsupported {
+                return Err(Status::unimplemented("KV events disabled"));
+            }
             std::future::pending().await
         }
 
@@ -667,7 +677,9 @@ mod tests {
         )]
         let server = tokio::spawn(
             Server::builder()
-                .add_service(TokenSpeedSchedulerServer::new(HangingScheduler))
+                .add_service(TokenSpeedSchedulerServer::new(HangingScheduler {
+                    unsupported: false,
+                }))
                 .serve(addr),
         );
         wait_until_listening(addr).await;
@@ -702,6 +714,72 @@ mod tests {
 
         pinger.abort();
         server.abort();
+    }
+
+    /// A backend without KV events remains usable for generation, but its
+    /// inability to feed cache-aware routing must be visible to a scraper.
+    #[tokio::test]
+    async fn unsupported_subscription_is_visible_until_worker_removal() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // This test and its subscription task use the same current-thread runtime.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = grpc_worker(listener.local_addr().unwrap());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test joins its scheduler after removing the worker"
+        )]
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(TokenSpeedSchedulerServer::new(HangingScheduler {
+                    unsupported: true,
+                }))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let monitor = KvEventMonitor::new(None);
+        monitor.on_worker_added(&worker).await;
+        let metric = format!(
+            "smg_kv_event_subscription_state{{worker=\"{}\"}}",
+            worker.url()
+        );
+        let unsupported = format!("{metric} -1");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if handle.render().lines().any(|line| line == unsupported) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("UNIMPLEMENTED must remain visible as an unsupported subscription");
+        assert!(worker.is_healthy());
+
+        monitor.on_worker_removed(worker.url()).await;
+        let removed = format!("{metric} -3");
+        assert!(handle.render().lines().any(|line| line == removed));
+
+        // Re-registration must get a fresh status, and stopping the monitor
+        // must retire even a subscription task that has already exited.
+        monitor.on_worker_added(&worker).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if handle.render().lines().any(|line| line == unsupported) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("re-registered worker reports its own subscription status");
+        monitor.stop().await;
+        assert!(handle.render().lines().any(|line| line == removed));
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

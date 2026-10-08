@@ -130,6 +130,7 @@ impl CircuitBreaker {
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         let init_state = CircuitState::Closed;
         Metrics::set_worker_cb_state(&metric_label, init_state.as_int());
+        Metrics::initialize_worker_cb_series(&metric_label);
         Self {
             state: AtomicU8::new(STATE_CLOSED),
             consecutive_failures: AtomicU32::new(0),
@@ -198,7 +199,12 @@ impl CircuitBreaker {
                     self.consecutive_failures.store(0, Ordering::Release);
                     self.consecutive_successes.store(0, Ordering::Release);
 
-                    info!("Circuit breaker state transition: open -> half_open");
+                    info!(
+                        worker_url = %self.metric_label,
+                        from = "open",
+                        to = "half_open",
+                        "Circuit breaker state transition: open -> half_open"
+                    );
                     Metrics::record_worker_cb_transition(&self.metric_label, "open", "half_open");
                     self.publish_state_gauge();
                     self.publish_gauge_metrics();
@@ -240,7 +246,10 @@ impl CircuitBreaker {
             }
             CircuitState::Closed => {}
             CircuitState::Open => {
-                tracing::warn!("Success recorded while circuit is open");
+                tracing::warn!(
+                    worker_url = %self.metric_label,
+                    "Success recorded while circuit is open"
+                );
             }
         }
     }
@@ -293,7 +302,12 @@ impl CircuitBreaker {
 
             let from = old_state.as_str();
             let to = new_state.as_str();
-            info!("Circuit breaker state transition: {} -> {}", from, to);
+            info!(
+                worker_url = %self.metric_label,
+                from,
+                to,
+                "Circuit breaker state transition: {from} -> {to}"
+            );
             Metrics::record_worker_cb_transition(&self.metric_label, from, to);
             self.publish_state_gauge();
             self.publish_gauge_metrics();

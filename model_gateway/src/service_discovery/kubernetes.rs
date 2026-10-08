@@ -27,6 +27,7 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
+    observability::metrics::Metrics,
     worker::{endpoint::Endpoint, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
 };
 
@@ -487,6 +488,8 @@ fn run_service_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
 ) -> task::JoinHandle<()> {
+    Metrics::initialize_discovery_series(DiscoveryKind::Kubernetes.metric_label());
+
     // Log the appropriate selectors based on mode
     if config.disaggregated_mode {
         let encode_selector = config
@@ -693,6 +696,68 @@ mod tests {
 
     use super::*;
     use crate::worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey};
+
+    #[tokio::test]
+    async fn discovery_start_registers_zero_series_without_resetting_live_metrics() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::{
+            observability::metrics::Metrics, service_discovery::testing::create_test_app_context,
+        };
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let client = Client::new(
+            tower::service_fn(|_: http::Request<kube::client::Body>| async {
+                std::future::pending::<
+                    Result<http::Response<kube::client::Body>, std::convert::Infallible>,
+                >()
+                .await
+            }),
+            "default",
+        );
+        let app_context = create_test_app_context();
+        let start = || {
+            metrics::with_local_recorder(&recorder, || {
+                run_service_discovery(
+                    client.clone(),
+                    ServiceDiscoveryConfig::default(),
+                    app_context.clone(),
+                )
+            })
+        };
+        // Abort before yielding: the test checks startup, without polling the API.
+        let task = start();
+        task.abort();
+        let _ = task.await;
+        let rendered = handle.render();
+        for sample in [
+            r#"smg_discovery_registrations_total{source="kubernetes",result="success"} 0"#,
+            r#"smg_discovery_deregistrations_total{source="kubernetes",reason="reconciled"} 0"#,
+            r#"smg_discovery_workers_discovered{source="kubernetes"} 0"#,
+            r#"smg_discovery_sync_duration_seconds_count{source="kubernetes"} 0"#,
+            r#"smg_discovery_sync_duration_seconds_sum{source="kubernetes"} 0"#,
+        ] {
+            assert!(rendered.contains(sample), "missing {sample}:\n{rendered}");
+        }
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::record_discovery_registration("kubernetes", "success");
+            Metrics::set_discovery_workers_discovered("kubernetes", 5);
+            Metrics::record_discovery_sync_duration("kubernetes", Duration::from_millis(7));
+        });
+        let task = start();
+        task.abort();
+        let _ = task.await;
+        let rendered = handle.render();
+        for sample in [
+            r#"smg_discovery_registrations_total{source="kubernetes",result="success"} 1"#,
+            r#"smg_discovery_workers_discovered{source="kubernetes"} 5"#,
+            r#"smg_discovery_sync_duration_seconds_count{source="kubernetes"} 1"#,
+            r#"smg_discovery_sync_duration_seconds_sum{source="kubernetes"} 0.007"#,
+        ] {
+            assert!(rendered.contains(sample), "wrong {sample}:\n{rendered}");
+        }
+    }
 
     fn create_k8s_pod(
         name: Option<&str>,

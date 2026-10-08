@@ -44,6 +44,7 @@ pub(crate) fn build_request(
 /// Send the HTTP request to the worker.
 pub(crate) async fn send_request(
     http_client: &reqwest::Client,
+    worker: &dyn ExternalWorker,
     url: &str,
     headers: &HeaderMap,
     request: &CreateMessageRequest,
@@ -56,6 +57,7 @@ pub(crate) async fn send_request(
         builder = builder.header(key, value);
     }
 
+    worker.record_request();
     match builder.send().await {
         Ok(response) => {
             debug!(url = %url, status = %response.status(), "Received response from worker");

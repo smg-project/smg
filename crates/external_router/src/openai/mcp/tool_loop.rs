@@ -841,7 +841,7 @@ pub(crate) async fn execute_tool_loop(
     client: &reqwest::Client,
     url: &str,
     headers: Option<&HeaderMap>,
-    worker_api_key: Option<&String>,
+    worker: &dyn crate::worker::ExternalWorker,
     initial_payload: Value,
     tool_loop_ctx: ToolLoopExecutionContext<'_>,
 ) -> Result<Value, String> {
@@ -866,12 +866,13 @@ pub(crate) async fn execute_tool_loop(
         max_tool_calls, DEFAULT_MAX_ITERATIONS
     );
     let provider = ApiProvider::from_url(url);
-    let auth_header = provider.extract_auth_header(headers, worker_api_key);
+    let auth_header = provider.extract_auth_header(headers, worker.api_key());
 
     loop {
         let request_builder = client.post(url).json(&current_payload);
         let request_builder = provider.apply_headers(request_builder, auth_header.as_ref());
 
+        worker.record_request();
         let response = request_builder
             .send()
             .await
@@ -1339,6 +1340,73 @@ mod tests {
         ToolLoopState,
     };
     use crate::openai_bridge::ResponseFormat;
+
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "mock server task is aborted by this test"
+    )]
+    async fn each_mcp_model_iteration_counts_an_upstream_attempt() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        use axum::{routing::post, Json, Router};
+
+        use crate::{
+            openai_bridge::FormatRegistry,
+            worker::{attempt_test_support::RecordingWorker, ExternalWorker},
+        };
+        let received = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&received);
+        let app = Router::new().route("/responses", post(move || {
+            let count = Arc::clone(&count);
+            async move {
+                if count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Json(json!({"id":"resp-first","output":[{"type":"function_call","id":"fc-first","call_id":"call-first","name":"unknown","arguments":"invalid JSON"}]}))
+                } else { Json(json!({"id":"resp-final","output":[]})) }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let worker = RecordingWorker::new(format!(
+            "http://{}/responses",
+            listener.local_addr().expect("address")
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        let orchestrator = McpOrchestrator::new(McpConfig::default())
+            .await
+            .expect("orchestrator");
+        let session = McpToolSession::new(&orchestrator, vec![], "attempt-test");
+        let request = openai_protocol::responses::ResponsesRequest {
+            model: "requested-alias".into(),
+            ..Default::default()
+        };
+        let formats = FormatRegistry::new();
+        let output = super::execute_tool_loop(
+            worker.http_client(),
+            &worker.url,
+            None,
+            &worker,
+            json!({"model":"requested-alias","input":[]}),
+            super::ToolLoopExecutionContext {
+                original_body: &request,
+                existing_mcp_list_tools_labels: &[],
+                session: &session,
+                format_registry: &formats,
+            },
+        )
+        .await
+        .expect("tool loop");
+        assert_eq!(output["id"], "resp-final");
+        assert_eq!(received.load(Ordering::Relaxed), 2);
+        assert_eq!(worker.count(), 2);
+        server.abort();
+    }
 
     fn test_tool(name: &str) -> Tool {
         let mut schema = serde_json::Map::new();

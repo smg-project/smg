@@ -31,14 +31,17 @@ use uuid::Uuid;
 
 use crate::{
     config::types::RetryConfig,
-    observability::metrics::Metrics,
+    observability::{
+        metrics::Metrics,
+        worker_metrics::{acquire_registered_worker, WorkerMetricsLease},
+    },
     worker::{
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
         hash_ring::HashRing,
         pd_pair_index::{PdPairIndex, PdWire},
         pd_pairing::PdPairingMode,
-        worker::{RuntimeType, WorkerType},
+        worker::{ConnectionModeExt, RuntimeType, WorkerType, WorkerTypeExt},
         ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
 };
@@ -267,6 +270,7 @@ struct HashRingTestHooks {
 pub struct WorkerRegistry {
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
+    metric_leases: DashMap<WorkerId, WorkerMetricsLease>,
 
     /// Model index for O(1) lookups using immutable snapshots.
     /// Uses Arc<[T]> instead of Arc<RwLock<Vec<T>>> for lock-free reads.
@@ -394,6 +398,7 @@ impl WorkerRegistry {
         let (connect_signal_tx, connect_signal_rx) = mpsc::unbounded_channel();
         Self {
             workers: Arc::new(DashMap::new()),
+            metric_leases: DashMap::new(),
             model_index: Arc::new(DashMap::new()),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
@@ -1715,7 +1720,10 @@ impl WorkerRegistry {
                 conn_workers.retain(|id| id != worker_id);
             }
 
-            Metrics::remove_worker_metrics(worker.url());
+            if self.metric_leases.remove(worker_id).is_none() {
+                // Standalone/local recorders retain their existing cleanup behavior.
+                Metrics::remove_worker_metrics(worker.url());
+            }
 
             // Release background work owned by this instance — notably the ZMQ
             // handshake driver, whose bound sockets would otherwise block a
@@ -1908,6 +1916,39 @@ impl WorkerRegistry {
             return None;
         }
 
+        if let Some(lease) = acquire_registered_worker(worker.url()) {
+            self.metric_leases.insert(worker_id.clone(), lease);
+            // Builders can precede registration; publish current state only
+            // after successful ownership is established, never a guessed reset.
+            Metrics::set_worker_health(worker.url(), worker.is_healthy());
+            Metrics::set_worker_http2(worker.url(), worker.http2());
+            Metrics::set_worker_requests_active(worker.url(), worker.load());
+            Metrics::set_worker_routing_keys_active(worker.url(), worker.routing_key_load());
+            Metrics::set_pd_prefill_admission_inflight(worker.url(), worker.pd_admitted());
+            Metrics::initialize_worker_series(
+                worker.url(),
+                worker.worker_type().as_metric_label(),
+                worker.connection_mode().as_metric_label(),
+            );
+            Metrics::initialize_worker_cb_series(worker.url());
+            Metrics::initialize_worker_request_series(worker.url(), worker.model_id());
+            for reason in [
+                super::worker::StallReason::Unreachable,
+                super::worker::StallReason::Wedged,
+            ] {
+                Metrics::set_worker_stalled(
+                    worker.url(),
+                    reason.as_str(),
+                    worker.stall_reason() == Some(reason),
+                );
+            }
+            if let Some(basic) = worker.as_any().downcast_ref::<super::worker::BasicWorker>() {
+                basic.publish_circuit_breaker_metrics();
+            } else {
+                Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
+            }
+        }
+
         // Record origin BEFORE the worker becomes visible in `workers`:
         // lock-free readers resolve workers by URL the moment the insert
         // lands, and a visible worker with no origin would be treated as
@@ -2062,6 +2103,7 @@ impl WorkerRegistry {
     /// Replaces any existing entry with the same URL so updates via replace()
     /// do not leave duplicate rows.
     fn add_worker_to_model_index(&self, model_id: &str, worker: Arc<dyn Worker>) {
+        Metrics::initialize_model_overload_series(model_id);
         // The replaced snapshot (and its cached projections) must not drop
         // under the shard write guard: capture it and let it fall after the
         // entry expression releases the lock.

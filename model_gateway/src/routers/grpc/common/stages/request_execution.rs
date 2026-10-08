@@ -27,6 +27,8 @@ use crate::{
         },
         error,
         grpc::{
+            backend_client::BackendClient,
+            client::GrpcClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
@@ -691,6 +693,9 @@ async fn execute_single(
 
     let prompt_tokens = u64::try_from(proto_request.prompt_len()).unwrap_or(u64::MAX);
     let streaming = proto_request.stream();
+    if let Some(worker) = workers.single() {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
     let result = client.generate(proto_request).await;
     workers.record_outcome(result.cb_status_code());
 
@@ -754,6 +759,21 @@ async fn execute_single_embed(
         )
     })?;
 
+    // Unsupported embedding backends return locally without an upstream RPC.
+    if matches!(
+        (&*client, &proto_request),
+        (
+            BackendClient::Grpc(GrpcClient::Sglang(_)),
+            ProtoEmbedRequest::Sglang(_)
+        ) | (
+            BackendClient::Grpc(GrpcClient::Vllm(_)),
+            ProtoEmbedRequest::Vllm(_)
+        )
+    ) {
+        if let Some(worker) = workers.single() {
+            Metrics::record_worker_request(worker.url(), worker.model_id());
+        }
+    }
     let result = client.embed(proto_request).await;
     workers.record_outcome(result.cb_status_code());
 
@@ -822,10 +842,20 @@ async fn execute_parallel_pd(
     // its partner fails can be moved off the request path.
     let mut prefill_client = prefill_client.clone();
     let mut decode_client = decode_client.clone();
-    let prefill_dispatch: PdLegDispatch =
-        Box::pin(async move { prefill_client.generate(prefill_request).await });
-    let decode_dispatch: PdLegDispatch =
-        Box::pin(async move { decode_client.generate(decode_request).await });
+    let prefill_worker = workers.prefill_worker().cloned();
+    let decode_worker = workers.decode_worker().cloned();
+    let prefill_dispatch: PdLegDispatch = Box::pin(async move {
+        if let Some(worker) = prefill_worker {
+            Metrics::record_worker_request(worker.url(), worker.model_id());
+        }
+        prefill_client.generate(prefill_request).await
+    });
+    let decode_dispatch: PdLegDispatch = Box::pin(async move {
+        if let Some(worker) = decode_worker {
+            Metrics::record_worker_request(worker.url(), worker.model_id());
+        }
+        decode_client.generate(decode_request).await
+    });
 
     match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
@@ -1253,6 +1283,9 @@ async fn execute_sequential_pd(
     // Send to prefill, wait for completion
     let (prefill_label, decode_label) = pd_leg_labels(workers);
     let prefill_start = Instant::now();
+    if let Some(worker) = workers.prefill_worker() {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
     let mut prefill_stream = prefill_client
         .generate(prefill_request)
         .await
@@ -1411,6 +1444,9 @@ async fn execute_sequential_pd(
     }
 
     // Send request to decode
+    if let Some(worker) = workers.decode_worker() {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
     let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
         workers.record_outcome_decode(e.http_status().as_u16());
         Metrics::record_worker_error(
@@ -1476,6 +1512,64 @@ mod tests {
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test server is aborted and joined at the end"
+    )]
+    async fn backend_dispatch_attempt_counts_rpc_not_samples_or_stream_events() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use smg_grpc_client::TokenSpeedSchedulerClient;
+
+        use crate::{
+            routers::grpc::{backend_client::BackendClient, client::GrpcClient},
+            worker::ModelCard,
+        };
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(mock_worker::grpc::serve_with_listener(
+            Arc::new(mock_worker::config::Config {
+                gen_delay: Duration::ZERO,
+                output_tokens: 2,
+                ..Default::default()
+            }),
+            listener,
+        ));
+        let client = TokenSpeedSchedulerClient::connect(&endpoint).await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(&endpoint)
+                .model(ModelCard::new("dispatch-model"))
+                .build(),
+        );
+        let workers = WorkerSelection::Single { worker };
+        let mut clients = ClientSelection::Single {
+            client: BackendClient::Grpc(GrpcClient::TokenSpeed(client)),
+        };
+        let result = execute_single(tokenspeed_request(3, None), &mut clients, &workers).await;
+        assert!(result.is_ok());
+        drop(result);
+        let result = execute_single(tokenspeed_request(1, None), &mut clients, &workers).await;
+        assert!(result.is_ok());
+        drop(result);
+        server.abort();
+        let _ = server.await;
+        assert!(
+            handle
+                .render()
+                .lines()
+                .any(|line| line.starts_with("smg_worker_requests_total{")
+                    && line.contains(&format!("worker=\"{endpoint}\""))
+                    && line.contains("model=\"dispatch-model\"")
+                    && line.ends_with(" 2")),
+            "two RPCs must count twice irrespective of n/response chunks: {}",
+            handle.render()
+        );
+    }
 
     fn tokenspeed_request(n: u32, seed: Option<u64>) -> ProtoGenerateRequest {
         ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {

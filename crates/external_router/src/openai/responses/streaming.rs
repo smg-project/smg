@@ -540,6 +540,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     request_builder = request_builder.header("Accept", "text/event-stream");
 
+    worker.record_request();
     let response = match request_builder.send().await {
         Ok(resp) => resp,
         Err(err) => {
@@ -684,7 +685,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 /// Handle streaming WITH MCP tool call interception and execution
 pub(super) fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
-    worker_api_key: Option<String>,
+    worker: Arc<dyn crate::worker::ExternalWorker>,
     headers: Option<&HeaderMap>,
     req: StreamingRequest,
     orchestrator: &Arc<McpOrchestrator>,
@@ -749,8 +750,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             mcp_format_registry: Some(&format_registry),
         };
         let provider = ApiProvider::from_url(&url_clone);
-        let auth_header =
-            provider.extract_auth_header(headers_opt.as_ref(), worker_api_key.as_ref());
+        let auth_header = provider.extract_auth_header(headers_opt.as_ref(), worker.api_key());
 
         loop {
             // Make streaming request
@@ -758,6 +758,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             request_builder = provider.apply_headers(request_builder, auth_header.as_ref());
             request_builder = request_builder.header("Accept", "text/event-stream");
 
+            worker.record_request();
             let response = match request_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1158,7 +1159,7 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
 
     handle_streaming_with_tool_interception(
         &client,
-        worker.api_key().cloned(),
+        worker,
         headers.as_ref(),
         req,
         &mcp_orchestrator,

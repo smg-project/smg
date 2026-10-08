@@ -66,7 +66,7 @@ use crate::{
         },
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        http::router::send_with_stale_conn_retry,
+        http::router::{send_with_stale_conn_retry, send_worker_request},
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
         PD_PREFILL_QUEUE_TIMEOUT,
     },
@@ -1074,7 +1074,7 @@ impl PDRouter {
         let runtime = prefill.metadata().spec.runtime_type.as_str();
         let dispatch_start = Instant::now();
         let prefill_fut = async {
-            let resp = send_with_stale_conn_retry(prefill_request)
+            let resp = send_worker_request(prefill.as_ref(), prefill_request)
                 .await
                 .map_err(DispatchError::Transport)?;
             if context.is_stream && !context.return_logprob && resp.status().is_success() {
@@ -1133,7 +1133,7 @@ impl PDRouter {
             Ok(PrefillResult::Buffered(body))
         };
         let decode_fut = async {
-            let resp = send_with_stale_conn_retry(decode_request)
+            let resp = send_worker_request(decode.as_ref(), decode_request)
                 .await
                 .map_err(DispatchError::Transport)?;
             if !resp.status().is_success() {
@@ -1403,21 +1403,22 @@ impl PDRouter {
                 ),
                 dp_rank,
             );
-            let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
-                Ok(response) => response,
-                Err(e) => {
-                    error!("PD prefill transport error: {e}");
-                    Self::record_sequential_leg(
-                        prefill.as_ref(),
-                        metrics_labels::WORKER_PREFILL,
-                        StatusCode::BAD_GATEWAY,
-                    );
-                    return error::bad_gateway(
-                        "prefill_request_failed",
-                        format!("Prefill transport error: {e}"),
-                    );
-                }
-            };
+            let prefill_response =
+                match send_worker_request(prefill.as_ref(), prefill_request).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        error!("PD prefill transport error: {e}");
+                        Self::record_sequential_leg(
+                            prefill.as_ref(),
+                            metrics_labels::WORKER_PREFILL,
+                            StatusCode::BAD_GATEWAY,
+                        );
+                        return error::bad_gateway(
+                            "prefill_request_failed",
+                            format!("Prefill transport error: {e}"),
+                        );
+                    }
+                };
             let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if !prefill_status.is_success() {
@@ -1549,7 +1550,7 @@ impl PDRouter {
             ),
             dp_rank,
         );
-        let decode_response = match send_with_stale_conn_retry(decode_request).await {
+        let decode_response = match send_worker_request(decode.as_ref(), decode_request).await {
             Ok(response) => response,
             Err(e) => {
                 error!("PD decode transport error: {e}");
@@ -1663,7 +1664,7 @@ impl PDRouter {
             dp_rank,
         );
         let prefill_leg = async {
-            let response = match send_with_stale_conn_retry(prefill_request).await {
+            let response = match send_worker_request(prefill.as_ref(), prefill_request).await {
                 Ok(response) => response,
                 Err(e) => {
                     error!("PD prefill transport error: {e}");
@@ -1716,7 +1717,8 @@ impl PDRouter {
                 }
             }
         };
-        let decode_leg = send_with_stale_conn_retry(decode_request);
+        let decode_dispatch_worker = Arc::clone(&decode);
+        let decode_leg = send_worker_request(decode_dispatch_worker.as_ref(), decode_request);
         tokio::pin!(decode_leg);
 
         let mut decode_head = None;
@@ -2737,7 +2739,7 @@ impl RouterTrait for PDRouter {
             headers,
             worker.api_key(),
         );
-        let res = match send_with_stale_conn_retry(request).await {
+        let res = match send_worker_request(worker.as_ref(), request).await {
             Ok(res) => res,
             Err(e) => {
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
