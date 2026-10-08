@@ -19,13 +19,16 @@
 //! nothing an engine sees.
 //!
 //! With the prompt's reasoning still open, the tag is wrapped in a prefix: free text that can
-//! write none of the table's markers, closed by the thought's close, so the forced call follows
-//! the reasoning instead of replacing it, as the gateway's `wrap_in_reasoning_prefix` does.
+//! write none of the table's markers nor the call syntax's inner tags, closed by the thought's
+//! close, so the forced call follows the reasoning instead of replacing it, as the gateway's
+//! `wrap_in_reasoning_prefix` does. A table without a thought has nothing to wrap, and the tag
+//! comes back as it is.
 //!
 //! Not derived yet, so [`Format::grammar`] gives `None` for them: the tagged syntax (Qwen 3.5 and
-//! later, Seed-OSS), keyed arguments in another spelling than GLM's (Hy4), MiniMax M3's XML tree,
-//! Kimi K3's XTML, the pythonic tables, xLAM's list, and a table without calls. The gateway then
-//! takes the JSON-schema path, as it does for those models today.
+//! later, Seed-OSS), keyed arguments in another spelling than the compact one (Ling's newlines,
+//! Hy4's suffixed tags), MiniMax M3's XML tree, Kimi K3's XTML, the pythonic tables, xLAM's list,
+//! and a table without calls. The gateway then takes the JSON-schema path, as it does for those
+//! models today.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -171,7 +174,8 @@ impl Format {
     /// table's call syntax has no derivation yet, the table has no calls, or no tool has a name.
     /// `at_least_one` asks for at least one call (`tool_choice` `required`, a named function, or
     /// an allowed-tools list in `required` mode). With `reasoning_open`, the prompt left the model
-    /// inside its thought, and the tag follows a reasoning prefix the thought's close ends.
+    /// inside its thought, and the tag follows a reasoning prefix the thought's close ends; a
+    /// table without a thought has no prefix, and the tag comes back as it is.
     pub fn grammar(
         &self,
         tools: &[Tool],
@@ -202,21 +206,21 @@ impl Format {
         if !reasoning_open {
             return Some(calls);
         }
-        let think_close =
-            self.marker(|from| from == Emits::Reasoning, |to| to != Emits::Reasoning)?;
+        let Some(think_close) = self.marker(Emits::Reasoning, Emits::Content) else {
+            return Some(calls);
+        };
         let mut excludes: Vec<String> = self.terminal_texts().map(str::to_string).collect();
-        if let Some(CallSyntax::Keyed(tags)) = self.call_syntax() {
-            excludes.extend(
-                [
-                    tags.key_open,
-                    tags.key_close,
-                    tags.value_open,
-                    tags.value_close,
-                ]
-                .into_iter()
-                .map(str::to_string),
-            );
-        }
+        let inner: &[&str] = match self.call_syntax() {
+            Some(CallSyntax::Keyed(tags)) => &[
+                tags.key_open,
+                tags.key_close,
+                tags.value_open,
+                tags.value_close,
+            ],
+            Some(CallSyntax::Dsml) => &[dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
+            _ => &[],
+        };
+        excludes.extend(inner.iter().map(|tag| tag.to_string()));
         let prefix = Grammar::Tag(Tag::new("", Grammar::AnyText { excludes }, think_close));
         Some(Grammar::Sequence(vec![prefix, calls]))
     }
@@ -245,9 +249,11 @@ impl Format {
         }
     }
 
-    /// Keyed arguments in GLM's spelling: each call is the call opener and the tool's name, the
-    /// schema written in the engines' `glm_xml` style (`<arg_key>` and `<arg_value>` pairs), and
-    /// the call's close; the shape xgrammar's built-in GLM tag has and the gateway writes today.
+    /// Keyed arguments in the compact spelling (GLM 4.7 and later, IQuest): each call is the call
+    /// opener and the tool's name, the schema written in the engines' `glm_xml` style (`<arg_key>`
+    /// and `<arg_value>` pairs with nothing between them), and the call's close; the shape
+    /// xgrammar's built-in GLM tag has and the gateway writes today. Ling's spelling, with the
+    /// template's newlines, is not this one, so it has no derivation yet.
     fn keyed_calls(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bool) -> Grammar {
         let tags = tools
             .iter()
@@ -328,17 +334,19 @@ impl Format {
         ]))
     }
 
-    /// The call markers the rows give: the terminal that enters the arguments state from outside
-    /// it and the one that leaves it, and the terminals around a wrapper state when there is one.
+    /// The call markers the rows give: the terminal from the wrapper state, or without one from
+    /// the content state, into the arguments state, and the one back; and, when the calls sit in
+    /// a block, the terminals from the content state into the wrapper state and back.
     fn call_markers(&self) -> Option<CallMarkers<'_>> {
-        let in_call = |emits: Emits| matches!(emits, Emits::Arguments | Emits::Wrapper);
-        let call_open =
-            self.marker(|from| from != Emits::Arguments, |to| to == Emits::Arguments)?;
-        let call_close =
-            self.marker(|from| from == Emits::Arguments, |to| to != Emits::Arguments)?;
+        let call_open = self
+            .marker(Emits::Wrapper, Emits::Arguments)
+            .or_else(|| self.marker(Emits::Content, Emits::Arguments))?;
+        let call_close = self
+            .marker(Emits::Arguments, Emits::Wrapper)
+            .or_else(|| self.marker(Emits::Arguments, Emits::Content))?;
         let block = self
-            .marker(|from| !in_call(from), |to| to == Emits::Wrapper)
-            .zip(self.marker(|from| from == Emits::Wrapper, |to| !in_call(to)));
+            .marker(Emits::Content, Emits::Wrapper)
+            .zip(self.marker(Emits::Wrapper, Emits::Content));
         Some(CallMarkers {
             block,
             call_open,
@@ -346,11 +354,11 @@ impl Format {
         })
     }
 
-    /// The text of the first terminal that moves the engine from a state whose emission `from`
-    /// accepts to one whose emission `to` accepts.
-    fn marker(&self, from: impl Fn(Emits) -> bool, to: impl Fn(Emits) -> bool) -> Option<&str> {
+    /// The text of the terminal that moves the engine from a state emitting `from` to one
+    /// emitting `to`: the two states name the marker, not the order of the rows.
+    fn marker(&self, from: Emits, to: Emits) -> Option<&str> {
         self.transitions()
-            .find(|&(source, _, target)| from(self.emits(source)) && to(self.emits(target)))
+            .find(|&(source, _, target)| self.emits(source) == from && self.emits(target) == to)
             .map(|(_, on, _)| self.terminal_text(on))
     }
 }
@@ -446,10 +454,121 @@ mod tests {
             })
         );
         assert_eq!(elements[1]["type"], "triggered_tags");
-        // Ling has the same rows under its own opener, so the same tag comes of it.
+    }
+
+    #[test]
+    fn iquest_takes_the_compact_tag_under_its_own_markers_and_ling_none() {
+        let tools = weather_tools();
+        let payload = formats::iquest()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
         assert_eq!(
-            formats::ling().grammar(&weather_tools(), true, true),
-            formats::glm().grammar(&weather_tools(), true, true)
+            payload["format"]["triggers"],
+            value!(["<iquest_tool_call>"])
+        );
+        assert_eq!(
+            payload["format"]["tags"][0]["begin"],
+            "<iquest_tool_call>get_weather"
+        );
+        assert_eq!(payload["format"]["tags"][0]["content"]["style"], "glm_xml");
+        assert_eq!(payload["format"]["tags"][0]["end"], "</iquest_tool_call>");
+        // Ling writes the template's newlines between the tags, which the compact style does not,
+        // so its table says so and gets no tag until that spelling has a derivation.
+        assert_eq!(keyed::Tags::LING.between, "\n");
+        assert!(formats::ling().grammar(&tools, true, false).is_none());
+        assert!(formats::ling().grammar(&tools, true, true).is_none());
+    }
+
+    #[test]
+    fn the_prefix_excludes_each_tables_own_terminals_and_inner_tags() {
+        // No old builder wraps these two, so the derived shape is pinned here: the prefix's
+        // excludes are the table's terminals in order and the syntax's inner tags, its end the
+        // thought's close back to content, and the second element the tag as derived without it.
+        let tools = weather_tools();
+        for (format, excludes) in [
+            (
+                formats::deepseek_v4_1(),
+                value!([
+                    "<think>",
+                    "</think>",
+                    "<｜DSML｜ calls>",
+                    "</｜DSML｜ calls>",
+                    "<｜DSML｜ invoke name=\"",
+                    "</｜DSML｜ invoke>",
+                    "<｜DSML｜ parameter name=\"",
+                    "</｜DSML｜ parameter>",
+                ]),
+            ),
+            (
+                formats::qwen3(CallSyntax::Json),
+                value!(["<think>", "</think>", "<tool_call>", "</tool_call>"]),
+            ),
+        ] {
+            let wrapped = format
+                .grammar(&tools, true, true)
+                .expect("a grammar")
+                .to_json();
+            let bare = format
+                .grammar(&tools, true, false)
+                .expect("a grammar")
+                .to_json();
+            assert_eq!(wrapped["type"], "sequence", "{}", format.name());
+            assert_eq!(
+                wrapped["elements"][0],
+                value!({
+                    "type": "tag",
+                    "begin": "",
+                    "content": {"type": "any_text", "excludes": excludes},
+                    "end": "</think>",
+                }),
+                "{}",
+                format.name()
+            );
+            assert_eq!(wrapped["elements"][1], bare, "{}", format.name());
+        }
+    }
+
+    #[test]
+    fn a_table_without_a_thought_has_no_prefix_to_wrap() {
+        // Qwen 2.5 has no reasoning state: a prompt cannot leave the model inside a thought, and
+        // the tag comes back as it is, as the old registry's does when a parser has no prefix.
+        let tools = weather_tools();
+        let bare = formats::qwen2_5().grammar(&tools, true, false);
+        assert!(bare.is_some());
+        assert_eq!(formats::qwen2_5().grammar(&tools, true, true), bare);
+    }
+
+    #[test]
+    fn the_markers_come_from_the_states_not_from_the_order_of_the_rows() {
+        // DeepSeek V4.1's rows with the reasoning state's two exits swapped and the invoke's two
+        // exits swapped: the thought still closes back to content, and the call still closes back
+        // to the block.
+        let swapped = Format::new("swapped")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("calls_open", "<｜DSML｜ calls>")
+            .terminal("calls_close", "</｜DSML｜ calls>")
+            .terminal("invoke_open", "<｜DSML｜ invoke name=\"")
+            .terminal("invoke_close", dsml::INVOKE_CLOSE)
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Wrapper)
+            .state("invoke", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "calls_open", "calls")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "calls_open", "calls")
+            .transition("calls", "invoke_open", "invoke")
+            .transition("invoke", "calls_close", "content")
+            .transition("invoke", "invoke_close", "calls")
+            .transition("invoke", "invoke_open", "invoke")
+            .transition("calls", "calls_close", "content")
+            .calls(CallSyntax::Dsml);
+        let tools = weather_tools();
+        assert_eq!(
+            swapped.grammar(&tools, true, true),
+            formats::deepseek_v4_1().grammar(&tools, true, true)
         );
     }
 
@@ -551,6 +670,7 @@ mod tests {
         for format in [
             formats::qwen3(CallSyntax::Tagged),
             formats::seed_oss(),
+            formats::ling(),
             formats::hy4(),
             formats::minimax_m3(),
             formats::kimi_k3(),
