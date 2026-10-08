@@ -427,9 +427,10 @@ mod tests {
         // Every link is a different pointer, so the memo of pointers followed does not shorten a
         // chain, and the walk keeps the schemas still to look at in a list of its own: a request's
         // chain costs its length and no stack, however many links it has and however deep each
-        // link nests before its pointer. The property carries a type of its own, so its pin shows
-        // the chain was followed to its end.
-        let chain = |links: usize, nesting: usize| {
+        // link nests before its pointer. The property carries a type of its own: a whole chain
+        // pins it, and a chain whose last link points at nothing does not, so the pin shows the
+        // walk reached the end rather than stopping partway.
+        let chain = |links: usize, nesting: usize, whole: bool| {
             let mut defs = serde_json::Map::new();
             for i in 0..links {
                 let mut link = value!({"$ref": format!("#/$defs/D{}", i + 1)});
@@ -438,7 +439,9 @@ mod tests {
                 }
                 defs.insert(format!("D{i}"), link);
             }
-            defs.insert(format!("D{links}"), value!({"type": "integer"}));
+            if whole {
+                defs.insert(format!("D{links}"), value!({"type": "integer"}));
+            }
             tool(
                 "t",
                 value!({
@@ -449,14 +452,15 @@ mod tests {
                 }),
             )
         };
-        let opener = |links: usize, nesting: usize| {
-            first_call(&[chain(links, nesting)])["elements"][3]["elements"][0]["elements"][0]
+        let opener = |links: usize, nesting: usize, whole: bool| {
+            first_call(&[chain(links, nesting, whole)])["elements"][3]["elements"][0]["elements"][0]
                 ["value"]
                 .clone()
         };
-        assert_eq!(opener(10, 0), argument_open("p", "object"));
+        let typeless = "<|open|>argument key=\"p\" type=\"";
+        assert_eq!(opener(10, 0, true), argument_open("p", "object"));
         assert_eq!(
-            opener(5_000, 0),
+            opener(5_000, 0, true),
             argument_open("p", "object"),
             "five thousand links"
         );
@@ -464,9 +468,21 @@ mod tests {
         // pointer, two objects a wrap: a walk with a frame per object would need some fifteen
         // thousand of them.
         assert_eq!(
-            opener(64, 120),
+            opener(64, 120, true),
             argument_open("p", "object"),
             "sixty-four links nested deep"
+        );
+        // The same chains with their last definition missing: only a walk that reaches the end
+        // finds the pointer at nothing.
+        assert_eq!(
+            opener(5_000, 0, false),
+            typeless,
+            "five thousand links to nothing"
+        );
+        assert_eq!(
+            opener(64, 120, false),
+            typeless,
+            "sixty-four deep links to nothing"
         );
     }
 
