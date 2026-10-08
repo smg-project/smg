@@ -17,8 +17,10 @@
 //! the reasoning state back to where the thought opened; the request's tools give each call its
 //! name and schema. What the syntax inside the markers constrains comes from the call syntax: a
 //! JSON object around each tool's schema for the JSON family; the engines' `glm_xml` style of a
-//! schema for keyed arguments in the compact spelling; a tag grammar per parameter for DSML; for
-//! Kimi K3's XTML, one argument tag per property of the schema (the `xtml` module). The gateway's
+//! schema for keyed arguments in the compact spelling, and the table's own tags written one pair
+//! per property for Ling's newlines and Hy4's suffixed tags (the `keyed` module); a tag grammar
+//! per parameter for DSML; for Kimi K3's XTML, one argument tag per property of the schema (the
+//! `xtml` module). The gateway's
 //! old parsers wrote these tags by hand, one function per parser; where one exists for a format
 //! Symphony has, the derived tag is pinned to it in the tests, so the switch changes nothing an
 //! engine sees.
@@ -36,18 +38,18 @@
 //! its way to the calls, whichever that was.
 //!
 //! Not derived yet, so [`Format::grammar`] gives `None` for them: the tagged syntax (Qwen 3.5 and
-//! later, Seed-OSS), keyed arguments in another spelling than the compact one (Ling's newlines,
-//! Hy4's suffixed tags), MiniMax M3's XML tree, the pythonic tables, xLAM's list, and a table
-//! without calls. The gateway then takes the JSON-schema path, as it does for those models today.
+//! later, Seed-OSS), MiniMax M3's XML tree, the pythonic tables, xLAM's list, and a table without
+//! calls. The gateway then takes the JSON-schema path, as it does for those models today.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    tagged::{dsml, keyed},
+    tagged::{self, dsml},
 };
 
+mod keyed;
 mod schema;
 mod xtml;
 
@@ -211,6 +213,26 @@ impl WayIn<'_> {
     }
 }
 
+/// A block of calls as the engine takes it: one tag per way in, each `content` between the way's
+/// text and the block's close, triggered by each way's first text, the same trigger once.
+fn block_of(ways_in: &[WayIn<'_>], content: Grammar, close: &str, at_least_one: bool) -> Grammar {
+    let tags = ways_in
+        .iter()
+        .map(|way| Tag::new(way.begin(), content.clone(), close))
+        .collect();
+    let mut triggers: Vec<String> = Vec::new();
+    for trigger in ways_in.iter().map(WayIn::trigger) {
+        if !triggers.iter().any(|known| known == trigger) {
+            triggers.push(trigger.to_string());
+        }
+    }
+    Grammar::TriggeredTags {
+        triggers,
+        tags,
+        at_least_one,
+    }
+}
+
 /// A region's two markers, the terminal of the row into its state and of the row back out, and
 /// the state the row back out returns to.
 struct Region<'a> {
@@ -245,19 +267,21 @@ impl Format {
         let markers = self.call_markers()?;
         let calls = match self.call_syntax()? {
             CallSyntax::Json => Self::json_calls(&markers, &named, at_least_one),
-            CallSyntax::Keyed(tags) if *tags == keyed::Tags::PLAIN => {
+            CallSyntax::Keyed(tags) if *tags == tagged::keyed::Tags::PLAIN => {
                 Self::keyed_calls(&markers, &named, at_least_one)
             }
             CallSyntax::Dsml => Self::dsml_calls(&markers, &named, at_least_one)?,
+            CallSyntax::Keyed(tags) => {
+                let ways_in = self.ways_into_block(&markers);
+                keyed::calls(&markers, &ways_in, tags, &named, at_least_one)
+            }
             CallSyntax::Xtml => {
                 let ways_in = self.ways_into(markers.block.as_ref()?.state);
                 return xtml::calls(&markers, &ways_in, &named, at_least_one);
             }
-            CallSyntax::Keyed(_)
-            | CallSyntax::Tagged
-            | CallSyntax::Pythonic
-            | CallSyntax::JsonList
-            | CallSyntax::Xml => return None,
+            CallSyntax::Tagged | CallSyntax::Pythonic | CallSyntax::JsonList | CallSyntax::Xml => {
+                return None
+            }
         };
         if !reasoning_open {
             return Some(calls);
@@ -311,8 +335,8 @@ impl Format {
     /// Keyed arguments in the compact spelling (GLM 4.7 and later, IQuest): each call is the call
     /// opener and the tool's name, the schema written in the engines' `glm_xml` style (`<arg_key>`
     /// and `<arg_value>` pairs with nothing between them), and the call's close; the shape
-    /// xgrammar's built-in GLM tag has and the gateway writes today. Ling's spelling, with the
-    /// template's newlines, is not this one, so it has no derivation yet.
+    /// xgrammar's built-in GLM tag has and the gateway writes today. Ling's and Hy4's spellings
+    /// are not this one, and are written from their own tags instead (the `keyed` module).
     fn keyed_calls(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bool) -> Grammar {
         let tags = tools
             .iter()
@@ -418,6 +442,15 @@ impl Format {
             call_open: call.open,
             call_close: call.close,
         })
+    }
+
+    /// The ways into the block the calls sit in, or none when they sit in no block.
+    fn ways_into_block(&self, markers: &CallMarkers<'_>) -> Vec<WayIn<'_>> {
+        markers
+            .block
+            .as_ref()
+            .map(|block| self.ways_into(block.state))
+            .unwrap_or_default()
     }
 
     /// The first state emitting `emits`.
@@ -612,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn iquest_takes_the_compact_tag_under_its_own_markers_and_ling_none() {
+    fn iquest_takes_the_compact_tag_under_its_own_markers() {
         let tools = weather_tools();
         let payload = formats::iquest()
             .grammar(&tools, true, false)
@@ -629,10 +662,8 @@ mod tests {
         assert_eq!(payload["format"]["tags"][0]["content"]["style"], "glm_xml");
         assert_eq!(payload["format"]["tags"][0]["end"], "</iquest_tool_call>");
         // Ling writes the template's newlines between the tags, which the compact style does not,
-        // so its table says so and gets no tag until that spelling has a derivation.
-        assert_eq!(keyed::Tags::LING.between, "\n");
-        assert!(formats::ling().grammar(&tools, true, false).is_none());
-        assert!(formats::ling().grammar(&tools, true, true).is_none());
+        // so its table says so and its tag is written from its own tags (the `keyed` module).
+        assert_eq!(tagged::keyed::Tags::LING.between, "\n");
     }
 
     #[test]
@@ -1027,8 +1058,6 @@ mod tests {
         for format in [
             formats::qwen3(CallSyntax::Tagged),
             formats::seed_oss(),
-            formats::ling(),
-            formats::hy4(),
             formats::minimax_m3(),
             formats::olmo3(),
             formats::lfm2_5(),

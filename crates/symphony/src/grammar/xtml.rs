@@ -25,8 +25,9 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
+    block_of,
     schema::{shape, Definitions},
-    CallMarkers, Grammar, Tag, WayIn,
+    CallMarkers, Grammar, WayIn,
 };
 
 const OPEN: &str = "<|open|>";
@@ -51,21 +52,7 @@ pub(super) fn calls(
             .collect(),
     );
     let content = Grammar::Plus(Box::new(one_call));
-    let tags = ways_in
-        .iter()
-        .map(|way| Tag::new(way.begin(), content.clone(), block.close))
-        .collect();
-    let mut triggers: Vec<String> = Vec::new();
-    for trigger in ways_in.iter().map(WayIn::trigger) {
-        if !triggers.iter().any(|known| known == trigger) {
-            triggers.push(trigger.to_string());
-        }
-    }
-    Some(Grammar::TriggeredTags {
-        triggers,
-        tags,
-        at_least_one,
-    })
+    Some(block_of(ways_in, content, block.close, at_least_one))
 }
 
 /// One call: the call's opener and the tool's name, its index, the arguments and the call's close.
