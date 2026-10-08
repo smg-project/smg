@@ -187,7 +187,21 @@ impl Encoder for CachedTokenizer {
                 .collect();
 
             let encoding = match l1.lookup_with_seeds(input, &tokens, add_special_tokens) {
-                PrefixLookup::Hit(prefix_tokens, prefix_len) if prefix_len < input.len() => {
+                PrefixLookup::Hit(prefix_tokens, prefix_len, Some((deepest, digest))) => {
+                    // Also cache this input's deepest boundary: a later input that extends
+                    // it (the next turn of the same conversation) then matches there, not at
+                    // the shorter prefix this one shares with other conversations.
+                    let middle = self.inner.encode(&input[prefix_len..deepest], false)?;
+                    let mut merged_tokens =
+                        Vec::with_capacity(prefix_tokens.len() + middle.token_ids().len());
+                    merged_tokens.extend_from_slice(&prefix_tokens);
+                    merged_tokens.extend_from_slice(middle.token_ids());
+                    l1.insert_prefix(digest, deepest, &merged_tokens);
+                    let tail = self.inner.encode(&input[deepest..], false)?;
+                    merged_tokens.extend_from_slice(tail.token_ids());
+                    Encoding::Plain(merged_tokens)
+                }
+                PrefixLookup::Hit(prefix_tokens, prefix_len, None) if prefix_len < input.len() => {
                     let suffix = &input[prefix_len..];
                     // The cached prefix already carries any leading special tokens,
                     // so the suffix must never re-add them (it is never segment 0).
@@ -205,7 +219,7 @@ impl Encoder for CachedTokenizer {
                 // Defensive: boundaries always exclude input.len(), so a full-input
                 // match cannot occur; if it ever did, the entry is keyed on the whole
                 // input and the cached tokens ARE the full encoding.
-                PrefixLookup::Hit(prefix_tokens, _) => Encoding::Plain(prefix_tokens.to_vec()),
+                PrefixLookup::Hit(prefix_tokens, _, _) => Encoding::Plain(prefix_tokens.to_vec()),
                 // No special token boundaries — nothing cacheable; single plain encode
                 // (preserves the inner tokenizer's native encoding variant).
                 PrefixLookup::Miss(seeds) if seeds.is_empty() => {
@@ -531,6 +545,39 @@ mod tests {
         let fresh = BosTokenizer::new().encode(input, true).unwrap();
         assert_eq!(first.token_ids(), fresh.token_ids());
         assert_eq!(second.token_ids(), fresh.token_ids());
+    }
+
+    #[test]
+    fn test_l1_hit_caches_the_deepest_boundary_for_the_next_turn() {
+        // Two conversations share a system prompt. The second one's first turn hits the
+        // first conversation's system-prompt boundary; its next turn must then match its
+        // own previous turn, tokenizing only the bytes past that turn's deepest boundary.
+        let counting = Arc::new(CountingTokenizer::new());
+        let cached = CachedTokenizer::new(counting.clone(), l1_only_config());
+        let system = "<|im_start|>system\nYou are helpful.<|im_end|>";
+        let first = format!(
+            "{system}<|im_start|>user\nfirst conversation<|im_end|><|im_start|>assistant\n"
+        );
+        cached.encode(&first, true).unwrap();
+
+        let turn_one = format!(
+            "{system}<|im_start|>user\nsecond conversation<|im_end|><|im_start|>assistant\n"
+        );
+        cached.encode(&turn_one, true).unwrap();
+        let deepest = turn_one.rfind("<|im_start|>").unwrap() + "<|im_start|>".len();
+
+        let turn_two = format!(
+            "{turn_one}answer<|im_end|><|im_start|>user\nmore<|im_end|><|im_start|>assistant\n"
+        );
+        counting.reset();
+        let encoded = cached.encode(&turn_two, true).unwrap();
+        assert_eq!(
+            counting.bytes_encoded(),
+            turn_two.len() - deepest,
+            "the next turn must match its own previous turn, not the shared prefix"
+        );
+        let fresh = BosTokenizer::new().encode(&turn_two, true).unwrap();
+        assert_eq!(encoded.token_ids(), fresh.token_ids());
     }
 
     #[test]
