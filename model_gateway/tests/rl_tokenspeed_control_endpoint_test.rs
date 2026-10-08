@@ -547,7 +547,7 @@ async fn grpc_generate_reports_the_engine_stamped_version() {
 /// must match.
 #[tokio::test]
 async fn single_prompt_generate_answers_with_an_object_like_sglang() {
-    let f = fleet(18931, 18932).await;
+    let f = fleet().await;
     let resp = f
         .router
         .route_generate(None, &tenant(), generate_request(false), MODEL)
