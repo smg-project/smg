@@ -458,13 +458,14 @@ def test_slim_output_appends_prompt_logprobs_and_reasoning_tokens():
     full.input_top_logprobs_idx = [None, [None, [2], [3]]]
     slim = wire.BatchTokenIDSlimOutput.from_full(full)
     encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
-    assert len(encoded) == 24
+    assert len(encoded) == 26
+    assert encoded[24:] == [[[], []], [[], []]]
     assert encoded[19] == [0, 4]
     assert encoded[20] == [[], [None, -0.7, -1.1]] and encoded[21] == [[], [1, 2, 3]]
     assert encoded[22] == [[], [[], [-0.7], [-1.1]]] and encoded[23] == [[], [[], [2], [3]]]
-    # Pins for the Rust decoder (`protocol/sglang/output.rs`): the 24-element
-    # batch, an embedding batch and a control reply.
-    print("PIN_SLIM24", msgspec.msgpack.encode(slim).hex())
+    # Pins for the Rust decoder (`protocol/sglang/output.rs`): the legacy
+    # 24-element prefix, an embedding batch and a control reply.
+    print("PIN_SLIM24", msgspec.msgpack.encode(encoded[:24]).hex())
     print(
         "PIN_EMBED",
         msgspec.msgpack.encode(
