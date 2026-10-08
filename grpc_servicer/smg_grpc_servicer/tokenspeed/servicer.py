@@ -1800,13 +1800,14 @@ def _make_json_serializable(obj: Any, _path: frozenset[int] = frozenset()) -> An
     a ``str`` rendering that could carry a credential past it. Enums, paths,
     dtypes and the like still render with ``str``. ``_path`` holds the ids of
     the containers on the current descent: a back-reference (a sub-config
-    pointing at its parent) renders with ``str`` instead of recursing forever,
+    pointing at its parent) becomes a ``<cycle: Type>`` placeholder instead of
+    recursing forever (never ``str(obj)``, whose repr could carry a credential),
     while the same object reached twice by different paths is expanded twice.
     """
     if obj is None or isinstance(obj, str | int | float | bool):
         return obj
     if id(obj) in _path:
-        return str(obj)
+        return f"<cycle: {type(obj).__name__}>"
     path = _path | {id(obj)}
     if isinstance(obj, list | tuple | set):
         return [_make_json_serializable(x, path) for x in obj]
