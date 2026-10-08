@@ -5,6 +5,8 @@
 //! over a tool's properties the syntaxes share: one argument per property, in the schema's order,
 //! optional unless the schema requires it.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
 use super::Grammar;
@@ -130,12 +132,6 @@ impl<'a> Blocks<'a> {
     }
 }
 
-/// How deep a chain of pointers the check follows before it gives up on a schema: a tool whose
-/// definitions chain deeper pins nothing, and the walk's depth stays bounded whatever a request
-/// sends. Breadth is not counted: a schema may point at any number of definitions, each walked
-/// once.
-pub(super) const POINTER_DEPTH_AT_MOST: usize = 64;
-
 impl<'a> Definitions<'a> {
     pub(super) fn of(root: &'a Value) -> Self {
         Self {
@@ -184,40 +180,37 @@ impl<'a> Definitions<'a> {
 
     /// Whether every local pointer in `schema` names something, and every pointer in what it
     /// names, as far as the pointers reach: the definitions travel with the property, so a pointer
-    /// at nothing inside one of them reaches the engine too. Each distinct pointer is walked once
-    /// (`followed` remembers them, so a definition that names itself, or a wide schema, costs one
-    /// walk per definition), and a chain is followed no deeper than [`POINTER_DEPTH_AT_MOST`].
-    fn pointers_resolve(self, schema: &Value) -> bool {
-        self.pointers_resolve_from(schema, &mut Vec::new(), 0)
-    }
-
-    fn pointers_resolve_from(
-        self,
-        schema: &Value,
-        followed: &mut Vec<String>,
-        depth: usize,
-    ) -> bool {
-        match schema {
-            Value::Object(map) => map.iter().all(|(key, value)| {
-                let local = value
-                    .as_str()
-                    .filter(|pointer| is_reference(key) && pointer.starts_with('#'));
-                let named_resolves = local.is_none_or(|pointer| match self.resolve(pointer) {
-                    None => false,
-                    Some(_) if followed.iter().any(|seen| seen == pointer) => true,
-                    Some(_) if depth >= POINTER_DEPTH_AT_MOST => false,
-                    Some(target) => {
-                        followed.push(pointer.to_string());
-                        self.pointers_resolve_from(target, followed, depth + 1)
+    /// at nothing inside one of them reaches the engine too. Each distinct pointer is followed
+    /// once (`followed` remembers them, so a definition that names itself, or a wide schema, costs
+    /// one look per definition), and the schemas still to look at wait in a list of the walk's
+    /// own, not on the call stack: a chain of definitions costs its length and no stack, however
+    /// long a request makes it and however deep each definition nests before its pointer.
+    fn pointers_resolve(self, schema: &'a Value) -> bool {
+        let mut followed = HashSet::new();
+        let mut pending = vec![schema];
+        while let Some(schema) = pending.pop() {
+            match schema {
+                Value::Object(map) => {
+                    for (key, value) in map {
+                        let local = value
+                            .as_str()
+                            .filter(|pointer| is_reference(key) && pointer.starts_with('#'));
+                        if let Some(pointer) = local {
+                            let Some(target) = self.resolve(pointer) else {
+                                return false;
+                            };
+                            if followed.insert(pointer) {
+                                pending.push(target);
+                            }
+                        }
+                        pending.push(value);
                     }
-                });
-                named_resolves && self.pointers_resolve_from(value, followed, depth)
-            }),
-            Value::Array(items) => items
-                .iter()
-                .all(|item| self.pointers_resolve_from(item, followed, depth)),
-            _ => true,
+                }
+                Value::Array(items) => pending.extend(items),
+                _ => {}
+            }
         }
+        true
     }
 
     /// The property's schema with the root's definitions attached, so a local pointer in it still

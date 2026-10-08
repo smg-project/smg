@@ -134,7 +134,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::{formats, grammar::schema::POINTER_DEPTH_AT_MOST};
+    use crate::formats;
 
     fn tool(name: &str, parameters: Value) -> Tool {
         Tool {
@@ -423,18 +423,20 @@ mod tests {
     }
 
     #[test]
-    fn a_chain_of_definitions_is_followed_so_far_and_no_further() {
-        // Every link is a different pointer, so cycle detection alone would follow a request's
-        // chain as deep as it goes; the walk stops at a fixed depth and the property pins nothing,
-        // which keeps the stack bounded whatever a request sends. The property carries a type of
-        // its own, so a chain within the depth pins it and one past the depth does not.
-        let chain = |links: usize| {
+    fn a_chain_of_definitions_is_followed_to_its_end_however_long_and_deep() {
+        // Every link is a different pointer, so the memo of pointers followed does not shorten a
+        // chain, and the walk keeps the schemas still to look at in a list of its own: a request's
+        // chain costs its length and no stack, however many links it has and however deep each
+        // link nests before its pointer. The property carries a type of its own, so its pin shows
+        // the chain was followed to its end.
+        let chain = |links: usize, nesting: usize| {
             let mut defs = serde_json::Map::new();
             for i in 0..links {
-                defs.insert(
-                    format!("D{i}"),
-                    value!({"$ref": format!("#/$defs/D{}", i + 1)}),
-                );
+                let mut link = value!({"$ref": format!("#/$defs/D{}", i + 1)});
+                for _ in 0..nesting {
+                    link = value!({"properties": {"a": link}});
+                }
+                defs.insert(format!("D{i}"), link);
             }
             defs.insert(format!("D{links}"), value!({"type": "integer"}));
             tool(
@@ -447,30 +449,31 @@ mod tests {
                 }),
             )
         };
-        let opener = |links: usize| {
-            first_call(&[chain(links)])["elements"][3]["elements"][0]["elements"][0]["value"]
+        let opener = |links: usize, nesting: usize| {
+            first_call(&[chain(links, nesting)])["elements"][3]["elements"][0]["elements"][0]
+                ["value"]
                 .clone()
         };
-        let depth = POINTER_DEPTH_AT_MOST;
-        assert_eq!(opener(10), argument_open("p", "object"));
+        assert_eq!(opener(10, 0), argument_open("p", "object"));
         assert_eq!(
-            opener(depth - 1),
+            opener(5_000, 0),
             argument_open("p", "object"),
-            "within the depth"
+            "five thousand links"
         );
+        // Sixty-four links, each wrapped a hundred and twenty times in `properties` before its
+        // pointer, two objects a wrap: a walk with a frame per object would need some fifteen
+        // thousand of them.
         assert_eq!(
-            opener(depth + 1),
-            "<|open|>argument key=\"p\" type=\"",
-            "past the depth"
+            opener(64, 120),
+            argument_open("p", "object"),
+            "sixty-four links nested deep"
         );
-        assert_eq!(opener(5_000), "<|open|>argument key=\"p\" type=\"");
     }
 
     #[test]
     fn a_wide_schema_keeps_its_pins_however_many_definitions_it_names() {
-        // Breadth is not depth: a property whose fields each name a different leaf definition,
-        // more of them than the depth the walk allows, is walked once per definition and keeps
-        // its type.
+        // A property whose fields each name a different leaf definition is looked at once per
+        // definition and keeps its type, with every definition attached.
         let mut defs = serde_json::Map::new();
         let mut fields = serde_json::Map::new();
         for i in 0..70 {
