@@ -10,6 +10,93 @@ Status: the public types are the contract, the adapters render them for the Chat
 Responses and Messages APIs, and the engine runs a format table; the tables under `formats` are
 the families recorded so far, and the models table below says which, and how far each is.
 
+## Architecture
+
+Symphony is a library, not a service: a caller feeds it a model's output and takes typed events
+back. SMG's gateway is its first caller, and the only thing of SMG's it depends on is the tool type
+of `openai-protocol`, the request's `tools` as the OpenAI API spells them. Everything else here is
+the model families' own syntax.
+
+### The pipeline
+
+```text
+prompt, output bytes --> Engine, running a Format table --> Events --> adapter --> API response
+                             |                              ^
+                             +-- the call syntax's assembler +   (json, tagged, pythonic)
+
+request tools, Format table --> Format::grammar --> Grammar --> the engine's structural tag
+```
+
+One object, one method. A `Parser` is fed `Input`s in lifecycle order: one `Prompt` (the prompt
+the engine was given, so the parser knows where the model starts, inside its thought or not), any
+number of `Delta`s (each engine chunk, decoded, with the spans that say which token wrote which
+byte), one `End` (the engine's finish reason). Each call appends `Event`s to an `Events` list;
+whole-output parsing is the same sequence with one `Delta`, so streaming and non-streaming share
+one implementation.
+
+Every byte of output lands in exactly one event: content, reasoning, a call's name, a fragment of
+its arguments, bytes the format dropped as wrapping (`Dropped`, with the reason), or bytes a region
+could not be parsed from (`Malformed`, returned whole with the reason). Nothing vanishes silently,
+and a client that wants the raw text back can have it.
+
+### The public types
+
+| Type or function | What it is |
+|---|---|
+| `Parser` (`feed`) | The one trait: one instance per generated choice, fed `Input`s, filling `Events`. |
+| `Input`, `TokenSpan`, `EngineFinish` | The lifecycle steps and the token-to-byte alignment the gateway's decoder gives. |
+| `Event`, `Events`, `Text` | The output: `Content`, `ReasoningStart`/`Reasoning`/`ReasoningEnd`, `ToolCallStart`/`ToolCallArguments`/`ToolCallEnd`, `Dropped`, `Malformed`, `Finish`. `Text` carries the bytes and the engine tokens they cost. |
+| `DropReason`, `MalformedReason`, `FinishReason` | Why bytes were dropped, why a region could not be parsed, and the refined finish (`tool_calls` when calls were made). |
+| `ParseError` | Buffer overflow, lifecycle misuse, or a defect in a parser; what was pushed before the error is final. |
+| `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. Built with a small builder and checked by `Format::validate`. |
+| `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
+| `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
+| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m3()`, `kimi_k3()`, `plain()`. |
+| `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
+| `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools: `to_json()` as the engine reads it, `payload()` as a request carries it. |
+| `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
+| `Ledger` | Token accounting: which tokens wrote which bytes, so every text event can say what it cost. |
+
+### The modules
+
+- `format`, `formats`: the table type and the fourteen tables. A table is data, read by the engine
+  and by the grammar derivation alike; it says what the template writes and nothing about how to
+  parse it.
+- `engine`, `markers`, `tokens`: the engine, its scanner and its token ledger.
+- `json`: the JSON family's assembler (`{"name": ..., "arguments": {...}}` as it arrives,
+  streaming the model's own argument bytes), the bare JSON list (xLAM), and the partial-JSON and
+  prefix readers they rest on.
+- `tagged`: the assemblers for arguments written as tags: Qwen 3.5's `<function=`/`<parameter=`,
+  DeepSeek's DSML, the keyed `<arg_key>`/`<arg_value>` pairs (GLM, Ling, Hy4, IQuest), MiniMax's
+  XML tree, Kimi K3's XTML; and the value reader that turns a value's text into the JSON the
+  request's tools declare.
+- `pythonic`: calls written as Python, `name(key=value)`.
+- `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `tagged`,
+  `xtml`), with the argument shapes a JSON schema pins (`schema`).
+- `adapt`: the three API adapters, every response policy in one place.
+- `event`, `input`, `parser`: the contract above.
+
+### Adding a model
+
+A model of a known syntax costs a table and evidence, no engine change:
+
+1. Read the chat template and write the table under `formats/`: the markers as terminals, the
+   states, the rows, the call syntax, the turn opener. Unit tests on the recorded shapes.
+2. Add the model's parity row to `tests/bellwether_parse_fixtures.rs`, which replays bellwether's
+   recorded sets through the table at every chunking and compares every byte against the reference.
+3. Replay the whole set on a checkout; the models table below records the result.
+
+A new call syntax costs an assembler under `json`, `tagged` or `pythonic`, a `CallSyntax` variant,
+and a grammar module under `grammar`, each with the same evidence.
+
+### Evidence
+
+Symphony is judged against [bellwether](https://github.com/smg-project/bellwether), a corpus of
+recorded fixtures: for every checkpoint group, the chat template's own renders and the model's
+outputs, at benchmark scale, with the reference parse beside each. The parity test replays them
+through the tables; a derived grammar is pinned in unit tests to the hand-written tag it replaces
+where one existed, and replayed against the recorded calls where none did.
+
 ## Models
 
 Symphony's target is every checkpoint group bellwether has a manifest for; a group is the
