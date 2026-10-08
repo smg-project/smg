@@ -18,7 +18,7 @@ use super::Grammar;
 pub(super) fn shape(
     schema: &Value,
     definitions: Definitions<'_>,
-    text: impl Fn() -> Grammar,
+    text: impl FnOnce() -> Grammar,
 ) -> Option<(&'static str, Grammar)> {
     if !definitions.pointers_resolve(schema) {
         return None;

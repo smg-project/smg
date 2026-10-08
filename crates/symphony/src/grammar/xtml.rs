@@ -25,7 +25,7 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
-    schema::{self, Definitions},
+    schema::{shape, Definitions},
     CallMarkers, Grammar, Tag, WayIn,
 };
 
@@ -114,7 +114,7 @@ fn arguments(parameters: &Value) -> Grammar {
 /// the key with any type and any value when the schema pins none.
 fn argument(key: &str, schema: &Value, definitions: Definitions<'_>) -> Grammar {
     let key = escape(key);
-    match schema::shape(schema, definitions, any_value) {
+    match shape(schema, definitions, any_value) {
         Some((type_name, value)) => Grammar::Sequence(vec![
             Grammar::ConstString(format!(
                 "{OPEN}argument key=\"{key}\" type=\"{type_name}\"{SEP}"
