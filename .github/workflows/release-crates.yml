@@ -87,17 +87,37 @@ jobs:
   tier3:
     needs: tier2
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: llm-multimodal
+            path: crates/multimodal
+          - crate: engine-zmq-adapter
+            path: crates/engine_zmq_adapter
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate
         with:
-          crate: llm-multimodal
-          path: crates/multimodal
+          crate: ${{ matrix.crate }}
+          path: ${{ matrix.path }}
           token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # Tier 4: Main crate depending on all others
+  # Tier 4: Crates depending on tier 3
   tier4:
     needs: tier3
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/publish-crate
+        with:
+          crate: engine-servicer
+          path: crates/engine_servicer
+          token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Tier 5: Main crate depending on all others
+  tier5:
+    needs: tier4
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

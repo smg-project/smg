@@ -1,6 +1,6 @@
 [package]
 name = "smg-external-router"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Routers for third-party providers behind the SMG gateway, and the contract they are built on"
 license = "Apache-2.0"

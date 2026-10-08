@@ -4,7 +4,7 @@ run-name: >-
   SMG+TokenSpeed |
   base=${{ inputs.base_image_ref || 'latest nightly carrier' }} |
   engine=${{ inputs.tokenspeed_commit || 'latest' }} |
-  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.11.0' }} |
+  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.12.0' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
   by @${{ github.actor }}
 
@@ -43,7 +43,7 @@ on:
       smg_commit:
         description: 'SMG commit/ref ("latest" for HEAD)'
         required: false
-        default: 'v1.11.0'
+        default: 'v1.12.0'
         type: string
       tag:
         description: 'Override image tag (default includes the SMG and TokenSpeed nightly versions)'
@@ -63,7 +63,7 @@ jobs:
       engine_repo: ${{ inputs.tokenspeed_repo }}
       engine_commit: ${{ inputs.tokenspeed_commit || 'latest' }}
       smg_repo: ${{ inputs.smg_repo || 'https://github.com/smg-project/smg' }}
-      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.11.0' }}
+      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.12.0' }}
       tag: ${{ inputs.tag }}
       dry_run: ${{ github.event_name == 'pull_request' }}
     secrets: inherit
