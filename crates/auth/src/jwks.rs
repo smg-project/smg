@@ -59,7 +59,8 @@ pub enum JwksError {
 
 /// Check if an IP address is private/internal (SSRF protection).
 fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
+    // IPv4-mapped IPv6 reaches the same destination as its embedded IPv4.
+    match &ip.to_canonical() {
         IpAddr::V4(ipv4) => {
             ipv4.is_private()                           // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
                 || ipv4.is_loopback()                   // 127.0.0.0/8
@@ -479,6 +480,42 @@ mod tests {
 
         // CGNAT
         assert!(validate_url("https://100.64.0.1/jwks").is_err());
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_jwks_urls_obey_ipv4_address_policy() {
+        for (host, blocked) in [
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:7f00:1", true),
+            ("::ffff:10.0.0.1", true),
+            ("::ffff:172.16.0.1", true),
+            ("::ffff:192.168.1.1", true),
+            ("::ffff:169.254.169.254", true),
+            ("::ffff:169.254.1.1", true),
+            ("::ffff:100.64.0.1", true),
+            ("::ffff:192.0.2.1", true),
+            ("::ffff:198.51.100.1", true),
+            ("::ffff:203.0.113.1", true),
+            ("::ffff:0.0.0.0", true),
+            ("::ffff:255.255.255.255", true),
+            ("::ffff:8.8.8.8", false),
+            ("::ffff:1.1.1.1", false),
+            ("::1", true),
+            ("::", true),
+            ("fc00::1", true),
+            ("fe80::1", true),
+            ("2001:4860:4860::8888", false),
+        ] {
+            let result = validate_url(&format!("https://[{host}]/jwks"));
+            if blocked {
+                assert!(
+                    matches!(result, Err(JwksError::SsrfBlocked(_))),
+                    "private address {host} must be blocked, got {result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "public address {host} must remain allowed");
+            }
+        }
     }
 
     #[test]
