@@ -189,10 +189,10 @@ struct Block<'a> {
 }
 
 /// One way into a block of calls, from a state with a row into it: from a region with a close of
-/// its own (a thought, an answer), that close first, then the opener of the row into the block
-/// from the state the close returns to, so the model closes what the prompt left open and goes on
-/// from where that leaves it; from the turn's own state, or a state with no close, the opener of
-/// its own row. Every way in is a path the table has.
+/// its own (a thought, an answer) whose home has a row into the block, that close first, then the
+/// home's row, so the model closes what the prompt left open and goes on from where that leaves
+/// it; from any other state (the turn's own, one with no close, one whose home has no row into
+/// the block), the opener of its own row. Every way in is a path the table has.
 struct WayIn<'a> {
     close: Option<&'a str>,
     open: &'a str,
@@ -462,9 +462,8 @@ impl Format {
     }
 
     /// The ways into the block `state` is, one per state it is entered from, in the order of the
-    /// states, the same way in once: from a region with a close, the close and then the row into
-    /// the block from where the close returns (the state's own row when there is none from there);
-    /// from any other state, its own row.
+    /// states, the same way in once: from a region with a close whose home has a row into the
+    /// block, the close and then that row; from any other state, its own row.
     fn ways_into(&self, state: usize) -> Vec<WayIn<'_>> {
         let door = |from: usize| {
             self.transitions()
@@ -473,10 +472,11 @@ impl Format {
         };
         let mut ways: Vec<WayIn<'_>> = Vec::new();
         for from in self.entered_from(state, |state| self.is_arguments(state)) {
-            let (close, open) = match self.region(from, |state| self.is_call_state(state)) {
-                Some(Region { close, home, .. }) => {
-                    (Some(close), door(home).or_else(|| door(from)))
-                }
+            let through_home = self
+                .region(from, |state| self.is_call_state(state))
+                .and_then(|Region { close, home, .. }| Some((Some(close), door(home)?)));
+            let (close, open) = match through_home {
+                Some((close, open)) => (close, Some(open)),
                 None => (None, door(from)),
             };
             let Some(open) = open else { continue };
@@ -735,6 +735,39 @@ mod tests {
             value!(["<calls>", "</think>"])
         );
         assert_eq!(begins(&as_xtml), ["<calls>", "</think>"]);
+    }
+
+    #[test]
+    fn a_thought_whose_home_has_no_row_into_the_block_enters_by_its_own_row() {
+        // The block is reachable from inside the thought alone and closes back into it, the shape
+        // of a model that calls tools mid-thought. The thought has a close, but content, where the
+        // close returns, has no row into the block, so `</think><calls>` would be no path the
+        // table has: the way in is the thought's own row, `<calls>`, with the thought left open.
+        let mid_thought = Format::new("mid_thought")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("calls_open", "<calls>")
+            .terminal("calls_close", "</calls>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("reasoning", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "reasoning")
+            .calls(CallSyntax::Xtml);
+        let payload = mid_thought
+            .grammar(&weather_tools(), true, true)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(payload["format"]["triggers"], value!(["<calls>"]));
+        assert_eq!(begins(&payload), ["<calls>"]);
+        assert_eq!(payload["format"]["tags"][0]["end"], "</calls>");
     }
 
     #[test]

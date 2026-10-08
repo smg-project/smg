@@ -1,14 +1,15 @@
 //! Kimi K3's structural tag: the block of calls as the gateway's Kimi K3 parser writes it by hand,
 //! here from the table's markers and the request's tools.
 //!
-//! The table gives the block its opener and close and the ways into it: Kimi K3's prompt leaves
-//! the thought open in thinking mode and the answer otherwise, and a block the model could not
-//! reach from there would force the calls inside a region the model can never close. So the tag
-//! has one way in per state the block is entered from, that state's own close followed by the
-//! opener, each closed by the block's close, and each way's first text (the opener from the turn
-//! itself, the close from the thought or the answer) triggers it. Inside, one
-//! or more calls, each `<|open|>call tool="NAME" index="N"<|sep|>`, its arguments and the call's
-//! close, with the name as the request gives it (`&` and `"` escaped as the template does).
+//! The table gives the block its close and its ways in (`Format::ways_into`): Kimi K3's prompt
+//! leaves the thought open in thinking mode and the answer otherwise, and a block the model could
+//! not reach from there would force the calls inside a region the model can never close. So the
+//! tag has one way in per state the block is entered from, each a path the table has: from the
+//! thought or the answer, its close and then the row into the block from where the close returns;
+//! from the turn itself, its own row. Each way is closed by the block's close, and its first text
+//! triggers the tag. Inside, one or more calls, each `<|open|>call tool="NAME" index="N"<|sep|>`,
+//! its arguments and the call's close, with the name as the request gives it (`&` and `"` escaped
+//! as the template does).
 //!
 //! The arguments follow the tool's schema: one argument tag per property, in the schema's order,
 //! each optional unless the schema requires it, its `type` attribute and value pinned by the
