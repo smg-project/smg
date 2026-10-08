@@ -48,6 +48,7 @@ use crate::{
     tagged::{dsml, keyed},
 };
 
+mod schema;
 mod xtml;
 
 /// A structural-tag grammar, as the engines take it.
