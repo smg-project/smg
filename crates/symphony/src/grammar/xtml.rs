@@ -134,7 +134,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::formats;
+    use crate::{formats, grammar::schema::POINTER_DEPTH_AT_MOST};
 
     fn tool(name: &str, parameters: Value) -> Tool {
         Tool {
@@ -425,8 +425,9 @@ mod tests {
     #[test]
     fn a_chain_of_definitions_is_followed_so_far_and_no_further() {
         // Every link is a different pointer, so cycle detection alone would follow a request's
-        // chain as deep as it goes; the walk stops after a fixed number and the property pins
-        // nothing, which keeps the stack bounded whatever a request sends.
+        // chain as deep as it goes; the walk stops at a fixed depth and the property pins nothing,
+        // which keeps the stack bounded whatever a request sends. The property carries a type of
+        // its own, so a chain within the depth pins it and one past the depth does not.
         let chain = |links: usize| {
             let mut defs = serde_json::Map::new();
             for i in 0..links {
@@ -441,22 +442,88 @@ mod tests {
                 value!({
                     "type": "object",
                     "$defs": defs,
-                    "properties": {"p": {"$ref": "#/$defs/D0"}},
+                    "properties": {"p": {"type": "object", "$ref": "#/$defs/D0"}},
                     "required": ["p"],
                 }),
             )
         };
-        let short = first_call(&[chain(10)]);
+        let opener = |links: usize| {
+            first_call(&[chain(links)])["elements"][3]["elements"][0]["elements"][0]["value"]
+                .clone()
+        };
+        let depth = POINTER_DEPTH_AT_MOST;
+        assert_eq!(opener(10), argument_open("p", "object"));
         assert_eq!(
-            short["elements"][3]["elements"][0]["elements"][0]["value"],
+            opener(depth - 1),
+            argument_open("p", "object"),
+            "within the depth"
+        );
+        assert_eq!(
+            opener(depth + 1),
             "<|open|>argument key=\"p\" type=\"",
-            "a chain lends no type, since a $ref lends its target's keywords one hop only"
+            "past the depth"
         );
-        let long = first_call(&[chain(5_000)]);
+        assert_eq!(opener(5_000), "<|open|>argument key=\"p\" type=\"");
+    }
+
+    #[test]
+    fn a_wide_schema_keeps_its_pins_however_many_definitions_it_names() {
+        // Breadth is not depth: a property whose fields each name a different leaf definition,
+        // more of them than the depth the walk allows, is walked once per definition and keeps
+        // its type.
+        let mut defs = serde_json::Map::new();
+        let mut fields = serde_json::Map::new();
+        for i in 0..70 {
+            defs.insert(format!("L{i}"), value!({"type": "integer"}));
+            fields.insert(format!("f{i}"), value!({"$ref": format!("#/$defs/L{i}")}));
+        }
+        let call = first_call(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": defs,
+                "properties": {"wide": {"type": "object", "properties": fields}},
+                "required": ["wide"],
+            }),
+        )]);
+        let slot = &call["elements"][3]["elements"][0];
         assert_eq!(
-            long["elements"][3]["elements"][0]["elements"][0]["value"],
-            "<|open|>argument key=\"p\" type=\""
+            slot["elements"][0]["value"],
+            argument_open("wide", "object")
         );
+        assert_eq!(
+            slot["elements"][1]["json_schema"]["$defs"]["L69"],
+            value!({"type": "integer"})
+        );
+    }
+
+    #[test]
+    fn a_propertys_own_definitions_block_that_is_no_object_resolves_nothing() {
+        // `"$defs": null` (an SDK writing an empty map as null) stays as it is in the document the
+        // engine gets, with no entry at the pointer, so the property pins nothing rather than a
+        // schema the engine cannot compile.
+        let call = first_call(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": {"Count": {"type": "integer"}},
+                "properties": {
+                    "null_block": {"$ref": "#/$defs/Count", "$defs": null},
+                    "list_block": {"$ref": "#/$defs/Count", "$defs": []},
+                },
+                "required": ["null_block", "list_block"],
+            }),
+        )]);
+        let slots = call["elements"][3]["elements"]
+            .as_array()
+            .expect("two slots");
+        for (slot, key) in [(&slots[0], "null_block"), (&slots[1], "list_block")] {
+            assert_eq!(
+                slot["elements"][0]["value"],
+                format!("<|open|>argument key=\"{key}\" type=\""),
+                "{key} pins nothing"
+            );
+        }
     }
 
     #[test]

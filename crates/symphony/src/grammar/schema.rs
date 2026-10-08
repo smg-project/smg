@@ -130,9 +130,11 @@ impl<'a> Blocks<'a> {
     }
 }
 
-/// How many pointers the check follows before it gives up on a schema: a tool whose definitions
-/// chain deeper pins nothing, and the walk's depth stays bounded whatever a request sends.
-const POINTERS_FOLLOWED_AT_MOST: usize = 64;
+/// How deep a chain of pointers the check follows before it gives up on a schema: a tool whose
+/// definitions chain deeper pins nothing, and the walk's depth stays bounded whatever a request
+/// sends. Breadth is not counted: a schema may point at any number of definitions, each walked
+/// once.
+pub(super) const POINTER_DEPTH_AT_MOST: usize = 64;
 
 impl<'a> Definitions<'a> {
     pub(super) fn of(root: &'a Value) -> Self {
@@ -158,9 +160,16 @@ impl<'a> Definitions<'a> {
         let mut segments = pointer.strip_prefix("#/")?.split('/');
         let block = segments.next()?;
         let name = segments.next()?.replace("~1", "/").replace("~0", "~");
-        let mut node = [self.own, self.root]
-            .into_iter()
-            .find_map(|blocks| blocks.named(block)?.get(&name))?;
+        // A block the property has but that is no object (`"$defs": null`) stays as it is in the
+        // document the engine gets, with no entry to find, so nothing resolves through it.
+        let mut node = match self.own.named(block) {
+            Some(Value::Object(entries)) => match entries.get(&name) {
+                Some(entry) => entry,
+                None => self.root.named(block)?.get(&name)?,
+            },
+            Some(_) => return None,
+            None => self.root.named(block)?.get(&name)?,
+        };
         for segment in segments {
             node = node.get(segment.replace("~1", "/").replace("~0", "~"))?;
         }
@@ -175,14 +184,19 @@ impl<'a> Definitions<'a> {
 
     /// Whether every local pointer in `schema` names something, and every pointer in what it
     /// names, as far as the pointers reach: the definitions travel with the property, so a pointer
-    /// at nothing inside one of them reaches the engine too. A definition that names itself is
-    /// followed once, and no more than [`POINTERS_FOLLOWED_AT_MOST`] pointers are followed in all,
-    /// so a chain of definitions cannot send the walk arbitrarily deep.
+    /// at nothing inside one of them reaches the engine too. Each distinct pointer is walked once
+    /// (`followed` remembers them, so a definition that names itself, or a wide schema, costs one
+    /// walk per definition), and a chain is followed no deeper than [`POINTER_DEPTH_AT_MOST`].
     fn pointers_resolve(self, schema: &Value) -> bool {
-        self.pointers_resolve_from(schema, &mut Vec::new())
+        self.pointers_resolve_from(schema, &mut Vec::new(), 0)
     }
 
-    fn pointers_resolve_from(self, schema: &Value, followed: &mut Vec<String>) -> bool {
+    fn pointers_resolve_from(
+        self,
+        schema: &Value,
+        followed: &mut Vec<String>,
+        depth: usize,
+    ) -> bool {
         match schema {
             Value::Object(map) => map.iter().all(|(key, value)| {
                 let local = value
@@ -191,17 +205,17 @@ impl<'a> Definitions<'a> {
                 let named_resolves = local.is_none_or(|pointer| match self.resolve(pointer) {
                     None => false,
                     Some(_) if followed.iter().any(|seen| seen == pointer) => true,
-                    Some(_) if followed.len() >= POINTERS_FOLLOWED_AT_MOST => false,
+                    Some(_) if depth >= POINTER_DEPTH_AT_MOST => false,
                     Some(target) => {
                         followed.push(pointer.to_string());
-                        self.pointers_resolve_from(target, followed)
+                        self.pointers_resolve_from(target, followed, depth + 1)
                     }
                 });
-                named_resolves && self.pointers_resolve_from(value, followed)
+                named_resolves && self.pointers_resolve_from(value, followed, depth)
             }),
             Value::Array(items) => items
                 .iter()
-                .all(|item| self.pointers_resolve_from(item, followed)),
+                .all(|item| self.pointers_resolve_from(item, followed, depth)),
             _ => true,
         }
     }
