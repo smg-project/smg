@@ -1,7 +1,7 @@
 // Base implementation of reasoning parser that handles common logic
 // for detecting and extracting reasoning blocks from text.
 
-use crate::traits::{ParseError, ParserConfig, ParserResult, ReasoningParser};
+use crate::traits::{ParseError, ParserConfig, ParserResult, PromptReasoning, ReasoningParser};
 
 /// Base reasoning parser implementation.
 ///
@@ -172,6 +172,14 @@ impl ReasoningParser for BaseReasoningParser {
 
     fn is_in_reasoning(&self) -> bool {
         self.in_reasoning
+    }
+
+    fn prompt_reasoning(&self, prompt: &str) -> PromptReasoning {
+        PromptReasoning::from_markers(
+            prompt,
+            &self.config.think_start_token,
+            &self.config.think_end_token,
+        )
     }
 }
 
@@ -393,5 +401,57 @@ mod tests {
             }
             _ => panic!("Expected BufferOverflow error"),
         }
+    }
+
+    #[test]
+    fn prompt_reasoning_reads_the_last_marker() {
+        let parser = create_test_parser(false, true);
+        // GLM-5.3 / DeepSeek-V3.1 style: the generation prompt opens the block.
+        assert_eq!(
+            parser.prompt_reasoning("<|user|>hi<|assistant|><think>"),
+            PromptReasoning::Open
+        );
+        // Qwen3 / GLM-4.5 with thinking off: an empty block is prefilled.
+        assert_eq!(
+            parser.prompt_reasoning("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            PromptReasoning::Closed
+        );
+        // MiniMax-style: only the closing marker is prefilled.
+        assert_eq!(
+            parser.prompt_reasoning("<|assistant|></think>"),
+            PromptReasoning::Closed
+        );
+        // Qwen3 with thinking on: the model opens the block itself.
+        assert_eq!(
+            parser.prompt_reasoning("<|im_start|>assistant\n"),
+            PromptReasoning::Absent
+        );
+        // Earlier turns do not count; only the tail does.
+        assert_eq!(
+            parser.prompt_reasoning("<think>old</think>answer<|user|>again<|assistant|><think>"),
+            PromptReasoning::Open
+        );
+        assert_eq!(
+            parser.prompt_reasoning("<think>partial reasoning</think>final answer"),
+            PromptReasoning::Closed
+        );
+    }
+
+    #[test]
+    fn prompt_reasoning_uses_the_configured_markers() {
+        let config = ParserConfig {
+            think_start_token: "<reasoning>".to_string(),
+            think_end_token: "</reasoning>".to_string(),
+            ..Default::default()
+        };
+        let parser = BaseReasoningParser::new(config);
+        assert_eq!(
+            parser.prompt_reasoning("prompt<reasoning>"),
+            PromptReasoning::Open
+        );
+        assert_eq!(
+            parser.prompt_reasoning("prompt<think>"),
+            PromptReasoning::Absent
+        );
     }
 }

@@ -4,13 +4,16 @@
 // `<think>\n` in the prefill when ON and `<think></think>` when OFF.
 // See: https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8?chat_template=default
 //
-// Uses `always_in_reasoning=false` because the thinking toggle is detected at
-// runtime via `ThinkingToggle::DefaultOn` + `think_in_prefill=true`, and
-// `mark_reasoning_started()` is called when thinking is effectively ON.
+// Uses `always_in_reasoning=false`: the gateway reads the rendered prompt's
+// tail (`prompt_reasoning`) and arms the parser only when it ends inside
+// `<think>`.
 
 use crate::{
     parsers::BaseReasoningParser,
-    traits::{ParseError, ParserConfig, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE},
+    traits::{
+        ParseError, ParserConfig, ParserResult, PromptReasoning, ReasoningParser,
+        DEFAULT_MAX_BUFFER_SIZE,
+    },
 };
 
 /// NanoV3 / Nemotron reasoning parser.
@@ -75,6 +78,10 @@ impl ReasoningParser for NanoV3Parser {
 
     fn mark_think_start_stripped(&mut self) {
         self.base.mark_think_start_stripped();
+    }
+
+    fn prompt_reasoning(&self, prompt: &str) -> PromptReasoning {
+        self.base.prompt_reasoning(prompt)
     }
 }
 

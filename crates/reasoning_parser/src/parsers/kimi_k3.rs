@@ -9,7 +9,9 @@
 
 use regex::Regex;
 
-use crate::traits::{ParseError, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE};
+use crate::traits::{
+    ParseError, ParserResult, PromptReasoning, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE,
+};
 
 /// Literal marker strings (used for streaming overlap detection).
 const THINK_OPEN: &str = "<|open|>think<|sep|>";
@@ -451,6 +453,14 @@ impl ReasoningParser for KimiK3Parser {
         // is already handled by treating reasoning_start as 0. No additional
         // state is needed.
     }
+
+    fn prompt_reasoning(&self, prompt: &str) -> PromptReasoning {
+        let last_match = |re: &Regex| re.find_iter(prompt).last().map(|m| m.start());
+        PromptReasoning::from_positions(
+            last_match(&self.think_open_re),
+            last_match(&self.think_close_re),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +472,27 @@ mod tests {
     const SEP: &str = "<|sep|>";
     fn think_open() -> String {
         format!("{OPEN}think{SEP}")
+    }
+
+    #[test]
+    fn prompt_reasoning_follows_the_xtml_think_channel() {
+        let parser = KimiK3Parser::new();
+        let header = format!("{OPEN}message{SEP}");
+        assert_eq!(
+            parser.prompt_reasoning(&format!("{header}{}", think_open())),
+            PromptReasoning::Open
+        );
+        // Thinking off: the renderer prefills an empty think channel.
+        assert_eq!(
+            parser.prompt_reasoning(&format!("{header}{}{CLOSE}think{SEP}", think_open())),
+            PromptReasoning::Closed
+        );
+        assert_eq!(parser.prompt_reasoning(&header), PromptReasoning::Absent);
+        // Tolerant whitespace inside the marker, like the output regexes.
+        assert_eq!(
+            parser.prompt_reasoning(&format!("{header}{OPEN} think {SEP}")),
+            PromptReasoning::Open
+        );
     }
     fn think_close() -> String {
         format!("{CLOSE}think{SEP}")

@@ -42,15 +42,29 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
-        let (token_ids, processed_messages, tool_constraints) =
-            prepare_chat_like(ctx, request).await?;
+        let PreparedChat {
+            token_ids,
+            processed_messages,
+            tool_constraints,
+            reasoning,
+        } = prepare_chat_like(ctx, request).await?;
         ctx.state.preparation = Some(PreparationOutput::Chat {
             token_ids,
             processed_messages,
             tool_constraints,
+            reasoning,
         });
         Ok(())
     }
+}
+
+/// What [`prepare_chat_like`] hands back for the caller's own
+/// `PreparationOutput` variant.
+pub(crate) struct PreparedChat {
+    pub token_ids: Vec<u32>,
+    pub processed_messages: ProcessedMessages,
+    pub tool_constraints: Option<(String, String)>,
+    pub reasoning: utils::ReasoningPrefill,
 }
 
 /// The chat request → prepared inputs pipeline, shared by the chat endpoint
@@ -64,7 +78,7 @@ impl ChatPreparationStage {
 pub(crate) async fn prepare_chat_like(
     ctx: &mut RequestContext,
     request: &ChatCompletionRequest,
-) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>), Response> {
+) -> Result<PreparedChat, Response> {
     utils::validate_chat_content_parts(&request.messages)
         .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
@@ -286,11 +300,20 @@ pub(crate) async fn prepare_chat_like(
         // reasoning instead of preempting it. The constraint covers every tool
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
+        let reasoning = utils::chat_reasoning_prefill(
+            request,
+            &processed_messages.text,
+            &ctx.components.reasoning_parser_factory,
+            ctx.components
+                .parser_resolver
+                .reasoning_parser(&request.model)
+                .as_deref(),
+            tokenizer.as_ref(),
+        );
         let constraint_tools = request.callable_tools();
         let tool_call_constraint = if let (false, Some(tool_choice)) =
             (constraint_tools.is_empty(), request.tool_choice.as_ref())
         {
-            let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
             ctx.components
                 .tool_parser_factory
                 .registry()
@@ -301,7 +324,7 @@ pub(crate) async fn prepare_chat_like(
                         .as_deref(),
                     &constraint_tools,
                     tool_choice,
-                    reasoning,
+                    reasoning.starts_in_reasoning,
                 )
                 .map_err(|e| {
                     error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
@@ -363,10 +386,11 @@ pub(crate) async fn prepare_chat_like(
         ctx.state.response.stop_decoder = Some(stop_decoder);
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
 
-        Ok((
+        Ok(PreparedChat {
             token_ids,
             processed_messages,
-            tool_call_constraint.map(|c| c.to_tuple()),
-        ))
+            tool_constraints: tool_call_constraint.map(|c| c.to_tuple()),
+            reasoning,
+        })
     }
 }

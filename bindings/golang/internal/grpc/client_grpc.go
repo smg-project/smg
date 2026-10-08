@@ -132,7 +132,7 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		model = "default"
 	}
 
-	requireReasoning, err := ffi.ChatRequiresReasoningWithTokenizer(reqJSON, c.tokenizerHandle)
+	requireReasoning, err := ffi.ChatRequiresReasoningWithTokenizer(reqJSON, preprocessed.PromptText, c.tokenizerHandle)
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine require_reasoning: %w", err)
 	}

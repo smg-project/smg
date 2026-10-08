@@ -35,6 +35,9 @@ workspace = true
 [dependencies.tool-parser]
 workspace = true
 
+[dependencies.reasoning-parser]
+workspace = true
+
 [dependencies.smg-grpc-client]
 workspace = true
 

@@ -75,6 +75,7 @@ impl BuildStage for MessageRequestBuildingStage {
             token_ids,
             processed_messages,
             tool_constraints,
+            reasoning,
         } = prep
         else {
             debug_assert!(false, "pipeline guarantees Messages variant");
@@ -132,16 +133,15 @@ impl BuildStage for MessageRequestBuildingStage {
         // A structural tag that already opens with the reasoning block runs
         // from the first token; asking SGLang to also defer the grammar past
         // `</think>` would make the model owe a second one.
-        let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::messages_reasoning_starts_in_prefill(&messages_request, tokenizer.as_ref())
-        }) && !utils::constraint_covers_reasoning(
-            &ctx.components.tool_parser_factory,
-            ctx.components
-                .parser_resolver
-                .tool_parser(&messages_request.model)
-                .as_deref(),
-            tool_constraints.as_ref(),
-        );
+        let require_reasoning = reasoning.expects_reasoning
+            && !utils::constraint_covers_reasoning(
+                &ctx.components.tool_parser_factory,
+                ctx.components
+                    .parser_resolver
+                    .tool_parser(&messages_request.model)
+                    .as_deref(),
+                tool_constraints.as_ref(),
+            );
 
         let mut proto_request = builder_client
             .build_messages_request(
@@ -212,7 +212,10 @@ impl BuildStage for MessageRequestBuildingStage {
 
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
-            spec: ResponseSpec::Messages(MessagesResponseSpec::from(messages_request.as_ref())),
+            spec: ResponseSpec::Messages(MessagesResponseSpec::new(
+                messages_request.as_ref(),
+                reasoning.starts_in_reasoning,
+            )),
             stamp: AttemptStamp {
                 id: id_stamp,
                 sampling_mask,

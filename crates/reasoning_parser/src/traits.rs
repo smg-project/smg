@@ -102,6 +102,44 @@ pub trait ReasoningParser: Send + Sync {
     /// Prevents the streaming parser from trying to find and strip `<think>`
     /// from the model output when the template already included it.
     fn mark_think_start_stripped(&mut self);
+
+    /// Where the rendered `prompt` leaves this parser's reasoning block.
+    ///
+    /// The completion continues the prompt, so the prompt's tail — not the
+    /// chat template's toggles — says whether the output starts mid-reasoning.
+    /// `Open` means the parser must be armed (`mark_reasoning_started` and
+    /// `mark_think_start_stripped`) before it sees any output.
+    fn prompt_reasoning(&self, prompt: &str) -> PromptReasoning;
+}
+
+/// Where a rendered prompt leaves the model's reasoning block, read from its
+/// tail the way the parser reads output: the last marker decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptReasoning {
+    /// No reasoning marker: whether the model reasons is left to it.
+    Absent,
+    /// A reasoning block was opened and never closed: the completion starts
+    /// inside it, with no opening marker of its own.
+    Open,
+    /// The last reasoning block is closed: the completion starts as content.
+    Closed,
+}
+
+impl PromptReasoning {
+    /// Classify by the byte offsets of the last opening and closing markers.
+    pub fn from_positions(last_open: Option<usize>, last_close: Option<usize>) -> Self {
+        match (last_open, last_close) {
+            (None, None) => Self::Absent,
+            (Some(open), Some(close)) if close > open => Self::Closed,
+            (None, Some(_)) => Self::Closed,
+            (Some(_), _) => Self::Open,
+        }
+    }
+
+    /// Classify by the last occurrence of literal `start`/`end` markers.
+    pub fn from_markers(prompt: &str, start: &str, end: &str) -> Self {
+        Self::from_positions(prompt.rfind(start), prompt.rfind(end))
+    }
 }
 
 /// Error types for reasoning parsing operations.

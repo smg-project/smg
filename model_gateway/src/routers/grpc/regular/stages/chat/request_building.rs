@@ -51,6 +51,7 @@ pub(crate) async fn build_chat_backed_plan(
     processed_text: String,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
+    reasoning: utils::ReasoningPrefill,
     id_prefix: &'static str,
     inject_pd_metadata: bool,
     plan_kind: ExecutionPlanKind,
@@ -118,16 +119,15 @@ pub(crate) async fn build_chat_backed_plan(
     // A structural tag that already opens with the reasoning block runs from
     // the first token; asking SGLang to also defer the grammar past `</think>`
     // would make the model owe a second one.
-    let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-        utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
-    }) && !utils::constraint_covers_reasoning(
-        &ctx.components.tool_parser_factory,
-        ctx.components
-            .parser_resolver
-            .tool_parser(&chat_request.model)
-            .as_deref(),
-        tool_constraints.as_ref(),
-    );
+    let require_reasoning = reasoning.expects_reasoning
+        && !utils::constraint_covers_reasoning(
+            &ctx.components.tool_parser_factory,
+            ctx.components
+                .parser_resolver
+                .tool_parser(&chat_request.model)
+                .as_deref(),
+            tool_constraints.as_ref(),
+        );
 
     let mut proto_request = builder_client
         .build_chat_request(
@@ -225,6 +225,7 @@ impl BuildStage for ChatRequestBuildingStage {
             token_ids,
             processed_messages,
             tool_constraints,
+            reasoning,
         } = prep
         else {
             debug_assert!(false, "pipeline guarantees Chat variant");
@@ -241,6 +242,7 @@ impl BuildStage for ChatRequestBuildingStage {
             processed_messages.text,
             token_ids,
             tool_constraints,
+            reasoning,
             "chatcmpl-",
             self.inject_pd_metadata,
             self.plan_kind,
@@ -249,7 +251,7 @@ impl BuildStage for ChatRequestBuildingStage {
 
         // Only the client-facing usage drops them; settlement keeps the engine's count.
         ctx.state.response.unbilled_prompt_tokens = unbilled_prompt_tokens;
-        let mut spec = ChatResponseSpec::from(chat_request.as_ref());
+        let mut spec = ChatResponseSpec::new(chat_request.as_ref(), reasoning.starts_in_reasoning);
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
 
         Ok(BuildOutput {

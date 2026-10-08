@@ -1,6 +1,6 @@
 // Passthrough reasoning parser: forwards input as normal_text, no extraction.
 
-use crate::traits::{ParseError, ParserResult, ReasoningParser};
+use crate::traits::{ParseError, ParserResult, PromptReasoning, ReasoningParser};
 
 #[derive(Debug, Clone, Default)]
 pub struct PassthroughParser;
@@ -36,6 +36,10 @@ impl ReasoningParser for PassthroughParser {
     fn mark_reasoning_started(&mut self) {}
 
     fn mark_think_start_stripped(&mut self) {}
+
+    fn prompt_reasoning(&self, _prompt: &str) -> PromptReasoning {
+        PromptReasoning::Absent
+    }
 }
 
 #[cfg(test)]

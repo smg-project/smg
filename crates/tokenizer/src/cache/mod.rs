@@ -340,10 +340,6 @@ impl Tokenizer for CachedTokenizer {
         self.inner.native_reasoning_effort_off_values()
     }
 
-    fn think_in_prefill(&self) -> bool {
-        self.inner.think_in_prefill()
-    }
-
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
         self.inner.renderer_capabilities()
     }

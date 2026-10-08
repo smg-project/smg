@@ -355,21 +355,29 @@ pub unsafe extern "C" fn sgl_preprocessed_request_free(
     }
 }
 
-/// Determine whether a chat request should ask SGLang to count reasoning tokens.
+/// Determine whether a chat request should ask SGLang to count reasoning
+/// tokens. `prompt_text` is the request's rendered prompt (from
+/// `sgl_preprocess_chat_request_with_tokenizer`): its tail says whether the
+/// completion starts inside the model's reasoning block.
 ///
 /// # Safety
-/// - `request_json` must be a valid null-terminated C string.
+/// - `request_json` and `prompt_text` must be valid null-terminated C strings.
 /// - `tokenizer_handle` must be a valid pointer returned by `sgl_tokenizer_create`.
 /// - `require_reasoning_out` must point to writable memory.
 /// - `error_out` may be null; if non-null, must point to writable memory.
 #[no_mangle]
 pub unsafe extern "C" fn sgl_chat_requires_reasoning_with_tokenizer(
     request_json: *const c_char,
+    prompt_text: *const c_char,
     tokenizer_handle: *mut TokenizerHandle,
     require_reasoning_out: *mut c_int,
     error_out: *mut *mut c_char,
 ) -> SglErrorCode {
-    if request_json.is_null() || tokenizer_handle.is_null() || require_reasoning_out.is_null() {
+    if request_json.is_null()
+        || prompt_text.is_null()
+        || tokenizer_handle.is_null()
+        || require_reasoning_out.is_null()
+    {
         set_error_message(error_out, "Invalid arguments: null pointer");
         return SglErrorCode::InvalidArgument;
     }
@@ -378,6 +386,14 @@ pub unsafe extern "C" fn sgl_chat_requires_reasoning_with_tokenizer(
         Ok(s) => s,
         Err(_) => {
             set_error_message(error_out, "Invalid UTF-8 in request_json");
+            return SglErrorCode::InvalidArgument;
+        }
+    };
+
+    let prompt = match CStr::from_ptr(prompt_text).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_error_message(error_out, "Invalid UTF-8 in prompt_text");
             return SglErrorCode::InvalidArgument;
         }
     };
@@ -393,6 +409,7 @@ pub unsafe extern "C" fn sgl_chat_requires_reasoning_with_tokenizer(
     let handle_ref = &*tokenizer_handle;
     *require_reasoning_out = i32::from(chat_requires_reasoning(
         &chat_request,
+        prompt,
         handle_ref.tokenizer.as_ref(),
     ));
 

@@ -5,7 +5,10 @@
 
 use crate::{
     parsers::BaseReasoningParser,
-    traits::{ParseError, ParserConfig, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE},
+    traits::{
+        ParseError, ParserConfig, ParserResult, PromptReasoning, ReasoningParser,
+        DEFAULT_MAX_BUFFER_SIZE,
+    },
 };
 
 /// Cohere Command model reasoning parser.
@@ -73,6 +76,10 @@ impl ReasoningParser for CohereCmdParser {
 
     fn mark_think_start_stripped(&mut self) {
         self.base.mark_think_start_stripped();
+    }
+
+    fn prompt_reasoning(&self, prompt: &str) -> PromptReasoning {
+        self.base.prompt_reasoning(prompt)
     }
 }
 

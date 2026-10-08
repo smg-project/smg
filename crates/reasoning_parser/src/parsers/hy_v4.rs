@@ -1,5 +1,7 @@
 //! Hy4 reasoning with optional checkpoint-specific structural-token suffixes.
-use crate::traits::{ParseError, ParserResult, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE};
+use crate::traits::{
+    ParseError, ParserResult, PromptReasoning, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE,
+};
 
 #[derive(Default)]
 pub struct HyV4Parser {
@@ -49,10 +51,7 @@ impl HyV4Parser {
                         break;
                     };
                     let suffix = &self.buffer[prefix.len()..end];
-                    let valid = suffix.is_empty()
-                        || (suffix.starts_with(':')
-                            && suffix.len() > 1
-                            && !suffix.chars().any(|c| c.is_whitespace() || c == '<'));
+                    let valid = is_marker_suffix(suffix);
                     if valid && self.suffix.as_ref().is_none_or(|s| s == suffix) {
                         self.suffix = Some(suffix.to_owned());
                         self.buffer.drain(..end + 1);
@@ -117,4 +116,28 @@ impl ReasoningParser for HyV4Parser {
         self.ended = false;
     }
     fn mark_think_start_stripped(&mut self) {}
+    /// The last complete `<think…>` or `</think…>` decides, by the suffix rule
+    /// the output is read with.
+    fn prompt_reasoning(&self, prompt: &str) -> PromptReasoning {
+        let last = |prefix: &str| {
+            prompt.rmatch_indices(prefix).map(|(at, _)| at).find(|&at| {
+                let tail = &prompt[at + prefix.len()..];
+                // A suffix holds no `<`, so a scan never runs past the next
+                // candidate and the read stays linear.
+                tail.find(['<', '>']).is_some_and(|end| {
+                    tail[end..].starts_with('>') && is_marker_suffix(&tail[..end])
+                })
+            })
+        };
+        PromptReasoning::from_positions(last("<think"), last("</think"))
+    }
+}
+
+/// Whether the text between `<think`/`</think` and `>` completes a marker:
+/// nothing, or a checkpoint suffix such as `:6124c78e`.
+fn is_marker_suffix(suffix: &str) -> bool {
+    suffix.is_empty()
+        || (suffix.starts_with(':')
+            && suffix.len() > 1
+            && !suffix.chars().any(|c| c.is_whitespace() || c == '<'))
 }
