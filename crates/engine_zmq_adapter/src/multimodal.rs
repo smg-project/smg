@@ -103,6 +103,7 @@ fn payload_bytes(
 
 /// Whether a read `/dev/shm` tensor file is unlinked afterwards (the default;
 /// `TOKENSPEED_UNLINK_MM_SHM_AFTER_READ=0` keeps it, for debugging).
+#[cfg(unix)]
 fn unlink_shm_after_read() -> bool {
     static UNLINK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *UNLINK.get_or_init(|| {
@@ -129,9 +130,14 @@ fn validated_shm_name(name: &str) -> Result<&str, String> {
 /// regular file reached without following a symlink at the final component,
 /// and is unlinked after the read unless disabled.
 fn read_shm_payload(tensor: &str, handle: &common::ShmHandle) -> Result<Vec<u8>, String> {
+    let name = validated_shm_name(&handle.name)?;
+    read_shm_file(tensor, name, handle)
+}
+
+#[cfg(unix)]
+fn read_shm_file(tensor: &str, name: &str, handle: &common::ShmHandle) -> Result<Vec<u8>, String> {
     use rustix::fs::{FileType, Mode, OFlags};
 
-    let name = validated_shm_name(&handle.name)?;
     let path = std::path::Path::new("/dev/shm").join(name);
     let nbytes = usize::try_from(handle.nbytes)
         .map_err(|_| format!("multimodal tensor {tensor:?}: shm nbytes out of range"))?;
@@ -193,6 +199,13 @@ fn read_shm_payload(tensor: &str, handle: &common::ShmHandle) -> Result<Vec<u8>,
         }
     }
     read
+}
+
+#[cfg(not(unix))]
+fn read_shm_file(tensor: &str, name: &str, _handle: &common::ShmHandle) -> Result<Vec<u8>, String> {
+    Err(format!(
+        "multimodal tensor {tensor:?}: TensorData.shm {name:?} is not supported on this platform"
+    ))
 }
 
 /// Little-endian float32 bytes from a floating payload of `dtype`, so every

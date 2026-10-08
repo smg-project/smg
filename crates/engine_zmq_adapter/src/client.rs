@@ -26,6 +26,8 @@ use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto as vllm};
 
+#[cfg(unix)]
+use crate::sockets::unlink_stale_socket;
 use crate::{
     eos::EosTokenIds,
     sglang::{
@@ -33,10 +35,7 @@ use crate::{
         translate_embed_request_sglang, translate_request_sglang, SglangGenerateStream,
         SglangProfileStart,
     },
-    sockets::{
-        ensure_ipc_socket_dir, unlink_stale_socket, zmq_socket_addresses, Handshake,
-        ZMQ_CONNECT_TIMEOUT,
-    },
+    sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake, ZMQ_CONNECT_TIMEOUT},
     stream::ZmqGenerateStream,
     tokenspeed::{
         fan_out_tokenspeed_requests, translate_request_tokenspeed, TokenSpeedGenerateStream,
