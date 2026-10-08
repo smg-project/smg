@@ -1377,10 +1377,11 @@ class RouterArgs:
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
             type=str,
-            default="0.0.0.0",
+            default=None,
             help=(
                 "Host address to bind the Prometheus metrics server. Supports IPv4, IPv6"
-                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces"
+                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: the unspecified"
+                " address of --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)"
             ),
         )
         prometheus_group.add_argument(

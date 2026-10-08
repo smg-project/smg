@@ -1807,3 +1807,31 @@ class TestRouterArgsFieldOrder:
                 f"{appended} must be appended after worker_startup_delay to "
                 "preserve positional callers"
             )
+
+
+class TestPrometheusHostDefault:
+    """--prometheus-host is unset by default: the router derives the metrics
+    bind address from --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)
+    instead of the launcher pinning an IPv4-only 0.0.0.0."""
+
+    def _parse(self, argv):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        return RouterArgs.from_cli_args(parser.parse_args(argv))
+
+    def test_unset_by_default(self):
+        assert self._parse([]).prometheus_host is None
+        assert self._parse(["--host", "[::]"]).prometheus_host is None
+        assert self._parse(["--host", "127.0.0.1"]).prometheus_host is None
+
+    def test_explicit_value_is_kept(self):
+        assert self._parse(["--prometheus-host", "::"]).prometheus_host == "::"
+        assert self._parse(["--prometheus-host", "[::]"]).prometheus_host == "[::]"
+        assert self._parse(["--prometheus-host", "127.0.0.1"]).prometheus_host == "127.0.0.1"
+        assert self._parse(["--prometheus-host", "0.0.0.0"]).prometheus_host == "0.0.0.0"
+
+    def test_router_prefix_unset_by_default(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = RouterArgs.from_cli_args(parser.parse_args([]), use_router_prefix=True)
+        assert args.prometheus_host is None

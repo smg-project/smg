@@ -245,7 +245,8 @@ class Router:
             selection for decode servers (PD mode only). Default: {}
         prometheus_port: Port to expose Prometheus metrics. Default: None
         prometheus_host: Host address to bind the Prometheus metrics server. Default:
-            None
+            None, which binds the unspecified address of host's family (:: for an IPv6
+            host, 0.0.0.0 otherwise)
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default:
             False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD

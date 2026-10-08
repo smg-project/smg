@@ -616,6 +616,14 @@ impl Router {
             .unwrap_or(ConnectionMode::Http)
     }
 
+    /// The metrics bind host: `prometheus_host`, or the unspecified address
+    /// of `host`'s family when it is not given.
+    fn metrics_host(&self) -> String {
+        self.prometheus_host
+            .clone()
+            .unwrap_or_else(|| config::MetricsConfig::default_host_for(&self.host))
+    }
+
     fn parse_mesh_socket_addr(
         host: &str,
         port: u16,
@@ -838,13 +846,10 @@ impl Router {
         };
         let has_discovery = discovery.is_some();
 
-        let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
-            (Some(port), Some(host)) => Some(MetricsConfig {
-                port,
-                host: host.clone(),
-            }),
-            _ => None,
-        };
+        let metrics = self.prometheus_port.map(|port| MetricsConfig {
+            port,
+            host: self.metrics_host(),
+        });
 
         let trace_config = Some(config::TraceConfig {
             enable_trace: self.enable_trace,
@@ -1709,10 +1714,7 @@ impl Router {
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),
-            host: self
-                .prometheus_host
-                .clone()
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            host: self.metrics_host(),
             duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 
