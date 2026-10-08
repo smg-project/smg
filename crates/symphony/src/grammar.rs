@@ -8,28 +8,36 @@
 //! compose; `const_string`, `any_text`, `regex` and `json_schema` as leaves. [`Grammar::to_json`]
 //! writes it as the engine reads it, and [`Grammar::payload`] wraps it as the request carries it.
 //!
-//! [`Format::grammar`] derives the tree from the table. The call markers are the terminals that
-//! enter and leave the arguments state, the block markers the ones around a wrapper state, the
-//! thought's close the terminal that leaves the reasoning state, and the request's tools give each
-//! call its name and schema. What the syntax inside the markers constrains comes from the call
-//! syntax: a JSON object around each tool's schema for the JSON family; the engines' `glm_xml`
-//! style of a schema for keyed arguments in GLM's spelling; a tag grammar per parameter for DSML.
-//! The gateway's old parsers wrote these tags by hand, one function per parser; where one exists
-//! for a format Symphony has, the derived tag is pinned to it in the tests, so the switch changes
-//! nothing an engine sees.
+//! [`Format::grammar`] derives the tree from the table. A region of the table (a call, a block of
+//! calls, the thought, the answer) is opened by the terminal of a row into its state and closed
+//! by the terminal of a row back to a state it is entered from; the terminal every state has a
+//! row for is the end of the turn, which ends whatever is open and closes no region of its own.
+//! So the call markers are the rows into and out of the arguments state, the block markers the
+//! rows into and out of the wrapper state the calls sit in, and the thought's close the row from
+//! the reasoning state back to where the thought opened; the request's tools give each call its
+//! name and schema. What the syntax inside the markers constrains comes from the call syntax: a
+//! JSON object around each tool's schema for the JSON family; the engines' `glm_xml` style of a
+//! schema for keyed arguments in the compact spelling; a tag grammar per parameter for DSML; for
+//! Kimi K3's XTML, one argument tag per property of the schema (the `xtml` module). The gateway's
+//! old parsers wrote these tags by hand, one function per parser; where one exists for a format
+//! Symphony has, the derived tag is pinned to it in the tests, so the switch changes nothing an
+//! engine sees.
 //!
 //! With the prompt's reasoning still open, the tag is wrapped in a prefix: free text that can
 //! write none of the table's markers nor the call syntax's inner tags, closed by the thought's
 //! close, so the forced call follows the reasoning instead of replacing it, as the gateway's
 //! `wrap_in_reasoning_prefix` does. A table without a thought has nothing to wrap, and the tag
-//! comes back as it is; a thought that closes somewhere other than content has no prefix yet, and
-//! the table gives `None` rather than a tag the model could write inside its thought.
+//! comes back as it is; a thought that does not close back to where it opened has no prefix yet,
+//! and the table gives `None` rather than a tag the model could write inside its thought. Kimi
+//! K3's tag takes no prefix: the block of calls can be entered from the turn itself, from the
+//! thought or from the answer, and the tag has one way in per state, that state's own close
+//! followed by the block's opener, so the model closes whatever the prompt left open on its way
+//! to the calls, whichever that was.
 //!
 //! Not derived yet, so [`Format::grammar`] gives `None` for them: the tagged syntax (Qwen 3.5 and
 //! later, Seed-OSS), keyed arguments in another spelling than the compact one (Ling's newlines,
-//! Hy4's suffixed tags), MiniMax M3's XML tree, Kimi K3's XTML, the pythonic tables, xLAM's list,
-//! and a table without calls. The gateway then takes the JSON-schema path, as it does for those
-//! models today.
+//! Hy4's suffixed tags), MiniMax M3's XML tree, the pythonic tables, xLAM's list, and a table
+//! without calls. The gateway then takes the JSON-schema path, as it does for those models today.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -38,6 +46,8 @@ use crate::{
     format::{CallSyntax, Emits, Format},
     tagged::{dsml, keyed},
 };
+
+mod xtml;
 
 /// A structural-tag grammar, as the engines take it.
 #[derive(Clone, Debug, PartialEq)]
@@ -162,12 +172,21 @@ impl Grammar {
     }
 }
 
-/// The markers a table's rows give a call: the terminals that enter and leave the arguments state,
-/// and the ones around a wrapper state when the calls sit in a block.
+/// The markers a table's rows give a call: the terminals into and out of the arguments state, and
+/// the block's own when the calls sit in a block.
 struct CallMarkers<'a> {
-    block: Option<(&'a str, &'a str)>,
+    block: Option<Block<'a>>,
     call_open: &'a str,
     call_close: &'a str,
+}
+
+/// A block of calls: the terminals into and out of its wrapper state, and what the model writes
+/// before the opener on each way in, one per state the block is entered from, in the order of the
+/// states: nothing from the turn's own state, the state's own close from a thought or an answer.
+struct Block<'a> {
+    open: &'a str,
+    close: &'a str,
+    before_open: Vec<&'a str>,
 }
 
 impl Format {
@@ -177,7 +196,8 @@ impl Format {
     /// an allowed-tools list in `required` mode). With `reasoning_open`, the prompt left the model
     /// inside its thought, and the tag follows a reasoning prefix the thought's close ends; a
     /// table without a thought has no prefix, and the tag comes back as it is; a table whose
-    /// thought closes somewhere other than content has no prefix yet, and gives `None`.
+    /// thought does not close back to where it opened has no prefix yet, and gives `None`. Kimi
+    /// K3's tag closes the thought on its own way in, and is the same either way.
     pub fn grammar(
         &self,
         tools: &[Tool],
@@ -198,20 +218,20 @@ impl Format {
                 Self::keyed_calls(&markers, &named, at_least_one)
             }
             CallSyntax::Dsml => Self::dsml_calls(&markers, &named, at_least_one)?,
+            CallSyntax::Xtml => return xtml::calls(&markers, &named, at_least_one),
             CallSyntax::Keyed(_)
             | CallSyntax::Tagged
             | CallSyntax::Pythonic
             | CallSyntax::JsonList
-            | CallSyntax::Xml
-            | CallSyntax::Xtml => return None,
+            | CallSyntax::Xml => return None,
         };
         if !reasoning_open {
             return Some(calls);
         }
-        if !self.has_state(Emits::Reasoning) {
+        let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return Some(calls);
-        }
-        let think_close = self.marker(Emits::Reasoning, Emits::Content)?;
+        };
+        let think_close = self.close_of(reasoning, |_| false)?;
         let mut excludes: Vec<String> = self.terminal_texts().map(str::to_string).collect();
         let inner: &[&str] = match self.call_syntax() {
             Some(CallSyntax::Keyed(tags)) => &[
@@ -287,7 +307,8 @@ impl Format {
         tools: &[&Tool],
         at_least_one: bool,
     ) -> Option<Grammar> {
-        let (block_open, block_close) = markers.block?;
+        let block = markers.block.as_ref()?;
+        let (block_open, block_close) = (block.open, block.close);
         let parameter_close = dsml::PARAMETER_CLOSE;
         let parameter = Grammar::Tag(Tag::new(
             dsml::PARAMETER_OPEN,
@@ -337,38 +358,93 @@ impl Format {
         ]))
     }
 
-    /// The call markers the rows give: the terminal from the wrapper state, or without one from
-    /// the content state, into the arguments state, and the one back; and, when the calls sit in
-    /// a block, the terminals from the content state into the wrapper state and back.
+    /// The call markers the rows give: the opener and the close of the arguments state, and of
+    /// the wrapper state with a row into it when the calls sit in a block.
     fn call_markers(&self) -> Option<CallMarkers<'_>> {
-        let call_open = self
-            .marker(Emits::Wrapper, Emits::Arguments)
-            .or_else(|| self.marker(Emits::Content, Emits::Arguments))?;
-        let call_close = self
-            .marker(Emits::Arguments, Emits::Wrapper)
-            .or_else(|| self.marker(Emits::Arguments, Emits::Content))?;
+        let arguments = self.state_emitting(Emits::Arguments)?;
+        let is_arguments = |state: usize| self.emits(state) == Emits::Arguments;
         let block = self
-            .marker(Emits::Content, Emits::Wrapper)
-            .zip(self.marker(Emits::Wrapper, Emits::Content));
+            .transitions()
+            .find(|&(source, _, target)| {
+                target == arguments && self.emits(source) == Emits::Wrapper
+            })
+            .map(|(source, _, _)| source);
+        let block = match block {
+            Some(state) => Some(Block {
+                open: self.opener_of(state, is_arguments)?,
+                close: self.close_of(state, is_arguments)?,
+                before_open: self
+                    .entered_from(state, is_arguments)
+                    .into_iter()
+                    .map(|from| self.close_of_region(from).unwrap_or(""))
+                    .collect(),
+            }),
+            None => None,
+        };
         Some(CallMarkers {
             block,
-            call_open,
-            call_close,
+            call_open: self.opener_of(arguments, |_| false)?,
+            call_close: self.close_of(arguments, |_| false)?,
         })
     }
 
-    /// The text of the terminal that moves the engine from a state emitting `from` to one
-    /// emitting `to`: the two states name the marker, not the order of the rows.
-    fn marker(&self, from: Emits, to: Emits) -> Option<&str> {
+    /// The first state emitting `emits`.
+    fn state_emitting(&self, emits: Emits) -> Option<usize> {
+        (0..self.states()).find(|&state| self.emits(state) == emits)
+    }
+
+    /// The states with a row into `state`, other than itself and the states `within` it, in the
+    /// order of the states: the states the region is entered from.
+    fn entered_from(&self, state: usize, within: impl Fn(usize) -> bool) -> Vec<usize> {
+        let mut from: Vec<usize> = self
+            .transitions()
+            .filter(|&(source, _, target)| target == state && source != state && !within(source))
+            .map(|(source, _, _)| source)
+            .collect();
+        from.sort_unstable();
+        from.dedup();
+        from
+    }
+
+    /// The text of the terminal of a row into `state` from a state it is entered from: the
+    /// region's opener.
+    fn opener_of(&self, state: usize, within: impl Fn(usize) -> bool) -> Option<&str> {
         self.transitions()
-            .find(|&(source, _, target)| self.emits(source) == from && self.emits(target) == to)
+            .find(|&(source, _, target)| target == state && source != state && !within(source))
             .map(|(_, on, _)| self.terminal_text(on))
     }
 
-    /// Whether a row of the table enters or leaves a state emitting `emits`.
-    fn has_state(&self, emits: Emits) -> bool {
+    /// The text of the terminal of a row from `state` back to a state it is entered from, other
+    /// than the end of the turn: the region's close. The two states name it, not the order of the
+    /// rows.
+    fn close_of(&self, state: usize, within: impl Fn(usize) -> bool + Copy) -> Option<&str> {
+        let from = self.entered_from(state, within);
+        let turn_close = self.turn_close();
         self.transitions()
-            .any(|(source, _, target)| self.emits(source) == emits || self.emits(target) == emits)
+            .find(|&(source, on, target)| {
+                source == state && from.contains(&target) && Some(on) != turn_close
+            })
+            .map(|(_, on, _)| self.terminal_text(on))
+    }
+
+    /// The close of the region `state` is, or `None` for the turn's own state, where the opener
+    /// leaves the engine and which no row opens as a region.
+    fn close_of_region(&self, state: usize) -> Option<&str> {
+        (state != 0)
+            .then(|| self.close_of(state, |_| false))
+            .flatten()
+    }
+
+    /// The terminal with a row from every state: the end of the turn, which ends whatever is
+    /// open, and so closes no region of its own.
+    fn turn_close(&self) -> Option<usize> {
+        let terminals = self.terminal_texts().count();
+        (0..terminals).find(|&on| {
+            (0..self.states()).all(|state| {
+                self.transitions()
+                    .any(|(source, t, _)| source == state && t == on)
+            })
+        })
     }
 }
 
@@ -710,7 +786,6 @@ mod tests {
             formats::ling(),
             formats::hy4(),
             formats::minimax_m3(),
-            formats::kimi_k3(),
             formats::olmo3(),
             formats::lfm2_5(),
             formats::xlam(),
@@ -722,6 +797,64 @@ mod tests {
                 format.name()
             );
         }
+    }
+
+    #[test]
+    fn kimi_k3_derives_the_tag_the_gateway_hand_writes_today() {
+        // The old crate's `KimiK3Parser::build_structural_tag`: one tag per way into the block
+        // of calls (from the turn itself, after the thought's close, after the answer's close),
+        // each the same `plus` of an `or` of the tools' calls, closed by the block's close, with
+        // the opener and the two closes as triggers.
+        let tools = weather_tools();
+        let payload = formats::kimi_k3()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let format = &payload["format"];
+        assert_eq!(format["type"], "triggered_tags");
+        assert_eq!(
+            format["triggers"],
+            value!([
+                "<|open|>tools<|sep|>",
+                "<|close|>think<|sep|>",
+                "<|close|>response<|sep|>"
+            ])
+        );
+        assert_eq!(format["at_least_one"], true);
+        let tags = format["tags"].as_array().expect("three ways in");
+        assert_eq!(
+            tags.iter().map(|tag| &tag["begin"]).collect::<Vec<_>>(),
+            [
+                "<|open|>tools<|sep|>",
+                "<|close|>think<|sep|><|open|>tools<|sep|>",
+                "<|close|>response<|sep|><|open|>tools<|sep|>",
+            ]
+        );
+        for tag in tags {
+            assert_eq!(tag["end"], "<|close|>tools<|sep|>");
+            assert_eq!(tag["content"], tags[0]["content"]);
+        }
+        assert_eq!(tags[0]["content"]["type"], "plus");
+        let calls = tags[0]["content"]["content"]["elements"]
+            .as_array()
+            .expect("one call per named tool");
+        assert_eq!(calls.len(), 3, "a nameless tool has no call");
+        assert_eq!(
+            calls[0]["elements"][0]["value"],
+            "<|open|>call tool=\"get_weather\" index=\""
+        );
+        // The prompt's open thought changes nothing: the tag closes it on its own way in.
+        assert_eq!(
+            formats::kimi_k3().grammar(&tools, false, true),
+            formats::kimi_k3().grammar(&tools, false, false)
+        );
+        assert_eq!(
+            formats::kimi_k3()
+                .grammar(&tools, false, false)
+                .expect("a grammar")
+                .payload()["format"]["at_least_one"],
+            false
+        );
     }
 
     #[test]

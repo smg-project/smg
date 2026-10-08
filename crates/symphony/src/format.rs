@@ -247,6 +247,11 @@ impl Format {
         self.states[index].emits
     }
 
+    /// How many states the table has; the first is the one the turn opener leaves the engine in.
+    pub(crate) fn states(&self) -> usize {
+        self.states.len()
+    }
+
     /// Where terminal `on` takes the engine from state `from`, if the table says.
     pub(crate) fn next(&self, from: usize, on: usize) -> Option<usize> {
         self.transitions
