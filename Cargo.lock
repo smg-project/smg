@@ -6402,6 +6402,8 @@ version = "1.8.0"
 dependencies = [
  "parking_lot",
  "regex",
+ "serde_json",
+ "smg-response-template",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -7623,6 +7625,7 @@ dependencies = [
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
+ "smg-response-template",
  "smg-rl",
  "smg-wasm",
  "str0m",
@@ -7896,6 +7899,17 @@ version = "0.1.0"
 dependencies = [
  "kv-index",
  "rustc-hash 2.1.3",
+]
+
+[[package]]
+name = "smg-response-template"
+version = "0.1.0"
+dependencies = [
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8918,6 +8932,7 @@ dependencies = [
  "rustpython-parser",
  "serde",
  "serde_json",
+ "smg-response-template",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

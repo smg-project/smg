@@ -11,6 +11,7 @@ pub mod minimax_m3;
 pub mod nano_v3;
 pub mod passthrough;
 pub mod qwen3;
+pub mod response_template;
 pub mod step3;
 
 pub use base::BaseReasoningParser;
@@ -26,6 +27,7 @@ pub use minimax_m3::MinimaxM3Parser;
 pub use nano_v3::NanoV3Parser;
 pub use passthrough::PassthroughParser;
 pub use qwen3::{Qwen3Parser, QwenThinkingParser};
+pub use response_template::TemplateReasoningParser;
 pub use step3::Step3Parser;
 
 pub mod hy_v4;

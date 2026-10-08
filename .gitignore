@@ -97,6 +97,8 @@ benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
+# Parity fixtures recorded from transformers
+!crates/response_template/tests/fixtures/hf/*.jsonl
 tmp*.txt
 
 # Torch Compile logs

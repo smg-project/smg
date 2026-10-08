@@ -105,6 +105,7 @@ pub(crate) struct PipelineDeps {
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
+    response_templates: Option<Arc<utils::ResponseTemplateParsers>>,
     /// `None` when tenant rate limiting is disabled; read only by the
     /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
@@ -125,6 +126,7 @@ impl PipelineDeps {
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        response_templates: Option<Arc<utils::ResponseTemplateParsers>>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
     ) -> Self {
         Self {
@@ -135,6 +137,7 @@ impl PipelineDeps {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            response_templates,
             rate_limit_manager,
         }
     }
@@ -155,6 +158,7 @@ impl PipelineDeps {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            response_templates: None,
             rate_limit_manager,
         }
     }
@@ -172,6 +176,7 @@ impl PipelineDeps {
             self.worker_registry.clone(),
             self.configured_tool_parser.clone(),
             self.configured_reasoning_parser.clone(),
+            self.response_templates.clone(),
         );
         let processor = processor::ResponseProcessor::new(
             self.tool_parser_factory.clone(),
@@ -220,6 +225,7 @@ impl PipelineDeps {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            response_templates: None,
             rate_limit_manager: None,
         }
     }
