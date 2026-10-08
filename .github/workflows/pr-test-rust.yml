@@ -258,11 +258,16 @@ jobs:
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
           cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
           # msgspec and pydantic gate the sidecar-protocol, fake-redis and
-          # limit-options tests. Modules gated on zmq or vllm still skip here
-          # (-rs lists them): the zmq ones import engine servicers that need
-          # torch, and the vllm cases run on the vLLM e2e lane.
-          pip install ./crates/grpc_client/python msgspec pydantic
+          # limit-options tests; numpy gates the Rust servicer's media bridge
+          # tests (it lends tensor buffers as numpy views). Modules gated on
+          # zmq or vllm still skip here (-rs lists them): the zmq ones import
+          # engine servicers that need torch, and the vllm cases run on the
+          # vLLM e2e lane.
+          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
           pytest -q grpc_servicer/tests -rs
+
+      - name: Run CI tooling unit tests
+        run: pytest -q scripts/tests/test_ci_node_health.py
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
@@ -399,7 +404,8 @@ jobs:
   # summary (BENCH_ENFORCE_THRESHOLDS=1 makes it fail). Results are still
   # uploaded and summarized.
   benchmarks:
-    needs: build-wheel
+    needs: [build-wheel, detect-changes]
+    if: needs.detect-changes.outputs.symphony-only != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -451,7 +457,6 @@ jobs:
           bash scripts/ci_killall_sglang.sh "nuke_gpus"
           SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest e2e_test/benchmarks \
             --ignore=e2e_test/benchmarks/test_go_bindings_perf.py \
-            --ignore=e2e_test/benchmarks/test_nightly_perf.py \
             -s -vv
 
       - name: Upload benchmark results
@@ -489,21 +494,16 @@ jobs:
       realtime: ${{ steps.filter.outputs.realtime }}
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
+      # Symphony is not wired into the gateway yet: a change confined to its crate and the
+      # lock file runs the CPU checks only, and every GPU lane below skips on this flag.
+      symphony-only: ${{ steps.filter.outputs.symphony == 'true' && steps.filter.outputs.outside-symphony == 'false' }}
       tokenspeed-image: ${{ steps.tokenspeed-image.outputs.image }}
     steps:
       - uses: actions/checkout@v7
 
-      # Resolve the prebuilt TokenSpeed carrier image (built by
-      # ci-tokenspeed-image.yml, content-addressed by the pinned engine ref +
-      # image-tooling hash — see scripts/ci_tokenspeed_image_tag.sh). The
-      # lanes run bare on the runner pods, so the image is not a job
-      # container: setup-tokenspeed extracts its payload onto the runner
-      # (scripts/ci_fetch_tokenspeed_prebuilt.sh). Any failure — a missing
-      # image (e.g. a PR that bumps the ref or edits the tooling before the
-      # image exists), a broken ref file, a registry hiccup — resolves to
-      # empty, and the tokenspeed lanes fall back to the source build. This
-      # step must NEVER fail the job: a failed detect-changes silently skips
-      # every gated lane.
+      # Resolve today's published nightly carrier to an immutable digest.
+      # A missing image falls back to installing nightly wheels on the runner.
+      # Resolution must stay tolerant so detect-changes can gate other lanes.
       - name: Resolve TokenSpeed CI image
         id: tokenspeed-image
         env:
@@ -514,19 +514,25 @@ jobs:
           if [ -n "$tag" ]; then
             candidate="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
             if docker login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN" > /dev/null 2>&1 \
-               && docker manifest inspect "$candidate" > /dev/null 2>&1; then
-              image="$candidate"
+               && manifest="$(docker manifest inspect --verbose "$candidate" 2>/dev/null)"; then
+              digest="$(jq -r 'if type == "array" then .[] | select(.Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "amd64") | .Descriptor.digest else .Descriptor.digest // empty end' <<< "$manifest")"
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                image="${candidate}@${digest}"
+              fi
             fi
           fi
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           if [ -n "$image" ]; then
             echo "TokenSpeed lanes use prebuilt image: ${image}"
           else
-            echo "Prebuilt TokenSpeed image not available (tag: ${tag:-unresolved}); lanes build from source"
+            echo "Prebuilt TokenSpeed image not available (tag: ${tag:-unresolved}); lanes install nightly wheels"
           fi
       - uses: dorny/paths-filter@v4
         id: filter
         with:
+          # Lets a filter exclude paths with `!` patterns. Filters without them
+          # behave exactly as before: any changed file matching any pattern.
+          predicate-quantifier: 'some-with-excludes'
           filters: |
             common:
               - 'model_gateway/**'
@@ -546,6 +552,7 @@ jobs:
               - 'scripts/ci_install_sglang.sh'
               - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
+              - 'scripts/ci_install_flashinfer.py'
               - '.github/versions/tokenspeed.ref'
               - 'scripts/ci_install_e2e_deps.sh'
               - 'scripts/ci_killall_sglang.sh'
@@ -565,9 +572,11 @@ jobs:
               - 'crates/reasoning_parser/**'
               - 'crates/multimodal/**'
               - 'crates/grpc_client/**'
-              # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes, which gate
-              # on this filter.
+              # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes and the
+              # Rust-servicer lane, which gate on this filter.
               - 'crates/engine_zmq_client/**'
+              - 'crates/engine_zmq_adapter/**'
+              - 'crates/engine_servicer/**'
               - 'crates/mock_worker/**'
               - 'grpc_servicer/**'
               - 'e2e_test/chat_completions/**'
@@ -576,6 +585,7 @@ jobs:
               - 'scripts/ci_install_trtllm.sh'
               - 'scripts/ci_apt_mirror.sh'
               - 'scripts/ci_install_tokenspeed.sh'
+              - 'scripts/ci_install_flashinfer.py'
               - 'scripts/ci_tokenspeed_image_tag.sh'
               - 'scripts/ci_fetch_tokenspeed_prebuilt.sh'
               - '.github/versions/tokenspeed.ref'
@@ -597,6 +607,15 @@ jobs:
               - 'e2e_test/realtime/**'
             go-bindings:
               - 'e2e_test/bindings_go/**'
+            symphony:
+              - 'crates/symphony/**'
+            # Everything that is not Symphony's crate or the lock file. A PR is Symphony-only
+            # when `symphony` matched and this did not. The `!` patterns only exclude under
+            # `some-with-excludes` above; with the default quantifier `**` would match every file.
+            outside-symphony:
+              - '**'
+              - '!crates/symphony/**'
+              - '!Cargo.lock'
             rust-ci:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -630,6 +649,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -680,6 +700,46 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
     secrets: inherit
 
+  # The SGLang chat and admin-op cases against the Rust gRPC servicer
+  # (SMG_SGLANG_SERVICER_IMPL=rust): the same workers, the Rust request path.
+  e2e-1gpu-chat-rust-servicer:
+    name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
+    # Qwen2.5-14B) since they're tp=1.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: sglang
+            timeout: 40
+            test_timeout: 32
+            # Chat lane plus the admin ops the Rust servicer serves through
+            # the wire's control calls.
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py
+            min_selected: 204 # floor ≈ 95% of the chat lane's measured effective (215 of 223 ran on the Rust servicer; audit 2026-10-04)
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
+      test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
+      min_selected: ${{ matrix.min_selected }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      servicer_impl: rust
+    secrets: inherit
+
   # Worker-side media processing: the vLLM gRPC worker fetches and
   # preprocesses media itself (SMG_VLLM_MM_PROCESSOR=inprocess) and the
   # gateway, left in auto mode, forwards media references. Same multimodal
@@ -689,6 +749,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -712,6 +773,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -736,6 +798,10 @@ jobs:
             timeout: 60
             test_timeout: 48
             min_selected: 109 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          - engine: sglang
+            timeout: 60
+            test_timeout: 48
+            min_selected: 204 # floor ≈ 95% of measured effective (215 of 223 selected ran; audit 2026-10-03)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -747,6 +813,9 @@ jobs:
       connection_mode: zmq
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      # The SGLang wire pins (grpc_servicer/tests/test_sglang_zmq_*) need a
+      # real SGLang plus pyzmq and msgspec; this is the lane that has them.
+      servicer_unit_tests: ${{ matrix.engine == 'sglang' }}
     secrets: inherit
 
   e2e-2gpu-chat-zmq-dp:
@@ -755,6 +824,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -803,6 +873,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -834,6 +905,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -865,6 +937,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -887,6 +960,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -925,6 +999,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -948,6 +1023,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1000,6 +1076,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.e2e-1gpu-chat-mm-worker.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1084,6 +1161,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1153,6 +1231,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1316,6 +1395,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1458,7 +1538,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1516,6 +1596,7 @@ jobs:
                 "${{ needs.python-unit-tests.result }}" == "failure" || \
                 "${{ needs.unit-tests.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
+                "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
                 "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \

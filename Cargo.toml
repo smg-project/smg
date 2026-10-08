@@ -1,27 +1,29 @@
 [workspace]
-members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
-    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
+members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
+    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
 resolver = "2"
 
 [workspace.dependencies]
 # Internal workspace crates
-openai-protocol = { version = "1.13.0", path = "crates/protocols" }
+openai-protocol = { version = "1.14.0", path = "crates/protocols" }
 smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
-reasoning-parser = { version = "1.7.0", path = "crates/reasoning_parser" }
-tool-parser = { version = "1.7.0", path = "crates/tool_parser" }
+reasoning-parser = { version = "1.8.0", path = "crates/reasoning_parser" }
+tool-parser = { version = "1.8.0", path = "crates/tool_parser" }
 wfaas = { version = "1.1.0", path = "crates/workflow" }
-llm-tokenizer = { version = "1.7.0", path = "crates/tokenizer" }
+llm-tokenizer = { version = "1.8.0", path = "crates/tokenizer" }
 smg-auth = { version = "1.2.3", path = "crates/auth" }
-smg-mcp = { version = "2.3.3", path = "crates/mcp" }
+smg-mcp = { version = "2.3.4", path = "crates/mcp" }
 smg-external-router = { version = "0.1.0", path = "crates/external_router" }
-kv-index = { version = "1.4.0", path = "crates/kv_index" }
+kv-index = { version = "1.5.0", path = "crates/kv_index" }
 smg-radix-tree = { version = "0.1.0", path = "crates/radix_tree" }
 smg-data-connector = { version = "2.3.4", path = "crates/data_connector", package = "data-connector" }
-llm-multimodal = { version = "1.11.0", path = "crates/multimodal" }
+llm-multimodal = { version = "1.12.0", path = "crates/multimodal" }
 smg-wasm = { version = "1.1.4", path = "crates/wasm", package = "smg-wasm" }
 smg-mesh = { version = "1.4.3", path = "crates/mesh", package = "smg-mesh" }
-smg-grpc-client = { version = "1.12.0", path = "crates/grpc_client" }
-engine-zmq-client = { version = "0.1.0", path = "crates/engine_zmq_client" }
+smg-grpc-client = { version = "1.13.0", path = "crates/grpc_client" }
+engine-zmq-client = { version = "0.2.0", path = "crates/engine_zmq_client" }
+engine-zmq-adapter = { version = "0.1.0", path = "crates/engine_zmq_adapter" }
+engine-servicer = { version = "0.1.0", path = "crates/engine_servicer" }
 smg-rl = { version = "0.1.0", path = "crates/rl" }
 
 # Shared dependencies
@@ -32,6 +34,7 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 tonic = { version = "0.14.6", features = ["gzip", "transport"] }
 tonic-prost = "0.14.6"
+tonic-health = "0.14.6"
 axum = { version = "0.8.9" }
 blake3 = "1.8"
 lz4_flex = "0.14"
@@ -153,6 +156,52 @@ opt-level = 2
 
 [profile.release.package.regex-automata]
 opt-level = 2
+
+# The compute-heavy crates: image preprocessing (resize kernels, patch
+# gather, wire serialization, base64 and hashing of inline images), the
+# tokenizer path (encode, per-token decode, stop-sequence scan) and the
+# cache-aware routing trees. Built for size they run 25-50% slower; the
+# binary grows by about 1.5 MB (measured in #2768). Note that generic
+# functions are compiled in the crate that instantiates them, at that
+# crate's opt-level: a kv-index entry point generic over a caller closure
+# only benefits once it hands the work to a non-generic inner function.
+[profile.release.package.llm-multimodal]
+opt-level = 3
+
+[profile.release.package.image]
+opt-level = 3
+
+[profile.release.package.zune-jpeg]
+opt-level = 3
+
+[profile.release.package.png]
+opt-level = 3
+
+[profile.release.package.fast_image_resize]
+opt-level = 3
+
+[profile.release.package.base64]
+opt-level = 3
+
+[profile.release.package.blake3]
+opt-level = 3
+
+[profile.release.package.llm-tokenizer]
+opt-level = 3
+
+[profile.release.package.tokenizers]
+opt-level = 3
+
+[profile.release.package.aho-corasick]
+opt-level = 3
+
+[profile.release.package.onig_sys]
+opt-level = 3
+
+# The cache-aware routing trees, walked on every request (the fused
+# match-and-insert walk is made non-generic in #2766 so it is built here).
+[profile.release.package.kv-index]
+opt-level = 3
 
 [profile.ci]
 inherits = "release"

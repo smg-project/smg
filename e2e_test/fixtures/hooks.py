@@ -19,6 +19,8 @@ from infra import (
     cleanup_pool,
     get_connection_mode_override,
     get_runtime,
+    get_sglang_servicer_impl,
+    get_tokenspeed_servicer_impl,
     get_zmq_engine_count,
 )
 
@@ -90,10 +92,6 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "slowtest: mark test as slow-running (alias)",
-    )
-    config.addinivalue_line(
-        "markers",
-        "nightly: mark test as a nightly comprehensive benchmark",
     )
 
     # ``hooks.py`` is not itself a conftest — only the functions conftest.py
@@ -168,6 +166,12 @@ def _is_multi_worker(item: pytest.Item) -> bool:
     return bool(kwargs.get("prefill") or kwargs.get("decode"))
 
 
+def _is_pd_worker_set(item: pytest.Item) -> bool:
+    """True when the item's ``workers`` marker asks for prefill/decode workers."""
+    marker = resolve_class_marker(item, "workers")
+    return marker is not None and bool(marker.kwargs.get("prefill") or marker.kwargs.get("decode"))
+
+
 def _zmq_dedup_key(item: pytest.Item) -> tuple:
     """Group key ignoring the ``setup_backend`` value.
 
@@ -209,6 +213,24 @@ def _filter_zmq_items(items: list[pytest.Item]) -> tuple[list[pytest.Item], list
     return kept, deselected
 
 
+_SGLANG_ZMQ_SKIPPED_MODULES = ("test_multimodal.py", "test_error_shapes.py")
+
+
+def _filter_sglang_zmq_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for the SGLang ZMQ lane: the
+    multimodal module stays on the gRPC lane until the wire carries media, and
+    the error-shape module tests SGLang's HTTP server's own validation."""
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        module = item.nodeid.split("::", 1)[0]
+        skipped = module.endswith(_SGLANG_ZMQ_SKIPPED_MODULES)
+        (deselected if skipped else kept).append(item)
+    return kept, deselected
+
+
 # Models whose TokenSpeed forward crashes on the 0-token idle batch a DP rank
 # runs to stay in the group's collectives (flashinfer silu_and_mul cannot
 # launch over an empty grid). Fixed upstream by
@@ -227,6 +249,58 @@ def _filter_tokenspeed_dp_items(
         marker = resolve_class_marker(item, "model")
         model = str(model_id_for_engine(marker, "tokenspeed", default=""))
         (deselected if model in _TOKENSPEED_DP_BROKEN_MODELS else kept).append(item)
+    return kept, deselected
+
+
+def _filter_tokenspeed_rust_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for a TokenSpeed lane whose gRPC
+    workers run the Rust servicer.
+
+    The Rust servicer reaches the scheduler over the msgpack wire, which
+    carries generate and abort only: no PD/EPD bootstrap fields and no
+    control messages. The PD/EPD and multi-worker topologies and the admin
+    operations (flush cache, profiling) stay with the Python servicer, so
+    their cases are dropped here rather than failing on a known gap.
+    """
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        param = _setup_backend_param(item)
+        pd_topology = param is not None and param not in _ZMQ_LOCAL_WIRES
+        admin_ops = "test_admin_ops.py" in item.nodeid
+        if pd_topology or _is_multi_worker(item) or admin_ops:
+            deselected.append(item)
+        else:
+            kept.append(item)
+    return kept, deselected
+
+
+def _filter_sglang_rust_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for an SGLang lane whose gRPC
+    workers run the Rust servicer.
+
+    The Rust servicer reaches the scheduler over the msgpack wire, which
+    carries no PD/EPD bootstrap fields and no multimodal payloads. Those
+    topologies and cases stay with the Python servicer, so they are dropped
+    here rather than failing on a known gap; everything else (admin ops,
+    embeddings, data-parallel workers) runs.
+    """
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        param = _setup_backend_param(item)
+        pd_topology = param is not None and param not in _ZMQ_LOCAL_WIRES
+        module = item.nodeid.split("::", 1)[0]
+        # An HTTP case talks to SGLang's own server, never to the servicer.
+        multimodal = module.endswith("test_multimodal.py") and param != "http"
+        if pd_topology or _is_pd_worker_set(item) or multimodal:
+            deselected.append(item)
+        else:
+            kept.append(item)
     return kept, deselected
 
 
@@ -316,6 +390,12 @@ def _format_selection_line(stats: dict) -> str:
     parts.append(f"{stats['by_zmq']} by zmq-dedup")
     if stats["by_tokenspeed_dp"]:
         parts.append(f"{stats['by_tokenspeed_dp']} by tokenspeed-dp")
+    if stats.get("by_tokenspeed_rust"):
+        parts.append(f"{stats['by_tokenspeed_rust']} by tokenspeed-rust-servicer")
+    if stats.get("by_sglang_rust"):
+        parts.append(f"{stats['by_sglang_rust']} by sglang-rust-servicer")
+    if stats.get("by_sglang_zmq"):
+        parts.append(f"{stats['by_sglang_zmq']} by sglang-zmq-wire")
     return (
         f"{header}: selected {stats['selected']} of {stats['collected']} collected "
         f"({', '.join(parts)})"
@@ -372,6 +452,9 @@ def pytest_collection_modifyitems(
         "by_tier": 0,
         "by_zmq": 0,
         "by_tokenspeed_dp": 0,
+        "by_tokenspeed_rust": 0,
+        "by_sglang_rust": 0,
+        "by_sglang_zmq": 0,
     }
 
     if any([engine, vendor, gpu_tier]):
@@ -384,12 +467,37 @@ def pytest_collection_modifyitems(
             config.hook.pytest_deselected(items=deselected)
         items[:] = selected
 
+    if get_runtime() == "tokenspeed" and get_tokenspeed_servicer_impl() == "rust":
+        kept, deselected = _filter_tokenspeed_rust_items(items)
+        stats["by_tokenspeed_rust"] = len(deselected)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = kept
+
+    if get_runtime() == "sglang" and get_sglang_servicer_impl() == "rust":
+        kept, deselected = _filter_sglang_rust_items(items)
+        stats["by_sglang_rust"] = len(deselected)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = kept
+
     if get_connection_mode_override() == ConnectionMode.ZMQ:
         kept, deselected = _filter_zmq_items(items)
         stats["by_zmq"] = len(deselected)
         if deselected:
             config.hook.pytest_deselected(items=deselected)
             items[:] = kept
+
+        # Multimodal is not wired over the SGLang ZMQ wire yet (the adapter
+        # refuses mm inputs), and the error-shape cases exercise SGLang's own
+        # HTTP server, which this wire has no counterpart of; the gRPC and HTTP
+        # lanes keep covering those modules.
+        if get_runtime() == "sglang":
+            kept, deselected = _filter_sglang_zmq_items(items)
+            stats["by_sglang_zmq"] = len(deselected)
+            if deselected:
+                config.hook.pytest_deselected(items=deselected)
+                items[:] = kept
 
         # Grouped TokenSpeed lane: drop the models the pinned engine cannot
         # run under DP (see _TOKENSPEED_DP_BROKEN_MODELS).

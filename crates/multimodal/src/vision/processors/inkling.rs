@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(result.encoder_input.shape(), &[2, 2, 2, 2, 3]);
         assert_eq!(result.feature_token_counts, vec![2]);
 
-        let flat = result.encoder_input.as_slice().unwrap();
+        let flat = result.encoder_input.flat_f32().into_owned();
         assert!((flat[0] - norm(0.0, 0)).abs() < 1e-6);
         assert!((flat[1] - norm(127.0, 1)).abs() < 1e-6);
         assert!((flat[2] - norm(255.0, 2)).abs() < 1e-6);

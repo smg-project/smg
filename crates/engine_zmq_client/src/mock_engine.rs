@@ -17,19 +17,24 @@ use zeromq::{
 };
 
 use crate::{
-    codec::{decode_msgpack, dtype::ModelDtype, encode_msgpack},
+    codec::{decode_msgpack, dtype::ModelDtype, encode_msgpack, OpaqueValue},
     protocol::{
         handshake::{EngineCoreReadyResponse, HandshakeInitMessage, ReadyMessage},
         vllm::{
-            output::EngineCoreOutputs,
-            request::{EngineCoreRequest, EngineCoreRequestType},
+            output::{EngineCoreOutputs, UtilityCallOutput, UtilityOutput},
+            request::{EngineCoreRequest, EngineCoreRequestType, UtilityCall},
         },
     },
     transport::EngineId,
     Error, Result,
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Every wait of the mock engine, the handshake's stages and each receive,
+/// ends in `Error::HandshakeTimeout` naming the step after this long: a
+/// servicer that never answers (or answers another test's engine) costs a
+/// test thirty seconds and a message instead of a hung gate.
+pub const MOCK_DEADLINE: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = MOCK_DEADLINE;
 
 /// Per-test IPC endpoint namespace backed by a unique temporary directory, so
 /// concurrent tests never collide on socket paths.
@@ -100,8 +105,9 @@ pub enum EngineInbound {
         wave: u64,
         exclude_engine_index: Option<u32>,
     },
-    /// Any other request type byte (Utility), unhandled here.
-    Other(u8),
+    /// A utility RPC (`EngineCoreRequestType::Utility`); answer it with
+    /// [`MockEngineOutput::send_utility_reply`].
+    Utility(UtilityCall),
 }
 
 /// The request-receiving half of a mock engine (frontend -> engine).
@@ -113,7 +119,12 @@ impl MockEngineInput {
     /// Receive one request's raw frames (`[request_type, payload, aux..]`); the
     /// DEALER identity is already stripped.
     pub async fn recv_frames(&mut self) -> Result<Vec<Bytes>> {
-        Ok(self.socket.recv().await?.into_vec())
+        let message = within(
+            "mock engine: a request from the servicer",
+            self.socket.recv(),
+        )
+        .await?;
+        Ok(message?.into_vec())
     }
 
     /// Receive and classify the next request.
@@ -138,7 +149,9 @@ impl MockEngineInput {
                     exclude_engine_index,
                 })
             }
-            Some(other) => Ok(EngineInbound::Other(other as u8)),
+            Some(EngineCoreRequestType::Utility) => {
+                Ok(EngineInbound::Utility(decode_msgpack(payload)?))
+            }
             None => Err(Error::UnexpectedHandshakeMessage {
                 message: format!("unknown request type frame {:?}", type_frame.as_ref()),
             }),
@@ -173,6 +186,22 @@ impl MockEngineOutput {
         self.send_frames(vec![Bytes::from(encode_msgpack(outputs)?)])
             .await
     }
+
+    /// Answer a utility call as `EngineCoreProc` does: the method's return
+    /// value, or the failure message of the exception it raised.
+    pub async fn send_utility_reply(
+        &mut self,
+        engine_index: u32,
+        call_id: i64,
+        outcome: std::result::Result<OpaqueValue, String>,
+    ) -> Result<()> {
+        self.send_outputs(&EngineCoreOutputs::Utility(UtilityCallOutput {
+            engine_index,
+            timestamp: 0.0,
+            output: UtilityOutput::from_outcome(call_id, outcome),
+        }))
+        .await
+    }
 }
 
 /// One mock engine's frontend-facing sockets after a completed handshake.
@@ -205,6 +234,18 @@ impl MockEngine {
     pub async fn send_output(&mut self, frames: Vec<Bytes>) -> Result<()> {
         self.output.send_frames(frames).await
     }
+
+    /// Answer a utility call. Convenience for sequential test drivers.
+    pub async fn send_utility_reply(
+        &mut self,
+        engine_index: u32,
+        call_id: i64,
+        outcome: std::result::Result<OpaqueValue, String>,
+    ) -> Result<()> {
+        self.output
+            .send_utility_reply(engine_index, call_id, outcome)
+            .await
+    }
 }
 
 fn ready_message(status: &str) -> ReadyMessage {
@@ -226,6 +267,16 @@ fn peer_identity(engine_id: &EngineId) -> Result<PeerIdentity> {
 }
 
 /// Wait for a ZMQ endpoint to become connectable before dialing it.
+/// `step` under the mock's deadline; the error names the step that hung.
+async fn within<T>(step: &'static str, future: impl std::future::Future<Output = T>) -> Result<T> {
+    timeout(MOCK_DEADLINE, future)
+        .await
+        .map_err(|_| Error::HandshakeTimeout {
+            stage: step,
+            timeout: MOCK_DEADLINE,
+        })
+}
+
 async fn wait_for_endpoint(endpoint: &str) -> Result<()> {
     let Some(socket_path) = endpoint.strip_prefix("ipc://") else {
         return Ok(());
@@ -257,13 +308,19 @@ pub async fn connect_to_frontend(
     let mut handshake_options = SocketOptions::default();
     handshake_options.peer_identity(identity.clone());
     let mut handshake = DealerSocket::with_options(handshake_options);
-    handshake.connect(handshake_address).await?;
+    within(
+        "mock engine: connecting to the handshake endpoint",
+        handshake.connect(handshake_address),
+    )
+    .await??;
 
     // HELLO -> (INIT) -> READY.
     handshake
         .send(ZmqMessage::from(encode_msgpack(&ready_message("HELLO"))?))
         .await?;
-    let init_frames = handshake.recv().await?.into_vec();
+    let init_frames = within("mock engine: INIT from the servicer", handshake.recv())
+        .await??
+        .into_vec();
     let [init_frame] = init_frames.as_slice() else {
         return Err(Error::UnexpectedHandshakeMessage {
             message: format!("expected one INIT frame, got {}", init_frames.len()),
@@ -296,14 +353,22 @@ pub async fn connect_to_frontend(
     let mut input_options = SocketOptions::default();
     input_options.peer_identity(identity);
     let mut input = DealerSocket::with_options(input_options);
-    input.connect(input_address).await?;
+    within(
+        "mock engine: connecting to the input endpoint",
+        input.connect(input_address),
+    )
+    .await??;
     input
         .send(ZmqMessage::from(encode_msgpack(&ready_response)?))
         .await?;
 
     wait_for_endpoint(output_address).await?;
     let mut output = PushSocket::new();
-    output.connect(output_address).await?;
+    within(
+        "mock engine: connecting to the output endpoint",
+        output.connect(output_address),
+    )
+    .await??;
 
     Ok(MockEngine {
         init,

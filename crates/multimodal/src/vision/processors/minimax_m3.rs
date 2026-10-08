@@ -395,6 +395,10 @@ impl Deref for MiniMaxM3VisionProcessor {
 }
 
 impl VisionPreProcessor for MiniMaxM3VisionProcessor {
+    fn emits_pixel_bytes(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }
@@ -845,7 +849,7 @@ mod tests {
                 Some(ModelSpecificValue::IntTensor { data, shape })
                     if data == &expected_grid && shape == &[1, 3]
             ));
-            for (index, &value) in output.encoder_input.iter().enumerate() {
+            for (index, &value) in output.encoder_input.as_f32().iter().enumerate() {
                 let expected = case["channel_frame_values"][(index % 1176) / 196]
                     .as_f64()
                     .unwrap() as f32;

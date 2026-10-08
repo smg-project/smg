@@ -636,6 +636,7 @@ mod tests {
         let padding = (-PreProcessorConfig::CLIP_MEAN[0] / PreProcessorConfig::CLIP_STD[0]) as f32;
         assert!(output
             .encoder_input
+            .as_f32()
             .iter()
             .any(|value| (*value - padding).abs() < 1e-5));
     }
@@ -683,7 +684,8 @@ mod tests {
         let output = Glm53FlashProcessor::new()
             .preprocess_video(&frames, &no_resize)
             .unwrap();
-        let patch = &output.encoder_input.as_slice().unwrap()[..1176];
+        let flat = output.encoder_input.flat_f32().into_owned();
+        let patch = &flat[..1176];
         for (offset, value) in [10.0, 40.0, 20.0, 50.0, 30.0, 60.0].into_iter().enumerate() {
             assert!((patch[offset * 196] - value / 255.0).abs() < 1e-6);
         }
@@ -695,7 +697,7 @@ mod tests {
         let first = |config: &PreProcessorConfig| {
             Glm53FlashProcessor::new()
                 .preprocess(std::slice::from_ref(&image), config)
-                .map(|output| output.encoder_input[[0, 0]])
+                .map(|output| output.encoder_input.as_f32()[[0, 0]])
         };
         let mut config = config(MAX_IMAGE_TOKENS);
         config.do_resize = Some(false);

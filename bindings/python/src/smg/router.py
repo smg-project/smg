@@ -228,6 +228,10 @@ class Router:
         service_discovery: Enable Kubernetes service discovery. When enabled, the
             router will automatically discover worker pods based on the selector.
             Default: False
+        discovery: The worker discovery provider's configuration, keyword-only:
+            a mapping with a ``provider`` key and that provider's fields, read
+            like ``RouterConfig.discovery`` (no ``provider`` means Kubernetes).
+            Mutually exclusive with ``service_discovery``. Default: None
         selector: Dictionary mapping of label keys to values for Kubernetes pod
             selection. Example: {"app": "sglang-worker"}. Default: {}
         service_discovery_port: Port to use for service discovery. The router will
@@ -251,6 +255,15 @@ class Router:
             only). If not specified, uses the main policy. Default: None
         decode_policy: Specific load balancing policy for decode nodes (PD mode only).
             If not specified, uses the main policy. Default: None
+        prefill_max_inflight_requests_per_worker: Maximum in-flight Prefill requests
+            per worker in PD or EPD mode. A non-positive value disables the limit.
+            Default: -1
+        prefill_queue_size: Maximum number of requests waiting for Prefill admission.
+            Defaults to 100 when Prefill admission is enabled. Set to 0 to disable
+            waiting. Default: None
+        prefill_queue_timeout_secs: Maximum time in seconds a request may wait for
+            Prefill admission. Defaults to 60 when Prefill admission is enabled.
+            Default: None
         request_id_headers: List of HTTP headers to check for request IDs. If not
             specified, uses common defaults: ['x-request-id', 'x-correlation-id',
             'x-trace-id', 'request-id']. Example: ['x-my-request-id',
@@ -304,6 +317,16 @@ class Router:
         """Create a router from a RouterArgs instance."""
 
         args_dict = vars(args).copy()
+        # Kubernetes, by either spelling, reaches Rust as service_discovery.
+        # A provider this cannot pass on fails here instead of quietly
+        # starting the router without discovery.
+        provider = args.selected_discovery_provider()
+        if provider not in (None, "kubernetes"):
+            raise ValueError(
+                f"Router.from_args cannot pass discovery provider {provider!r} to Rust"
+            )
+        args_dict["service_discovery"] = provider == "kubernetes"
+        args_dict.pop("discovery_provider")
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []

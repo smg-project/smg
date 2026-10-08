@@ -187,8 +187,10 @@ impl ResponseProcessor {
             complete.finish_reason()
         };
 
-        // Override finish reason if we have tool calls
-        let final_finish_reason_str = if tool_calls.is_some() {
+        // Parsed calls do not override an engine truncation or failure.
+        let final_finish_reason_str = if tool_calls.is_some()
+            && !matches!(finish_reason_str, "length" | "failed" | "error")
+        {
             "tool_calls"
         } else {
             finish_reason_str
@@ -464,10 +466,11 @@ impl ResponseProcessor {
                 id: dispatch.request_id.clone(),
                 finish_reason,
                 prompt_tokens: complete.prompt_tokens(),
-                weight_version: dispatch
-                    .weight_version
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
+                weight_version: response_formatting::effective_weight_version(
+                    complete.weight_version(),
+                    dispatch.weight_version.as_deref(),
+                )
+                .to_string(),
                 input_token_logprobs,
                 output_token_logprobs,
                 completion_tokens: complete.completion_tokens(),
@@ -741,12 +744,13 @@ impl ResponseProcessor {
                 .and_then(|v| v.as_str().map(String::from))
         });
 
-        let stop_reason = if tool_calls.is_some() || finish_reason_str == "tool_calls" {
+        // Parsed calls do not override a truncation, as in Chat.
+        let stop_reason = if finish_reason_str == "length" {
+            Some(messages::StopReason::MaxTokens)
+        } else if tool_calls.is_some() || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if stop_sequence.is_some() {
             Some(messages::StopReason::StopSequence)
-        } else if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
         } else {
             Some(messages::StopReason::EndTurn)
         };
@@ -990,5 +994,70 @@ mod messages_usage_wire_tests {
         assert_eq!(v["output_tokens"], 150);
         assert_eq!(v["cache_creation_input_tokens"], 0);
         assert_eq!(v["cache_read_input_tokens"], 0);
+    }
+}
+
+#[cfg(test)]
+mod responses_finish_reason_tests {
+    use openai_protocol::chat::ChatCompletionRequest;
+    use smg_grpc_client::tokenspeed_proto::GenerateComplete;
+
+    use super::*;
+
+    #[expect(
+        dead_code,
+        reason = "this shared fixture also supports multi-turn MCP tests"
+    )]
+    mod scripted_tokenizer {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/scripted_tokenizer.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parsed_tool_call_preserves_engine_length_finish() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
+            "<tool_call>\n{\"name\":\"user_tool\",\"arguments\":{}}\n</tool_call>",
+        ));
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test-model","messages":[{"role":"user","content":"call the tool"}],
+            "tools":[{"type":"function","function":{"name":"user_tool","parameters":{"type":"object","properties":{}}}}]
+        })).unwrap();
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for (finish, expected) in [("stop", "tool_calls"), ("length", "length")] {
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: finish.into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let choice = processor
+                .process_single_choice(
+                    &complete,
+                    0,
+                    &ChatResponseSpec::from(&request),
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    false,
+                    true,
+                    None,
+                    Some("qwen"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(choice.finish_reason.as_deref(), Some(expected));
+            assert_eq!(choice.message.tool_calls.as_ref().unwrap().len(), 1);
+        }
     }
 }

@@ -3513,27 +3513,8 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
         return Err(e);
     }
 
-    // 4. Validate input items structure
-    if let ResponseInput::Items(items) = &request.input {
-        // Check for at least one valid input message
-        let has_valid_input = items.iter().any(|item| {
-            matches!(
-                item,
-                ResponseInputOutputItem::Message { .. }
-                    | ResponseInputOutputItem::SimpleInputMessage { .. }
-            )
-        });
-
-        if !has_valid_input {
-            let mut e = ValidationError::new("input_missing_user_message");
-            e.message = Some("Input items must contain at least one message".into());
-            return Err(e);
-        }
-    }
-
-    // 5. Validate text format conflicts (for future structured output constraints)
-    // Currently, Responses API doesn't have regex/ebnf like Chat API,
-    // but this is here for completeness and future-proofing
+    // Tool-result-only continuations are valid; validate_response_input checks
+    // individual items without requiring a message already held in history.
 
     Ok(())
 }

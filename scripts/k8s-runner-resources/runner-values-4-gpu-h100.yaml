@@ -71,7 +71,7 @@ template:
 
     containers:
       - name: runner
-        image: fra.ocir.io/idqj093njucb/action-runner:v0.0.3
+        image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
         command:
           - /home/runner/run.sh
         securityContext:
@@ -127,7 +127,7 @@ template:
           - /home/runner/tmpDir/
         command:
           - cp
-        image: fra.ocir.io/idqj093njucb/action-runner:v0.0.3
+        image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
         volumeMounts:
           - mountPath: /home/runner/tmpDir
             name: dind-externals

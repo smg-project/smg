@@ -1,0 +1,233 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ci-node-health-trigger
+  namespace: actions-runner-system
+spec:
+  schedule: "17 * * * *"
+  timeZone: Etc/UTC
+  suspend: false
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Do not retry an ambiguous POST: GitHub may already have accepted it.
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: ci-node-health-trigger
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          volumes:
+            - name: github-app
+              secret:
+                secretName: github-arc-secret
+                defaultMode: 0440
+                items:
+                  - key: github_app_id
+                    path: app-id
+                  - key: github_app_installation_id
+                    path: installation-id
+                  - key: github_app_private_key
+                    path: private-key.pem
+          containers:
+            - name: dispatch
+              image: docker.io/library/ruby:3.3-slim
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: github-app
+                  mountPath: /var/run/github-app
+                  readOnly: true
+              env:
+                # Set to "true" in a one-off test Job to avoid issue changes.
+                - name: DRY_RUN
+                  value: "false"
+                - name: WORKFLOW_REF
+                  value: "main"
+              command: [ruby, -rjson, -rnet/http, -ropenssl, -rbase64, -rtime, -e]
+              args:
+                - |
+                  POOLS = %w[1-gpu-h100 2-gpu-h100 4-gpu-h100 k8s-runner-cpu].freeze
+
+                  def api(method, path, token, body = nil, base: "https://api.github.com", ca_file: nil)
+                    uri = URI("#{base}#{path}")
+                    request = method.new(uri)
+                    request["Authorization"] = "Bearer #{token}"
+                    request["Accept"] = "application/json"
+                    request["Content-Type"] = "application/json"
+                    request["X-GitHub-Api-Version"] = "2026-03-10"
+                    request["User-Agent"] = "smg-ci-node-health-trigger"
+                    request.body = JSON.generate(body) if body
+                    options = {
+                      use_ssl: true, verify_mode: OpenSSL::SSL::VERIFY_PEER,
+                      open_timeout: 10, read_timeout: 30, write_timeout: 30
+                    }
+                    options[:ca_file] = ca_file if ca_file
+                    response = Net::HTTP.start(uri.host, uri.port, **options) do |http|
+                      # Never retry ambiguous writes or log token-bearing response bodies.
+                      http.max_retries = 0
+                      http.request(request)
+                    end
+                    unless response.is_a?(Net::HTTPSuccess)
+                      raise "#{method::METHOD} #{path}: HTTP #{response.code}"
+                    end
+                    response.body.to_s.empty? ? {} : JSON.parse(response.body)
+                  end
+
+                  def summarize_runners(items)
+                    pools = POOLS.to_h { |name| [name, { "name" => name, "failed" => 0, "examples" => [] }] }
+                    items.each do |runner|
+                      metadata = runner.fetch("metadata", {})
+                      labels = metadata.fetch("labels", {})
+                      status = runner.fetch("status", {})
+                      next unless labels["actions.github.com/organization"] == "smg-project" &&
+                                  labels["actions.github.com/repository"] == "smg" && status["phase"] == "Failed"
+                      pool = pools[labels["actions.github.com/scale-set-name"]]
+                      next unless pool
+                      pool["failed"] += 1
+                      next if pool["examples"].length >= 3
+                      pool["examples"] << {
+                        "name" => metadata["name"].to_s[0, 100],
+                        "reason" => status["reason"].to_s[0, 100],
+                        "message" => status["message"].to_s[0, 500]
+                      }
+                    end
+                    pools.values
+                  end
+
+                  def runner_snapshot
+                    directory = "/var/run/secrets/kubernetes.io/serviceaccount"
+                    token = File.read("#{directory}/token").strip
+                    items = []
+                    cursor = nil
+                    seen = []
+                    loop do
+                      params = { limit: 200 }
+                      params[:continue] = cursor if cursor
+                      path = "/apis/actions.github.com/v1alpha1/namespaces/actions-runner-system/" \
+                             "ephemeralrunners?#{URI.encode_www_form(params)}"
+                      page = api(Net::HTTP::Get, path, token, base: "https://kubernetes.default.svc",
+                                 ca_file: "#{directory}/ca.crt")
+                      items.concat(page.fetch("items"))
+                      cursor = page.fetch("metadata", {})["continue"]
+                      break if cursor.nil? || cursor.empty?
+                      raise "Repeated pagination token" if seen.include?(cursor)
+                      seen << cursor
+                    end
+                    { "checked_at" => Time.now.utc.iso8601, "pools" => summarize_runners(items) }
+                  rescue StandardError => error
+                    # Never forward raw objects, response bodies, JIT config or credentials.
+                    { "error" => "Unable to list runner status (#{error.class})" }
+                  end
+
+                  def encode(value)
+                    Base64.urlsafe_encode64(value, padding: false)
+                  end
+
+                  def app_jwt(directory)
+                    app_id = File.read("#{directory}/app-id").strip
+                    key = OpenSSL::PKey::RSA.new(File.read("#{directory}/private-key.pem"))
+                    now = Time.now.to_i
+                    header = encode(JSON.generate(alg: "RS256", typ: "JWT"))
+                    claims = encode(JSON.generate(iat: now - 60, exp: now + 540, iss: app_id))
+                    message = "#{header}.#{claims}"
+                    "#{message}.#{encode(key.sign(OpenSSL::Digest::SHA256.new, message))}"
+                  end
+
+                  def serialize_snapshot(snapshot)
+                    serialized = JSON.generate(snapshot)
+                    # Reserve space below GitHub's 65,535-character workflow input limit.
+                    if serialized.bytesize > 48000
+                      return JSON.generate(error: "Runner snapshot exceeded dispatch size limit")
+                    end
+                    serialized
+                  end
+
+                  def main
+                    snapshot = serialize_snapshot(runner_snapshot)
+                    directory = "/var/run/github-app"
+                    installation = File.read("#{directory}/installation-id").strip
+                    access = api(
+                      Net::HTTP::Post, "/app/installations/#{installation}/access_tokens", app_jwt(directory),
+                      { repositories: ["smg"], permissions: { actions: "write" } }
+                    )
+                    token = access.fetch("token")
+                    begin
+                      result = api(
+                        Net::HTTP::Post, "/repos/smg-project/smg/actions/workflows/ci-node-health.yml/dispatches",
+                        token, {
+                          ref: ENV.fetch("WORKFLOW_REF", "main"),
+                          inputs: { dry_run: ENV.fetch("DRY_RUN", "false"), runner_failures_json: snapshot }
+                        }
+                      )
+                      puts "Dispatch accepted: #{result.fetch('html_url', 'ci-node-health.yml')}"
+                      puts "Runner snapshot: #{snapshot}"
+                    ensure
+                      api(Net::HTTP::Delete, "/installation/token", token)
+                    end
+                  end
+
+                  if $PROGRAM_NAME == __FILE__
+                    begin
+                      main
+                    rescue StandardError => error
+                      # App/API failures deliberately exclude credentials and response bodies.
+                      warn "Trigger failed (#{error.class})"
+                      exit 1
+                    end
+                  end
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-node-health-trigger
+  namespace: actions-runner-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-node-health-trigger
+  namespace: actions-runner-system
+rules:
+  - apiGroups: [actions.github.com]
+    resources: [ephemeralrunners]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-node-health-trigger
+  namespace: actions-runner-system
+subjects:
+  - kind: ServiceAccount
+    name: ci-node-health-trigger
+    namespace: actions-runner-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ci-node-health-trigger

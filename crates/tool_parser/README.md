@@ -17,6 +17,7 @@ Parser library for extracting tool/function calls from LLM model outputs. Suppor
 | `Step3Parser` | Step-3 | `<steptml:function_call>...</steptml:function_call>` |
 | `KimiK2Parser` | Kimi K2 | `<\|tool_call_begin\|>...<\|tool_call_end\|>` |
 | `MinimaxM2Parser` | MiniMax M2 | `<FUNCTION_CALL>{...}</FUNCTION_CALL>` |
+| `HyV4Parser` | Hunyuan v4 (Hy4) | `<tool_calls[:suffix]><tool_call[:suffix]>...<arg_key[:suffix]>...<arg_value[:suffix]>...` |
 | `JsonParser` | OpenAI, Claude, Gemini | Direct JSON tool calls |
 
 ## Usage

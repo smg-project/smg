@@ -22,8 +22,11 @@ from smg_grpc_servicer.tensor_wire import PROTO_DTYPE_MAP
 logger = logging.getLogger(__name__)
 
 # The per-item tensors a decode leg needs besides pixels: the M-RoPE grids and
-# the video timing that goes with them. The router keeps the same set.
-GRID_KEYS = ("image_grid_thw", "video_grid_thw", "second_per_grid_ts")
+# the video timing that goes with them, in both spellings: `second_per_grid_ts`
+# from the Qwen-VL processors, `video_second_per_grid` from the Qwen-Omni
+# family and the router's own processors. The router's VLLM_MROPE_GRID_KEYS
+# mirrors this list.
+GRID_KEYS = ("image_grid_thw", "video_grid_thw", "second_per_grid_ts", "video_second_per_grid")
 
 _MODALITIES = {"image": common_pb2.IMAGE, "video": common_pb2.VIDEO, "audio": common_pb2.AUDIO}
 _WIRE_DTYPES = {dtype: name for name, dtype in PROTO_DTYPE_MAP.items()}

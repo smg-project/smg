@@ -1,0 +1,15 @@
+[
+  {
+    "op": "test",
+    "path": "/spec/versions/0/name",
+    "value": "v1alpha1"
+  },
+  {
+    "op": "add",
+    "path": "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/phase",
+    "value": {
+      "description": "EphemeralRunnerSetPhase is the phase of the ephemeral runner set resource",
+      "type": "string"
+    }
+  }
+]

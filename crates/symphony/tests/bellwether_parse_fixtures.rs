@@ -1,0 +1,1796 @@
+//! Parity with bellwether's parse fixtures.
+//!
+//! bellwether (smg-project/bellwether) records, per model, what a model's output must parse to: the
+//! output text, its token ids, chunk plans, and the reference assistant message from the round trip
+//! through the checkpoint's template. This test replays every Qwen3-8B parse case through the
+//! Qwen3 table ([`qwen3()`]), folds the events into the assistant message with
+//! [`adapt::chat::message`], and compares it with the reference: whole, character by character,
+//! on thirty seeded byte plans, and on the token-level chunk plans bellwether recorded with the
+//! case, each delta carrying its tokens' ids and pieces. Every replay also has to conserve the
+//! output's bytes across its events and agree with the whole one. An output of at most 256 bytes
+//! also replays at every two-way split; past that the set is linear in the output's length, so
+//! a case of any size replays forty-odd times.
+//!
+//! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory of a bellwether
+//! checkout; without it the test prints a skip notice and passes. `SYMPHONY_SAMPLE_EVERY=n`
+//! replays every n-th case of each recorded set, the same slice every run, for a CI job that
+//! cannot afford a benchmark-scale set whole, and the hand-written `common` set whole; a run
+//! that leaves it unset or empty replays every case. A second parity test replays
+//! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
+//! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
+//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves; it
+//! skips the slugs bellwether has not recorded yet, and says so. When a preview run sets
+//! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows the classes of difference the recorded
+//! sets have ([`Allowance`]): a reference argument whose type contradicts the one the tool
+//! declares, which the template writes the same way as the string; reasoning in a reference whose
+//! template writes no thought; calls, or content, in a reference whose template writes content or
+//! calls, not both; a null the template writes no element for; and whitespace at the content's
+//! edges that the template trims. Each is refused at record time by bellwether now, or will be
+//! once the issue named on it lands; each allowed case is counted and printed, and without the
+//! switch the classes fail the run, so they cannot hide anything.
+//!
+//! Two policy questions stand between the parser and bitwise parity, and the test declares them
+//! rather than hides them. Bellwether #17: the template's separator bytes (the newline after
+//! `<think>`, the two after `</think>`) are in the parser's content and reasoning and not in the
+//! reference's; a case that matches once the newlines at both ends are trimmed is counted as
+//! "separators only", and any other whitespace still counts as a difference. Two of
+//! the bitwise cases, the parallel calls, owe their count to the adapter rather than the parser:
+//! there the parser's content is nothing but the separator between the calls, and the adapter's
+//! rule that whitespace-only content is absent folds the difference away before the comparison.
+//! Bellwether #16: two probe cases put marker strings inside text, and the parser reads them as
+//! markers like every marker parser; they are listed in [`KNOWN_DIFFERENCES`] with their reason and
+//! with the call count and finish reason the parser gives, so the list allows that difference and
+//! no other. The run fails on any other difference, when a listed case starts matching, and when a
+//! listed case is no longer among the fixtures, so the list cannot rot. Each replay ends with the
+//! engine finish the reference implies. A second test replays the fixtures' token-level chunk
+//! plans, each delta carrying its tokens' pieces as bellwether records them in `output_pieces`, and
+//! checks that every token is counted once, in the event that carries its first byte.
+
+mod common;
+
+use std::{collections::BTreeMap, fs, path::PathBuf};
+
+use common::{bytes_of, chunkings, prompt, replay, replay_after};
+use openai_protocol::common::Tool;
+use serde::Deserialize;
+use symphony::{
+    adapt,
+    formats::{
+        deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
+        qwen3, seed_oss, xlam,
+    },
+    CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
+    Parser, TokenSpan,
+};
+
+const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
+/// Replay every n-th case of each recorded set, counted from the set's first, when this is set
+/// and not empty: a deterministic slice of a benchmark-scale set, so CI can replay a set of fifty
+/// thousand cases in minutes, and a nightly run, which leaves it unset, replays them all. The
+/// hand-written [`COMMON_SET`] is replayed whole whatever the step. The run says so.
+const SAMPLE_ENV: &str = "SYMPHONY_SAMPLE_EVERY";
+/// The hand-written set in every slug's directory: the probes (bellwether #16) and the parallel
+/// calls, a few cases that a sample must not thin.
+const COMMON_SET: &str = "common";
+/// Up to this many bytes an output is also replayed at every two-way split, which costs as many
+/// replays as it has characters; past it the sampled plans alone keep a case's cost linear in
+/// its size (a 252 KB swebench case took 80 minutes and 13 GB under every split).
+const EVERY_SPLIT_UP_TO: usize = 256;
+const SLUG: &str = "qwen3-8b";
+/// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
+/// the table that reads it and how its template ends the generation prompt. The fixtures carry
+/// the request and the output, not the rendered prompt, so the prompt's tail is stated here until
+/// bellwether records it. A slug bellwether has not recorded is skipped with a notice; `qwen3-8b`
+/// is the one set bellwether's main always holds, and has its own test.
+const MODELS: &[(&str, Family, GenerationPrompt)] = &[
+    // Qwen3: the model writes its own `<think>`; thinking off closes it in the prompt.
+    (
+        "qwen3-8b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-4b-saferl",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-0.6b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-235b-a22b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // The 2507 line, Qwen3-Next and Qwen3-VL split into instruct, with no thought, and thinking,
+    // whose template always opens the thought in the prompt.
+    (
+        "qwen3-4b-instruct-2507",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-30b-a3b-instruct-2507",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-235b-a22b-instruct-2507",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-4b-thinking-2507",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-235b-a22b-thinking-2507",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-next-80b-a3b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-next-80b-a3b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-2b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-4b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-8b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-30b-a3b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-32b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-235b-a22b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-2b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-4b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-8b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-30b-a3b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-32b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-235b-a22b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // Qwen2.5: no thought at all.
+    (
+        "qwen2.5-7b-instruct-1m",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen2.5-14b-instruct-1m",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen2.5-vl-3b-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen2.5-vl-7b-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen2.5-vl-32b-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    ("qwen2.5-omni-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    // Qwen 3.5 and later write calls as tags and open the thought in the prompt; Qwen3-Coder
+    // writes tags and has no thought.
+    // Qwen3.5-0.8B's template has no thought.
+    ("qwen3.5-0.8b", Family::Qwen3Tagged, GenerationPrompt::Plain),
+    // Qwen3.5-2B's opens the thought only when the request asks for it.
+    (
+        "qwen3.5-2b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "qwen3.5-4b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.5-9b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.5-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.5-35b-a3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.5-122b-a10b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.6-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.6-35b-a3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.8-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.8-flash-next",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // Qwen3.8-2.4T-A95B's template opens the thought whatever the request says and raises on a
+    // request that turns thinking off, so bellwether refused those cases ([`REFUSED_PROBES`]).
+    (
+        "qwen3.8-2.4t-a95b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-coder-30b-a3b-instruct",
+        Family::Qwen3Tagged,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-coder-next",
+        Family::Qwen3Tagged,
+        GenerationPrompt::Plain,
+    ),
+    // Qwen-AgentWorld and Qwen-Drive write Qwen 3.5's template (their `chat_template.jinja`):
+    // tagged calls, the thought opened in the prompt. Qwen-Drive's `tokenizer_config.json` carries
+    // an older template without a thought; the recorded outputs follow the former.
+    (
+        "qwen-agentworld-35b-a3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen-drive-1.0-4b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
+    (
+        "deepseek-v4.1-flash",
+        Family::DeepSeekV4_1,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // Kimi K3 writes XTML and opens the thought in the prompt, whatever the request says: its
+    // recorded requests carry no switch. The shared tail adds a newline the template does not
+    // write; it is prompt text inside the thought and moves nothing.
+    (
+        "kimi-k3",
+        Family::KimiK3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // Other families that write Qwen's syntaxes, each as its own template spells the thought.
+    (
+        "webworld-32b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "webworld-14b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "k-exaone-236b-a23b",
+        Family::Qwen3,
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("hermes-4-14b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("granite-4.1-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("ai21-jamba2-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    (
+        "step-3.5-flash",
+        Family::Qwen3Tagged,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "nanbeige4.2-3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "mimo-v2.5",
+        Family::Qwen3Tagged,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "nvidia-nemotron-3-nano-30b-a3b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "seed-oss-36b-instruct",
+        Family::SeedOss,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // Keyed arguments, each family under its own markers; the prompt opens the thought, Hy4's
+    // whatever the request says.
+    (
+        "hy4-preview",
+        Family::Hy4,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "ling-3.0-flash",
+        Family::Ling,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // GLM writes Ling's syntax with nothing between the tags; its prompt opens the thought
+    // whatever the request says (the template has no thinking switch).
+    (
+        "glm-5.3-flash",
+        Family::Glm,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "iquest-q1",
+        Family::IQuest,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // Content and nothing else: templates without a thought or a call syntax, whose parse sets
+    // hold content alone.
+    (
+        "tinyllama-1.1b-chat-v1.0",
+        Family::Plain,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "phi-4-mini-instruct",
+        Family::Plain,
+        GenerationPrompt::Plain,
+    ),
+    // Python calls: Olmo 3 has no thought; LFM2.5 writes its own `<think>`.
+    ("olmo-3-7b-instruct", Family::Olmo3, GenerationPrompt::Plain),
+    (
+        "lfm2.5-1.2b-instruct",
+        Family::Lfm2_5,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // A bare JSON list of calls, or content; no thought.
+    (
+        "llama-xlam-2-8b-fc-r",
+        Family::Xlam,
+        GenerationPrompt::Plain,
+    ),
+    // An XML tree of arguments behind a separator token; the model writes the thought or closes
+    // an empty one, and the generation prompt adds nothing.
+    (
+        "minimax-m3",
+        Family::MinimaxM3,
+        GenerationPrompt::ModelDecides,
+    ),
+];
+
+/// The turn opener a model's own chat template writes, for a model that reads another family's
+/// table: the opener is the template's, not the table's, so the prompt's replay has to start at
+/// the model's own. K-EXAONE writes Qwen3's markers under its own template, Granite 4.1 Qwen2.5's;
+/// every other recorded model renders `<|im_start|>assistant` or its own table's opener. The
+/// replay below feeds only the generation prompt's tail, so it does not check these spellings:
+/// they were measured against the templates' rendered prompts (smg #2841, Alex's probes), and
+/// `formats/qwen3.rs` holds the K-EXAONE shape as a test.
+const OPENERS: &[(&str, &str)] = &[
+    ("k-exaone-236b-a23b", "<|assistant|>"),
+    (
+        "granite-4.1-3b",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
+];
+
+/// The table that reads a checkpoint's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    /// [`qwen3`] with the JSON call syntax.
+    Qwen3,
+    /// [`qwen3`] with the tagged call syntax, typed by the case's request tools.
+    Qwen3Tagged,
+    /// [`qwen2_5`].
+    Qwen2_5,
+    /// [`deepseek_v4_1`]: DSML, whose parameter tags type their own values.
+    DeepSeekV4_1,
+    /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
+    SeedOss,
+    /// [`hy4`], [`ling`], [`iquest`], [`glm`]: keyed arguments, typed by the request tools.
+    Hy4,
+    Ling,
+    IQuest,
+    Glm,
+    /// [`olmo3`], [`lfm2_5`]: Python calls.
+    Olmo3,
+    Lfm2_5,
+    /// [`xlam`]: a bare JSON list of calls.
+    Xlam,
+    /// [`minimax_m3`]: an XML tree of arguments, typed by the request tools at every depth.
+    MinimaxM3,
+    /// [`kimi_k3`]: XTML, whose argument tags name their own values' types.
+    KimiK3,
+    /// [`plain`]: content and nothing else.
+    Plain,
+}
+
+impl Family {
+    /// How the family spells the thought's markers, for the prompt's tail and the reasoning
+    /// allowance's guard.
+    fn think_markers(self) -> (&'static str, &'static str) {
+        match self {
+            Self::SeedOss => ("<seed:think>", "</seed:think>"),
+            Self::Hy4 => ("<think:opensource>", "</think:opensource>"),
+            Self::MinimaxM3 => ("<mm:think>", "</mm:think>"),
+            Self::KimiK3 => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+            _ => ("<think>", "</think>"),
+        }
+    }
+
+    /// The engine for one of the model's cases: the family's table, with the model's own turn
+    /// opener when its template is not the table's ([`OPENERS`]), and the case's tools.
+    fn engine(self, slug: &str, fixture: &Fixture) -> Engine {
+        let mut format = self.format();
+        if let Some((_, opener)) = OPENERS.iter().find(|(model, _)| *model == slug) {
+            format = format.opens_turn(opener);
+        }
+        Engine::new(format, Declared::of(&fixture.request.tools))
+    }
+
+    fn format(self) -> symphony::Format {
+        match self {
+            Self::Qwen3 => qwen3(CallSyntax::Json),
+            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged),
+            Self::Qwen2_5 => qwen2_5(),
+            Self::DeepSeekV4_1 => deepseek_v4_1(),
+            Self::SeedOss => seed_oss(),
+            Self::Hy4 => hy4(),
+            Self::Ling => ling(),
+            Self::Glm => glm(),
+            Self::IQuest => iquest(),
+            Self::Olmo3 => olmo3(),
+            Self::Lfm2_5 => lfm2_5(),
+            Self::Xlam => xlam(),
+            Self::MinimaxM3 => minimax_m3(),
+            Self::KimiK3 => kimi_k3(),
+            Self::Plain => plain(),
+        }
+    }
+
+    /// The probe cases known to differ under this syntax: the code fence holds the JSON syntax,
+    /// which the JSON assembler reads as a call and the tagged one reports as text between a
+    /// call's tags.
+    fn known_differences(self, slug: &str, prompt: GenerationPrompt) -> Vec<KnownDifference> {
+        let list = match self {
+            Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
+            Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
+            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3 and the plain table read neither of the probes'
+            // Qwen markers: `</think>` stays reasoning text and the fenced `<tool_call>` block
+            // stays content, as the reference says.
+            Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam | Self::KimiK3 | Self::Plain => {
+                &[]
+            }
+            // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
+            // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
+            // but not `<tool_call>`.
+            Self::Ling | Self::Glm => KNOWN_TAGGED_DIFFERENCES,
+            Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 => KNOWN_REASONING_PROBE,
+            Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
+        };
+        // A template that writes no thought for the probe's request leaves the reasoning out, so
+        // the marker inside it is never read; that case falls under the reasoning allowance, or
+        // was refused at record time, instead of the list. A probe a template refused outright is
+        // not among the slug's fixtures either.
+        list.iter()
+            .copied()
+            .filter(|known| !prompt.writes_no_thought_unasked() || known.id != REASONING_PROBE.id)
+            .filter(|known| !REFUSED_PROBES.contains(&(slug, known.id)))
+            .collect()
+    }
+
+    /// The corpus classes this syntax meets in sets recorded before bellwether refused them,
+    /// when the run opts in ([`CORPUS_ALLOWANCES_ENV`]): the tagged syntaxes cannot carry a type
+    /// the text does not say, a template without a thought drops the reference's reasoning, four
+    /// Qwen2.5 templates write content or calls, not both, xLAM's writes the calls and drops the
+    /// content beside them, MiniMax M3's writes no element for a null, and Qwen 3.5's trims the
+    /// content's edges.
+    fn allowances(self, slug: &str, prompt: GenerationPrompt) -> Vec<Allowance> {
+        if !corpus_allowances_on() {
+            return Vec::new();
+        }
+        let mut allowed = Vec::new();
+        if matches!(
+            self,
+            Self::Qwen3Tagged | Self::SeedOss | Self::Hy4 | Self::Ling | Self::IQuest | Self::Glm
+        ) {
+            allowed.push(Allowance::DeclaredTypeConflict);
+        }
+        if prompt == GenerationPrompt::Plain {
+            allowed.push(Allowance::ReasoningNotWritten);
+        }
+        if CONTENT_OR_CALLS.contains(&slug) {
+            allowed.push(Allowance::CallsNotWritten);
+        }
+        if self == Self::Xlam {
+            allowed.push(Allowance::ContentNotWritten);
+        }
+        if self == Self::MinimaxM3 {
+            allowed.push(Allowance::DeclaredTypeConflict);
+            allowed.push(Allowance::NullNotWritten);
+        }
+        if self == Self::Qwen3Tagged {
+            allowed.push(Allowance::ContentTrimmed);
+        }
+        allowed
+    }
+}
+
+/// How a template ends the generation prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationPrompt {
+    /// Qwen 3.5 and later: `<think>\n`, so the output starts inside the thought; when the request
+    /// turns thinking off, `<think>\n\n</think>\n\n`, and the output starts in content.
+    OpensTheThought,
+    /// The Qwen3 thinking variants (the 2507 line, Qwen3-Next, Qwen3-VL): `<think>\n` whatever
+    /// the request says; their templates have no switch, so the output always starts inside the
+    /// thought.
+    AlwaysOpensTheThought,
+    /// Qwen3.5-2B: `<think>\n` only when the request turns thinking on (`enable_thinking: true`);
+    /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
+    /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
+    OpensTheThoughtWhenAsked,
+    /// Qwen3: nothing, and the model writes its own `<think>`; thinking off closes it in the
+    /// prompt as above.
+    ModelWritesTheThought,
+    /// Qwen3-Coder, Qwen2.5 and the instruct variants: `<|im_start|>assistant\n` and nothing more;
+    /// the template has no thought.
+    Plain,
+    /// MiniMax M3: nothing, whatever the request says (the template reads `thinking_mode`, which
+    /// the requests do not set), and the template has a thought: the model writes `<mm:think>`
+    /// itself or closes an empty thought with `</mm:think>` at once.
+    ModelDecides,
+}
+
+impl GenerationPrompt {
+    /// The bytes after the assistant header for the case's request, in the family's spelling of
+    /// the thought's markers.
+    fn tail(self, fixture: &Fixture, family: Family) -> String {
+        self.tail_for(&fixture.request, family)
+    }
+
+    fn tail_for(self, request: &Request, family: Family) -> String {
+        let (open, close) = family.think_markers();
+        let opened = format!("{open}\n");
+        let closed = format!("{open}\n\n{close}\n\n");
+        match (self, request.thinking_off()) {
+            (Self::Plain | Self::ModelDecides, _) | (Self::ModelWritesTheThought, false) => {
+                String::new()
+            }
+            (Self::OpensTheThought | Self::ModelWritesTheThought, true) => closed,
+            (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => opened,
+            (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
+            (Self::OpensTheThoughtWhenAsked, _) => closed,
+        }
+    }
+
+    /// Whether the template writes no thought for a request that leaves the switch alone: the
+    /// reasoning probe's does, so its reasoning is not in the output and the case is refused or
+    /// allowed, not listed.
+    fn writes_no_thought_unasked(self) -> bool {
+        matches!(self, Self::Plain | Self::OpensTheThoughtWhenAsked)
+    }
+}
+
+/// The variable a preview run sets to allow the corpus classes below; CI, on sets bellwether
+/// records now, leaves it unset, so a class that comes back fails the run.
+const CORPUS_ALLOWANCES_ENV: &str = "SYMPHONY_CORPUS_ALLOWANCES";
+
+/// Whether the run opted in: the variable is set to anything but `0` or nothing.
+fn corpus_allowances_on() -> bool {
+    std::env::var(CORPUS_ALLOWANCES_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+}
+
+/// The slugs whose template writes a message's content or its calls, not both.
+const CONTENT_OR_CALLS: &[&str] = &[
+    "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-7b-instruct",
+    "qwen2.5-vl-32b-instruct",
+    "qwen2.5-omni-3b",
+];
+
+/// A class of difference the recorded sets have, allowed for what the fixture shows rather than
+/// by id, and only when the run opts in. Each is a case bellwether refuses at record time now, or
+/// will once the issue named on it lands; the sets that hold them were recorded before the rule
+/// that refuses them, and the classes go once those sets are recorded again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Allowance {
+    /// The reference's argument is a boolean, a number or null for a parameter the tool declares
+    /// `string`, so the template writes it as it writes the string, and the parser gives the
+    /// string back, as vLLM does (BFCL declares `smoking_allowed` an enum of `"True"`, `"False"`
+    /// and `"dontcare"` and answers `false`). Bellwether #56 refuses such a case.
+    DeclaredTypeConflict,
+    /// The template writes no thought, so the reasoning the reference carries is not in the output
+    /// (bellwether #52, refused by bellwether #68). Allowed only when the output holds neither of
+    /// the family's thought markers, so a thought the parser lost never passes as one the
+    /// template dropped.
+    ReasoningNotWritten,
+    /// The template writes a message's content or its calls, not both, so the calls the reference
+    /// carries are not in the output: Qwen2.5-VL and Qwen2.5-Omni (bellwether #33's class, refused
+    /// since it merged). Allowed only when the output holds no call marker at all, so a call the
+    /// parser missed never passes as one the template dropped.
+    CallsNotWritten,
+    /// The other half of the same: the template writes the calls and drops the content beside
+    /// them, so the content the reference carries is not in the output: xLAM (bellwether #68
+    /// refuses the case now). Allowed only when the output is the list and nothing else.
+    ContentNotWritten,
+    /// The template writes no element for an argument whose value is null (`if v is not none`),
+    /// so the null the reference carries is not in the output: MiniMax M3. Allowed only when the
+    /// output holds no element of that name, so a null the parser lost never passes as one the
+    /// template dropped; with the declared-type class allowed too, a member of either class
+    /// passes.
+    NullNotWritten,
+    /// The template trims the content's edges (`content | trim` in Qwen 3.5's), so whitespace at
+    /// the edges of the reference's content is not in the output: two Hermes cases of every Qwen
+    /// 3.5 group end their content with a space (bellwether #81). Allowed only when the content the
+    /// parser gives is the reference's trimmed, the output does not carry the untrimmed content,
+    /// and nothing else differs, so a byte the parser lost, inside the content or at its edge,
+    /// never passes as one the template trimmed.
+    ContentTrimmed,
+}
+
+/// A case known to differ from the reference beyond the separator bytes: why, and what the parser
+/// says instead, its call count and finish reason, so that the list allows that difference and no
+/// other. `id` is the case's id after the slug, so one list serves every slug it names.
+#[derive(Clone, Copy)]
+struct KnownDifference {
+    id: &'static str,
+    reason: &'static str,
+    calls: usize,
+    finish: &'static str,
+}
+
+const KNOWN_DIFFERENCES: &[KnownDifference] = &[
+    REASONING_PROBE,
+    KnownDifference {
+        id: "parse/content-with-marker-in-code-fence",
+        reason: "the content holds a complete `<tool_call>` block inside a code fence; the parser makes \
+                 a call of it, as every marker parser does, and the reference keeps it as content \
+                 (bellwether #16)",
+        calls: 1,
+        finish: "tool_calls",
+    },
+];
+
+/// Probe cases bellwether refused for a slug, by the slug and the case's id after it: the listed
+/// difference cannot be among that slug's fixtures, so the check that the list has not rotted
+/// skips it there.
+const REFUSED_PROBES: &[(&str, &str)] = &[
+    // Its template raises on a request that turns thinking off, and the content probe's does.
+    (
+        "qwen3.8-2.4t-a95b",
+        "parse/content-with-marker-in-code-fence",
+    ),
+];
+
+/// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
+/// reads as the thought's end.
+const REASONING_PROBE: KnownDifference = KnownDifference {
+    id: "parse/reasoning-with-marker-text",
+    reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every \
+             marker parser does, and the reference keeps the marker as reasoning text \
+             (bellwether #16)",
+    calls: 0,
+    finish: "stop",
+};
+
+/// The code-fence probe: its content holds a complete `<tool_call>` block inside a code fence,
+/// which every table with that marker reads as a block.
+const FENCE_PROBE: KnownDifference = KnownDifference {
+    id: "parse/content-with-marker-in-code-fence",
+    reason: "the content holds a complete `<tool_call>` block inside a code fence; the parser \
+             reads the block, as every marker parser does, and the reference keeps it as \
+             content (bellwether #16)",
+    calls: 0,
+    finish: "stop",
+};
+
+/// Under the tagged syntax both probes differ.
+const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[REASONING_PROBE, FENCE_PROBE];
+
+/// Under a table that reads `</think>` but not `<tool_call>` (DSML, IQuest), only the reasoning
+/// probe differs: the fence holds Qwen's syntax, which the table never reads as a call, so it is
+/// content, as the reference says.
+const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
+
+/// Under the MiniMax M3 table only the code-fence probe differs: the fence holds `<tool_call>`,
+/// which this table reads as the block's opening, so the JSON inside is text between calls and the
+/// markers are dropped; the reference keeps the fence as content. The reasoning probe's `</think>`
+/// is not this family's marker, so it stays reasoning text, as the reference says.
+const KNOWN_M3_DIFFERENCES: &[KnownDifference] = &[FENCE_PROBE];
+
+/// The case's id after its slug: what [`KnownDifference::id`] names.
+fn after_slug(id: &str) -> &str {
+    id.split_once('/').map_or(id, |(_, rest)| rest)
+}
+
+#[derive(Deserialize)]
+struct Fixture {
+    id: String,
+    #[serde(default)]
+    request: Request,
+    reference: Reference,
+    #[serde(default)]
+    output_ids: Vec<u32>,
+    /// The text each output token contributes under the reference tokenizer's incremental decode;
+    /// absent before bellwether 95f079b.
+    output_pieces: Option<Vec<String>>,
+    /// Chunk sizes in tokens by plan name; `whole` and `per_token` carry none and are derived.
+    #[serde(default)]
+    chunk_plans: BTreeMap<String, Option<Vec<usize>>>,
+}
+
+/// The parts of the case's request the replay needs: the tools, which type a tagged call's values,
+/// and whether the request turned thinking off, which decides the prompt's tail.
+#[derive(Default, Deserialize)]
+struct Request {
+    #[serde(default)]
+    tools: Vec<Tool>,
+    #[serde(default)]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+impl Request {
+    fn thinking_off(&self) -> bool {
+        self.enable_thinking() == Some(false)
+    }
+
+    fn thinking_on(&self) -> bool {
+        self.enable_thinking() == Some(true)
+    }
+
+    fn enable_thinking(&self) -> Option<bool> {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.enable_thinking)
+    }
+}
+
+#[derive(Deserialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct Reference {
+    text: String,
+    message: ReferenceMessage,
+    finish_reason: String,
+}
+
+#[derive(Deserialize)]
+struct ReferenceMessage {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ReferenceCall>,
+}
+
+#[derive(Deserialize)]
+struct ReferenceCall {
+    function: ReferenceFunction,
+}
+
+#[derive(Deserialize)]
+struct ReferenceFunction {
+    name: String,
+    arguments: String,
+}
+
+/// What the parser said an output means, in the terms the reference uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Said {
+    content: Option<String>,
+    reasoning: Option<String>,
+    calls: Vec<(String, String)>,
+    finish: String,
+}
+
+impl Said {
+    fn of(events: &[Event]) -> Self {
+        let choice = adapt::chat::message(0, events);
+        Self {
+            content: choice.message.content,
+            reasoning: choice.message.reasoning_content,
+            calls: choice
+                .message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(|call| {
+                    (
+                        call.function.name,
+                        call.function.arguments.unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            finish: choice.finish_reason.unwrap_or_default(),
+        }
+    }
+
+    fn of_reference(reference: &Reference) -> Self {
+        Self {
+            content: reference.message.content.clone().filter(|c| !c.is_empty()),
+            reasoning: reference.message.reasoning_content.clone(),
+            calls: reference
+                .message
+                .tool_calls
+                .iter()
+                .map(|call| (call.function.name.clone(), call.function.arguments.clone()))
+                .collect(),
+            finish: reference.finish_reason.clone(),
+        }
+    }
+
+    /// The same, with the separator bytes trimmed from content and reasoning (bellwether #17). The
+    /// template's separators are newlines, so only newlines are trimmed: any other whitespace the
+    /// parser kept or lost still counts as a difference.
+    fn trimmed(&self) -> Self {
+        let trim = |part: &Option<String>| {
+            part.as_deref()
+                .map(|text| text.trim_matches('\n'))
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            content: trim(&self.content),
+            reasoning: trim(&self.reasoning),
+            calls: self.calls.clone(),
+            finish: self.finish.clone(),
+        }
+    }
+}
+
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "the skip notice is test diagnostic output"
+)]
+fn qwen3_parse_fixtures_match_the_reference() {
+    let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
+        );
+        return;
+    };
+    let Cases { fixtures, ids } =
+        read_fixtures(&root.join(SLUG).join("parse")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !fixtures.is_empty(),
+        "no parse fixtures under {}",
+        root.display()
+    );
+    let failures = parity(
+        &fixtures,
+        &ids,
+        &|fixture| Family::Qwen3.engine(SLUG, fixture),
+        &|_| String::new(),
+        KNOWN_DIFFERENCES,
+        &[],
+        Family::Qwen3.think_markers(),
+    );
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "the skip notice and the per-case report are test diagnostic output"
+)]
+fn every_recorded_qwen_model_parses_like_its_reference() {
+    let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
+        );
+        return;
+    };
+    let mut failures = Vec::new();
+    let mut recorded = 0;
+    for &(slug, family, prompt) in MODELS {
+        let dir = root.join(slug).join("parse");
+        if !dir.is_dir() {
+            eprintln!("skipping {slug}: bellwether has not recorded its parse sets yet");
+            continue;
+        }
+        let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
+        println!("{slug} ({family:?}, {prompt:?}):");
+        failures.extend(parity(
+            &fixtures,
+            &ids,
+            &|fixture| family.engine(slug, fixture),
+            &|fixture| prompt.tail(fixture, family),
+            &family.known_differences(slug, prompt),
+            &family.allowances(slug, prompt),
+            family.think_markers(),
+        ));
+        recorded += 1;
+    }
+    if recorded == 0 {
+        eprintln!(
+            "skipping: none of the table's slugs is recorded under {}",
+            root.display()
+        );
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
+/// case's `prompt_tail`, on every chunking, prints one line per case, and returns every difference
+/// that neither `known_differences` nor `allowed` allows. `every_id` is the id of every case the
+/// set files hold, before any sample thinned them: a listed difference no longer among them is a
+/// failure too, so the list cannot rot.
+#[expect(
+    clippy::print_stdout,
+    clippy::panic,
+    reason = "the per-case report is diagnostic output; a fixture that cannot be replayed ends \
+              the test with its id"
+)]
+fn parity(
+    fixtures: &[Fixture],
+    every_id: &[String],
+    new_parser: &dyn Fn(&Fixture) -> Engine,
+    prompt_tail: &dyn Fn(&Fixture) -> String,
+    known_differences: &[KnownDifference],
+    allowed: &[Allowance],
+    think_markers: (&str, &str),
+) -> Vec<String> {
+    let known = |id: &str| {
+        known_differences
+            .iter()
+            .find(|known| known.id == after_slug(id))
+    };
+    let mut failures = Vec::new();
+    let (mut bitwise, mut separators_only, mut listed, mut allowed_count) = (0, 0, 0, 0);
+    let (mut token_plans_run, mut without_pieces) = (0, 0);
+    for fixture in fixtures {
+        let text = fixture.reference.text.as_str();
+        let expected = Said::of_reference(&fixture.reference);
+        let finish = engine_finish(&fixture.reference.finish_reason);
+        // The whole replay comes first; every other replay is checked against it as it is made,
+        // so a case holds one `Said` at a time however many plans it has.
+        let plans = chunkings(text, EVERY_SPLIT_UP_TO);
+        let replay_text = |cuts: &[usize], plan: &str| {
+            replay_after(
+                &mut new_parser(fixture),
+                &prompt_tail(fixture),
+                text,
+                cuts,
+                &finish,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{}: {plan} replay: {e}", fixture.id))
+        };
+        let said = checked(
+            fixture,
+            "whole",
+            &replay_text(&plans[0].1, "whole"),
+            &mut failures,
+        );
+        for (plan, cuts) in plans.iter().skip(1) {
+            if checked(fixture, plan, &replay_text(cuts, plan), &mut failures) != said {
+                failures.push(format!(
+                    "{}: the {plan} replay disagrees with the whole one",
+                    fixture.id
+                ));
+            }
+        }
+        // The token plans need the pieces bellwether records with the case: one per id, giving
+        // back the text. A case that lacks them is counted, and one whose pieces are wrong is a
+        // failure of the fixture, not of the parser.
+        let pieces = match fixture.output_pieces.as_deref() {
+            None => {
+                without_pieces += 1;
+                None
+            }
+            Some(pieces) if pieces.len() != fixture.output_ids.len() => {
+                failures.push(format!(
+                    "{}: {} output_pieces for {} output_ids",
+                    fixture.id,
+                    pieces.len(),
+                    fixture.output_ids.len()
+                ));
+                None
+            }
+            Some(pieces) if pieces.concat() != text => {
+                failures.push(format!(
+                    "{}: the output_pieces do not give back the text",
+                    fixture.id
+                ));
+                None
+            }
+            Some(pieces) => Some(pieces),
+        };
+        if let Some(pieces) = pieces {
+            for (name, sizes) in token_plans(fixture) {
+                token_plans_run += 1;
+                let plan = format!("token plan {name}");
+                let events = replay_tokens(
+                    &mut new_parser(fixture),
+                    Input::Prompt {
+                        token_ids: &[],
+                        text: &prompt_tail(fixture),
+                    },
+                    &fixture.output_ids,
+                    pieces,
+                    &sizes,
+                    &finish,
+                )
+                .unwrap_or_else(|e| panic!("{}: {plan} replay: {e}", fixture.id));
+                if checked(fixture, &plan, &events, &mut failures) != said {
+                    failures.push(format!(
+                        "{}: the {plan} replay disagrees with the whole one",
+                        fixture.id
+                    ));
+                }
+            }
+        }
+        let verdict = if said == expected {
+            bitwise += 1;
+            "bitwise"
+        } else if said.trimmed() == expected.trimmed() {
+            separators_only += 1;
+            "separators only (bellwether #17)"
+        } else if let Some(listed_case) = known(&fixture.id) {
+            if said.calls.len() != listed_case.calls || said.finish != listed_case.finish {
+                failures.push(format!(
+                    "{}: listed in KNOWN_DIFFERENCES for {} call(s) and `{}`, but the parser says {} \
+                     call(s) and `{}`",
+                    fixture.id,
+                    listed_case.calls,
+                    listed_case.finish,
+                    said.calls.len(),
+                    said.finish
+                ));
+            }
+            listed += 1;
+            "listed (bellwether #16)"
+        } else if let Some(allowance) =
+            allowance_for(&said, &expected, text, allowed, think_markers)
+        {
+            allowed_count += 1;
+            match allowance {
+                Allowance::DeclaredTypeConflict => "allowed: declared-type conflict (corpus)",
+                Allowance::ReasoningNotWritten => "allowed: reasoning not written (corpus)",
+                Allowance::CallsNotWritten => "allowed: calls not written (corpus)",
+                Allowance::ContentNotWritten => "allowed: content not written (corpus)",
+                Allowance::NullNotWritten => "allowed: null not written (corpus)",
+                Allowance::ContentTrimmed => "allowed: content trimmed (corpus)",
+            }
+        } else {
+            failures.push(format!(
+                "{}: differs from the reference\n    said:      {said:?}\n    reference: {expected:?}",
+                fixture.id
+            ));
+            "DIFFERS"
+        };
+        if known(&fixture.id).is_some() && said.trimmed() == expected.trimmed() {
+            failures.push(format!(
+                "{}: listed in KNOWN_DIFFERENCES but matching the reference now; remove it",
+                fixture.id
+            ));
+        }
+        println!("  {verdict:34} {}", fixture.id);
+        if let Some(listed_case) = known(&fixture.id) {
+            println!("  {:34} {}", "", listed_case.reason);
+        }
+    }
+    // A listed case that is no longer among the fixtures would let the list rot. The check reads
+    // every id the set files hold, before the sample thinned them, so it holds for a sampled run.
+    for listed_case in known_differences {
+        if !every_id.iter().any(|id| after_slug(id) == listed_case.id) {
+            failures.push(format!(
+                "{}: listed in KNOWN_DIFFERENCES but not among the fixtures; remove it",
+                listed_case.id
+            ));
+        }
+    }
+    let sample = sample_note(sample_every());
+    println!(
+        "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, \
+         {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} token plans \
+         replayed, {without_pieces} cases without output_pieces",
+        fixtures.len()
+    );
+    failures
+}
+
+/// The allowance that covers the difference between `said` and `expected`, if one of `allowed`
+/// does: the two agree once the separators are trimmed, except as the allowance says. `text` is
+/// the output, for the allowance that asks what the template wrote.
+fn allowance_for(
+    said: &Said,
+    expected: &Said,
+    text: &str,
+    allowed: &[Allowance],
+    think_markers: (&str, &str),
+) -> Option<Allowance> {
+    let (said, expected) = (said.trimmed(), expected.trimmed());
+    allowed.iter().copied().find(|allowance| match allowance {
+        Allowance::ReasoningNotWritten => {
+            said.reasoning.is_none()
+                && expected.reasoning.is_some()
+                && !text.contains(think_markers.0)
+                && !text.contains(think_markers.1)
+                && Said {
+                    reasoning: None,
+                    ..expected.clone()
+                } == said
+        }
+        Allowance::CallsNotWritten => {
+            said.calls.is_empty()
+                && !expected.calls.is_empty()
+                && !text.contains("<tool_call>")
+                && Said {
+                    calls: Vec::new(),
+                    finish: "stop".to_string(),
+                    ..expected.clone()
+                } == said
+        }
+        Allowance::ContentNotWritten => {
+            said.content.is_none()
+                && expected.content.is_some()
+                && text.trim_start().starts_with('[')
+                && Said {
+                    content: None,
+                    ..expected.clone()
+                } == said
+        }
+        Allowance::DeclaredTypeConflict => {
+            said.content == expected.content
+                && said.reasoning == expected.reasoning
+                && said.finish == expected.finish
+                && said.calls.len() == expected.calls.len()
+                && said.calls.iter().zip(&expected.calls).all(
+                    |((name, arguments), (expected_name, expected_arguments))| {
+                        name == expected_name
+                            && differs_at_most_in_declared_type(arguments, expected_arguments)
+                    },
+                )
+        }
+        Allowance::ContentTrimmed => {
+            let trimmed = expected.content.as_deref().map(str::trim);
+            // The output must not carry the untrimmed content either: then the parser lost the
+            // whitespace, not the template.
+            let template_trimmed = expected
+                .content
+                .as_deref()
+                .is_some_and(|content| !text.contains(content));
+            said.content != expected.content
+                && said.content.as_deref() == trimmed
+                && template_trimmed
+                && Said {
+                    content: said.content.clone(),
+                    ..expected.clone()
+                } == said
+        }
+        Allowance::NullNotWritten => {
+            let types_too = allowed.contains(&Allowance::DeclaredTypeConflict);
+            said.content == expected.content
+                && said.reasoning == expected.reasoning
+                && said.finish == expected.finish
+                && said.calls.len() == expected.calls.len()
+                && said.calls.iter().zip(&expected.calls).all(
+                    |((name, arguments), (expected_name, expected_arguments))| {
+                        name == expected_name
+                            && differs_at_most_in_null_members(
+                                arguments,
+                                expected_arguments,
+                                text,
+                                types_too,
+                            )
+                    },
+                )
+        }
+    })
+}
+
+#[test]
+fn a_content_the_template_trimmed_is_allowed_and_nothing_else_is() {
+    let markers = ("<think>", "</think>");
+    let allowed = [Allowance::ContentTrimmed];
+    let expected = Said {
+        content: Some("Done. ".to_string()),
+        reasoning: None,
+        calls: Vec::new(),
+        finish: "stop".to_string(),
+    };
+    let trimmed = Said {
+        content: Some("Done.".to_string()),
+        ..expected.clone()
+    };
+    assert!(
+        allowance_for(&trimmed, &expected, "Done.", &allowed, markers)
+            == Some(Allowance::ContentTrimmed)
+    );
+    // A byte lost inside the content is not trimming, and neither is a call beside it.
+    let lost = Said {
+        content: Some("Done".to_string()),
+        ..expected.clone()
+    };
+    assert!(allowance_for(&lost, &expected, "Done", &allowed, markers).is_none());
+    let with_call = Said {
+        calls: vec![("f".to_string(), "{}".to_string())],
+        ..trimmed.clone()
+    };
+    assert!(allowance_for(&with_call, &expected, "Done.", &allowed, markers).is_none());
+    // Whitespace the output carries was the parser's to keep, not the template's to trim.
+    assert!(allowance_for(&trimmed, &expected, "Done. ", &allowed, markers).is_none());
+    // Without the allowance, the trimmed content is a difference.
+    assert!(allowance_for(&trimmed, &expected, "Done.", &[], markers).is_none());
+}
+
+/// Whether `said` is `expected` less the members whose value is null, none of which the output
+/// `text` writes an element for; with `types_too`, a member that differs only in its declared
+/// type's spelling passes as well.
+fn differs_at_most_in_null_members(
+    said: &str,
+    expected: &str,
+    text: &str,
+    types_too: bool,
+) -> bool {
+    let (Ok(said), Ok(expected)) = (
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(said),
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(expected),
+    ) else {
+        return false;
+    };
+    if !said.keys().all(|key| expected.contains_key(key)) {
+        return false;
+    }
+    for (key, reference) in &expected {
+        match said.get(key) {
+            Some(value) if value == reference => {}
+            Some(serde_json::Value::String(spelled)) if types_too && !reference.is_string() => {
+                if ![reference.to_string(), python_spelling(reference)].contains(spelled) {
+                    return false;
+                }
+            }
+            Some(_) => return false,
+            None => {
+                if !reference.is_null() || text.contains(&format!("<{key}>")) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Whether two arguments objects differ at most in members where `said` holds a string spelling
+/// the value `expected` holds, in JSON or as Python writes it. The caller knows the two messages
+/// differ somewhere; a call of theirs that is the same on both sides passes.
+fn differs_at_most_in_declared_type(said: &str, expected: &str) -> bool {
+    let (Ok(said), Ok(expected)) = (
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(said),
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(expected),
+    ) else {
+        return false;
+    };
+    if said.len() != expected.len() || said.keys().ne(expected.keys()) {
+        return false;
+    }
+    for (key, value) in &said {
+        let reference = &expected[key];
+        if value == reference {
+            continue;
+        }
+        let spelled_the_same = match (value, reference) {
+            (serde_json::Value::String(text), reference) if !reference.is_string() => {
+                [reference.to_string(), python_spelling(reference)].contains(text)
+            }
+            _ => false,
+        };
+        if !spelled_the_same {
+            return false;
+        }
+    }
+    true
+}
+
+/// How Qwen 3.5's and Qwen3-Coder's templates write a boolean or null: Python's spelling.
+fn python_spelling(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Bool(true) => "True".to_string(),
+        serde_json::Value::Bool(false) => "False".to_string(),
+        serde_json::Value::Null => "None".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The engine's finish for a reference's finish reason. The adapter turns `stop` after a call into
+/// `tool_calls`, so only a truncation needs its own engine reason.
+fn engine_finish(reference: &str) -> EngineFinish {
+    match reference {
+        "length" => EngineFinish::Length,
+        _ => EngineFinish::Stop,
+    }
+}
+
+#[test]
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "the skip notice and the summary are test diagnostic output"
+)]
+fn qwen3_token_plans_count_every_token_where_its_first_byte_lands() {
+    let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
+        );
+        return;
+    };
+    let Cases { fixtures, .. } =
+        read_fixtures(&root.join(SLUG).join("parse")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !fixtures.is_empty(),
+        "no parse fixtures under {}",
+        root.display()
+    );
+    let (mut plans_run, mut tokens_counted, mut reasoning_counted) = (0, 0, 0);
+    for fixture in &fixtures {
+        let pieces = fixture.output_pieces.as_deref().unwrap_or_else(|| {
+            panic!(
+                "{}: no output_pieces; these fixtures predate bellwether 95f079b",
+                fixture.id
+            )
+        });
+        let text = fixture.reference.text.as_str();
+        assert_eq!(
+            pieces.len(),
+            fixture.output_ids.len(),
+            "{}: one piece per id",
+            fixture.id
+        );
+        assert_eq!(
+            pieces.concat(),
+            text,
+            "{}: the pieces give back the text",
+            fixture.id
+        );
+        let starts = token_starts(pieces);
+        let expected_reasoning = reasoning_oracle(text, &starts);
+        let finish = engine_finish(&fixture.reference.finish_reason);
+        let by_text = Said::of(
+            &replay(
+                &mut Engine::new(qwen3(CallSyntax::Json), Declared::default()),
+                text,
+                &[],
+                &finish,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", fixture.id)),
+        );
+        for (name, sizes) in token_plans(fixture) {
+            let place = format!("{} plan {name}", fixture.id);
+            let events = replay_tokens(
+                &mut Engine::new(qwen3(CallSyntax::Json), Declared::default()),
+                prompt(),
+                &fixture.output_ids,
+                pieces,
+                &sizes,
+                &finish,
+            )
+            .unwrap_or_else(|e| panic!("{place}: {e}"));
+            let conserved: String = events.iter().map(bytes_of).collect();
+            assert_eq!(conserved, text, "{place}: bytes conserved");
+            let mut at = 0;
+            let mut total = 0;
+            for event in &events {
+                if matches!(
+                    event,
+                    Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. }
+                ) {
+                    continue;
+                }
+                let tokens = tokens_of(event)
+                    .unwrap_or_else(|| panic!("{place}: uncounted {event:?}"))
+                    as usize;
+                let length = bytes_of(event).len();
+                let expected = match event {
+                    // Tokens left without bytes at the end are reported once, after the text.
+                    Event::Dropped {
+                        why: DropReason::ControlToken,
+                        ..
+                    } if length == 0 => starts.iter().filter(|&&start| start >= text.len()).count(),
+                    _ => starts
+                        .iter()
+                        .filter(|&&start| start >= at && start < at + length)
+                        .count(),
+                };
+                assert_eq!(tokens, expected, "{place}: {event:?} at byte {at}");
+                at += length;
+                total += tokens;
+            }
+            assert_eq!(
+                total,
+                fixture.output_ids.len(),
+                "{place}: every token counted once"
+            );
+            let Some(Event::Finish {
+                reasoning_tokens, ..
+            }) = events.last()
+            else {
+                panic!("{place}: Finish is last");
+            };
+            assert_eq!(
+                *reasoning_tokens as usize, expected_reasoning,
+                "{place}: the reasoning tokens"
+            );
+            assert_eq!(
+                Said::of(&events),
+                by_text,
+                "{place}: says what the text replay says"
+            );
+            plans_run += 1;
+            tokens_counted += total;
+            reasoning_counted += expected_reasoning;
+        }
+    }
+    println!(
+        "{} cases{}, {plans_run} token plans, {tokens_counted} tokens counted, \
+         {reasoning_counted} of them reasoning",
+        fixtures.len(),
+        sample_note(sample_every())
+    );
+}
+
+/// Every token plan the fixture records, as chunk sizes in tokens: `whole` and `per_token` derived,
+/// the others as recorded.
+fn token_plans(fixture: &Fixture) -> Vec<(String, Vec<usize>)> {
+    let count = fixture.output_ids.len();
+    fixture
+        .chunk_plans
+        .iter()
+        .map(|(name, sizes)| {
+            let sizes = match (name.as_str(), sizes) {
+                (_, Some(sizes)) => sizes.clone(),
+                ("per_token", None) => vec![1; count],
+                (_, None) => vec![count],
+            };
+            (name.clone(), sizes)
+        })
+        .collect()
+}
+
+/// Where each token's text starts in the output. A token whose piece is empty starts where the
+/// next byte is, so it counts with the text that follows it.
+fn token_starts(pieces: &[String]) -> Vec<usize> {
+    let mut at = 0;
+    pieces
+        .iter()
+        .map(|piece| {
+            let start = at;
+            at += piece.len();
+            start
+        })
+        .collect()
+}
+
+/// How many tokens start inside the first reasoning region of `text`: after the first `<think>`
+/// and before the `</think>` that follows it, or the end. Found by searching the text, not by the
+/// parser, so it checks the parser's count.
+fn reasoning_oracle(text: &str, starts: &[usize]) -> usize {
+    let Some(open) = text.find("<think>") else {
+        return 0;
+    };
+    let from = open + "<think>".len();
+    let to = text[from..]
+        .find("</think>")
+        .map_or(text.len(), |at| from + at);
+    starts
+        .iter()
+        .filter(|&&start| start >= from && start < to)
+        .count()
+}
+
+/// One replay's events checked: every output byte in exactly one event, and the calls indexed
+/// and named in order; what it said, for the comparison with the whole replay.
+fn checked(fixture: &Fixture, plan: &str, events: &[Event], failures: &mut Vec<String>) -> Said {
+    let conserved: String = events.iter().map(bytes_of).collect();
+    if conserved != fixture.reference.text {
+        failures.push(format!(
+            "{}: bytes not conserved on the {plan} replay",
+            fixture.id
+        ));
+    }
+    let mut index = 0;
+    for event in events {
+        if let Event::ToolCallStart { index: i, id, .. } = event {
+            if *i != index || *id != format!("call_{index}") {
+                failures.push(format!(
+                    "{}: call index {i} / id {id} on the {plan} replay",
+                    fixture.id
+                ));
+            }
+            index += 1;
+        }
+    }
+    Said::of(events)
+}
+
+/// Feed the output token by token as the plan `sizes` groups them, each delta carrying its tokens'
+/// ids and the span of each token's piece, after `prompt`, then the end with the engine's
+/// `finish`.
+fn replay_tokens(
+    parser: &mut dyn Parser,
+    prompt: Input<'_>,
+    ids: &[u32],
+    pieces: &[String],
+    sizes: &[usize],
+    finish: &EngineFinish,
+) -> Result<Vec<Event>, ParseError> {
+    let mut out = Events::new();
+    parser.feed(prompt, &mut out)?;
+    let mut first = 0;
+    for &size in sizes {
+        let last = (first + size).min(ids.len());
+        let mut text = String::new();
+        let mut spans = Vec::with_capacity(last - first);
+        for (offset, piece) in pieces[first..last].iter().enumerate() {
+            spans.push(TokenSpan {
+                token_id: ids[first + offset],
+                start: text.len(),
+                end: text.len() + piece.len(),
+                continued: false,
+            });
+            text.push_str(piece);
+        }
+        parser.feed(
+            Input::Delta {
+                token_ids: &ids[first..last],
+                text: &text,
+                spans: &spans,
+            },
+            &mut out,
+        )?;
+        first = last;
+    }
+    parser.feed(
+        Input::End {
+            finish: finish.clone(),
+        },
+        &mut out,
+    )?;
+    Ok(out.drain())
+}
+
+fn tokens_of(event: &Event) -> Option<u32> {
+    match event {
+        Event::Content(t) | Event::Reasoning(t) => t.tokens,
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.tokens,
+        Event::ToolCallStart { source, .. }
+        | Event::ToolCallArguments { source, .. }
+        | Event::ToolCallEnd { source, .. } => source.tokens,
+        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => None,
+    }
+}
+
+/// The sample's step from [`SAMPLE_ENV`]: 1 when it is unset or empty, as the allowances switch
+/// reads an empty value as off. A value that is not a positive integer is a mistake in the run's
+/// setup, not a smaller sample.
+fn sample_every() -> usize {
+    sample_step(std::env::var(SAMPLE_ENV).ok().as_deref())
+}
+
+/// [`sample_every`]'s reading of the variable's value.
+fn sample_step(value: Option<&str>) -> usize {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return 1;
+    };
+    let every: usize = value.parse().unwrap_or(0);
+    assert!(
+        every > 0,
+        "{SAMPLE_ENV}={value:?} is not a positive integer"
+    );
+    every
+}
+
+/// What a run's summary says of its sample: nothing for a whole run.
+fn sample_note(every: usize) -> String {
+    match every {
+        1 => String::new(),
+        every => {
+            format!(" (1 in {every} cases of each recorded set, {COMMON_SET} whole, {SAMPLE_ENV})")
+        }
+    }
+}
+
+/// The step for one set's file: the hand-written [`COMMON_SET`] is never thinned.
+fn step_for(file: &std::path::Path, every: usize) -> usize {
+    if file.file_stem().is_some_and(|stem| stem == COMMON_SET) {
+        1
+    } else {
+        every
+    }
+}
+
+/// Every `every`-th of `items`, the first included: the same slice of a set every run.
+fn sampled<T>(items: Vec<T>, every: usize) -> Vec<T> {
+    items.into_iter().step_by(every.max(1)).collect()
+}
+
+/// The cases a slug's set files gave.
+struct Cases {
+    /// The cases to replay, in the files' order, each recorded set sampled by [`SAMPLE_ENV`] and
+    /// the [`COMMON_SET`] whole.
+    fixtures: Vec<Fixture>,
+    /// Every case's id, in the same order, before the sample thinned them: what the check that a
+    /// listed difference is still among the cases reads, so that a sample never fails it.
+    ids: Vec<String>,
+}
+
+/// Reads every `.jsonl` set under `dir`, in the files' order, into [`Cases`].
+fn read_fixtures(dir: &std::path::Path) -> Result<Cases, String> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    files.sort();
+    let every = sample_every();
+    let mut fixtures = Vec::new();
+    let mut ids = Vec::new();
+    for file in files {
+        let text = fs::read_to_string(&file)
+            .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+        let mut of_this_set = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let fixture: Fixture = serde_json::from_str(line)
+                .map_err(|e| format!("{}:{}: {e}", file.display(), number + 1))?;
+            of_this_set.push(fixture);
+        }
+        ids.extend(of_this_set.iter().map(|fixture| fixture.id.clone()));
+        fixtures.extend(sampled(of_this_set, step_for(&file, every)));
+    }
+    Ok(Cases { fixtures, ids })
+}
+
+#[test]
+fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
+    let request = |kwargs: &str| -> Request {
+        serde_json::from_str(&format!("{{\"chat_template_kwargs\": {kwargs}}}")).expect("a request")
+    };
+    let when_asked = GenerationPrompt::OpensTheThoughtWhenAsked;
+    assert_eq!(
+        when_asked.tail_for(&request("{\"enable_thinking\": true}"), Family::Qwen3Tagged),
+        "<think>\n"
+    );
+    for unasked in ["{\"enable_thinking\": false}", "{}", "null"] {
+        assert_eq!(
+            when_asked.tail_for(&request(unasked), Family::Qwen3Tagged),
+            "<think>\n\n</think>\n\n",
+            "{unasked}"
+        );
+    }
+    // The default-on variant reads the same requests the other way round.
+    assert_eq!(
+        GenerationPrompt::OpensTheThought.tail_for(&request("null"), Family::Qwen3Tagged),
+        "<think>\n"
+    );
+    // A slug whose template refused a probe does not list it.
+    let listed: Vec<&str> = Family::Qwen3Tagged
+        .known_differences("qwen3.8-2.4t-a95b", GenerationPrompt::AlwaysOpensTheThought)
+        .iter()
+        .map(|known| known.id)
+        .collect();
+    assert_eq!(listed, [REASONING_PROBE.id]);
+    assert!(Family::Qwen3Tagged
+        .known_differences("qwen3.5-2b", when_asked)
+        .iter()
+        .all(|known| known.id != REASONING_PROBE.id));
+}
+
+#[test]
+fn a_sample_keeps_every_nth_case_of_a_set_from_its_first() {
+    assert_eq!(sampled((0..10).collect::<Vec<_>>(), 3), [0, 3, 6, 9]);
+    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 1), [0, 1, 2, 3]);
+    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 10), [0]);
+    assert!(sampled(Vec::<u8>::new(), 2).is_empty());
+}
+
+#[test]
+fn the_sample_step_is_one_when_the_variable_is_unset_or_empty() {
+    assert_eq!(sample_step(None), 1);
+    assert_eq!(sample_step(Some("")), 1);
+    assert_eq!(sample_step(Some("10")), 10);
+}
+
+#[test]
+fn a_summary_names_its_sample_and_a_whole_run_says_nothing() {
+    assert_eq!(sample_note(1), "");
+    assert_eq!(
+        sample_note(2),
+        " (1 in 2 cases of each recorded set, common whole, SYMPHONY_SAMPLE_EVERY)"
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not a positive integer")]
+fn a_sample_step_that_is_not_a_positive_integer_is_refused() {
+    sample_step(Some("0"));
+}
+
+#[test]
+fn the_common_set_is_replayed_whole_whatever_the_step() {
+    let parse = std::path::Path::new("fixtures/qwen3-8b/parse");
+    assert_eq!(step_for(&parse.join("common.jsonl"), 10), 1);
+    assert_eq!(step_for(&parse.join("gsm8k-test-content.jsonl"), 10), 10);
+}

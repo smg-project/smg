@@ -46,3 +46,6 @@ pub use qwen::QwenParser;
 pub use qwen_xml::QwenXmlParser;
 pub use sarashina::SarashinaParser;
 pub use step3::Step3Parser;
+
+pub mod hy_v4;
+pub use hy_v4::HyV4Parser;

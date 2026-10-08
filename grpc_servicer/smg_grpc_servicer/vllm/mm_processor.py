@@ -54,6 +54,7 @@ from smg_grpc_servicer.vllm.media_refs import (
 logger = logging.getLogger(__name__)
 
 ENV_PROCESSOR = "SMG_VLLM_MM_PROCESSOR"
+PROCESSOR_FLAG = "--mm-processor"
 ENV_MAX_INFLIGHT = "SMG_VLLM_MM_MAX_INFLIGHT"
 ENV_MAX_ITEM_BYTES = "SMG_VLLM_MM_MAX_ITEM_BYTES"
 ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
@@ -61,7 +62,9 @@ ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
 MODE_OFF = "off"
 MODE_INPROCESS = "inprocess"
 MODE_REDIS = "redis"
-VALID_MODES = (MODE_OFF, MODE_INPROCESS, MODE_REDIS)
+# smg's own media pipeline, inside the Rust servicer only.
+MODE_SMG = "smg"
+VALID_MODES = (MODE_OFF, MODE_INPROCESS, MODE_REDIS, MODE_SMG)
 
 DEFAULT_MAX_INFLIGHT = 64
 DEFAULT_MAX_ITEM_BYTES = 32 * 1024 * 1024
@@ -79,7 +82,9 @@ class MmProcessorUnavailable(Exception):
 def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
     raw = (env.get(ENV_PROCESSOR) or MODE_OFF).strip().lower()
     if raw not in VALID_MODES:
-        raise ValueError(f"{ENV_PROCESSOR}={raw!r} is not one of {'|'.join(VALID_MODES)}")
+        raise ValueError(
+            f"{PROCESSOR_FLAG} / {ENV_PROCESSOR}={raw!r} is not one of {'|'.join(VALID_MODES)}"
+        )
     return raw
 
 
@@ -131,15 +136,24 @@ def clamp_video_frames(
     """vLLM's media kwargs with the video frame count capped at `max_frames`.
 
     A copy: the engine config keeps its own value. `default_frames` is what vLLM
-    samples when the kwargs set nothing; unknown, the budget itself is used. A
-    non-positive count means every frame to vLLM, so it is capped as well.
+    samples when the kwargs set nothing; unknown, and nothing set, sampling is
+    left alone, since a maximum must never raise it. A non-positive count means
+    every frame to vLLM, so it is capped as well.
     """
     if max_frames <= 0:
         return media_io_kwargs
     kwargs = dict(media_io_kwargs or {})
     video = dict(kwargs.get("video") or {})
     current = video.get("num_frames", default_frames)
-    unbounded = current is None or int(current) <= 0
+    if current is None:
+        logger.warning(
+            "%s=%d not applied: vLLM's default video frame count is unknown and "
+            "media_io_kwargs sets none; sampling is left as vLLM decides",
+            ENV_MAX_VIDEO_FRAMES,
+            max_frames,
+        )
+        return media_io_kwargs
+    unbounded = int(current) <= 0
     video["num_frames"] = max_frames if unbounded else min(int(current), max_frames)
     kwargs["video"] = video
     return kwargs
@@ -148,10 +162,12 @@ def clamp_video_frames(
 def vllm_default_video_frames() -> int | None:
     """The frame count vLLM's video loader falls back to."""
     try:
-        from vllm.multimodal.video import VideoMediaIO
+        # Re-exported from vllm.multimodal.media.video; vllm.multimodal.video
+        # is not a module on the vLLM this servicer targets.
+        from vllm.multimodal.media import VideoMediaIO
 
         default = inspect.signature(VideoMediaIO.__init__).parameters["num_frames"].default
-    except Exception:  # noqa: BLE001 - an unknown default is capped to the budget itself
+    except Exception:  # noqa: BLE001 - an unknown default leaves sampling untouched
         return None
     return default if isinstance(default, int) else None
 
@@ -207,11 +223,11 @@ def _require_inprocess_apis(engine) -> None:
             get_video_processor_cls_name,
         )
     except ImportError as e:
-        raise ValueError(f"{ENV_PROCESSOR}=inprocess needs vllm>={MIN_VLLM_VERSION} ({e})") from e
+        raise ValueError(f"{PROCESSOR_FLAG}=inprocess needs vllm>={MIN_VLLM_VERSION} ({e})") from e
     process = getattr(getattr(engine, "renderer", None), "process_for_engine_async", None)
     if process is None or "skip_mm_cache" not in inspect.signature(process).parameters:
         raise ValueError(
-            f"{ENV_PROCESSOR}=inprocess needs vllm>={MIN_VLLM_VERSION} "
+            f"{PROCESSOR_FLAG}=inprocess needs vllm>={MIN_VLLM_VERSION} "
             f"(installed {vllm.__version__}: renderer.process_for_engine_async lacks skip_mm_cache)"
         )
 
@@ -261,7 +277,7 @@ class InProcessMediaProcessor:
             logger.warning(
                 "%s=inprocess with no --allowed-media-domains: this worker will fetch media "
                 "from any host the router forwards",
-                ENV_PROCESSOR,
+                PROCESSOR_FLAG,
             )
 
     async def probe(self) -> bool:
@@ -615,7 +631,7 @@ def _redis_client(redis_url: str):
         import redis.asyncio as redis_asyncio
     except ImportError as e:
         raise ValueError(
-            f"{ENV_PROCESSOR}=redis requires the redis client: "
+            f"{PROCESSOR_FLAG}=redis requires the redis client: "
             "pip install smg-grpc-servicer[vllm,vllm-redis]"
         ) from e
 
@@ -767,6 +783,12 @@ def build_mm_processor(
     mode = resolved.processor
     if mode == MODE_OFF:
         return None
+    if mode == MODE_SMG:
+        raise ValueError(
+            f"{PROCESSOR_FLAG}={MODE_SMG} is smg's own media pipeline, which runs inside the "
+            "Rust servicer (--servicer-impl rust / SMG_VLLM_SERVICER_IMPL=rust); the Python "
+            f"servicer serves {MODE_INPROCESS} or {MODE_REDIS}"
+        )
     model_config = getattr(engine, "model_config", None)
     if model_config is None or not getattr(model_config, "is_multimodal_model", False):
         logger.warning("mm_processor=%s ignored: the served model is not multimodal", mode)

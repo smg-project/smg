@@ -5,14 +5,15 @@
 //! shapes, field order, and `array_like` positional-tuple encoding are the wire
 //! contract with Python `EngineCoreProc` — do not reorder fields.
 //!
-//! Text generation, structured outputs (guided decoding), and multimodal
-//! features are typed fully. Pooling params and prompt embeds are carried as
-//! [`crate::codec::OpaqueValue`] — they serialize as `nil` on supported paths.
+//! Text generation, structured outputs (guided decoding), multimodal features
+//! and pooling (embedding) requests are typed fully. Prompt embeds are carried
+//! as [`crate::codec::OpaqueValue`] — they serialize as `nil` on supported paths.
 
 pub mod logprobs;
 pub mod lora;
 pub mod multimodal;
 pub mod output;
+pub mod pooling;
 pub mod request;
 pub mod sampling;
 pub mod stats;
@@ -21,17 +22,17 @@ pub mod structured_outputs;
 use bytes::Bytes;
 
 use crate::{
-    codec::encode_msgpack,
+    codec::{encode_msgpack, OpaqueValue},
     error::Result,
     protocol::{
         vllm::{
             output::{
                 decode_engine_core_outputs, DpControlMessage, EngineCoreOutput, EngineCoreOutputs,
             },
-            request::{EngineCoreRequest, EngineCoreRequestType},
+            request::{EngineCoreRequest, EngineCoreRequestType, UtilityCall},
             stats::SchedulerStats,
         },
-        EngineBatch, EngineLoad, EngineOutput, EngineProtocol, WaveEvent,
+        EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
     },
 };
 
@@ -105,10 +106,28 @@ impl EngineProtocol for VllmProtocol {
         )))
     }
 
+    fn encode_utility(
+        call_id: i64,
+        method: &str,
+        args: &[OpaqueValue],
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        // Framed `[engine, UTILITY, (client_index, call_id, method, args)]`,
+        // as vLLM's `AsyncMPClient._call_utility_async` sends it; this client
+        // has one output socket, so `client_index` is 0.
+        Ok(Some((
+            EngineCoreRequestType::Utility.to_frame(),
+            encode_msgpack(&UtilityCall {
+                client_index: 0,
+                call_id,
+                method: method.to_string(),
+                args: args.to_vec(),
+            })?,
+        )))
+    }
+
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
-        // vLLM multiplexes request batches, utility RPCs, and DP control on one
-        // wire struct; only request batches carry per-request outputs (utility
-        // results surface as an empty batch the dispatcher ignores).
+        // vLLM multiplexes request batches, utility replies, and DP control on
+        // one wire struct; each lands in its own slot of the batch.
         match decode_engine_core_outputs(frames)? {
             EngineCoreOutputs::RequestBatch(batch) => Ok(EngineBatch {
                 engine_index: batch.engine_index,
@@ -119,6 +138,7 @@ impl EngineProtocol for VllmProtocol {
                     .unwrap_or_default(),
                 load: batch.scheduler_stats.map(|stats| EngineLoad::from(*stats)),
                 wave: None,
+                utility: None,
             }),
             EngineCoreOutputs::DpControl(control) => Ok(EngineBatch {
                 engine_index: control.engine_index,
@@ -128,7 +148,14 @@ impl EngineProtocol for VllmProtocol {
                 }),
                 ..EngineBatch::default()
             }),
-            EngineCoreOutputs::Utility(_) => Ok(EngineBatch::default()),
+            EngineCoreOutputs::Utility(reply) => Ok(EngineBatch {
+                engine_index: reply.engine_index,
+                utility: Some(UtilityReply {
+                    call_id: reply.output.call_id,
+                    outcome: reply.output.into_outcome(),
+                }),
+                ..EngineBatch::default()
+            }),
         }
     }
 }

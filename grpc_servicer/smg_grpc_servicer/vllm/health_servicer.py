@@ -12,6 +12,12 @@ import grpc
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 from vllm.logger import init_logger
 
+# The launcher imports this module before it defines serve_grpc: the moment
+# the servicer switch has to be in place (see launcher_switch).
+from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
+
+install_launcher_switch()
+
 if TYPE_CHECKING:
     from vllm.v1.engine.async_llm import AsyncLLM
 

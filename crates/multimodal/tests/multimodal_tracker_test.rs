@@ -74,8 +74,8 @@ async fn fetch_image_from_inline_bytes() {
         )
         .await
         .expect("inline image");
-    assert_eq!(frame.data().width(), 1);
-    assert_eq!(frame.data().height(), 1);
+    assert_eq!(frame.size().width, 1);
+    assert_eq!(frame.size().height, 1);
     assert_eq!(frame.raw_bytes(), bytes.as_slice());
 }
 
@@ -92,7 +92,7 @@ async fn fetch_image_from_data_url() {
         .fetch_image(MediaSource::DataUrl(data_url), ImageFetchConfig::default())
         .await
         .expect("data url");
-    assert_eq!(frame.data().width(), 1);
+    assert_eq!(frame.size().width, 1);
     assert_eq!(frame.raw_bytes(), bytes.as_slice());
 }
 
@@ -111,7 +111,7 @@ async fn fetch_image_from_file() {
         )
         .await
         .expect("file png");
-    assert_eq!(frame.data().width(), 1);
+    assert_eq!(frame.size().width, 1);
     let expected = std::fs::canonicalize(&file_path).expect("canonical path");
     match frame.source() {
         ImageSource::File { path } => assert_eq!(path, &expected),

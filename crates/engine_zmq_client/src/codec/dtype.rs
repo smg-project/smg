@@ -4,6 +4,7 @@
 use std::io::Cursor;
 
 use byteorder::{BigEndian, LittleEndian, NativeEndian, ReadBytesExt};
+use half::{bf16, f16};
 
 use crate::error::{Error, Result};
 
@@ -28,20 +29,25 @@ impl ModelDtype {
     }
 }
 
-/// The scalar element type of a wire ndarray, parsed from its numpy dtype string.
+/// The scalar element type of a wire ndarray/tensor, parsed from its dtype
+/// string (numpy `dtype.str` for ndarrays, `torch.<dtype>` names for tensors).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {
     I32,
     I64,
+    F16,
+    BF16,
     F32,
+    F64,
 }
 
 impl ScalarType {
     /// Size in bytes of one element.
     pub fn element_size(self) -> usize {
         match self {
+            Self::F16 | Self::BF16 => 2,
             Self::I32 | Self::F32 => 4,
-            Self::I64 => 8,
+            Self::I64 | Self::F64 => 8,
         }
     }
 }
@@ -67,7 +73,11 @@ pub fn parse_dtype(dtype: &str, field: &str) -> Result<(ScalarType, Endianness)>
     let scalar = match body {
         "i4" | "int32" => ScalarType::I32,
         "i8" | "int64" => ScalarType::I64,
+        "f2" | "float16" => ScalarType::F16,
+        // numpy has no bfloat16; only torch tensors carry this name.
+        "bfloat16" => ScalarType::BF16,
         "f4" | "float32" => ScalarType::F32,
+        "f8" | "float64" => ScalarType::F64,
         _ => {
             return Err(decode_error(
                 field,
@@ -144,6 +154,52 @@ pub fn decode_f32_vec(bytes: &[u8], endianness: Endianness, field: &str) -> Resu
     Ok(values)
 }
 
+/// Decode a buffer of floating-point `scalar` elements into `f32` values:
+/// half precisions widen exactly, float64 narrows. Integer types are an error.
+pub fn decode_float_vec(
+    bytes: &[u8],
+    scalar: ScalarType,
+    endianness: Endianness,
+    field: &str,
+) -> Result<Vec<f32>> {
+    let convert: fn(u64) -> f32 = match scalar {
+        ScalarType::F16 => |bits| f16::from_bits(bits as u16).to_f32(),
+        ScalarType::BF16 => |bits| bf16::from_bits(bits as u16).to_f32(),
+        ScalarType::F32 => |bits| f32::from_bits(bits as u32),
+        ScalarType::F64 => |bits| f64::from_bits(bits) as f32,
+        ScalarType::I32 | ScalarType::I64 => {
+            return Err(decode_error(
+                field,
+                &format!("expected a floating-point dtype, got {scalar:?}"),
+            ))
+        }
+    };
+    let size = scalar.element_size();
+    if !bytes.len().is_multiple_of(size) {
+        return Err(decode_error(
+            field,
+            &format!("byte length {} is not divisible by {size}", bytes.len()),
+        ));
+    }
+    let mut cursor = Cursor::new(bytes);
+    let mut values = Vec::with_capacity(bytes.len() / size);
+    while (cursor.position() as usize) < bytes.len() {
+        let bits = match endianness {
+            Endianness::Little => cursor.read_uint::<LittleEndian>(size),
+            Endianness::Big => cursor.read_uint::<BigEndian>(size),
+            Endianness::Native => cursor.read_uint::<NativeEndian>(size),
+        }
+        .map_err(|error| {
+            decode_error(
+                field,
+                &format!("failed to read {scalar:?} payload: {error}"),
+            )
+        })?;
+        values.push(convert(bits));
+    }
+    Ok(values)
+}
+
 /// Convert a signed token id / rank into `u32`, rejecting negatives and overflow.
 pub fn convert_to_u32<I>(value: I, field: &str) -> Result<u32>
 where
@@ -200,6 +256,60 @@ mod tests {
             (ScalarType::F32, Endianness::Native)
         );
         assert!(parse_dtype("<c8", "f").is_err());
+        // torch dtype names, as `MsgpackEncoder._encode_tensor` writes them.
+        assert_eq!(
+            parse_dtype("bfloat16", "f").unwrap(),
+            (ScalarType::BF16, Endianness::Native)
+        );
+        assert_eq!(
+            parse_dtype("float16", "f").unwrap(),
+            (ScalarType::F16, Endianness::Native)
+        );
+        assert_eq!(
+            parse_dtype("<f8", "f").unwrap(),
+            (ScalarType::F64, Endianness::Little)
+        );
+    }
+
+    #[test]
+    fn decode_float_vec_widens_half_precisions_and_narrows_doubles() {
+        let f16_bytes: Vec<u8> = [0.25_f32, -1.5, 3.0]
+            .into_iter()
+            .flat_map(|v| f16::from_f32(v).to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_float_vec(&f16_bytes, ScalarType::F16, Endianness::Little, "f").unwrap(),
+            vec![0.25, -1.5, 3.0]
+        );
+        let bf16_bytes: Vec<u8> = [0.25_f32, -1.5, 3.0]
+            .into_iter()
+            .flat_map(|v| bf16::from_f32(v).to_be_bytes())
+            .collect();
+        assert_eq!(
+            decode_float_vec(&bf16_bytes, ScalarType::BF16, Endianness::Big, "f").unwrap(),
+            vec![0.25, -1.5, 3.0]
+        );
+        let f64_bytes: Vec<u8> = [0.25_f64, -1.5]
+            .into_iter()
+            .flat_map(f64::to_ne_bytes)
+            .collect();
+        assert_eq!(
+            decode_float_vec(&f64_bytes, ScalarType::F64, Endianness::Native, "f").unwrap(),
+            vec![0.25, -1.5]
+        );
+        assert_eq!(
+            decode_float_vec(
+                &2.5_f32.to_le_bytes(),
+                ScalarType::F32,
+                Endianness::Little,
+                "f"
+            )
+            .unwrap(),
+            vec![2.5]
+        );
+        // Wrong element count and integer dtypes are errors, not panics.
+        assert!(decode_float_vec(&[0, 1, 2], ScalarType::F16, Endianness::Little, "f").is_err());
+        assert!(decode_float_vec(&[0, 1, 2, 3], ScalarType::I32, Endianness::Little, "f").is_err());
     }
 
     #[test]

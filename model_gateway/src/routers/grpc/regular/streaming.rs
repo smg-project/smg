@@ -29,6 +29,7 @@ use openai_protocol::{
     profile::ProviderProfile,
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
@@ -44,12 +45,14 @@ use crate::{
         },
         grpc::{
             common::{
-                response_formatting::CompletionTokenTracker,
+                response_collection::drain_prefill,
+                response_formatting::{effective_weight_version, CompletionTokenTracker},
                 responses::{build_sse_response, build_sse_response_from_stream},
             },
             context,
             proto_wrapper::{
-                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoResponseVariant, ProtoStream,
+                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoInputLogProbs,
+                ProtoResponseVariant, ProtoStream,
             },
             spec::{
                 ChatResponseSpec, CompletionResponseSpec, GenerateResponseSpec,
@@ -59,6 +62,7 @@ use crate::{
             utils::message_utils,
         },
     },
+    worker::PrefillLoadGuard,
 };
 
 /// One backend stream of a `/v1/completions` request. Batched requests fan
@@ -68,6 +72,7 @@ enum CompletionStreamUnit {
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
     },
 }
 
@@ -254,7 +259,10 @@ impl StreamingProcessor {
             context::ExecutionResult::PrefillDecode {
                 prefill,
                 decode,
+                prefill_guards,
                 pd_timing,
+                // Chat streaming does not emit prompt logprobs.
+                prefill_input_logprobs: _,
             } => {
                 let processor = self.clone();
                 let tokenizer_clone = tokenizer.clone();
@@ -273,6 +281,7 @@ impl StreamingProcessor {
                             chat_request,
                             &tx,
                             pd_timing,
+                            prefill_guards,
                             reservation,
                         )
                         .await;
@@ -363,10 +372,19 @@ impl StreamingProcessor {
         let tools = &original_request.tools;
         let history_tool_calls_count = original_request.history_tool_calls_count;
         let stream_options = &original_request.stream_options;
+        // DeepSeek always reports aggregate usage on the final finish chunk.
+        // include_usage controls null placeholders on earlier chunks only.
+        let deepseek_usage = original_request.provider == ProviderProfile::DeepSeek;
+        let include_usage = stream_options
+            .as_ref()
+            .is_some_and(|opts| opts.include_usage.unwrap_or(false));
+        let emit_usage_null = deepseek_usage && include_usage;
         let mut continuous_usage = stream_options
             .as_ref()
             .filter(|opts| {
-                opts.include_usage.unwrap_or(false) && opts.continuous_usage_stats.unwrap_or(false)
+                !deepseek_usage
+                    && opts.include_usage.unwrap_or(false)
+                    && opts.continuous_usage_stats.unwrap_or(false)
             })
             .map(|_| ChatStreamUsage::default());
 
@@ -630,7 +648,7 @@ impl StreamingProcessor {
                     .maybe_system_fingerprint(system_fingerprint)
                     .maybe_usage(usage.clone())
                     .build();
-                Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+                Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk, emit_usage_null);
                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
                     .await
                     .map_err(|_| "Failed to send first chunk".to_string())?;
@@ -658,7 +676,7 @@ impl StreamingProcessor {
                     .await;
                 if let Some(mut chunk) = reasoning_chunk {
                     chunk.usage = usage.clone();
-                    Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                    Self::format_sse_chunk_into(&mut sse_buffer, &chunk, emit_usage_null);
                     tx.send(Ok(Bytes::from(sse_buffer.clone())))
                         .await
                         .map_err(|_| "Failed to send reasoning chunk".to_string())?;
@@ -716,7 +734,7 @@ impl StreamingProcessor {
 
                     for mut chunk in tool_chunks {
                         chunk.usage = usage.clone();
-                        Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                        Self::format_sse_chunk_into(&mut sse_buffer, &chunk, emit_usage_null);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .await
                             .map_err(|_| "Failed to send tool call chunk".to_string())?;
@@ -736,7 +754,7 @@ impl StreamingProcessor {
                     .maybe_system_fingerprint(system_fingerprint)
                     .maybe_usage(usage.clone())
                     .build();
-                Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+                Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk, emit_usage_null);
                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
                     .await
                     .map_err(|_| "Failed to send content chunk".to_string())?;
@@ -766,7 +784,7 @@ impl StreamingProcessor {
                     .build();
 
                 let sse_chunk = sse_encoder
-                    .encode_data(&content_chunk)
+                    .encode_data(&ChatChunkWithUsage::new(&content_chunk, emit_usage_null))
                     .map_err(|e| format!("Failed to serialize content chunk: {e}"))?;
                 tx.send(Ok(sse_chunk))
                     .await
@@ -797,7 +815,7 @@ impl StreamingProcessor {
                         .build();
 
                     let sse_chunk = sse_encoder
-                        .encode_data(&tool_chunk)
+                        .encode_data(&ChatChunkWithUsage::new(&tool_chunk, emit_usage_null))
                         .map_err(|e| format!("Failed to serialize tool chunk: {e}"))?;
                     tx.send(Ok(sse_chunk))
                         .await
@@ -806,8 +824,23 @@ impl StreamingProcessor {
             }
         }
 
-        // Phase 4: Finish reason chunks
-        for (index, finish_reason) in &finish_reasons {
+        // Every choice shares one prompt, so prompt/cache counts take max;
+        // completion and reasoning counts sum across choices.
+        let final_usage = (deepseek_usage || include_usage).then(|| {
+            Usage::from_counts(
+                prompt_tokens.values().copied().max().unwrap_or(0),
+                completion_tokens.total(),
+            )
+            .with_cached_tokens(cached_tokens.values().copied().max().unwrap_or(0))
+            .with_reasoning_tokens(reasoning_tokens.values().sum())
+            .with_speculative_tokens(spec_accepted.values().sum(), spec_drafted.values().sum())
+            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+        });
+
+        // Phase 4: Finish reason chunks. Do not advertise partial counters as
+        // a final aggregate if the backend omitted a choice's Complete frame.
+        let complete_usage = prompt_tokens.len() as u32 >= original_request.expected_choices;
+        for (position, (index, finish_reason)) in finish_reasons.iter().enumerate() {
             let final_finish_reason =
                 if has_tool_calls.get(index).copied().unwrap_or(false) && finish_reason == "stop" {
                     "tool_calls".to_string()
@@ -817,48 +850,35 @@ impl StreamingProcessor {
 
             let matched_stop_value = matched_stops.get(index).and_then(|v| v.clone());
 
+            let finish_usage =
+                if deepseek_usage && complete_usage && position + 1 == finish_reasons.len() {
+                    final_usage.clone()
+                } else {
+                    usage.clone()
+                };
             let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                 .created(created)
                 .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
                 .maybe_system_fingerprint(system_fingerprint)
-                .maybe_usage(usage.clone())
+                .maybe_usage(finish_usage)
                 .build();
 
             let sse_chunk = sse_encoder
-                .encode_data(&finish_chunk)
+                .encode_data(&ChatChunkWithUsage::new(&finish_chunk, emit_usage_null))
                 .map_err(|e| format!("Failed to serialize finish chunk: {e}"))?;
             tx.send(Ok(sse_chunk))
                 .await
                 .map_err(|_| "Failed to send finish chunk".to_string())?;
         }
 
-        // Phase 5: Usage chunk
-        if let Some(stream_opts) = stream_options {
-            if stream_opts.include_usage.unwrap_or(false) {
-                // Every `n>1` choice shares one prompt; each Complete reports
-                // that same full length, so max (not sum) is the actual
-                // prompt cost -- summing would multiply it by `n`. cached_tokens
-                // is a property of that same shared prompt, not of the
-                // individual completion, so it takes the same treatment.
-                let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
-                let total_completion: u32 = completion_tokens.total();
-                let total_cached: u32 = cached_tokens.values().copied().max().unwrap_or(0);
-                let total_reasoning: u32 = reasoning_tokens.values().sum();
-                let total_spec_accepted: u32 = spec_accepted.values().sum();
-                let total_spec_drafted: u32 = spec_drafted.values().sum();
-
+        // Phase 5: The OpenAI dialect keeps its opt-in, usage-only chunk.
+        if !deepseek_usage {
+            if let Some(final_usage) = final_usage {
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
-                    .usage(
-                        Usage::from_counts(total_prompt, total_completion)
-                            .with_cached_tokens(total_cached)
-                            .with_reasoning_tokens(total_reasoning)
-                            .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
-                            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens),
-                    )
+                    .usage(final_usage)
                     .maybe_system_fingerprint(system_fingerprint)
                     .build();
-
                 let sse_chunk = sse_encoder
                     .encode_data(&usage_chunk)
                     .map_err(|e| format!("Failed to serialize usage chunk: {e}"))?;
@@ -892,13 +912,22 @@ impl StreamingProcessor {
                     .await;
             }
         }
+        // In PD mode this task only starts once the decode stream exists —
+        // for sequential PD that is after prefill completes, with the first
+        // decode chunk already buffered — so `start_time` would report a
+        // near-zero TTFT. Anchor at the prefill dispatch instant instead;
+        // generation duration must share the base or TPOT underflows.
+        let stream_base = pd_timing
+            .as_ref()
+            .map(|timing| timing.prefill_start)
+            .unwrap_or(start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
-            ttft: first_token_time.map(|t| t.duration_since(start_time)),
-            generation_duration: start_time.elapsed(),
+            ttft: first_token_time.map(|t| t.duration_since(stream_base)),
+            generation_duration: stream_base.elapsed(),
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
         });
@@ -918,23 +947,14 @@ impl StreamingProcessor {
         original_request: ChatResponseSpec,
         tx: &SseSender,
         pd_timing: context::PdTiming,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
-        // Phase 1.5: Collect input_logprobs from prefill stream if requested
-        if original_request.logprobs {
-            while let Some(response) = prefill_stream.next().await {
-                let gen_response =
-                    response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-                match gen_response.into_response() {
-                    ProtoResponseVariant::Complete(_complete) => {
-                        // Input logprobs collected but not yet used in streaming
-                        // (OpenAI spec doesn't require prompt logprobs in streaming responses)
-                        break;
-                    }
-                    _ => continue,
-                }
-            }
-        }
+        // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
+        // logprobs, but the Prefill reservation must end with this phase.
+        drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+            .await
+            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
 
         // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
         // so the first decode token yields honest PD TTFT.
@@ -1014,7 +1034,9 @@ impl StreamingProcessor {
             context::ExecutionResult::PrefillDecode {
                 prefill,
                 decode,
+                prefill_guards,
                 pd_timing,
+                prefill_input_logprobs,
             } => {
                 // For PD mode, need to handle prefill stream for input_logprobs
                 let tokenizer = tokenizer.clone();
@@ -1030,6 +1052,8 @@ impl StreamingProcessor {
                         ctx,
                         &tx,
                         pd_timing,
+                        prefill_input_logprobs,
+                        prefill_guards,
                         reservation,
                     )
                     .await;
@@ -1127,7 +1151,7 @@ impl StreamingProcessor {
                             "id": index_id,
                             "finish_reason": null,
                             "prompt_tokens": chunk.prompt_tokens(),
-                            "weight_version": &ctx.weight_version,
+                            "weight_version": effective_weight_version(chunk.weight_version(), Some(ctx.weight_version.as_str())),
                             "completion_tokens": current_completion_tokens,
                             "cached_tokens": chunk.cached_tokens(),
                             "reasoning_tokens": chunk.reasoning_tokens()
@@ -1160,7 +1184,7 @@ impl StreamingProcessor {
                             "id": index_id,
                             "finish_reason": complete.finish_reason(),
                             "prompt_tokens": complete.prompt_tokens(),
-                            "weight_version": &ctx.weight_version,
+                            "weight_version": effective_weight_version(complete.weight_version(), Some(ctx.weight_version.as_str())),
                             "completion_tokens": completion_tokens,
                             "cached_tokens": complete.cached_tokens(),
                             "reasoning_tokens": complete.reasoning_tokens(),
@@ -1199,12 +1223,16 @@ impl StreamingProcessor {
                 handle.close_reserved_only().await;
             }
         }
-        Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+        Self::record_generate_metrics(start_time, first_token_time, total_completion, None, &ctx);
 
         Ok(())
     }
 
     /// Process prefill/decode streaming for generate endpoint (PD mode with logprobs support)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "streaming PD generate keeps phase streams, metadata, guards and reservation separate"
+    )]
     async fn process_generate_prefill_decode_streaming(
         tokenizer: Arc<dyn Tokenizer>,
         mut prefill_stream: ProtoStream,
@@ -1212,30 +1240,30 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &SseSender,
         pd_timing: context::PdTiming,
+        prefill_input_logprobs: Option<ProtoInputLogProbs>,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
-        // Collect input_logprobs from prefill stream if requested
-        let input_token_logprobs = if ctx.return_logprob {
-            let mut input_logprobs = None;
-            while let Some(response) = prefill_stream.next().await {
-                let gen_response =
-                    response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-                match gen_response.into_response() {
-                    ProtoResponseVariant::Complete(complete) => {
-                        // Extract input_logprobs from prefill Complete message (convert proto to SGLang format)
-                        input_logprobs = complete
-                            .input_logprobs()
-                            .as_ref()
-                            .map(utils::convert_generate_input_logprobs);
-                        break;
-                    }
-                    _ => continue,
-                }
-            }
-            input_logprobs
+        // Drain prefill stream. Collect input_logprobs only when requested.
+        // Sequential PD drained the stream in the execution stage, so its
+        // logprobs arrive via `prefill_input_logprobs` instead.
+        let mut input_token_logprobs = if ctx.return_logprob {
+            prefill_input_logprobs
+                .as_ref()
+                .map(utils::convert_generate_input_logprobs)
         } else {
             None
         };
+        drain_prefill(&mut prefill_stream, prefill_guards, true, |complete| {
+            if ctx.return_logprob && input_token_logprobs.is_none() {
+                input_token_logprobs = complete
+                    .input_logprobs()
+                    .as_ref()
+                    .map(utils::convert_generate_input_logprobs);
+            }
+        })
+        .await
+        .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
 
         // Process decode stream with input_logprobs prepended. Pass pd_timing so
         // the first decode token yields honest PD TTFT.
@@ -1355,7 +1383,7 @@ impl StreamingProcessor {
                             "id": index_id,
                             "finish_reason": null,
                             "prompt_tokens": chunk.prompt_tokens(),
-                            "weight_version": &ctx.weight_version,
+                            "weight_version": effective_weight_version(chunk.weight_version(), Some(ctx.weight_version.as_str())),
                             "input_token_logprobs": input_token_logprobs.as_ref(),
                             "output_token_logprobs": current_output_logprobs,
                             "completion_tokens": current_completion_tokens,
@@ -1402,7 +1430,7 @@ impl StreamingProcessor {
                             "id": index_id,
                             "finish_reason": finish_reason,
                             "prompt_tokens": complete.prompt_tokens(),
-                            "weight_version": &ctx.weight_version,
+                            "weight_version": effective_weight_version(complete.weight_version(), Some(ctx.weight_version.as_str())),
                             "input_token_logprobs": input_token_logprobs.as_ref(),
                             "output_token_logprobs": final_output_logprobs,
                             "completion_tokens": completion_tokens,
@@ -1443,7 +1471,13 @@ impl StreamingProcessor {
                 handle.close_reserved_only().await;
             }
         }
-        Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+        Self::record_generate_metrics(
+            start_time,
+            first_token_time,
+            total_completion,
+            pd_timing.as_ref(),
+            &ctx,
+        );
 
         Ok(())
     }
@@ -1457,15 +1491,23 @@ impl StreamingProcessor {
         start_time: Instant,
         first_token_time: Option<Instant>,
         total_completion: u32,
+        pd_timing: Option<&context::PdTiming>,
         ctx: &GenerateStreamContext,
     ) {
+        // PD mode: the stream task starts after the prefill leg was dispatched
+        // (sequential PD: after it completes, with the first decode chunk
+        // already buffered), so anchor TTFT at prefill dispatch. Generation
+        // duration shares the base or TPOT underflows.
+        let stream_base = pd_timing
+            .map(|timing| timing.prefill_start)
+            .unwrap_or(start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: ctx.backend_type,
             model_id: &ctx.model,
             endpoint: metrics_labels::ENDPOINT_GENERATE,
-            ttft: first_token_time.map(|t| t.duration_since(start_time)),
-            generation_duration: start_time.elapsed(),
+            ttft: first_token_time.map(|t| t.duration_since(stream_base)),
+            generation_duration: stream_base.elapsed(),
             input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
             output_tokens: total_completion as u64,
         });
@@ -1740,10 +1782,17 @@ impl StreamingProcessor {
     /// Format a response as SSE chunk into a reusable buffer
     /// This avoids allocations by reusing the same buffer across multiple chunks
     #[inline]
-    fn format_sse_chunk_into(buffer: &mut Vec<u8>, chunk: &ChatCompletionStreamResponse) {
+    fn format_sse_chunk_into(
+        buffer: &mut Vec<u8>,
+        chunk: &ChatCompletionStreamResponse,
+        emit_usage_null: bool,
+    ) {
         buffer.clear();
         buffer.extend_from_slice(b"data: ");
-        if let Err(e) = serde_json::to_writer(&mut *buffer, chunk) {
+        if let Err(e) = serde_json::to_writer(
+            &mut *buffer,
+            &ChatChunkWithUsage::new(chunk, emit_usage_null),
+        ) {
             error!("Failed to serialize SSE chunk: {}", e);
             buffer.clear();
             buffer.extend_from_slice(b"data: ");
@@ -1801,6 +1850,49 @@ impl StreamingProcessor {
         tx.send(Ok(Bytes::from(buffer.clone())))
             .await
             .map_err(|_| "Client disconnected".to_string())
+    }
+
+    /// Stop the open content block, if any, so the next block gets the next
+    /// index: reasoning, text and tool calls can alternate.
+    async fn stop_open_block(
+        tx: &SseSender,
+        buffer: &mut Vec<u8>,
+        index: &mut u32,
+        open: [&mut bool; 3],
+    ) -> Result<(), String> {
+        if open
+            .into_iter()
+            .fold(false, |any, open| std::mem::take(open) | any)
+        {
+            let stop = MessageStreamEvent::ContentBlockStop { index: *index };
+            Self::send_messages_event(tx, buffer, &stop).await?;
+            *index += 1;
+        }
+        Ok(())
+    }
+
+    /// Send tool call arguments to the open `tool_use` block. Reasoning can
+    /// stop that block in the middle of a call, and the arguments after it
+    /// have no block to go to, so they are dropped.
+    async fn send_tool_arguments(
+        tx: &SseSender,
+        buffer: &mut Vec<u8>,
+        index: u32,
+        tool_block_open: bool,
+        partial_json: String,
+    ) -> Result<(), String> {
+        if partial_json.is_empty() {
+            return Ok(());
+        }
+        if !tool_block_open {
+            debug!("Dropping tool arguments without an open tool_use block");
+            return Ok(());
+        }
+        let delta = MessageStreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentBlockDelta::InputJsonDelta { partial_json },
+        };
+        Self::send_messages_event(tx, buffer, &delta).await
     }
 
     /// Process reasoning content in Messages streaming mode (n=1 only).
@@ -1923,6 +2015,7 @@ impl StreamingProcessor {
                 // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
+                prefill_guards,
                 ..
             } => {
                 let processor = self.clone();
@@ -1941,6 +2034,7 @@ impl StreamingProcessor {
                             stop_params,
                             messages_request,
                             &tx,
+                            prefill_guards,
                             reservation,
                         )
                         .await;
@@ -2238,6 +2332,17 @@ impl StreamingProcessor {
             // Emit thinking content block deltas
             if !reasoning_chunk_text.is_empty() {
                 if !thinking_block_open {
+                    Self::stop_open_block(
+                        tx,
+                        &mut sse_buffer,
+                        &mut current_block_index,
+                        [
+                            &mut thinking_block_open,
+                            &mut text_block_open,
+                            &mut tool_block_open,
+                        ],
+                    )
+                    .await?;
                     Self::send_messages_event(
                         tx,
                         &mut sse_buffer,
@@ -2289,19 +2394,18 @@ impl StreamingProcessor {
                     // Specific function: entire output is arguments for one tool
                     if !has_tool_calls {
                         has_tool_calls = true;
-                        // Close text block if open before starting tool block
-                        if text_block_open {
-                            Self::send_messages_event(
-                                tx,
-                                &mut sse_buffer,
-                                &MessageStreamEvent::ContentBlockStop {
-                                    index: current_block_index,
-                                },
-                            )
-                            .await?;
-                            text_block_open = false;
-                            current_block_index += 1;
-                        }
+                        // Close the open block before starting tool block
+                        Self::stop_open_block(
+                            tx,
+                            &mut sse_buffer,
+                            &mut current_block_index,
+                            [
+                                &mut thinking_block_open,
+                                &mut text_block_open,
+                                &mut tool_block_open,
+                            ],
+                        )
+                        .await?;
                         // Emit content_block_start for the tool_use
                         let tool_name = match &original_request.tool_choice {
                             Some(messages::ToolChoice::Tool { name, .. }) => name.clone(),
@@ -2328,30 +2432,57 @@ impl StreamingProcessor {
                         .await?;
                         tool_block_open = true;
                     }
-                    // Emit arguments delta
-                    if !normal_text.is_empty() {
-                        Self::send_messages_event(
-                            tx,
-                            &mut sse_buffer,
-                            &MessageStreamEvent::ContentBlockDelta {
-                                index: current_block_index,
-                                delta: ContentBlockDelta::InputJsonDelta {
-                                    partial_json: normal_text,
-                                },
-                            },
-                        )
-                        .await?;
-                    }
+                    // Emit arguments delta, unless reasoning stopped the block
+                    Self::send_tool_arguments(
+                        tx,
+                        &mut sse_buffer,
+                        current_block_index,
+                        tool_block_open,
+                        normal_text,
+                    )
+                    .await?;
                 } else if let Some(ref mut parser) = streaming_tool_parser {
                     // Regular/required tool choice: use incremental parser
                     match parser.parse_incremental(&normal_text, chat_tools).await {
                         Ok(StreamingParseResult {
                             normal_text: text,
-                            calls,
+                            mut calls,
                         }) => {
+                            // Arguments that finish the open call come before
+                            // the text after it in the same chunk.
+                            let finishing = if tool_block_open {
+                                calls
+                                    .iter()
+                                    .position(|call| call.name.is_some())
+                                    .unwrap_or(calls.len())
+                            } else {
+                                0
+                            };
+                            for tool_call_item in calls.drain(..finishing) {
+                                Self::send_tool_arguments(
+                                    tx,
+                                    &mut sse_buffer,
+                                    current_block_index,
+                                    tool_block_open,
+                                    tool_call_item.parameters,
+                                )
+                                .await?;
+                            }
+
                             // Emit normal text from parser as text content blocks
                             if !text.is_empty() {
                                 if !text_block_open {
+                                    Self::stop_open_block(
+                                        tx,
+                                        &mut sse_buffer,
+                                        &mut current_block_index,
+                                        [
+                                            &mut thinking_block_open,
+                                            &mut text_block_open,
+                                            &mut tool_block_open,
+                                        ],
+                                    )
+                                    .await?;
                                     Self::send_messages_event(
                                         tx,
                                         &mut sse_buffer,
@@ -2383,29 +2514,17 @@ impl StreamingProcessor {
 
                                 if let Some(ref name) = tool_call_item.name {
                                     // New tool call: close previous blocks, emit start
-                                    if text_block_open {
-                                        Self::send_messages_event(
-                                            tx,
-                                            &mut sse_buffer,
-                                            &MessageStreamEvent::ContentBlockStop {
-                                                index: current_block_index,
-                                            },
-                                        )
-                                        .await?;
-                                        text_block_open = false;
-                                        current_block_index += 1;
-                                    }
-                                    if tool_block_open {
-                                        Self::send_messages_event(
-                                            tx,
-                                            &mut sse_buffer,
-                                            &MessageStreamEvent::ContentBlockStop {
-                                                index: current_block_index,
-                                            },
-                                        )
-                                        .await?;
-                                        current_block_index += 1;
-                                    }
+                                    Self::stop_open_block(
+                                        tx,
+                                        &mut sse_buffer,
+                                        &mut current_block_index,
+                                        [
+                                            &mut thinking_block_open,
+                                            &mut text_block_open,
+                                            &mut tool_block_open,
+                                        ],
+                                    )
+                                    .await?;
 
                                     let tool_call_id = utils::generate_tool_call_id(
                                         model,
@@ -2432,19 +2551,14 @@ impl StreamingProcessor {
                                 }
 
                                 // Emit incremental arguments
-                                if !tool_call_item.parameters.is_empty() {
-                                    Self::send_messages_event(
-                                        tx,
-                                        &mut sse_buffer,
-                                        &MessageStreamEvent::ContentBlockDelta {
-                                            index: current_block_index,
-                                            delta: ContentBlockDelta::InputJsonDelta {
-                                                partial_json: tool_call_item.parameters,
-                                            },
-                                        },
-                                    )
-                                    .await?;
-                                }
+                                Self::send_tool_arguments(
+                                    tx,
+                                    &mut sse_buffer,
+                                    current_block_index,
+                                    tool_block_open,
+                                    tool_call_item.parameters,
+                                )
+                                .await?;
                             }
                         }
                         Err(e) => {
@@ -2458,6 +2572,17 @@ impl StreamingProcessor {
             // Regular text emission (no tools active)
             if !normal_text.is_empty() {
                 if !text_block_open {
+                    Self::stop_open_block(
+                        tx,
+                        &mut sse_buffer,
+                        &mut current_block_index,
+                        [
+                            &mut thinking_block_open,
+                            &mut text_block_open,
+                            &mut tool_block_open,
+                        ],
+                    )
+                    .await?;
                     Self::send_messages_event(
                         tx,
                         &mut sse_buffer,
@@ -2492,6 +2617,17 @@ impl StreamingProcessor {
             let leftover_text = parser.take_unstreamed_normal_text();
             if !leftover_text.is_empty() {
                 if !text_block_open {
+                    Self::stop_open_block(
+                        tx,
+                        &mut sse_buffer,
+                        &mut current_block_index,
+                        [
+                            &mut thinking_block_open,
+                            &mut text_block_open,
+                            &mut tool_block_open,
+                        ],
+                    )
+                    .await?;
                     Self::send_messages_event(
                         tx,
                         &mut sse_buffer,
@@ -2526,30 +2662,18 @@ impl StreamingProcessor {
                     has_tool_calls = true;
 
                     if let Some(ref name) = tool_call_item.name {
-                        // Close text block if open before starting tool block
-                        if text_block_open {
-                            Self::send_messages_event(
-                                tx,
-                                &mut sse_buffer,
-                                &MessageStreamEvent::ContentBlockStop {
-                                    index: current_block_index,
-                                },
-                            )
-                            .await?;
-                            text_block_open = false;
-                            current_block_index += 1;
-                        }
-                        if tool_block_open {
-                            Self::send_messages_event(
-                                tx,
-                                &mut sse_buffer,
-                                &MessageStreamEvent::ContentBlockStop {
-                                    index: current_block_index,
-                                },
-                            )
-                            .await?;
-                            current_block_index += 1;
-                        }
+                        // Close the open block before starting tool block
+                        Self::stop_open_block(
+                            tx,
+                            &mut sse_buffer,
+                            &mut current_block_index,
+                            [
+                                &mut thinking_block_open,
+                                &mut text_block_open,
+                                &mut tool_block_open,
+                            ],
+                        )
+                        .await?;
 
                         let tool_call_id = utils::generate_tool_call_id(
                             model,
@@ -2573,19 +2697,14 @@ impl StreamingProcessor {
                         tool_block_open = true;
                     }
 
-                    if !tool_call_item.parameters.is_empty() {
-                        Self::send_messages_event(
-                            tx,
-                            &mut sse_buffer,
-                            &MessageStreamEvent::ContentBlockDelta {
-                                index: current_block_index,
-                                delta: ContentBlockDelta::InputJsonDelta {
-                                    partial_json: tool_call_item.parameters,
-                                },
-                            },
-                        )
-                        .await?;
-                    }
+                    Self::send_tool_arguments(
+                        tx,
+                        &mut sse_buffer,
+                        current_block_index,
+                        tool_block_open,
+                        tool_call_item.parameters,
+                    )
+                    .await?;
                 }
             }
         }
@@ -2626,13 +2745,15 @@ impl StreamingProcessor {
             .await?;
         }
 
-        // Phase 4: Emit message_delta with stop_reason and usage
-        let stop_reason = if has_tool_calls || finish_reason_str == "tool_calls" {
+        // Phase 4: Emit message_delta with stop_reason and usage. A truncation
+        // stays max_tokens after a tool call started, as Chat keeps `length`:
+        // the call may be cut short.
+        let stop_reason = if finish_reason_str == "length" {
+            Some(messages::StopReason::MaxTokens)
+        } else if has_tool_calls || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if matched_stop.is_some() {
             Some(messages::StopReason::StopSequence)
-        } else if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
         } else {
             Some(messages::StopReason::EndTurn)
         };
@@ -2707,17 +2828,13 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: MessagesResponseSpec,
         tx: &SseSender,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
-        while let Some(response) = prefill_stream.next().await {
-            let gen_response =
-                response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-            match gen_response.into_response() {
-                ProtoResponseVariant::Complete(_) => break,
-                _ => continue,
-            }
-        }
+        drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+            .await
+            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
 
         let result = self
             .process_messages_streaming_chunks(
@@ -2826,7 +2943,11 @@ impl StreamingProcessor {
                                     )
                                     .await
                             }
-                            CompletionStreamUnit::PrefillDecode { prefill, decode } => {
+                            CompletionStreamUnit::PrefillDecode {
+                                prefill,
+                                decode,
+                                prefill_guards,
+                            } => {
                                 processor
                                     .process_prefill_decode_completion_streaming_chunks(
                                         prefill,
@@ -2838,6 +2959,7 @@ impl StreamingProcessor {
                                         prompt_text,
                                         index_offset,
                                         tx,
+                                        prefill_guards,
                                     )
                                     .await
                             }
@@ -2944,10 +3066,12 @@ impl StreamingProcessor {
                 // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
+                prefill_guards,
                 ..
             } => Ok(vec![CompletionStreamUnit::PrefillDecode {
                 prefill,
                 decode,
+                prefill_guards,
             }]),
             context::ExecutionResult::Batch { results } => results
                 .into_iter()
@@ -2956,8 +3080,15 @@ impl StreamingProcessor {
                         Ok(CompletionStreamUnit::Single(stream))
                     }
                     context::ExecutionResult::PrefillDecode {
-                        prefill, decode, ..
-                    } => Ok(CompletionStreamUnit::PrefillDecode { prefill, decode }),
+                        prefill,
+                        decode,
+                        prefill_guards,
+                        ..
+                    } => Ok(CompletionStreamUnit::PrefillDecode {
+                        prefill,
+                        decode,
+                        prefill_guards,
+                    }),
                     _ => Err("Nested batch or embedding result in completion streaming"),
                 })
                 .collect(),
@@ -3303,16 +3434,11 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<CompletionStreamOutcome, String> {
-        while let Some(response) = prefill_stream.next().await {
-            let gen_response =
-                response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-
-            match gen_response.into_response() {
-                ProtoResponseVariant::Complete(_) => break,
-                _ => continue,
-            }
-        }
+        drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+            .await
+            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
 
         let result = self
             .process_completion_streaming_chunks(
@@ -3401,6 +3527,26 @@ impl StreamingProcessor {
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
             server_tool_use: None,
+        }
+    }
+}
+
+/// Add the provider's null placeholder without allocating a JSON value per
+/// token or changing the shared Chat response type. A populated usage field
+/// is serialized only by `chunk`, so there is never a duplicate JSON key.
+#[derive(Serialize)]
+struct ChatChunkWithUsage<'a> {
+    #[serde(flatten)]
+    chunk: &'a ChatCompletionStreamResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<()>,
+}
+
+impl<'a> ChatChunkWithUsage<'a> {
+    fn new(chunk: &'a ChatCompletionStreamResponse, emit_usage_null: bool) -> Self {
+        Self {
+            chunk,
+            usage: (emit_usage_null && chunk.usage.is_none()).then_some(()),
         }
     }
 }

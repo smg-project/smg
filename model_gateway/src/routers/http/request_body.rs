@@ -44,12 +44,33 @@ pub(crate) fn serialize_request_body<T: Serialize>(
     worker: &dyn Worker,
     raw_len: Option<usize>,
 ) -> Result<Vec<u8>, RequestBodyError> {
+    serialize_request_body_impl(typed_req, canonical_model, worker, raw_len, true)
+}
+
+/// Preserve explicitly supplied backend fields while applying model aliases
+/// and worker preparation. Decisions and SystemOne extensions have no shared defaults.
+pub(crate) fn serialize_request_body_preserving_fields<T: Serialize>(
+    typed_req: &T,
+    canonical_model: Option<&str>,
+    worker: &dyn Worker,
+    raw_len: Option<usize>,
+) -> Result<Vec<u8>, RequestBodyError> {
+    serialize_request_body_impl(typed_req, canonical_model, worker, raw_len, false)
+}
+
+fn serialize_request_body_impl<T: Serialize>(
+    typed_req: &T,
+    canonical_model: Option<&str>,
+    worker: &dyn Worker,
+    raw_len: Option<usize>,
+    strip_defaults: bool,
+) -> Result<Vec<u8>, RequestBodyError> {
     let bytes = serialize_json_sized(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
 
     // A body the raw editor cannot parse (in practice: non-objects) takes
     // the Value pipeline rather than skipping the hooks.
     let Ok(mut body) = RawBody::parse(&bytes) else {
-        return value_request_body(typed_req, canonical_model, worker, raw_len);
+        return value_request_body(typed_req, canonical_model, worker, raw_len, strip_defaults);
     };
     // Edits only swap the model id, append the DP rank, or strip fields, so
     // the first pass plus the two inserted values bounds the reserialization.
@@ -68,13 +89,23 @@ pub(crate) fn serialize_request_body<T: Serialize>(
     if worker.mutates_request() {
         let rank = match worker.dp_rank() {
             Some(rank) if worker.uses_builtin_prepare_request() => rank,
-            _ => return value_request_body(typed_req, canonical_model, worker, raw_len),
+            _ => {
+                return value_request_body(
+                    typed_req,
+                    canonical_model,
+                    worker,
+                    raw_len,
+                    strip_defaults,
+                )
+            }
         };
         let rank = to_raw_value(&rank).map_err(RequestBodyError::Serialize)?;
         extra += DATA_PARALLEL_RANK.len() + rank.get().len() + 4;
         body.insert(DATA_PARALLEL_RANK, rank);
     }
-    body.strip_default_sglang_fields();
+    if strip_defaults {
+        body.strip_default_sglang_fields();
+    }
     if body.mutated() {
         let mut out = Vec::with_capacity(bytes.len() + extra);
         serde_json::to_writer(&mut out, &body).map_err(RequestBodyError::Serialize)?;
@@ -91,6 +122,7 @@ fn value_request_body<T: Serialize>(
     canonical_model: Option<&str>,
     worker: &dyn Worker,
     raw_len: Option<usize>,
+    strip_defaults: bool,
 ) -> Result<Vec<u8>, RequestBodyError> {
     let mut json_val = request_to_value(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
     if let Some(canonical_model) = canonical_model {
@@ -99,7 +131,9 @@ fn value_request_body<T: Serialize>(
     let mut json_val = worker
         .prepare_request(json_val)
         .map_err(RequestBodyError::Prepare)?;
-    strip_default_sglang_fields(&mut json_val);
+    if strip_defaults {
+        strip_default_sglang_fields(&mut json_val);
+    }
     serialize_json_sized(&json_val, raw_len).map_err(RequestBodyError::Serialize)
 }
 
@@ -156,10 +190,16 @@ impl<'a> RawBody<'a> {
     }
 
     /// `serde_json::Map::insert` under `preserve_order`: an existing field
-    /// keeps its position, a new one goes last.
+    /// keeps its position, a new one goes last. A value equal to the one
+    /// present changes nothing, so the body stays unmutated.
     pub(crate) fn insert(&mut self, name: &str, value: Box<RawValue>) {
         match self.fields.iter_mut().find(|(field, _)| field == name) {
-            Some((_, slot)) => *slot = Cow::Owned(value),
+            Some((_, slot)) => {
+                if slot.get() == value.get() {
+                    return;
+                }
+                *slot = Cow::Owned(value);
+            }
             None => self.fields.push((name.to_owned(), Cow::Owned(value))),
         }
         self.mutated = true;
@@ -445,13 +485,37 @@ mod tests {
         assert_eq!(plain, serialize_json_sized(&req, None).unwrap());
         let parsed: Value = serde_json::from_slice(&plain).unwrap();
         assert!(parsed.get("separate_reasoning").is_none());
-        assert_eq!(parsed["skip_special_tokens"], true);
+        assert!(parsed.get("skip_special_tokens").is_none());
 
         let aliased = serialize_request_body(&req, Some("canonical-model"), &worker, None).unwrap();
         assert_eq!(
             aliased,
             value_path_bytes(&req, Some("canonical-model"), &worker)
         );
+    }
+
+    /// `separate_reasoning`, `stream_reasoning` and `skip_special_tokens`
+    /// default to `true` on the engine, so an explicit `false` is the value
+    /// the client means; it must reach the worker on both body paths.
+    #[test]
+    fn explicit_false_on_true_default_fields_reaches_the_worker() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "alias-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "separate_reasoning": false,
+            "stream_reasoning": false,
+            "skip_special_tokens": false
+        }))
+        .unwrap();
+
+        for worker in [worker(), dp_worker()] {
+            let body = serialize_request_body(&req, None, &worker, None).unwrap();
+            assert_eq!(body, value_path_bytes(&req, None, &worker));
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["separate_reasoning"], false);
+            assert_eq!(parsed["stream_reasoning"], false);
+            assert_eq!(parsed["skip_special_tokens"], false);
+        }
     }
 
     #[test]
@@ -595,6 +659,18 @@ mod tests {
         assert!(raw.contains("d"));
         assert!(!raw.contains("a"));
         assert!(RawBody::parse(b"[1,2]").is_err());
+    }
+
+    /// The prefill leg always sets `stream: false`; a non-streaming request
+    /// already carries it, and marking the body mutated for that re-serialized
+    /// a body the parsed bytes could have served as they were.
+    #[test]
+    fn insert_of_an_unchanged_value_does_not_mark_the_body() {
+        let mut raw = RawBody::parse(br#"{"stream":false}"#).unwrap();
+        raw.insert("stream", to_raw_value(&false).unwrap());
+        assert!(!raw.mutated());
+        raw.insert("stream", to_raw_value(&true).unwrap());
+        assert!(raw.mutated());
     }
 
     #[test]
@@ -757,6 +833,65 @@ mod tests {
         assert_eq!(
             parsed["data_parallel_rank"], 3,
             "and so did the built-in one"
+        );
+    }
+
+    #[test]
+    fn preserving_fields_retains_extensions_with_alias_and_dp_rank() {
+        let req = json!({
+            "model": "alias-model",
+            "skip_special_tokens": false,
+            "separate_reasoning": true,
+            "chat_template_kwargs": null,
+            "native": {"keep": [false, null]}
+        });
+        let body = serialize_request_body_preserving_fields(
+            &req,
+            Some("canonical-model"),
+            &dp_worker(),
+            None,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "model": "canonical-model",
+                "skip_special_tokens": false,
+                "separate_reasoning": true,
+                "chat_template_kwargs": null,
+                "native": {"keep": [false, null]},
+                "data_parallel_rank": 3
+            })
+        );
+    }
+
+    #[test]
+    fn preserving_fields_retains_extensions_through_custom_prepare() {
+        let req = json!({
+            "model": "alias-model",
+            "skip_special_tokens": false,
+            "separate_reasoning": true,
+            "chat_template_kwargs": null
+        });
+        let body = serialize_request_body_preserving_fields(
+            &req,
+            Some("canonical-model"),
+            &CustomPrepare(dp_worker()),
+            None,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "model": "canonical-model",
+                "skip_special_tokens": false,
+                "separate_reasoning": true,
+                "chat_template_kwargs": null,
+                "custom": true,
+                "data_parallel_rank": 3
+            })
         );
     }
 }

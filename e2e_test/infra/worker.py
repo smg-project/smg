@@ -19,13 +19,20 @@ from .constants import (
     DEFAULT_HOST,
     DEFAULT_STARTUP_TIMEOUT,
     ENV_SHOW_WORKER_LOGS,
+    ENV_VLLM_SERVICER_IMPL,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
     MM_PROCESSING_WORKER,
     ConnectionMode,
     WorkerType,
+    effective_startup_timeout,
+    get_gpu_offset,
     get_mm_processing,
     get_runtime,
+    get_sglang_servicer_impl,
+    get_tokenspeed_servicer_impl,
+    get_vllm_mm_processor,
+    get_vllm_servicer_impl,
     get_zmq_engine_count,
     sglang_transfer_backend,
     vllm_kv_backend,
@@ -282,6 +289,13 @@ class Worker:
         features = spec.get("features", [])
 
         if self.engine == "sglang":
+            if self.mode == ConnectionMode.ZMQ:
+                # The launcher validates the complete engine argument list
+                # (it refuses a DP launch this wire does not carry yet), so
+                # the extras go through it instead of onto its output.
+                return self._build_sglang_zmq_cmd(
+                    model_path, tp_size, spec, list(self.extra_engine_args or [])
+                )
             cmd = self._build_sglang_cmd(model_path, tp_size, features, spec)
         elif self.engine == "vllm":
             if self.mode == ConnectionMode.ZMQ:
@@ -442,6 +456,29 @@ class Worker:
             cmd.extend(extra)
         return cmd
 
+    def _build_sglang_zmq_cmd(
+        self,
+        model_path: str,
+        tp_size: int,
+        spec: dict,
+        extra_engine_args: list[str] | None = None,
+    ) -> list[str]:
+        """Build the headless SGLang command for the ZMQ direct backend.
+
+        Delegates to the ``smg serve`` launcher so the engine flags and the
+        FNV-1a handshake port stay identical to the production launch path,
+        and so the launcher sees every engine argument, extras included.
+        """
+        from smg.serve import SglangWorkerLauncher
+
+        args = argparse.Namespace(
+            connection_mode="zmq", model_path=model_path, tensor_parallel_size=tp_size
+        )
+        backend_args = list(spec.get("sglang_args", [])) + list(extra_engine_args or [])
+        if tp_size > 1:
+            backend_args += ["--tp-size", str(tp_size)]
+        return SglangWorkerLauncher().build_command(args, backend_args, DEFAULT_HOST, self.port)
+
     def _build_tokenspeed_zmq_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build the headless TokenSpeed command for the ZMQ direct backend.
 
@@ -547,6 +584,33 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
+        # The vLLM gRPC servicer implementation is a flag inside the smg
+        # servicer package, read by upstream's entrypoint; the command stays.
+        if self.engine == "vllm" and self.mode == ConnectionMode.GRPC:
+            if get_vllm_servicer_impl() == "rust":
+                # A vLLM without the hook would run Python while the lane
+                # reports Rust coverage; refuse to start such a worker.
+                _require_rust_servicer_hook()
+                env["SMG_VLLM_SERVICER_IMPL"] = "rust"
+            else:
+                # The lane setting is authoritative over an inherited value.
+                env.pop("SMG_VLLM_SERVICER_IMPL", None)
+
+        # The TokenSpeed servicer implementation is likewise a flag inside the
+        # smg servicer package, read by its own entrypoint; the command stays.
+        if self.engine == "tokenspeed" and self.mode == ConnectionMode.GRPC:
+            if get_tokenspeed_servicer_impl() == "rust":
+                env["SMG_TOKENSPEED_SERVICER_IMPL"] = "rust"
+            else:
+                env.pop("SMG_TOKENSPEED_SERVICER_IMPL", None)
+
+        # The SGLang servicer implementation is a flag inside the smg servicer
+        # package too, read at the entry SGLang's --grpc-mode calls.
+        if self.engine == "sglang" and self.mode == ConnectionMode.GRPC:
+            if get_sglang_servicer_impl() == "rust":
+                env["SMG_SGLANG_SERVICER_IMPL"] = "rust"
+            else:
+                env.pop("SMG_SGLANG_SERVICER_IMPL", None)
 
         if (
             self.engine == "vllm"
@@ -555,7 +619,7 @@ class Worker:
         ):
             # The worker advertises mm_processor and the gateway, left in auto
             # mode, forwards media references instead of preprocessed tensors.
-            env["SMG_VLLM_MM_PROCESSOR"] = "inprocess"
+            env["SMG_VLLM_MM_PROCESSOR"] = get_vllm_mm_processor()
 
         if self.engine == "tokenspeed" and self.worker_type in (
             WorkerType.ENCODE,
@@ -717,6 +781,17 @@ class Worker:
         )
 
 
+def _require_rust_servicer_hook() -> None:
+    """Fail the Rust lane up front when the installed vLLM cannot select it."""
+    try:
+        from smg_grpc_servicer.vllm.rust import require_upstream_hook
+    except ImportError as error:
+        raise RuntimeError(
+            f"{ENV_VLLM_SERVICER_IMPL}=rust needs the smg-grpc-servicer package"
+        ) from error
+    require_upstream_hook()
+
+
 def start_workers(
     model_id: str,
     engine: str | None = None,
@@ -757,6 +832,8 @@ def start_workers(
     Returns:
         List of started Worker instances.
     """
+    # The lane's GPU slice: every worker shifts by E2E_GPU_OFFSET.
+    gpu_offset += get_gpu_offset()
     if log_dir is None:
         log_dir = os.environ.get("E2E_LOG_DIR")
 
@@ -778,7 +855,7 @@ def start_workers(
                 f"launcher (vllm or tokenspeed); got engine={engine!r}"
             )
         gpus_per_worker *= zmq_engine_count
-    timeout = spec.get("startup_timeout", timeout)
+    timeout = effective_startup_timeout(spec.get("startup_timeout", timeout))
 
     # Detect IB device for PD workers
     has_pd = worker_type in (WorkerType.PREFILL, WorkerType.DECODE)

@@ -12,7 +12,7 @@ on:
         required: false
         type: string
       base_image_ref:
-        description: 'Base image (full image:tag)'
+        description: 'Base image (full image:tag; empty for TokenSpeed uses the latest dated nightly carrier)'
         required: false
         type: string
       engine_repo:
@@ -171,8 +171,21 @@ jobs:
           ENGINE_REPO: ${{ inputs.engine_repo }}
           ENGINE_COMMIT: ${{ inputs.engine_commit }}
           TAG_OVERRIDE: ${{ inputs.tag }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           SMG_VERSION=$(grep -m1 '^version = ' bindings/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+
+          ENGINE_BASE_STAGE=engine-base
+          TOKENSPEED_VERSION=""
+          if [ "${ENGINE}" = "tokenspeed" ] && [ -z "${BASE_IMAGE_REF}" ]; then
+            TOKENSPEED_VERSION="$(bash scripts/ci_tokenspeed_image_tag.sh --version)"
+            BASE_IMAGE_REF="ghcr.io/${OWNER}/smg:ci-tokenspeed-${TOKENSPEED_VERSION##*post}"
+            ENGINE_BASE_STAGE=tokenspeed-nightly-base
+            # Never fall back to an older engine when today's carrier is not ready.
+            docker manifest inspect "${BASE_IMAGE_REF}" > /dev/null
+          fi
+          echo "engine_base_stage=${ENGINE_BASE_STAGE}" >> "$GITHUB_OUTPUT"
+          echo "tokenspeed_version=${TOKENSPEED_VERSION}" >> "$GITHUB_OUTPUT"
 
           if [ -n "${TAG_OVERRIDE}" ]; then
             IMAGE_TAG="${TAG_OVERRIDE}"
@@ -180,6 +193,8 @@ jobs:
             if [ -n "${ENGINE_REPO}" ]; then
               ENGINE_VERSION="${ENGINE_COMMIT//\//-}"
               ENGINE_VERSION="${ENGINE_VERSION// /}"
+            elif [ -n "${TOKENSPEED_VERSION}" ]; then
+              ENGINE_VERSION="${TOKENSPEED_VERSION}"
             else
               ENGINE_VERSION="${BASE_IMAGE_REF##*:}"
               ENGINE_VERSION="${ENGINE_VERSION//\//-}"
@@ -223,9 +238,11 @@ jobs:
           file: docker/engine.Dockerfile
           push: false
           load: true
+          pull: ${{ steps.resolve.outputs.tokenspeed_version != '' }}
           no-cache: true
           build-args: |
             BASE_IMAGE_REF=${{ steps.resolve.outputs.base_image_ref }}
+            ENGINE_BASE_STAGE=${{ steps.resolve.outputs.engine_base_stage }}
             ENGINE=${{ inputs.engine }}
             BACKEND=${{ inputs.backend }}
             ENGINE_REPO=${{ steps.resolve.outputs.effective_engine_repo }}
@@ -233,6 +250,24 @@ jobs:
             SMG_REPO=${{ inputs.smg_repo }}
             SMG_COMMIT=${{ inputs.smg_commit }}
           tags: smg-build:${{ steps.resolve.outputs.image_tag }}
+
+      - name: Verify TokenSpeed nightly image
+        if: steps.resolve.outputs.tokenspeed_version != '' && inputs.engine_repo == ''
+        env:
+          IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
+          TOKENSPEED_VERSION: ${{ steps.resolve.outputs.tokenspeed_version }}
+        run: |
+          docker run --rm "smg-build:${IMAGE_TAG}" --version
+          docker run --rm --entrypoint python "smg-build:${IMAGE_TAG}" -c '
+          import sys
+          from importlib.metadata import version
+          import tokenspeed
+          import smg_grpc_proto
+          import smg_grpc_servicer
+          assert sys.prefix == "/opt/smg-ci/.venv", sys.prefix
+          assert version("tokenspeed") == sys.argv[1], version("tokenspeed")
+          print("TokenSpeed nightly verified:", version("tokenspeed"))
+          ' "${TOKENSPEED_VERSION}"
 
       # ── Push to GHCR ────────────────────────────────────────────────────────
 

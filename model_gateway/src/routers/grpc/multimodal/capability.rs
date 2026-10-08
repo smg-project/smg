@@ -148,7 +148,9 @@ mod tests {
 
         MultimodalIntermediate::try_new(vec![PrecomputedMultimodalIntermediate {
             preprocessed: PreprocessedEncoderInputs {
-                encoder_input: ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![1.0]).unwrap(),
+                encoder_input: ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![1.0])
+                    .unwrap()
+                    .into(),
                 feature_token_counts: vec![1],
                 item_sizes: vec![(1, 1)],
                 model_specific: HashMap::new(),

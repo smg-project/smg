@@ -4,7 +4,9 @@ use tokio::task::JoinHandle;
 
 use super::{
     error::{MediaConnectorError, MultiModalError, MultiModalResult},
-    media::{FrameSampling, ImageFetchConfig, MediaConnector, MediaSource, VideoFetchConfig},
+    media::{
+        FetchSource, FrameSampling, ImageFetchConfig, MediaConnector, MediaSource, VideoFetchConfig,
+    },
     types::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
@@ -25,11 +27,52 @@ pub struct TrackerOutput {
     pub uuids: MultiModalUUIDs,
 }
 
+/// What a fetch is looked up by before its payload is compared: the
+/// modality, the fetch settings, and the payload's kind and length. Hashing
+/// the payload itself would cost a pass over every data URL of the request;
+/// comparing it costs a pass only over actual duplicates (and over the first
+/// few distinct payloads of one length, see `COMPARE_CANDIDATES`).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FetchKey {
+    modality: Modality,
+    settings: String,
+    kind: u8,
+    len: usize,
+}
+
+/// How many distinct payloads of one `FetchKey` a new part is compared
+/// against byte for byte. Past that the bucket is matched by digest, which
+/// keeps a request full of same-length, long-shared-prefix payloads at one
+/// pass over each payload instead of a pass per earlier candidate.
+const COMPARE_CANDIDATES: usize = 4;
+
+/// The fetching slots of one `FetchKey`, remembered so later parts can be
+/// matched against them.
+#[derive(Default)]
+struct Bucket {
+    /// The first distinct payloads, kept so parts can be compared against
+    /// them byte for byte.
+    compared: Vec<Compared>,
+    /// Later distinct payloads, kept as their digest only: nothing compares
+    /// their bytes again, so the table does not hold them past their fetch.
+    hashed: Vec<Hashed>,
+}
+
+struct Compared {
+    source: Arc<FetchSource>,
+    slot: usize,
+}
+
+struct Hashed {
+    digest: [u8; 32],
+    slot: usize,
+}
+
 pub struct AsyncMultiModalTracker {
     media_connector: Arc<MediaConnector>,
     pending: HashMap<Modality, Vec<Slot>>,
     uuids: MultiModalUUIDs,
-    first_slot: HashMap<[u8; 32], usize>,
+    first_slot: HashMap<FetchKey, Bucket>,
     /// Frame rate to sample a video at when the request names none; `None`
     /// keeps the connector default.
     default_video_sample_fps: Option<f32>,
@@ -70,10 +113,7 @@ impl AsyncMultiModalTracker {
                 uuid,
                 max_long_side_pixel,
             } => {
-                let source = match url::Url::parse(&url) {
-                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-                    _ => MediaSource::Url(url),
-                };
+                let source = media_url_source(url, "data:image/");
                 self.enqueue_image(
                     source,
                     detail.unwrap_or_default(),
@@ -98,10 +138,7 @@ impl AsyncMultiModalTracker {
                 return Err(MultiModalError::UnsupportedContent("image_embeds"));
             }
             MediaContentPart::AudioUrl { url, uuid } => {
-                let source = match url::Url::parse(&url) {
-                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-                    _ => MediaSource::Url(url),
-                };
+                let source = media_url_source(url, "data:audio/");
                 self.enqueue_audio(source, uuid);
             }
             MediaContentPart::AudioData {
@@ -117,10 +154,7 @@ impl AsyncMultiModalTracker {
                 fps,
                 max_long_side_pixel,
             } => {
-                let source = match url::Url::parse(&url) {
-                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-                    _ => MediaSource::Url(url),
-                };
+                let source = media_url_source(url, "data:video/");
                 self.enqueue_video(source, uuid, fps, max_long_side_pixel)?;
             }
             MediaContentPart::VideoData {
@@ -158,14 +192,51 @@ impl AsyncMultiModalTracker {
         })
     }
 
-    /// The slot that already fetches this media, if an earlier part named it;
-    /// otherwise the next slot is claimed for it.
-    fn same_media_as(&mut self, modality: Modality, key: [u8; 32]) -> Option<usize> {
+    /// The slot that already fetches this media with these settings, if an
+    /// earlier part named it; otherwise the next slot is claimed for it.
+    fn same_media_as(
+        &mut self,
+        modality: Modality,
+        settings: String,
+        source: &Arc<FetchSource>,
+    ) -> Option<usize> {
         let next = self.pending.entry(modality).or_default().len();
-        if let Some(&first) = self.first_slot.get(&key) {
-            return Some(first);
+        let key = FetchKey {
+            modality,
+            settings,
+            kind: source.kind(),
+            len: source.len(),
+        };
+        let bucket = self.first_slot.entry(key).or_default();
+        // The first few distinct payloads are compared byte for byte: a repeat
+        // (the common case) matches the first one, a different payload usually
+        // differs within its first bytes. A part that differs from all of them
+        // cannot match them later either, so they never need a digest.
+        if let Some(first) = bucket
+            .compared
+            .iter()
+            .find(|candidate| *candidate.source == **source)
+        {
+            return Some(first.slot);
         }
-        self.first_slot.insert(key, next);
+        if bucket.compared.len() < COMPARE_CANDIDATES {
+            bucket.compared.push(Compared {
+                source: Arc::clone(source),
+                slot: next,
+            });
+            return None;
+        }
+        // Past them the bucket is matched by digest: one pass over this
+        // payload, and only its digest is kept.
+        let digest: [u8; 32] = blake3::hash(source.payload()).into();
+        if let Some(first) = bucket
+            .hashed
+            .iter()
+            .find(|candidate| candidate.digest == digest)
+        {
+            return Some(first.slot);
+        }
+        bucket.hashed.push(Hashed { digest, slot: next });
         None
     }
 
@@ -183,8 +254,8 @@ impl AsyncMultiModalTracker {
             detail,
             max_long_side_pixel,
         };
-        let key = fetch_key(modality, &format!("{config:?}"), &source);
-        if let Some(first) = self.same_media_as(modality, key) {
+        let source = Arc::new(FetchSource::from(source));
+        if let Some(first) = self.same_media_as(modality, format!("{config:?}"), &source) {
             self.pending
                 .entry(modality)
                 .or_default()
@@ -198,7 +269,7 @@ impl AsyncMultiModalTracker {
             reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
         )]
         let handle = tokio::spawn(async move {
-            let frame = connector.fetch_image(source, config).await?;
+            let frame = connector.fetch_image_from(&source, config).await?;
             Ok(TrackedMedia::Image(frame))
         });
 
@@ -225,8 +296,8 @@ impl AsyncMultiModalTracker {
         let modality = Modality::Video;
         self.uuids.entry(modality).or_default().push(uuid);
 
-        let key = fetch_key(modality, &format!("{cfg:?}"), &source);
-        if let Some(first) = self.same_media_as(modality, key) {
+        let source = Arc::new(FetchSource::from(source));
+        if let Some(first) = self.same_media_as(modality, format!("{cfg:?}"), &source) {
             self.pending
                 .entry(modality)
                 .or_default()
@@ -240,7 +311,7 @@ impl AsyncMultiModalTracker {
             reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
         )]
         let handle = tokio::spawn(async move {
-            let clip = connector.fetch_video(source, cfg).await?;
+            let clip = connector.fetch_video_from(&source, cfg).await?;
             Ok(TrackedMedia::Video(clip))
         });
 
@@ -255,8 +326,8 @@ impl AsyncMultiModalTracker {
         let modality = Modality::Audio;
         self.uuids.entry(modality).or_default().push(uuid);
 
-        let key = fetch_key(modality, "", &source);
-        if let Some(first) = self.same_media_as(modality, key) {
+        let source = Arc::new(FetchSource::from(source));
+        if let Some(first) = self.same_media_as(modality, String::new(), &source) {
             self.pending
                 .entry(modality)
                 .or_default()
@@ -270,7 +341,7 @@ impl AsyncMultiModalTracker {
             reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
         )]
         let handle = tokio::spawn(async move {
-            let clip = connector.fetch_audio(source).await?;
+            let clip = connector.fetch_audio_from(&source).await?;
             Ok(TrackedMedia::Audio(clip))
         });
 
@@ -281,33 +352,19 @@ impl AsyncMultiModalTracker {
     }
 }
 
-/// Identity of one fetch: the media a part names, together with the settings
-/// it would be fetched with.
-fn fetch_key(modality: Modality, settings: &str, source: &MediaSource) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(modality.to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(settings.as_bytes());
-    hasher.update(b"\0");
-    match source {
-        MediaSource::Url(url) => {
-            hasher.update(b"url\0");
-            hasher.update(url.as_bytes());
-        }
-        MediaSource::DataUrl(url) => {
-            hasher.update(b"data\0");
-            hasher.update(url.as_bytes());
-        }
-        MediaSource::InlineBytes(bytes) => {
-            hasher.update(b"bytes\0");
-            hasher.update(bytes);
-        }
-        MediaSource::File(path) => {
-            hasher.update(b"file\0");
-            hasher.update(path.to_string_lossy().as_bytes());
-        }
+// Avoid scanning and allocating the entire payload just to identify its scheme.
+// Only canonical opaque data URLs of the part's own media type take this path
+// (`data:image/`, `data:audio/`, `data:video/`); noncanonical forms and
+// invalid data:// authorities retain URL parsing. Connector validation still
+// receives the original input unchanged.
+fn media_url_source(url: String, canonical_data_prefix: &str) -> MediaSource {
+    if url.starts_with(canonical_data_prefix) {
+        return MediaSource::DataUrl(url);
     }
-    hasher.finalize().into()
+    match url::Url::parse(&url) {
+        Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
+        _ => MediaSource::Url(url),
+    }
 }
 
 /// The fetch settings for one video: the request's `fps` when given (and
@@ -453,6 +510,48 @@ mod repeat_tests {
 
     const TINY_PNG_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
 
+    #[test]
+    fn fast_data_scheme_classification_matches_url_parser() {
+        for (prefix, mime) in [
+            ("data:image/", "image/png"),
+            ("data:audio/", "audio/wav"),
+            ("data:video/", "video/mp4"),
+        ] {
+            let mut cases = vec![
+                TINY_PNG_URL.to_owned(),
+                format!("data:{mime};base64,abc"),
+                "data:".to_owned(),
+                format!("DATA:{mime};base64,abc"),
+                " data:text/plain,hello".to_owned(),
+                "https://example.com/image".to_owned(),
+                "not-a-url".to_owned(),
+                "data://[invalid];base64,abc".to_owned(),
+                "data:\n//[invalid];base64,abc".to_owned(),
+                "data://user:password@[invalid]/image;base64,abc".to_owned(),
+                "data:;base64,abc".to_owned(),
+            ];
+            for byte in 0..=127u8 {
+                cases.push(format!("data:{};base64,abc", char::from(byte)));
+                cases.push(format!("data:text/plain,abc{}def", char::from(byte)));
+                cases.push(format!("data:{mime};base64,abc{}def", char::from(byte)));
+            }
+            for input in cases {
+                let expected = url::Url::parse(&input).is_ok_and(|url| url.scheme() == "data");
+                match media_url_source(input.clone(), prefix) {
+                    MediaSource::DataUrl(actual) => {
+                        assert!(expected, "{input:?}");
+                        assert_eq!(actual, input);
+                    }
+                    MediaSource::Url(actual) => {
+                        assert!(!expected, "{input:?}");
+                        assert_eq!(actual, input);
+                    }
+                    _ => panic!("unexpected media source"),
+                }
+            }
+        }
+    }
+
     fn tracker() -> AsyncMultiModalTracker {
         let connector =
             MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
@@ -517,19 +616,173 @@ mod repeat_tests {
 
     #[test]
     fn a_fetch_is_shared_only_with_the_same_media_and_settings() {
-        let clip = MediaSource::Url("https://example.test/clip.mp4".to_string());
-        let key = fetch_key(Modality::Video, "one", &clip);
+        let mut tracker = tracker();
+        let clip = Arc::new(FetchSource::Url("https://example.test/clip.mp4".into()));
+        // Same length and kind, different bytes: never merged.
+        let other = Arc::new(FetchSource::Url("https://example.test/clop.mp4".into()));
 
-        assert_eq!(key, fetch_key(Modality::Video, "one", &clip));
-        assert_ne!(key, fetch_key(Modality::Video, "two", &clip));
-        assert_ne!(key, fetch_key(Modality::Image, "one", &clip));
-        assert_ne!(
-            key,
-            fetch_key(
-                Modality::Video,
-                "one",
-                &MediaSource::Url("https://example.test/other.mp4".to_string()),
-            )
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &clip),
+            None
         );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &clip),
+            Some(0)
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "two".into(), &clip),
+            None
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Image, "one".into(), &clip),
+            None
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &other),
+            None
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &other),
+            Some(0)
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Video, "one".into(), &clip),
+            Some(0)
+        );
+    }
+
+    /// Distinct data URLs of one length that share everything but their last
+    /// character: the worst case for comparison-based matching.
+    fn same_length_variants(count: usize) -> Vec<String> {
+        let mut base = TINY_PNG_URL.to_string();
+        base.pop().expect("non-empty data url");
+        (0..count)
+            .map(|i| {
+                format!(
+                    "{base}{}",
+                    char::from(b'A' + u8::try_from(i).expect("few variants"))
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_crowded_bucket_matches_by_digest_past_the_first_few_candidates() {
+        let mut tracker = tracker();
+        let sources: Vec<Arc<FetchSource>> = same_length_variants(10)
+            .into_iter()
+            .map(|url| Arc::new(FetchSource::DataUrl(url)))
+            .collect();
+        for source in &sources {
+            assert_eq!(
+                tracker.same_media_as(Modality::Image, String::new(), source),
+                None,
+                "every distinct payload fetches"
+            );
+            // Stand-in for the fetch slot the caller pushes; slots are indices
+            // into this list.
+            tracker
+                .pending
+                .entry(Modality::Image)
+                .or_default()
+                .push(Slot::SameAs(usize::MAX));
+        }
+        // Every repeat, in either region of the bucket, finds its first slot.
+        for (slot, source) in sources.iter().enumerate().rev() {
+            assert_eq!(
+                tracker.same_media_as(Modality::Image, String::new(), source),
+                Some(slot)
+            );
+        }
+        // The first candidates are kept to be compared, so a part is compared
+        // against at most COMPARE_CANDIDATES payloads; the rest are kept as a
+        // digest and a slot only, so their bytes are not retained by the table.
+        let bucket = tracker
+            .first_slot
+            .values()
+            .find(|bucket| !bucket.hashed.is_empty())
+            .expect("one bucket: same modality, settings, kind and length");
+        assert_eq!(bucket.compared.len(), COMPARE_CANDIDATES);
+        assert_eq!(bucket.hashed.len(), sources.len() - COMPARE_CANDIDATES);
+        for (i, source) in sources.iter().enumerate() {
+            let expected = if i < COMPARE_CANDIDATES { 2 } else { 1 };
+            assert_eq!(
+                Arc::strong_count(source),
+                expected,
+                "candidate {i}: only the compared ones are held by the table"
+            );
+        }
+        // A lone payload of another length is neither compared nor hashed.
+        let lone = Arc::new(FetchSource::DataUrl(format!("{TINY_PNG_URL}=")));
+        assert_eq!(
+            tracker.same_media_as(Modality::Image, String::new(), &lone),
+            None
+        );
+        let lone_bucket = tracker
+            .first_slot
+            .values()
+            .find(|bucket| bucket.compared.len() == 1)
+            .expect("its own bucket");
+        assert!(lone_bucket.hashed.is_empty());
+        assert_eq!(Arc::strong_count(&lone), 2);
+    }
+
+    #[tokio::test]
+    async fn many_same_length_data_urls_are_fetched_once_each() {
+        let mut tracker = tracker();
+        let variants = same_length_variants(8);
+        for _ in 0..2 {
+            for url in &variants {
+                tracker
+                    .push_part(MediaContentPart::ImageUrl {
+                        url: url.clone(),
+                        detail: None,
+                        uuid: None,
+                        max_long_side_pixel: None,
+                    })
+                    .expect("part");
+            }
+        }
+        let slots = tracker.pending.get(&Modality::Image).expect("image slots");
+        let fetches = slots
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Fetch(_)))
+            .count();
+        let repeats: Vec<usize> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::SameAs(first) => Some(*first),
+                Slot::Fetch(_) => None,
+            })
+            .collect();
+        assert_eq!(fetches, variants.len());
+        assert_eq!(repeats, (0..variants.len()).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn data_urls_differing_in_one_byte_are_fetched_separately() {
+        let mut tracker = tracker();
+        let mut other = TINY_PNG_URL.to_string();
+        // Flip the last base64 character so the payload differs but not its length.
+        let last = other.pop().expect("non-empty data url");
+        other.push(if last == 'A' { 'B' } else { 'A' });
+        tracker.push_part(image_part(None)).expect("first part");
+        tracker
+            .push_part(MediaContentPart::ImageUrl {
+                url: other,
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            })
+            .expect("second part");
+
+        let slots = tracker
+            .pending
+            .get(&Modality::Image)
+            .expect("image slots")
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Fetch(_)))
+            .count();
+        assert_eq!(slots, 2);
     }
 }

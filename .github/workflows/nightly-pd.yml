@@ -6,7 +6,7 @@ name: Nightly PD Topologies
 
 on:
   schedule:
-    - cron: "45 9 * * *" # 09:45 UTC daily, after the nightly benchmarks release the GPU pool
+    - cron: "45 9 * * *" # 09:45 UTC daily, after the nightly image builds
   workflow_dispatch:
     inputs:
       engines:
@@ -136,12 +136,15 @@ jobs:
           if [ -n "$tag" ]; then
             candidate="ghcr.io/${REPO_OWNER}/smg:${tag}"
             if docker login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN" > /dev/null 2>&1 \
-               && docker manifest inspect "$candidate" > /dev/null 2>&1; then
-              image="$candidate"
+               && manifest="$(docker manifest inspect --verbose "$candidate" 2>/dev/null)"; then
+              digest="$(jq -r 'if type == "array" then .[] | select(.Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "amd64") | .Descriptor.digest else .Descriptor.digest // empty end' <<< "$manifest")"
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                image="${candidate}@${digest}"
+              fi
             fi
           fi
           echo "image=${image}" >> "$GITHUB_OUTPUT"
-          echo "TokenSpeed image: ${image:-none (source build)}"
+          echo "TokenSpeed image: ${image:-none (nightly wheel install)}"
 
   pd-topologies:
     name: pd-topologies (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})

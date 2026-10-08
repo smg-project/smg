@@ -1,6 +1,6 @@
 [package]
 name = "openai-protocol"
-version = "1.13.0"
+version = "1.14.0"
 edition = "2021"
 description = "OpenAI-compatible API protocol definitions and types"
 license = "Apache-2.0"
@@ -22,6 +22,7 @@ axum = { workspace = true, optional = true }
 bitflags.workspace = true
 bytes = "1.12.0"
 chrono.workspace = true
+indexmap = { version = "2", features = ["serde"] }
 rand.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, features = ["preserve_order"] }

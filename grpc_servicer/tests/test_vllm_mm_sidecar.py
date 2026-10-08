@@ -650,7 +650,6 @@ class TestServe:
         assert seen["sidecar_kwargs"]["settings"].sources == {
             "redis_url": "flag",
             "sidecar_namespace": "flag",
-            "sidecar_timeout_ms": "default",
         }
 
     def test_the_startup_log_hides_redis_credentials(self, monkeypatch, caplog):
@@ -674,7 +673,6 @@ class TestServe:
         assert mm_sidecar.redacted_url("rediss://u:p@cache:6380/2#x") == "rediss://***@cache:6380/2"
 
     def test_env_fills_in_for_absent_flags(self, monkeypatch):
-        # An older namespace without the timeout flag, and no url/namespace given.
         args = types.SimpleNamespace(redis_url=None, namespace=None, concurrency=1)
         seen = self._serve(
             monkeypatch,
@@ -688,13 +686,15 @@ class TestServe:
         assert seen["sidecar_kwargs"]["namespace"] == "ns-env"
         settings = seen["sidecar_kwargs"]["settings"]
         assert settings.sources["redis_url"] == "env"
-        assert settings.sidecar_timeout_ms == proto.DEFAULT_TIMEOUT_MS
-        assert settings.sources["sidecar_timeout_ms"] == "default"
+        # The worker's timeout reaches the sidecar as each job's deadline, so
+        # the sidecar resolves no timeout setting of its own.
+        assert settings.sidecar_timeout_ms is None
+        assert "sidecar_timeout_ms" not in settings.sources
 
-    def test_the_parser_takes_the_timeout_flag(self, monkeypatch):
+    def test_the_parser_has_no_timeout_flag(self, monkeypatch):
         parser = mm_sidecar.build_parser(lambda parser: parser)
-        args = parser.parse_args(["--mm-sidecar-timeout-ms", "250"])
-        assert args.mm_sidecar_timeout_ms == 250
+        args = parser.parse_args([])
+        assert not hasattr(args, "mm_sidecar_timeout_ms")
         assert args.redis_url is None and args.namespace is None
 
     def test_waiting_for_a_job_has_no_read_deadline(self, monkeypatch):

@@ -61,6 +61,9 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
 
             // Notify policy registry of the update
             app_context.policy_registry.on_worker_added(model_id, None);
+            for worker in workers.iter() {
+                worker.set_completion_sink(Some(app_context.policy_registry.completion_sink()));
+            }
         }
 
         let prefill_workers = app_context.worker_registry.get_prefill_workers();

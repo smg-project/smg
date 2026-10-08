@@ -44,6 +44,25 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+def _validate_token_ids_logprobs(values: list[list[float]], token_ids: list[list[int]]) -> None:
+    """Reject a selected-score payload that would lose entries when zipped."""
+    try:
+        if len(values) != len(token_ids):
+            raise ValueError(
+                "Malformed selected-token logprobs: values and IDs have different row counts"
+            )
+        if any(len(row_values) != len(row_ids) for row_values, row_ids in zip(values, token_ids)):
+            raise ValueError(
+                "Malformed selected-token logprobs: a row has different values and IDs lengths"
+            )
+    except TypeError as exc:
+        # A missing or scalar row is a request error too. Letting TypeError
+        # escape the shared batch handler would also strand valid siblings.
+        raise ValueError(
+            "Malformed selected-token logprobs: values and IDs must contain candidate rows"
+        ) from exc
+
+
 class _GrpcCommunicator:
     """
     Communicator for request/response patterns with scheduler.
@@ -159,6 +178,8 @@ class GrpcReqState:
     input_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
     output_top_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
     output_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
 
     # Session state
     session_id: str | None = None
@@ -614,29 +635,41 @@ class GrpcRequestManager:
         Convert and accumulate logprobs from batch output to state.
         Follows the same logic as tokenizer_manager.convert_logprob_style.
         """
-        # Early exit if no input logprobs at all
-        if batch_out.input_token_logprobs_val is None:
-            return
+        selected_values = getattr(batch_out, "output_token_ids_logprobs_val", None) or []
+        selected_ids = getattr(batch_out, "output_token_ids_logprobs_idx", None) or []
+        if selected_values or selected_ids:
+            batch_size = len(batch_out.rids)
+            if len(selected_values) != batch_size or len(selected_ids) != batch_size:
+                raise ValueError(
+                    "Malformed selected-token logprobs: batch columns do not match request count"
+                )
+            _validate_token_ids_logprobs(
+                selected_values[batch_index] or [], selected_ids[batch_index] or []
+            )
 
-        # Accumulate input token logprobs (only if list is non-empty)
-        if len(batch_out.input_token_logprobs_val) > 0:
-            state.input_token_logprobs_val.extend(batch_out.input_token_logprobs_val[batch_index])
-            state.input_token_logprobs_idx.extend(batch_out.input_token_logprobs_idx[batch_index])
-
-        # Always accumulate output token logprobs
-        state.output_token_logprobs_val.extend(batch_out.output_token_logprobs_val[batch_index])
-        state.output_token_logprobs_idx.extend(batch_out.output_token_logprobs_idx[batch_index])
-
-        # Handle top logprobs if requested
+        # Each column is independent: prefill-only scoring may have a selected
+        # candidate row with neither input nor sampled-token logprobs.
+        columns = [
+            "input_token_logprobs_val",
+            "input_token_logprobs_idx",
+            "output_token_logprobs_val",
+            "output_token_logprobs_idx",
+            "output_token_ids_logprobs_val",
+            "output_token_ids_logprobs_idx",
+        ]
         if state.obj.top_logprobs_num > 0:
-            # Accumulate input top logprobs (only if list is non-empty)
-            if len(batch_out.input_top_logprobs_val) > 0:
-                state.input_top_logprobs_val.extend(batch_out.input_top_logprobs_val[batch_index])
-                state.input_top_logprobs_idx.extend(batch_out.input_top_logprobs_idx[batch_index])
-
-            # Always accumulate output top logprobs
-            state.output_top_logprobs_val.extend(batch_out.output_top_logprobs_val[batch_index])
-            state.output_top_logprobs_idx.extend(batch_out.output_top_logprobs_idx[batch_index])
+            columns.extend(
+                (
+                    "input_top_logprobs_val",
+                    "input_top_logprobs_idx",
+                    "output_top_logprobs_val",
+                    "output_top_logprobs_idx",
+                )
+            )
+        for name in columns:
+            column = getattr(batch_out, name, None)
+            if column and batch_index < len(column) and column[batch_index]:
+                getattr(state, name).extend(column[batch_index])
 
     async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
@@ -689,7 +722,20 @@ class GrpcRequestManager:
             # Use getattr for safe access - not all request types have return_logprob
             # (e.g., TokenizedEmbeddingReqInput)
             if getattr(state.obj, "return_logprob", False):
-                self._convert_logprob_style(state, batch_out, i)
+                try:
+                    self._convert_logprob_style(state, batch_out, i)
+                except ValueError as exc:
+                    # Raising out of this loop would strand the waiting client.
+                    # Finish with an engine error and stop any remaining decode.
+                    output_data["error"] = str(exc)
+                    output_data["finished"] = True
+                    output_data["meta_info"]["finish_reason"] = {
+                        "type": "abort",
+                        "message": str(exc),
+                        "status_code": 500,
+                    }
+                    if not finished:
+                        await self.abort_request(rid)
 
             # Send input logprobs based if available
             if (
@@ -716,24 +762,37 @@ class GrpcRequestManager:
                     }
 
             # Send output logprobs if available
-            if (
-                getattr(state.obj, "return_logprob", False)
-                and batch_out.output_token_logprobs_val
-                and i < len(batch_out.output_token_logprobs_val)
+            if getattr(state.obj, "return_logprob", False) and (
+                (
+                    batch_out.output_token_logprobs_val
+                    and i < len(batch_out.output_token_logprobs_val)
+                )
+                or state.output_token_ids_logprobs_val
             ):
                 if state.obj.stream:
                     # For streaming: send incremental logprobs (only new tokens in this chunk)
                     # NOTE: this is different than TokenizerManager, which always accumulates
                     def get_part(attr_name):
                         source_list = getattr(batch_out, attr_name, None)
-                        return source_list[i] if source_list and i < len(source_list) else []
+                        return (
+                            (source_list[i] or []) if source_list and i < len(source_list) else []
+                        )
 
                     output_data["output_logprobs"] = {
-                        "token_logprobs_val": batch_out.output_token_logprobs_val[i],
+                        "token_logprobs_val": get_part("output_token_logprobs_val"),
                         "token_logprobs_idx": get_part("output_token_logprobs_idx"),
                         "top_logprobs_val": get_part("output_top_logprobs_val"),
                         "top_logprobs_idx": get_part("output_top_logprobs_idx"),
+                        "token_ids_logprobs_val": get_part("output_token_ids_logprobs_val"),
+                        "token_ids_logprobs_idx": get_part("output_token_ids_logprobs_idx"),
                     }
+                    if finished and state.output_token_ids_logprobs_val:
+                        # The final stream chunk stays incremental. Complete
+                        # carries every selected row accumulated for the request.
+                        output_data["complete_token_ids_logprobs"] = {
+                            "token_ids_logprobs_val": state.output_token_ids_logprobs_val,
+                            "token_ids_logprobs_idx": state.output_token_ids_logprobs_idx,
+                        }
                 elif output_data["finished"]:
                     # Non-streaming: send cumulative output logprobs in final chunk
                     output_data["output_logprobs"] = {
@@ -741,6 +800,8 @@ class GrpcRequestManager:
                         "token_logprobs_idx": state.output_token_logprobs_idx,
                         "top_logprobs_val": state.output_top_logprobs_val,
                         "top_logprobs_idx": state.output_top_logprobs_idx,
+                        "token_ids_logprobs_val": state.output_token_ids_logprobs_val,
+                        "token_ids_logprobs_idx": state.output_token_ids_logprobs_idx,
                     }
 
             # Update state for accumulation

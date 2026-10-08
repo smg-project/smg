@@ -11,6 +11,21 @@ pip install -e grpc_servicer/
 
 No version concerns locally — editable installs always use the latest source.
 
+## Proto stubs for local tests
+
+The tests import ``smg_grpc_proto``, whose stubs the released package builds at
+install time from ``crates/grpc_client/proto``. While a proto change is in
+flight, generate stubs from the checkout instead of installing the release:
+
+```bash
+pip install 'grpcio-tools>=1.81.1,<1.82'
+python3 grpc_servicer/scripts/gen_proto_stubs.py /tmp/smg-proto-gen
+SMG_GRPC_PROTO_PATH=/tmp/smg-proto-gen pytest -q grpc_servicer/tests
+```
+
+Generated stubs are never committed; ``tests/conftest.py`` puts the directory
+on ``sys.path`` when the variable is set.
+
 ## CI — vLLM
 
 PR tests install both `smg-grpc-proto` and `smg-grpc-servicer` from source (not PyPI),

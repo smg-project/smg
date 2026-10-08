@@ -250,6 +250,8 @@ class SglangWorkerLauncher(WorkerLauncher):
             "--port",
             str(port),
         ]
+        if getattr(args, "connection_mode", "grpc") == "zmq":
+            return self._build_zmq_command(args, backend_args, port)
         if getattr(args, "connection_mode", "grpc") == "grpc":
             cmd.append("--grpc-mode")
 
@@ -261,9 +263,75 @@ class SglangWorkerLauncher(WorkerLauncher):
         cmd.extend(self._filter_backend_args(backend_args, ["--model-path", "--host", "--port"]))
         return cmd
 
+    def _build_zmq_command(
+        self, args: argparse.Namespace, backend_args: list[str], port: int
+    ) -> list[str]:
+        """Launch SGLang's scheduler headless behind SMG's ZMQ handshake.
+
+        SMG binds the tcp handshake + ipc data-plane sockets it derives from
+        the ipc:// worker URL; the scheduler dials in. The launcher is
+        ``smg_grpc_servicer.sglang.headless`` (this package's SGLang plugin
+        does the dialing inside the scheduler; SGLang itself is unchanged).
+        ``--port`` seeds SGLang's derived control-plane ports, so co-located
+        workers get distinct clusters.
+        """
+        # SGLang accepts both spellings of its DP flag.
+        engine_dp = max(
+            _backend_arg_int(backend_args, "--dp-size", 1),
+            _backend_arg_int(backend_args, "--data-parallel-size", 1),
+        )
+        if engine_dp > 1:
+            raise ValueError(
+                "--dp-size > 1 is not supported over the SGLang ZMQ wire yet; "
+                "use --connection-mode grpc for data parallelism"
+            )
+        rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
+        cmd = [
+            sys.executable,
+            "-m",
+            "smg_grpc_servicer.sglang.headless",
+            "--zmq-handshake-address",
+            f"tcp://127.0.0.1:{rpc_port}",
+            "--zmq-engine-index",
+            "0",
+            "--model-path",
+            getattr(args, "model_path", ""),
+            "--port",
+            str(port),
+        ]
+        cmd.extend(
+            self._filter_backend_args(
+                backend_args,
+                [
+                    "--model-path",
+                    "--host",
+                    "--port",
+                    "--zmq-handshake-address",
+                    "--zmq-engine-index",
+                    "--grpc-mode",
+                ],
+            )
+        )
+        return cmd
+
 
 class VllmWorkerLauncher(WorkerLauncher):
     """Launcher for vLLM inference workers."""
+
+    def gpu_env(self, args: argparse.Namespace, dp_rank: int, env: dict | None = None) -> dict:
+        env = super().gpu_env(args, dp_rank, env)
+        # The servicer implementation is a flag inside the smg servicer package
+        # (`SMG_VLLM_SERVICER_IMPL`), read by upstream vLLM's gRPC entrypoint
+        # before it builds an AsyncLLM; the worker command line stays upstream's.
+        if (
+            getattr(args, "connection_mode", "grpc") == "grpc"
+            and getattr(args, "servicer_impl", "python") == "rust"
+        ):
+            env["SMG_VLLM_SERVICER_IMPL"] = "rust"
+        else:
+            # The flag is authoritative: an inherited value must not outlive it.
+            env.pop("SMG_VLLM_SERVICER_IMPL", None)
+        return env
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         return getattr(args, "tensor_parallel_size", 1)
@@ -752,7 +820,19 @@ def add_serve_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Connection mode for workers (default: grpc). Note: trtllm only "
             "supports grpc, tokenspeed only supports zmq, and zmq is otherwise "
-            "only supported for the vllm backend"
+            "supported for the vllm and sglang backends"
+        ),
+    )
+    group.add_argument(
+        "--servicer-impl",
+        default="python",
+        choices=["python", "rust"],
+        help=(
+            "gRPC servicer implementation for vllm workers (default: python). "
+            "rust keeps the same vLLM gRPC contract but serves it from Rust over "
+            "a same-host ZMQ engine connection, selected through "
+            "SMG_VLLM_SERVICER_IMPL in the worker's environment; requires "
+            "--backend vllm --connection-mode grpc"
         ),
     )
     # Router host/port - may be overridden by backend (e.g. sglang)
@@ -805,6 +885,18 @@ def _import_backend_args(backend: str, parser: argparse.ArgumentParser) -> None:
     BACKEND_ARG_ADDERS[backend](parser)
 
 
+def _require_rust_servicer_hook() -> None:
+    """Fail fast when the installed vLLM cannot select the Rust servicer."""
+    try:
+        from smg_grpc_servicer.vllm.rust import require_upstream_hook
+    except ImportError as error:
+        raise RuntimeError(
+            "servicer-impl rust needs the smg-grpc-servicer package importable by this "
+            "interpreter (it carries the Rust request path)"
+        ) from error
+    require_upstream_hook()
+
+
 def parse_serve_args(
     argv: list[str] | None = None,
 ) -> tuple[str, argparse.Namespace, list[str]]:
@@ -831,13 +923,29 @@ def parse_serve_args(
     serve_router_args, backend_args = pre_parser.parse_known_args(argv)
     backend = serve_router_args.backend
 
-    # ZMQ direct-backend is a same-host engine connection; only vLLM EngineCore
-    # and TokenSpeed speak a supported ZMQ wire protocol.
-    if serve_router_args.connection_mode == "zmq" and backend not in ("vllm", "tokenspeed"):
+    # ZMQ direct-backend is a same-host engine connection; vLLM EngineCore,
+    # TokenSpeed and SGLang speak a supported ZMQ wire protocol.
+    if serve_router_args.connection_mode == "zmq" and backend not in (
+        "vllm",
+        "tokenspeed",
+        "sglang",
+    ):
         pre_parser.error(
-            "connection-mode zmq is only supported for the vllm and tokenspeed "
+            "connection-mode zmq is only supported for the vllm, tokenspeed and sglang "
             f"backends, not {backend}"
         )
+    if getattr(serve_router_args, "servicer_impl", "python") == "rust":
+        if backend != "vllm" or serve_router_args.connection_mode != "grpc":
+            pre_parser.error(
+                "servicer-impl rust is only available for --backend vllm with "
+                f"--connection-mode grpc, not {backend}/{serve_router_args.connection_mode}"
+            )
+        # The flag is read by upstream vLLM's gRPC entrypoint; a vLLM without
+        # the hook would start Python workers while reporting Rust ones.
+        try:
+            _require_rust_servicer_hook()
+        except RuntimeError as error:
+            pre_parser.error(str(error))
 
     # Pass 2: full parser with backend-specific args; resolve so backend can override
     parser = argparse.ArgumentParser(

@@ -11,11 +11,12 @@ use smg_data_connector::{
     StorageFactoryConfig,
 };
 use smg_mcp::McpOrchestrator;
+use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
-    config::RouterConfig,
+    config::{KvIndexKind, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -28,7 +29,10 @@ use crate::{
         grpc::multimodal::MultimodalConfigRegistry,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService},
+    worker::{
+        liveness, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor,
+        WorkerRegistry, WorkerService,
+    },
     workflow::{JobQueue, WorkflowEngines},
 };
 
@@ -66,6 +70,7 @@ pub struct AppContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
+    pub prefill_admission: Option<Arc<PrefillAdmission>>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub gateway: Option<Arc<Gateway>>,
     pub response_storage: Arc<dyn ResponseStorage>,
@@ -100,6 +105,28 @@ impl std::fmt::Debug for AppContext {
             .field("router_config", &self.router_config)
             .finish_non_exhaustive()
     }
+}
+
+fn start_prefill_admission_notifier(
+    worker_registry: &WorkerRegistry,
+    admission: &Arc<PrefillAdmission>,
+) -> Result<(), AppContextBuildError> {
+    let mut events = worker_registry.subscribe_events();
+    let admission = Arc::downgrade(admission);
+    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+        AppContextBuildError::InvalidConfig(format!(
+            "Prefill admission requires a Tokio runtime: {error}"
+        ))
+    })?;
+    runtime.spawn(async move {
+        while let Ok(_) | Err(RecvError::Lagged(_)) = events.recv().await {
+            let Some(admission) = admission.upgrade() else {
+                break;
+            };
+            admission.notify_capacity_changed();
+        }
+    });
+    Ok(())
 }
 
 pub struct AppContextBuilder {
@@ -360,6 +387,24 @@ impl AppContextBuilder {
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
 
+        let prefill_admission =
+            usize::try_from(router_config.prefill_max_inflight_requests_per_worker)
+                .ok()
+                .filter(|max| *max > 0)
+                .map(|max| {
+                    Arc::new(PrefillAdmission::new(
+                        max,
+                        router_config.effective_prefill_queue_size(),
+                        Duration::from_secs(router_config.effective_prefill_queue_timeout_secs()),
+                    ))
+                });
+        if let Some(admission) = prefill_admission
+            .as_ref()
+            .filter(|_| router_config.effective_prefill_queue_size() > 0)
+        {
+            start_prefill_admission_notifier(&worker_registry, admission)?;
+        }
+
         // Create WorkerService from the already-built components
         let worker_service = Arc::new(WorkerService::new(
             worker_registry.clone(),
@@ -390,6 +435,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
+            prefill_admission,
             policy_registry: self
                 .policy_registry
                 .ok_or(AppContextBuildError::MissingField("policy_registry"))?,
@@ -641,6 +687,21 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        if let Some(registry) = self.worker_registry.as_ref() {
+            registry.set_overload_shed(config.worker_overload_shed);
+        }
+        // Progress-based liveness thresholds (see `worker::liveness`).
+        liveness::configure(
+            Duration::from_secs(config.worker_stall_secs),
+            Duration::from_secs(config.worker_wedge_secs),
+        );
+        liveness::configure_warmup(liveness::Warmup {
+            secs: Duration::from_secs(config.worker_warmup_secs),
+            share: config.worker_warmup_share,
+            blocks: config.worker_warmup_blocks,
+            thin_ratio: config.worker_warmup_thin_ratio,
+            divert_every: config.worker_warmup_divert_every,
+        });
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
@@ -664,30 +725,26 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create and initialize MCP orchestrator with empty config
+    /// Create and initialize the MCP orchestrator from the operator's MCP
+    /// config (`--mcp-config-path`), minus its server list.
     ///
-    /// This initializes the MCP orchestrator with an empty config and default settings.
-    /// MCP servers will be registered later via the InitializeMcpServers job.
-    async fn with_mcp_orchestrator(
-        mut self,
-        _router_config: &RouterConfig,
-    ) -> Result<Self, String> {
+    /// The servers are registered later via the InitializeMcpServers job, so
+    /// startup never waits on one. The pool limits, the global proxy, the
+    /// inventory settings and the approval policy have to be in place before
+    /// that: the orchestrator resolves each server's proxy against its global
+    /// proxy and builds its policy engine once, at construction.
+    async fn with_mcp_orchestrator(mut self, router_config: &RouterConfig) -> Result<Self, String> {
         // Create OnceLock container
         let mcp_orchestrator_lock = Arc::new(OnceLock::new());
 
-        // Always create with empty config and defaults
-        debug!("Initializing MCP orchestrator with empty config and default settings (5 min TTL, 100 max connections)");
+        let config = mcp_bootstrap_config(router_config.mcp_config.as_ref());
+        debug!(
+            max_connections = config.pool.max_connections,
+            proxy = config.proxy.is_some(),
+            "Initializing MCP orchestrator; config-file servers register through the job queue"
+        );
 
-        let empty_config = smg_mcp::McpConfig {
-            servers: Vec::new(),
-            pool: Default::default(),
-            proxy: None,
-            warmup: Vec::new(),
-            inventory: Default::default(),
-            policy: Default::default(),
-        };
-
-        let orchestrator = McpOrchestrator::new(empty_config)
+        let orchestrator = McpOrchestrator::new(config)
             .await
             .map_err(|e| format!("Failed to initialize MCP orchestrator: {e}"))?;
 
@@ -736,8 +793,18 @@ impl AppContextBuilder {
             };
 
         if is_cache_aware {
-            let monitor = Arc::new(KvEventMonitor::new(None));
-            debug!("Created KV event monitor for event-driven cache-aware routing");
+            let monitor = Arc::new(KvEventMonitor::with_kind(config.kv_index, None));
+            debug!(
+                kv_index = config.kv_index.as_str(),
+                "Created KV event monitor for event-driven cache-aware routing"
+            );
+            // The load records on the event streams are polls of the worker.
+            if let Some(worker_monitor) = &self.worker_monitor {
+                monitor.set_load_sink(worker_monitor);
+            }
+            if KvIndexKind::deprecated_alias_used() {
+                warn!("--kv-index run is the deprecated spelling of --kv-index chain");
+            }
 
             // Optional indexer bounding: prune entries by last-touch TTL and/or
             // capacity ceiling. Both default off (unbounded, prior behavior).
@@ -745,6 +812,7 @@ impl AppContextBuilder {
                 config.kv_indexer_ttl_secs.unwrap_or(0),
                 config.kv_indexer_max_entries.unwrap_or(0),
             );
+            monitor.start_stats_task();
 
             // Inject monitor into PolicyRegistry — propagates to default_policy
             // and any other existing cache-aware policies.
@@ -777,10 +845,28 @@ impl Default for AppContextBuilder {
     }
 }
 
+/// The orchestrator's startup configuration: the operator's MCP file with
+/// its server list removed (the `InitializeMcpServers` job registers those
+/// once the gateway is up), and the global proxy taken from the environment
+/// (`MCP_HTTP_PROXY`, `MCP_HTTPS_PROXY`, `MCP_NO_PROXY`, or their unprefixed
+/// forms) when the file sets none.
+fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig {
+    let mut config = file.cloned().unwrap_or_default();
+    config.servers.clear();
+    config.with_env_proxy()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+
     use super::*;
-    use crate::config::types::PolicyConfig;
+    use crate::{
+        config::types::PolicyConfig,
+        worker::{BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType},
+    };
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
@@ -922,6 +1008,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         });
         let builder = AppContextBuilder::new()
             .with_client(&config, 5)
@@ -965,6 +1053,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         }));
     }
 
@@ -988,6 +1078,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);
@@ -1055,5 +1147,150 @@ mod tests {
         let result = AppContextBuilder::new().maybe_rate_limit_manager(&config);
         assert!(result.is_ok());
         assert!(result.unwrap().rate_limit_manager.is_some());
+    }
+
+    #[test]
+    fn mcp_bootstrap_keeps_everything_but_the_server_list() {
+        let file: smg_mcp::McpConfig = serde_yaml::from_str(
+            r#"
+servers:
+  - name: "docs"
+    protocol: sse
+    url: "https://mcp.example.com/sse"
+pool:
+  max_connections: 7
+proxy:
+  https: "http://proxy.example:3128"
+policy:
+  default: deny
+"#,
+        )
+        .unwrap();
+        assert_eq!(file.servers.len(), 1);
+
+        let config = mcp_bootstrap_config(Some(&file));
+        assert!(
+            config.servers.is_empty(),
+            "servers register through the job queue"
+        );
+        assert_eq!(config.pool.max_connections, 7);
+        assert_eq!(
+            config
+                .proxy
+                .as_ref()
+                .and_then(|proxy| proxy.https.as_deref()),
+            Some("http://proxy.example:3128")
+        );
+        assert!(matches!(
+            config.policy.default,
+            smg_mcp::PolicyDecisionConfig::Deny
+        ));
+
+        assert!(mcp_bootstrap_config(None).servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_bootstrap_reads_the_proxy_from_the_environment_when_the_file_has_none() {
+        std::env::set_var("MCP_HTTPS_PROXY", "http://env-proxy.example:3128");
+        let config = mcp_bootstrap_config(None);
+        std::env::remove_var("MCP_HTTPS_PROXY");
+        assert_eq!(
+            config
+                .proxy
+                .as_ref()
+                .and_then(|proxy| proxy.https.as_deref()),
+            Some("http://env-proxy.example:3128")
+        );
+    }
+
+    fn prefill_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn worker_status_change_wakes_prefill_admission() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let admission = Arc::new(PrefillAdmission::new(1, 1, Duration::from_secs(1)));
+        start_prefill_admission_notifier(&registry, &admission).unwrap();
+
+        let first = prefill_worker("http://prefill-1:8000");
+        registry.register(Arc::clone(&first)).unwrap();
+        let occupied = admission
+            .admit(None, {
+                let first = Arc::clone(&first);
+                move |capacity| capacity.select(Arc::clone(&first), ())
+            })
+            .await
+            .unwrap();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test waiter must run concurrently with worker status changes"
+        )]
+        let waiting = tokio::spawn({
+            let admission = Arc::clone(&admission);
+            let registry = Arc::clone(&registry);
+            let attempts = Arc::clone(&attempts);
+            async move {
+                admission
+                    .admit(None, |capacity| {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        let workers = registry.get_by_type(WorkerType::Prefill);
+                        if workers.is_empty() {
+                            return PrefillAdmissionAttempt::Unavailable;
+                        }
+                        workers
+                            .iter()
+                            .find(|worker| worker.is_available() && capacity.has_capacity(worker))
+                            .map_or(PrefillAdmissionAttempt::AtCapacity, |worker| {
+                                capacity.select(Arc::clone(worker), Arc::clone(worker))
+                            })
+                    })
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admission.queued_requests() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill-2:8000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let second_id = registry.register(Arc::clone(&second)).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(admission.queued_requests(), 1);
+
+        registry.transition_status(&second_id, WorkerStatus::Ready);
+        let selected = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.selected.url(), second.url());
+        drop(selected);
+        drop(occupied);
     }
 }

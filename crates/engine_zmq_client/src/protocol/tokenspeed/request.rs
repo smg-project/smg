@@ -10,9 +10,9 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
-use crate::protocol::tokenspeed::{
-    drain_trailing, expect_tag, multimodal::TokenSpeedWireMmInputs, next_field,
-    sampling::SamplingParams,
+use crate::protocol::{
+    positional::{drain_trailing, expect_tag, next_field},
+    tokenspeed::{multimodal::TokenSpeedWireMmInputs, sampling::SamplingParams},
 };
 
 /// The msgspec tag for [`TokenizedGenerateReqInput`] (element 0 on the wire).

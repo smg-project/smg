@@ -126,6 +126,8 @@ pub mod metrics_labels {
     pub const ENDPOINT_CHAT: &str = "chat";
     pub const ENDPOINT_GENERATE: &str = "generate";
     pub const ENDPOINT_RESPONSES: &str = "responses";
+    pub const ENDPOINT_DECISIONS: &str = "decisions";
+    pub const ENDPOINT_SYSTEMONE: &str = "systemone";
     pub const ENDPOINT_COMPLETIONS: &str = "completions";
     pub const ENDPOINT_RERANK: &str = "rerank";
     pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
@@ -155,6 +157,7 @@ pub mod metrics_labels {
 
     // PD KV connector modes (smg_pd_kv_connector_mode_total)
     pub const KV_CONNECTOR_MOONCAKE: &str = "mooncake";
+    pub const KV_CONNECTOR_MORIIO: &str = "moriio";
     pub const KV_CONNECTOR_NIXL: &str = "nixl";
     pub const KV_CONNECTOR_PASSTHROUGH: &str = "passthrough";
 

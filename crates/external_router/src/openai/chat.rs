@@ -8,8 +8,7 @@ use axum::{
     response::Response,
 };
 use futures_util::StreamExt;
-use openai_protocol::{chat::ChatCompletionRequest, model_type::Endpoint};
-use serde_json::to_value;
+use openai_protocol::{chat::ChatCompletionRequest, common::to_value_exact, model_type::Endpoint};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -83,7 +82,7 @@ pub(super) async fn route_chat(
         }
     };
 
-    let mut payload = match to_value(&body) {
+    let mut payload = match to_value_exact(&body) {
         Ok(v) => v,
         Err(e) => {
             Metrics::record_router_error(

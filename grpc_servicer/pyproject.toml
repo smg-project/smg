@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-servicer"
-version = "0.12.0"
+version = "0.13.2"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
-    "smg-grpc-proto>=0.4.20",  # 0.4.20: first release with GenerateRequest.extra_mm_inputs (field 11)
+    "smg-grpc-proto>=0.4.24",  # 0.4.24: SGLang OutputLogProbs.token_ids_logprobs for prefill-only scoring
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",
@@ -33,23 +33,41 @@ classifiers = [
 vllm = ["vllm>=0.19.0", "pyzmq>=25.0.0", "msgspec>=0.18.0"]
 # Redis media-processing sidecar backend for vLLM (SMG_VLLM_MM_PROCESSOR=redis).
 vllm-redis = ["redis>=5.0", "msgspec>=0.18.0"]
-# 0.5.20 dropped the server_args parameter from start_disagg_service(), which
-# the gRPC server calls unconditionally when starting a prefill worker; it now
-# reads the per-process config instead. The floor tracks that signature, the
-# same way it tracked 0.5.18 dropping the same parameter from
+# 0.5.21 (sgl-project/sglang#40638) dropped the attn_cp_rank, moe_dp_rank and
+# moe_ep_rank parameters from run_scheduler_process(), which the launcher calls
+# positionally; the scheduler derives those ranks itself now. 0.5.20 dropped
+# the server_args parameter from start_disagg_service(), which the gRPC server
+# calls unconditionally when starting a prefill worker; it now reads the
+# per-process config instead. The floor tracks those signatures, the same way
+# it tracked 0.5.18 dropping the same parameter from
 # create_load_snapshot_reader(). (Earlier floors recorded the shmem load
 # snapshots that replaced the WatchLoadUpdateReq piggyback path in 0.5.13,
 # removed upstream in v0.5.14.)
-sglang = ["sglang>=0.5.20"]
+sglang = ["sglang>=0.5.21", "pyzmq>=25.0.0", "msgspec>=0.18.0"]
 # smg-grpc-proto>=0.4.7 is the first release that ships mlx_engine_pb2;
 # without this floor, installing [mlx] against an older proto build would
 # crash at import time when smg_grpc_servicer.mlx.server runs.
 # transformers<5.13: 5.13.0 regressed AutoTokenizer.register on string keys,
 # which mlx-lm's NewlineTokenizer registration hits at import.
-mlx = ["smg-grpc-proto>=0.4.7", "mlx>=0.22.0", "mlx-lm>=0.22.0", "transformers<5.13"]
+# mlx-lm<0.32: 0.32.0 replaced `SequenceStateMachine` (token-sequence stop
+# transitions, which the MLX servicer builds its stop handling on) with a
+# string-level `TextStateMachine` plus a separate `StopSequences` matcher;
+# lift the bound together with that port.
+mlx = ["smg-grpc-proto>=0.4.7", "mlx>=0.22.0", "mlx-lm>=0.22.0,<0.32", "transformers<5.13"]
 # TokenSpeed itself is installed from source (no PyPI release); these are the
 # extra runtime deps the KV-event bridge needs on top of a TokenSpeed install.
 tokenspeed = ["pyzmq>=25.0.0", "msgspec>=0.18.0"]
+
+# SGLang loads this in every scheduler process; it hooks the scheduler behind
+# SMG over ZMQ only when the headless launcher's env is set (see
+# smg_grpc_servicer/sglang/zmq_plugin.py).
+[project.entry-points."sglang.srt.plugins"]
+smg-zmq = "smg_grpc_servicer.sglang.zmq_plugin:register"
+
+# vLLM loads this while it builds the engine CLI; it adds `--servicer-impl`
+# to the `vllm serve --grpc` parser (see smg_grpc_servicer/vllm/plugin.py).
+[project.entry-points."vllm.general_plugins"]
+smg-servicer = "smg_grpc_servicer.vllm.plugin:register"
 
 [project.urls]
 Homepage = "https://github.com/smg-project/smg"

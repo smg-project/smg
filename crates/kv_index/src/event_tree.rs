@@ -3,13 +3,15 @@
 //! Uses a single `DashMap<(usize, ContentHash), IndexEntry>` keyed by (position, content_hash).
 //! Unbounded by default; [`PositionalIndexer::prune`] optionally bounds it with a
 //! last-touch TTL and/or a capacity ceiling (oldest-first eviction).
-//! Jump search skips positions in strides, yielding amortized O(D/J + W) complexity.
+//! A lookup verifies every position of the request in order, so a worker's score is exactly
+//! the length of the prefix it holds contiguously (O(D) probes for a request of D blocks).
 //!
 //! **Dual-hash scheme**: backends send a position-aware `block_hash` (SequenceHash)
 //! and raw `token_ids` per block. The router computes a position-independent
 //! ContentHash (XXH3) from token_ids, then a rolling prefix hash (also XXH3) from
-//! the ContentHash sequence. SeqEntry is keyed by the router's prefix hash for
-//! precise disambiguation at query time. The backend's SequenceHash is stored in
+//! the ContentHash sequence. SeqEntry is keyed by the router's prefix hash, and every lookup probe
+//! (every position) matches on it, so a
+//! request is credited only for the exact chain a worker holds. The backend's SequenceHash is stored in
 //! worker_blocks only, used for `apply_removed` reverse lookup.
 //!
 //! **Performance**: Internal u32 worker IDs eliminate Arc<str> hashing and atomic
@@ -31,7 +33,7 @@ use std::{
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 /// Seed for XXH3 hashing.
 pub const XXH3_SEED: u64 = 1337;
@@ -145,24 +147,78 @@ impl std::error::Error for WorkerIdExhausted {}
 /// Overlap scores: how many consecutive blocks each worker has cached.
 ///
 /// Keys are internal `u32` worker IDs. Use [`PositionalIndexer::worker_id`] to
-/// map a worker URL to its internal ID for lookups.
+/// map a worker URL to its internal ID for lookups. A worker's total block count
+/// is available separately through [`PositionalIndexer::worker_block_count`]; it
+/// is not collected per lookup, since no routing decision reads it there.
 #[derive(Debug, Default)]
 pub struct OverlapScores {
     /// internal_worker_id → number of matching prefix blocks (depth in indexer)
     pub scores: FxHashMap<u32, u32>,
-    /// internal_worker_id → total blocks cached by this worker
-    pub tree_sizes: FxHashMap<u32, usize>,
 }
 
-/// Compute content hash from token IDs (position-independent).
-/// Uses XXH3-64 streaming hasher with standard seed — avoids intermediate allocation.
-pub fn compute_content_hash(token_ids: &[u32]) -> ContentHash {
-    use std::hash::Hasher;
-    let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(XXH3_SEED);
-    for &t in token_ids {
-        hasher.write(&t.to_le_bytes());
+/// A request's block content hashes as the lookup reads them: by position, without copying.
+///
+/// Implemented for `[ContentHash]` and `[u64]`. A caller with its own hash newtype implements
+/// it on a wrapper around its slice and calls
+/// [`PositionalIndexer::find_matches_in`], so no `Vec<ContentHash>` is built per lookup.
+pub trait ContentSeq {
+    /// Number of blocks in the request.
+    fn len(&self) -> usize;
+    /// Content hash of the block at `position` (`position < len()`).
+    fn at(&self, position: usize) -> ContentHash;
+    /// Whether the request has no blocks.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
-    ContentHash(hasher.finish())
+}
+
+impl ContentSeq for [ContentHash] {
+    #[inline]
+    fn len(&self) -> usize {
+        <[ContentHash]>::len(self)
+    }
+
+    #[inline]
+    fn at(&self, position: usize) -> ContentHash {
+        self[position]
+    }
+}
+
+impl ContentSeq for [u64] {
+    #[inline]
+    fn len(&self) -> usize {
+        <[u64]>::len(self)
+    }
+
+    #[inline]
+    fn at(&self, position: usize) -> ContentHash {
+        ContentHash(self[position])
+    }
+}
+
+/// Compute content hash from token IDs (position-independent): XXH3-64 with
+/// the standard seed over the ids' little-endian bytes.
+///
+/// One-shot over a stack buffer for blocks up to 256 tokens: the streaming
+/// hasher derives a seeded secret per instance before it sees a byte, which
+/// outweighs hashing a 16-token block. Same digest either way (the test
+/// below pins that).
+pub fn compute_content_hash(token_ids: &[u32]) -> ContentHash {
+    const STACK_BYTES: usize = 1024;
+    let len = token_ids.len() * 4;
+    if len <= STACK_BYTES {
+        let mut bytes = [0u8; STACK_BYTES];
+        let (slots, _) = bytes[..len].as_chunks_mut::<4>();
+        for (slot, token) in slots.iter_mut().zip(token_ids) {
+            *slot = token.to_le_bytes();
+        }
+        return ContentHash(xxhash_rust::xxh3::xxh3_64_with_seed(
+            &bytes[..len],
+            XXH3_SEED,
+        ));
+    }
+    let bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
+    ContentHash(xxhash_rust::xxh3::xxh3_64_with_seed(&bytes, XXH3_SEED))
 }
 
 /// Rolling prefix hash over content hashes: `XXH3(prev || current)`, the
@@ -219,6 +275,135 @@ pub fn compute_request_content_hashes(tokens: &[u32], block_size: usize) -> Vec<
 // SeqEntry: optimizes for the common case (one seq_hash per position+content)
 // ---------------------------------------------------------------------------
 
+/// Ids below this many live in the inline words of a [`WorkerSet`].
+const INLINE_WORKER_IDS: u32 = 128;
+
+/// Dense set of interned worker ids.
+///
+/// Two inline words cover ids below [`INLINE_WORKER_IDS`] with no heap
+/// allocation, which is every worker in a typical fleet; larger ids spill
+/// into a boxed vector that is grown on demand (rare: a fleet past 128
+/// workers). The spill sits behind one thin pointer so the set is 24 bytes and
+/// an [`IndexEntry`] 48, which keeps a map bucket (16-byte key included) at 64
+/// bytes. Membership is a bit test, which is what the lookup path does for
+/// every active worker at every position.
+#[derive(Debug, Clone, Default)]
+struct WorkerSet {
+    low: [u64; 2],
+    high: Option<Box<Spill>>,
+}
+
+/// The spill words of a [`WorkerSet`] (ids at or above [`INLINE_WORKER_IDS`]), boxed as one
+/// thin pointer: a `Box<[u64]>` is two words and would put the set back at 32 bytes. The extra
+/// indirection is paid only on the rare spill path.
+#[derive(Debug, Clone, Default)]
+struct Spill(Vec<u64>);
+
+impl std::ops::Deref for Spill {
+    type Target = Vec<u64>;
+
+    fn deref(&self) -> &Vec<u64> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Spill {
+    fn deref_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.0
+    }
+}
+
+impl WorkerSet {
+    fn single(id: u32) -> Self {
+        let mut set = Self::default();
+        set.insert(id);
+        set
+    }
+
+    #[inline]
+    fn slot(id: u32) -> (usize, u64) {
+        ((id / 64) as usize, 1u64 << (id % 64))
+    }
+
+    /// Insert `id`; returns whether it was newly added.
+    fn insert(&mut self, id: u32) -> bool {
+        let (word, bit) = Self::slot(id);
+        if id < INLINE_WORKER_IDS {
+            let was = self.low[word] & bit != 0;
+            self.low[word] |= bit;
+            return !was;
+        }
+        let index = word - 2;
+        let high = self.high.get_or_insert_with(Box::default);
+        if high.len() <= index {
+            high.resize(index + 1, 0);
+        }
+        let was = high[index] & bit != 0;
+        high[index] |= bit;
+        !was
+    }
+
+    /// Remove `id`; returns whether it was present.
+    fn remove(&mut self, id: u32) -> bool {
+        let (word, bit) = Self::slot(id);
+        if id < INLINE_WORKER_IDS {
+            let was = self.low[word] & bit != 0;
+            self.low[word] &= !bit;
+            return was;
+        }
+        let Some(high) = self.high.as_mut() else {
+            return false;
+        };
+        let index = word - 2;
+        let Some(slot) = high.get_mut(index) else {
+            return false;
+        };
+        let was = *slot & bit != 0;
+        *slot &= !bit;
+        was
+    }
+
+    #[inline]
+    fn contains(&self, id: u32) -> bool {
+        let (word, bit) = Self::slot(id);
+        if id < INLINE_WORKER_IDS {
+            return self.low[word] & bit != 0;
+        }
+        self.high
+            .as_ref()
+            .and_then(|high| high.get(word - 2))
+            .is_some_and(|slot| slot & bit != 0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.low == [0, 0]
+            && self
+                .high
+                .as_ref()
+                .is_none_or(|high| high.iter().all(|w| *w == 0))
+    }
+
+    /// Every id in the set, ascending.
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        let words = self
+            .low
+            .iter()
+            .copied()
+            .chain(self.high.iter().flat_map(|high| high.iter().copied()));
+        words.enumerate().flat_map(|(index, mut word)| {
+            let base = index as u32 * 64;
+            std::iter::from_fn(move || {
+                if word == 0 {
+                    return None;
+                }
+                let bit = word.trailing_zeros();
+                word &= word - 1;
+                Some(base + bit)
+            })
+        })
+    }
+}
+
 /// Entry for the innermost level of the index.
 ///
 /// Optimizes for the common case where there's only one sequence hash
@@ -226,16 +411,14 @@ pub fn compute_request_content_hashes(tokens: &[u32], block_size: usize) -> Vec<
 #[derive(Debug, Clone)]
 enum SeqEntry {
     /// Single seq_hash → workers mapping (common case, no HashMap allocation).
-    Single(SequenceHash, FxHashSet<u32>),
+    Single(SequenceHash, WorkerSet),
     /// Multiple seq_hash → workers mappings (rare: different prefixes with same content).
-    Multi(FxHashMap<SequenceHash, FxHashSet<u32>>),
+    Multi(FxHashMap<SequenceHash, WorkerSet>),
 }
 
 impl SeqEntry {
     fn new(seq_hash: SequenceHash, worker_id: u32) -> Self {
-        let mut workers = FxHashSet::default();
-        workers.insert(worker_id);
-        Self::Single(seq_hash, workers)
+        Self::Single(seq_hash, WorkerSet::single(worker_id))
     }
 
     /// Insert a worker for a given seq_hash, upgrading to Multi if needed.
@@ -266,14 +449,14 @@ impl SeqEntry {
     fn remove(&mut self, seq_hash: SequenceHash, worker_id: u32) -> (bool, bool) {
         match self {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => {
-                let removed = workers.remove(&worker_id);
+                let removed = workers.remove(worker_id);
                 (removed, workers.is_empty())
             }
             Self::Single(_, _) => (false, false),
             Self::Multi(map) => {
                 let mut removed = false;
                 if let Some(workers) = map.get_mut(&seq_hash) {
-                    removed = workers.remove(&worker_id);
+                    removed = workers.remove(worker_id);
                     if workers.is_empty() {
                         map.remove(&seq_hash);
                     }
@@ -290,13 +473,13 @@ impl SeqEntry {
     fn accumulate_worker_counts(&self, acc: &mut FxHashMap<u32, usize>) {
         match self {
             Self::Single(_, workers) => {
-                for &w in workers {
+                for w in workers.iter() {
                     *acc.entry(w).or_default() += 1;
                 }
             }
             Self::Multi(map) => {
                 for workers in map.values() {
-                    for &w in workers {
+                    for w in workers.iter() {
                         *acc.entry(w).or_default() += 1;
                     }
                 }
@@ -305,24 +488,11 @@ impl SeqEntry {
     }
 
     /// Get workers for a specific prefix hash (used in query path and event processing).
-    fn get(&self, seq_hash: SequenceHash) -> Option<&FxHashSet<u32>> {
+    fn get(&self, seq_hash: SequenceHash) -> Option<&WorkerSet> {
         match self {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => Some(workers),
             Self::Single(_, _) => None,
             Self::Multi(map) => map.get(&seq_hash),
-        }
-    }
-
-    /// For Single entries, return the worker set directly without prefix hash check.
-    /// Content hash collisions at 64-bit XXH3 are practically impossible (~2^-64),
-    /// so a matching content_hash at the same position is unambiguous — the rolling
-    /// hash computation can be skipped entirely.
-    /// Returns None for Multi entries — caller must compute prefix hash to disambiguate.
-    #[inline]
-    fn workers_if_single(&self) -> Option<&FxHashSet<u32>> {
-        match self {
-            Self::Single(_, workers) => Some(workers),
-            Self::Multi(_) => None,
         }
     }
 }
@@ -346,13 +516,31 @@ impl SeqEntry {
 /// whose per-URL entries are an order of magnitude larger.
 struct TreeSizes {
     segments: [OnceLock<Box<[AtomicUsize]>>; SEGMENT_COUNT],
+    /// Sum of every slot, moved in step with the slot updates below, so
+    /// `total()` (the policy's per-request "is this indexer empty" check) is
+    /// one load instead of a sweep over every allocated slot.
+    total: AtomicUsize,
 }
 
 impl TreeSizes {
     fn new() -> Self {
         Self {
             segments: std::array::from_fn(|_| OnceLock::new()),
+            total: AtomicUsize::new(0),
         }
+    }
+
+    /// Add `n` blocks to a worker's count.
+    fn add(&self, id: u32, n: usize) {
+        self.slot(id).fetch_add(n, Ordering::Relaxed);
+        self.total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Subtract `n` blocks from a worker's count (the caller guarantees the
+    /// worker holds at least `n`).
+    fn sub(&self, id: u32, n: usize) {
+        self.slot(id).fetch_sub(n, Ordering::Relaxed);
+        self.total.fetch_sub(n, Ordering::Relaxed);
     }
 
     /// Map a worker id to (segment index, offset within segment).
@@ -398,18 +586,14 @@ impl TreeSizes {
     fn reset(&self, id: u32) {
         let (segment, offset) = Self::locate(id);
         if let Some(entries) = self.segments[segment].get() {
-            entries[offset].store(0, Ordering::Relaxed);
+            let previous = entries[offset].swap(0, Ordering::Relaxed);
+            self.total.fetch_sub(previous, Ordering::Relaxed);
         }
     }
 
-    /// Sum of all counters across allocated segments.
+    /// Sum of all counters.
     fn total(&self) -> usize {
-        self.segments
-            .iter()
-            .filter_map(OnceLock::get)
-            .flat_map(|entries| entries.iter())
-            .map(|size| size.load(Ordering::Relaxed))
-            .sum()
+        self.total.load(Ordering::Relaxed)
     }
 
     /// Subtract `n` from a worker's count, saturating at 0. Prune-side
@@ -421,7 +605,10 @@ impl TreeSizes {
         loop {
             let next = current.saturating_sub(n);
             match slot.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
+                Ok(_) => {
+                    self.total.fetch_sub(current - next, Ordering::Relaxed);
+                    break;
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -457,9 +644,19 @@ impl IndexEntry {
         }
     }
 
+    /// Record an access at coarse time `now`.
+    ///
+    /// The stamp has whole-second resolution, so a store is needed at most
+    /// once per second per entry: every other call finds the value already
+    /// equal and performs a plain load. That keeps the query path free of
+    /// shared-memory writes in steady state (a hot entry probed a million
+    /// times a second is written once), while prune keeps the exact "last
+    /// store or read" semantics it had when every probe wrote.
     #[inline]
     fn touch(&self, now: u32) {
-        self.last_touch.store(now, Ordering::Relaxed);
+        if self.last_touch.load(Ordering::Relaxed) != now {
+            self.last_touch.store(now, Ordering::Relaxed);
+        }
     }
 }
 
@@ -484,7 +681,7 @@ pub struct PruneStats {
 /// Uses a single `DashMap<(usize, ContentHash), IndexEntry>` — keyed by
 /// (position, content_hash). Unbounded by default; [`prune`](Self::prune)
 /// optionally bounds it with a last-touch TTL and a capacity ceiling.
-/// Jump search gives amortized O(D/J + W) matching complexity.
+/// A lookup probes every position of the request (O(D)); see [`find_matches`](Self::find_matches).
 ///
 /// Write-path methods take a caller-owned `&mut WorkerBlockMap` (one per worker).
 /// This gives direct HashMap access (~5ns) instead of DashMap hash+shard locking
@@ -503,7 +700,8 @@ pub struct PositionalIndexer {
     /// Monotonic counter for assigning new worker IDs. Never recycled; u64 so
     /// exhaustion of the u32 id space is detected instead of wrapping.
     next_worker_id: AtomicU64,
-    /// Jump size for search optimization (default 64).
+    /// Accepted for API compatibility; the lookup no longer strides (see
+    /// [`find_matches`](Self::find_matches)).
     jump_size: usize,
     /// Origin of the coarse `last_touch` clock (whole seconds since creation).
     epoch: Instant,
@@ -512,12 +710,27 @@ pub struct PositionalIndexer {
     test_now: AtomicU32,
 }
 
+/// Per-thread scratch for the lookup path: the request's chain hashes and the active worker
+/// set, reused across lookups so a query allocates nothing before it builds its result.
+struct LookupScratch {
+    seq_hashes: Vec<SequenceHash>,
+    active: Vec<u32>,
+}
+
+thread_local! {
+    static LOOKUP_SCRATCH: std::cell::RefCell<LookupScratch> = const {
+        std::cell::RefCell::new(LookupScratch {
+            seq_hashes: Vec::new(),
+            active: Vec::new(),
+        })
+    };
+}
+
 impl PositionalIndexer {
-    /// Create a new PositionalIndexer with the given jump size.
+    /// Create a new PositionalIndexer.
     ///
-    /// `jump_size` controls how many positions the search algorithm skips at a time.
-    /// Larger values reduce lookups on long matching prefixes but increase scan range
-    /// when workers drain. Default: 64.
+    /// `jump_size` is accepted for API compatibility and does not change the lookup: every
+    /// position is verified (see [`find_matches`](Self::find_matches)).
     pub fn new(jump_size: usize) -> Self {
         assert!(jump_size > 0, "jump_size must be greater than 0");
         Self {
@@ -574,7 +787,28 @@ impl PositionalIndexer {
         parent_seq_hash: Option<SequenceHash>,
         worker_blocks: &mut WorkerBlockMap,
     ) -> Result<(), ApplyError> {
-        if blocks.is_empty() {
+        self.apply_stored_iter(
+            worker_id,
+            blocks.iter().copied(),
+            parent_seq_hash,
+            worker_blocks,
+        )
+    }
+
+    /// [`apply_stored`](Self::apply_stored) with the blocks taken from an iterator, so a
+    /// caller translating another event format does not build a `Vec<StoredBlock>` per event.
+    pub fn apply_stored_iter<I>(
+        &self,
+        worker_id: u32,
+        blocks: I,
+        parent_seq_hash: Option<SequenceHash>,
+        worker_blocks: &mut WorkerBlockMap,
+    ) -> Result<(), ApplyError>
+    where
+        I: IntoIterator<Item = StoredBlock>,
+    {
+        let mut blocks = blocks.into_iter().peekable();
+        if blocks.peek().is_none() {
             return Ok(());
         }
 
@@ -594,10 +828,11 @@ impl PositionalIndexer {
 
         let mut prev_prefix = parent_prefix;
         let mut num_new_blocks = 0usize;
+        let mut num_moved = 0usize;
         // One coarse stamp per batch — cheaper than per-block clock reads and
         // precise enough for prune's second-granularity TTL.
         let now = self.now_secs();
-        for (i, block) in blocks.iter().enumerate() {
+        for (i, block) in blocks.enumerate() {
             let position = start_pos + i;
             let content_hash = block.content_hash;
 
@@ -628,7 +863,28 @@ impl PositionalIndexer {
             // pruned (its stale reverse mapping kept) restores its count —
             // mirroring apply_removed, which decrements only memberships
             // actually removed.
-            worker_blocks.insert(block.seq_hash, (position, content_hash, prefix_hash));
+            // A hash this worker already held at another place (a store without its parent
+            // followed by the whole chain, as the gateway's fallback produces) is held at the
+            // new place only: the latest store wins, and the old membership goes.
+            if let Some(old) =
+                worker_blocks.insert(block.seq_hash, (position, content_hash, prefix_hash))
+            {
+                if old != (position, content_hash, prefix_hash) {
+                    let (old_position, old_content, old_prefix) = old;
+                    if let Entry::Occupied(mut occupied) =
+                        self.index.entry((old_position, old_content))
+                    {
+                        let (removed, now_empty) =
+                            occupied.get_mut().seq.remove(old_prefix, worker_id);
+                        if now_empty {
+                            occupied.remove();
+                        }
+                        if removed {
+                            num_moved += 1;
+                        }
+                    }
+                }
+            }
             if membership_added {
                 num_new_blocks += 1;
             }
@@ -636,10 +892,10 @@ impl PositionalIndexer {
         }
 
         // Atomically update tree_sizes — lock-free array index.
-        if num_new_blocks > 0 {
-            self.tree_sizes
-                .slot(worker_id)
-                .fetch_add(num_new_blocks, Ordering::Relaxed);
+        if num_new_blocks > num_moved {
+            self.tree_sizes.add(worker_id, num_new_blocks - num_moved);
+        } else if num_moved > num_new_blocks {
+            self.tree_sizes.sub(worker_id, num_moved - num_new_blocks);
         }
 
         Ok(())
@@ -663,8 +919,21 @@ impl PositionalIndexer {
         seq_hashes: &[SequenceHash],
         worker_blocks: &mut WorkerBlockMap,
     ) {
+        self.apply_removed_iter(worker_id, seq_hashes.iter().copied(), worker_blocks);
+    }
+
+    /// [`apply_removed`](Self::apply_removed) with the hashes taken from an iterator, so a
+    /// caller translating another event format does not build a `Vec<SequenceHash>` per event.
+    pub fn apply_removed_iter<I>(
+        &self,
+        worker_id: u32,
+        seq_hashes: I,
+        worker_blocks: &mut WorkerBlockMap,
+    ) where
+        I: IntoIterator<Item = SequenceHash>,
+    {
         let mut num_removed = 0usize;
-        for &seq_hash in seq_hashes {
+        for seq_hash in seq_hashes {
             let Some((position, content_hash, prefix_hash)) = worker_blocks.remove(&seq_hash)
             else {
                 continue;
@@ -685,9 +954,7 @@ impl PositionalIndexer {
         }
 
         if num_removed > 0 {
-            self.tree_sizes
-                .slot(worker_id)
-                .fetch_sub(num_removed, Ordering::Relaxed);
+            self.tree_sizes.sub(worker_id, num_removed);
         }
     }
 
@@ -725,9 +992,37 @@ impl PositionalIndexer {
         self.tree_sizes.reset(worker_id);
     }
 
+    /// Number of blocks the index currently holds for `worker_id` (a lock-free counter read).
+    pub fn worker_block_count(&self, worker_id: u32) -> usize {
+        self.tree_sizes.load(worker_id)
+    }
+
     /// Get total number of blocks across all workers.
     pub fn current_size(&self) -> usize {
         self.tree_sizes.total()
+    }
+
+    /// Every membership in the index as `(worker, position, content hash, prefix hash)`.
+    ///
+    /// A full walk under the shard read locks, for the exactness harness only; never call it on
+    /// a request path.
+    #[doc(hidden)]
+    pub fn debug_blocks(&self) -> Vec<(u32, usize, ContentHash, SequenceHash)> {
+        let mut out = Vec::new();
+        for entry in &self.index {
+            let (position, content) = *entry.key();
+            match &entry.value().seq {
+                SeqEntry::Single(prefix, workers) => {
+                    out.extend(workers.iter().map(|w| (w, position, content, *prefix)));
+                }
+                SeqEntry::Multi(map) => {
+                    for (prefix, workers) in map {
+                        out.extend(workers.iter().map(|w| (w, position, content, *prefix)));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Number of `(position, content_hash)` entries currently in the index.
@@ -747,12 +1042,9 @@ impl PositionalIndexer {
     ///   `None` or `Some(0)` disables the capacity pass.
     ///
     /// Semantics and caveats:
-    /// * Queries touch exactly the entries they read (position 0, jump
-    ///   landings, and linear-scan ranges), so entries a hot request stream
-    ///   actually needs stay resident; interior positions the jump shortcut
-    ///   skips may age out — harmless, the shortcut never reads them, and a
-    ///   later drain across an evicted position under-counts that one score
-    ///   (same tolerance as the documented `apply_removed` gap behavior).
+    /// * Queries touch every entry they read (each position of the request up
+    ///   to where its last worker drains), so entries a hot request stream
+    ///   actually needs stay resident.
     /// * Eviction leaves the per-worker reverse maps (`WorkerBlockMap`)
     ///   untouched; a later `apply_removed` for a pruned block is a safe
     ///   no-op (membership check), and stale reverse entries are dropped by
@@ -844,25 +1136,39 @@ impl PositionalIndexer {
 
     /// Find overlap scores for a request's content hash sequence.
     ///
-    /// Uses jump search: strides by `jump_size` positions, only scanning
-    /// intermediate positions when workers drain (stop matching).
-    /// Complexity: amortized O(D/J + W) where D=depth, J=jump_size, W=workers.
+    /// Verifies every position of the request in order (O(D) probes, D = depth), draining
+    /// workers as they stop matching; a worker's score is the length of the prefix it holds
+    /// contiguously, so an evicted middle block ends it exactly as it does in the engine.
     ///
     /// When `early_exit` is true, returns immediately after finding any match
     /// at position 0 (score = 1 for all matching workers). Useful when the caller
     /// only needs to know whether any worker has cached data for this sequence.
     ///
-    /// **Assumption**: Block sequences are prefix-closed — if a worker has a block at
-    /// position N, it has blocks at all positions 0..N. This holds when backends evict
-    /// from the tail (LRU). If `apply_removed` creates a mid-sequence gap, the rolling
-    /// prefix hash detects it (the chain breaks at the gap), but the jump heuristic may
-    /// over-count if it lands past the gap. In practice, backends only evict tail blocks.
+    /// A worker is credited exactly the prefix it holds contiguously: a block evicted from
+    /// the middle of a chain ends the score there, as the engine's own prefix match does.
     pub fn find_matches(&self, content_hashes: &[ContentHash], early_exit: bool) -> OverlapScores {
-        self.jump_search_matches(content_hashes, early_exit)
+        self.find_matches_in(content_hashes, early_exit)
+    }
+
+    /// [`find_matches`](Self::find_matches) over any [`ContentSeq`], so a caller whose
+    /// request hashes live in its own type (plain `u64`s, or a newtype wrapped by the caller)
+    /// does not build a `Vec<ContentHash>` per lookup.
+    pub fn find_matches_in<S: ContentSeq + ?Sized>(
+        &self,
+        sequence: &S,
+        early_exit: bool,
+    ) -> OverlapScores {
+        LOOKUP_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let LookupScratch { seq_hashes, active } = &mut *scratch;
+            seq_hashes.clear();
+            active.clear();
+            self.scan_with(sequence, early_exit, seq_hashes, active)
+        })
     }
 
     // -----------------------------------------------------------------------
-    // Internal: router prefix hash + jump search
+    // Internal: router prefix hash + lookup scan
     //
     // The router computes its own rolling hash from ContentHashes (XXH3).
     // This hash is stored in SeqEntry during apply_stored and recomputed
@@ -882,18 +1188,18 @@ impl PositionalIndexer {
 
     /// Lazily compute prefix hashes up to `target_pos`.
     #[inline]
-    fn ensure_seq_hash_computed(
+    fn ensure_seq_hash_computed<S: ContentSeq + ?Sized>(
         seq_hashes: &mut Vec<SequenceHash>,
         target_pos: usize,
-        sequence: &[ContentHash],
+        sequence: &S,
     ) {
         while seq_hashes.len() <= target_pos {
             let pos = seq_hashes.len();
             if pos == 0 {
-                seq_hashes.push(SequenceHash(sequence[0].0));
+                seq_hashes.push(SequenceHash(sequence.at(0).0));
             } else {
                 let prev = seq_hashes[pos - 1].0;
-                let current = sequence[pos].0;
+                let current = sequence.at(pos).0;
                 seq_hashes.push(SequenceHash(Self::compute_next_seq_hash(prev, current)));
             }
         }
@@ -933,67 +1239,34 @@ impl PositionalIndexer {
     // Internal: query helpers
     // -----------------------------------------------------------------------
 
-    /// Get workers at a position matching content_hash (and prefix_hash for Multi).
-    /// Copies worker IDs into a Vec — used only once at position 0 to initialize `active`.
-    /// Skips rolling hash computation for Single entries (unambiguous match).
-    fn get_workers_lazy(
+    /// Workers holding the request's first block (position 0: same content hash and prefix
+    /// hash), appended to the caller's `active` buffer. False when no entry exists at all.
+    fn collect_workers_at_start<S: ContentSeq + ?Sized>(
         index: &PosIndex,
-        position: usize,
-        content_hash: ContentHash,
         seq_hashes: &mut Vec<SequenceHash>,
-        sequence: &[ContentHash],
+        sequence: &S,
         now: u32,
-    ) -> Option<Vec<u32>> {
-        let entry = index.get(&(position, content_hash))?;
-        entry.value().touch(now);
-        if let Some(workers) = entry.value().seq.workers_if_single() {
-            return Some(workers.iter().copied().collect());
-        }
-        // Multi: need rolling hash to disambiguate
-        Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
-        entry
-            .value()
-            .seq
-            .get(seq_hashes[position])
-            .map(|workers| workers.iter().copied().collect())
-    }
-
-    /// Count workers at a position matching the prefix_hash (no set materialization).
-    /// Skips rolling hash computation for Single entries (unambiguous match).
-    fn count_workers_at(
-        index: &PosIndex,
-        position: usize,
-        content_hash: ContentHash,
-        seq_hashes: &mut Vec<SequenceHash>,
-        sequence: &[ContentHash],
-        now: u32,
-    ) -> usize {
-        let Some(entry) = index.get(&(position, content_hash)) else {
-            return 0;
+        active: &mut Vec<u32>,
+    ) -> bool {
+        let Some(entry) = index.get(&(0, sequence.at(0))) else {
+            return false;
         };
         entry.value().touch(now);
-        if let Some(workers) = entry.value().seq.workers_if_single() {
-            return workers.len();
+        Self::ensure_seq_hash_computed(seq_hashes, 0, sequence);
+        if let Some(workers) = entry.value().seq.get(seq_hashes[0]) {
+            active.extend(workers.iter());
         }
-        // Multi: need rolling hash to disambiguate
-        Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
-        entry
-            .value()
-            .seq
-            .get(seq_hashes[position])
-            .map(|workers| workers.len())
-            .unwrap_or(0)
+        true
     }
 
     /// Scan positions sequentially, draining workers that stop matching.
-    /// Accesses DashMap entries directly — no set cloning.
-    /// Skips rolling hash computation for Single entries (unambiguous match).
-    /// Uses retain guard: skips retain when workers.len() >= active.len()
-    /// (all active workers are still present, no work to do).
+    /// Accesses DashMap entries directly — no set cloning. Every position is matched on
+    /// content hash and prefix hash, and every active worker is checked against the matching
+    /// set: a set at least as large as `active` may still lack one of its workers.
     #[expect(clippy::too_many_arguments)]
-    fn linear_scan_drain(
+    fn linear_scan_drain<S: ContentSeq + ?Sized>(
         index: &PosIndex,
-        sequence: &[ContentHash],
+        sequence: &S,
         seq_hashes: &mut Vec<SequenceHash>,
         active: &mut Vec<u32>,
         internal_scores: &mut FxHashMap<u32, u32>,
@@ -1002,11 +1275,11 @@ impl PositionalIndexer {
         early_exit: bool,
         now: u32,
     ) {
-        for (offset, &content_hash) in sequence[lo..hi].iter().enumerate() {
+        for pos in lo..hi {
             if active.is_empty() {
                 break;
             }
-            let pos = lo + offset;
+            let content_hash = sequence.at(pos);
 
             let Some(entry) = index.get(&(pos, content_hash)) else {
                 for &w in active.iter() {
@@ -1016,30 +1289,6 @@ impl PositionalIndexer {
                 break;
             };
             entry.value().touch(now);
-
-            // Fast path: Single entry — skip rolling hash, use workers directly.
-            if let Some(workers) = entry.value().seq.workers_if_single() {
-                // Retain guard: only retain when some workers
-                // have dropped off. When workers.len() >= active.len(), all active
-                // workers are still present — skip the O(active) iteration.
-                if workers.len() < active.len() {
-                    let mut i = 0;
-                    while i < active.len() {
-                        if workers.contains(&active[i]) {
-                            i += 1;
-                        } else {
-                            internal_scores.insert(active[i], pos as u32);
-                            active.swap_remove(i);
-                        }
-                    }
-                }
-                if early_exit && !active.is_empty() {
-                    break;
-                }
-                continue;
-            }
-
-            // Multi: need rolling hash to disambiguate.
             Self::ensure_seq_hash_computed(seq_hashes, pos, sequence);
             let seq_hash = seq_hashes[pos];
 
@@ -1051,120 +1300,78 @@ impl PositionalIndexer {
                 break;
             };
 
-            // Retain guard: only iterate when some workers dropped off.
-            if workers.len() < active.len() {
-                let mut i = 0;
-                while i < active.len() {
-                    if workers.contains(&active[i]) {
-                        i += 1;
-                    } else {
-                        internal_scores.insert(active[i], pos as u32);
-                        active.swap_remove(i);
-                    }
+            let mut i = 0;
+            while i < active.len() {
+                if workers.contains(active[i]) {
+                    i += 1;
+                } else {
+                    internal_scores.insert(active[i], pos as u32);
+                    active.swap_remove(i);
                 }
             }
-
             if early_exit && !active.is_empty() {
                 break;
             }
         }
     }
 
-    fn jump_search_matches(
+    /// The lookup proper, over caller-provided scratch buffers (see [`LookupScratch`]).
+    fn scan_with<S: ContentSeq + ?Sized>(
         &self,
-        content_hashes: &[ContentHash],
+        sequence: &S,
         early_exit: bool,
+        seq_hashes: &mut Vec<SequenceHash>,
+        active: &mut Vec<u32>,
     ) -> OverlapScores {
         let mut scores = OverlapScores::default();
 
-        if content_hashes.is_empty() {
+        if sequence.is_empty() {
             return scores;
         }
 
-        let mut seq_hashes = Vec::with_capacity(content_hashes.len());
         let now = self.now_secs();
 
-        let Some(initial_workers) = Self::get_workers_lazy(
-            &self.index,
-            0,
-            content_hashes[0],
-            &mut seq_hashes,
-            content_hashes,
-            now,
-        ) else {
-            return scores;
-        };
-
-        let mut active = initial_workers;
-        if active.is_empty() {
+        if !Self::collect_workers_at_start(&self.index, seq_hashes, sequence, now, active)
+            || active.is_empty()
+        {
             return scores;
         }
 
-        let len = content_hashes.len();
+        let len = sequence.len();
         let mut internal_scores: FxHashMap<u32, u32> = FxHashMap::default();
 
         // Early exit: just record that workers matched at position 0.
         if early_exit {
-            for &w in &active {
+            for &w in active.iter() {
                 internal_scores.insert(w, 1);
             }
             scores.scores = internal_scores;
-            for &int_id in scores.scores.keys() {
-                scores
-                    .tree_sizes
-                    .insert(int_id, self.tree_sizes.load(int_id));
-            }
             return scores;
         }
 
-        let mut current_pos = 0;
-
-        while current_pos < len - 1 && !active.is_empty() {
-            let next_pos = (current_pos + self.jump_size).min(len - 1);
-
-            let count = Self::count_workers_at(
-                &self.index,
-                next_pos,
-                content_hashes[next_pos],
-                &mut seq_hashes,
-                content_hashes,
-                now,
-            );
-
-            // If the worker count at the jump destination matches the active set size,
-            // all active workers are still present — safe to skip intermediate positions.
-            if count == active.len() {
-                current_pos = next_pos;
-            } else {
-                Self::linear_scan_drain(
-                    &self.index,
-                    content_hashes,
-                    &mut seq_hashes,
-                    &mut active,
-                    &mut internal_scores,
-                    current_pos + 1,
-                    next_pos + 1,
-                    false,
-                    now,
-                );
-                current_pos = next_pos;
-            }
-        }
+        // Every position is verified in order. A worker's score is the length of the prefix it
+        // holds contiguously, so an evicted middle block (a hole) must stop it, and a landing
+        // check alone cannot see holes: the prefix hash stored at a later position was computed
+        // when the chain was intact. The jump shortcut is therefore not taken; exactness
+        // (guardrail 1) over the probe count. `jump_size` is kept for API compatibility.
+        Self::linear_scan_drain(
+            &self.index,
+            sequence,
+            seq_hashes,
+            active,
+            &mut internal_scores,
+            1,
+            len,
+            false,
+            now,
+        );
 
         let final_score = len as u32;
-        for &w in &active {
+        for &w in active.iter() {
             internal_scores.insert(w, final_score);
         }
 
         scores.scores = internal_scores;
-
-        // Populate tree_sizes from atomic counters — lock-free array index.
-        for &int_id in scores.scores.keys() {
-            scores
-                .tree_sizes
-                .insert(int_id, self.tree_sizes.load(int_id));
-        }
-
         scores
     }
 }
@@ -1187,6 +1394,104 @@ impl fmt::Debug for PositionalIndexer {
 
 #[cfg(test)]
 mod tests {
+    /// The gateway's parent-missing fallback: b4 and b5 stored without a parent land at
+    /// positions 0 and 1; when the engine announces the chain whole they move to 4 and 5 and
+    /// their old memberships go, so the count reads six and a query for the pair alone scores
+    /// nothing.
+    #[test]
+    fn a_hash_stored_again_at_another_position_releases_its_old_place() {
+        use super::{
+            compute_content_hash, ContentHash, PositionalIndexer, SequenceHash, StoredBlock,
+            WorkerBlockMap,
+        };
+        let indexer = PositionalIndexer::new(8);
+        let worker = indexer.intern_worker("w").expect("id");
+        let mut map = WorkerBlockMap::default();
+        let contents: Vec<ContentHash> = (0..6)
+            .map(|p| compute_content_hash(&[31, p as u32]))
+            .collect();
+        let mut prefix = None::<u64>;
+        let blocks: Vec<StoredBlock> = contents
+            .iter()
+            .map(|&content| {
+                let next = match prefix {
+                    Some(prev) => PositionalIndexer::compute_next_seq_hash(prev, content.0),
+                    None => content.0,
+                };
+                prefix = Some(next);
+                StoredBlock {
+                    seq_hash: SequenceHash(next),
+                    content_hash: content,
+                }
+            })
+            .collect();
+        indexer
+            .apply_stored(worker, &blocks[..4], None, &mut map)
+            .expect("b0..b3");
+        indexer.apply_removed(worker, &[blocks[2].seq_hash, blocks[3].seq_hash], &mut map);
+        indexer
+            .apply_stored(worker, &blocks[4..], None, &mut map)
+            .expect("fallback");
+        assert_eq!(indexer.current_size(), 4);
+        assert_eq!(
+            indexer
+                .find_matches(&contents[4..], false)
+                .scores
+                .get(&worker),
+            Some(&2)
+        );
+        indexer
+            .apply_stored(worker, &blocks, None, &mut map)
+            .expect("whole");
+        assert_eq!(indexer.current_size(), 6);
+        assert_eq!(map.len(), 6);
+        assert_eq!(
+            indexer.find_matches(&contents, false).scores.get(&worker),
+            Some(&6)
+        );
+        assert!(!indexer
+            .find_matches(&contents[4..], false)
+            .scores
+            .contains_key(&worker));
+    }
+
+    /// The streaming hasher this function used before; the one-shot path must
+    /// stay bit-identical because workers report hashes computed the old way.
+    fn streaming_content_hash(token_ids: &[u32]) -> ContentHash {
+        use std::hash::Hasher;
+        let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(XXH3_SEED);
+        for &t in token_ids {
+            hasher.write(&t.to_le_bytes());
+        }
+        ContentHash(hasher.finish())
+    }
+
+    #[test]
+    fn content_hash_matches_streaming_hasher() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Every length across the stack/heap boundary (256 tokens), including
+        // the short-input, mid-input and long-input XXH3 regimes.
+        for len in 0..=300usize {
+            let tokens: Vec<u32> = (0..len).map(|_| (next() % 160_000) as u32).collect();
+            assert_eq!(
+                compute_content_hash(&tokens),
+                streaming_content_hash(&tokens),
+                "len={len}"
+            );
+        }
+        assert_eq!(
+            compute_content_hash(&[]),
+            streaming_content_hash(&[]),
+            "empty block"
+        );
+    }
+
     use super::*;
 
     /// Helper: create a sequence of StoredBlocks with distinct seq_hashes and content_hashes.
@@ -1215,6 +1520,36 @@ mod tests {
     }
 
     #[test]
+    fn worker_set_inline_and_spilled_ids() {
+        let mut set = WorkerSet::default();
+        assert!(set.is_empty());
+        for id in [0u32, 63, 64, 127, 128, 200, 10_000] {
+            assert!(set.insert(id), "{id} newly inserted");
+            assert!(!set.insert(id), "{id} already present");
+            assert!(set.contains(id));
+        }
+        assert!(!set.contains(1));
+        assert!(!set.contains(129));
+        assert!(!set.contains(100_000));
+        assert_eq!(
+            set.iter().collect::<Vec<_>>(),
+            vec![0, 63, 64, 127, 128, 200, 10_000],
+            "iteration is ascending across the inline and spilled words"
+        );
+        for id in [63u32, 128, 10_000] {
+            assert!(set.remove(id));
+            assert!(!set.remove(id));
+            assert!(!set.contains(id));
+        }
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 64, 127, 200]);
+        for id in [0u32, 64, 127, 200] {
+            set.remove(id);
+        }
+        assert!(set.is_empty(), "all bits cleared, including spilled words");
+        assert!(!WorkerSet::default().remove(5));
+    }
+
+    #[test]
     fn test_new_indexer_is_empty() {
         let indexer = PositionalIndexer::default();
         let scores = indexer.find_matches(&hashes(&[1, 2, 3]), false);
@@ -1232,7 +1567,7 @@ mod tests {
 
         let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert_eq!(scores.scores.get(&w1), Some(&3));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+        assert_eq!(indexer.worker_block_count(w1), 3);
     }
 
     #[test]
@@ -1294,7 +1629,7 @@ mod tests {
         // After removing block at position 2, w1 should only match 2 blocks
         let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert_eq!(scores.scores.get(&w1), Some(&2));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&2));
+        assert_eq!(indexer.worker_block_count(w1), 2);
     }
 
     #[test]
@@ -1336,9 +1671,8 @@ mod tests {
             .apply_stored(w2, &blocks_w2, None, &mut wb2)
             .unwrap();
 
-        let scores = indexer.find_matches(&hashes(&[10]), false);
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
-        assert_eq!(scores.tree_sizes.get(&w2), Some(&2));
+        assert_eq!(indexer.worker_block_count(w1), 3);
+        assert_eq!(indexer.worker_block_count(w2), 2);
     }
 
     #[test]
@@ -1368,7 +1702,7 @@ mod tests {
 
         let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40]), false);
         assert_eq!(scores.scores.get(&w1), Some(&4));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&4));
+        assert_eq!(indexer.worker_block_count(w1), 4);
     }
 
     #[test]
@@ -1514,6 +1848,49 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    #[test]
+    fn find_matches_in_reads_plain_u64_hashes_without_copying() {
+        let indexer = PositionalIndexer::new(8);
+        let w1 = indexer.intern_worker("w1").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+        let blocks = make_blocks(&[10, 20, 30, 40]);
+        indexer
+            .apply_stored_iter(w1, blocks.iter().copied(), None, &mut wb1)
+            .unwrap();
+        let typed = hashes(&[10, 20, 30, 40]);
+        let raw: Vec<u64> = typed.iter().map(|h| h.0).collect();
+        assert_eq!(
+            indexer.find_matches_in(raw.as_slice(), false).scores,
+            indexer.find_matches(&typed, false).scores
+        );
+        assert_eq!(
+            indexer
+                .find_matches_in(raw.as_slice(), false)
+                .scores
+                .get(&w1),
+            Some(&4)
+        );
+        indexer.apply_removed_iter(w1, [blocks[3].seq_hash], &mut wb1);
+        assert_eq!(
+            indexer
+                .find_matches_in(raw.as_slice(), false)
+                .scores
+                .get(&w1),
+            Some(&3)
+        );
+        assert!(indexer.find_matches_in(&raw[..0], false).scores.is_empty());
+    }
+
+    /// The index stores one `IndexEntry` per (position, content) key; its size sets the
+    /// bytes per unique block, so a regression here is a memory regression.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn index_entry_is_48_bytes() {
+        assert_eq!(size_of::<WorkerSet>(), 24);
+        assert_eq!(size_of::<SeqEntry>(), 40);
+        assert_eq!(size_of::<IndexEntry>(), 48);
+    }
+
     // Jump search edge cases
     // -----------------------------------------------------------------------
 
@@ -1695,8 +2072,8 @@ mod tests {
         let scores = indexer.find_matches(&hashes(&[10, 20, 30]), true);
         // early_exit: score is 1 (matched at position 0), not full depth
         assert_eq!(scores.scores.get(&w1), Some(&1));
-        // tree_sizes still populated
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+        // the worker's block count does not depend on the lookup mode
+        assert_eq!(indexer.worker_block_count(w1), 3);
     }
 
     #[test]
@@ -1749,9 +2126,7 @@ mod tests {
         indexer.apply_removed(w1, &[blocks[3].seq_hash, blocks[4].seq_hash], &mut wb1);
         assert_eq!(indexer.current_size(), 3);
 
-        // Verify tree_sizes in query results
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+        assert_eq!(indexer.worker_block_count(w1), 3);
     }
 
     #[test]
@@ -1763,19 +2138,18 @@ mod tests {
 
         // First store: 3 new blocks
         indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+        assert_eq!(indexer.worker_block_count(w1), 3);
 
         // Replay the same store event — tree_size must not change
         indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert_eq!(
-            scores.tree_sizes.get(&w1),
-            Some(&3),
+            indexer.worker_block_count(w1),
+            3,
             "Duplicate store event must not inflate tree_size"
         );
 
         // Overlap scores should also be unchanged
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert_eq!(scores.scores.get(&w1), Some(&3));
     }
 
@@ -1875,7 +2249,7 @@ mod tests {
         let content_hashes = hashes(&content);
 
         let mut seq_hashes: Vec<SequenceHash> = Vec::new();
-        PositionalIndexer::ensure_seq_hash_computed(&mut seq_hashes, 4, &content_hashes);
+        PositionalIndexer::ensure_seq_hash_computed(&mut seq_hashes, 4, content_hashes.as_slice());
 
         for (i, block) in blocks.iter().enumerate() {
             assert_eq!(
@@ -1895,7 +2269,7 @@ mod tests {
 
         let scores = indexer.find_matches(&hashes(&[10, 20]), false);
         assert_eq!(scores.scores.get(&w1), Some(&2));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&5));
+        assert_eq!(indexer.worker_block_count(w1), 5);
     }
 
     #[test]
@@ -2065,7 +2439,7 @@ mod tests {
         let query_hashes = compute_request_content_hashes(&query_tokens, block_size);
         let scores = indexer.find_matches(&query_hashes, false);
         assert_eq!(scores.scores.get(&w1), Some(&2));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&2));
+        assert_eq!(indexer.worker_block_count(w1), 2);
     }
 
     #[test]
@@ -2454,8 +2828,8 @@ mod tests {
                 "worker at depth {depth} has wrong score"
             );
             assert_eq!(
-                scores.tree_sizes.get(&wid),
-                Some(&depth),
+                indexer.worker_block_count(wid),
+                depth,
                 "worker at depth {depth} has wrong tree_size"
             );
         }
@@ -2516,11 +2890,7 @@ mod tests {
         let scores = indexer.find_matches(&hashes(&shared), false);
         for &wid in &probe_ids {
             assert_eq!(scores.scores.get(&wid), Some(&3), "worker {wid} score");
-            assert_eq!(
-                scores.tree_sizes.get(&wid),
-                Some(&4),
-                "worker {wid} tree_size"
-            );
+            assert_eq!(indexer.worker_block_count(wid), 4, "worker {wid} tree_size");
         }
 
         // Only worker 2049 has the tail block — the rest drain at depth 3.

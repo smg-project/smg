@@ -121,6 +121,11 @@ fn rgb_buffer_len(w: usize, h: usize) -> Option<usize> {
         .filter(|&n| n <= MAX_DECODED_BYTES)
 }
 
+/// Whether libjpeg-turbo was found, so JPEGs decode to PIL's pixels.
+pub fn turbojpeg_available() -> bool {
+    turbojpeg().is_some()
+}
+
 /// True if `bytes` start with the JPEG SOI marker.
 pub fn is_jpeg(bytes: &[u8]) -> bool {
     bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF

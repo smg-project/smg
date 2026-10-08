@@ -53,6 +53,7 @@ async fn main() {
 | MiniMax M2 | `<think>`/`</think>` | Auto-prepends start token |
 | Cohere Command | `<\|START_THINKING\|>`/`<\|END_THINKING\|>` | CMD3/CMD4 format |
 | Nemotron-Nano | `<think>`/`</think>` | Qwen3-compatible |
+| Hy4 | `<think>`/`</think>` with optional checkpoint suffix | `reasoning_parser: hy_v4` |
 
 Unknown models fall back to a passthrough parser that returns all text as normal output.
 

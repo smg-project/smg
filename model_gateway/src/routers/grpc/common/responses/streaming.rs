@@ -18,16 +18,24 @@ use openai_protocol::{
 };
 use serde_json::json;
 use smg_mcp::{self as mcp};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::routers::{
-    common::{
-        openai_bridge::{self, descriptor, ResponseFormat},
-        sse::{SseReceiver, SseSender},
+use super::utils::generation_failure_error;
+#[cfg(test)]
+use crate::routers::common::sse::sse_channel;
+use crate::{
+    observability::metrics::Metrics,
+    routers::{
+        common::{
+            openai_bridge::{self, descriptor, ResponseFormat},
+            sse::{SseReceiver, SseSender},
+        },
+        error,
+        grpc::harmony::responses::ToolResult,
     },
-    grpc::harmony::responses::ToolResult,
 };
 
 /// Item-id-prefix discriminator for non-format kinds. Format-driven items
@@ -77,6 +85,21 @@ struct ToolCallStreamItem {
     name: String,
     arguments: String,
     added_emitted: bool,
+}
+
+/// The bounded `reason` label for the stream-failure counter.
+///
+/// The gateway emits two error codes on this path: `stream_error` when the
+/// backend stream could not be read, and `server_error` when the engine
+/// reported a failed generation (also the case when the finish reason alone
+/// says so and no error object was built). Anything else counts as `other`
+/// so a client-visible code can never widen the label set.
+fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
+    match error.and_then(|e| e.get("code")).and_then(|c| c.as_str()) {
+        Some("stream_error") => "stream_error",
+        Some("server_error") | None => "server_error",
+        Some(_) => "other",
+    }
 }
 
 /// OpenAI-compatible event emitter for /v1/responses streaming
@@ -344,16 +367,20 @@ impl ResponseStreamEventEmitter {
         // incomplete_details and terminates the stream with
         // response.incomplete, mirroring the non-streaming conversion.
         let truncated = self.finish_reason.as_deref() == Some("length");
+        let failed = matches!(self.finish_reason.as_deref(), Some("failed" | "error"));
 
         // Build base response object
         let mut response_obj = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
-            "status": if truncated { "incomplete" } else { "completed" },
+            "status": if failed { "failed" } else if truncated { "incomplete" } else { "completed" },
             "model": self.model,
             "output": output
         });
+        if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
+            response_obj["error"] = error;
+        }
         if truncated {
             response_obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
         }
@@ -403,7 +430,9 @@ impl ResponseStreamEventEmitter {
         }
 
         json!({
-            "type": if truncated {
+            "type": if failed {
+                ResponseEvent::FAILED
+            } else if truncated {
                 ResponseEvent::INCOMPLETE
             } else {
                 ResponseEvent::COMPLETED
@@ -411,6 +440,40 @@ impl ResponseStreamEventEmitter {
             "sequence_number": self.next_sequence(),
             "response": response_obj
         })
+    }
+
+    /// Close remaining item event sequences, retaining unfinished wire statuses,
+    /// and emit exactly one terminal event.
+    pub async fn emit_terminal(
+        &mut self,
+        usage: Option<&serde_json::Value>,
+        error: Option<&serde_json::Value>,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        if error.is_some() {
+            self.finish_reason = Some("failed".into());
+        }
+        self.close_reasoning_item(tx).await?;
+        self.close_message_item(tx).await?;
+        self.close_tool_call_items(tx).await?;
+        let mut event = self.emit_completed(usage);
+        if let Some(error) = error {
+            event["type"] = json!(ResponseEvent::FAILED);
+            event["response"]["status"] = json!("failed");
+            event["response"]["error"] = error.clone();
+            if let Some(response) = event["response"].as_object_mut() {
+                response.remove("incomplete_details");
+            }
+        }
+        let failed = event["type"] == ResponseEvent::FAILED;
+        self.send_event(&event, tx).await?;
+        if failed {
+            // Counted only once the terminal reached the client: a stream that
+            // dies before its terminal is not a delivered failure, and the
+            // completed/incomplete terminals never count here.
+            Metrics::record_responses_stream_failure(&self.model, failure_reason(error));
+        }
+        Ok(())
     }
 
     /// Convert tool entries to JSON values using the shared bridge builder.
@@ -780,6 +843,7 @@ impl ResponseStreamEventEmitter {
         // Match the streamed terminal event: a `length` finish reports
         // status=incomplete with the truncation reason.
         let (status, incomplete_details) = match self.finish_reason.as_deref() {
+            Some("failed" | "error") => (ResponseStatus::Failed, None),
             Some("length") => (
                 ResponseStatus::Incomplete,
                 Some(IncompleteDetails {
@@ -798,6 +862,9 @@ impl ResponseStreamEventEmitter {
             .maybe_usage(responses_usage);
         if let Some(details) = incomplete_details {
             builder = builder.incomplete_details(details);
+        }
+        if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
+            builder = builder.error(error);
         }
         builder.build()
     }
@@ -890,7 +957,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Close the in-flight reasoning item, if any: `reasoning_text.done`
-    /// followed by `output_item.done` carrying the full text.
+    /// followed by `content_part.done` and `output_item.done` with the full text.
     async fn close_reasoning_item(&mut self, tx: &SseSender) -> Result<(), String> {
         let Some(reasoning) = self.reasoning_item.take() else {
             return Ok(());
@@ -900,6 +967,15 @@ impl ResponseStreamEventEmitter {
             &reasoning.item_id,
             &reasoning.text,
         );
+        self.send_event(&event, tx).await?;
+        let event = json!({
+            "type": "response.content_part.done",
+            "sequence_number": self.next_sequence(),
+            "output_index": reasoning.output_index,
+            "item_id": reasoning.item_id,
+            "content_index": 0,
+            "part": { "type": "reasoning_text", "text": reasoning.text }
+        });
         self.send_event(&event, tx).await?;
 
         let mut item = json!({
@@ -919,9 +995,43 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
+    /// Closing the event sequence does not imply generation succeeded: partial
+    /// messages remain in_progress on the wire, but belong in terminal output.
+    async fn close_message_item(&mut self, tx: &SseSender) -> Result<(), String> {
+        let (Some(output_index), Some(item_id)) = (
+            self.current_message_output_index.take(),
+            self.current_item_id.take(),
+        ) else {
+            return Ok(());
+        };
+        if std::mem::take(&mut self.has_emitted_content_part_added) {
+            let event = self.emit_text_done(output_index, &item_id, 0);
+            self.send_event(&event, tx).await?;
+            let event = self.emit_content_part_done(output_index, &item_id, 0);
+            self.send_event(&event, tx).await?;
+        }
+        if std::mem::take(&mut self.has_emitted_output_item_added) {
+            let item = json!({
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": std::mem::take(&mut self.accumulated_text)}],
+                "status": if matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
+                    "in_progress"
+                } else {
+                    "completed"
+                },
+            });
+            let event = self.emit_output_item_done(output_index, &item);
+            self.send_event(&event, tx).await?;
+        }
+        self.complete_output_item(output_index);
+        Ok(())
+    }
+
     /// Close every streamed tool-call item: arguments (or custom input) done,
     /// then output_item.done, as the non-streaming path pairs them. Called on
-    /// `tool_calls` and on `length` finishes — grammar-constrained models can
+    /// all finishes and terminal errors — grammar-constrained models can
     /// keep emitting valid tool calls until `max_output_tokens` truncates the
     /// turn, and those (possibly partial) calls still belong in the final
     /// output, so they must be closed and collected here.
@@ -962,7 +1072,10 @@ impl ResponseStreamEventEmitter {
                     "call_id": item.call_id,
                     "name": item.name,
                     "arguments": item.arguments,
-                    "status": "completed",
+                    "status": super::utils::function_call_status(
+                        self.finish_reason.as_deref(),
+                        &item.arguments,
+                    ),
                 })
             };
             let event = self.emit_output_item_done(item.output_index, &full);
@@ -999,6 +1112,15 @@ impl ResponseStreamEventEmitter {
                         "status": "in_progress"
                     });
                     let event = self.emit_output_item_added(output_index, &item);
+                    self.send_event(&event, tx).await?;
+                    let event = json!({
+                        "type": "response.content_part.added",
+                        "sequence_number": self.next_sequence(),
+                        "output_index": output_index,
+                        "item_id": item_id,
+                        "content_index": 0,
+                        "part": { "type": "reasoning_text", "text": "" }
+                    });
                     self.send_event(&event, tx).await?;
                     self.reasoning_item = Some(ReasoningStreamItem {
                         output_index,
@@ -1154,47 +1276,8 @@ impl ResponseStreamEventEmitter {
             if let Some(reason) = &choice.finish_reason {
                 self.finish_reason = Some(reason.clone());
                 self.close_reasoning_item(tx).await?;
-                if reason == "stop" || reason == "length" || reason == "tool_calls" {
-                    if let (Some(output_index), Some(item_id)) = (
-                        self.current_message_output_index,
-                        self.current_item_id.clone(),
-                    ) {
-                        let content_index = 0;
-
-                        // Emit closing events
-                        if self.has_emitted_content_part_added {
-                            let event = self.emit_text_done(output_index, &item_id, content_index);
-                            self.send_event(&event, tx).await?;
-                            let event =
-                                self.emit_content_part_done(output_index, &item_id, content_index);
-                            self.send_event(&event, tx).await?;
-                        }
-
-                        if self.has_emitted_output_item_added {
-                            // Build complete message item for output_item.done
-                            let item = json!({
-                                "id": item_id,
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{
-                                    "type": "output_text",
-                                    "text": std::mem::take(&mut self.accumulated_text)
-                                }]
-                            });
-                            let event = self.emit_output_item_done(output_index, &item);
-                            self.send_event(&event, tx).await?;
-                        }
-
-                        // Mark item as completed
-                        self.complete_output_item(output_index);
-                    }
-                }
-                // Tool-call items close on `tool_calls` and on `length`:
-                // truncation can hit mid-call, but whatever arguments
-                // arrived still form a (partial) function-call output item.
-                if reason == "tool_calls" || reason == "length" {
-                    self.close_tool_call_items(tx).await?;
-                }
+                self.close_message_item(tx).await?;
+                self.close_tool_call_items(tx).await?;
             }
         }
 
@@ -1322,6 +1405,41 @@ impl ResponseStreamEventEmitter {
     }
 }
 
+/// One-shot signal used by streaming `/v1/responses` handlers to avoid
+/// returning HTTP 200 until the first backend request has actually started.
+pub(crate) type StreamStartupSender = oneshot::Sender<Result<(), Response>>;
+pub(crate) type StreamStartupReceiver = oneshot::Receiver<Result<(), Response>>;
+
+pub(crate) fn stream_startup_channel() -> (StreamStartupSender, StreamStartupReceiver) {
+    oneshot::channel()
+}
+
+#[must_use]
+pub(crate) fn signal_stream_startup(
+    startup: &mut Option<StreamStartupSender>,
+    result: Result<(), Response>,
+) -> bool {
+    let Some(startup) = startup.take() else {
+        return true;
+    };
+
+    startup.send(result).is_ok()
+}
+
+pub(crate) async fn await_stream_startup(
+    startup: StreamStartupReceiver,
+    rx: SseReceiver,
+) -> Response {
+    match startup.await {
+        Ok(Ok(())) => build_sse_response(rx),
+        Ok(Err(response)) => response,
+        Err(_) => error::internal_error(
+            "responses_stream_startup_failed",
+            "Streaming response failed before backend request startup",
+        ),
+    }
+}
+
 /// Build a Server-Sent Events (SSE) response
 ///
 /// Creates a Response with proper SSE headers and streaming body.
@@ -1395,6 +1513,40 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn await_stream_startup_returns_backend_error_response() {
+        let (startup_tx, startup_rx) = stream_startup_channel();
+        let (_sse_tx, sse_rx) = sse_channel();
+        let response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::empty())
+            .expect("test response should build");
+
+        assert!(startup_tx.send(Err(response)).is_ok());
+
+        let response = await_stream_startup(startup_rx, sse_rx).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn signal_stream_startup_returns_sse_after_success() {
+        let (startup_tx, startup_rx) = stream_startup_channel();
+        let (_sse_tx, sse_rx) = sse_channel();
+        let mut startup = Some(startup_tx);
+
+        assert!(signal_stream_startup(&mut startup, Ok(())));
+        assert!(startup.is_none());
+
+        let response = await_stream_startup(startup_rx, sse_rx).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "text/event-stream; charset=utf-8"
+            ))
+        );
     }
 }
 
@@ -1513,9 +1665,11 @@ mod process_chunk_tests {
             types(&events),
             [
                 "response.output_item.added",
+                "response.content_part.added",
                 "response.reasoning_text.delta",
                 "response.reasoning_text.delta",
                 "response.reasoning_text.done",
+                "response.content_part.done",
                 "response.output_item.done",
                 "response.output_item.added",
                 "response.function_call_arguments.delta",
@@ -1524,6 +1678,16 @@ mod process_chunk_tests {
                 "response.output_item.done",
             ]
         );
+        assert_eq!(
+            events[1]["part"],
+            json!({"type": "reasoning_text", "text": ""})
+        );
+        assert_eq!(events[5]["part"], output[0]["content"][0]);
+        for event in &events[1..6] {
+            assert_eq!(event["item_id"], output[0]["id"]);
+            assert_eq!(event["output_index"], 0);
+            assert_eq!(event["content_index"], 0);
+        }
         let seq: Vec<u64> = events
             .iter()
             .map(|e| e["sequence_number"].as_u64().unwrap())
@@ -1545,9 +1709,9 @@ mod process_chunk_tests {
         assert_eq!(output[1]["arguments"], "{\"city\":\"Paris\"}");
         assert_eq!(output[1]["status"], "completed");
         // Each output_item.done carries the item response.completed reports.
-        assert_eq!(events[4]["item"], output[0]);
-        assert_eq!(events[9]["item"], output[1]);
-        assert_eq!(events[8]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(events[6]["item"], output[0]);
+        assert_eq!(events[11]["item"], output[1]);
+        assert_eq!(events[10]["arguments"], "{\"city\":\"Paris\"}");
     }
 
     #[tokio::test]
@@ -1601,8 +1765,10 @@ mod process_chunk_tests {
             types(&events),
             [
                 "response.output_item.added",
+                "response.content_part.added",
                 "response.reasoning_text.delta",
                 "response.reasoning_text.done",
+                "response.content_part.done",
                 "response.output_item.done",
                 "response.output_item.added",
                 "response.content_part.added",
@@ -1613,10 +1779,52 @@ mod process_chunk_tests {
                 "response.output_item.done",
             ]
         );
+        assert_eq!(events[1]["part"]["type"], "reasoning_text");
+        assert_eq!(events[4]["part"], output[0]["content"][0]);
+        assert_eq!(events[7]["part"]["type"], "output_text");
+        assert_eq!(events[11]["part"], output[1]["content"][0]);
+        assert_eq!(events[1]["item_id"], output[0]["id"]);
+        assert_eq!(events[7]["item_id"], output[1]["id"]);
         assert_eq!(output[0]["type"], "reasoning");
         assert!(output[0].get("encrypted_content").is_none());
         assert_eq!(output[1]["type"], "message");
         assert_eq!(output[1]["content"][0]["text"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn reasoning_truncation_closes_content_part_before_incomplete() {
+        let (events, terminal) = stream_with_terminal(
+            json!({"model": "test-model", "input": "hi"}),
+            &[
+                chunk(json!({"reasoning_content": "still thinking"}), None),
+                chunk(json!({}), Some("length")),
+            ],
+        )
+        .await;
+        assert_eq!(
+            types(&events),
+            [
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert_eq!(
+            terminal["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(
+            events[4]["part"],
+            json!({"type": "reasoning_text", "text": "still thinking"})
+        );
+        assert_eq!(events[4]["part"], events[5]["item"]["content"][0]);
+        assert_eq!(events[1]["item_id"], events[4]["item_id"]);
+        assert_eq!(events[5]["item"], terminal["response"]["output"][0]);
     }
 
     #[tokio::test]
@@ -1671,6 +1879,33 @@ mod process_chunk_tests {
         assert_eq!(output[1]["type"], "function_call");
         assert_eq!(output[1]["name"], "get_time");
         assert_eq!(output[1]["arguments"], "{\"tz\":");
+        assert_eq!(output[0]["status"], "completed");
+        assert_eq!(output[1]["status"], "incomplete");
+        assert_eq!(events[5]["item"], output[0]);
+        assert_eq!(events[7]["item"], output[1]);
+    }
+
+    #[tokio::test]
+    async fn length_finish_keeps_complete_streamed_tool_arguments_completed() {
+        let (events, terminal) = stream_with_terminal(
+            json!({"model":"test-model","input":"hi"}),
+            &[
+                chunk(
+                    json!({"tool_calls":[{"index":0,"id":"call_a","type":"function",
+                "function":{"name":"weather","arguments":"{}"}}]}),
+                    None,
+                ),
+                chunk(json!({}), Some("length")),
+            ],
+        )
+        .await;
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(terminal["response"]["output"][0]["status"], "completed");
+        let done = events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap();
+        assert_eq!(done["item"], terminal["response"]["output"][0]);
     }
 
     #[tokio::test]

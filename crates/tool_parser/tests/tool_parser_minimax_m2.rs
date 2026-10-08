@@ -549,6 +549,108 @@ async fn test_minimax_empty_parameters() {
 }
 
 #[tokio::test]
+async fn test_minimax_streaming_empty_parameters() {
+    // A streamed call without parameters ends with `{}`, as parse_complete returns.
+    let tools = create_test_tools();
+    for chunks in [
+        vec!["<minimax:tool_call>\n<invoke name=\"get_weather\">\n</invoke>\n</minimax:tool_call>"],
+        vec![
+            "<minimax:tool_call>",
+            "\n<invoke name=\"get_weather\">",
+            "\n</invoke>",
+            "\n</minimax:tool_call>",
+        ],
+    ] {
+        let mut parser = MinimaxM2Parser::new();
+        let mut name = None;
+        let mut arguments = String::new();
+        for chunk in chunks {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            for call in result.calls {
+                assert_eq!(call.tool_index, 0);
+                name = call.name.or(name);
+                arguments.push_str(&call.parameters);
+            }
+        }
+        assert_eq!(name.as_deref(), Some("get_weather"));
+        assert_eq!(arguments, "{}");
+    }
+}
+
+#[tokio::test]
+async fn test_minimax_streaming_closes_outer_object_after_nested_value() {
+    let tools = vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "process".to_string(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {"data": {"type": "object"}}
+            }),
+            strict: None,
+        },
+    }];
+    let input = r#"<minimax:tool_call><invoke name="process"><parameter name="data">{"host":"db.example"}</parameter></invoke></minimax:tool_call>"#;
+    let (_normal, complete) = MinimaxM2Parser::new()
+        .parse_complete_with_tools(input, &tools)
+        .await
+        .unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(&complete[0].function.arguments).unwrap();
+    assert_eq!(expected, json!({"data": {"host": "db.example"}}));
+
+    for chunk_size in [input.len(), 7] {
+        let mut parser = MinimaxM2Parser::new();
+        let mut arguments = String::new();
+        for chunk in input.as_bytes().chunks(chunk_size) {
+            let result = parser
+                .parse_incremental(std::str::from_utf8(chunk).unwrap(), &tools)
+                .await
+                .unwrap();
+            for call in result.calls {
+                arguments.push_str(&call.parameters);
+            }
+        }
+        if let Some(calls) = parser.get_unstreamed_tool_args() {
+            for call in calls {
+                arguments.push_str(&call.parameters);
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_minimax_streaming_closure_ignores_braces_in_strings_and_resets() {
+    let mut parser = MinimaxM2Parser::new();
+    for _ in 0..2 {
+        let mut arguments = [String::new(), String::new()];
+        for chunk in [
+            "<minimax:tool_call>",
+            r#"<invoke name="process"><parameter name="text">}</parameter></invoke>"#,
+            r#"<invoke name="process"></invoke>"#,
+            "</minimax:tool_call>",
+        ] {
+            let result = parser.parse_incremental(chunk, &[]).await.unwrap();
+            for call in result.calls {
+                arguments[call.tool_index].push_str(&call.parameters);
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments[0]).unwrap(),
+            json!({"text": "}"})
+        );
+        assert_eq!(arguments[1], "{}");
+        assert!(parser.get_unstreamed_tool_args().is_none());
+        parser.reset();
+    }
+}
+
+#[tokio::test]
 async fn test_minimax_multiline_parameter_values() {
     let parser = MinimaxM2Parser::new();
 

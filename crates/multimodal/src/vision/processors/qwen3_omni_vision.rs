@@ -136,6 +136,10 @@ impl Qwen3OmniVisionProcessor {
 }
 
 impl VisionPreProcessor for Qwen3OmniVisionProcessor {
+    fn emits_pixel_bytes(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }
@@ -267,6 +271,7 @@ mod tests {
 
         assert!(output
             .encoder_input
+            .as_f32()
             .iter()
             .all(|value| (*value + 1.0).abs() < 1e-6));
     }

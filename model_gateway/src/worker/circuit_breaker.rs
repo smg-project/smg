@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use parking_lot::Mutex;
 use tracing::info;
 
 use crate::observability::metrics::Metrics;
@@ -98,7 +99,9 @@ fn now_ms() -> u64 {
 ///
 /// This implementation avoids RwLock contention by using atomic operations
 /// for state checks (the most common operation). Only state transitions
-/// use compare-and-swap which is still lock-free.
+/// use compare-and-swap which is still lock-free. The one mutex serializes
+/// the state gauge writes a transition makes, so the gauge cannot end up
+/// behind the state; the check and record paths never take it.
 #[derive(Debug)]
 pub struct CircuitBreaker {
     /// Circuit state stored as atomic u8 (0=Closed, 1=Open, 2=HalfOpen)
@@ -113,6 +116,8 @@ pub struct CircuitBreaker {
     last_state_change_ms: AtomicU64,
     config: CircuitBreakerConfig,
     metric_label: String,
+    /// Serializes the state gauge writes (see `publish_state_gauge`).
+    gauge_lock: Mutex<()>,
 }
 
 impl CircuitBreaker {
@@ -135,6 +140,7 @@ impl CircuitBreaker {
             last_state_change_ms: AtomicU64::new(now_ms()),
             config,
             metric_label,
+            gauge_lock: Mutex::new(()),
         }
     }
 
@@ -194,7 +200,7 @@ impl CircuitBreaker {
 
                     info!("Circuit breaker state transition: open -> half_open");
                     Metrics::record_worker_cb_transition(&self.metric_label, "open", "half_open");
-                    Metrics::set_worker_cb_state(&self.metric_label, STATE_HALF_OPEN);
+                    self.publish_state_gauge();
                     self.publish_gauge_metrics();
                     return CircuitState::HalfOpen;
                 }
@@ -289,7 +295,7 @@ impl CircuitBreaker {
             let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
             Metrics::record_worker_cb_transition(&self.metric_label, from, to);
-            Metrics::set_worker_cb_state(&self.metric_label, new_state.as_int());
+            self.publish_state_gauge();
             self.publish_gauge_metrics();
         }
     }
@@ -358,6 +364,27 @@ impl CircuitBreaker {
         }
     }
 
+    /// Publish this breaker's state and counters to the per-worker gauges.
+    ///
+    /// Constructing a breaker sets the state gauge for its label to closed,
+    /// so a replacement worker built for the same URL resets the gauge of
+    /// the live breaker it is about to adopt; the adopter calls this to put
+    /// the adopted state back.
+    pub fn publish_metrics(&self) {
+        self.publish_state_gauge();
+        self.publish_gauge_metrics();
+    }
+
+    /// Write the state gauge from a fresh read of the state. The writes are
+    /// serialized so the last one always carries the latest state: two
+    /// transitions in quick succession, or a transition racing
+    /// [`Self::publish_metrics`], could otherwise land the older value last.
+    fn publish_state_gauge(&self) {
+        let _guard = self.gauge_lock.lock();
+        let state = CircuitState::from_int(self.state.load(Ordering::Acquire));
+        Metrics::set_worker_cb_state(&self.metric_label, state.as_int());
+    }
+
     fn publish_gauge_metrics(&self) {
         Metrics::set_worker_cb_consecutive_failures(
             &self.metric_label,
@@ -384,6 +411,7 @@ impl Clone for CircuitBreaker {
             last_state_change_ms: AtomicU64::new(self.last_state_change_ms.load(Ordering::Acquire)),
             config: self.config.clone(),
             metric_label: self.metric_label.clone(),
+            gauge_lock: Mutex::new(()),
         }
     }
 }

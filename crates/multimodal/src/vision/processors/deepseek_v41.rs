@@ -511,7 +511,7 @@ mod tests {
             let out = processor
                 .preprocess(std::slice::from_ref(&image), &config)
                 .unwrap();
-            out.encoder_input.iter().copied().collect()
+            out.encoder_input.as_f32().iter().copied().collect()
         };
         for (w, h) in [(300, 100), (200, 100)] {
             assert!(
@@ -597,10 +597,10 @@ mod tests {
         // The image is contain-fit into a slightly taller canvas, so the
         // top-left pixel is the gray pad color ...
         let pad_value = (127.0f32 / 255.0 - 0.5) / 0.5;
-        assert!((out.encoder_input[[0, 0, 0, 0]] - pad_value).abs() < 1e-6);
+        assert!((out.encoder_input.as_f32()[[0, 0, 0, 0]] - pad_value).abs() < 1e-6);
         // ... while a center patch carries the (R=10) image content.
         let center_patch = (plan.n_vit_h / 2) * plan.n_vit_w + plan.n_vit_w / 2;
         let expected = (10.0f32 / 255.0 - 0.5) / 0.5;
-        assert!((out.encoder_input[[center_patch, 0, 0, 0]] - expected).abs() < 0.02);
+        assert!((out.encoder_input.as_f32()[[center_patch, 0, 0, 0]] - expected).abs() < 0.02);
     }
 }

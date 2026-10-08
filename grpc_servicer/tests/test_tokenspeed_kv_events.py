@@ -192,3 +192,28 @@ class TestConvertBatchAttnDpRank:
         proto, _ = shared.convert_batch(batch, seq_num=1, event_id_start=0)
         assert proto.HasField("dp_rank")
         assert proto.dp_rank == 0
+
+
+class TestResolvedReplayEndpoint:
+    def test_replay_endpoint_is_carried_when_configured(self):
+        cfg = ts_kv_events.resolve_kv_events_config(
+            _Args(
+                _cfg(
+                    enable_kv_cache_events=True,
+                    publisher="zmq",
+                    endpoint="tcp://*:5600",
+                    replay_endpoint="tcp://*:5601",
+                )
+            )
+        )
+        assert (cfg.endpoint, cfg.replay_endpoint) == ("tcp://*:5600", "tcp://*:5601")
+
+    def test_replay_endpoint_is_empty_when_absent_or_not_a_string(self):
+        absent = ts_kv_events.resolve_kv_events_config(
+            _Args(_cfg(enable_kv_cache_events=True, publisher="zmq"))
+        )
+        assert absent.replay_endpoint == ""
+        odd = ts_kv_events.resolve_kv_events_config(
+            _Args(_cfg(enable_kv_cache_events=True, publisher="zmq", replay_endpoint=5601))
+        )
+        assert odd is not None and odd.replay_endpoint == ""

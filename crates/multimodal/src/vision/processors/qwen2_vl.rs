@@ -222,6 +222,10 @@ impl VisionPreProcessor for Qwen2VLProcessor {
         true
     }
 
+    fn emits_pixel_bytes(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }
@@ -408,6 +412,39 @@ mod tests {
 
         // Verify token count is reasonable
         assert!(result.feature_token_counts[0] > 0);
+    }
+
+    /// `do_rescale=false, do_normalize=false` is the raw-pixel contract of an
+    /// engine that rescales and normalizes on device: the patches carry the
+    /// image's own 0..255 values, exactly.
+    #[test]
+    fn test_qwen2_vl_preprocess_raw_pixels() {
+        let processor = Qwen2VLProcessor::new();
+        let config = PreProcessorConfig {
+            do_resize: Some(true),
+            do_rescale: Some(false),
+            do_normalize: Some(false),
+            patch_size: Some(PatchSize {
+                height: Some(14),
+                width: Some(14),
+            }),
+            merge_size: Some(2),
+            min_pixels: Some(DEFAULT_MIN_PIXELS),
+            max_pixels: Some(DEFAULT_MAX_PIXELS),
+            ..Default::default()
+        };
+        let image = create_test_image(600, 400, Rgb([17, 128, 255]));
+        let result = processor.preprocess(&[image], &config).unwrap();
+        let flat = result.encoder_input_flat();
+        assert!(!flat.is_empty());
+        assert!(flat
+            .iter()
+            .all(|&v| v == v.round() && (0.0..=255.0).contains(&v)));
+        // Every channel value of a solid image survives untouched.
+        let mut seen: Vec<i32> = flat.iter().map(|&v| v as i32).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, vec![17, 128, 255]);
     }
 
     #[test]

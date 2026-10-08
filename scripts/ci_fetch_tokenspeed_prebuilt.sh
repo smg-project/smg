@@ -6,10 +6,9 @@
 # CARRIER: pull it, create a stopped container, and docker-cp the baked
 # payload out:
 #   /opt/smg-ci          venv + prebuilt stamp
-#   /opt/tokenspeed-src  checkout the venv's editable installs point at
 # then advertise the venv via SMG_BAKED_VENV (GITHUB_ENV, i.e. subsequent
 # steps) so ci_setup_python_venv.sh adopts it and
-# ci_install_tokenspeed.sh's stamp check skips the source build.
+# ci_install_tokenspeed.sh upgrades it from the nightly wheel index.
 #
 # PER-NODE CACHE. The runner pods are ephemeral and their dind storage is a
 # per-pod emptyDir, so without a cache every lane re-pulls the ~8 GB carrier
@@ -17,7 +16,7 @@
 # payload out again (2+ min). The extracted payload is therefore kept on the
 # node's NVMe hostPath mount (/models, shared by every runner pod on the
 # node), keyed by the content-addressed image tag:
-#   $CACHE_ROOT/<tag>/{smg-ci,tokenspeed-src}     populated once per node per tag
+#   $CACHE_ROOT/<tag>/smg-ci     populated once per node per tag
 #   $CACHE_ROOT/<tag>/.complete                   written last; marks it usable
 #   $CACHE_ROOT/jobs/<run>-<job>-<attempt>.XXXXXX/  this job's private copy
 # Every job gets its own copy because the lane writes into the venv (the PR's
@@ -31,13 +30,12 @@
 # hollow tree), and a populate retires whatever is at the entry path by
 # rename-then-delete before moving its own tree in, so a damaged entry can
 # never poison later lanes. Without a writable shared cache root the same
-# flow runs against a job-local root under RUNNER_TEMP: no reuse, but still
-# the ~8 min carrier path rather than the ~20 min source build; the payload
-# is then moved into the job dir rather than copied, since it has one reader.
+# flow runs against a job-local root under RUNNER_TEMP with no reuse. The
+# payload is moved into the job dir rather than copied, since it has one reader.
 #
 # TOLERANT BY DESIGN: this script must never fail the job. No image resolved,
 # no docker on the runner, no writable cache, a failed pull or extraction —
-# each just means the lane falls back to the source build, with a log line
+# each just means the lane falls back to the nightly wheel install, with a log line
 # saying why.
 
 set -uo pipefail # deliberately NOT -e: every failure is a soft fallback
@@ -48,16 +46,17 @@ INSTALL_ROOT="${TOKENSPEED_PREBUILT_INSTALL_ROOT:-/opt}"
 
 log() { echo "[fetch-tokenspeed-prebuilt] $*"; }
 fallback() {
-    log "$*; lane will build from source"
+    log "$*; lane will install nightly wheels"
     exit 0
 }
 
 [ -n "$IMAGE" ] || fallback "TOKENSPEED_PREBUILT_IMAGE unset"
+log "Prebuilt image: ${IMAGE}"
 command -v docker &> /dev/null || fallback "docker not available on this runner"
 if command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
 
-# The tag is content-addressed (scripts/ci_tokenspeed_image_tag.sh), so it is
-# the cache key; reduce it to a plain path segment.
+# Consumers resolve date tags to immutable digests before caching payloads.
+# Reduce the digest (or a legacy tag) to a plain path segment.
 tag="$(printf '%s' "${IMAGE##*:}" | tr -c 'A-Za-z0-9._-' '_')"
 [ -n "$tag" ] || fallback "cannot derive a tag from ${IMAGE}"
 init_cache_root() { mkdir -p "$1/.locks" "$1/jobs" 2> /dev/null; }
@@ -73,7 +72,7 @@ entry="${CACHE_ROOT}/${tag}"
 # rm -rf leaves them hollow): require the files the payload actually needs.
 entry_usable() {
     [ -f "$entry/.complete" ] && [ -f "$entry/smg-ci/tokenspeed.ref" ] \
-        && [ -x "$entry/smg-ci/.venv/bin/python" ] && [ -d "$entry/tokenspeed-src" ]
+        && [ -x "$entry/smg-ci/.venv/bin/python" ]
 }
 # Invalidate atomically: rename first (instant), then delete under a name
 # nothing consults, so a kill mid-delete cannot leave a half-emptied entry.
@@ -84,7 +83,7 @@ retire_entry() {
 }
 
 # Housekeeping: job copies left behind by cancelled jobs, and tags nothing
-# pulls anymore (the tag changes on every tokenspeed.ref bump).
+# pulls anymore (the digest changes on every carrier rebuild).
 find "${CACHE_ROOT}/jobs" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2> /dev/null
 find "${CACHE_ROOT}" -mindepth 1 -maxdepth 1 -type d ! -name "${tag}" ! -name jobs ! -name .locks \
     -mtime +7 -exec rm -rf {} + 2> /dev/null
@@ -118,7 +117,6 @@ populate() {
     # The payload was baked as root; the job user needs write access for the
     # per-PR glue installs, so repair ownership before the entry goes live.
     if docker cp "$cid:/opt/smg-ci" "$tmp/smg-ci" \
-        && docker cp "$cid:/opt/tokenspeed-src" "$tmp/tokenspeed-src" \
         && $SUDO chown -R "$(id -u):$(id -g)" "$tmp" \
         && retire_entry \
         && mv -T "$tmp" "$entry" \
@@ -158,25 +156,23 @@ if [ "$job_local" = 1 ]; then
 else
     transfer=(cp -a --reflink=auto)
 fi
-if ! { "${transfer[@]}" "$entry/smg-ci" "$job/smg-ci" \
-    && "${transfer[@]}" "$entry/tokenspeed-src" "$job/tokenspeed-src"; }; then
+if ! "${transfer[@]}" "$entry/smg-ci" "$job/smg-ci"; then
     rm -rf "$job"
     fallback "could not copy the payload for this job"
 fi
 
 # Undo a half-done install (a dangling symlink would otherwise greet the
-# source build) and the job copy, then fall back.
+# nightly wheel install) and the job copy, then fall back.
 abort_install() {
-    $SUDO rm -rf "${INSTALL_ROOT}/smg-ci" "${INSTALL_ROOT}/tokenspeed-src" > /dev/null 2>&1 || true
+    $SUDO rm -rf "${INSTALL_ROOT}/smg-ci" > /dev/null 2>&1 || true
     rm -rf "$job"
     fallback "$@"
 }
 
 # Fixed destination paths (the venv's shebangs and editable installs are
 # absolute) now point into the job's copy.
-if ! { $SUDO rm -rf "${INSTALL_ROOT}/smg-ci" "${INSTALL_ROOT}/tokenspeed-src" \
-    && $SUDO ln -s "$job/smg-ci" "${INSTALL_ROOT}/smg-ci" \
-    && $SUDO ln -s "$job/tokenspeed-src" "${INSTALL_ROOT}/tokenspeed-src"; }; then
+if ! { $SUDO rm -rf "${INSTALL_ROOT}/smg-ci" \
+    && $SUDO ln -s "$job/smg-ci" "${INSTALL_ROOT}/smg-ci"; }; then
     abort_install "install to ${INSTALL_ROOT} failed"
 fi
 

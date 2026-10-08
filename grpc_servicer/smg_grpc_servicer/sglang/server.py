@@ -29,6 +29,7 @@ from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
+from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, resolve_servicer_impl, serve_rust
 from smg_grpc_servicer.sglang.scheduler_launcher import (
     launch_scheduler_process_only,
     terminate_scheduler_processes,
@@ -107,6 +108,17 @@ async def serve_grpc(
             this to wire its admin endpoints to the scheduler, so the
             callback signature is a public contract.
     """
+
+    # One flag selects the Rust request path; the entrypoint and every
+    # ServerArgs flag stay the same, and the Router cannot tell them apart.
+    if resolve_servicer_impl() == "rust":
+        if on_request_manager_ready is not None:
+            logger.warning(
+                "%s=rust: SGLang's HTTP sidecar (metrics, profiling endpoints) stays off; "
+                "the Rust servicer has no request manager to wire it to",
+                SERVICER_IMPL_ENV,
+            )
+        raise SystemExit(await serve_rust(server_args))
 
     # Install the process-wide runtime context before any sglang machinery
     # runs here. Since 0.5.18 the config is published per process and read

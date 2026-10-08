@@ -39,7 +39,7 @@ fn preprocessed_heap_bytes(preprocessed: &PreprocessedEncoderInputs) -> usize {
         .iter()
         .map(|(key, value)| key.len() + model_specific_value_heap_bytes(value))
         .sum();
-    preprocessed.encoder_input.len() * size_of::<f32>()
+    preprocessed.encoder_input.nbytes()
         + preprocessed.encoder_input.ndim() * size_of::<usize>()
         + preprocessed.feature_token_counts.len() * size_of::<usize>()
         + preprocessed.item_sizes.len() * size_of::<(u32, u32)>()
@@ -175,7 +175,7 @@ mod tests {
     fn pixel_cache_item(token_count: usize, payload: usize) -> Arc<CachedPreprocessedItem> {
         Arc::new(CachedPreprocessedItem {
             preprocessed: PreprocessedEncoderInputs {
-                encoder_input: ArrayD::from_elem(IxDyn(&[1, payload]), token_count as f32),
+                encoder_input: ArrayD::from_elem(IxDyn(&[1, payload]), token_count as f32).into(),
                 feature_token_counts: vec![token_count],
                 item_sizes: vec![(payload as u32, 1)],
                 model_specific: HashMap::new(),

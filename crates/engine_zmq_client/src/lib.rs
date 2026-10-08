@@ -10,7 +10,9 @@
 //!
 //! - [`codec`] — engine-agnostic wire primitives: msgpack positional-tuple
 //!   serde, numpy dtype handling, and the zero-copy tensor aux-frame codec.
-//! - `protocol` — per-engine protocol modules (vLLM EngineCore first).
+//! - `protocol` — per-engine protocol modules (vLLM EngineCore and TokenSpeed
+//!   today, SGLang's scheduler through the SMG plugin that performs the
+//!   handshake inside it; each further ZMQ engine adds its own).
 //! - `transport` — the ZMQ socket topology (SMG binds; engines connect in).
 //! - `connector` — request submission, streaming output, and DP wave handling.
 //!
@@ -36,7 +38,8 @@ pub mod mock_engine;
 // Crate-root shortcuts for what consumers actually build against; everything
 // else stays reachable through its own module path.
 pub use connector::{
-    Client, EngineCoreClient, EngineCoreStream, RequestStream, TokenSpeedClient, TokenSpeedStream,
+    Client, EngineCoreClient, EngineCoreStream, RequestStream, SglangClient, SglangStream,
+    TokenSpeedClient, TokenSpeedStream,
 };
 pub use error::{Error, Result};
 pub use transport::{connect_handshake, ConnectedEngine, EngineId, ENGINE_CORE_DEAD_SENTINEL};

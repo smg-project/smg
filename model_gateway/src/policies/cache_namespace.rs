@@ -17,6 +17,13 @@
 //! gossip. Requests without any partition field get no namespace, and their
 //! routing keys are byte-identical to before.
 //!
+//! The event-driven index is keyed differently: the engines fold the LoRA
+//! name and the cache salt into their block hashes, and the KV event monitor
+//! recomputes stored blocks under the same XXH3 seed (`kv_index::salt`). A
+//! namespace therefore also carries that seed, so a salted or LoRA request
+//! is hashed under it and matches only its own blocks; a plain request keeps
+//! the plain hash. The extra key is not part of the engines' seed.
+//!
 //! The marker is excluded from the match ratio, so it cannot by itself push
 //! two unrelated prompts of one namespace over the cache threshold.
 //!
@@ -32,6 +39,7 @@
 //! Size it for tenants × working set; a per-request salt makes every request
 //! a unique path.
 
+use kv_index::salt::namespace_seed;
 use openai_protocol::common::CachePartition;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -58,9 +66,13 @@ const MARKER_PAD_TOKEN: u32 = MARKER_TOKEN_BIT;
 /// does not begin with.
 const TEXT_MARKER_DELIM: char = '\u{1}';
 
-/// Fixed-width identity of a request's cache partition.
+/// Fixed-width identity of a request's cache partition, and the XXH3 seed
+/// under which the engines' KV events for that partition are hashed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CacheNamespace(u64);
+pub struct CacheNamespace {
+    marker: u64,
+    event_seed: u64,
+}
 
 impl CacheNamespace {
     /// Derive the namespace from a request's partition fields; `None` when
@@ -88,21 +100,31 @@ impl CacheNamespace {
                 None => hasher.update(&[0u8]),
             }
         }
-        Some(Self(hasher.digest()))
+        Some(Self {
+            marker: hasher.digest(),
+            event_seed: namespace_seed(partition.lora_path, partition.cache_salt),
+        })
+    }
+
+    /// The XXH3 seed the engines' blocks for this partition are hashed under
+    /// (see `kv_index::salt::namespace_seed`); the plain seed when neither a
+    /// LoRA name nor a cache salt is set.
+    pub fn event_seed(self) -> u64 {
+        self.event_seed
     }
 
     /// The namespace as token ids for the token tree and hash mode: two ids
     /// with the reserved high bit set, so they never match prompt tokens.
     pub fn token_marker(self) -> [u32; TOKEN_MARKER_LEN] {
         [
-            (self.0 >> 32) as u32 | MARKER_TOKEN_BIT,
-            self.0 as u32 | MARKER_TOKEN_BIT,
+            (self.marker >> 32) as u32 | MARKER_TOKEN_BIT,
+            self.marker as u32 | MARKER_TOKEN_BIT,
         ]
     }
 
     /// The namespace as a fixed-width text prefix for the string tree.
     pub fn text_marker(self) -> String {
-        format!("{d}{:016x}{d}", self.0, d = TEXT_MARKER_DELIM)
+        format!("{d}{:016x}{d}", self.marker, d = TEXT_MARKER_DELIM)
     }
 
     /// Length of the token-tree marker for a tree with `page_size`-token
@@ -264,5 +286,23 @@ mod tests {
         assert_eq!(keyed.chars().count(), TEXT_MARKER_LEN + 5);
         assert!(keyed.ends_with("hello"));
         assert!(keyed.starts_with(&marker));
+    }
+
+    #[test]
+    fn event_seed_follows_the_lora_name_and_cache_salt_only() {
+        let salted =
+            CacheNamespace::derive(&partition(Some("tenant-a"), None, Some("adapter"))).unwrap();
+        assert_eq!(
+            salted.event_seed(),
+            namespace_seed(Some("adapter"), Some("tenant-a"))
+        );
+        let extra_only = CacheNamespace::derive(&partition(None, Some("k"), None)).unwrap();
+        assert_eq!(extra_only.event_seed(), kv_index::XXH3_SEED);
+        assert_ne!(
+            salted.event_seed(),
+            CacheNamespace::derive(&partition(Some("tenant-b"), None, Some("adapter")))
+                .unwrap()
+                .event_seed()
+        );
     }
 }

@@ -8,10 +8,11 @@ use llm_multimodal::{ImageDetail, MediaContentPart};
 use openai_protocol::{
     chat::{ChatMessage, MessageContent},
     common::ContentPart,
-    messages::{ImageSource, InputContent, InputContentBlock, InputMessage, Role},
+    messages::{ImageBlock, ImageSource, InputContent, InputContentBlock, InputMessage, Role},
 };
 
 use super::plan::MediaPlan;
+use crate::routers::grpc::utils::message_utils::tool_result_image_blocks;
 
 /// Extract media parts from OpenAI chat messages,
 /// converting protocol `ContentPart` to multimodal crate `MediaContentPart`.
@@ -109,26 +110,13 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
 
         for block in blocks {
             match block {
-                InputContentBlock::Image(image_block) => match &image_block.source {
-                    ImageSource::Base64 { media_type, data } => {
-                        // Convert base64 to data URL for the media connector
-                        let data_url = format!("data:{media_type};base64,{data}");
-                        parts.push(MediaContentPart::ImageUrl {
-                            url: data_url,
-                            detail: None,
-                            uuid: None,
-                            max_long_side_pixel: None,
-                        });
-                    }
-                    ImageSource::Url { url } => {
-                        parts.push(MediaContentPart::ImageUrl {
-                            url: url.clone(),
-                            detail: None,
-                            uuid: None,
-                            max_long_side_pixel: None,
-                        });
-                    }
-                },
+                InputContentBlock::Image(image_block) => parts.push(image_media_part(image_block)),
+                // Images inside a tool result enter the plan where the tool
+                // result stands, in block order: `convert_user_message` renders
+                // them into the user content at that same position.
+                InputContentBlock::ToolResult(tool_result) => {
+                    parts.extend(tool_result_image_blocks(tool_result).map(image_media_part));
+                }
                 InputContentBlock::Text(_) => {}
                 _ => {}
             }
@@ -136,6 +124,21 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
     }
 
     parts
+}
+
+/// Convert a Messages API image block to a media part for the connector,
+/// turning a base64 source into a data URL.
+fn image_media_part(image_block: &ImageBlock) -> MediaContentPart {
+    let url = match &image_block.source {
+        ImageSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
+        ImageSource::Url { url } => url.clone(),
+    };
+    MediaContentPart::ImageUrl {
+        url,
+        detail: None,
+        uuid: None,
+        max_long_side_pixel: None,
+    }
 }
 
 /// Build the canonical ordered media plan for Messages API input.
@@ -344,5 +347,73 @@ mod tests {
         assert_eq!(parse_detail("LOW"), Some(ImageDetail::Low));
         assert_eq!(parse_detail("high"), Some(ImageDetail::High));
         assert_eq!(parse_detail("unknown"), None);
+    }
+
+    #[test]
+    fn media_plan_messages_counts_images_inside_tool_results() {
+        use openai_protocol::messages::{
+            TextBlock, ToolResultBlock, ToolResultContent, ToolResultContentBlock,
+        };
+
+        let image = |data: &str| ImageBlock {
+            source: ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: data.to_string(),
+            },
+            cache_control: None,
+        };
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![
+                InputContentBlock::ToolResult(ToolResultBlock {
+                    tool_use_id: "tu_1".to_string(),
+                    content: Some(ToolResultContent::Blocks(vec![
+                        ToolResultContentBlock::Text(TextBlock {
+                            text: "screenshot taken".to_string(),
+                            cache_control: None,
+                            citations: None,
+                        }),
+                        ToolResultContentBlock::Image(image("AAAA")),
+                    ])),
+                    is_error: None,
+                    cache_control: None,
+                }),
+                InputContentBlock::Image(image("BBBB")),
+            ]),
+        }];
+
+        let plan = media_plan_messages(&messages);
+        assert_eq!(plan.modalities(), &[Modality::Image]);
+        assert_eq!(plan.count(Modality::Image), 2);
+        // Block order: the tool result's image comes before the top-level one.
+        let urls: Vec<&str> = plan
+            .parts()
+            .iter()
+            .map(|part| match part {
+                MediaContentPart::ImageUrl { url, .. } => url.as_str(),
+                _ => panic!("tool result images are image parts"),
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            ["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]
+        );
+    }
+
+    #[test]
+    fn media_plan_messages_ignores_text_only_tool_results() {
+        use openai_protocol::messages::{ToolResultBlock, ToolResultContent};
+
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![InputContentBlock::ToolResult(ToolResultBlock {
+                tool_use_id: "tu_1".to_string(),
+                content: Some(ToolResultContent::String("4".to_string())),
+                is_error: None,
+                cache_control: None,
+            })]),
+        }];
+
+        assert!(media_plan_messages(&messages).is_empty());
     }
 }

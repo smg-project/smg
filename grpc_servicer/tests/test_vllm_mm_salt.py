@@ -6,6 +6,7 @@ Run with: pytest grpc_servicer/tests/test_vllm_mm_salt.py
 import importlib.util
 from pathlib import Path
 
+import pytest
 from smg_grpc_proto import vllm_engine_pb2
 
 # Import the module directly to avoid pulling vllm via the package __init__
@@ -83,14 +84,25 @@ class _ModelConfig:
             self.supports_multimodal_inputs = supports_multimodal_inputs
 
 
-def _fake_vllm_registry(monkeypatch, probe):
+def _fake_vllm_registry(monkeypatch, probe, modalities=("image",), *, public_api=False):
     """Install a fake ``vllm.multimodal`` whose registry probe is ``probe``."""
     import sys
     import types
 
     vllm_mod = types.ModuleType("vllm")
     mm_mod = types.ModuleType("vllm.multimodal")
-    mm_mod.MULTIMODAL_REGISTRY = types.SimpleNamespace(supports_multimodal_inputs=probe)
+    mm_mod.MULTIMODAL_REGISTRY = types.SimpleNamespace(
+        supports_multimodal_inputs=probe,
+        _create_processing_info=lambda mc, tokenizer=None: types.SimpleNamespace(
+            supported_mm_limits=dict.fromkeys(modalities)
+        ),
+    )
+    if public_api:
+        registry = mm_mod.MULTIMODAL_REGISTRY
+        registry.get_processing_info = lambda mc: types.SimpleNamespace(
+            supported_mm_limits=dict.fromkeys(modalities)
+        )
+        del registry._create_processing_info
     vllm_mod.multimodal = mm_mod
     monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
     monkeypatch.setitem(sys.modules, "vllm.multimodal", mm_mod)
@@ -113,7 +125,8 @@ def test_engine_accepts_mm_inputs_text_model():
     assert not mm_salt.engine_accepts_mm_inputs(_ModelConfig(False, False))
 
 
-def test_engine_accepts_mm_inputs_mm_embeds_only():
+def test_engine_accepts_mm_inputs_mm_embeds_only(monkeypatch):
+    _fake_vllm_registry(monkeypatch, lambda mc: True)
     # enable_mm_embeds with every modality limit at 0 ingests pre-computed
     # embeddings but has no encoder for pixel payloads.
     embeds_only = _ModelConfig(
@@ -128,6 +141,70 @@ def test_engine_accepts_mm_inputs_mm_embeds_only():
         mm_config=_MmConfig(language_model_only=True, enable_mm_embeds=True),
     )
     assert not mm_salt.engine_accepts_mm_inputs(flagged)
+
+
+@pytest.mark.parametrize("public_api", [False, True], ids=["legacy-api", "public-api"])
+@pytest.mark.parametrize("supports", [True, None], ids=["property", "registry"])
+@pytest.mark.parametrize(
+    "modalities,limits,expected",
+    [
+        (("image", "video"), {"video": 0}, True),
+        (("image", "video"), {"image": 0}, True),
+        (("image", "video"), {}, True),
+        (("image", "video"), {"image": 1, "video": 0}, True),
+        (("image", "video"), {"image": 0, "video": 0}, False),
+        (("image",), {"image": 0, "video": 1}, False),
+        (("image", "audio"), {"image": 0}, False),
+        (("image", "video", "audio"), {"image": 0, "video": 0}, False),
+        (("image", "audio"), {"audio": 0}, True),
+        (("audio",), {}, False),
+    ],
+)
+def test_engine_accepts_mm_inputs_uses_supported_visual_modalities(
+    monkeypatch, supports, modalities, limits, expected, public_api
+):
+    _fake_vllm_registry(monkeypatch, lambda mc: True, modalities, public_api=public_api)
+    model = _ModelConfig(
+        True,
+        supports,
+        mm_config=_MmConfig(enable_mm_embeds=True, limit_per_prompt=limits),
+    )
+    assert mm_salt.engine_accepts_mm_inputs(model) is expected
+
+
+@pytest.mark.parametrize("language_model_only", [False, True])
+def test_engine_accepts_mm_embeds_without_vllm(monkeypatch, language_model_only):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "vllm", None)
+    monkeypatch.setitem(sys.modules, "vllm.multimodal", None)
+    model = _ModelConfig(
+        True,
+        True,
+        mm_config=_MmConfig(
+            enable_mm_embeds=True,
+            language_model_only=language_model_only,
+            limit_per_prompt={"video": 0},
+        ),
+    )
+    assert mm_salt.engine_accepts_mm_inputs(model) is not language_model_only
+
+
+def test_engine_accepts_mm_inputs_processing_info_failure(monkeypatch, caplog):
+    _fake_vllm_registry(monkeypatch, lambda mc: True)
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+
+    def broken_info(mc, tokenizer=None):
+        raise RuntimeError("processing info unavailable")
+
+    monkeypatch.setattr(MULTIMODAL_REGISTRY, "_create_processing_info", broken_info)
+    model = _ModelConfig(
+        True,
+        True,
+        mm_config=_MmConfig(enable_mm_embeds=True, limit_per_prompt={"video": 0}),
+    )
+    assert mm_salt.engine_accepts_mm_inputs(model)
+    assert "Multimodal limits probe failed" in caplog.text
 
 
 # --- the registry fallback (vLLM 0.19-0.20, no ModelConfig property) ---

@@ -26,6 +26,7 @@ pub type OpaqueValue = Value;
 /// array than this client knows about — and `rmp-serde` rejects an array with
 /// unconsumed elements, which would fail the whole message. This wrapper
 /// consumes the elements `T` declares and discards the trailing remainder.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrailingTolerant<T>(pub T);
 
 impl<'de, T> Deserialize<'de> for TrailingTolerant<T>
@@ -104,6 +105,24 @@ where
 /// Decode a msgpack payload into a dynamic value for diagnostics and tests.
 pub fn decode_value(bytes: &[u8]) -> Result<Value> {
     Ok(rmpv::decode::read_value(&mut Cursor::new(bytes))?)
+}
+
+/// Golden wire bytes from a hex string (tests only).
+#[cfg(test)]
+pub(crate) fn hex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
+        .collect()
+}
+
+/// Bytes of a hex string: the golden wire samples captured from vLLM.
+#[cfg(test)]
+pub(crate) fn unhex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digit"))
+        .collect()
 }
 
 #[cfg(test)]

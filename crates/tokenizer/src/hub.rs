@@ -155,6 +155,14 @@ pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> anyhow::R
     }
 }
 
+/// One file of a Hub repository: served from the local HF cache when it is
+/// there (no network), fetched into it otherwise. Returns the file's path.
+pub async fn fetch_file(model_id: &str, filename: &str) -> anyhow::Result<PathBuf> {
+    let api = build_api()?;
+    let path = api.model(model_id.to_string()).get(filename).await?;
+    Ok(path)
+}
+
 /// Attempt to download a model from Hugging Face (including weights)
 /// Returns the directory it is in
 /// If ignore_weights is true, model weight files will be skipped

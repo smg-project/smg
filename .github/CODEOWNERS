@@ -23,6 +23,7 @@
 /model_gateway/src/core @slin1237 @CatherineSue
 /model_gateway/src/policies @slin1237
 /model_gateway/src/routers @CatherineSue @key4ng @slin1237
+/model_gateway/src/service_discovery @slin1237 @CatherineSue @key4ng @XinyueZhang369
 
 # Workspace crates
 /crates/auth @slin1237
@@ -36,6 +37,7 @@
 /crates/multimodal @slin1237 @CatherineSue
 /crates/protocols @CatherineSue @key4ng
 /crates/reasoning_parser @CatherineSue
+/crates/symphony @slin1237 @CatherineSue
 /crates/tokenizer @slin1237 @CatherineSue
 /crates/tool_parser @slin1237 @CatherineSue
 /crates/wasm @slin1237 @tonyluj

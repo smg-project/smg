@@ -1,27 +1,11 @@
 name: CI TokenSpeed Image
 
-# Bakes the pinned TokenSpeed build (engine + kernel + scheduler) into a
-# runner-matched carrier image (ubuntu:24.04 — the GPU e2e jobs run bare on
-# the runner pods, so this is extracted at job time, not used as a job
-# container; see docker/ci-tokenspeed.Dockerfile) and pushes it under the
-# content-addressed tag printed by scripts/ci_tokenspeed_image_tag.sh
-# (engine ref + a hash of the image tooling). The tokenspeed e2e lanes in
-# pr-test-rust.yml pull this image (resolved in detect-changes) instead of
-# spending ~25 GPU-runner-minutes compiling from source in every job.
-#
-# The kernel compile needs nvcc but no GPU (arch list is pinned in
-# scripts/ci_install_tokenspeed.sh), so this runs on the docker runner pool.
-#
-# Lifecycle: a PR bumping .github/versions/tokenspeed.ref (or touching the
-# image tooling) falls back to the source build — the image for the new tag
-# doesn't exist yet, detect-changes resolves an empty image, and the lanes
-# degrade gracefully. This workflow builds the new tag on merge, and every
-# subsequent run is fast again.
-#
-# Retention: each tag is ~8 GB and nothing can pull a superseded one, so the
-# prune job below keeps the newest few and deletes the rest.
+# Publishes a runner-matched carrier tagged by the TokenSpeed nightly date.
+# Jobs still upgrade nightly wheels and validate their FlashInfer artifacts.
 
 on:
+  schedule:
+    - cron: '0 6 * * *'
   push:
     branches: [main]
     paths:
@@ -30,6 +14,7 @@ on:
       - 'scripts/ci_apt_mirror.sh'
       - 'scripts/ci_ensure_python_headers.sh'
       - 'scripts/ci_install_tokenspeed.sh'
+      - 'scripts/ci_install_flashinfer.py'
       - 'scripts/ci_retry.sh'
       - 'scripts/ci_setup_python_venv.sh'
       - 'scripts/ci_tokenspeed_image_tag.sh'
@@ -69,7 +54,9 @@ jobs:
         run: |
           # Unlike the tolerant resolution in detect-changes, THIS workflow
           # must fail loudly on a broken ref — its whole job is the image.
-          tag="$(bash scripts/ci_tokenspeed_image_tag.sh)"
+          version="$(bash scripts/ci_tokenspeed_image_tag.sh --version)"
+          tag="ci-tokenspeed-${version##*post}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
           # ubuntu:24.04 matches the runner pods (see the Dockerfile's
           # portability contract); the dispatch input can override it.
           base="${BASE_OVERRIDE:-ubuntu:24.04}"
@@ -86,9 +73,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags are content-addressed (engine ref + image-tooling hash, see
-      # scripts/ci_tokenspeed_image_tag.sh), so an existing tag means the
-      # work is already done (unless force is set).
+      # Rebuild on tooling changes even when today's nightly already exists.
       - name: Check for existing image
         id: exists
         env:
@@ -102,13 +87,13 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        if: steps.exists.outputs.exists != 'true' || inputs.force
+        if: steps.exists.outputs.exists != 'true' || inputs.force || github.event_name == 'push'
         uses: docker/setup-buildx-action@v4
         with:
           driver: docker
 
       - name: Build and push image
-        if: steps.exists.outputs.exists != 'true' || inputs.force
+        if: steps.exists.outputs.exists != 'true' || inputs.force || github.event_name == 'push'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -117,6 +102,7 @@ jobs:
           no-cache: true
           build-args: |
             BASE_IMAGE=${{ steps.resolve.outputs.base }}
+            TOKENSPEED_VERSION=${{ steps.resolve.outputs.version }}
           tags: ${{ steps.resolve.outputs.image }}
 
       - name: Clean up local images
@@ -128,10 +114,7 @@ jobs:
           docker rmi "$IMAGE" || true
           docker rmi "$BASE" || true
 
-  # Superseded tags are unreachable by construction (the tag is a hash of its
-  # own inputs), so this runs whenever the tag resolves — after a fresh push
-  # and after a no-op run that found the tag already present. Split out onto
-  # the CPU pool because that is where the gh CLI is available.
+  # Keep recent carriers for jobs that already resolved an older digest.
   prune:
     needs: [build-and-push]
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}

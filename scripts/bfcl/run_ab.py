@@ -38,9 +38,12 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -138,13 +141,28 @@ def run_bfcl(
         ):
             arm.timed_out.append("generate")
     # Evaluate even after a killed generate: whatever completed is already on disk.
+    # Each evaluate scores into a new directory under score/ (BFCL resolves
+    # --score-dir against BFCL_PROJECT_ROOT), and only that directory is parsed:
+    # a reused project root keeps score files from earlier runs, such as another
+    # model, an older BFCL version, or a category this evaluate did not rescore.
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    score_dir = Path("score") / f"run-{stamp}-{uuid.uuid4().hex[:8]}"
     _run(
-        [bfcl, "evaluate", "--model", model, "--test-category", cats],
+        [
+            bfcl,
+            "evaluate",
+            "--model",
+            model,
+            "--test-category",
+            cats,
+            "--score-dir",
+            str(score_dir),
+        ],
         env,
         f"[{arm.name}] evaluate",
         timeout=run_timeout,
     )
-    arm.scores, arm.counts = parse_scores(arm.project_root, model, categories)
+    arm.scores, arm.counts = parse_scores(arm.project_root / score_dir, model, categories)
 
 
 def _run(cmd: list[str], env: dict[str, str], label: str, timeout: int = 0) -> bool:
@@ -173,16 +191,16 @@ def _killpg(proc: subprocess.Popen) -> None:
 
 
 def parse_scores(
-    project_root: Path, model: str, categories: list[str]
+    score_root: Path, model: str, categories: list[str]
 ) -> tuple[dict[str, float], dict[str, int]]:
-    """Extract per-category accuracy and test-case count from BFCL's score output.
+    """Extract per-category accuracy and test-case count from one evaluate's scores.
 
-    BFCL writes ``<root>/score/<sanitized-model>/<category>_score.json`` whose
-    FIRST line is a summary dict ``{"accuracy", "correct_count", "total_count"}``.
-    We glob for the model dir (sanitization differs across versions) and read each
-    category's summary. ``total_count`` is what weights the weighted overall.
+    ``score_root`` is the ``--score-dir`` of a single ``bfcl evaluate``. BFCL writes
+    ``<score_root>/<sanitized-model>/<category>_score.json`` whose FIRST line is a
+    summary dict ``{"accuracy", "correct_count", "total_count"}``. We glob for the
+    model dir (sanitization differs across versions) and read each category's
+    summary. ``total_count`` is what weights the weighted overall.
     """
-    score_root = project_root / "score"
     scores: dict[str, float] = {}
     counts: dict[str, int] = {}
     if not score_root.is_dir():
@@ -197,9 +215,15 @@ def parse_scores(
 
 
 def _find_category_summary(score_root: Path, category: str) -> tuple[float, int] | None:
-    # BFCL nests scores as <model>/<section>/BFCL_v4_<category>_score.json, so
-    # match a trailing-wildcard pattern (the BFCL_v4_ prefix varies by version).
-    for path in score_root.rglob(f"*{category}_score.json"):
+    # BFCL nests scores as <model>/<section>/BFCL_v4_<category>_score.json, and
+    # the BFCL_v4_ prefix varies by version. The category must be the whole name
+    # after that prefix: "*multiple_score.json" alone also matches
+    # parallel_multiple, live_multiple and live_parallel_multiple, and which of
+    # them rglob yields first depends on the filesystem.
+    exact = re.compile(rf"(?:BFCL_v\d+_)?{re.escape(category)}_score\.json")
+    for path in sorted(score_root.rglob(f"*{category}_score.json")):
+        if not exact.fullmatch(path.name):
+            continue
         try:
             first = path.read_text(encoding="utf-8").splitlines()[0]
             summary = json.loads(first)

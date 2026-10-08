@@ -287,6 +287,10 @@ impl VisionPreProcessor for Qwen3VLProcessor {
         true
     }
 
+    fn emits_pixel_bytes(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }
@@ -538,8 +542,6 @@ mod tests {
     // this fails and the cache assumption must be revisited.
     #[test]
     fn per_image_preprocess_equals_batched_slices() {
-        use ndarray::{Axis, Slice};
-
         let processor = Qwen3VLProcessor::new();
         let config = PreProcessorConfig {
             image_mean: Some(QWEN3_MEAN.to_vec()),
@@ -570,17 +572,11 @@ mod tests {
         let pb = single_b.encoder_input.shape()[0];
         assert_eq!(batched.encoder_input.shape()[0], pa + pb);
         assert_eq!(
-            batched
-                .encoder_input
-                .slice_axis(Axis(0), Slice::from(0..pa))
-                .to_owned(),
+            batched.encoder_input.slice_axis0(0, pa).unwrap(),
             single_a.encoder_input
         );
         assert_eq!(
-            batched
-                .encoder_input
-                .slice_axis(Axis(0), Slice::from(pa..pa + pb))
-                .to_owned(),
+            batched.encoder_input.slice_axis0(pa, pb).unwrap(),
             single_b.encoder_input
         );
 

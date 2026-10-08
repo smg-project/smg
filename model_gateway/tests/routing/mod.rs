@@ -10,6 +10,7 @@ pub mod manual_routing_test;
 pub mod model_alias_test;
 pub mod payload_size_test;
 pub mod pd_routing_test;
+pub mod policy_completion_test;
 pub mod policy_registry_integration;
 pub mod power_of_two_test;
 pub mod prefix_hash_test;

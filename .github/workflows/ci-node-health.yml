@@ -1,0 +1,79 @@
+name: CI node health
+
+# Hourly health check of the H100 CI nodes. Evaluates Prometheus (NPD, DCGM,
+# node-exporter, kube-state-metrics) and the GitHub Actions queue, and keeps one
+# GitHub issue per active problem under the `ci-node-health` label. Slack hears
+# about it through the GitHub Slack app:
+#   /github subscribe smg-project/smg issues +label:"ci-node-health"
+# Triggered hourly by scripts/k8s-runner-resources/ci-node-health-trigger.yaml.
+# Docs: scripts/k8s-runner-resources/README.md, section "CI node health monitor".
+#
+# Runbook (issue title -> first action; the issue body repeats it):
+#   [CRIT] H100 node not Ready       kubectl describe node; cordon + OCI ticket if not back in 15 min
+#   [CRIT] NPD hardware condition    kubectl cordon; read the condition message; OCI hardware ticket
+#   [CRIT] GPU XID error             dmesg | grep -i xid on the node; close the issue yourself when handled
+#   [CRIT] GPU row-remap failure     cordon; OCI hardware ticket
+#   [CRIT] Node disk over 85%        root: delete finished runner pods, crictl rmi --prune; /raid: prune hub/
+#   [CRIT] GPU runner label starved  kubectl get autoscalingrunnersets -n actions-runner-system; listener logs
+#   [CRIT] Failed runners occupy pool capacity  inspect error; manually clean confirmed Failed records
+#   [CRIT] Monitor cannot read runner status    check trigger logs and its read-only RBAC
+#   [CRIT] Monitor cannot reach Prometheus   kubectl -n monitoring get pods | grep prometheus
+#   [WARN] H100 node cordoned        intentional? assign the issue to yourself. else kubectl uncordon
+#   [WARN] GPU jobs waiting for runners      free GPUs or raise maxRunners in scripts/k8s-runner-resources
+#   [WARN] GPU memory held by no pod nvidia-smi --query-compute-apps on the node; kill the orphan
+#   [WARN] GPU over 85C              check clocks/power; OCI ticket if it persists idle
+#   [WARN] Workflow runs queued over 24h     gh run cancel <id>; fix the runs-on label
+#
+# State findings close on their own after two clean runs. XID issues are closed by a human.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the issue operations without writing any issue
+        type: boolean
+        default: false
+      runner_failures_json:
+        description: Bounded runner status snapshot from the cluster trigger; empty skips this check
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-node-health
+  cancel-in-progress: false
+
+jobs:
+  check:
+    # Must run in the cluster: Prometheus is only reachable on its ClusterIP.
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/ci_node_health.py
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Evaluate node health and reconcile issues
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PROM_URL: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+          RUNNER_FAILURES_JSON: ${{ inputs.runner_failures_json }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python3 scripts/ci_node_health.py "${args[@]}"

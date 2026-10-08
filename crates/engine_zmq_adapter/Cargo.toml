@@ -1,0 +1,31 @@
+[package]
+name = "engine-zmq-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Each engine's own gRPC-proto surface over the same-host ZMQ engine wire"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+
+[dependencies]
+prost-types.workspace = true
+engine-zmq-client.workspace = true
+smg-grpc-client.workspace = true
+llm-tokenizer.workspace = true
+openai-protocol.workspace = true
+
+bytes.workspace = true
+half.workspace = true
+rustix = { version = "1", features = ["fs", "process"] }
+futures.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "rt", "sync", "time", "net", "macros"] }
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+engine-zmq-client = { workspace = true, features = ["mock-engine"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

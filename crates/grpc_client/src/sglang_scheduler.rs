@@ -172,6 +172,36 @@ impl SglangSchedulerClient {
         }
     }
 
+    /// Build a prefill-only next-token scoring request with explicit defaults.
+    pub fn build_score_request(
+        request_id: String,
+        token_ids: Vec<u32>,
+        label_ids: Vec<u32>,
+    ) -> proto::GenerateRequest {
+        proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                input_ids: token_ids,
+                original_text: String::new(),
+            }),
+            sampling_params: Some(proto::SamplingParams {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: -1,
+                repetition_penalty: 1.0,
+                max_new_tokens: Some(0),
+                n: 1,
+                ..Default::default()
+            }),
+            return_logprob: true,
+            logprob_start_len: -1,
+            token_ids_logprob: label_ids,
+            stream: false,
+            require_reasoning: false,
+            ..Default::default()
+        }
+    }
+
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
     #[expect(
         clippy::unused_self,
@@ -194,7 +224,9 @@ impl SglangSchedulerClient {
         )
     }
 
-    fn build_generate_request_from_chat_parts(
+    /// [`Self::build_generate_request_from_chat`] without a receiver, for
+    /// callers that hold no client (the ZMQ lane builds the same proto).
+    pub fn build_generate_request_from_chat_parts(
         request_id: String,
         body: &ChatCompletionRequest,
         processed_text: String,
@@ -240,7 +272,8 @@ impl SglangSchedulerClient {
         Self::build_plain_generate_request_parts(request_id, body, original_text, token_ids)
     }
 
-    fn build_plain_generate_request_parts(
+    /// [`Self::build_plain_generate_request`] without a receiver.
+    pub fn build_plain_generate_request_parts(
         request_id: String,
         body: &GenerateRequest,
         original_text: Option<String>,
@@ -285,6 +318,24 @@ impl SglangSchedulerClient {
     )]
     pub fn build_generate_request_from_responses(
         &self,
+        request_id: String,
+        body: &ResponsesRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        constraint: Option<(String, String)>,
+    ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_responses_parts(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            constraint,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_responses`] without a receiver,
+    /// for callers that hold no client (the ZMQ lane builds the same proto).
+    pub fn build_generate_request_from_responses_parts(
         request_id: String,
         body: &ResponsesRequest,
         processed_text: String,
@@ -502,7 +553,8 @@ impl SglangSchedulerClient {
         )
     }
 
-    fn build_generate_request_from_messages_parts(
+    /// [`Self::build_generate_request_from_messages`] without a receiver.
+    pub fn build_generate_request_from_messages_parts(
         request_id: String,
         body: &CreateMessageRequest,
         processed_text: String,
@@ -570,6 +622,21 @@ impl SglangSchedulerClient {
     )]
     pub fn build_generate_request_from_completion(
         &self,
+        request_id: String,
+        body: &CompletionRequest,
+        original_text: String,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_completion_parts(
+            request_id,
+            body,
+            original_text,
+            token_ids,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_completion`] without a receiver.
+    pub fn build_generate_request_from_completion_parts(
         request_id: String,
         body: &CompletionRequest,
         original_text: String,
@@ -832,6 +899,7 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
             aggregate,
+            sampled_at: None,
         }
     }
 }
@@ -841,6 +909,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn score_request_uses_unscaled_prefill_only_logprobs() {
+        let request = SglangSchedulerClient::build_score_request(
+            "score".to_string(),
+            vec![1, 2, 3],
+            vec![42, 5],
+        );
+        assert_eq!(request.request_id, "score");
+        assert_eq!(request.tokenized.unwrap().input_ids, vec![1, 2, 3]);
+        assert_eq!(request.token_ids_logprob, vec![42, 5]);
+        assert!(request.return_logprob);
+        assert_eq!(request.logprob_start_len, -1);
+        assert_eq!(request.top_logprobs_num, 0);
+        assert!(!request.stream && !request.require_reasoning);
+        let params = request.sampling_params.unwrap();
+        assert_eq!(params.max_new_tokens, Some(0));
+        assert_eq!(params.temperature, 1.0);
+        assert_eq!(params.top_p, 1.0);
+        assert_eq!(params.top_k, -1);
+        assert_eq!(params.repetition_penalty, 1.0);
+        assert_eq!(params.n, 1);
+        assert!(params.constraint.is_none() && params.logit_bias.is_empty());
+    }
 
     #[test]
     fn test_proto_types_compilation() {

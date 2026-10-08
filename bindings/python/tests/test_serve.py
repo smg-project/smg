@@ -725,6 +725,21 @@ class TestSglangWorkerLauncher:
             assert arg in cmd
         assert "--enable-cache-report" in cmd
 
+    def test_build_zmq_command_launches_headless_and_refuses_dp(self):
+        launcher = SglangWorkerLauncher()
+        args = argparse.Namespace(model_path="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--mem-fraction-static", "0.5"], "127.0.0.1", 31000)
+        assert "smg_grpc_servicer.sglang.headless" in cmd
+        expected_port = _zmq_handshake_port(_zmq_ipc_url(31000))
+        assert cmd[cmd.index("--zmq-handshake-address") + 1] == f"tcp://127.0.0.1:{expected_port}"
+        assert cmd[cmd.index("--model-path") + 1] == "/tmp/model"
+        assert "--mem-fraction-static" in cmd and "--grpc-mode" not in cmd
+        # DP over the SGLang ZMQ wire is not wired yet: refuse rather than
+        # start ranks the gateway will not await.
+        for flag in ("--dp-size", "--data-parallel-size"):
+            with pytest.raises(ValueError, match="dp-size"):
+                launcher.build_command(args, [flag, "2"], "127.0.0.1", 31000)
+
     def test_worker_url_grpc_mode(self):
         launcher = SglangWorkerLauncher()
         args = argparse.Namespace(connection_mode="grpc")
@@ -769,6 +784,32 @@ class TestVllmWorkerLauncher:
         assert "32000" in cmd
         for arg in backend_args:
             assert arg in cmd
+
+    def test_rust_servicer_is_a_worker_env_flag_not_a_command(self):
+        """servicer-impl rust keeps upstream's gRPC entrypoint as the command and
+        selects the Rust path through the servicer package's flag in the env."""
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="grpc", servicer_impl="rust")
+        cmd = launcher.build_command(args, ["--max-model-len", "4096"], "0.0.0.0", 32000)
+        assert "vllm.entrypoints.grpc_server" in cmd
+        assert "--impl" not in cmd and "--servicer-impl" not in cmd
+        env = launcher.gpu_env(args, 0, {"CUDA_VISIBLE_DEVICES": "3"})
+        assert env["SMG_VLLM_SERVICER_IMPL"] == "rust"
+        assert env["CUDA_VISIBLE_DEVICES"] == "3"
+
+    def test_python_servicer_clears_an_inherited_rust_flag(self):
+        """The CLI flag is authoritative: a `SMG_VLLM_SERVICER_IMPL=rust`
+        exported in the operator's shell must not survive `--servicer-impl
+        python` (the default) into the worker's environment."""
+        launcher = VllmWorkerLauncher()
+        for connection_mode, impl in [("grpc", "python"), ("http", "rust")]:
+            args = argparse.Namespace(
+                model="/tmp/model", connection_mode=connection_mode, servicer_impl=impl
+            )
+            inherited = {"CUDA_VISIBLE_DEVICES": "0", "SMG_VLLM_SERVICER_IMPL": "rust"}
+            env = launcher.gpu_env(args, 0, inherited)
+            assert "SMG_VLLM_SERVICER_IMPL" not in env
+            assert env["CUDA_VISIBLE_DEVICES"] == "0"
 
     def test_build_zmq_command_defaults_to_single_engine(self):
         launcher = VllmWorkerLauncher()

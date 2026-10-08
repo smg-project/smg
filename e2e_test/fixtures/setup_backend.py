@@ -33,6 +33,7 @@ from infra import (
     Gateway,
     Runtime,
     WorkerType,
+    effective_startup_timeout,
     get_connection_mode_override,
     get_runtime,
     launch_cloud_gateway,
@@ -77,7 +78,9 @@ _MAX_WORKER_START_FAILURES = 3  # fail fast after this many failures (matches --
 # Engines that speak the direct-ZMQ backend wire in e2e. Pairing ZMQ with any
 # other engine can't work, so we reject it up front instead of timing out on a
 # worker that never becomes ready.
-ZMQ_CAPABLE_ENGINES = frozenset({Runtime.VLLM.value, Runtime.TOKENSPEED.value})
+ZMQ_CAPABLE_ENGINES = frozenset(
+    {Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value}
+)
 
 
 def _validate_connection_mode(connection_mode: ConnectionMode, engine: str) -> None:
@@ -137,7 +140,9 @@ def _gateway_readiness_timeout(
     """
     if connection_mode != ConnectionMode.ZMQ:
         return base_timeout
-    startup_timeout = get_model_spec(model_id).get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+    startup_timeout = effective_startup_timeout(
+        get_model_spec(model_id).get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+    )
     return max(base_timeout, startup_timeout)
 
 
@@ -592,7 +597,9 @@ def _setup_pd(
             # a user launching a fleet does.
             # One deadline for the fleet, and a failed load still counts toward
             # the session's fail-fast budget as it does on the sequential path.
-            deadline = time.monotonic() + spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            deadline = time.monotonic() + effective_startup_timeout(
+                spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            )
             try:
                 for worker in all_workers:
                     worker.wait_ready(max(1, int(deadline - time.monotonic())))

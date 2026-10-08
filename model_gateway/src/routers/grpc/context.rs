@@ -13,6 +13,7 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::{ClassifyRequest, ClassifyResponse},
     completion::{CompletionRequest, CompletionResponse},
+    decisions::{DecisionResponse, DecisionsRequest},
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
@@ -33,16 +34,20 @@ use super::{
     multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
-        ProtoRequest, ProtoStream,
+        ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
+    regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
     spec::ResponseSpec,
     utils::ParserResolver,
 };
 use crate::{
     middleware::TenantRequestMeta,
+    observability::cache_trace,
     policies::CacheNamespace,
     routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{
+        ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+    },
 };
 
 /// Ingress-phase request context: owns the parsed request.
@@ -81,6 +86,7 @@ pub(crate) enum RequestType {
     Responses(Arc<ResponsesRequest>),
     Embedding(Arc<EmbeddingRequest>),
     Classify(Arc<ClassifyRequest>),
+    Decisions(Arc<DecisionsRequest>),
     Messages(Arc<CreateMessageRequest>),
     /// Audio transcription: the request plus its uploaded audio. The
     /// preparation stage turns these into a chat-shaped backend request
@@ -111,6 +117,7 @@ impl RequestType {
             Self::Responses(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Decisions(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Transcription { request, .. } => {
                 replace(&mut Arc::make_mut(request).model, model_id);
@@ -128,7 +135,7 @@ impl RequestType {
             Self::Embedding(r) => r.rid.as_deref(),
             Self::Classify(r) => r.rid.as_deref(),
             Self::Messages(r) => r.rid.as_deref(),
-            Self::Responses(_) | Self::Transcription { .. } => None,
+            Self::Responses(_) | Self::Decisions(_) | Self::Transcription { .. } => None,
         }
     }
 }
@@ -142,6 +149,7 @@ impl std::fmt::Display for RequestType {
             Self::Responses(_) => write!(f, "Responses"),
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
+            Self::Decisions(_) => write!(f, "Decisions"),
             Self::Messages(_) => write!(f, "Messages"),
             Self::Transcription { .. } => write!(f, "Transcription"),
         }
@@ -156,6 +164,7 @@ impl std::fmt::Display for FinalResponse {
             Self::Completion(_) => write!(f, "Completion"),
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
+            Self::Decisions(_) => write!(f, "Decisions"),
             Self::Messages(_) => write!(f, "Messages"),
             Self::Transcription { .. } => write!(f, "Transcription"),
         }
@@ -211,7 +220,7 @@ pub(crate) struct ProcessingState {
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
 
-    /// Effective sticky key (rid-derived wins, header falls back), recorded by
+    /// Effective sticky key (header wins, rid-derived falls back), recorded by
     /// worker selection so load guards account keyed load identically.
     pub sticky_key: Option<String>,
 
@@ -221,6 +230,10 @@ pub(crate) struct ProcessingState {
 
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
+
+    /// Prefill admission slot, taken during PD/EPD worker selection and
+    /// handed to the dispatch that runs the Prefill leg.
+    pub pd_prefill_guard: Option<PrefillLoadGuard>,
 
     // Response processing state seeded during ingress (stop decoder, router
     // stop obligations, derived skip_special_tokens).
@@ -268,6 +281,9 @@ impl WireConstraint {
 /// [`RequestContext::into_dispatch`]. `ResponseSpec` is the only
 /// request-derived input past this point.
 pub(crate) struct DispatchContext {
+    pub root_request_id: Option<String>,
+    pub cache_trace: Option<String>,
+    pub attempt: u32,
     /// Canonical model ID (routing, registries).
     pub model_id: String,
     /// Model the response reports, captured from the request at the build
@@ -288,6 +304,9 @@ pub(crate) struct DispatchContext {
     pub multimodal_inflight: Option<InflightPermit>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
+    /// Prefill admission slot for the next PD/EPD dispatch; a retry's
+    /// reselection refills it.
+    pub pd_prefill_guard: Option<PrefillLoadGuard>,
     pub response: ResponseState,
 }
 
@@ -471,6 +490,10 @@ impl ExecutionPlan {
 /// Each request type produces its own variant, eliminating optional fields
 /// that are always None for certain pipelines.
 pub(crate) enum PreparationOutput {
+    Decisions {
+        items: Vec<DecisionPrompt>,
+        scoring: DecisionScoring,
+    },
     Chat {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
@@ -534,6 +557,9 @@ impl PreparationOutput {
     /// first prompt's tokens as the routing-affinity proxy.
     pub fn token_ids(&self) -> &[u32] {
         match self {
+            Self::Decisions { items, .. } => {
+                items.first().map_or(&[], |item| item.token_ids.as_slice())
+            }
             Self::Chat { token_ids, .. }
             | Self::Messages { token_ids, .. }
             | Self::Transcription { token_ids, .. }
@@ -552,6 +578,7 @@ impl PreparationOutput {
     /// request's real input cost is the sum of every prompt in the batch.
     pub fn total_input_token_count(&self) -> usize {
         match self {
+            Self::Decisions { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             Self::Completion { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             other => other.token_ids().len(),
         }
@@ -562,6 +589,11 @@ impl PreparationOutput {
     /// engine request, so the window applies per item, not to their sum.
     pub fn max_input_token_count(&self) -> usize {
         match self {
+            Self::Decisions { items, .. } => items
+                .iter()
+                .map(|item| item.token_ids.len())
+                .max()
+                .unwrap_or(0),
             Self::Completion { items, .. } => items
                 .iter()
                 .map(|item| item.token_ids.len())
@@ -575,6 +607,7 @@ impl PreparationOutput {
     /// Chat/Messages borrow from processed_messages.text to avoid a redundant clone.
     pub fn routing_text(&self) -> Option<&str> {
         match self {
+            Self::Decisions { items, .. } => items.first().map(|item| item.text.as_str()),
             Self::Chat {
                 processed_messages, ..
             }
@@ -647,10 +680,9 @@ pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
     },
-    /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
-    /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
+    /// Disaggregated guards cover the decode leg only. The Prefill load is
+    /// a `PrefillLoadGuard` that drops when the Prefill phase ends.
     Disaggregated {
-        _prefill: WorkerLoadGuard,
         _decode: WorkerLoadGuard,
     },
     /// Batched completion fan-out: one guard set per sub-request so load-aware
@@ -674,10 +706,7 @@ impl LoadGuards {
             WorkerSelection::Single { worker } => LoadGuards::Single {
                 _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
             },
-            WorkerSelection::Disaggregated {
-                prefill, decode, ..
-            } => LoadGuards::Disaggregated {
-                _prefill: WorkerLoadGuard::with_key(prefill.clone(), routing_key),
+            WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
                 _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
             },
         }
@@ -774,7 +803,9 @@ impl RequestContext {
             // preparation by capability check, never handed off here.
             RequestType::Transcription { .. } => false,
             // Embeddings and classification never stream.
-            RequestType::Embedding(_) | RequestType::Classify(_) => false,
+            RequestType::Embedding(_) | RequestType::Classify(_) | RequestType::Decisions(_) => {
+                false
+            }
         };
         Self {
             input: RequestInput {
@@ -808,7 +839,7 @@ impl RequestContext {
             headers,
             model_id,
             streaming,
-            tenant_request_meta: _,
+            tenant_request_meta,
             rate_limit_cell,
         } = input;
         // The model the response reports. `RequestContext::new` already
@@ -823,6 +854,7 @@ impl RequestContext {
             RequestType::Responses(req) => req.model.clone(),
             RequestType::Embedding(req) => req.model.clone(),
             RequestType::Classify(req) => req.model.clone(),
+            RequestType::Decisions(req) => req.model.clone(),
             RequestType::Messages(req) => req.model.clone(),
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
@@ -853,6 +885,14 @@ impl RequestContext {
                 )
             })?;
         Ok(DispatchContext {
+            root_request_id: if cache_trace::enabled() {
+                super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
+                    .map(str::to_owned)
+            } else {
+                None
+            },
+            cache_trace: None,
+            attempt: 0,
             model_id,
             dispatch_model,
             streaming,
@@ -868,6 +908,7 @@ impl RequestContext {
             multimodal_inflight: state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
+            pd_prefill_guard: state.pd_prefill_guard,
             response: state.response,
         })
     }
@@ -937,6 +978,21 @@ impl RequestContext {
     ) -> Self {
         Self::new(
             RequestType::Responses(request),
+            headers,
+            model_id,
+            components,
+        )
+    }
+
+    /// Create context for a Decisions scoring request.
+    pub fn for_decisions(
+        request: Arc<DecisionsRequest>,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self::new(
+            RequestType::Decisions(request),
             headers,
             model_id,
             components,
@@ -1245,8 +1301,18 @@ pub(crate) enum ExecutionResult {
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
+        /// Guards indexed by fan-out sample. Each starts as `Some` and is taken
+        /// when that sample completes; siblings retain their guards. A leg
+        /// whose prefill already ran to completion in the execution stage
+        /// (sequential PD) carries `None` — there is no live guard to release.
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         /// PD timing context, for honest PD TTFT (prefill start to first decode token).
         pd_timing: PdTiming,
+        /// Input (prompt) logprobs harvested from the prefill `Complete` frame.
+        /// `Some` only for sequential PD, where the execution stage drains the
+        /// prefill stream before the streaming layer runs; parallel/fan-out PD
+        /// leaves this `None` and the streaming layer drains the stream itself.
+        prefill_input_logprobs: Option<ProtoInputLogProbs>,
     },
     /// Embedding requests return a single response, not a stream
     Embedding {
@@ -1271,6 +1337,7 @@ pub(crate) struct PdTiming {
 /// Final processed response
 #[derive(Debug)]
 pub(crate) enum FinalResponse {
+    Decisions(DecisionResponse),
     Chat(ChatCompletionResponse),
     /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
     Generate(Vec<GenerateResponse>),
@@ -1305,6 +1372,131 @@ mod tests {
                 .collect(),
             joined_routing_text: joined.map(str::to_string),
         }
+    }
+
+    fn pd_selection(prefill: &Arc<dyn Worker>, decode: &Arc<dyn Worker>) -> WorkerSelection {
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(prefill),
+            decode: Arc::clone(decode),
+            runtime_type: RuntimeType::Sglang,
+        }
+    }
+
+    #[test]
+    fn disaggregated_load_guards_hold_decode_only() {
+        use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill-load")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-load")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+        };
+        assert_eq!(prefill.load(), 1);
+        drop(prefill_guard);
+
+        let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 1);
+        drop(guards);
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_prompts_preserve_phase_load_semantics() {
+        use crate::worker::{BasicWorkerBuilder, PrefillAdmission, WorkerType};
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let routing_key = "batch-key";
+
+        let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+        let admitted = match admission
+            .admit(Some(routing_key), {
+                let prefill = Arc::clone(&prefill);
+                move |capacity| capacity.select(Arc::clone(&prefill), ())
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("initial admission should succeed"),
+        };
+        let prefill_guard = PrefillLoadGuard::Admission {
+            _reservation: Arc::new(admitted.reservation),
+        };
+        let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
+        prefill_children.push(prefill_guard);
+        let mut decode_children =
+            match LoadGuards::scaled(&pd_selection(&prefill, &decode), Some(routing_key), 3) {
+                LoadGuards::Batch { _guards: guards } => guards,
+                _ => panic!("count > 1 should create batch guards"),
+            };
+
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 3);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children.pop());
+        drop(decode_children.pop());
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 2);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children);
+        drop(decode_children);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.routing_key_load(), 0);
+        assert_eq!(decode.routing_key_load(), 0);
+
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), Some(routing_key)),
+        };
+        let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
+        prefill_children.push(prefill_guard);
+        let mut decode_children =
+            match LoadGuards::scaled(&pd_selection(&prefill, &decode), Some(routing_key), 3) {
+                LoadGuards::Batch { _guards: guards } => guards,
+                _ => panic!("count > 1 should create batch guards"),
+            };
+
+        assert_eq!(prefill.load(), 3);
+        assert_eq!(decode.load(), 3);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children.pop());
+        drop(decode_children.pop());
+        assert_eq!(prefill.load(), 2);
+        assert_eq!(decode.load(), 2);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children);
+        drop(decode_children);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.routing_key_load(), 0);
+        assert_eq!(decode.routing_key_load(), 0);
     }
 
     #[test]
@@ -1394,5 +1586,75 @@ mod tests {
         assert_eq!(plan.request_id(), "cmpl_shared");
         assert_eq!(plan.request_type(), "generate");
         assert_eq!(plan.mode_label(), "prefill_decode");
+    }
+
+    #[test]
+    fn load_guards_report_completion_for_each_leg_they_hold() {
+        use crate::worker::{BasicWorkerBuilder, RequestCompletionSink, WorkerType};
+        #[derive(Debug, Default)]
+        struct CompletionSpy(std::sync::Mutex<Vec<String>>);
+        impl RequestCompletionSink for CompletionSpy {
+            fn request_completed(&self, worker: &dyn Worker) {
+                self.0.lock().unwrap().push(worker.url().to_string());
+            }
+        }
+
+        let spy = Arc::new(CompletionSpy::default());
+        let sink: Arc<dyn RequestCompletionSink> = spy.clone();
+        let single: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://single")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        for worker in [&single, &prefill, &decode] {
+            worker.set_completion_sink(Some(Arc::clone(&sink)));
+        }
+
+        // The regular gRPC path: one guard, one completion when the stream ends.
+        drop(LoadGuards::new(
+            &WorkerSelection::Single {
+                worker: Arc::clone(&single),
+            },
+            None,
+        ));
+        assert_eq!(spy.0.lock().unwrap().as_slice(), ["grpc://single"]);
+
+        // The disaggregated path: the decode leg completes with the guards,
+        // the prefill leg with its own guard when the prefill phase ends.
+        let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+        };
+        drop(prefill_guard);
+        assert_eq!(
+            spy.0.lock().unwrap().last().map(String::as_str),
+            Some("grpc://prefill")
+        );
+        drop(guards);
+        assert_eq!(
+            spy.0.lock().unwrap().last().map(String::as_str),
+            Some("grpc://decode")
+        );
+
+        // A batched fan-out reports once per sub-request.
+        let before = spy.0.lock().unwrap().len();
+        drop(LoadGuards::scaled(
+            &WorkerSelection::Single {
+                worker: Arc::clone(&single),
+            },
+            None,
+            3,
+        ));
+        assert_eq!(spy.0.lock().unwrap().len(), before + 3);
     }
 }

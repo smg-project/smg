@@ -2,9 +2,9 @@ name: Release SMG+TokenSpeed Docker Image
 
 run-name: >-
   SMG+TokenSpeed |
-  ${{ github.event_name == 'push' && 'base=lightseekorg/tokenspeed:tml' || format('base={0}', inputs.base_image_ref || 'lightseekorg/tokenspeed:tml') }} |
+  base=${{ inputs.base_image_ref || 'latest nightly carrier' }} |
   engine=${{ inputs.tokenspeed_commit || 'latest' }} |
-  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.7.0' }} |
+  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.11.0' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
   by @${{ github.actor }}
 
@@ -23,9 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image_ref:
-        description: 'Base image (e.g. lightseekorg/tokenspeed:tml). Engine is baked in; leave engine repo empty.'
-        default: 'lightseekorg/tokenspeed:tml'
-        required: true
+        description: 'Base image override (empty = latest dated TokenSpeed nightly carrier)'
+        required: false
         type: string
       tokenspeed_repo:
         description: 'TokenSpeed repo URL (empty = use engine from base image)'
@@ -44,10 +43,10 @@ on:
       smg_commit:
         description: 'SMG commit/ref ("latest" for HEAD)'
         required: false
-        default: 'v1.7.0'
+        default: 'v1.11.0'
         type: string
       tag:
-        description: 'Override image tag (e.g. v1.7.0-tokenspeed-tml)'
+        description: 'Override image tag (default includes the SMG and TokenSpeed nightly versions)'
         required: false
         type: string
 
@@ -57,18 +56,14 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        base_image: ${{ github.event_name == 'push' && fromJSON('["lightseekorg/tokenspeed:tml"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'lightseekorg/tokenspeed:tml')) }}
     uses: ./.github/workflows/_build-engine-image.yml
     with:
       engine: tokenspeed
-      base_image_ref: ${{ matrix.base_image }}
+      base_image_ref: ${{ inputs.base_image_ref }}
       engine_repo: ${{ inputs.tokenspeed_repo }}
       engine_commit: ${{ inputs.tokenspeed_commit || 'latest' }}
       smg_repo: ${{ inputs.smg_repo || 'https://github.com/smg-project/smg' }}
-      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.7.0' }}
+      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.11.0' }}
       tag: ${{ inputs.tag }}
       dry_run: ${{ github.event_name == 'pull_request' }}
     secrets: inherit

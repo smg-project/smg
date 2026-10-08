@@ -10,9 +10,9 @@ use tokio::sync::Mutex;
 use crate::{
     parsers::{
         CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
-        InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser, MinimaxM2Parser,
-        MinimaxM3Parser, MistralParser, PassthroughParser, PythonicParser, QwenParser,
-        QwenXmlParser, SarashinaParser, Step3Parser,
+        HyV4Parser, InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser,
+        MinimaxM2Parser, MinimaxM3Parser, MistralParser, PassthroughParser, PythonicParser,
+        QwenParser, QwenXmlParser, SarashinaParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -418,6 +418,12 @@ impl ParserFactory {
         );
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
         registry.register_parser("minimax_m3", || Box::new(MinimaxM3Parser::new()));
+        registry.register_parser_with_structural_tag(
+            "hy_v4",
+            || Box::new(HyV4Parser::new()),
+            HyV4Parser::build_structural_tag,
+        );
+        registry.register_reasoning_prefix("hy_v4", HyV4Parser::reasoning_prefix);
         registry.register_parser("cohere", || Box::new(CohereParser::new()));
 
         // Register default model mappings
@@ -520,6 +526,8 @@ impl ParserFactory {
         registry.map_model("kimi-k2*", "kimik2");
         registry.map_model("Kimi-K2*", "kimik2");
         registry.map_model("moonshot*/Kimi-K2*", "kimik2");
+        registry.map_model("hy4*", "hy_v4");
+        registry.map_model("hy_v4", "hy_v4");
         registry.map_model("kimi-k3*", "kimi_k3");
         registry.map_model("Kimi-K3*", "kimi_k3");
         registry.map_model("moonshot*/Kimi-K3*", "kimi_k3");

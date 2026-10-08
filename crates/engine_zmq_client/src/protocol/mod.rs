@@ -1,25 +1,28 @@
 //! Per-engine wire protocol modules plus the engine-neutral seam the transport
 //! and connector are generic over.
 //!
-//! vLLM's EngineCore protocol and TokenSpeed's native msgpack protocol
-//! (issues #2003/#2006) live alongside each other. Both are msgpack-over-ZMQ
-//! with a single-byte request-type frame and share the same transport — only
-//! the message struct shapes differ, so the transport and connector are
+//! vLLM's EngineCore protocol, TokenSpeed's native msgpack protocol (issues
+//! #2003/#2006) and SGLang's scheduler structs (spoken by the SMG plugin inside
+//! the scheduler) live alongside each other. All are msgpack-over-ZMQ with a
+//! single-byte request-type frame and share the same transport — only the
+//! message struct shapes differ, so the transport and connector are
 //! parameterized over the [`EngineProtocol`] trait and each engine family
 //! provides one implementation.
 
 use bytes::Bytes;
 
-use crate::Result;
+use crate::{codec::OpaqueValue, Result};
 
 pub mod handshake;
+pub(crate) mod positional;
+pub mod sglang;
 pub mod tokenspeed;
 pub mod vllm;
 
 /// Engine-neutral per-rank load signal. Each protocol maps its native scheduler
-/// stats into this shape (vLLM maps `SchedulerStats`; TokenSpeed carries none
-/// yet), so the connector and gateway consume one load type regardless of
-/// engine. Extend it as more engines report load (task #11).
+/// stats into this shape (vLLM its `SchedulerStats`, TokenSpeed and SGLang the
+/// load tail of their slim batches), so the connector and gateway consume one
+/// load type regardless of engine.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EngineLoad {
     /// Requests currently in model-execution batches.
@@ -44,6 +47,16 @@ pub enum WaveEvent {
     /// A rank took a request for an already-drained wave and needs the rest of
     /// the group started on this one (vLLM `start_wave`).
     Start(u64),
+}
+
+/// An engine's answer to a utility RPC (vLLM `call_utility`), matched to the
+/// waiting caller by `call_id`. Protocols without utility RPCs never produce
+/// one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UtilityReply {
+    pub call_id: i64,
+    /// The returned value, or the engine's failure message.
+    pub outcome: std::result::Result<OpaqueValue, String>,
 }
 
 /// A single per-request output decoded from one engine tick. Lets the
@@ -74,6 +87,8 @@ pub struct EngineBatch<O> {
     /// Wave-control notification from a lockstep engine group (`None` on every
     /// ordinary tick).
     pub wave: Option<WaveEvent>,
+    /// A utility RPC reply (`None` on every ordinary tick).
+    pub utility: Option<UtilityReply>,
 }
 
 impl<O> Default for EngineBatch<O> {
@@ -84,6 +99,7 @@ impl<O> Default for EngineBatch<O> {
             finished_request_ids: Vec::new(),
             load: None,
             wave: None,
+            utility: None,
         }
     }
 }
@@ -121,6 +137,16 @@ pub trait EngineProtocol: Send + Sync + 'static {
     /// the protocol has no wave protocol — its ranks run independently, so
     /// there is nothing to wake.
     fn encode_start_wave(wave: u64) -> Result<Option<(Bytes, Vec<u8>)>>;
+    /// Encode a utility (control) call, `method(*args)` on one rank answered by
+    /// a [`UtilityReply`] under `call_id`, as `(request-type frame, payload)`.
+    /// `Ok(None)` when the protocol has no control messages.
+    fn encode_utility(
+        _call_id: i64,
+        _method: &str,
+        _args: &[OpaqueValue],
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        Ok(None)
+    }
     /// Decode one output message (frame 0 plus ordered aux frames) into a batch.
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>>;
 }

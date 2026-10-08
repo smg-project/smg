@@ -16,6 +16,7 @@ mod bucket;
 mod cache_aware;
 mod cache_namespace;
 mod consistent_hashing;
+pub mod cost;
 mod dp_min_token;
 mod factory;
 mod least_load;
@@ -98,6 +99,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     fn remove_worker(&self, _url: &str) {
         // Default: no-op for policies that don't cache per-worker state
     }
+
+    /// Reconcile the state this policy booked on `worker_url` against the
+    /// router's live count of requests in flight there.
+    ///
+    /// Every request end reaches [`Self::on_request_complete`] through the
+    /// worker's load guard; this is the safety net behind it. The worker
+    /// monitor calls it once per load poll with the requests the router still
+    /// holds on the worker. A dispatch books once and a completion releases
+    /// once, so whatever a policy holds beyond `in_flight` is a completion
+    /// that never arrived (a worker that moved under another policy, a sink
+    /// never installed) and is released here rather than kept for good.
+    /// Default: no-op for policies that book nothing.
+    fn reconcile_in_flight(&self, _worker_url: &str, _in_flight: usize) {}
 
     /// Reset any internal state
     ///
@@ -187,6 +201,14 @@ pub struct CacheAwareConfig {
     /// Ascending token positions at which serving engines retain reusable
     /// prefix state; the hash index keys request heads at these boundaries.
     pub cache_boundaries: Vec<usize>,
+    /// Worker selection policy run over the gathered per-worker inputs, by
+    /// name from [`cost::POLICY_NAMES`]. `None` is [`cost::DEFAULT_POLICY`],
+    /// the affinity-group decision this policy has always made.
+    pub selection_policy: Option<String>,
+    /// Lifetime of optimistic dispatch bookings (predicted prefill and prefix
+    /// placement charged to the chosen worker before the engine reports it).
+    /// `0` disables (default); set a little above the engine's event lag.
+    pub selection_accounting_ttl_ms: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -209,6 +231,8 @@ impl Default for CacheAwareConfig {
             cache_index: CacheIndexKind::Tree,
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         }
     }
 }
@@ -304,8 +328,8 @@ pub struct SelectWorkerInfo<'a> {
     /// engine cannot serve from the same cache never match each other.
     pub cache_namespace: Option<CacheNamespace>,
     /// Session key derived from the request body's `rid` (routers with typed
-    /// body access populate it); consumed by the routing-key override when
-    /// its key source includes rid.
+    /// body access populate it); used when no valid routing-key header is
+    /// present under the routing-key override.
     pub rid_key: Option<&'a str>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds

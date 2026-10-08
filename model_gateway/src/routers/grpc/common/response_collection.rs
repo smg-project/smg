@@ -6,14 +6,58 @@
 use axum::response::Response;
 use tracing::error as trace_error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        context::ExecutionResult,
-        proto_wrapper::{ProtoGenerateComplete, ProtoResponseVariant, ProtoStream},
-        utils::tonic_ext::TonicStatusExt,
+use crate::{
+    routers::{
+        error,
+        grpc::{
+            context::ExecutionResult,
+            proto_wrapper::{
+                FanoutChild, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
+            },
+            utils::tonic_ext::TonicStatusExt,
+        },
     },
+    worker::PrefillLoadGuard,
 };
+
+/// Drain each Prefill sample through its terminal response, releasing only that
+/// sample's guard. A fan-out's first `Complete` does not finish its siblings.
+/// Keep the streams' abort-on-drop armed until Decode succeeds, as before.
+/// Collectors continue to EOF to preserve their metadata collection behavior;
+/// streaming handlers can stop once all dispatched Prefill samples complete.
+pub(crate) async fn drain_prefill<S: FanoutChild>(
+    stream: &mut S,
+    mut guards: Vec<Option<PrefillLoadGuard>>,
+    finish_at_complete: bool,
+    mut on_complete: impl FnMut(ProtoGenerateComplete) + Send,
+) -> Result<(), tonic::Status> {
+    let mut remaining = guards.len();
+    let single_dispatch = remaining == 1;
+    while let Some(response) = stream.next_item().await {
+        if let ProtoResponseVariant::Complete(complete) = response?.into_response() {
+            // Fan-out responses are restamped with their dispatch positions.
+            // For a single dispatch, preserve the collector's existing guard
+            // lifetime: EOF-based collectors release it when the stream ends.
+            if !single_dispatch || finish_at_complete {
+                let index = if single_dispatch {
+                    0
+                } else {
+                    complete.index() as usize
+                };
+                if let Some(guard) = guards.get_mut(index) {
+                    if guard.take().is_some() {
+                        remaining -= 1;
+                    }
+                }
+            }
+            on_complete(complete);
+            if finish_at_complete && remaining == 0 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Collect and merge responses from execution result
 ///
@@ -39,10 +83,21 @@ pub(crate) async fn collect_responses(
         ExecutionResult::PrefillDecode {
             mut prefill,
             decode,
+            prefill_guards,
             ..
         } => {
             // Collect prefill for input_logprobs (don't mark completed yet)
-            let prefill_responses = collect_stream_responses(&mut prefill, "Prefill").await?;
+            let mut prefill_responses = Vec::new();
+            drain_prefill(&mut prefill, prefill_guards, false, |complete| {
+                prefill_responses.push(complete);
+            })
+            .await
+            .map_err(|e| {
+                e.to_http_error(
+                    "worker_stream_failed",
+                    format!("Prefill stream failed: {}", e.message()),
+                )
+            })?;
 
             // Collect decode for actual output (don't mark completed yet)
             let mut decode_stream = *decode;
@@ -144,4 +199,42 @@ async fn collect_stream_responses(
     }
 
     Ok(all_responses)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::routers::grpc::proto_wrapper::ProtoGenerateResponse;
+
+    /// A stream that is already at EOF, as sequential PD hands to the
+    /// streaming layer after draining prefill in the execution stage.
+    struct ExhaustedStream;
+
+    impl FanoutChild for ExhaustedStream {
+        async fn next_item(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+            None
+        }
+
+        fn mark_completed(&mut self) {}
+
+        fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_prefill_accepts_exhausted_stream_with_released_guard() {
+        // Sequential PD releases the prefill guard in the execution stage, so
+        // the streaming layer receives an exhausted stream with `vec![None]`.
+        let mut stream = ExhaustedStream;
+        let completions = AtomicUsize::new(0);
+        let result = drain_prefill(&mut stream, vec![None], true, |_complete| {
+            completions.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+    }
 }

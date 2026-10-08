@@ -27,6 +27,8 @@ use smg_mesh::{
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
+use crate::config::DiscoveryConfig;
+
 /// Configuration for Kubernetes router-peer discovery.
 #[derive(Debug, Clone)]
 pub struct MeshDiscoveryConfig {
@@ -49,6 +51,19 @@ impl Default for MeshDiscoveryConfig {
 }
 
 impl MeshDiscoveryConfig {
+    /// Router discovery as configured today: inside Kubernetes worker
+    /// discovery, so it runs only alongside it. `None` without a router
+    /// selector.
+    pub fn from_discovery(discovery: &DiscoveryConfig) -> Option<Self> {
+        let DiscoveryConfig::Kubernetes(kubernetes) = discovery;
+        Some(Self {
+            namespace: kubernetes.namespace.clone(),
+            router_selector: kubernetes.router_selector.clone(),
+            router_mesh_port_annotation: kubernetes.router_mesh_port_annotation.clone(),
+        })
+        .filter(Self::is_enabled)
+    }
+
     /// Router discovery only runs with a selector; without one there is no way
     /// to tell a router Pod from any other Pod in the namespace.
     pub fn is_enabled(&self) -> bool {

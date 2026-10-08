@@ -3,7 +3,7 @@ name = "mock-worker"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Multi-port mock HTTP/gRPC inference worker for SMG gateway scale testing"
+description = "Multi-port mock HTTP/gRPC inference worker for SMG gateway scale testing, with the trace replayer that measures routing against it"
 
 [lib]
 name = "mock_worker"
@@ -13,7 +13,16 @@ path = "src/lib.rs"
 name = "mock-worker"
 path = "src/main.rs"
 
+# The trace replayer: a measurement tool belongs with the fleet it measures.
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"
+
 [dependencies]
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+reqwest = { workspace = true, features = ["json", "stream", "rustls"] }
+serde = { workspace = true, features = ["derive"] }
 smg-grpc-client.workspace = true
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 tokio = { workspace = true, features = ["full"] }
@@ -24,6 +33,10 @@ serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rmpv.workspace = true
+zeromq.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+engine-servicer = { path = "../engine_servicer" }
+rmp-serde.workspace = true

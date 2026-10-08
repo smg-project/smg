@@ -320,8 +320,18 @@ fn is_client_visible_output_item(
         | ResponseOutputItem::McpApprovalRequest {
             server_label, name, ..
         } => !session.should_hide_mcp_call_like_by_label(name, server_label),
-        ResponseOutputItem::FunctionToolCall { name, .. } => {
-            !session.should_hide_function_call_like(name, user_function_names)
+        ResponseOutputItem::FunctionToolCall {
+            name, namespace, ..
+        } => {
+            // Namespace members are advertised and classified by qualified name.
+            // A same-named internal MCP tool must not hide a client function.
+            let qualified_name = namespace
+                .as_ref()
+                .map(|namespace| format!("{namespace}.{name}"));
+            !session.should_hide_function_call_like(
+                qualified_name.as_deref().unwrap_or(name),
+                user_function_names,
+            )
         }
         // Custom tool calls are user-declared (never MCP-hosted), so they are
         // always client-visible.

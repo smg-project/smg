@@ -1,11 +1,583 @@
 //! Shared encoder-input types for all encoder-backed modalities.
+//!
+//! The primary encoder input comes in two forms. Most processors produce it
+//! as `f32`, normalized. The processors that patchify pixels (the Qwen-VL
+//! family) produce the image's own bytes in the model's patch layout plus the
+//! normalization a float destination applies ([`EncoderInput::U8`]): the
+//! destination's dtype, or no normalization at all for an engine that
+//! normalizes on device, is then one pass at serialization
+//! ([`EncoderInput::write_as`]), and a cache of preprocessed inputs holds
+//! bytes, a quarter of the floats, valid for every destination.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt,
+    mem::{size_of, size_of_val},
+    str::FromStr,
+};
 
 use anyhow::{Context, Result as AnyhowResult};
-use ndarray::{Array, ArrayD, Axis, Dimension};
+use ndarray::{Array, ArrayD, ArrayViewD, Axis, Dimension, Slice};
 
-use crate::types::FieldLayout;
+use crate::{types::FieldLayout, vision::execution};
+
+/// The dtypes an encoder input is written in for the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderDtype {
+    Float32,
+    BFloat16,
+    Float16,
+    /// The image's own bytes, for an engine that rescales and normalizes on
+    /// device. Only an [`EncoderInput::U8`] can be written this way exactly.
+    Uint8,
+}
+
+impl EncoderDtype {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Float32 => "float32",
+            Self::BFloat16 => "bfloat16",
+            Self::Float16 => "float16",
+            Self::Uint8 => "uint8",
+        }
+    }
+
+    pub fn element_size(self) -> usize {
+        match self {
+            Self::Float32 => 4,
+            Self::BFloat16 | Self::Float16 => 2,
+            Self::Uint8 => 1,
+        }
+    }
+}
+
+impl fmt::Display for EncoderDtype {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EncoderDtype {
+    type Err = String;
+
+    /// The wire names and their common spellings (`fp32`, `bf16`, `half`, ...).
+    fn from_str(dtype: &str) -> Result<Self, Self::Err> {
+        match dtype.trim().to_ascii_lowercase().as_str() {
+            "float32" | "fp32" | "f32" => Ok(Self::Float32),
+            "bfloat16" | "bf16" => Ok(Self::BFloat16),
+            "float16" | "fp16" | "f16" | "half" => Ok(Self::Float16),
+            "uint8" | "u8" => Ok(Self::Uint8),
+            other => Err(format!("unsupported encoder input dtype {other:?}")),
+        }
+    }
+}
+
+/// Round an `f32` to the nearest `bfloat16` (ties to even), as the bits.
+#[inline]
+pub fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let lsb = (bits >> 16) & 1;
+    let rounding_bias = 0x7fff + lsb;
+    (bits.wrapping_add(rounding_bias) >> 16) as u16
+}
+
+/// Round an `f32` to the nearest `float16` (ties to even), as the bits.
+#[inline]
+pub fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x7fffff;
+
+    if exp == 0xff {
+        // Infinity or NaN; keep a NaN a NaN.
+        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let unbiased = exp - 127;
+    if unbiased > 15 {
+        return sign | 0x7c00;
+    }
+    if unbiased < -25 {
+        return sign;
+    }
+    if unbiased < -14 {
+        // Subnormal: shift the implicit one into the mantissa.
+        let full = mant | 0x800000;
+        let shift = (-14 - unbiased) as u32;
+        let shifted = full >> (13 + shift);
+        let remainder = full & ((1u32 << (13 + shift)) - 1);
+        let halfway = 1u32 << (12 + shift);
+        let rounded = match remainder.cmp(&halfway) {
+            std::cmp::Ordering::Greater => shifted + 1,
+            std::cmp::Ordering::Equal => shifted + (shifted & 1),
+            std::cmp::Ordering::Less => shifted,
+        };
+        return sign | rounded as u16;
+    }
+    let half_exp = ((unbiased + 15) as u32) << 10;
+    let half_mant = mant >> 13;
+    let remainder = mant & 0x1fff;
+    let mut result = half_exp | half_mant;
+    if remainder > 0x1000 || (remainder == 0x1000 && (half_mant & 1) == 1) {
+        result += 1;
+    }
+    sign | result as u16
+}
+
+/// The per-channel map from a pixel byte to the normalized value a float
+/// destination takes: `value * scale[c] + bias[c]`, the HF processor's
+/// rescale and normalize folded into one step, in `f32` exactly as the
+/// processors computed it before the bytes were kept instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PixelNorm {
+    pub scale: [f32; 3],
+    pub bias: [f32; 3],
+    /// Consecutive elements of one channel within a row of the encoder
+    /// input: for a patch layout `[C, temporal, patch_h, patch_w]` the
+    /// temporal × patch_h × patch_w product. Channel `c` owns elements
+    /// `[c * channel_block, (c + 1) * channel_block)` of every row.
+    pub channel_block: usize,
+}
+
+impl PixelNorm {
+    /// The `f32` each byte maps to, per channel.
+    pub fn table_f32(&self) -> [[f32; 256]; 3] {
+        std::array::from_fn(|channel| {
+            std::array::from_fn(|value| value as f32 * self.scale[channel] + self.bias[channel])
+        })
+    }
+
+    fn table_u16(&self, convert: fn(f32) -> u16) -> [[u16; 256]; 3] {
+        let table = self.table_f32();
+        std::array::from_fn(|channel| std::array::from_fn(|value| convert(table[channel][value])))
+    }
+}
+
+/// The primary encoder input, in the form its processor produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EncoderInput {
+    /// Normalized floats, the form of most processors.
+    F32(ArrayD<f32>),
+    /// The image's own bytes in the model's patch layout (rows of
+    /// `channel_block × 3` elements per channel block), with the
+    /// normalization a float destination applies.
+    U8 {
+        patches: ArrayD<u8>,
+        norm: PixelNorm,
+    },
+}
+
+impl<D: Dimension> From<Array<f32, D>> for EncoderInput {
+    fn from(array: Array<f32, D>) -> Self {
+        Self::F32(array.into_dyn())
+    }
+}
+
+impl EncoderInput {
+    /// Pixel bytes in the model's patch layout with their normalization.
+    pub fn bytes<D: Dimension>(patches: Array<u8, D>, norm: PixelNorm) -> Self {
+        Self::U8 {
+            patches: patches.into_dyn(),
+            norm,
+        }
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            Self::F32(array) => array.shape(),
+            Self::U8 { patches, .. } => patches.shape(),
+        }
+    }
+
+    pub fn ndim(&self) -> usize {
+        self.shape().len()
+    }
+
+    /// Elements in all.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(array) => array.len(),
+            Self::U8 { patches, .. } => patches.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Bytes per element as stored.
+    pub fn element_size(&self) -> usize {
+        match self {
+            Self::F32(_) => size_of::<f32>(),
+            Self::U8 { .. } => size_of::<u8>(),
+        }
+    }
+
+    /// Bytes as stored.
+    pub fn nbytes(&self) -> usize {
+        self.len() * self.element_size()
+    }
+
+    /// The normalization bytes carry; `None` for floats, already normalized.
+    pub fn pixel_norm(&self) -> Option<PixelNorm> {
+        match self {
+            Self::F32(_) => None,
+            Self::U8 { norm, .. } => Some(*norm),
+        }
+    }
+
+    /// The input as normalized `f32`: borrowed when it is one, materialized
+    /// through the normalization table when it is bytes (the same values the
+    /// processors produced when they normalized while patchifying).
+    pub fn as_f32(&self) -> Cow<'_, ArrayD<f32>> {
+        match self {
+            Self::F32(array) => Cow::Borrowed(array),
+            Self::U8 { patches, norm } => {
+                let table = norm.table_f32();
+                let block = norm.channel_block.max(1);
+                let row = row_len(patches.shape());
+                let mut out = vec![0f32; patches.len()];
+                let standard = patches.as_standard_layout();
+                let src = standard.as_slice().unwrap_or(&[]);
+                fill_rows(&mut out, src, row, |dst, src| {
+                    for (i, (d, &v)) in dst.iter_mut().zip(src).enumerate() {
+                        *d = table[(i / block) % 3][v as usize];
+                    }
+                });
+                Cow::Owned(
+                    ArrayD::from_shape_vec(patches.raw_dim(), out)
+                        .unwrap_or_else(|_| ArrayD::zeros(patches.raw_dim())),
+                )
+            }
+        }
+    }
+
+    /// The input as normalized `f32`, owned: a move for floats.
+    pub fn into_f32(self) -> ArrayD<f32> {
+        match self {
+            Self::F32(array) => array,
+            bytes @ Self::U8 { .. } => bytes.as_f32().into_owned(),
+        }
+    }
+
+    /// The normalized values flattened in row-major order.
+    pub fn flat_f32(&self) -> Cow<'_, [f32]> {
+        match self {
+            Self::F32(array) => match array.as_slice() {
+                Some(slice) => Cow::Borrowed(slice),
+                None => Cow::Owned(array.iter().copied().collect()),
+            },
+            Self::U8 { .. } => Cow::Owned(self.as_f32().into_owned().into_raw_vec_and_offset().0),
+        }
+    }
+
+    /// This input, borrowed: what the per-destination writers take.
+    pub fn view(&self) -> EncoderInputView<'_> {
+        match self {
+            Self::F32(array) => EncoderInputView::F32(array.view()),
+            Self::U8 { patches, norm } => EncoderInputView::U8 {
+                patches: patches.view(),
+                norm: *norm,
+            },
+        }
+    }
+
+    /// [`EncoderInputView::write_as`] for the whole input.
+    pub fn write_as(&self, dtype: EncoderDtype) -> Vec<u8> {
+        self.view().write_as(dtype)
+    }
+
+    /// [`EncoderInputView::write_into`] for the whole input.
+    pub fn write_into(&self, dtype: EncoderDtype, out: &mut [u8]) -> Result<(), String> {
+        self.view().write_into(dtype, out)
+    }
+
+    /// Rows `[start, start + len)` along the first axis, as an owned input.
+    pub fn slice_axis0(&self, start: usize, len: usize) -> AnyhowResult<Self> {
+        Ok(self.view().slice_axis0(start, len)?.to_owned())
+    }
+
+    /// Stack inputs along the first axis. Bytes stack with bytes of the same
+    /// normalization, floats with floats; the two forms do not mix.
+    pub fn concat(parts: &[&Self]) -> AnyhowResult<Self> {
+        let first = parts.first().context("cannot join zero encoder inputs")?;
+        match first {
+            Self::F32(_) => {
+                let views = parts
+                    .iter()
+                    .map(|part| match part {
+                        Self::F32(array) => Ok(array.view()),
+                        Self::U8 { .. } => Err(anyhow::anyhow!(
+                            "encoder inputs of the batch parts mix bytes and floats"
+                        )),
+                    })
+                    .collect::<AnyhowResult<Vec<_>>>()?;
+                Ok(Self::F32(ndarray::concatenate(Axis(0), &views).context(
+                    "encoder inputs of the batch parts do not stack",
+                )?))
+            }
+            Self::U8 { norm, .. } => {
+                let views = parts
+                    .iter()
+                    .map(|part| match part {
+                        Self::U8 {
+                            patches,
+                            norm: other,
+                        } if other == norm => Ok(patches.view()),
+                        Self::U8 { .. } => Err(anyhow::anyhow!(
+                            "encoder inputs of the batch parts disagree on pixel normalization"
+                        )),
+                        Self::F32(_) => Err(anyhow::anyhow!(
+                            "encoder inputs of the batch parts mix bytes and floats"
+                        )),
+                    })
+                    .collect::<AnyhowResult<Vec<_>>>()?;
+                Ok(Self::U8 {
+                    patches: ndarray::concatenate(Axis(0), &views)
+                        .context("encoder inputs of the batch parts do not stack")?,
+                    norm: *norm,
+                })
+            }
+        }
+    }
+}
+
+/// A borrowed [`EncoderInput`]: the whole, or rows of it. Per-destination
+/// materialization lives here so an item sliced out of a batch is written
+/// without first being copied.
+#[derive(Debug, Clone)]
+pub enum EncoderInputView<'a> {
+    F32(ArrayViewD<'a, f32>),
+    U8 {
+        patches: ArrayViewD<'a, u8>,
+        norm: PixelNorm,
+    },
+}
+
+impl<'a> EncoderInputView<'a> {
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            Self::F32(array) => array.shape(),
+            Self::U8 { patches, .. } => patches.shape(),
+        }
+    }
+
+    pub fn ndim(&self) -> usize {
+        self.shape().len()
+    }
+
+    /// Elements in all.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(array) => array.len(),
+            Self::U8 { patches, .. } => patches.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The normalization bytes carry; `None` for floats, already normalized.
+    pub fn pixel_norm(&self) -> Option<PixelNorm> {
+        match self {
+            Self::F32(_) => None,
+            Self::U8 { norm, .. } => Some(*norm),
+        }
+    }
+
+    /// An owned copy, in the same form.
+    pub fn to_owned(&self) -> EncoderInput {
+        match self {
+            Self::F32(array) => EncoderInput::F32(array.to_owned()),
+            Self::U8 { patches, norm } => EncoderInput::U8 {
+                patches: patches.to_owned(),
+                norm: *norm,
+            },
+        }
+    }
+
+    /// Rows `[start, start + len)` along the first axis, still borrowed.
+    pub fn slice_axis0(&self, start: usize, len: usize) -> AnyhowResult<Self> {
+        let rows = self.shape().first().copied().unwrap_or(0);
+        anyhow::ensure!(
+            start.checked_add(len).is_some_and(|end| end <= rows),
+            "rows {start}..{} are out of bounds for {rows} rows",
+            start.saturating_add(len)
+        );
+        let range = Slice::from(start..start + len);
+        Ok(match self {
+            Self::F32(array) => Self::F32(array.clone().slice_axis_move(Axis(0), range)),
+            Self::U8 { patches, norm } => Self::U8 {
+                patches: patches.clone().slice_axis_move(Axis(0), range),
+                norm: *norm,
+            },
+        })
+    }
+
+    /// The input as little-endian bytes of `dtype`, in row-major order.
+    ///
+    /// Bytes to a float dtype go through the normalization table once;
+    /// floats to a narrower dtype are rounded to nearest even. `Uint8` from
+    /// bytes is the bytes themselves; from floats it is the rounded, clamped
+    /// value, for a caller that knows its floats are whole numbers.
+    pub fn write_as(&self, dtype: EncoderDtype) -> Vec<u8> {
+        let mut out = vec![0u8; self.len() * dtype.element_size()];
+        // The buffer is sized by this input and dtype, the one error case.
+        let _ = self.write_into(dtype, &mut out);
+        out
+    }
+
+    /// [`write_as`](Self::write_as) into a buffer the caller owns (a
+    /// shared-memory mapping), which must hold exactly `len() *
+    /// dtype.element_size()` bytes.
+    pub fn write_into(&self, dtype: EncoderDtype, out: &mut [u8]) -> Result<(), String> {
+        let expected = self.len() * dtype.element_size();
+        if out.len() != expected {
+            return Err(format!(
+                "encoder input buffer holds {} bytes, {expected} needed for {dtype}",
+                out.len()
+            ));
+        }
+        let row = row_len(self.shape());
+        match self {
+            Self::U8 { patches, norm } => {
+                let standard = patches.as_standard_layout();
+                let src = standard.as_slice().unwrap_or(&[]);
+                let block = norm.channel_block.max(1);
+                match dtype {
+                    EncoderDtype::Uint8 => out.copy_from_slice(src),
+                    EncoderDtype::Float32 => {
+                        let table = norm.table_f32();
+                        fill_rows_bytes(out, src, row, 4, |dst, src| {
+                            for (i, (d, &v)) in
+                                dst.as_chunks_mut::<4>().0.iter_mut().zip(src).enumerate()
+                            {
+                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
+                            }
+                        });
+                    }
+                    EncoderDtype::BFloat16 | EncoderDtype::Float16 => {
+                        let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
+                            f32_to_bf16_bits
+                        } else {
+                            f32_to_f16_bits
+                        };
+                        let table = norm.table_u16(convert);
+                        fill_rows_bytes(out, src, row, 2, |dst, src| {
+                            for (i, (d, &v)) in
+                                dst.as_chunks_mut::<2>().0.iter_mut().zip(src).enumerate()
+                            {
+                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
+                            }
+                        });
+                    }
+                }
+            }
+            Self::F32(array) => {
+                let standard = array.as_standard_layout();
+                let src = standard.as_slice().unwrap_or(&[]);
+                match dtype {
+                    EncoderDtype::Float32 => {
+                        fill_rows_bytes(out, src, row, 4, |dst, src| {
+                            for (d, &v) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                                *d = v.to_le_bytes();
+                            }
+                        });
+                    }
+                    EncoderDtype::BFloat16 | EncoderDtype::Float16 => {
+                        let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
+                            f32_to_bf16_bits
+                        } else {
+                            f32_to_f16_bits
+                        };
+                        fill_rows_bytes(out, src, row, 2, |dst, src| {
+                            for (d, &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+                                *d = convert(v).to_le_bytes();
+                            }
+                        });
+                    }
+                    EncoderDtype::Uint8 => {
+                        for (d, &v) in out.iter_mut().zip(src) {
+                            *d = v.round().clamp(0.0, 255.0) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Elements per row: everything but the first axis (the whole input when it
+/// has one axis).
+fn row_len(shape: &[usize]) -> usize {
+    match shape {
+        [] => 0,
+        [n] => *n,
+        [_, rest @ ..] => rest.iter().product::<usize>().max(1),
+    }
+}
+
+/// Run `fill(dst_rows, src_rows)` over row bands, concurrently when the
+/// executor allows it: each band is a whole number of rows so a channel
+/// block never straddles two bands.
+fn fill_rows<T: Copy + Send + Sync, S: Copy + Send + Sync>(
+    out: &mut [T],
+    src: &[S],
+    row: usize,
+    fill: impl Fn(&mut [T], &[S]) + Sync,
+) {
+    let rows = src.len().checked_div(row).unwrap_or(0);
+    let tasks = execution::task_count(size_of_val(out), rows, 32);
+    if tasks <= 1 {
+        fill(out, src);
+        return;
+    }
+    let band_rows = rows.div_ceil(tasks);
+    execution::scope(|spawner| {
+        let fill = &fill;
+        let (mut out_rest, mut src_rest) = (out, src);
+        while !out_rest.is_empty() {
+            let n = band_rows.min(out_rest.len() / row.max(1));
+            let (dst, dst_tail) = out_rest.split_at_mut(n * row);
+            let (band_src, src_tail) = src_rest.split_at(n * row);
+            out_rest = dst_tail;
+            src_rest = src_tail;
+            spawner.spawn(move |_| fill(dst, band_src));
+        }
+    });
+}
+
+/// [`fill_rows`] for a byte output of `width` bytes per element.
+fn fill_rows_bytes<S: Copy + Send + Sync>(
+    out: &mut [u8],
+    src: &[S],
+    row: usize,
+    width: usize,
+    fill: impl Fn(&mut [u8], &[S]) + Sync,
+) {
+    let rows = src.len().checked_div(row).unwrap_or(0);
+    let tasks = execution::task_count(out.len(), rows, 32);
+    if tasks <= 1 {
+        fill(out, src);
+        return;
+    }
+    let band_rows = rows.div_ceil(tasks);
+    execution::scope(|spawner| {
+        let fill = &fill;
+        let (mut out_rest, mut src_rest) = (out, src);
+        while !out_rest.is_empty() {
+            let n = band_rows.min(src_rest.len() / row.max(1));
+            let (dst, dst_tail) = out_rest.split_at_mut(n * row * width);
+            let (band_src, src_tail) = src_rest.split_at(n * row);
+            out_rest = dst_tail;
+            src_rest = src_tail;
+            spawner.spawn(move |_| fill(dst, band_src));
+        }
+    });
+}
 
 /// Model-specific auxiliary output values.
 #[derive(Debug, Clone)]
@@ -319,8 +891,9 @@ fn slice_1d<T>(values: &[T], start: usize, len: usize) -> AnyhowResult<&[T]> {
 /// Preprocessed encoder inputs ready for model consumption.
 #[derive(Debug, Clone)]
 pub struct PreprocessedEncoderInputs {
-    /// Primary encoder input as a dynamic-dimensional float32 tensor.
-    pub encoder_input: ArrayD<f32>,
+    /// Primary encoder input: normalized floats, or pixel bytes with their
+    /// normalization (see [`EncoderInput`]).
+    pub encoder_input: EncoderInput,
 
     /// Number of encoder feature tokens per media item in the batch.
     pub feature_token_counts: Vec<usize>,
@@ -338,13 +911,13 @@ pub struct PreprocessedEncoderInputs {
 
 impl PreprocessedEncoderInputs {
     /// Create encoder inputs backed by a tensor of any dimensionality.
-    pub fn new<D: Dimension>(
-        encoder_input: Array<f32, D>,
+    pub fn new(
+        encoder_input: impl Into<EncoderInput>,
         feature_token_counts: Vec<usize>,
         item_sizes: Vec<(u32, u32)>,
     ) -> Self {
         Self {
-            encoder_input: encoder_input.into_dyn(),
+            encoder_input: encoder_input.into(),
             feature_token_counts,
             item_sizes,
             model_specific: HashMap::new(),
@@ -374,10 +947,7 @@ impl PreprocessedEncoderInputs {
 
     /// Get the primary encoder input as a flat f32 slice without copying if possible.
     pub fn encoder_input_flat(&self) -> Cow<'_, [f32]> {
-        match self.encoder_input.as_slice() {
-            Some(slice) => Cow::Borrowed(slice),
-            None => Cow::Owned(self.encoder_input.iter().copied().collect()),
-        }
+        self.encoder_input.flat_f32()
     }
 
     /// Get the shape of the primary encoder input as a vector.
@@ -399,12 +969,11 @@ impl PreprocessedEncoderInputs {
         if parts.len() == 1 {
             return parts.into_iter().next().context("cannot join zero batches");
         }
-        let views = parts
+        let inputs = parts
             .iter()
-            .map(|part| part.encoder_input.view())
+            .map(|part| &part.encoder_input)
             .collect::<Vec<_>>();
-        let encoder_input = ndarray::concatenate(Axis(0), &views)
-            .context("encoder inputs of the batch parts do not stack")?;
+        let encoder_input = EncoderInput::concat(&inputs)?;
 
         let keys = parts[0].model_specific.keys().cloned().collect::<Vec<_>>();
         let mut model_specific = HashMap::with_capacity(keys.len());
@@ -673,7 +1242,7 @@ mod tests {
         );
 
         let mut wrong_width = clip(16, 1, 1.0);
-        wrong_width.encoder_input = ndarray::Array2::<f32>::zeros((16, 5)).into_dyn();
+        wrong_width.encoder_input = ndarray::Array2::<f32>::zeros((16, 5)).into();
         assert!(
             PreprocessedEncoderInputs::concat(vec![clip(16, 1, 1.0), wrong_width], &layouts)
                 .is_err()

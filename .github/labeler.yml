@@ -51,6 +51,10 @@ reasoning-parser:
   - changed-files:
       - any-glob-to-any-file: 'crates/reasoning_parser/**/*'
 
+symphony:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/symphony/**/*'
+
 wasm:
   - changed-files:
       - any-glob-to-any-file:

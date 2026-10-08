@@ -12,10 +12,12 @@ use std::{
 };
 
 use engine_zmq_client::{
+    codec::OpaqueValue,
     mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
     protocol::vllm::{
         output::{
             EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
+            UtilityCallOutput, UtilityOutput,
         },
         stats::SchedulerStats,
     },
@@ -51,7 +53,24 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
     tracing::info!("zmq mock engine {engine_index} connected to {handshake_address}");
 
     let (mut input, output) = mock.split();
-    let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
+    let engine = cfg
+        .realistic
+        .then(|| Engine::spawn_named(cfg.engine.clone(), format!("zmq:{engine_index}"), true));
+    // The rank's KV-event publisher, numbered after the gRPC workers and
+    // stamping the batches with the rank this engine advertised.
+    let publisher = engine.as_ref().and_then(|engine| {
+        let index = cfg
+            .grpc_count
+            .checked_add(u16::try_from(engine_index).ok()?)?;
+        let dp_rank = i32::try_from(engine_index).ok()?;
+        cfg.kv_zmq_for(index, dp_rank)
+            .map(|kv| (engine.clone(), kv))
+    });
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "publisher self-terminates when the engine's event channel closes"
+    )]
+    let _publisher = publisher.map(|(engine, kv)| tokio::spawn(crate::kv_zmq::serve(engine, kv)));
 
     // A single writer owns the output PUSH socket; per-request forwarders funnel
     // their outputs here so concurrent requests serialize onto the one socket.
@@ -133,8 +152,22 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
                 // group, so it never pauses and has no wave to start.
                 tracing::debug!("zmq engine {engine_index} ignoring start of wave {wave}");
             }
-            Ok(EngineInbound::Other(byte)) => {
-                tracing::debug!("zmq engine {engine_index} ignoring request type {byte}");
+            Ok(EngineInbound::Utility(call)) => {
+                // A prefix-cache reset is acknowledged and leaves the simulated
+                // engine's cache as it is; no other EngineCore method exists here.
+                let outcome = if call.method == "reset_prefix_cache" {
+                    Ok(OpaqueValue::from(true))
+                } else {
+                    Err(format!(
+                        "Call to {} method failed: the mock engine has no such method",
+                        call.method
+                    ))
+                };
+                let _ = out_tx.send(EngineCoreOutputs::Utility(UtilityCallOutput {
+                    engine_index,
+                    timestamp: 0.0,
+                    output: UtilityOutput::from_outcome(call.call_id, outcome),
+                }));
             }
             Err(error) => {
                 tracing::info!("zmq engine {engine_index} input closed: {error}");
@@ -287,11 +320,12 @@ mod tests {
             zmq_count: 0,
             zmq_start_index: 0,
             model_id: "mock-model".to_string(),
-            tokenizer_path: "mock-model".to_string(),
-            gen_delay: Duration::ZERO,
+            tokenizer_path: String::new(),
+            gen_delay: Duration::from_millis(0),
             output_tokens: 4,
-            realistic: false,
+            realistic: true,
             engine: EngineParams::default(),
+            ..Config::default()
         }
     }
 
@@ -341,7 +375,11 @@ mod tests {
             }
         }
         assert!(finished, "stream should reach a terminal output");
-        assert_eq!(tokens.len(), 4, "canned mode emits output_tokens tokens");
+        assert_eq!(
+            tokens.len(),
+            4,
+            "a request without max_tokens gets output_tokens tokens"
+        );
     }
 
     /// Two mock ranks dial one socket set — the grouped-worker topology the
@@ -395,7 +433,11 @@ mod tests {
                 }
             }
             assert!(finished, "rank {rank} should reach a terminal output");
-            assert_eq!(tokens.len(), 4, "rank {rank} emits output_tokens tokens");
+            assert_eq!(
+                tokens.len(),
+                4,
+                "rank {rank} answers with output_tokens tokens"
+            );
         }
     }
 }

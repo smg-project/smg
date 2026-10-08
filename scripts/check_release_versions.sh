@@ -106,6 +106,7 @@ SMG_VERSION_SYNC=(
     "sglang-docker|.github/workflows/release-sglang-docker.yml|workflow"
     "vllm-docker|.github/workflows/release-vllm-docker.yml|workflow"
     "trtllm-docker|.github/workflows/release-trtllm-docker.yml|workflow"
+    "tokenspeed-docker|.github/workflows/release-tokenspeed-docker.yml|workflow"
 )
 
 # ---------------------------------------------------------------------------

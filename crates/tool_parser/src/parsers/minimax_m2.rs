@@ -467,18 +467,23 @@ impl ToolParser for MinimaxM2Parser {
                     let tool_id = self.current_tool_id as usize;
                     if tool_id < self.streamed_args_for_tool.len() {
                         let current_streamed = &self.streamed_args_for_tool[tool_id];
-                        if !current_streamed.is_empty() && !current_streamed.ends_with('}') {
-                            // Count opening and closing braces to check if JSON is complete
-                            let open_braces = current_streamed.matches('{').count();
-                            let close_braces = current_streamed.matches('}').count();
-                            if open_braces > close_braces {
-                                calls.push(ToolCallItem {
-                                    tool_index: tool_id,
-                                    name: None,
-                                    parameters: "}".to_string(),
-                                });
-                                self.streamed_args_for_tool[tool_id].push('}');
-                            }
+                        if current_streamed.is_empty() {
+                            // No parameters: `{}`, as in the non-streaming parse.
+                            calls.push(ToolCallItem {
+                                tool_index: tool_id,
+                                name: None,
+                                parameters: "{}".to_string(),
+                            });
+                            self.streamed_args_for_tool[tool_id].push_str("{}");
+                        } else {
+                            // Parameter fragments leave the outer object open.
+                            // Braces inside values do not close that object.
+                            calls.push(ToolCallItem {
+                                tool_index: tool_id,
+                                name: None,
+                                parameters: "}".to_string(),
+                            });
+                            self.streamed_args_for_tool[tool_id].push('}');
                         }
                     }
 

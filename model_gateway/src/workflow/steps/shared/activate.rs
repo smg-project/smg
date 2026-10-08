@@ -33,6 +33,12 @@ fn activation_status(worker: &Arc<dyn Worker>) -> Option<WorkerStatus> {
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
+        let app_context = context
+            .data
+            .get_app_context()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
+            .clone();
+
         let workers = context
             .data
             .get_actual_workers()
@@ -43,6 +49,12 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
             if let Some(status) = activation_status(worker) {
                 worker.set_status(status);
                 activated += 1;
+            }
+        }
+
+        if activated > 0 {
+            if let Some(admission) = &app_context.prefill_admission {
+                admission.notify_capacity_changed();
             }
         }
 

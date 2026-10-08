@@ -8,22 +8,17 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 import asyncio
 import hashlib
 import itertools
-import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
 import grpc
-import msgspec
 import torch
-import zmq
-import zmq.asyncio
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
-from vllm.distributed.kv_events import KVEventBatch
 from vllm.engine.protocol import EngineClient
 from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
 from vllm.inputs.engine import mm_input, tokens_input
@@ -37,26 +32,29 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
-from smg_grpc_servicer import mm_shm
+from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
 from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
-    endpoint_for_rank,
+    rank_sources_for,
     resolve_kv_events_config,
-    stream_kv_events,
 )
 from smg_grpc_servicer.vllm.kv_transfer import (
-    pairing_fields,
     params_from_request,
     params_to_response_fields,
-    resolve_pd_connector,
 )
+
+# The launcher imports this module before it defines serve_grpc: the moment
+# the servicer switch has to be in place (see launcher_switch).
+from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
+from smg_grpc_servicer.vllm.loads import LoadTracker, scheduler_load_fields
 from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
     ENV_PROCESSOR,
+    PROCESSOR_FLAG,
     MmProcessorUnavailable,
     MmSettings,
     build_mm_processor,
@@ -67,8 +65,12 @@ from smg_grpc_servicer.vllm.mm_salt import (
     mm_identity_cache_salt,
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
+from smg_grpc_servicer.vllm.model_info import (
+    mm_device_do_normalize,
+    model_facts,
+    server_facts,
+)
 
-from ..pd_pairing import pairing_protocol_from_env
 from .mm_keys import (
     batches_missing_pixels,
     describes_media_twice,
@@ -79,31 +81,39 @@ from .mm_keys import (
     primary_encoder_key,
 )
 
+install_launcher_switch()
+
 logger = init_logger(__name__)
 attach_vllm_logging()
-SAMPLING_DEFAULT_KEYS = (
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "repetition_penalty",
-)
-
-
-def _filtered_sampling_defaults(params: dict | None) -> dict:
-    if not params:
-        return {}
-    return {
-        key: params[key]
-        for key in SAMPLING_DEFAULT_KEYS
-        if key in params and params[key] is not None
-    }
-
-
 try:
     from vllm.version import __version__ as VLLM_VERSION
 except Exception:  # pragma: no cover - version lookup is best-effort
     VLLM_VERSION = ""
+
+
+def _prompt_length(prompt) -> int:
+    """The token count of an engine prompt (0 when it is text the engine tokenizes)."""
+    if isinstance(prompt, dict):
+        ids = prompt.get("prompt_token_ids")
+        return len(ids) if ids is not None else 0
+    return 0
+
+
+def _kv_capacity_tokens(engine) -> int:
+    """The KV cache's token capacity, when the engine config exposes it."""
+    cache = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
+    blocks = getattr(cache, "num_gpu_blocks", None)
+    block_size = getattr(cache, "block_size", None)
+    if isinstance(blocks, int) and isinstance(block_size, int) and blocks > 0 and block_size > 0:
+        return blocks * block_size
+    return 0
+
+
+def _max_running_requests(engine) -> int:
+    """The scheduler's running window (``max_num_seqs``), when exposed."""
+    scheduler = getattr(getattr(engine, "vllm_config", None), "scheduler_config", None)
+    window = getattr(scheduler, "max_num_seqs", None)
+    return window if isinstance(window, int) and window > 0 else 0
 
 
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
@@ -170,11 +180,19 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             mm_settings: The launcher's `--mm-*` flags; None (an older
                 launcher) resolves everything from the environment
         """
+        # The Rust path takes the process before this class exists; reaching
+        # here with the flag set means the launcher never consulted it.
+        from smg_grpc_servicer.vllm.rust import require_python_impl
+
+        require_python_impl()
         self.engine = async_llm
         self.start_time = start_time
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
+        # Queued token-work, generation throughput and hit rate for GetLoads,
+        # from the requests this servicer forwards (vLLM's stats carry none).
+        self._loads = LoadTracker()
         # Flag > env > default, resolved once so each value names its source.
         self._mm_settings = (mm_settings or MmSettings()).resolve()
         # Worker-side media processing (media_refs); None keeps refs rejected.
@@ -306,8 +324,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 if self._mm_processor is None:
                     raise ValueError(
-                        f"media_refs sent but {ENV_PROCESSOR} is off on this worker; check the "
-                        "router's SMG_MM_PROCESSING and this worker's mm_processor label"
+                        f"media_refs sent but {PROCESSOR_FLAG} ({ENV_PROCESSOR}) is off on this "
+                        "worker; check the router's --mm-processing and this worker's "
+                        "mm_processor label"
                     )
                 items = parse_media_refs(request.media_refs)
                 validate_schemes(items, self._mm_processor.accepted_schemes)
@@ -323,10 +342,21 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 finally:
                     self._mm_inflight.release()
                 # A PD prefill leg answers with the identity so decode is
-                # served without pixels or references.
+                # served without pixels or references. The identity is an
+                # optimisation with a fallback (decode reprocesses), so a
+                # shape it cannot read must not fail a served request.
                 if kv_transfer_params is not None:
                     if media_identity_supported():
-                        media_identity = build_media_identity(prompt)
+                        try:
+                            media_identity = build_media_identity(prompt)
+                        except Exception as e:  # noqa: BLE001 - any failure falls back
+                            logger.warning(
+                                "Request %s: media identity not built (%s); the decode leg "
+                                "will reprocess the media",
+                                request_id,
+                                e,
+                            )
+                            media_identity = None
                     else:
                         logger.warning(
                             "Request %s: the installed smg-grpc-proto has no media_identity; "
@@ -398,6 +428,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Track which indices have sent their first chunk
             seen_indices: set[int] = set()
 
+            self._loads.submitted(request_id, _prompt_length(prompt))
             async for output in self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -407,7 +438,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     request.data_parallel_rank if request.HasField("data_parallel_rank") else None
                 ),
             ):
+                if not engine_started:
+                    self._loads.first_output(
+                        request_id,
+                        len(output.prompt_token_ids or ()),
+                        getattr(output, "num_cached_tokens", 0) or 0,
+                    )
                 engine_started = True
+                self._loads.generated(sum(len(c.token_ids) for c in output.outputs))
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -466,6 +504,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 logger.warning("Generate request %s rejected (%s): %s", request_id, code.name, e)
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
             await context.abort(code, str(e))
+        finally:
+            self._loads.finished(request_id)
 
     async def _notify_kv_transfer_rejected(
         self,
@@ -636,39 +676,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetModelInfoResponse protobuf
         """
-        model_config = self.engine.model_config
-        hf_config = model_config.hf_config
-
-        # eos_token_id can be int or list[int]
-        eos = getattr(hf_config, "eos_token_id", None)
-        if isinstance(eos, int):
-            eos_token_ids = [eos]
-        elif isinstance(eos, list):
-            eos_token_ids = eos
-        else:
-            eos_token_ids = []
-
-        sampling_defaults = _filtered_sampling_defaults(
-            model_config.get_diff_sampling_param() or {}
-        )
-
+        facts = model_facts(self.engine.model_config)
         return vllm_engine_pb2.GetModelInfoResponse(
-            model_path=model_config.model,
-            is_generation=model_config.runner_type == "generate",
-            max_context_length=model_config.max_model_len,
-            vocab_size=model_config.get_vocab_size(),
-            supports_vision=engine_accepts_mm_inputs(model_config),
-            served_model_name=model_config.served_model_name or model_config.model,
-            tokenizer_path=model_config.tokenizer or "",
-            model_type=getattr(hf_config, "model_type", "") or "",
-            architectures=model_config.architectures or [],
-            eos_token_ids=eos_token_ids,
-            pad_token_id=getattr(hf_config, "pad_token_id", None) or 0,
-            bos_token_id=getattr(hf_config, "bos_token_id", None) or 0,
-            max_req_input_len=model_config.max_model_len,
-            default_sampling_params_json=(
-                json.dumps(sampling_defaults, separators=(",", ":")) if sampling_defaults else ""
-            ),
+            max_req_input_len=facts["max_context_length"], **facts
         )
 
     async def GetServerInfo(
@@ -686,18 +696,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetServerInfoResponse protobuf
         """
-        kv_connector = ""
-        kv_role = ""
-        kv_engine_id = ""
-        parallel = self.engine.vllm_config.parallel_config
-        kv_transfer_config = self.engine.vllm_config.kv_transfer_config
-        if kv_transfer_config is not None:
-            kv_connector, kv_engine_id = resolve_pd_connector(kv_transfer_config)
-            kv_role = kv_transfer_config.kv_role or ""
-            # Effective PD engine_id; with DP the engine cores serve
-            # `{id}_dp{rank}` and the router derives the suffix from the rank it
-            # pins per request.
-
+        facts = server_facts(self.engine.vllm_config)
         mm_processor = ""
         mm_media_ref_schemes = ""
         # A --language-model-only engine accepts no multimodal inputs, so it
@@ -712,20 +711,18 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             mm_media_ref_schemes = self._mm_processor.schemes
 
         info = vllm_engine_pb2.GetServerInfoResponse(
-            kv_connector=kv_connector,
-            kv_role=kv_role,
-            kv_engine_id=kv_engine_id,
-            data_parallel_size=parallel.data_parallel_size,
-            shm_namespace_id=mm_shm.shm_namespace_id(),
             mm_processor=mm_processor,
             mm_media_ref_schemes=mm_media_ref_schemes,
-            pairing_protocol=pairing_protocol_from_env(),
-            **pairing_fields(self.engine.vllm_config),
+            **facts,
         )
         # Where the processor mode came from, for the gateway's /workers; a
         # proto package predating the field simply leaves it out.
         if mm_processor and "mm_processor_source" in info.DESCRIPTOR.fields_by_name:
             info.mm_processor_source = self._mm_settings.source
+        # Whether pixels are normalized on device, so the Router sends this
+        # engine raw pixels; likewise absent from an older proto package.
+        if "mm_device_do_normalize" in info.DESCRIPTOR.fields_by_name:
+            info.mm_device_do_normalize = mm_device_do_normalize(self.engine.vllm_config)
         return info
 
     async def GetLoads(
@@ -739,7 +736,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Reads the latest SchedulerStats snapshot cached on the engine's stat
         loggers and maps it onto a single-DP-rank SchedulerLoad: ``token_usage``
         carries KV-cache utilization ([0,1)) and ``num_running_reqs`` /
-        ``num_waiting_reqs`` report queue depth.
+        ``num_waiting_reqs`` report queue depth. ``num_waiting_uncached_tokens``,
+        ``gen_throughput`` and ``cache_hit_rate`` come from this servicer's own
+        bookkeeping of the requests it forwards (``smg_grpc_servicer.vllm.loads``),
+        since vLLM's stats do not carry them.
 
         Always returns exactly one SchedulerLoad entry (zero-filled when no
         snapshot is available yet, e.g. with --disable-log-stats or before the
@@ -769,11 +769,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_usage = 0.0
 
         load = vllm_engine_pb2.SchedulerLoad(
-            dp_rank=0,
-            num_running_reqs=num_running,
-            num_waiting_reqs=num_waiting,
-            num_total_reqs=num_running + num_waiting,
-            token_usage=max(0.0, kv_usage),
+            **scheduler_load_fields(
+                num_running,
+                num_waiting,
+                kv_usage,
+                self._loads.estimate(num_waiting),
+                max_total_num_tokens=_kv_capacity_tokens(self.engine),
+                max_running_requests=_max_running_requests(self.engine),
+            )
         )
 
         return vllm_engine_pb2.GetLoadsResponse(
@@ -1312,11 +1315,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: common_pb2.SubscribeKvEventsRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[common_pb2.KvEventBatch]:
-        """Bridge vLLM's in-process ZMQ KV cache events to a gRPC stream.
-
-        The ZMQ publisher's sequence numbers are used directly as the gRPC
-        batch sequence numbers.
-        """
+        """Relay vLLM's ZMQ KV cache events, every DP rank's publisher, as one
+        gRPC stream (see ``smg_grpc_servicer.kv_relay``)."""
         if self._kv_events_config is None:
             await context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
@@ -1326,34 +1326,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             )
 
         config = self._kv_events_config
-
-        # For DP attention each rank publishes on port + rank with independent
-        # sequence counters; subscribing to several on one socket interleaves
-        # them and breaks gap detection. Subscribe to rank 0 only for now.
-        # TODO(phase3): per-rank virtual workers or merged renumbering.
-        pub_endpoint = endpoint_for_rank(config.endpoint, 0)
-
-        zmq_ctx = zmq.asyncio.Context.instance()
-        sub_socket = zmq_ctx.socket(zmq.SUB)
-        sub_socket.subscribe(config.topic.encode("utf-8"))
-        sub_socket.connect(pub_endpoint)
-        logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
-
-        decoder = msgspec.msgpack.Decoder(KVEventBatch)
-
-        try:
-            async for proto_batch in stream_kv_events(
-                sub_socket,
-                decoder.decode,
-                lambda: context.send_initial_metadata(()),
-                context.cancelled,
-            ):
-                yield proto_batch
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.exception("SubscribeKvEvents failed")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
-        finally:
-            sub_socket.close(linger=0)
-            logger.info("SubscribeKvEvents: stream closed")
+        async for proto_batch in relay(
+            rank_sources_for(config, self.engine),
+            Engine.VLLM,
+            request.start_sequence_number,
+            context,
+            topic=str(getattr(config, "topic", "") or ""),
+            hwm=getattr(config, "hwm", None),
+        ):
+            yield proto_batch

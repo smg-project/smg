@@ -78,6 +78,14 @@ pub trait VisionPreProcessor: Send + Sync {
         false
     }
 
+    /// Whether this processor produces the image's own bytes
+    /// ([`EncoderInput::U8`](crate::encoder_inputs::EncoderInput::U8)), so
+    /// a destination that normalizes on device can be served raw pixels
+    /// exactly; `false` means it produces normalized floats.
+    fn emits_pixel_bytes(&self) -> bool {
+        false
+    }
+
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 
@@ -165,7 +173,10 @@ impl VisionProcessorRegistry {
 
     /// Register a processor for a model pattern.
     pub fn register(&mut self, pattern: impl Into<String>, processor: Box<dyn VisionPreProcessor>) {
-        self.processors.insert(pattern.into(), processor);
+        // Matching is case-insensitive on both sides; lowercase the pattern
+        // once here rather than every pattern on every lookup.
+        self.processors
+            .insert(pattern.into().to_lowercase(), processor);
     }
 
     /// Find a processor for the given model ID, falling back to model_type.
@@ -182,12 +193,10 @@ impl VisionProcessorRegistry {
 
     fn find_in_candidate(&self, candidate: &str) -> Option<&dyn VisionPreProcessor> {
         let candidate = candidate.to_lowercase();
-        for (pattern, processor) in &self.processors {
-            if candidate.contains(&pattern.to_lowercase()) {
-                return Some(processor.as_ref());
-            }
-        }
-        None
+        self.processors
+            .iter()
+            .find(|(pattern, _)| candidate.contains(pattern.as_str()))
+            .map(|(_, processor)| processor.as_ref())
     }
 
     /// Get list of supported model patterns.

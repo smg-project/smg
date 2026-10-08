@@ -27,3 +27,6 @@ pub use nano_v3::NanoV3Parser;
 pub use passthrough::PassthroughParser;
 pub use qwen3::{Qwen3Parser, QwenThinkingParser};
 pub use step3::Step3Parser;
+
+pub mod hy_v4;
+pub use hy_v4::HyV4Parser;

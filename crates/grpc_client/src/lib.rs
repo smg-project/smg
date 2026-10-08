@@ -15,6 +15,7 @@ pub mod common_proto {
 }
 pub mod abort_on_drop;
 pub mod channel;
+pub mod engine_load;
 pub mod mlx_engine;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;

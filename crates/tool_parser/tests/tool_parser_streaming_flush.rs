@@ -9,7 +9,7 @@
 //! empty stream — no tool_call deltas AND no content deltas — while the
 //! non-streaming path correctly fell back to returning the text as content.
 //!
-//! Four properties are covered here:
+//! Five properties are covered here:
 //! 1. Text that is definitively not a declared tool call (complete JSON with
 //!    a missing or undeclared name) is surfaced as normal text mid-stream
 //!    instead of being buffered forever or silently dropped, while legitimate
@@ -22,6 +22,8 @@
 //! 4. A call whose name and arguments both land in one chunk streams *both*
 //!    in that chunk. There is no later parser call to fall back on, so a name
 //!    without arguments would reach the client as an unusable tool call.
+//! 5. A complete call without arguments streams `{}`, as the non-streaming
+//!    parse returns, rather than a name alone.
 mod common;
 
 use common::{create_test_tools, streaming_helpers};
@@ -365,6 +367,38 @@ async fn streaming_never_swallows_content() {
             "[{}] flush must drain: a second take returns nothing",
             case.label
         );
+    }
+}
+
+#[tokio::test]
+async fn a_call_without_arguments_streams_an_empty_object() {
+    let cases: [(&str, MakeParser, &[&str]); 4] = [
+        ("json", json, &[r#"{"name": "get_weather"}"#]),
+        ("llama", llama, &[r#"{"name": "get_weather"}"#]),
+        (
+            "mistral",
+            mistral,
+            &[r#"[TOOL_CALLS] [{"name": "get_weather"}]"#],
+        ),
+        (
+            "qwen",
+            qwen,
+            &["<tool_call>\n{\"name\": \"get_weather\"}\n</tool_call>"],
+        ),
+    ];
+    for (label, make, whole) in cases {
+        for feed in [Feed::Chunks(whole), Feed::Realistic(whole[0])] {
+            let mut parser = make();
+            let (text, calls) = stream(parser.as_mut(), &feed).await;
+            assert_eq!(text, "", "[{label}] streamed content");
+            assert_eq!(
+                announced(&calls),
+                Some("get_weather"),
+                "[{label}] tool call"
+            );
+            assert_eq!(streamed_args(&calls), "{}", "[{label}] arguments");
+            assert_eq!(parser.take_unstreamed_normal_text(), "", "[{label}] flush");
+        }
     }
 }
 

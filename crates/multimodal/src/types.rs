@@ -1,10 +1,18 @@
-use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use image::{DynamicImage, RgbImage};
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::audio::DecodedAudio;
+use crate::{
+    audio::DecodedAudio, error::MediaConnectorError, media::decode_image_bytes, vision::execution,
+};
 
 /// Supported multimodal modalities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -130,14 +138,20 @@ pub enum VideoSource {
     File { path: PathBuf },
 }
 
-/// Concrete image payload captured by the media connector.
+/// Concrete image payload captured by the media connector: the encoded bytes
+/// with their identity and size, decoded on first use, so a request whose
+/// pixels are already cached never pays for the decode.
 #[derive(Debug, Clone)]
 pub struct ImageFrame {
-    pub image: DynamicImage,
+    decoded: OnceCell<DynamicImage>,
+    /// Width and height the decode produces, from the header and the cap.
+    size: ImageSize,
+    /// The long-side cap the decode applies; `size` already reflects it.
+    max_long_side_pixel: Option<u32>,
     pub raw_bytes: bytes::Bytes,
     pub detail: ImageDetail,
     pub source: ImageSource,
-    /// Blake3 hex-digest of raw_bytes, computed at decode time.
+    /// Blake3 hex-digest of `raw_bytes` and the resolution cap.
     pub hash: String,
 }
 
@@ -388,6 +402,7 @@ impl AudioClip {
 }
 
 impl ImageFrame {
+    /// A frame from pixels already decoded.
     pub fn new(
         image: DynamicImage,
         raw_bytes: bytes::Bytes,
@@ -395,8 +410,11 @@ impl ImageFrame {
         source: ImageSource,
         hash: String,
     ) -> Self {
+        let size = ImageSize::new(image.width(), image.height());
         Self {
-            image,
+            decoded: OnceCell::with_value(image),
+            size,
+            max_long_side_pixel: None,
             raw_bytes,
             detail,
             source,
@@ -404,8 +422,75 @@ impl ImageFrame {
         }
     }
 
-    pub fn data(&self) -> &DynamicImage {
-        &self.image
+    /// A frame from encoded bytes whose header gave `size` (after the cap);
+    /// the pixels are decoded, and capped, when first asked for.
+    pub fn encoded(
+        raw_bytes: bytes::Bytes,
+        detail: ImageDetail,
+        source: ImageSource,
+        hash: String,
+        size: ImageSize,
+        max_long_side_pixel: Option<u32>,
+    ) -> Self {
+        Self {
+            decoded: OnceCell::new(),
+            size,
+            max_long_side_pixel,
+            raw_bytes,
+            detail,
+            source,
+            hash,
+        }
+    }
+
+    /// The decoded pixels, decoding on the first call. A body its header did
+    /// not vouch for fails here, as the caller's input.
+    pub fn image(&self) -> Result<&DynamicImage, MediaConnectorError> {
+        self.decoded
+            .get_or_try_init(|| decode_image_bytes(&self.raw_bytes, self.max_long_side_pixel))
+    }
+
+    /// Decode the pixels of every frame that is still encoded, in parallel on
+    /// the preprocessing pool (inline under `Parallelism::Inline`), instead of
+    /// one photo after another on the calling thread. [`image`](Self::image)
+    /// is a lookup for each of them afterwards.
+    pub fn decode_all(frames: &[Arc<Self>]) -> Result<(), MediaConnectorError> {
+        let pending = Self::undecoded(frames);
+        if pending.len() < 2 {
+            return pending
+                .into_iter()
+                .try_for_each(|frame| frame.image().map(|_| ()));
+        }
+        let failures: Vec<OnceLock<MediaConnectorError>> =
+            pending.iter().map(|_| OnceLock::new()).collect();
+        execution::scope(|spawner| {
+            for (frame, failure) in pending.iter().copied().zip(&failures) {
+                spawner.spawn(move |_| {
+                    if let Err(error) = frame.image() {
+                        // One slot, one attempt: the cell is empty here.
+                        let _ = failure.set(error);
+                    }
+                });
+            }
+        });
+        failures
+            .into_iter()
+            .find_map(OnceLock::into_inner)
+            .map_or(Ok(()), Err)
+    }
+
+    /// The distinct frames of `frames` that still have to be decoded. A
+    /// repeated part is the same `Arc` several times over; it decodes once,
+    /// and the repeats must not become tasks that park on its cell.
+    fn undecoded(frames: &[Arc<Self>]) -> Vec<&Self> {
+        let mut seen = HashSet::with_capacity(frames.len());
+        frames
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|frame| {
+                frame.decoded.get().is_none() && seen.insert(std::ptr::from_ref(*frame))
+            })
+            .collect()
     }
 
     pub fn raw_bytes(&self) -> &[u8] {
@@ -417,7 +502,7 @@ impl ImageFrame {
     }
 
     pub fn size(&self) -> ImageSize {
-        ImageSize::new(self.image.width(), self.image.height())
+        ImageSize::new(self.size.width, self.size.height)
     }
 }
 
@@ -661,5 +746,64 @@ mod tests {
             layouts.model_specific,
             HashMap::from([("image_grid_thw".to_string(), FieldLayout::Batched)])
         );
+    }
+
+    fn encoded_fixture() -> ImageFrame {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/images/tiny.jpg"
+        ))
+        .expect("fixture");
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .expect("format")
+            .into_dimensions()
+            .expect("header");
+        ImageFrame::encoded(
+            bytes::Bytes::from(bytes),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(width, height),
+            None,
+        )
+    }
+
+    #[test]
+    fn decode_all_decodes_a_repeated_frame_once() {
+        let first = Arc::new(encoded_fixture());
+        let second = Arc::new(encoded_fixture());
+        let mut frames: Vec<Arc<ImageFrame>> = (0..70).map(|_| Arc::clone(&first)).collect();
+        frames.push(Arc::clone(&second));
+
+        // 70 repeats of one frame plus one other: two decodes, not 71 tasks.
+        let pending = ImageFrame::undecoded(&frames);
+        assert_eq!(pending.len(), 2);
+        assert!(std::ptr::eq(pending[0], &*first));
+        assert!(std::ptr::eq(pending[1], &*second));
+
+        ImageFrame::decode_all(&frames).expect("decode");
+        let image = first.image().expect("decoded");
+        for frame in &frames[..70] {
+            assert!(std::ptr::eq(frame.image().expect("decoded"), image));
+        }
+        assert!(ImageFrame::undecoded(&frames).is_empty());
+    }
+
+    #[test]
+    fn decode_all_reports_a_bad_repeated_frame_once_and_decodes_the_rest() {
+        let bad = Arc::new(ImageFrame::encoded(
+            bytes::Bytes::from_static(b"not an image"),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(1, 1),
+            None,
+        ));
+        let good = Arc::new(encoded_fixture());
+        let frames = vec![Arc::clone(&bad), Arc::clone(&good), Arc::clone(&bad)];
+        assert_eq!(ImageFrame::undecoded(&frames).len(), 2);
+        assert!(ImageFrame::decode_all(&frames).is_err());
+        assert!(good.image().is_ok());
     }
 }

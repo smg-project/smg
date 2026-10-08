@@ -47,8 +47,8 @@ pub(crate) struct BodyPathInputs {
 }
 
 /// Decide the request body path before the body arrives. Buffer when
-/// something must read the body here: routing-key override (body `rid` wins
-/// over any header key), a text-routing policy without a valid hint-header
+/// something must read the body here: routing-key override (body `rid` supplies
+/// the fallback key), a text-routing policy without a valid hint-header
 /// waiver, a registry serving more than one model (content-blind selection
 /// could land the request on the wrong model's worker), a body-mutating
 /// worker, a WASM request hook, or a missing/invalid Content-Length.

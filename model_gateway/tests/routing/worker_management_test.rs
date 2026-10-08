@@ -232,6 +232,48 @@ mod dp_removal_tests {
         );
     }
 
+    /// A worker registered behind a path prefix must still be removable.
+    /// Rejecting those addresses in the lookup made `DELETE` fail as "not
+    /// found", and made a guarded removal report success while removing
+    /// nothing.
+    #[tokio::test]
+    async fn path_prefixed_workers_are_removable() {
+        let context = create_test_context(RouterConfig {
+            disable_load_monitoring: true,
+            ..Default::default()
+        })
+        .await;
+        let target = register(
+            &context,
+            "http://proxy:8080/sglang",
+            WorkerType::Regular,
+            None,
+        );
+        let sibling = register(
+            &context,
+            "http://proxy:8080/other",
+            WorkerType::Regular,
+            None,
+        );
+
+        run_removal(
+            &context,
+            "http://proxy:8080/sglang",
+            Some(guards(&context, &[&target])),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            context.worker_registry.get_by_url(target.url()).is_none(),
+            "a path-prefixed worker must be removable"
+        );
+        assert!(
+            context.worker_registry.get_by_url(sibling.url()).is_some(),
+            "a different path is a different backend and must survive"
+        );
+    }
+
     #[tokio::test]
     async fn discovery_removal_resolves_plain_and_dp_groups_without_global_dp_setting() {
         for dp_aware in [false, true] {

@@ -46,8 +46,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
-        let mut workers_to_remove =
-            find_workers_by_url(&app_context.worker_registry, &request.url, true);
+        let mut workers_to_remove = find_workers_by_url(&app_context.worker_registry, &request.url);
 
         if let Some(expected_revisions) = &request.expected_revisions {
             // Pin each worker to its own revision. An id absent from the map

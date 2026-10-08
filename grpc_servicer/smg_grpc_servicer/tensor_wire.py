@@ -14,6 +14,7 @@ PROTO_DTYPE_MAP: dict[str, torch.dtype] = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
+    "uint8": torch.uint8,
     "int64": torch.int64,
     "uint32": torch.uint32,
 }

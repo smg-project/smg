@@ -423,7 +423,13 @@ pub(crate) fn handle_json_tool_streaming(
     // them either because only this branch populates `prev_tool_call_arr`.
     // `current_tool_name_sent` implies `current_tool_id >= 0`.
     if *current_tool_name_sent {
-        let Some(cur_arguments) = current_tool_call.get("arguments") else {
+        // A complete call without arguments takes `{}`, as in the
+        // non-streaming parse.
+        let empty_obj = Value::Object(serde_json::Map::new());
+        let Some(cur_arguments) = current_tool_call
+            .get("arguments")
+            .or_else(|| is_complete.then_some(&empty_obj))
+        else {
             return Ok(result);
         };
         let tool_id = *current_tool_id as usize;

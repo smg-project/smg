@@ -35,6 +35,8 @@ class TestRouterArgs:
 
         # Test service discovery defaults
         assert args.service_discovery is False
+        assert args.discovery_provider is None
+        assert args.selected_discovery_provider() is None
         assert args.selector == {}
         assert args.service_discovery_port == 80
         assert args.service_discovery_namespace is None
@@ -643,7 +645,7 @@ class TestParseRouterArgs:
         assert defaults.cache_ttl_secs == 180
 
     def test_parse_worker_overload_args(self):
-        """Both overload flags round-trip, and both default to unset.
+        """Both overload flags round-trip, and both default as the Rust CLI does.
 
         The argparse names are built from an f-string prefix, so a typo or a
         dest/field mismatch would leave the field at its default and silently
@@ -662,8 +664,8 @@ class TestParseRouterArgs:
         assert router_args.worker_overload_token_usage == pytest.approx(0.9)
 
         defaults = parse_router_args([])
-        assert defaults.worker_overload_waiting_requests is None
-        assert defaults.worker_overload_token_usage is None
+        assert defaults.worker_overload_waiting_requests == 8
+        assert defaults.worker_overload_token_usage == pytest.approx(0.8)
 
     def test_prefixed_worker_overload_args(self):
         """The --router-prefixed aliases reach the same fields."""
@@ -684,10 +686,11 @@ class TestParseRouterArgs:
         assert router_args.worker_overload_token_usage == pytest.approx(0.75)
 
     def test_parse_overload_protection_and_monitoring_flags(self):
-        """The enable/opt-out flags round-trip, and both default to False.
+        """Protection is on by default, as in the Rust CLI; the disable flag
+        switches it off and the legacy enable flag keeps it on.
 
         Same failure mode as the threshold flags: a dest/field mismatch would
-        silently disable the feature from Python.
+        silently change the feature from Python.
         """
         router_args = parse_router_args(
             ["--worker-overload-protection", "--disable-load-monitoring"]
@@ -696,8 +699,74 @@ class TestParseRouterArgs:
         assert router_args.disable_load_monitoring is True
 
         defaults = parse_router_args([])
-        assert defaults.worker_overload_protection is False
+        assert defaults.worker_overload_protection is True
         assert defaults.disable_load_monitoring is False
+
+        disabled = parse_router_args(["--disable-worker-overload-protection"])
+        assert disabled.worker_overload_protection is False
+
+    def test_parse_overload_shed_liveness_warmup_index_and_selection_flags(self):
+        """Every RouterConfig field the Rust CLI exposes reaches RouterArgs,
+        with the CLI's defaults when the flags are absent."""
+        router_args = parse_router_args(
+            [
+                "--worker-overload-shed",
+                "--kv-index",
+                "chain",
+                "--worker-stall-secs",
+                "5",
+                "--worker-wedge-secs",
+                "7",
+                "--worker-warmup-secs",
+                "30",
+                "--worker-warmup-share",
+                "0.5",
+                "--worker-warmup-blocks",
+                "256",
+                "--worker-warmup-thin-ratio",
+                "0.25",
+                "--worker-warmup-divert-every",
+                "4",
+                "--selection-policy",
+                "cache-aware-default",
+                "--selection-accounting-ttl-ms",
+                "250",
+            ]
+        )
+        assert router_args.worker_overload_shed is True
+        assert router_args.kv_index == "chain"
+        assert router_args.worker_stall_secs == 5
+        assert router_args.worker_wedge_secs == 7
+        assert router_args.worker_warmup_secs == 30
+        assert router_args.worker_warmup_share == pytest.approx(0.5)
+        assert router_args.worker_warmup_blocks == 256
+        assert router_args.worker_warmup_thin_ratio == pytest.approx(0.25)
+        assert router_args.worker_warmup_divert_every == 4
+        assert router_args.selection_policy == "cache-aware-default"
+        assert router_args.selection_accounting_ttl_ms == 250
+
+        defaults = parse_router_args([])
+        assert defaults.worker_overload_shed is False
+        assert defaults.kv_index == "positional"
+        assert defaults.worker_stall_secs == 2
+        assert defaults.worker_wedge_secs == 3
+        assert defaults.worker_warmup_secs == 60
+        assert defaults.worker_warmup_share == pytest.approx(0.25)
+        assert defaults.worker_warmup_blocks == 1024
+        assert defaults.worker_warmup_thin_ratio == pytest.approx(0.5)
+        assert defaults.worker_warmup_divert_every == 8
+        assert defaults.selection_policy == "cache-aware-default"
+        assert defaults.selection_accounting_ttl_ms == 0
+
+    def test_prefixed_disable_overload_protection_flag(self):
+        """The --router-prefixed disable flag reaches the same field."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-disable-worker-overload-protection"])
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.worker_overload_protection is False
 
     def test_prefixed_overload_protection_and_monitoring_flags(self):
         """The --router-prefixed aliases reach the same fields."""
@@ -837,6 +906,63 @@ class TestParseRouterArgs:
         assert router_args.pd_disaggregation is True
         assert router_args.prefill_policy == "consistent_hashing"
         assert router_args.decode_policy == "prefix_hash"
+
+    def test_parse_pd_prefill_admission_args(self):
+        """Test parsing explicit Prefill admission options."""
+        args = [
+            "--pd-disaggregation",
+            "--prefill",
+            "http://prefill1:8000",
+            "none",
+            "--decode",
+            "http://decode1:8001",
+            "--prefill-max-inflight-requests-per-worker",
+            "7",
+            "--prefill-queue-size",
+            "13",
+            "--prefill-queue-timeout-secs",
+            "17",
+        ]
+
+        router_args = parse_router_args(args)
+
+        assert router_args.prefill_max_inflight_requests_per_worker == 7
+        assert router_args.prefill_queue_size == 13
+        assert router_args.prefill_queue_timeout_secs == 17
+
+    def test_parse_discovery_provider_kubernetes(self):
+        """--discovery-provider kubernetes selects Kubernetes without the legacy flag."""
+        router_args = parse_router_args(
+            ["--discovery-provider", "kubernetes", "--selector", "app=worker"]
+        )
+
+        assert router_args.discovery_provider == "kubernetes"
+        assert router_args.service_discovery is False
+        assert router_args.selected_discovery_provider() == "kubernetes"
+        assert router_args.selector == {"app": "worker"}
+
+    def test_service_discovery_and_discovery_provider_are_exclusive(self):
+        """Both spellings of one choice is a usage error, not a precedence rule."""
+        with pytest.raises(SystemExit):
+            parse_router_args(["--service-discovery", "--discovery-provider", "kubernetes"])
+
+    def test_unknown_discovery_provider_is_rejected(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--discovery-provider", "zookeeper"])
+
+    def test_selected_discovery_provider_programmatic(self):
+        """RouterArgs built in code follows the CLI's rules."""
+        assert RouterArgs(service_discovery=True).selected_discovery_provider() == "kubernetes"
+        assert (
+            RouterArgs(discovery_provider="kubernetes").selected_discovery_provider()
+            == "kubernetes"
+        )
+        with pytest.raises(ValueError, match="not both"):
+            RouterArgs(
+                service_discovery=True, discovery_provider="kubernetes"
+            ).selected_discovery_provider()
+        with pytest.raises(ValueError, match="Unknown discovery provider"):
+            RouterArgs(discovery_provider="zookeeper").selected_discovery_provider()
 
     def test_parse_service_discovery_args(self):
         """Test parsing service discovery arguments."""
@@ -1515,6 +1641,21 @@ class TestRouterArgsFieldOrder:
         "rdma_listen_ip",
         "rdma_slot_ttl_s",
         "log_mm_timing",
+        "prefill_max_inflight_requests_per_worker",
+        "prefill_queue_size",
+        "prefill_queue_timeout_secs",
+        "discovery_provider",
+        "worker_overload_shed",
+        "kv_index",
+        "worker_stall_secs",
+        "worker_wedge_secs",
+        "worker_warmup_secs",
+        "worker_warmup_share",
+        "worker_warmup_blocks",
+        "worker_warmup_thin_ratio",
+        "worker_warmup_divert_every",
+        "selection_policy",
+        "selection_accounting_ttl_ms",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1553,6 +1694,17 @@ class TestRouterArgsFieldOrder:
             "enable_rl",
             "rl_control_timeout_secs",
             "rl_fanout_concurrency",
+            "worker_overload_shed",
+            "kv_index",
+            "worker_stall_secs",
+            "worker_wedge_secs",
+            "worker_warmup_secs",
+            "worker_warmup_share",
+            "worker_warmup_blocks",
+            "worker_warmup_thin_ratio",
+            "worker_warmup_divert_every",
+            "selection_policy",
+            "selection_accounting_ttl_ms",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

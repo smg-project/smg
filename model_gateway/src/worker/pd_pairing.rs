@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use openai_protocol::worker::{RuntimeType, WorkerSpec};
 
+use super::MORIIO_MODE_LABEL;
 pub use crate::config::types::PdPairingMode;
 
 /// Label under which the pairing protocol arrives when it is not on the
@@ -235,7 +236,14 @@ fn transport_of(spec: &WorkerSpec) -> Option<String> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .or_else(|| non_empty(labels.get("kv_connector")))
-            .map(|connector| normalise_connector(&connector)),
+            .map(|connector| normalise_connector(&connector))
+            // MoRI-IO READ and WRITE engines cannot hand KV to each other.
+            .map(|transport| {
+                match (transport.as_str(), non_empty(labels.get(MORIIO_MODE_LABEL))) {
+                    ("moriio", Some(mode)) => format!("moriio-{}", mode.to_ascii_lowercase()),
+                    _ => transport,
+                }
+            }),
         RuntimeType::Sglang => {
             non_empty(labels.get("disaggregation_transfer_backend")).map(|s| s.to_ascii_lowercase())
         }
@@ -259,6 +267,8 @@ fn normalise_connector(connector: &str) -> String {
         "nixl".to_string()
     } else if lower.contains("mooncake") {
         "mooncake".to_string()
+    } else if lower.contains("moriio") {
+        "moriio".to_string()
     } else {
         lower
     }
@@ -318,6 +328,25 @@ mod tests {
             &[("kv_connector", "MooncakeStoreConnector")],
         );
         assert_eq!(PdPairing::derive(&s).transport(), Some("mooncake"));
+    }
+
+    #[test]
+    fn moriio_read_and_write_engines_never_pair() {
+        let moriio = |mode: Option<&str>| {
+            let labels: Vec<(&str, &str)> = mode.map(|m| ("moriio_mode", m)).into_iter().collect();
+            let mut s = spec(RuntimeType::Vllm, &labels);
+            s.kv_connector = Some("MoRIIOConnector".to_string());
+            PdPairing::derive(&s)
+        };
+        let (read, write, unknown) = (moriio(Some("read")), moriio(Some("WRITE")), moriio(None));
+        assert_eq!(read.transport(), Some("moriio-read"));
+        assert_eq!(write.transport(), Some("moriio-write"));
+        assert_eq!(unknown.transport(), Some("moriio"));
+        assert_eq!(
+            read.mismatch(&write, PdPairingMode::Lenient),
+            Some(PairingMismatch::Transport)
+        );
+        assert!(read.compatible(&moriio(Some("Read")), PdPairingMode::Strict));
     }
 
     #[test]

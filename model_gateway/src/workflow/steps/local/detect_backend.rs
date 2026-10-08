@@ -347,10 +347,11 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
                 warn!(
                     worker = %config.url,
                     "runtime_type unspecified for ZMQ worker; defaulting to vLLM \
-                     EngineCore. A TokenSpeed engine must declare its runtime to \
-                     speak the correct wire protocol: `--backend tokenspeed` for \
-                     startup --worker-urls workers, or an explicit runtime_type \
-                     on the worker API spec / YAML worker config."
+                     EngineCore. A TokenSpeed or SGLang engine must declare its \
+                     runtime to speak the correct wire protocol: `--backend \
+                     tokenspeed` / `--backend sglang` for startup --worker-urls \
+                     workers, or an explicit runtime_type on the worker API spec \
+                     / YAML worker config."
                 );
                 "vllm".to_string()
             }

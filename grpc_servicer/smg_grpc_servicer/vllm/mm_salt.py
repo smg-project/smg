@@ -27,10 +27,10 @@ def engine_accepts_mm_inputs(model_config) -> bool:
         supports = _registry_supports_multimodal_inputs(model_config)
     if not supports:
         return False
-    # vLLM counts enable_mm_embeds-only engines as accepting multimodal
-    # inputs (they ingest embeddings), but they have no encoder for the pixel
-    # payloads supports_vision speaks for.
-    return not _mm_embeds_only(model_config)
+    # vLLM can accept embeddings or audio while all visual inputs are
+    # disabled. Neither implies an encoder for the pixel payloads that
+    # supports_vision speaks for.
+    return not _mm_embeds_leave_no_visual_encoder(model_config)
 
 
 def _registry_supports_multimodal_inputs(model_config) -> bool:
@@ -59,23 +59,47 @@ def _registry_supports_multimodal_inputs(model_config) -> bool:
         return True
 
 
-def _mm_embeds_only(model_config) -> bool:
-    """Whether the engine ingests only pre-computed embeddings (no encoder).
+def _mm_embeds_leave_no_visual_encoder(model_config) -> bool:
+    """Whether enabled mm embeds leave no image/video encoder enabled.
 
-    True when ``enable_mm_embeds`` is on and every explicitly listed modality
-    limit is 0 — including the ``--language-model-only`` case, where
-    ``get_limit_per_prompt`` reads 0 for every modality.
+    True when ``enable_mm_embeds`` is on and every supported visual modality
+    has an effective limit of 0. Explicit limits alone are insufficient:
+    omitted modalities retain vLLM's default limit. Audio support does not
+    imply that the engine accepts pixel payloads.
     """
     mm_config = getattr(model_config, "multimodal_config", None)
     if mm_config is None or not getattr(mm_config, "enable_mm_embeds", False):
         return False
-    limits = getattr(mm_config, "limit_per_prompt", None) or {}
+    if getattr(mm_config, "language_model_only", False):
+        return True
     get_limit = getattr(mm_config, "get_limit_per_prompt", None)
     if get_limit is None:
         return False
-    if getattr(mm_config, "language_model_only", False):
-        return True
-    return bool(limits) and all(get_limit(modality) == 0 for modality in limits)
+    try:
+        from vllm.multimodal import MULTIMODAL_REGISTRY
+    except ImportError:
+        # Without the model's supported modalities, do not infer disabled
+        # visual inputs from a potentially partial set of explicit limits.
+        return False
+    try:
+        # Use the same modality set as vLLM's own capability check. Prefer
+        # the public API, with a fallback for vLLM 0.19.
+        get_info = getattr(MULTIMODAL_REGISTRY, "get_processing_info", None)
+        if get_info is not None:
+            info = get_info(model_config)
+        else:
+            info = MULTIMODAL_REGISTRY._create_processing_info(model_config, tokenizer=None)
+        return all(
+            get_limit(modality) == 0
+            for modality in info.supported_mm_limits
+            if modality in {"image", "video"}
+        )
+    except Exception:
+        logger.warning(
+            "Multimodal limits probe failed; preserving the engine's multimodal capability",
+            exc_info=True,
+        )
+        return False
 
 
 def has_preprocessed_mm_payload(mm_inputs) -> bool:

@@ -123,14 +123,14 @@ impl ConsistentHashingPolicy {
         }
 
         let target_worker = extract_target_worker(info.headers);
-        // The rid-derived session key (populated only under the routing-key
-        // override, already capped and lineage-stripped) outranks the header.
+        // Explicit routing-key headers outrank the rid-derived session key
+        // (populated only under the routing-key override).
         // Both header sides apply the hint caps: an over-cap or non-UTF-8 key
         // must not influence placement on any path.
         let routing_key = info
-            .rid_key
-            .or(info.routing_key)
-            .or_else(|| extract_routing_key_hint(info.headers));
+            .routing_key
+            .or_else(|| extract_routing_key_hint(info.headers))
+            .or(info.rid_key);
 
         // Priority 1: X-SMG-Target-Worker - direct routing by worker index
         // O(1) parse + O(1) bounds check + O(1) health check
@@ -663,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rid_key_outranks_routing_key_hint() {
+    fn test_routing_key_hint_outranks_rid_key() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&[
             "http://w1:8000",
@@ -698,8 +698,25 @@ mod tests {
             ..Default::default()
         };
         let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(result, Some(rid_idx), "the rid-derived key must win");
+        let header_idx = select_by_key(&other_key);
+        assert_eq!(result, Some(header_idx), "the explicit header key must win");
         assert_eq!(branch, Branch::RoutingKeyHit);
+
+        // Policies also support callers that supply headers without a resolved hint.
+        let raw_headers = SelectWorkerInfo {
+            routing_key: None,
+            ..info
+        };
+        assert_eq!(policy.select_worker_impl(&workers, &raw_headers).0, result);
+
+        let fallback = SelectWorkerInfo {
+            headers: None,
+            ..raw_headers
+        };
+        assert_eq!(
+            policy.select_worker_impl(&workers, &fallback).0,
+            Some(rid_idx)
+        );
     }
 
     #[test]

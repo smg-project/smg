@@ -3,6 +3,7 @@
 //! Transition: BuildRequest → NonStreamRequest | StreamRequestWithTool | StreamRequest
 
 use axum::response::Response;
+use openai_protocol::common::to_value_exact;
 use serde_json::Value;
 
 use crate::{
@@ -36,8 +37,9 @@ pub(crate) async fn request_building(ctx: &mut RequestContext) -> Result<StepRes
         ));
     }
 
-    // Serialize the original request as the upstream payload.
-    let mut payload = serde_json::to_value(ctx.input.original_request.as_ref()).map_err(|e| {
+    // Serialize the original request as the upstream payload, every number
+    // as the client wrote it.
+    let mut payload = to_value_exact(ctx.input.original_request.as_ref()).map_err(|e| {
         tracing::error!(error = %e, "Failed to serialize Gemini interactions request");
         error::internal_error("internal_error", "Failed to build upstream request payload")
     })?;

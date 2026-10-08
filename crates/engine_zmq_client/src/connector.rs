@@ -8,17 +8,17 @@
 //   `data_parallel_rank` remains authoritative.
 // - No DP coordinator process: for a lockstep engine group the connector plays
 //   the wake role itself, over the input socket each rank already listens on.
-// - No utility RPC. Upstream's `call_utility` and its management wrappers
-//   (LoRA add/remove, prefix-cache reset, sleep/wake, profiling, weight
-//   updates) are out of scope: none of them is wired through SMG's ZMQ router
-//   path, so utility outputs decode to an empty batch the dispatcher ignores.
-//   Re-porting them means restoring upstream's call-id registry (u64 sequence
-//   numbers) alongside the request registry below.
+// - Utility RPCs (`call_utility`, vLLM only): one call to one rank, correlated
+//   by a call id this client issues. Pending calls live in the request
+//   registry, so the one dispatcher resolves their replies and fails them with
+//   the requests when the engine dies. Upstream's management wrappers (LoRA
+//   add/remove, sleep/wake, profiling, weight updates) stay unported; the
+//   prefix-cache reset is built on it by the adapter.
 
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -27,15 +27,19 @@ use std::{
 use bytes::Bytes;
 use futures::Stream;
 use parking_lot::Mutex;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tracing::{trace, warn};
 use zeromq::RouterSendHalf;
 
 use crate::{
+    codec::OpaqueValue,
     error::{Error, Result},
     protocol::{
-        tokenspeed::TokenSpeedProtocol, vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput,
-        EngineProtocol, WaveEvent,
+        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, vllm::VllmProtocol, EngineBatch,
+        EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
     },
     transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
 };
@@ -48,6 +52,10 @@ pub type EngineCoreStream = RequestStream<VllmProtocol>;
 pub type TokenSpeedClient = Client<TokenSpeedProtocol>;
 /// The per-request output stream for the TokenSpeed connector.
 pub type TokenSpeedStream = RequestStream<TokenSpeedProtocol>;
+/// The SGLang connector.
+pub type SglangClient = Client<SglangProtocol>;
+/// The per-request output stream for the SGLang connector.
+pub type SglangStream = RequestStream<SglangProtocol>;
 
 /// Per-request output channels are unbounded on purpose. The dispatcher fans
 /// one engine tick out to every request in it while holding the registry lock,
@@ -60,18 +68,24 @@ pub type TokenSpeedStream = RequestStream<TokenSpeedProtocol>;
 type OutputSender<O> = mpsc::UnboundedSender<Result<O>>;
 type OutputReceiver<O> = mpsc::UnboundedReceiver<Result<O>>;
 
-/// Routes engine outputs to per-request streams and tracks in-flight requests.
-/// Keyed by `request_id`; the value is that request's output channel sender.
+/// Routes engine outputs to per-request streams and utility replies to their
+/// callers, and tracks what is in flight. Requests are keyed by `request_id`,
+/// utility calls by the call id this client issued; closing fails both.
 struct RequestRegistry<O> {
     closed: bool,
     requests: HashMap<String, OutputSender<O>>,
+    utility_calls: HashMap<i64, UtilitySender>,
 }
+
+/// Completes one utility call with its value, or the error that ended it.
+type UtilitySender = oneshot::Sender<Result<OpaqueValue>>;
 
 impl<O> Default for RequestRegistry<O> {
     fn default() -> Self {
         Self {
             closed: false,
             requests: HashMap::new(),
+            utility_calls: HashMap::new(),
         }
     }
 }
@@ -132,10 +146,43 @@ impl<O: EngineOutput> RequestRegistry<O> {
         }
     }
 
-    /// Fail every in-flight request with a shared error and close the registry.
+    /// Register a utility call, returning the receiver its reply resolves.
+    fn register_utility(&mut self, call_id: i64) -> Result<oneshot::Receiver<Result<OpaqueValue>>> {
+        if self.closed {
+            return Err(Error::ClientClosed {
+                message: "client is shutting down".to_string(),
+            });
+        }
+        let (sender, receiver) = oneshot::channel();
+        self.utility_calls.insert(call_id, sender);
+        Ok(receiver)
+    }
+
+    /// Complete the call waiting on `reply.call_id`. A reply nobody waits for
+    /// (a timed-out call, or one of vLLM's unprompted negative-id notices) is
+    /// dropped.
+    fn resolve_utility(&mut self, reply: UtilityReply) {
+        let Some(sender) = self.utility_calls.remove(&reply.call_id) else {
+            trace!(
+                call_id = reply.call_id,
+                "utility reply for no waiting call; dropping"
+            );
+            return;
+        };
+        let outcome = reply
+            .outcome
+            .map_err(|message| Error::UtilityCallFailed { message });
+        let _ = sender.send(outcome);
+    }
+
+    /// Fail every in-flight request and pending utility call with a shared
+    /// error and close the registry.
     fn fail_all(&mut self, error: Arc<Error>) {
         self.closed = true;
         for (_, sender) in self.requests.drain() {
+            let _ = sender.send(Err(Error::Shared(error.clone())));
+        }
+        for (_, sender) in self.utility_calls.drain() {
             let _ = sender.send(Err(Error::Shared(error.clone())));
         }
     }
@@ -180,6 +227,9 @@ struct ClientInner<P: EngineProtocol> {
     wave: Option<Mutex<u64>>,
     /// Auto-abort channel fed by dropped streams.
     abort_tx: mpsc::UnboundedSender<(EngineId, String)>,
+    /// Issues utility call ids; the engine echoes one on its reply. Positive
+    /// only: vLLM reserves negative ids for notices it sends unprompted.
+    next_call_id: AtomicI64,
 }
 
 impl<P: EngineProtocol> ClientInner<P> {
@@ -474,6 +524,7 @@ impl<P: EngineProtocol> Client<P> {
             scan_start: AtomicUsize::new(0),
             wave: lockstep.then(|| Mutex::new(0)),
             abort_tx,
+            next_call_id: AtomicI64::new(1),
         });
 
         // Transport output loop: decode raw frames -> EngineBatch channel.
@@ -518,6 +569,18 @@ impl<P: EngineProtocol> Client<P> {
     /// least-loaded engine (see [`ClientInner::select_engine`]).
     /// Dropping the returned stream before it finishes aborts the request.
     pub async fn submit(&self, request: P::Request) -> Result<RequestStream<P>> {
+        self.submit_with_aux(request, Vec::new()).await
+    }
+
+    /// [`submit`](Self::submit) with `aux_frames` appended after the payload:
+    /// vLLM's zero-copy tensor frames, which the payload references by index
+    /// (the payload is frame 0, so the first of these is frame 1). The
+    /// request's own encoding must not reference aux frames of its own.
+    pub async fn submit_with_aux(
+        &self,
+        request: P::Request,
+        extra_aux_frames: Vec<Bytes>,
+    ) -> Result<RequestStream<P>> {
         P::validate(&request)?;
         let request_id = P::request_id(&request).to_string();
         // Register before selecting: registration is the admission gate (it
@@ -539,7 +602,7 @@ impl<P: EngineProtocol> Client<P> {
             }
         };
 
-        let (payload, aux_frames) = match P::encode_add(&request) {
+        let (payload, mut aux_frames) = match P::encode_add(&request) {
             Ok(encoded) => encoded,
             Err(error) => {
                 self.inner.registry.lock().remove_all([&request_id]);
@@ -547,6 +610,7 @@ impl<P: EngineProtocol> Client<P> {
                 return Err(error);
             }
         };
+        aux_frames.extend(extra_aux_frames);
         if let Err(error) = self
             .inner
             .send_to_engine(&engine_id, P::add_frame(), payload, aux_frames)
@@ -593,6 +657,66 @@ impl<P: EngineProtocol> Drop for Client<P> {
         for task in &self.tasks {
             task.abort();
         }
+    }
+}
+
+impl<P: EngineProtocol> Client<P> {
+    /// Run `method(*args)` on one rank and return its result (vLLM's
+    /// `AsyncMPClient._call_utility_async`; the SGLang plugin's control
+    /// call): the protocol frames the call and the reply resolves by call id.
+    /// Waits at most `timeout`; the engine still runs a call whose reply comes
+    /// late, that reply is just dropped. A protocol without control messages
+    /// answers [`Error::UtilityUnsupported`] without touching the wire.
+    pub async fn call_utility(
+        &self,
+        engine_id: &EngineId,
+        method: &str,
+        args: Vec<OpaqueValue>,
+        timeout: Duration,
+    ) -> Result<OpaqueValue> {
+        let call_id = self.inner.next_call_id.fetch_add(1, Ordering::Relaxed);
+        let Some((frame, payload)) = P::encode_utility(call_id, method, &args)? else {
+            return Err(Error::UtilityUnsupported {
+                method: method.to_string(),
+            });
+        };
+        let receiver = self.inner.registry.lock().register_utility(call_id)?;
+        // Retires the registration on every exit (timeout, cancellation, a
+        // failed send); a resolved call has already left the map.
+        let _pending = PendingUtilityCall {
+            inner: &self.inner,
+            call_id,
+        };
+        self.inner
+            .send_to_engine(engine_id, frame, payload, Vec::new())
+            .await?;
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(outcome)) => outcome,
+            // The registry closed and dropped the sender without an error item.
+            Ok(Err(_closed)) => Err(Error::ClientClosed {
+                message: "client closed while a utility call was pending".to_string(),
+            }),
+            Err(_elapsed) => Err(Error::UtilityTimeout {
+                method: method.to_string(),
+                timeout,
+            }),
+        }
+    }
+}
+
+/// Removes a utility call's registry entry once its caller stops waiting.
+struct PendingUtilityCall<'a, P: EngineProtocol> {
+    inner: &'a ClientInner<P>,
+    call_id: i64,
+}
+
+impl<P: EngineProtocol> Drop for PendingUtilityCall<'_, P> {
+    fn drop(&mut self) {
+        self.inner
+            .registry
+            .lock()
+            .utility_calls
+            .remove(&self.call_id);
     }
 }
 
@@ -651,6 +775,9 @@ async fn run_dispatcher<P: EngineProtocol>(
                         let mut finished: HashSet<String> =
                             batch.finished_request_ids.into_iter().collect();
                         let mut registry = inner.registry.lock();
+                        if let Some(reply) = batch.utility {
+                            registry.resolve_utility(reply);
+                        }
                         for output in batch.outputs {
                             if output.finished() {
                                 finished.insert(output.request_id().to_string());
@@ -813,7 +940,7 @@ mod tests {
                     DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput,
                     EngineCoreOutputs, RequestBatchOutputs,
                 },
-                request::EngineCoreRequest,
+                request::{EngineCoreRequest, UtilityCall},
                 stats::SchedulerStats,
             },
         },
@@ -1654,5 +1781,137 @@ mod tests {
             client.inner.wave.is_none(),
             "no clock for independent ranks"
         );
+    }
+
+    /// The utility RPC: the call is framed as vLLM's client frames it, goes to
+    /// the named rank, and its reply resolves the caller by call id.
+    #[tokio::test]
+    async fn call_utility_resolves_the_reply_by_call_id() {
+        let (client, mut engine, _ns) = connect().await;
+        let engine_id = engines_id(&client, 0);
+        let args = vec![OpaqueValue::from(false), OpaqueValue::from(false)];
+        let (result, call) = tokio::join!(
+            client.call_utility(&engine_id, "reset_prefix_cache", args.clone(), TIMEOUT),
+            async {
+                let frames = engine.recv_request().await.unwrap();
+                assert_eq!(frames[0].as_ref(), b"\x03");
+                let call: UtilityCall = decode_msgpack(frames[1].as_ref()).unwrap();
+                engine
+                    .send_utility_reply(0, call.call_id, Ok(OpaqueValue::from(true)))
+                    .await
+                    .unwrap();
+                call
+            }
+        );
+        assert_eq!(result.unwrap(), OpaqueValue::from(true));
+        assert_eq!(call.client_index, 0);
+        assert_eq!(call.method, "reset_prefix_cache");
+        assert_eq!(call.args, args);
+        assert!(client.inner.registry.lock().utility_calls.is_empty());
+
+        // Calls are told apart by id: the next one gets a fresh id and its own
+        // reply.
+        let (result, next) = tokio::join!(
+            client.call_utility(&engine_id, "is_sleeping", Vec::new(), TIMEOUT),
+            async {
+                let EngineInbound::Utility(next) = engine.recv().await.unwrap() else {
+                    panic!("expected a utility call");
+                };
+                engine
+                    .send_utility_reply(0, next.call_id, Ok(OpaqueValue::from(false)))
+                    .await
+                    .unwrap();
+                next
+            }
+        );
+        assert_ne!(next.call_id, call.call_id);
+        assert_eq!(result.unwrap(), OpaqueValue::from(false));
+    }
+
+    /// The engine's failure message is the call's error.
+    #[tokio::test]
+    async fn call_utility_surfaces_the_engine_failure_message() {
+        let (client, mut engine, _ns) = connect().await;
+        let engine_id = engines_id(&client, 0);
+        let failure = "Call to reset_prefix_cache method failed: boom";
+        let (result, ()) = tokio::join!(
+            client.call_utility(&engine_id, "reset_prefix_cache", Vec::new(), TIMEOUT),
+            async {
+                let EngineInbound::Utility(call) = engine.recv().await.unwrap() else {
+                    panic!("expected a utility call");
+                };
+                engine
+                    .send_utility_reply(0, call.call_id, Err(failure.to_string()))
+                    .await
+                    .unwrap();
+            }
+        );
+        assert!(
+            matches!(result, Err(Error::UtilityCallFailed { ref message }) if message == failure),
+            "{result:?}"
+        );
+    }
+
+    /// An unanswered call times out and leaves nothing behind; the reply that
+    /// arrives late is dropped without disturbing later calls.
+    #[tokio::test]
+    async fn call_utility_times_out_and_drops_a_late_reply() {
+        let (client, mut engine, _ns) = connect().await;
+        let engine_id = engines_id(&client, 0);
+        let result = client
+            .call_utility(
+                &engine_id,
+                "reset_prefix_cache",
+                Vec::new(),
+                Duration::from_millis(200),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::UtilityTimeout { .. })),
+            "{result:?}"
+        );
+        assert!(client.inner.registry.lock().utility_calls.is_empty());
+
+        let EngineInbound::Utility(stale) = engine.recv().await.unwrap() else {
+            panic!("expected a utility call");
+        };
+        engine
+            .send_utility_reply(0, stale.call_id, Ok(OpaqueValue::from(true)))
+            .await
+            .unwrap();
+
+        let (result, ()) = tokio::join!(
+            client.call_utility(&engine_id, "reset_prefix_cache", Vec::new(), TIMEOUT),
+            async {
+                let EngineInbound::Utility(call) = engine.recv().await.unwrap() else {
+                    panic!("expected a utility call");
+                };
+                assert_ne!(call.call_id, stale.call_id);
+                engine
+                    .send_utility_reply(0, call.call_id, Ok(OpaqueValue::from(false)))
+                    .await
+                    .unwrap();
+            }
+        );
+        assert_eq!(result.unwrap(), OpaqueValue::from(false));
+    }
+
+    /// A pending call fails with the requests when the engine dies.
+    #[tokio::test]
+    async fn engine_dead_fails_pending_utility_calls() {
+        let (client, mut engine, _ns) = connect().await;
+        let engine_id = engines_id(&client, 0);
+        let (result, ()) = tokio::join!(
+            client.call_utility(&engine_id, "reset_prefix_cache", Vec::new(), TIMEOUT),
+            async {
+                engine.recv().await.unwrap();
+                engine
+                    .send_output(vec![Bytes::from_static(ENGINE_CORE_DEAD_SENTINEL)])
+                    .await
+                    .unwrap();
+            }
+        );
+        assert!(matches!(result, Err(Error::Shared(_))), "{result:?}");
+        assert!(!client.is_alive());
     }
 }

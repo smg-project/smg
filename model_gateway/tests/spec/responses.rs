@@ -1049,10 +1049,9 @@ fn test_validate_conversation_previous_response_mutual_exclusion() {
     }
 }
 
-/// Test input items structure validation
+/// A regular message remains a valid input item.
 #[test]
 fn test_validate_input_items_structure() {
-    // Valid: items with at least one message
     let request = ResponsesRequest {
         input: ResponseInput::Items(vec![ResponseInputOutputItem::SimpleInputMessage {
             content: StringOrContentParts::String("Hello".to_string()),
@@ -1066,22 +1065,95 @@ fn test_validate_input_items_structure() {
         request.validate().is_ok(),
         "Input items with message should be valid"
     );
+}
 
-    // Invalid: items with no messages (only function calls)
-    let request = ResponsesRequest {
-        input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
-            id: None,
-            call_id: "call_123".to_string(),
-            output: "result".to_string().into(),
-            status: None,
-        }]),
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "Input items without messages should be invalid"
-    );
+/// Stored history supplies the message and function call for a continuation.
+#[test]
+fn test_validate_tool_result_only_continuation() {
+    for (previous_response_id, conversation) in [
+        (Some("resp_123"), None),
+        (None, Some(json!("conv_123"))),
+        (None, Some(json!({"id": "conv_123"}))),
+    ] {
+        for stream in [false, true] {
+            let request: ResponsesRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "previous_response_id": previous_response_id,
+                "conversation": conversation,
+                "stream": stream,
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call_weather",
+                    "output": "sunny"
+                }]
+            }))
+            .unwrap();
+            assert!(
+                request.validate().is_ok(),
+                "Tool-result-only continuation should validate: {request:?}"
+            );
+        }
+    }
+}
+
+/// Stateless replay does not require a new message after the tool result.
+#[test]
+fn test_validate_stateless_function_history_without_new_message() {
+    for stream in [false, true] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "store": false,
+            "stream": stream,
+            "input": [
+                {"role": "user", "content": "What is the weather?"},
+                {"type": "reasoning", "id": "rs_weather", "summary": []},
+                {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok());
+    }
+}
+
+/// Continuations retain input-item and cross-field validation.
+#[test]
+fn test_validate_tool_continuation_keeps_other_constraints() {
+    for input in [
+        json!(""),
+        json!([]),
+        json!([{"role": "user", "content": ""}]),
+        json!([{"role": "user", "content": []}]),
+    ] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model", "previous_response_id": "resp_123", "input": input
+        }))
+        .unwrap();
+        assert!(request.validate().is_err(), "Invalid input: {input}");
+    }
+
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "previous_response_id": "resp_123",
+        "conversation": "conv_123",
+        "input": [{"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}]
+    }))
+    .unwrap();
+    let errors = request.validate().unwrap_err();
+    let field_errors = errors.field_errors();
+    assert!(field_errors.get("__all__").is_some_and(|errors| errors
+        .iter()
+        .any(|error| error.code == "mutually_exclusive_parameters")));
+
+    for item in [
+        json!({"type": "function_call_output", "output": "sunny"}),
+        json!({"type": "function_call_output", "call_id": "call_weather"}),
+    ] {
+        assert!(serde_json::from_value::<ResponsesRequest>(json!({
+            "model": "test-model", "previous_response_id": "resp_123", "input": [item]
+        }))
+        .is_err());
+    }
 }
 
 // ============================================================================

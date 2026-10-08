@@ -284,3 +284,36 @@ def test_floor_satisfied_from_collection_hook(monkeypatch):
     config = _FakeConfig()
     items = _run(config, [match, wrong])
     assert items == [match]
+
+
+def test_sglang_zmq_lane_keeps_multimodal_and_http_error_shapes_off_the_wire():
+    mm = _FakeItem("e2e_test/chat_completions/test_multimodal.py::test_image[grpc]")
+    shape = _FakeItem("e2e_test/chat_completions/test_error_shapes.py::test_json[http]")
+    text = _FakeItem("e2e_test/chat_completions/test_basic.py::test_chat[grpc]")
+    kept, deselected = hooks._filter_sglang_zmq_items([mm, shape, text])
+    assert kept == [text] and deselected == [mm, shape]
+
+
+def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
+    chat = _FakeItem(
+        "e2e_test/chat_completions/test_basic.py::test_chat[grpc]", params={"setup_backend": "grpc"}
+    )
+    pd = _FakeItem(
+        "e2e_test/chat_completions/test_pd.py::test_pd[pd_mooncake]",
+        params={"setup_backend": "pd_mooncake"},
+    )
+    mm = _FakeItem(
+        "e2e_test/chat_completions/test_multimodal.py::test_image[grpc]",
+        params={"setup_backend": "grpc"},
+    )
+    admin = _FakeItem(
+        "e2e_test/chat_completions/test_admin_ops.py::test_flush[grpc]",
+        params={"setup_backend": "grpc"},
+    )
+    embed = _FakeItem(
+        "e2e_test/embeddings/test_basic.py::test_embed[grpc]", params={"setup_backend": "grpc"}
+    )
+    kept, deselected = hooks._filter_sglang_rust_items([chat, pd, mm, admin, embed])
+    # Admin ops and embeddings ride the wire (control calls, embedding
+    # requests); PD topologies and multimodal payloads do not.
+    assert kept == [chat, admin, embed] and deselected == [pd, mm]

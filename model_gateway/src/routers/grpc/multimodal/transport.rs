@@ -441,6 +441,23 @@ fn cached_env_dtype(cell: &'static OnceLock<Option<String>>, name: &str) -> Opti
         .clone()
 }
 
+/// The label a vLLM worker advertises when its engine rescales and normalizes
+/// pixels on device (`GetServerInfoResponse.mm_device_do_normalize`).
+pub(super) const MM_DEVICE_DO_NORMALIZE_LABEL: &str = "mm_device_do_normalize";
+
+/// Whether the selected vLLM worker normalizes pixels on device, in which
+/// case it takes the pixels' own bytes and would normalize floats twice.
+pub(super) fn mm_vllm_device_normalizes(workers: Option<&WorkerSelection>) -> bool {
+    primary_worker(workers).is_some_and(|worker| {
+        worker
+            .metadata()
+            .spec
+            .labels
+            .get(MM_DEVICE_DO_NORMALIZE_LABEL)
+            .is_some_and(|value| value == "true")
+    })
+}
+
 fn mm_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Option<String> {
     primary_worker(workers)?
         .metadata()

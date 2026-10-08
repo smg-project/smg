@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use common::mock_mcp_server::{MockMCPServer, MockSearchResponseMCPServer, MockSearchResponseMode};
 use openai_protocol::responses::{ResponseOutputItem, WebSearchAction};
 use serde_json::json;
-use smg::routers::common::openai_bridge::{transform_tool_output, ResponseFormat};
+use smg::routers::common::openai_bridge::{
+    inject_client_visible_mcp_output_items, transform_tool_output, ResponseFormat,
+};
 use smg_mcp::{
     core::config::{ResponseFormatConfig, ToolConfig},
     McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig, McpToolSession, McpTransport,
@@ -813,4 +815,59 @@ async fn test_complete_workflow() {
     ];
 
     assert_eq!(capabilities.len(), 8);
+}
+
+#[tokio::test]
+async fn internal_mcp_visibility_preserves_namespaced_client_function() {
+    let mut server = MockMCPServer::start().await.unwrap();
+    let manager = McpOrchestrator::new(McpConfig {
+        servers: vec![McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Streamable {
+                url: server.url(),
+                token: None,
+                headers: HashMap::new(),
+            },
+            proxy: None,
+            required: false,
+            tools: None,
+            builtin_type: None,
+            builtin_tool_name: None,
+            internal: true,
+        }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
+        policy: Default::default(),
+    })
+    .await
+    .unwrap();
+    let session = McpToolSession::new(
+        &manager,
+        vec![McpServerBinding {
+            label: "internal".into(),
+            server_key: "internal".into(),
+            allowed_tools: None,
+        }],
+        "visibility-test",
+    );
+    let client: ResponseOutputItem = serde_json::from_value(json!({
+        "type":"function_call", "id":"fc_client", "call_id":"call_client", "name":"brave_web_search", "namespace":"client", "arguments":"{}", "status":"completed",
+    })).unwrap();
+    let internal: ResponseOutputItem = serde_json::from_value(json!({
+        "type":"function_call", "id":"fc_internal", "call_id":"call_internal", "name":"brave_web_search", "arguments":"{}", "status":"completed",
+    })).unwrap();
+    let mut output = vec![client, internal];
+    inject_client_visible_mcp_output_items(
+        &session,
+        &mut output,
+        vec![],
+        &std::collections::HashSet::from(["client.brave_web_search".to_string()]),
+    );
+    server.stop().await;
+    let output = serde_json::to_value(output).unwrap();
+    assert_eq!(output.as_array().unwrap().len(), 1, "{output}");
+    assert_eq!(output[0]["call_id"], "call_client");
+    assert_eq!(output[0]["namespace"], "client");
 }

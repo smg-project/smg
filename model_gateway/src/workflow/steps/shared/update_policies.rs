@@ -137,6 +137,9 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             app_context
                 .policy_registry
                 .on_worker_added(&model_id, policy_hint);
+            // Policies learn of the request's end through the worker's load
+            // guard; the registry routes it to the policy that placed it.
+            worker.set_completion_sink(Some(app_context.policy_registry.completion_sink()));
 
             // Initialize cache-aware policy if configured
             let all_workers = app_context.worker_registry.get_by_model(&model_id);

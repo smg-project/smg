@@ -360,6 +360,17 @@ fn main() -> anyhow::Result<()> {
             &resp_name,
         ),
     );
+    let req_name = collect_schema(schema_for!(CountMessageTokensRequest), &mut schemas)?;
+    let resp_name = collect_schema(schema_for!(CountMessageTokensResponse), &mut schemas)?;
+    paths.insert(
+        "/v1/messages/count_tokens".to_string(),
+        post_endpoint(
+            "countMessageTokens",
+            "Count message tokens (Anthropic)",
+            &req_name,
+            &resp_name,
+        ),
+    );
 
     // ---- Responses API ----
     use openai_protocol::responses::*;

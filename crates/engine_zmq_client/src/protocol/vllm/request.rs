@@ -10,7 +10,9 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
     codec::OpaqueValue,
-    protocol::vllm::{lora, multimodal::MmFeatures, sampling::EngineCoreSamplingParams},
+    protocol::vllm::{
+        lora, multimodal::MmFeatures, pooling::PoolingParams, sampling::EngineCoreSamplingParams,
+    },
     Error, Result,
 };
 
@@ -58,6 +60,34 @@ pub struct ReasoningParserKwargs {
     pub chat_template_kwargs: HashMap<String, serde_json::Value>,
 }
 
+/// `mm_features` as this client sends it: built here from Router-preprocessed
+/// tensors (`Typed`), or produced by vLLM's own input processor and relayed
+/// as the msgpack its encoder wrote (`Raw`; tensors over vLLM's zero-copy
+/// threshold then ride the request's aux frames, see
+/// [`EngineCoreClient::submit_with_aux`](crate::connector::EngineCoreClient::submit_with_aux)).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MmFeaturesPayload {
+    Typed(MmFeatures),
+    Raw(OpaqueValue),
+}
+
+impl From<MmFeatures> for MmFeaturesPayload {
+    fn from(features: MmFeatures) -> Self {
+        Self::Typed(features)
+    }
+}
+
+impl MmFeaturesPayload {
+    /// The features when this client built them.
+    pub fn typed(&self) -> Option<&MmFeatures> {
+        match self {
+            Self::Typed(features) => Some(features),
+            Self::Raw(_) => None,
+        }
+    }
+}
+
 /// Engine-core add-request payload sent from frontend to engine.
 ///
 /// This is a msgspec `array_like=True` struct: it serializes as a positional
@@ -68,10 +98,11 @@ pub struct EngineCoreRequest {
     pub request_id: String,
     pub prompt_token_ids: Option<Vec<u32>>,
     /// Multimodal features, one per input item, sorted by placeholder offset.
-    pub mm_features: Option<MmFeatures>,
+    pub mm_features: Option<MmFeaturesPayload>,
     pub sampling_params: Option<EngineCoreSamplingParams>,
-    /// Pooling parameters, preserved in the schema but not yet strongly typed.
-    pub pooling_params: Option<OpaqueValue>,
+    /// Pooling (embedding) parameters: set, with `sampling_params` unset, on
+    /// a pooling request.
+    pub pooling_params: Option<PoolingParams>,
     pub arrival_time: f64,
     #[serde(default)]
     pub lora_request: Option<lora::LoraRequest>,
@@ -135,12 +166,52 @@ impl EngineCoreRequest {
     // follow-up.
 }
 
+/// A utility RPC to one engine (`EngineCoreRequestType::Utility`): the
+/// positional tuple vLLM's client sends, `(client_index, call_id, method,
+/// args)`. The engine runs `getattr(EngineCore, method)(*args)` and answers
+/// with a [`UtilityOutput`](super::output::UtilityOutput) carrying the same
+/// `call_id`.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
+pub struct UtilityCall {
+    /// Which of the frontend's output sockets gets the reply; this client has
+    /// one.
+    pub client_index: u32,
+    /// Correlates the reply. vLLM reserves negative ids for notices an engine
+    /// sends unprompted, so callers issue positive ones.
+    pub call_id: i64,
+    pub method: String,
+    pub args: Vec<OpaqueValue>,
+}
+
 #[cfg(test)]
 mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::{decode_value, encode_msgpack};
+    use crate::codec::{decode_msgpack, decode_value, encode_msgpack, hex};
+
+    /// Golden bytes from vLLM's own encoder (`vllm.v1.serial_utils.MsgpackEncoder`,
+    /// vLLM 0.30.1rc1): `encode((0, 0x0123456789ABCDEF, "reset_prefix_cache",
+    /// (False, False)))`, the tuple `AsyncMPClient._call_utility_async` sends.
+    #[test]
+    fn utility_call_encodes_as_vllm_client_does() {
+        let call = UtilityCall {
+            client_index: 0,
+            call_id: 0x0123_4567_89AB_CDEF,
+            method: "reset_prefix_cache".to_string(),
+            args: vec![Value::from(false), Value::from(false)],
+        };
+        let golden = hex("9400cf0123456789abcdefb272657365745f7072656669785f636163686592c2c2");
+        assert_eq!(encode_msgpack(&call).unwrap(), golden);
+        assert_eq!(decode_msgpack::<UtilityCall>(&golden).unwrap(), call);
+
+        // A small id takes msgpack's positive fixint, as msgspec encodes it.
+        let first = UtilityCall { call_id: 1, ..call };
+        assert_eq!(
+            encode_msgpack(&first).unwrap(),
+            hex("940001b272657365745f7072656669785f636163686592c2c2")
+        );
+    }
 
     #[test]
     fn request_type_frames_roundtrip() {
@@ -185,6 +256,33 @@ mod tests {
         assert_eq!(array[4], Value::Nil); // pooling_params
         assert_eq!(array[10], Value::Nil); // prompt_is_token_ids
         assert_eq!(array[11], Value::from(7)); // client_index
+    }
+
+    /// A pooling request carries typed `pooling_params` at position 4 and no
+    /// sampling params; the nested array is byte-identical to vLLM's own
+    /// `msgspec` encoding of the verified `PoolingParams(task="embed")`.
+    #[test]
+    fn pooling_request_nests_vllm_encoded_pooling_params() {
+        let request = EngineCoreRequest {
+            request_id: "emb-1".to_string(),
+            prompt_token_ids: Some(vec![101, 2088, 102]),
+            pooling_params: Some(PoolingParams::embed()),
+            arrival_time: 1.0,
+            ..EngineCoreRequest::default()
+        };
+        let encoded = encode_msgpack(&request).unwrap();
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected array");
+        };
+        assert_eq!(array[3], Value::Nil); // sampling_params
+        let mut nested = Vec::new();
+        rmpv::encode::write_value(&mut nested, &array[4]).unwrap();
+        assert_eq!(
+            nested,
+            b"\x9a\xc3\xc0\xc0\xc0\xa5embed\xc2\xc2\xc0\xc0\x02".to_vec()
+        );
+        let decoded: EngineCoreRequest = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded, request);
     }
 
     #[test]

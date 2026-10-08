@@ -214,8 +214,8 @@ fn check_batch(processor: &Qwen3AudioProcessor, case: &Case) {
         case.name
     );
 
-    let values = output
-        .encoder_input
+    let encoder_f32 = output.encoder_input.as_f32();
+    let values = encoder_f32
         .as_slice_memory_order()
         .unwrap_or_else(|| panic!("{}: encoder_input must be contiguous", case.name));
     let (diff, at) = max_abs_diff(values, &case.mel);

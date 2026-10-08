@@ -12,8 +12,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/ci_fetch_tokenspeed_prebuilt.sh"
-IMAGE="ghcr.io/smg-project/smg:ci-tokenspeed-aaaa-bbbb"
-TAG="ci-tokenspeed-aaaa-bbbb"
+TAG="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+IMAGE="ghcr.io/smg-project/smg:ci-tokenspeed-20000101@sha256:${TAG}"
 
 assert_eq() {
     local expected="$1" actual="$2" what="${3:-}"
@@ -46,11 +46,10 @@ setup() {
     cleanup_sandbox
     T="$(mktemp -d)"
     export FAKE_IMAGE_ROOT="$T/image" FAKE_DOCKER_LOG="$T/docker.log"
-    mkdir -p "$FAKE_IMAGE_ROOT/opt/smg-ci/.venv/bin" "$FAKE_IMAGE_ROOT/opt/tokenspeed-src"
+    mkdir -p "$FAKE_IMAGE_ROOT/opt/smg-ci/.venv/bin"
     echo "#!/bin/sh" > "$FAKE_IMAGE_ROOT/opt/smg-ci/.venv/bin/python"
     chmod +x "$FAKE_IMAGE_ROOT/opt/smg-ci/.venv/bin/python"
     echo "deadbeef" > "$FAKE_IMAGE_ROOT/opt/smg-ci/tokenspeed.ref"
-    echo "src" > "$FAKE_IMAGE_ROOT/opt/tokenspeed-src/README"
     : > "$FAKE_DOCKER_LOG"
     mkdir -p "$T/bin"
     cat > "$T/bin/docker" <<'FAKE'
@@ -93,12 +92,12 @@ test_cold_pull_populates_cache_and_links_install_root() {
     assert_file "$CACHE/$TAG/.complete"
     assert_file "$CACHE/$TAG/smg-ci/tokenspeed.ref"
     assert_link_into "$T/opt/smg-ci" "$CACHE/jobs"
-    assert_link_into "$T/opt/tokenspeed-src" "$CACHE/jobs"
     assert_eq "deadbeef" "$(cat "$T/opt/smg-ci/tokenspeed.ref")" "payload readable through the link"
     assert_eq 1 "$(pull_count)" "one docker pull"
     assert_contains "$(cat "$T/opt/github.env")" "SMG_BAKED_VENV=$T/opt/smg-ci/.venv"
     assert_contains "$(cat "$T/opt/github.env")" "TOKENSPEED_PREBUILT_JOB_DIR=$CACHE/jobs/"
     assert_contains "$out" "Prebuilt payload installed"
+    assert_contains "$out" "Prebuilt image: $IMAGE"
 }
 
 test_warm_cache_skips_docker_entirely() {
@@ -110,6 +109,7 @@ test_warm_cache_skips_docker_entirely() {
     assert_link_into "$T/opt-b/smg-ci" "$CACHE/jobs"
     assert_eq "deadbeef" "$(cat "$T/opt-b/smg-ci/tokenspeed.ref")"
     assert_contains "$out" "cache hit"
+    assert_contains "$out" "Prebuilt image: $IMAGE"
 }
 
 test_job_copies_are_private() {
@@ -146,7 +146,7 @@ test_job_dir_is_unique_even_when_pid_and_job_identity_collide() {
 test_failed_extraction_leaves_no_cache_entry_and_falls_back() {
     setup
     local out; out="$(run_fetch "$T/opt" 100 FAKE_CP_FAIL=1)"
-    assert_contains "$out" "lane will build from source"
+    assert_contains "$out" "lane will install nightly wheels"
     assert_no_file "$CACHE/$TAG"
     assert_no_file "$T/opt/smg-ci"
     assert_eq "" "$(grep SMG_BAKED_VENV "$T/opt/github.env" || true)" "no venv advertised"
@@ -168,7 +168,6 @@ test_unwritable_cache_root_degrades_to_a_job_local_cache() {
     # One reader, pod-local storage, no reflink: the payload must exist once,
     # in the job dir the workflow's cleanup step removes, not also in the entry.
     assert_no_file "$T/runner-temp/tokenspeed-prebuilt-cache/$TAG/smg-ci"
-    assert_no_file "$T/runner-temp/tokenspeed-prebuilt-cache/$TAG/tokenspeed-src"
 }
 
 # A populate killed between the rename and the marker leaves an entry dir
@@ -203,7 +202,7 @@ test_marked_entry_missing_payload_is_treated_as_miss() {
 # needs must be there, or it is a miss.
 test_hollow_entry_with_marker_is_treated_as_miss() {
     setup
-    mkdir -p "$CACHE/$TAG/smg-ci" "$CACHE/$TAG/tokenspeed-src"
+    mkdir -p "$CACHE/$TAG/smg-ci"
     : > "$CACHE/$TAG/.complete"
     run_fetch "$T/opt" 100 > /dev/null
     assert_eq 1 "$(pull_count)" "repopulated"
@@ -211,20 +210,17 @@ test_hollow_entry_with_marker_is_treated_as_miss() {
     assert_eq "deadbeef" "$(cat "$T/opt/smg-ci/tokenspeed.ref")"
 }
 
-# If the second symlink cannot be created, the first one must not be left
-# dangling in the install root, and the job copy must go with it.
+# A failed payload symlink must remove the job copy.
 test_partial_install_links_are_removed_on_failure() {
     setup
     cat > "$T/bin/ln" <<'FAKE'
 #!/bin/bash
-for a in "$@"; do case "$a" in *tokenspeed-src) exit 1 ;; esac; done
-exec /bin/ln "$@"
+exit 1
 FAKE
     chmod +x "$T/bin/ln"
     local out; out="$(run_fetch "$T/opt" 100)"
-    assert_contains "$out" "lane will build from source"
+    assert_contains "$out" "lane will install nightly wheels"
     assert_no_file "$T/opt/smg-ci"
-    assert_no_file "$T/opt/tokenspeed-src"
     assert_eq "" "$(find "$CACHE/jobs" -mindepth 1 -maxdepth 1)" "job copy removed"
 }
 
@@ -233,9 +229,8 @@ FAKE
 test_unwritable_github_env_rolls_back_the_install() {
     setup
     local out; out="$(run_fetch "$T/opt" 100 GITHUB_ENV="$T/nonexistent/github.env")"
-    assert_contains "$out" "lane will build from source"
+    assert_contains "$out" "lane will install nightly wheels"
     assert_no_file "$T/opt/smg-ci"
-    assert_no_file "$T/opt/tokenspeed-src"
     assert_eq "" "$(find "$CACHE/jobs" -mindepth 1 -maxdepth 1)" "job copy removed"
 }
 

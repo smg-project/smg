@@ -32,6 +32,7 @@ pub struct MockTokenizer {
     thinking_toggle: ThinkingToggle,
     thinking_key_name: Option<ThinkingKeyName>,
     native_reasoning_effort_values: &'static [&'static str],
+    native_reasoning_effort_off_values: &'static [&'static str],
     renderer_capabilities: RendererCapabilities,
     content_format: ChatTemplateContentFormat,
     /// When set, `apply_chat_template` renders the message list and the
@@ -95,6 +96,7 @@ impl MockTokenizer {
             thinking_toggle: ThinkingToggle::None,
             thinking_key_name: None,
             native_reasoning_effort_values: &[],
+            native_reasoning_effort_off_values: &[],
             renderer_capabilities: RendererCapabilities::default(),
             content_format: ChatTemplateContentFormat::default(),
             json_chat_template: false,
@@ -137,6 +139,15 @@ impl MockTokenizer {
     /// Report `values` from `native_reasoning_effort_values()`.
     pub fn with_native_reasoning_effort_values(mut self, values: &'static [&'static str]) -> Self {
         self.native_reasoning_effort_values = values;
+        self
+    }
+
+    /// Report `values` from `native_reasoning_effort_off_values()`.
+    pub fn with_native_reasoning_effort_off_values(
+        mut self,
+        values: &'static [&'static str],
+    ) -> Self {
+        self.native_reasoning_effort_off_values = values;
         self
     }
 
@@ -232,6 +243,10 @@ impl TokenizerTrait for MockTokenizer {
 
     fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
         self.native_reasoning_effort_values
+    }
+
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        self.native_reasoning_effort_off_values
     }
 
     fn renderer_capabilities(&self) -> RendererCapabilities {

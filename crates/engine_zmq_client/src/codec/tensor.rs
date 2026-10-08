@@ -11,8 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use super::dtype::{
-    convert_to_u32, decode_error, decode_f32_vec, decode_i32_vec, decode_i64_vec, parse_dtype,
-    Endianness, ScalarType,
+    convert_to_u32, decode_error, decode_f32_vec, decode_float_vec, decode_i32_vec, decode_i64_vec,
+    parse_dtype, Endianness, ScalarType,
 };
 use crate::error::Result;
 
@@ -395,6 +395,35 @@ pub fn decode_array2_f32(
     })
 }
 
+/// A floating-point tensor decoded to `f32`, flattened in row-major order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedFloatTensor {
+    pub shape: Vec<usize>,
+    pub data: Vec<f32>,
+}
+
+/// Decode a floating-point tensor of any rank (float32, float16, bfloat16 or
+/// float64 elements) to `f32` values.
+pub fn decode_tensor_f32(
+    value: WireNdArray,
+    field: &str,
+    frames: &[Bytes],
+) -> Result<DecodedFloatTensor> {
+    let (shape, bytes, scalar, endianness) = decode_array_metadata(
+        value,
+        field,
+        frames,
+        &[
+            ScalarType::F32,
+            ScalarType::F16,
+            ScalarType::BF16,
+            ScalarType::F64,
+        ],
+    )?;
+    let data = decode_float_vec(&bytes, scalar, endianness, field)?;
+    Ok(DecodedFloatTensor { shape, data })
+}
+
 fn decode_int_as_u32(
     bytes: &[u8],
     scalar: ScalarType,
@@ -410,13 +439,16 @@ fn decode_int_as_u32(
             .into_iter()
             .map(|value| convert_to_u32(value, field))
             .collect(),
-        ScalarType::F32 => Err(decode_error(field, "expected integer dtype, got f32")),
+        ScalarType::F16 | ScalarType::BF16 | ScalarType::F32 | ScalarType::F64 => Err(
+            decode_error(field, &format!("expected integer dtype, got {scalar:?}")),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::unhex;
 
     #[test]
     fn raw_view_serializes_as_msgpack_ext() {
@@ -504,6 +536,55 @@ mod tests {
         let resolved = resolve_array_bytes(WireArrayData::AuxIndex(1), "ids", &frames).unwrap();
         // Zero-copy: the resolved payload aliases the received frame.
         assert_eq!(resolved.as_ptr(), frame.as_ptr());
+    }
+
+    /// Golden bytes from vLLM's `MsgpackEncoder` (vLLM 0.30.1rc1) for
+    /// `torch.tensor([0.25, -1.5, 3.0])` in float32, bfloat16 and float16:
+    /// `(dtype, shape, raw-view ext)` with the dtype as the torch name.
+    #[test]
+    fn decode_tensor_f32_reads_vllm_encoded_torch_tensors() {
+        for (hex, dtype) in [
+            (
+                "93a7666c6f617433329103c70c030000803e0000c0bf00004040",
+                "float32",
+            ),
+            ("93a862666c6f617431369103c70603803ec0bf4040", "bfloat16"),
+            ("93a7666c6f617431369103c70603003400be0042", "float16"),
+        ] {
+            let bytes = unhex(hex);
+            let wire: WireNdArray = rmp_serde::from_slice(&bytes).expect("wire tensor");
+            assert_eq!(wire.dtype, dtype);
+            assert_eq!(wire.shape, vec![3]);
+            let decoded = decode_tensor_f32(wire, "t", &[]).unwrap();
+            assert_eq!(decoded.shape, vec![3]);
+            assert_eq!(decoded.data, vec![0.25, -1.5, 3.0], "{dtype}");
+        }
+    }
+
+    /// A tensor over the inline threshold rides as an aux frame: the wire
+    /// tuple carries the frame index (`93 a7 float32 91 60 01`).
+    #[test]
+    fn decode_tensor_f32_follows_an_aux_frame_index() {
+        let wire: WireNdArray =
+            rmp_serde::from_slice(&unhex("93a7666c6f61743332916001")).expect("wire tensor");
+        assert_eq!(wire.data, WireArrayData::AuxIndex(1));
+        let values: Vec<f32> = (0..96).map(|i| i as f32 / 8.0).collect();
+        let frame = Bytes::from(
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let decoded = decode_tensor_f32(wire, "t", &[Bytes::new(), frame]).unwrap();
+        assert_eq!(decoded.shape, vec![96]);
+        assert_eq!(decoded.data, values);
+    }
+
+    #[test]
+    fn decode_tensor_f32_rejects_integer_dtypes() {
+        let wire = WireNdArray::from_i64(vec![1], vec![7]).unwrap();
+        let error = decode_tensor_f32(wire, "t", &[]).unwrap_err();
+        assert!(error.to_string().contains("expected dtype in"), "{error}");
     }
 
     #[test]

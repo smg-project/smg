@@ -1,27 +1,7 @@
 #!/bin/bash
-# Install TokenSpeed from source (engine + kernel + scheduler) for CI.
-#
-# Mirrors the upstream install pattern (see tokenspeed's docs / test/ci_system/
-# install_deps.sh): one editable pip install per package, in engine →
-# kernel → scheduler order. The kernel package's metadata pulls in its
-# own CUDA dependencies, so we don't pre-install requirements files.
-#
-# Prerequisites (expected on k8s-runner-gpu nodes):
-#   - NVIDIA driver 580+ (CUDA 13)
-#   - CUDA 13.0 toolkit at /usr/local/cuda-13.0 or /usr/local/cuda
-#   - H100 GPUs (sm90)
-#
-# Fast path: docker/ci-tokenspeed.Dockerfile bakes this script's source build
-# (TOKENSPEED_BUILD_ONLY=1) into the CI image and stamps the built ref at
-# /opt/smg-ci/tokenspeed.ref. When that stamp matches the pinned ref, the
-# source build is skipped and only the per-PR SMG gRPC glue below runs —
-# that part must run every job so proto/servicer changes in the PR land.
-#
-# Env knobs:
-#   TOKENSPEED_BUILD_ONLY=1    image build: run the source build and write the
-#                              stamp, skip the SMG glue + verification (the
-#                              per-PR glue never belongs in the image).
-#   TOKENSPEED_FORCE_SOURCE=1  ignore a matching stamp and build from source.
+# Install the latest published TokenSpeed nightly for CI.
+# CUDA tooling supports runtime JIT; SMG gRPC packages come from this checkout.
+# TOKENSPEED_BUILD_ONLY=1 prepares the carrier image without per-PR SMG glue.
 
 set -euo pipefail
 
@@ -38,28 +18,13 @@ if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
 fi
 
-# Pinned SHA from lightseekorg/tokenspeed main, single-sourced from
-# .github/versions/tokenspeed.ref (also read by ci-tokenspeed-image.yml, the
-# prebuilt-image resolution in pr-test-rust.yml, and
-# check_engine_versions.sh). Bump the file explicitly (the engine-watch
-# workflow files an issue when this drifts) rather than floating against
-# ``main`` — upstream has renamed APIs before and the gRPC servicer broke
-# until we caught up.
-if [ -z "${TOKENSPEED_REF:-}" ]; then
-    TOKENSPEED_REF="$(tr -d '[:space:]' < "${REPO_ROOT}/.github/versions/tokenspeed.ref")"
-fi
-if [ -z "$TOKENSPEED_REF" ]; then
-    echo "ERROR: could not resolve TOKENSPEED_REF (env unset and ref file empty)" >&2
-    exit 1
-fi
-TOKENSPEED_REPO="${TOKENSPEED_REPO:-https://github.com/lightseekorg/tokenspeed.git}"
-TOKENSPEED_DIR="${TOKENSPEED_DIR:-/tmp/tokenspeed-src}"
-# Stamp written by the prebuilt-image build (TOKENSPEED_BUILD_ONLY=1);
-# presence + ref match means this container already carries the pinned build.
+# Keep the carrier stamp compatible with the image cache tooling. The ref
+# identifies the carrier, while pip selects the latest published nightly.
+TOKENSPEED_REF="${TOKENSPEED_REF:-$(tr -d '[:space:]' < "${REPO_ROOT}/.github/versions/tokenspeed.ref")}"
 TOKENSPEED_PREBUILT_STAMP="${TOKENSPEED_PREBUILT_STAMP:-/opt/smg-ci/tokenspeed.ref}"
 
 # Install uv for faster package management (mirrors ci_install_sglang.sh).
-# Both the source build and the SMG glue below use it.
+# The SMG glue below uses it.
 if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
     $RETRY 3 5 bash -c 'set -o pipefail; curl -LsSf https://astral.sh/uv/install.sh | sh'
@@ -127,7 +92,7 @@ ensure_rdma_libs() {
     # reports as a generic "please install mooncake".
     #
     # Like the CUDA toolkit and Python headers above, these belong to the
-    # runner and are not part of the prebuilt payload: the source build only
+    # runner and are not part of the prebuilt payload: the package install only
     # ever pulled them in as a transitive dependency of libopenmpi-dev, so the
     # prebuilt fast path leaves the runner without them. Install them
     # explicitly on both paths, same set as ci_install_vllm.sh.
@@ -147,99 +112,36 @@ ensure_rdma_libs() {
     $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libnuma1 libibverbs1 ibverbs-providers
 }
 
-install_tokenspeed_from_source() {
-    # ── Clone TokenSpeed ───────────────────────────────────────────────────
-    # ``git clone --branch`` only accepts branch/tag names, not SHAs, so we
-    # init+fetch+checkout instead. Works for both SHAs and refs.
-    if [ ! -d "$TOKENSPEED_DIR" ]; then
-        echo "Cloning TokenSpeed ${TOKENSPEED_REF} from ${TOKENSPEED_REPO}..."
-        git init -q "$TOKENSPEED_DIR"
-        (cd "$TOKENSPEED_DIR" \
-            && git remote add origin "$TOKENSPEED_REPO" \
-            && $RETRY 3 10 git fetch --depth 1 origin "$TOKENSPEED_REF" \
-            && git checkout FETCH_HEAD)
-    else
-        echo "TokenSpeed clone exists at $TOKENSPEED_DIR, reusing"
-        (cd "$TOKENSPEED_DIR" && $RETRY 3 10 git fetch --depth 1 origin "$TOKENSPEED_REF" && git checkout "$TOKENSPEED_REF")
+install_tokenspeed() {
+    # Reuse downloaded wheels across ephemeral runner jobs when available.
+    if [ "${TOKENSPEED_BUILD_ONLY:-0}" != "1" ]; then
+        cache="${PIP_CACHE_DIR:-/models/.ci-cache/pip}"
+        if mkdir -p "$cache" 2>/dev/null && [ -w "$cache" ]; then
+            export PIP_CACHE_DIR="$cache"
+        fi
     fi
-
-    cd "$TOKENSPEED_DIR"
-
-    # ── System dependencies (mirrors docker/Dockerfile) ────────────────────
-    export DEBIAN_FRONTEND=noninteractive
-    bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
-    $RETRY 3 10 $SUDO apt-get update -qq
-    $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libssl-dev libopenmpi-dev cmake
-
-    # ── TokenSpeed packages ────────────────────────────────────────────────
-    export MAX_JOBS="${MAX_JOBS:-16}"
-    export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-9.0a 10.0a}"
-    # Select the CUDA kernel backend explicitly, as TokenSpeed's own install_deps.sh
-    # does on the kernel build (otherwise the native build path can differ).
-    export TOKENSPEED_KERNEL_BACKEND="${TOKENSPEED_KERNEL_BACKEND:-cuda}"
-
-    # The kernel's torch cpp_extension build must link a torch built for CUDA 13.
-    # TokenSpeed's CI runs on a cu130 Docker base image that already ships it; the
-    # generic k8s runner does not, so pip/uv would pull the default PyPI torch
-    # (CUDA 12.x). That drops nvidia-cuda-runtime-cu12's own crt/host_runtime.h on
-    # the include path, and nvcc 13's cudafe++ then generates a host stub that fails
-    # to compile against those cu12 headers: "'__cudaLaunch' was not declared".
-    # Point pip/uv at the cu130 wheel index (mirrors install_deps.sh line 118) so
-    # every install below resolves the CUDA-13 torch + nvidia deps.
-    export PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
-    export UV_EXTRA_INDEX_URL="${UV_EXTRA_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
-    # Match pip's cross-index best-version semantics (what upstream's pip-based
-    # install_deps.sh relies on). uv's default first-index strategy pins each
-    # package to the first index carrying it, so the cu130 index's stale
-    # ``packaging`` (<=24.1) would block flashinfer-python's packaging>=24.2.
-    export UV_INDEX_STRATEGY="${UV_INDEX_STRATEGY:-unsafe-best-match}"
-
-    # Keep Cutlass DSL and quack versioning owned by TokenSpeed's requirements.
-    # Duplicating those exact pins here makes the install unsatisfiable when
-    # TokenSpeed advances the compatible pair together.
-
-    # Preseed build-time tooling: ``./python`` and ``tokenspeed-kernel`` use
-    # ``setuptools.build_meta`` without declaring ``setuptools`` in
-    # ``build-system.requires``, and we install with ``--no-build-isolation``.
-    $RETRY 3 10 uv pip install setuptools wheel pybind11
-
-    # Install the CUDA-13 torch build explicitly (the +cu130 local wheel) before the
-    # --no-build-isolation kernel compile below, so the build links matching CUDA 13
-    # headers instead of the default PyPI (cu12.x) torch. Pin tracks TokenSpeed's
-    # torch requirement; bump alongside the ref in .github/versions/tokenspeed.ref.
-    $RETRY 3 10 uv pip install "torch==2.14.0+cu130"
-
-    # The kernel's host-stub compile binds crt/host_runtime.h from torch's bundled
-    # cu13 headers (site-packages/nvidia/cu*/include/crt) no matter the -I order,
-    # and those are a newer patch (nvidia-cuda-runtime 13.0.96) than the apt system
-    # nvcc (13.0.88): the 88 nvcc emits a 2-arg __cudaLaunch stub the 96 header's
-    # 1-arg macro can't satisfy -> "'__cudaLaunch' was not declared". Those crt dirs
-    # are pulled by the kernel build's own dependency resolution, so materialize
-    # them with a first build pass (tolerate its compile failure), realign every
-    # bundled crt to the system toolkit, then build for real -- deps are satisfied
-    # now, so nothing re-pulls the crt.
-    uv pip install -e tokenspeed-kernel/python/ --no-build-isolation || \
-        echo "first kernel build pass failed (expected: crt skew); realigning crt headers"
-
-    local _sys_crt="${CUDA_HOME}/include/crt"
-    local _purelib
-    _purelib="$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-    if [ -d "$_sys_crt" ] && [ -d "$_purelib" ]; then
-        local _aligned=0
-        while IFS= read -r -d '' _pip_crt; do
-            echo "Aligning bundled CUDA crt to system: ${_pip_crt} -> ${_sys_crt}"
-            rm -rf "$_pip_crt"
-            ln -sfnT "$_sys_crt" "$_pip_crt"
-            _aligned=1
-        done < <(find "$_purelib" -type d -path '*/nvidia/cu*/include/crt' -print0 2>/dev/null)
-        [ "$_aligned" = 1 ] || echo "WARNING: no bundled nvidia crt dirs found under ${_purelib}" >&2
+    requirement="tokenspeed"
+    if [ -n "${TOKENSPEED_VERSION:-}" ]; then
+        requirement="tokenspeed==${TOKENSPEED_VERSION}"
     fi
+    $RETRY 3 10 python3 -m pip install --upgrade "$requirement" \
+        --extra-index-url https://lightseek.org/whl/nightly
+    python3 - <<'PY'
+import os
+import re
+from importlib import metadata
 
-    uv pip install -e tokenspeed-kernel/python/ --no-build-isolation
-    $RETRY 3 10 uv pip install -e tokenspeed-scheduler/
-    $RETRY 3 10 uv pip install -e "./python" --no-build-isolation
-
-    cd "$REPO_ROOT"
+version = metadata.version("tokenspeed")
+print(f"Installed tokenspeed=={version}", flush=True)
+nightly = re.fullmatch(r"\d+\.\d+\.\d+\.post(\d{8})", version)
+if nightly is None:
+    raise RuntimeError(f"Expected a dated TokenSpeed nightly, installed {version}")
+expected = os.environ.get("TOKENSPEED_VERSION")
+if expected and version != expected:
+    raise RuntimeError(f"Expected tokenspeed=={expected}, installed {version}")
+print(f"TokenSpeed nightly date: {nightly.group(1)}", flush=True)
+PY
+    $RETRY 3 10 python3 "${SCRIPT_DIR}/ci_install_flashinfer.py"
 }
 
 persist_ci_env() {
@@ -277,18 +179,6 @@ install_smg_glue() {
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
-# Prebuilt fast path: the stamp must match the pinned ref AND the engine must
-# actually import in the active venv (a stale image or a venv the baked-venv
-# adoption skipped degrades to the source build, never to a broken lane).
-use_prebuilt=0
-if [ "${TOKENSPEED_BUILD_ONLY:-0}" != "1" ] && [ "${TOKENSPEED_FORCE_SOURCE:-0}" != "1" ] \
-    && [ -f "$TOKENSPEED_PREBUILT_STAMP" ] \
-    && [ "$(tr -d '[:space:]' < "$TOKENSPEED_PREBUILT_STAMP")" = "$TOKENSPEED_REF" ] \
-    && python3 -c "import tokenspeed" &> /dev/null; then
-    use_prebuilt=1
-    echo "Prebuilt TokenSpeed ${TOKENSPEED_REF} found (stamp ${TOKENSPEED_PREBUILT_STAMP}); skipping source build"
-fi
-
 setup_cuda_env
 # Python dev headers: Triton compiles against them at runtime, and the baked
 # venv skipped the apt repair that used to provide them by accident. Shared
@@ -296,12 +186,11 @@ setup_cuda_env
 bash "${SCRIPT_DIR}/ci_ensure_python_headers.sh"
 ensure_rdma_libs
 
-if [ "$use_prebuilt" = "0" ]; then
-    install_tokenspeed_from_source
-fi
+# Upgrade even when the carrier already contains TokenSpeed.
+install_tokenspeed
 
 if [ "${TOKENSPEED_BUILD_ONLY:-0}" = "1" ]; then
-    # Image build: stamp the built ref for the per-job fast-path check and
+    # Image build: keep the carrier stamp for cache validation and
     # stop before the per-PR glue.
     mkdir -p "$(dirname "$TOKENSPEED_PREBUILT_STAMP")"
     printf '%s\n' "$TOKENSPEED_REF" > "$TOKENSPEED_PREBUILT_STAMP"

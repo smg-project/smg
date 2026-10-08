@@ -202,6 +202,14 @@ pub trait Tokenizer: Encoder + Decoder {
         &[]
     }
 
+    /// `chat_template_kwargs.reasoning_effort` values that switch this
+    /// tokenizer's renderer out of thinking mode. Empty when the renderer
+    /// has no such word of its own (the protocol-level `none`/`minimal`
+    /// still apply).
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Renderer behaviours the gateway mirrors when it prepares a request.
     fn renderer_capabilities(&self) -> RendererCapabilities {
         RendererCapabilities::default()

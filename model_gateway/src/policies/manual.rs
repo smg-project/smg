@@ -11,9 +11,9 @@
 //! for example with stateful chat sessions where context is stored on the worker.
 //!
 //! ## Key sources
-//! - `SelectWorkerInfo::rid_key`: the session key derived from the request
-//!   body's `rid` (populated under `--routing-key-override`); outranks the header
-//! - `X-SMG-Routing-Key`: The routing key for sticky session routing
+//! - `X-SMG-Routing-Key`: The preferred routing key for sticky session routing
+//! - `SelectWorkerInfo::rid_key`: the fallback session key derived from the
+//!   request body's `rid` (populated under `--routing-key-override`)
 
 use std::{sync::Arc, time::Instant};
 
@@ -27,7 +27,7 @@ use super::{
 };
 use crate::{
     config::ManualAssignmentMode, observability::metrics::Metrics,
-    routers::common::header_utils::extract_routing_key, worker::Worker,
+    routers::common::header_utils::extract_routing_key_hint, worker::Worker,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,11 +288,12 @@ impl ManualPolicy {
             return (None, ExecutionBranch::NoHealthyWorkers);
         }
 
-        // The rid-derived session key outranks the routing-key header. The
-        // registry populates it only under the routing-key override, already
-        // lineage-stripped, so a proxy that rotates the header per request
-        // cannot break a conversation's pin.
-        let routing_id = info.rid_key.or_else(|| extract_routing_key(info.headers));
+        // Explicit conversation affinity must survive a fresh request ID on
+        // each call. The rid-derived session key only fills in a missing key.
+        let routing_id = info
+            .routing_key
+            .or_else(|| extract_routing_key_hint(info.headers))
+            .or(info.rid_key);
         if let Some(routing_id) = routing_id {
             // Single is the common leg; route on the bare key to skip the
             // per-request allocation. PD legs namespace so prefill and decode
@@ -459,32 +460,28 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_rid_key_outranks_header_key() {
+    fn test_manual_header_key_outranks_rid_key() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
-        // One conversation (rid-derived key) whose per-request header key
-        // rotates: the pin must follow the rid, not the header.
-        let header_a = headers_with_routing_key("key_a");
-        let header_b = headers_with_routing_key("key_b");
+        let headers = headers_with_routing_key("conv");
         let turn1 = SelectWorkerInfo {
-            headers: Some(&header_a),
-            rid_key: Some("conv"),
+            headers: Some(&headers),
+            rid_key: Some("request-1"),
             ..Default::default()
         };
         let turn2 = SelectWorkerInfo {
-            headers: Some(&header_b),
-            rid_key: Some("conv"),
+            headers: Some(&headers),
+            rid_key: Some("request-2"),
             ..Default::default()
         };
 
         let (first, branch) = policy.select_worker_impl(&workers, &turn1);
         assert_eq!(branch, ExecutionBranch::Vacant);
         let (second, branch) = policy.select_worker_impl(&workers, &turn2);
-        assert_eq!(second, first, "rid-derived key must outrank the header key");
+        assert_eq!(second, first, "header key must outrank fresh request IDs");
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
 
-        // The pin lives under the rid-derived key, not under either header.
         assert_eq!(policy.routing_map.len(), 1);
         assert!(policy.routing_map.contains_key(&RoutingId::new("conv")));
     }

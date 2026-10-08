@@ -8,24 +8,44 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Jemalloc's run-time options for a long-running server. With the stock
+// settings a thread's freed pages decay back to the OS only when that thread
+// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
+// resident over ~270 MB of live objects (soak s2, ten hours). A background
+// thread purges on schedule instead; dirty pages are returned after 10 s and
+// muzzy pages at once. This is jemalloc's application-provided `malloc_conf`
+// string under the vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF`
+// environment variable is read after it and overrides it entry by entry.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 61] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0\0";
+
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
         resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode,
-        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, ManualAssignmentMode,
+        MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
+        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
+        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
+        logging::close_logging,
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
+    policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
     server::{self, ServerConfig},
-    service_discovery::{ModelIdSource, ServiceDiscoveryConfig},
+    service_discovery::{ModelIdSource, RuntimeDiscoveryConfig},
     version,
     worker::{ConnectionMode, RuntimeType},
 };
@@ -109,6 +129,13 @@ impl std::fmt::Display for Backend {
     }
 }
 
+/// A worker discovery provider, as `--discovery-provider` names it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DiscoveryProvider {
+    #[value(name = "kubernetes")]
+    Kubernetes,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "shepherd-model-gateway", alias = "smg", alias = "amg")]
 #[command(about = "Shepherd Model Gateway - High-performance inference gateway")]
@@ -164,6 +191,12 @@ enum Commands {
 fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
     TransportMode::parse(value)
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
+}
+
+/// Parse the `--kv-index` value into a `KvIndexKind`.
+fn parse_kv_index_kind(value: &str) -> Result<KvIndexKind, String> {
+    KvIndexKind::parse(value)
+        .ok_or_else(|| format!("invalid value '{value}'; expected positional or chain"))
 }
 
 /// Parse the `--mm-processing` value into an `MmProcessingMode`.
@@ -286,50 +319,46 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
-    /// Enable worker overload protection with the gateway default thresholds.
-    ///
-    /// A worker whose load signal crosses a threshold is considered overloaded
-    /// and excluded from routing until the signal recovers; when every worker
-    /// is overloaded, requests are shed immediately rather than queued.
-    ///
-    /// This flag alone applies --worker-overload-token-usage 0.9 and leaves
-    /// --worker-overload-waiting-requests unset: KV token usage means the same
-    /// thing on every engine, while a sensible waiting-requests ceiling is
-    /// workload-dependent, so it has no universal default. Explicit thresholds
-    /// override the default, and either threshold set on its own enables
-    /// protection without this flag — exactly as before it existed. Per-worker
-    /// `overload` blocks on a WorkerSpec override the gateway values per
-    /// signal, and enable protection for that worker even with everything here
-    /// unset.
-    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    /// Worker overload protection (the default; kept so existing command
+    /// lines still parse). A worker whose load report is at or above
+    /// --worker-overload-waiting-requests or --worker-overload-token-usage is
+    /// left out of routing while another worker is under them; when every
+    /// worker is over them the request goes to the least-loaded one, unless
+    /// --worker-overload-shed asks for a 503 instead. Evaluated once per load
+    /// report, never per request. Per-worker `overload` blocks on a WorkerSpec
+    /// override the gateway values per signal
+    #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
 
-    /// Queued-request count at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when
-    /// every worker is overloaded, requests are shed immediately rather than
-    /// queued. Unset disables overload protection.
-    ///
-    /// Queued (waiting) requests, summed across DP ranks. Must be >= 1: the
-    /// comparison is inclusive, so 0 would veto every worker unconditionally.
-    #[arg(long, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
-    worker_overload_waiting_requests: Option<usize>,
+    /// Switch worker overload protection off: no worker is ever left out of
+    /// routing for its waiting queue or KV usage (per-worker `overload` blocks
+    /// on a WorkerSpec still apply)
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    disable_worker_overload_protection: bool,
 
-    /// KV-cache token usage at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when
-    /// every worker is overloaded, requests are shed immediately rather than
-    /// queued. Unset disables overload protection.
-    ///
-    /// Mean KV-cache token usage across DP ranks, the same signal
-    /// `--balance-token-usage-threshold` reads, applied as an absolute
-    /// per-worker ceiling rather than a fleet-relative spread. Backend must
-    /// report token_usage. Must be in (0.0, 1.0]: the comparison is inclusive,
-    /// so 0.0 would veto every worker unconditionally.
-    ///
-    /// Distinct from `--overload-token-usage-threshold`, which only de-ranks
-    /// the hottest backend within cache-aware affinity; this flag removes the
-    /// worker from routing entirely and sheds when every worker crosses it.
-    #[arg(long, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
-    worker_overload_token_usage: Option<f64>,
+    /// Queued (waiting) requests, summed across DP ranks, at or above which a
+    /// worker counts as overloaded. Must be >= 1: the comparison is inclusive,
+    /// so 0 would veto every worker unconditionally
+    #[arg(long, default_value_t = 8, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    worker_overload_waiting_requests: usize,
+
+    /// Mean KV-cache token usage across DP ranks at or above which a worker
+    /// counts as overloaded: the same signal --balance-token-usage-threshold
+    /// reads, applied as an absolute per-worker ceiling rather than a
+    /// fleet-relative spread. Backend must report token_usage. Must be in
+    /// (0.0, 1.0]: the comparison is inclusive, so 0.0 would veto every worker
+    /// unconditionally. Distinct from --overload-token-usage-threshold, which
+    /// only de-ranks the hottest backend within cache-aware affinity
+    #[arg(long, default_value_t = 0.8, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
+    worker_overload_token_usage: f64,
+
+    /// Refuse a request with a 503 (worker_overload_protection_shed,
+    /// Retry-After the load poll interval) when every worker it could use is
+    /// overloaded, instead of routing it to the least-loaded one; also sheds a
+    /// worker that crossed a threshold between selection and dispatch. Off by
+    /// default: steering never turns a load signal into an outage
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    worker_overload_shed: bool,
 
     /// Anti-hotspot decay: de-rank cache-affine candidates by their
     /// waiting-prefill backlog (overlap score divided by 1 + overlap_decay
@@ -343,6 +372,24 @@ struct CliArgs {
     /// argmax.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     selection_temperature: f32,
+
+    /// Worker selection policy for cache_aware, run over the per-worker
+    /// inputs the router gathers (prefix overlap, in-flight requests,
+    /// backend load reports); cache-aware-default, the affinity-group
+    /// decision, is the one policy
+    #[arg(
+        long,
+        default_value = "cache-aware-default",
+        help_heading = "Routing Policy"
+    )]
+    selection_policy: String,
+
+    /// Lifetime in milliseconds of optimistic dispatch bookings for
+    /// cache_aware: predicted prefill and prefix placement are charged to the
+    /// chosen worker until the engine reports them or the booking expires.
+    /// 0 disables; set a little above the engine's KV-event lag
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    selection_accounting_ttl_ms: u64,
 
     /// Interval in seconds between cache-tree eviction cycles
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -434,11 +481,10 @@ struct CliArgs {
     dp_aware: bool,
 
     /// Sticky sessions: route every request of a conversation to the same
-    /// worker, on any policy. The key is derived from the request body's rid
-    /// with per-turn/per-retry suffixes stripped (conv_t2_r1 -> conv),
-    /// falling back to the routing-key headers when no rid is present.
-    /// Enabling this keeps automatic body forwarding buffered so body rid
-    /// precedence is preserved.
+    /// worker, on any policy. Valid routing-key headers take priority over
+    /// a key derived from the request body's rid, with per-turn/per-retry
+    /// suffixes stripped (conv_t2_r1 -> conv). Enabling this keeps automatic
+    /// body forwarding buffered so the body rid remains available as fallback.
     /// Reuses the manual eviction/idle/assignment knobs for the sticky map
     #[arg(
         long,
@@ -515,6 +561,18 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
+    /// Maximum in-flight Prefill requests per worker in PD or EPD mode (non-positive to disable)
+    #[arg(long, default_value_t = -1, help_heading = "PD Disaggregation")]
+    prefill_max_inflight_requests_per_worker: i32,
+
+    /// Maximum number of requests waiting for Prefill admission (default: 100 when enabled)
+    #[arg(long, help_heading = "PD Disaggregation")]
+    prefill_queue_size: Option<usize>,
+
+    /// Maximum time in seconds a request may wait for Prefill admission (default: 60 when enabled)
+    #[arg(long, help_heading = "PD Disaggregation")]
+    prefill_queue_timeout_secs: Option<u64>,
+
     /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
     #[arg(long, value_parser = ["random", "round_robin", "consistent_hashing"], help_heading = "PD Disaggregation")]
     encode_policy: Option<String>,
@@ -559,6 +617,54 @@ struct CliArgs {
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// Seconds without any contact from a worker (a load poll, a health probe,
+    /// a KV event, a response) after which a transport failure excludes it
+    /// from routing; the first successful contact re-admits it.
+    #[arg(long, default_value_t = 2, help_heading = "Load Monitoring")]
+    worker_stall_secs: u64,
+
+    /// Seconds without a token or a completion from a worker with requests
+    /// in flight whose waiting queue grows, or whose in-flight pile grows or
+    /// is four deep, after which new requests stop being routed to it until
+    /// it makes progress. The bound stretches to the time its in-flight
+    /// prompts may still need in prefill, up to 120 seconds. The pile is the
+    /// streaming gRPC generations in flight; HTTP workers, PD legs and
+    /// non-streaming generations give no signal and never form one. 0
+    /// disables the rule.
+    #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
+    worker_wedge_secs: u64,
+
+    /// Warm-up slice for cache-aware routing: for this many seconds after a
+    /// worker becomes routable, until its index has grown by
+    /// --worker-warmup-blocks blocks, one cache miss in 1/--worker-warmup-share
+    /// is routed to it so it builds a cache instead of idling. 0 disables.
+    #[arg(long, default_value_t = 60, help_heading = "Routing Policy")]
+    worker_warmup_secs: u64,
+
+    /// Share of cache misses offered to warming workers (0.0 to 1.0).
+    #[arg(long, default_value_t = 0.25, help_heading = "Routing Policy")]
+    worker_warmup_share: f32,
+
+    /// A worker whose index has grown by this many blocks since it became
+    /// thin is warm.
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
+    worker_warmup_blocks: usize,
+
+    /// A worker whose index holds less than this share of the fleet's median
+    /// (or nothing) is thin and receives the warm-up slice until it has grown
+    /// by --worker-warmup-blocks, whatever emptied it (a resync after a
+    /// publisher restart, an out-of-range or data-loss resubscription, an
+    /// engine that came back empty). 0 keeps the age rule alone.
+    #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
+    worker_warmup_thin_ratio: f32,
+
+    /// One cache hit in this many is diverted to a thin worker although
+    /// another worker holds its prefix (shallow overlaps first, one in flight
+    /// per thin worker), so an index emptied by a resync refills on a
+    /// workload where every request has a holder. 0 disables.
+    #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
+    worker_warmup_divert_every: u64,
+
     /// Only poll worker loads when a load-aware routing policy,
     /// --engine-metrics, or worker overload protection needs the data. By
     /// default every worker group is polled from registration onward; this
@@ -569,6 +675,9 @@ struct CliArgs {
 
     /// Force GetLoads polling for smg_engine_* Prometheus gauges even without
     /// a load-aware routing policy. Routing-owned polls are always re-exported.
+    /// A worker whose KV-event stream pushes its load feeds the gauges from
+    /// those records and is not polled while they flow (GetLoads is the
+    /// fallback).
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
 
@@ -594,6 +703,15 @@ struct CliArgs {
     /// ceiling. Unset or 0 disables the ceiling.
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_max_entries: Option<usize>,
+
+    /// The event-driven KV index behind cache-aware routing: `positional`
+    /// (one entry per block position, the default) or `chain` (chains as runs
+    /// with per-run worker coverage; lock-free, store-free lookups; `run` is
+    /// its deprecated spelling). The --kv-indexer-* prune bounds apply to the
+    /// positional index only; the chain index holds what the engines report
+    /// and shrinks with their removals.
+    #[arg(long, default_value = "positional", value_parser = parse_kv_index_kind, help_heading = "Routing Policy")]
+    kv_index: KvIndexKind,
 
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
     /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
@@ -655,13 +773,23 @@ struct CliArgs {
     log_mm_timing: bool,
 
     // ==================== Service Discovery (Kubernetes) ====================
-    /// Enable Kubernetes service discovery
+    /// Enable Kubernetes service discovery (the legacy spelling of
+    /// `--discovery-provider kubernetes`)
     #[arg(
         long,
         default_value_t = false,
         help_heading = "Service Discovery (Kubernetes)"
     )]
     service_discovery: bool,
+
+    /// Worker discovery provider. Give this or `--service-discovery`, not both
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with = "service_discovery",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    discovery_provider: Option<DiscoveryProvider>,
 
     /// Label selector for Kubernetes service discovery (format: key=value)
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -1399,6 +1527,24 @@ impl CliArgs {
             .unwrap_or(ConnectionMode::Http)
     }
 
+    /// The worker discovery provider selected by either spelling:
+    /// `--service-discovery` is `--discovery-provider kubernetes`.
+    fn selected_discovery_provider(&self) -> Option<DiscoveryProvider> {
+        if self.service_discovery {
+            Some(DiscoveryProvider::Kubernetes)
+        } else {
+            self.discovery_provider
+        }
+    }
+
+    /// Selecting a discovery provider, by either spelling, turns IGW mode on.
+    /// Returns whether this call turned it on.
+    fn enable_igw_for_discovery(&mut self) -> bool {
+        let enable = self.selected_discovery_provider().is_some() && !self.enable_igw;
+        self.enable_igw |= enable;
+        enable
+    }
+
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for item in selector_list {
@@ -1514,6 +1660,9 @@ impl CliArgs {
                 cache_index: Self::parse_cache_index(&self.cache_index),
                 cache_ttl_secs: self.cache_ttl_secs,
                 cache_boundaries: self.cache_boundaries.clone(),
+                selection_policy: (self.selection_policy != DEFAULT_SELECTION_POLICY)
+                    .then(|| self.selection_policy.clone()),
+                selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -1767,27 +1916,28 @@ impl CliArgs {
 
         let policy = self.parse_policy(&self.policy);
 
-        let discovery = if self.service_discovery {
-            Some(DiscoveryConfig {
-                enabled: true,
-                namespace: self.service_discovery_namespace.clone(),
-                port: self.service_discovery_port,
-                check_interval_secs: 60,
-                selector: Self::parse_selector(&self.selector),
-                encode_selector: Self::parse_selector(&self.encode_selector),
-                prefill_selector: Self::parse_selector(&self.prefill_selector),
-                decode_selector: Self::parse_selector(&self.decode_selector),
-                bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-                worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                kv_connector_annotation: self.kv_connector_annotation.clone(),
-                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
-                router_selector: Self::parse_selector(&self.router_selector),
-                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source: self.model_id_from.clone(),
-            })
-        } else {
-            None
-        };
+        let discovery = self
+            .selected_discovery_provider()
+            .map(|provider| match provider {
+                DiscoveryProvider::Kubernetes => {
+                    DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
+                        namespace: self.service_discovery_namespace.clone(),
+                        port: self.service_discovery_port,
+                        check_interval_secs: 60,
+                        selector: Self::parse_selector(&self.selector),
+                        encode_selector: Self::parse_selector(&self.encode_selector),
+                        prefill_selector: Self::parse_selector(&self.prefill_selector),
+                        decode_selector: Self::parse_selector(&self.decode_selector),
+                        bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                        worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                        kv_connector_annotation: self.kv_connector_annotation.clone(),
+                        kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                        router_selector: Self::parse_selector(&self.router_selector),
+                        router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
+                        model_id_source: self.model_id_from.clone(),
+                    })
+                }
+            });
 
         let metrics = Some(MetricsConfig {
             port: self.prometheus_port,
@@ -1845,6 +1995,7 @@ impl CliArgs {
             match self.backend {
                 Some(Backend::Vllm) => Some(RuntimeType::Vllm),
                 Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+                Some(Backend::Sglang) => Some(RuntimeType::Sglang),
                 _ => None,
             }
         } else {
@@ -1919,13 +2070,26 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .worker_stall_secs(self.worker_stall_secs)
+            .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_warmup(
+                self.worker_warmup_secs,
+                self.worker_warmup_share,
+                self.worker_warmup_blocks,
+                self.worker_warmup_thin_ratio,
+                self.worker_warmup_divert_every,
+            )
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)
-            .worker_overload_protection(self.worker_overload_protection)
-            .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
-            .worker_overload_token_usage(self.worker_overload_token_usage)
+            .worker_overload_protection(
+                self.worker_overload_protection && !self.disable_worker_overload_protection,
+            )
+            .worker_overload_waiting_requests(Some(self.worker_overload_waiting_requests))
+            .worker_overload_token_usage(Some(self.worker_overload_token_usage))
+            .worker_overload_shed(self.worker_overload_shed)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
+            .kv_index(self.kv_index)
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
@@ -1940,6 +2104,9 @@ impl CliArgs {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
+            .prefill_queue_size(self.prefill_queue_size)
+            .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
             .priority_scheduler_enabled(self.priority_scheduler_enabled)
             .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
             .priority_scheduler_config(self.priority_scheduler_config.clone())
@@ -1969,7 +2136,7 @@ impl CliArgs {
                 disable_health_check: self.disable_health_check,
                 remove_unhealthy_workers: resolve_worker_auto_recovery(
                     self.remove_unhealthy_workers,
-                    self.service_discovery,
+                    self.selected_discovery_provider().is_some(),
                 ),
                 drain_settle_secs: self.drain_settle_secs,
             })
@@ -2038,74 +2205,15 @@ impl CliArgs {
     }
 
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
-        let service_discovery_config = if self.service_discovery {
-            let (kv_connector_annotation, kv_engine_id_annotation) = router_config
-                .discovery
-                .as_ref()
-                .map(|d| {
-                    (
-                        d.kv_connector_annotation.clone(),
-                        d.kv_engine_id_annotation.clone(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        self.kv_connector_annotation.clone(),
-                        self.kv_engine_id_annotation.clone(),
-                    )
-                });
-
-            let model_id_source = self
-                .model_id_from
-                .as_deref()
-                .or_else(|| {
-                    router_config
-                        .discovery
-                        .as_ref()
-                        .and_then(|d| d.model_id_source.as_deref())
-                })
-                .map(|s| {
-                    ModelIdSource::parse(s).map_err(|e| ConfigError::InvalidValue {
-                        field: "model_id_source".to_string(),
-                        value: s.to_string(),
-                        reason: e,
-                    })
-                })
-                .transpose()?;
-
-            Some(ServiceDiscoveryConfig {
-                enabled: true,
-                selector: Self::parse_selector(&self.selector),
-                check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
-                namespace: self.service_discovery_namespace.clone(),
-                disaggregated_mode: self.pd_disaggregation || self.epd_disaggregation,
-                encode_selector: Self::parse_selector(&self.encode_selector),
-                prefill_selector: Self::parse_selector(&self.prefill_selector),
-                decode_selector: Self::parse_selector(&self.decode_selector),
-                bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-                worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                kv_connector_annotation,
-                kv_engine_id_annotation,
-                model_id_source,
-            })
-        } else {
-            None
-        };
-
-        // Mesh-router discovery now has its own task and lifetime, but its
-        // configuration still arrives inside `discovery`, so it stays reachable
-        // only under `--service-discovery`. Moving it onto its own config
-        // surface lands with the tagged provider configuration.
+        let service_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .map(|discovery| RuntimeDiscoveryConfig::from_config(discovery, &router_config.mode))
+            .transpose()?;
         let mesh_discovery_config = router_config
             .discovery
             .as_ref()
-            .map(|d| MeshDiscoveryConfig {
-                namespace: d.namespace.clone(),
-                router_selector: d.router_selector.clone(),
-                router_mesh_port_annotation: d.router_mesh_port_annotation.clone(),
-            })
-            .filter(MeshDiscoveryConfig::is_enabled);
+            .and_then(MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
@@ -2208,10 +2316,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => cli.router_args,
     };
 
-    // Automatically enable IGW mode when service discovery is turned on
-    if cli_args.service_discovery && !cli_args.enable_igw {
+    if cli_args.enable_igw_for_discovery() {
         println!("INFO: IGW mode automatically enabled because service discovery is turned on");
-        cli_args.enable_igw = true;
     }
 
     let mode_str = if cli_args.enable_igw {
@@ -2271,7 +2377,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::runtime::Runtime::new()?
         }
     };
-    runtime.block_on(Box::pin(server::startup(server_config)))?;
+    let served = runtime.block_on(Box::pin(server::startup(server_config)));
+    // The writer threads outlive `startup` (a process may start more than one
+    // router); flush and stop them now that this process is done logging.
+    close_logging();
+    served?;
     if is_otel_enabled() {
         shutdown_otel();
     }
@@ -2327,6 +2437,33 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_indexer_ttl_secs, None);
         assert_eq!(defaults.kv_indexer_max_entries, None);
+    }
+
+    /// `--kv-index` selects the event-driven index for cache-aware routing;
+    /// the positional indexer stays the default until the chain index has
+    /// passed a soak in the gateway.
+    #[test]
+    fn kv_index_flag_flows_into_router_config() {
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.kv_index, KvIndexKind::Positional);
+
+        let cli = cli_args_from(&["--kv-index", "chain"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.kv_index, KvIndexKind::Chain);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.kv_index, KvIndexKind::Chain);
+        // The spelling before the rename still selects the chain index.
+        assert_eq!(
+            cli_args_from(&["--kv-index", "run"]).kv_index,
+            KvIndexKind::Chain
+        );
+        assert!(KvIndexKind::deprecated_alias_used());
+
+        assert_eq!(
+            cli_args_from(&["--kv-index", "Positional"]).kv_index,
+            KvIndexKind::Positional
+        );
+        assert!(parse_kv_index_kind("tree").is_err());
     }
 
     /// The retry-buffer cap must flow through both conversion paths.
@@ -2523,9 +2660,9 @@ mod tests {
     }
 
     /// Mesh-router discovery has its own task and lifetime, but is still
-    /// configured through `discovery`, which only `--service-discovery`
-    /// populates. `--router-selector` alone therefore still does nothing; it
-    /// gains its own config surface with the tagged provider configuration.
+    /// configured through Kubernetes `discovery`, which only a selected
+    /// Kubernetes provider populates. `--router-selector` alone therefore
+    /// still does nothing until router discovery gets its own config surface.
     #[test]
     fn router_selector_alone_does_not_yet_configure_mesh_discovery() {
         let cli = cli_args_from(&["--router-selector", "role=router"]);
@@ -2617,21 +2754,101 @@ mod tests {
             "example.com/engine-id",
         ]);
         let router = cli.to_router_config(vec![], vec![]).unwrap();
-        let discovery = router.discovery.as_ref().unwrap();
+        let Some(DiscoveryConfig::Kubernetes(discovery)) = &router.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
         assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
         assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
 
         let server = cli.to_server_config(router).unwrap();
-        let discovery = server.service_discovery_config.as_ref().unwrap();
+        let Some(RuntimeDiscoveryConfig::Kubernetes(discovery)) = &server.service_discovery_config
+        else {
+            panic!("expected Kubernetes runtime discovery");
+        };
         assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
         assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
 
         let defaults = cli_args_from(&["--service-discovery", "--selector", "app=worker"])
             .to_router_config(vec![], vec![])
             .unwrap();
-        let defaults = defaults.discovery.as_ref().unwrap();
+        let Some(DiscoveryConfig::Kubernetes(defaults)) = &defaults.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
         assert_eq!(defaults.kv_connector_annotation, "smg.ai/kv-connector");
         assert_eq!(defaults.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    }
+
+    /// `--discovery-provider kubernetes` is `--service-discovery` under its
+    /// new name: the same detail flags build the same configuration, worker
+    /// and router discovery alike.
+    #[test]
+    fn discovery_provider_kubernetes_matches_service_discovery() {
+        let details = [
+            "--selector",
+            "app=worker",
+            "--service-discovery-port",
+            "9000",
+            "--service-discovery-namespace",
+            "prod",
+            "--kv-connector-annotation",
+            "example.com/connector",
+            "--model-id-from",
+            "namespace",
+            "--router-selector",
+            "role=router",
+        ];
+        let build = |selection: &[&str]| {
+            let args: Vec<&str> = selection.iter().chain(details.iter()).copied().collect();
+            let cli = cli_args_from(&args);
+            let router = cli.to_router_config(vec![], vec![]).unwrap();
+            let discovery = router.discovery.clone();
+            let server = cli.to_server_config(router).unwrap();
+            (
+                discovery,
+                format!("{:?}", server.service_discovery_config),
+                format!("{:?}", server.mesh_discovery_config),
+            )
+        };
+
+        let legacy = build(&["--service-discovery"]);
+        let tagged = build(&["--discovery-provider", "kubernetes"]);
+        assert!(matches!(legacy.0, Some(DiscoveryConfig::Kubernetes(_))));
+        assert_eq!(legacy, tagged);
+    }
+
+    /// Two spellings of one choice: giving both is a usage error, not a
+    /// precedence rule to remember.
+    #[test]
+    fn service_discovery_and_discovery_provider_conflict() {
+        let err = Cli::try_parse_from([
+            "smg",
+            "--service-discovery",
+            "--discovery-provider",
+            "kubernetes",
+        ])
+        .expect_err("both spellings must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// IGW mode follows the selected provider, whichever spelling selected it.
+    #[test]
+    fn selecting_a_discovery_provider_enables_igw() {
+        for selection in [
+            &["--service-discovery"][..],
+            &["--discovery-provider", "kubernetes"][..],
+        ] {
+            let mut cli = cli_args_from(selection);
+            assert!(cli.enable_igw_for_discovery(), "{selection:?}");
+            assert!(cli.enable_igw, "{selection:?}");
+        }
+
+        let mut already_on = cli_args_from(&["--service-discovery", "--enable-igw"]);
+        assert!(!already_on.enable_igw_for_discovery());
+        assert!(already_on.enable_igw);
+
+        let mut no_discovery = cli_args_from(&[]);
+        assert!(!no_discovery.enable_igw_for_discovery());
+        assert!(!no_discovery.enable_igw);
     }
 
     /// `--worker-auto-recovery` defaults to the `--service-discovery`
@@ -2645,6 +2862,12 @@ mod tests {
             .to_router_config(vec![], vec![])
             .unwrap();
         assert!(derived_on.health_check.remove_unhealthy_workers);
+
+        let derived_on_tagged =
+            cli_args_from(&["--discovery-provider", "kubernetes", "--selector", "app=w"])
+                .to_router_config(vec![], vec![])
+                .unwrap();
+        assert!(derived_on_tagged.health_check.remove_unhealthy_workers);
 
         let derived_off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert!(!derived_off.health_check.remove_unhealthy_workers);
@@ -2759,25 +2982,48 @@ mod tests {
         );
     }
 
-    /// Unset means off on both paths: the feature must be byte-identical to
-    /// pre-feature behavior until an operator opts in.
+    /// Protection is on by default on both signals, steering only, on both
+    /// config paths.
     #[test]
-    fn worker_overload_thresholds_default_to_unset_in_both_configs() {
+    fn worker_overload_protection_defaults_to_on_and_steering_in_both_configs() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.worker_overload_waiting_requests, None);
-        assert_eq!(router_config.worker_overload_token_usage, None);
+        assert!(router_config.worker_overload_protection);
+        assert_eq!(router_config.worker_overload_waiting_requests, Some(8));
+        assert_eq!(router_config.worker_overload_token_usage, Some(0.8));
+        assert!(!router_config.worker_overload_shed);
 
         let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.worker_overload_protection);
         assert_eq!(
             server_config.router_config.worker_overload_waiting_requests,
-            None
+            Some(8)
         );
         assert_eq!(
             server_config.router_config.worker_overload_token_usage,
-            None
+            Some(0.8)
         );
+        assert!(!server_config.router_config.worker_overload_shed);
+    }
+
+    /// The two opt-outs: `--disable-worker-overload-protection` switches the
+    /// gateway thresholds off, `--worker-overload-shed` turns steering into
+    /// refusal; both must survive into `ServerConfig.router_config`.
+    #[test]
+    fn worker_overload_opt_outs_flow_into_both_configs() {
+        let cli = cli_args_from(&["--disable-worker-overload-protection"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.worker_overload_protection);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.worker_overload_protection);
+
+        let cli = cli_args_from(&["--worker-overload-shed"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router_config.worker_overload_shed);
+        assert!(router_config.worker_overload_protection);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.worker_overload_shed);
     }
 
     /// Both thresholds are `>=` comparisons, so the excluded ends of their
@@ -2818,10 +3064,9 @@ mod tests {
             router_config.disable_load_monitoring,
             "disable_load_monitoring must reach RouterConfig via to_router_config"
         );
-        // The flag alone carries no thresholds; the token default is applied
-        // at resolution, not stored in config.
-        assert_eq!(router_config.worker_overload_waiting_requests, None);
-        assert_eq!(router_config.worker_overload_token_usage, None);
+        // The flag changes nothing: the defaults are already on.
+        assert_eq!(router_config.worker_overload_waiting_requests, Some(8));
+        assert_eq!(router_config.worker_overload_token_usage, Some(0.8));
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert!(
@@ -2834,18 +3079,18 @@ mod tests {
         );
     }
 
-    /// Defaults: protection off, monitoring default-on (opt-out false) — the
-    /// behavior change is monitoring, and it is carried by the default here.
+    /// Defaults: protection on, monitoring on (opt-out false) — both carried
+    /// by the defaults here.
     #[test]
-    fn overload_protection_and_monitoring_flags_default_off_in_both_configs() {
+    fn overload_protection_and_monitoring_default_on_in_both_configs() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert!(!router_config.worker_overload_protection);
+        assert!(router_config.worker_overload_protection);
         assert!(!router_config.disable_load_monitoring);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert!(!server_config.router_config.worker_overload_protection);
+        assert!(server_config.router_config.worker_overload_protection);
         assert!(!server_config.router_config.disable_load_monitoring);
     }
 
@@ -3096,6 +3341,21 @@ mod tests {
             server_config.router_config.startup_worker_runtime_type,
             Some(RuntimeType::TokenSpeed),
             "the runtime pin must survive into ServerConfig via to_server_config"
+        );
+
+        let sglang = cli_args_from(&[
+            "--backend",
+            "sglang",
+            "--worker-urls",
+            "ipc:///tmp/smg-zmq/engine-0",
+        ]);
+        assert_eq!(
+            sglang
+                .to_router_config(vec![], vec![])
+                .unwrap()
+                .startup_worker_runtime_type,
+            Some(RuntimeType::Sglang),
+            "--backend sglang must pin the ZMQ startup worker runtime"
         );
     }
 

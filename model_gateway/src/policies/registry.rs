@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
 };
 
 use dashmap::DashMap;
@@ -23,13 +23,33 @@ use super::{
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
-    observability::metrics::Metrics,
+    observability::{cache_trace, metrics::Metrics},
     policies::cache_aware::LoadReceiver,
     routers::common::header_utils::{
         extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
-    worker::{KvEventMonitor, Worker},
+    worker::{KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
 };
+
+/// Routes a request completion to the policy that placed the request: the
+/// prefill, decode or encode policy by worker type, else the model's policy.
+/// Holds the registry weakly so a worker outliving its registry reports to
+/// nobody instead of keeping the registry alive.
+#[derive(Debug)]
+struct PolicyCompletionSink {
+    registry: Weak<PolicyRegistry>,
+}
+
+impl RequestCompletionSink for PolicyCompletionSink {
+    fn request_completed(&self, worker: &dyn Worker) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        registry
+            .policy_for_worker(worker)
+            .on_request_complete(worker.url(), true);
+    }
+}
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -223,35 +243,41 @@ impl PolicyRegistry {
         })
     }
 
-    /// Whether sticky routing may derive its preferred key from the request
+    /// Use the same header-first key for load accounting and worker selection.
+    pub(crate) fn sticky_key<'a>(
+        &self,
+        headers: Option<&'a HeaderMap>,
+        rid_key: Option<&'a str>,
+    ) -> Option<&'a str> {
+        self.sticky_header_key(headers).or(rid_key)
+    }
+
+    /// Whether sticky routing may derive its fallback key from the request
     /// body's `rid`, requiring automatic body-path selection to keep the body
     /// readable.
     pub(crate) fn routing_key_override_enabled(&self) -> bool {
         self.routing_key_sticky.is_some()
     }
 
-    /// Resolve the effective sticky key: the rid-derived key wins, the
-    /// configured routing-key headers are the fallback when no rid is
-    /// present. Header keys get the same lineage stripping as rid keys, so a
+    /// Resolve the effective sticky key: a valid configured routing-key header
+    /// wins, with the rid-derived key as fallback. Header keys get the same
+    /// lineage stripping as rid keys, so a
     /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
     fn effective_sticky_key<'a>(
         &self,
         info: &SelectWorkerInfo<'a>,
     ) -> Option<(&'a str, &'static str)> {
-        if let Some(key) = info.rid_key {
-            return Some((key, "rid"));
-        }
-        let raw = info
-            .routing_key
-            .or_else(|| self.resolve_routing_key(info.headers))?;
-        Some((Self::strip_header_key(raw), "header"))
+        info.routing_key
+            .or_else(|| self.resolve_routing_key(info.headers))
+            .map(|raw| (Self::strip_header_key(raw), "header"))
+            .or_else(|| info.rid_key.map(|key| (key, "rid")))
     }
 
     /// Select a worker, applying the sticky routing-key override when it is
     /// enabled, the request carries a key from the configured source, and the
     /// configured policy does not already honor the key (`manual` /
     /// `consistent_hashing`, which read `rid_key` and the header themselves
-    /// with the same rid-first precedence). Otherwise delegates to `policy`.
+    /// with the same header-first precedence). Otherwise delegates to `policy`.
     /// `policy.name()` stays the real policy (for metrics).
     pub fn select_worker_for_model(
         &self,
@@ -260,6 +286,7 @@ impl PolicyRegistry {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
+        cache_trace::begin_selection(workers);
         if let Some(sticky) = self.routing_key_sticky.as_ref() {
             if Self::routing_key_override_applies(policy.name()) {
                 if let Some((key, source)) = self.effective_sticky_key(info) {
@@ -269,7 +296,9 @@ impl PolicyRegistry {
                 }
             }
         }
-        policy.select_worker(workers, info)
+        let selected = policy.select_worker(workers, info);
+        cache_trace::selection(policy.name(), "policy", workers, selected);
+        selected
     }
 
     #[cfg(test)]
@@ -318,6 +347,7 @@ impl PolicyRegistry {
         let over_cap =
             |idx: usize| workers[idx].routing_key_inflight(load_key) >= STICKY_INFLIGHT_CAP;
         let finish = |result: Option<usize>, branch: ExecutionBranch| {
+            cache_trace::selection(policy.name(), branch.as_str(), workers, result);
             Metrics::record_worker_manual_policy_branch(branch.as_str());
             Metrics::set_manual_policy_cache_entries(sticky.map_len());
             debug!(
@@ -489,6 +519,36 @@ impl PolicyRegistry {
 
     /// Called when a worker is added
     /// Returns the policy that should be used for this worker's model
+    /// The request-completion observer to install on every worker (see
+    /// [`RequestCompletionSink`]): policies that book state at dispatch
+    /// release it when the request's load guard drops.
+    pub fn completion_sink(self: &Arc<Self>) -> Arc<dyn RequestCompletionSink> {
+        Arc::new(PolicyCompletionSink {
+            registry: Arc::downgrade(self),
+        })
+    }
+
+    /// The policy that places requests on `worker`: the prefill, decode or
+    /// encode policy by worker type, else the model's policy. Completion
+    /// reports and in-flight reconciliation both go there.
+    fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
+        match worker.worker_type() {
+            WorkerType::Prefill => self.get_prefill_policy(),
+            WorkerType::Decode => self.get_decode_policy(),
+            WorkerType::Encode => self.get_encode_policy(),
+            WorkerType::Regular => self.get_policy_or_default(worker.model_id()),
+        }
+    }
+
+    /// Reconcile the policy that places requests on `worker` against the
+    /// router's live in-flight count there (see
+    /// [`LoadBalancingPolicy::reconcile_in_flight`]). The worker monitor
+    /// calls this once per load poll for every polled worker.
+    pub fn reconcile_in_flight(&self, worker: &dyn Worker) {
+        self.policy_for_worker(worker)
+            .reconcile_in_flight(worker.url(), worker.load());
+    }
+
     pub fn on_worker_added(
         &self,
         model_id: &str,
@@ -522,22 +582,32 @@ impl PolicyRegistry {
             model_id
         );
 
-        // Inject and publish under the integration guards so a concurrent
-        // setter cannot fall between them: it either wrote before the reads
-        // here, or its propagation scan runs after the insert and finds
-        // this policy.
-        {
-            let monitor = self.kv_event_monitor.read();
-            let load_rx = self.load_rx.read();
-            let mesh = self.mesh_tree_sync.read();
-            Self::maybe_inject_monitor(&policy, monitor.as_ref());
-            Self::maybe_inject_load_rx(&policy, load_rx.as_ref());
-            Self::maybe_inject_mesh_tree_sync(&policy, mesh.as_ref());
+        self.publish_with_shared_state(&policy, || {
             self.model_policies
                 .insert(model_id.to_string(), Arc::clone(&policy));
-        }
+        });
 
         policy
+    }
+
+    /// Hand `policy` the shared state a cache-aware policy consumes (the KV
+    /// event monitor, the backend load feed, the mesh tree bridge), then run
+    /// `publish` while the three guards are still held. Holding them across
+    /// the publish is what makes this race-free against the setters: a
+    /// setter either wrote before these reads, or its propagation scan runs
+    /// after `publish` and finds the policy in place.
+    fn publish_with_shared_state(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        publish: impl FnOnce(),
+    ) {
+        let monitor = self.kv_event_monitor.read();
+        let load_rx = self.load_rx.read();
+        let mesh = self.mesh_tree_sync.read();
+        Self::maybe_inject_monitor(policy, monitor.as_ref());
+        Self::maybe_inject_load_rx(policy, load_rx.as_ref());
+        Self::maybe_inject_mesh_tree_sync(policy, mesh.as_ref());
+        publish();
     }
 
     /// Called when a worker is removed
@@ -698,11 +768,18 @@ impl PolicyRegistry {
         self.model_worker_counts.clear();
     }
 
-    /// Set the prefill policy for PD mode (lock-free, set once at startup)
+    /// Set the prefill policy for PD mode (set once at startup).
+    ///
+    /// The router factory sets the prefill leg after the app context wired the
+    /// KV event monitor, the load feed and the mesh tree bridge into the
+    /// registry, and those setters only reach policies that already exist,
+    /// so the leg takes that state here, under the shared-state read guards.
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
-        // OnceLock::set returns Err if already set, which we ignore since
-        // the policy should only be set once at startup
-        let _ = self.prefill_policy.set(policy);
+        self.publish_with_shared_state(&policy, || {
+            // OnceLock::set returns Err if already set, which we ignore since
+            // the policy should only be set once at startup
+            let _ = self.prefill_policy.set(Arc::clone(&policy));
+        });
     }
 
     pub fn set_dp_rank_policy(&self, policy: Arc<dyn DPRankLoadPolicy>) {
@@ -716,18 +793,32 @@ impl PolicyRegistry {
         self.dp_rank_policy.get().map(Arc::clone)
     }
 
-    /// Set the decode policy for PD mode (lock-free, set once at startup)
+    /// Set the decode policy for PD mode (set once at startup).
+    ///
+    /// The router factory sets the decode leg after the app context wired the
+    /// KV event monitor, the load feed and the mesh tree bridge into the
+    /// registry, and those setters only reach policies that already exist,
+    /// so the leg takes that state here, under the shared-state read guards.
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
-        // OnceLock::set returns Err if already set, which we ignore since
-        // the policy should only be set once at startup
-        let _ = self.decode_policy.set(policy);
+        self.publish_with_shared_state(&policy, || {
+            // OnceLock::set returns Err if already set, which we ignore since
+            // the policy should only be set once at startup
+            let _ = self.decode_policy.set(Arc::clone(&policy));
+        });
     }
 
-    /// Set the encode policy for EPD mode (lock-free, set once at startup)
+    /// Set the encode policy for EPD mode (set once at startup).
+    ///
+    /// The router factory sets the encode leg after the app context wired the
+    /// KV event monitor, the load feed and the mesh tree bridge into the
+    /// registry, and those setters only reach policies that already exist,
+    /// so the leg takes that state here, under the shared-state read guards.
     pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
-        // OnceLock::set returns Err if already set, which we ignore since
-        // the policy should only be set once at startup
-        let _ = self.encode_policy.set(policy);
+        self.publish_with_shared_state(&policy, || {
+            // OnceLock::set returns Err if already set, which we ignore since
+            // the policy should only be set once at startup
+            let _ = self.encode_policy.set(Arc::clone(&policy));
+        });
     }
 
     /// Get the prefill policy for PD mode, or default if not set (lock-free)
@@ -1003,12 +1094,16 @@ impl std::fmt::Debug for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::HealthCheckConfig;
+    use tokio::sync::watch;
     use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
-        worker::{BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard, WorkerType},
+        worker::{
+            load_state::LoadSnapshot, BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard,
+            WorkerType,
+        },
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -1119,10 +1214,10 @@ mod tests {
     }
 
     /// `--routing-key-override` means the same thing under every policy:
-    /// the body rid outranks the routing-key header. Key-native policies
-    /// skip the sticky override, so they must honor `rid_key` themselves.
+    /// the routing-key header outranks the body rid. Key-native policies
+    /// skip the sticky override, so they must apply that precedence themselves.
     #[test]
-    fn rid_key_outranks_header_under_key_native_policies() {
+    fn header_key_outranks_rid_under_key_native_policies() {
         for config in [
             PolicyConfig::Manual {
                 eviction_interval_secs: 60,
@@ -1148,26 +1243,22 @@ mod tests {
                 worker("http://w4", WorkerType::Regular),
             ];
             let hash_ring = Some(Arc::new(HashRing::new(workers.iter().map(|w| w.url()))));
-
-            let rid_key = reg.derive_rid_key(Some("conv_t1"));
-            assert_eq!(rid_key, Some("conv"));
+            let headers = headers_with_key("conversation-42");
             let pinned = reg
                 .select_worker(
                     &policy,
                     &workers,
                     &SelectWorkerInfo {
-                        rid_key,
+                        headers: Some(&headers),
+                        routing_key: reg.resolve_routing_key(Some(&headers)),
                         hash_ring: hash_ring.clone(),
                         ..Default::default()
                     },
                 )
                 .unwrap();
 
-            // Later turns of the conversation with rotating header keys stay
-            // on the rid's worker, whatever the header would have picked.
-            for (turn, key) in (2..).zip(["key_a", "key_b", "key_c", "key_d"]) {
-                let headers = headers_with_key(key);
-                let rid = format!("conv_t{turn}");
+            for request in 0..4 {
+                let rid = format!("request:group:request-{request}");
                 let info = SelectWorkerInfo {
                     headers: Some(&headers),
                     routing_key: reg.resolve_routing_key(Some(&headers)),
@@ -1178,8 +1269,11 @@ mod tests {
                 assert_eq!(
                     reg.select_worker(&policy, &workers, &info),
                     Some(pinned),
-                    "{name}: body rid must outrank header {key}"
+                    "{name}: header must outrank body rid {rid}"
                 );
+            }
+            if let Some(manual) = policy.as_any().downcast_ref::<ManualPolicy>() {
+                assert_eq!(manual.map_len(), 1);
             }
         }
     }
@@ -1220,6 +1314,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         }
     }
 
@@ -1483,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn rid_key_wins_over_header_and_header_is_fallback() {
+    fn header_key_wins_over_rid_and_rid_is_fallback() {
         let reg = PolicyRegistry::with_override(
             PolicyConfig::RoundRobin,
             rid_override(ManualAssignmentMode::Delegate),
@@ -1494,28 +1590,26 @@ mod tests {
             worker("http://w2", WorkerType::Regular),
         ];
 
-        // Unique per-request header keys must not fragment the rid pin.
-        let poison_a = headers_with_key("req-aaa");
-        let poison_b = headers_with_key("req-bbb");
+        let headers = headers_with_key("conversation-42");
         let first = reg
             .select_worker(
                 &policy,
                 &workers,
                 &SelectWorkerInfo {
-                    headers: Some(&poison_a),
-                    rid_key: Some("conv42"),
+                    headers: Some(&headers),
+                    rid_key: Some("request:group:request-1"),
                     ..Default::default()
                 },
             )
             .unwrap();
-        for headers in [&poison_b, &poison_a] {
+        for rid in ["request:group:request-2", "request:group:request-3"] {
             assert_eq!(
                 reg.select_worker(
                     &policy,
                     &workers,
                     &SelectWorkerInfo {
-                        headers: Some(headers),
-                        rid_key: Some("conv42"),
+                        headers: Some(&headers),
+                        rid_key: Some(rid),
                         ..Default::default()
                     },
                 ),
@@ -1523,17 +1617,95 @@ mod tests {
             );
         }
 
-        // No rid: the header key gets its own stable pin (fallback works).
-        let session = headers_with_key("session-H");
-        let header_info = SelectWorkerInfo {
-            headers: Some(&session),
+        assert_eq!(reg.routing_key_sticky.as_ref().unwrap().map_len(), 1);
+
+        // No header: request-ID lineage still gets its own stable pin.
+        let rid_info = SelectWorkerInfo {
+            rid_key: reg.derive_rid_key(Some("conv42_t1")),
             ..Default::default()
         };
-        let pinned = reg.select_worker(&policy, &workers, &header_info).unwrap();
+        let pinned = reg.select_worker(&policy, &workers, &rid_info).unwrap();
+        assert_ne!(pinned, first);
         assert_eq!(
-            reg.select_worker(&policy, &workers, &header_info),
+            reg.select_worker(
+                &policy,
+                &workers,
+                &SelectWorkerInfo {
+                    rid_key: reg.derive_rid_key(Some("conv42_t2_r1")),
+                    ..Default::default()
+                },
+            ),
             Some(pinned)
         );
+    }
+
+    #[test]
+    fn invalid_header_keys_fall_back_to_rid_for_selection_and_accounting() {
+        let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        let rid_key = reg.derive_rid_key(Some("conversation_t2_r1"));
+        let mut invalid_utf8 = HeaderMap::new();
+        invalid_utf8.insert(
+            "x-smg-routing-key",
+            http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        for headers in [
+            HeaderMap::new(),
+            headers_with_key(""),
+            headers_with_key(&"k".repeat(ROUTING_KEY_HINT_MAX_BYTES + 1)),
+            invalid_utf8,
+        ] {
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                rid_key,
+                ..Default::default()
+            };
+            assert_eq!(
+                reg.effective_sticky_key(&info),
+                Some(("conversation", "rid"))
+            );
+            assert_eq!(
+                reg.sticky_key(Some(&headers), rid_key),
+                Some("conversation")
+            );
+        }
+    }
+
+    #[test]
+    fn header_priority_accounts_inflight_requests_under_the_selected_key() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let headers = headers_with_key("conversation_t1");
+        let mut guards = Vec::new();
+        for rid in ["request-1", "request-2", "request-3"] {
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                rid_key: Some(rid),
+                ..Default::default()
+            };
+            assert_eq!(
+                reg.effective_sticky_key(&info),
+                Some(("conversation", "header"))
+            );
+            let selected = reg.select_worker(&policy, &workers, &info).unwrap();
+            assert_eq!(selected, usize::from(guards.len() == STICKY_INFLIGHT_CAP));
+            guards.push(WorkerLoadGuard::with_key(
+                workers[selected].clone(),
+                reg.sticky_key(Some(&headers), info.rid_key),
+            ));
+            assert_eq!(workers[selected].routing_key_inflight(rid), 0);
+        }
+        assert_eq!(workers[0].routing_key_inflight("conversation"), 2);
+        assert_eq!(workers[1].routing_key_inflight("conversation"), 1);
+        drop(guards);
+        assert_eq!(workers[0].routing_key_inflight("conversation"), 0);
+        assert_eq!(workers[1].routing_key_inflight("conversation"), 0);
     }
 
     #[test]
@@ -1553,6 +1725,8 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
             },
             rid_override(ManualAssignmentMode::Delegate),
         );
@@ -1974,6 +2148,8 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
             }
         }
 
@@ -2022,6 +2198,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         });
 
         // Hinted policy is a fresh per-model instance, not the shared default.
@@ -2094,6 +2272,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         }));
 
         for round in 0..64 {
@@ -2129,6 +2309,55 @@ mod tests {
             }
             registry.set_kv_event_monitor(None);
             registry.clear();
+        }
+    }
+
+    /// The PD/EPD legs are set after the app context wired the shared state
+    /// into the registry (the KV event monitor, the load feed, and the mesh
+    /// tree bridge that `MeshAdapters::start` attaches), so the leg setters
+    /// hand all of it over themselves.
+    #[tokio::test]
+    async fn pd_leg_policies_receive_the_shared_state_set_before_them() {
+        use std::collections::BTreeMap;
+
+        use smg_mesh::MeshKV;
+
+        use crate::{mesh::MeshAdapters, worker::WorkerRegistry};
+
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new(Some(4)))));
+        let (_load_tx, load_rx) = watch::channel(LoadSnapshot::from_loads_for_test(Vec::new()));
+        registry.set_load_receiver(Some(load_rx));
+        let mesh = MeshKV::new("node-a".into());
+        let _adapters = MeshAdapters::start(
+            &mesh,
+            "node-a".into(),
+            Arc::new(WorkerRegistry::new()),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            Arc::clone(&registry),
+        );
+
+        let prefill = cache_aware_policy();
+        let decode = cache_aware_policy();
+        let encode = cache_aware_policy();
+        registry.set_prefill_policy(Arc::clone(&prefill));
+        registry.set_decode_policy(Arc::clone(&decode));
+        registry.set_encode_policy(Arc::clone(&encode));
+
+        for (leg, policy) in [("prefill", prefill), ("decode", decode), ("encode", encode)] {
+            let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+            assert!(
+                cache_aware.kv_event_monitor_is_set_for_test(),
+                "{leg} leg missed the KV event monitor"
+            );
+            assert!(
+                cache_aware.has_load_receiver_for_test(),
+                "{leg} leg missed the load feed"
+            );
+            assert!(
+                cache_aware.should_populate_hash_index_for_test(),
+                "{leg} leg missed the mesh tree bridge"
+            );
         }
     }
 
@@ -2186,5 +2415,122 @@ mod tests {
 
         registry.remove_worker_from_pd_cache_aware("http://prefill-1:8000");
         registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
+    }
+
+    /// A policy that remembers completions and reconciliation ticks.
+    #[derive(Debug, Default)]
+    struct CompletionRecorder {
+        completed: std::sync::Mutex<Vec<String>>,
+        reconciled: std::sync::Mutex<Vec<(String, usize)>>,
+    }
+
+    impl LoadBalancingPolicy for CompletionRecorder {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn on_request_complete(&self, worker_url: &str, _success: bool) {
+            self.completed.lock().unwrap().push(worker_url.to_string());
+        }
+
+        fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
+            self.reconciled
+                .lock()
+                .unwrap()
+                .push((worker_url.to_string(), in_flight));
+        }
+
+        fn name(&self) -> &'static str {
+            "completion_recorder"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn completion_sink_reports_to_the_policy_that_owns_the_worker_type() {
+        use crate::worker::{BasicWorkerBuilder, WorkerLoadGuard};
+
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        let prefill_policy = Arc::new(CompletionRecorder::default());
+        let decode_policy = Arc::new(CompletionRecorder::default());
+        registry.set_prefill_policy(Arc::clone(&prefill_policy) as Arc<dyn LoadBalancingPolicy>);
+        registry.set_decode_policy(Arc::clone(&decode_policy) as Arc<dyn LoadBalancingPolicy>);
+        let sink = registry.completion_sink();
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:9000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:9000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let regular: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://regular:9000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        for worker in [&prefill, &decode, &regular] {
+            worker.set_completion_sink(Some(Arc::clone(&sink)));
+        }
+
+        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
+        drop(WorkerLoadGuard::new(Arc::clone(&decode), None));
+        // The regular worker's model policy (random) accepts the completion silently.
+        drop(WorkerLoadGuard::new(Arc::clone(&regular), None));
+
+        assert_eq!(
+            prefill_policy.completed.lock().unwrap().as_slice(),
+            ["grpc://prefill:9000"]
+        );
+        assert_eq!(
+            decode_policy.completed.lock().unwrap().as_slice(),
+            ["grpc://decode:9000"]
+        );
+
+        // A worker that outlives its registry reports to nobody.
+        drop(registry);
+        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
+        assert_eq!(prefill_policy.completed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_in_flight_reaches_the_policy_that_owns_the_worker_type() {
+        use crate::worker::{BasicWorkerBuilder, WorkerLoadGuard};
+
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        let decode_policy = Arc::new(CompletionRecorder::default());
+        registry.set_decode_policy(Arc::clone(&decode_policy) as Arc<dyn LoadBalancingPolicy>);
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:9000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+
+        // The count handed over is the router's live one: two guards held,
+        // then none.
+        let held = [
+            WorkerLoadGuard::new(Arc::clone(&decode), None),
+            WorkerLoadGuard::new(Arc::clone(&decode), None),
+        ];
+        registry.reconcile_in_flight(decode.as_ref());
+        drop(held);
+        registry.reconcile_in_flight(decode.as_ref());
+        assert_eq!(
+            decode_policy.reconciled.lock().unwrap().as_slice(),
+            [
+                ("grpc://decode:9000".to_string(), 2),
+                ("grpc://decode:9000".to_string(), 0)
+            ]
+        );
     }
 }
