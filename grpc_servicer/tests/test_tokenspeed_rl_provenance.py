@@ -9,6 +9,7 @@ Run with: pytest grpc_servicer/tests/test_tokenspeed_rl_provenance.py
 """
 
 import asyncio
+import enum
 from types import SimpleNamespace
 
 import pytest
@@ -155,6 +156,7 @@ def test_is_secret_key_targets_credentials_only():
     is_secret = redact.is_secret_key
     assert is_secret("rl_control_api_key") and is_secret("api_key") and is_secret("hf_token")
     assert is_secret("some_secret") and is_secret("db_password")
+    assert is_secret("token") and is_secret("TOKEN")
     assert not is_secret("max_total_tokens") and not is_secret("tokenizer")
     assert not is_secret("weight_version")
 
@@ -169,6 +171,7 @@ def test_redaction_reaches_nested_configs_and_lists():
             "kv_store": {"endpoint": "redis://cache", "password": "p", "ttl": 5},
             "providers": [{"name": "p", "api_key": "k"}, "plain"],
             "nested": {"deeper": {"api_key": "k", "keep": 1}},
+            "hub": {"token": "t", "repo": "r"},
         }
     )
     assert redacted == {
@@ -176,6 +179,29 @@ def test_redaction_reaches_nested_configs_and_lists():
         "kv_store": {"endpoint": "redis://cache", "ttl": 5},
         "providers": [{"name": "p"}, "plain"],
         "nested": {"deeper": {"keep": 1}},
+        "hub": {"repo": "r"},
+    }
+
+
+def test_nested_objects_are_flattened_before_redaction():
+    """A plain config object nested in the server args used to be stringified
+    whole, which could carry a credential past the redaction. It is flattened
+    to a dict first, so the key is dropped; enums still render as strings."""
+
+    class Hub:
+        def __init__(self):
+            self.endpoint = "https://hub"
+            self.api_key = "k"
+            self._cache = "private, skipped"
+
+    class Mode(enum.Enum):
+        PREFILL = "prefill"
+
+    flat = servicer_mod._make_json_serializable({"hub": Hub(), "mode": Mode.PREFILL})
+    assert flat == {"hub": {"endpoint": "https://hub", "api_key": "k"}, "mode": "Mode.PREFILL"}
+    assert redact.redact_secrets(flat) == {
+        "hub": {"endpoint": "https://hub"},
+        "mode": "Mode.PREFILL",
     }
 
 
