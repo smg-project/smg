@@ -422,6 +422,51 @@ async fn chat_eof_preserves_reasoning_and_normal_tails_per_choice() {
     }
 }
 
+/// A stream carries `role` once, in a first delta shaped like the engine's
+/// (`{"role": "assistant", "content": ""}`); later deltas carry neither the
+/// role nor a `reasoning_content: null` placeholder.
+#[tokio::test]
+async fn chat_stream_sends_role_once_in_an_empty_first_content_delta() {
+    let text = vec![chunk(0, "Hi"), chunk(0, "!"), complete(0, "stop")];
+    let reasoning = vec![chunk(0, "<think>why</think>answer"), complete(0, "stop")];
+    let tool = vec![
+        chunk(0, r#"{"name": "lookup", "arguments": {}}"#),
+        complete(0, "stop"),
+    ];
+    for (frames, with_tools, content) in [
+        (text, false, "Hi!"),
+        (reasoning, false, "answer"),
+        (tool, true, ""),
+    ] {
+        let (result, events) = chat_events(frames, with_tools, "0").await;
+        assert!(result.is_ok(), "{result:?}");
+        let deltas: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["choices"][0]["index"] == 0)
+            .map(|event| &event["choices"][0]["delta"])
+            .collect();
+        assert!(deltas.len() > 2, "{events:?}");
+        assert_eq!(
+            deltas[0],
+            &serde_json::json!({"role": "assistant", "content": ""}),
+            "{events:?}"
+        );
+        for delta in &deltas[1..] {
+            assert!(delta.get("role").is_none(), "role repeated: {events:?}");
+            assert!(
+                delta.get("reasoning_content").is_none_or(Value::is_string),
+                "null reasoning placeholder: {events:?}"
+            );
+        }
+        assert_eq!(chat_text(&events, 0, "content"), content, "{events:?}");
+        assert_eq!(
+            deltas.iter().any(|delta| delta["tool_calls"].is_array()),
+            with_tools,
+            "{events:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn chat_eof_tail_passes_through_buffered_tool_text_in_order() {
     let (result, events) = chat_events(

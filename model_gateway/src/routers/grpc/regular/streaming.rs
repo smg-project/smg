@@ -883,7 +883,7 @@ impl StreamingProcessor {
             if !leftover_text.is_empty() {
                 let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
-                    .add_choice_content(*index, "assistant", leftover_text)
+                    .add_choice_content_with_logprobs(*index, leftover_text, None)
                     .maybe_system_fingerprint(system_fingerprint)
                     .maybe_usage(usage.clone())
                     .build();
@@ -1947,7 +1947,7 @@ impl StreamingProcessor {
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) -> Result<(), String> {
-        let role_choice = assistant_choice(index, None, None, None);
+        let role_choice = role_choice(index);
         Self::push_chunk(tx, buffer, frame, &role_choice, usage, emit_usage_null)
             .await
             .map_err(|()| "Failed to send first chunk".to_string())
@@ -3788,8 +3788,27 @@ impl ChatChunkFrame {
     }
 }
 
-/// A streamed choice whose delta speaks as the assistant, carrying whichever
-/// of `content`, `reasoning_content` and `tool_calls` the caller sets.
+/// The stream's first choice: the role, once, with an empty content, the
+/// shape the engines' own OpenAI-compatible servers send. Later deltas carry
+/// only what changed ([`assistant_choice`]).
+fn role_choice(index: u32) -> ChatStreamChoice {
+    ChatStreamChoice {
+        index,
+        delta: ChatMessageDelta {
+            role: Some("assistant".to_string()),
+            content: Some(String::new()),
+            tool_calls: None,
+            reasoning_content: None,
+        },
+        logprobs: None,
+        finish_reason: None,
+        matched_stop: None,
+    }
+}
+
+/// A streamed choice carrying whichever of `content`, `reasoning_content` and
+/// `tool_calls` the caller sets; the role is not repeated, the first chunk
+/// ([`role_choice`]) carried it.
 fn assistant_choice(
     index: u32,
     content: Option<String>,
@@ -3799,7 +3818,7 @@ fn assistant_choice(
     ChatStreamChoice {
         index,
         delta: ChatMessageDelta {
-            role: Some("assistant".to_string()),
+            role: None,
             content,
             tool_calls,
             reasoning_content,
