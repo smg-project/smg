@@ -53,11 +53,12 @@ pub(super) fn arguments(
 /// points at nothing (a grammar with such a pointer would not compile, and the whole call with
 /// it). A `$ref` lends its target's keywords, and the property's own win, as in JSON Schema
 /// 2020-12.
-pub(super) fn shape(
-    schema: &Value,
-    definitions: Definitions<'_>,
+pub(super) fn shape<'a>(
+    schema: &'a Value,
+    definitions: Definitions<'a>,
     text: impl FnOnce() -> Grammar,
 ) -> Option<(&'static str, Grammar)> {
+    let definitions = definitions.within(schema);
     if !definitions.pointers_resolve(schema) {
         return None;
     }
@@ -92,35 +93,74 @@ pub(super) fn shape(
     }
 }
 
-/// The definitions at the root of a tool's schema, `$defs` and `definitions`. Each property's
-/// schema goes to the engine as a document of its own, and a `$ref` such as `#/$defs/Node` points
-/// from the root of the document it stands in, so the definitions travel with the property's
-/// schema. A pointer to the root itself, `#`, names the tool's schema in the tool and the property
-/// in the property's document, so it resolves to nothing here, and the property takes any value.
+/// The definitions a property's schema can point into: its own `$defs` and `definitions` first,
+/// then the tool's root ones, which is the document the engine gets ([`Self::attached_to`]). Each
+/// property's schema goes to the engine as a document of its own, and a `$ref` such as
+/// `#/$defs/Node` points from the root of the document it stands in, so the definitions travel
+/// with the property's schema. A pointer to the root itself, `#`, names the tool's schema in the
+/// tool and the property in the property's document, so it resolves to nothing here, and the
+/// property takes any value.
 #[derive(Clone, Copy)]
 pub(super) struct Definitions<'a> {
+    own: Blocks<'a>,
+    root: Blocks<'a>,
+}
+
+/// A schema's two definition blocks.
+#[derive(Clone, Copy)]
+struct Blocks<'a> {
     defs: Option<&'a Value>,
     definitions: Option<&'a Value>,
 }
 
-impl<'a> Definitions<'a> {
-    pub(super) fn of(root: &'a Value) -> Self {
+impl<'a> Blocks<'a> {
+    fn of(schema: &'a Value) -> Self {
         Self {
-            defs: root.get("$defs"),
-            definitions: root.get("definitions"),
+            defs: schema.get("$defs"),
+            definitions: schema.get("definitions"),
         }
     }
 
-    /// The schema a local pointer names: `#/$defs/Name` or `#/definitions/Name` an entry, with the
-    /// pointer's escapes (`~1` for `/`, `~0` for `~`) undone; `#` itself nothing, since it would
-    /// name the property's own document once the engine compiles it alone.
+    fn named(self, block: &str) -> Option<&'a Value> {
+        match block {
+            "$defs" => self.defs,
+            "definitions" => self.definitions,
+            _ => None,
+        }
+    }
+}
+
+/// How many pointers the check follows before it gives up on a schema: a tool whose definitions
+/// chain deeper pins nothing, and the walk's depth stays bounded whatever a request sends.
+const POINTERS_FOLLOWED_AT_MOST: usize = 64;
+
+impl<'a> Definitions<'a> {
+    pub(super) fn of(root: &'a Value) -> Self {
+        Self {
+            own: Blocks::of(root),
+            root: Blocks::of(root),
+        }
+    }
+
+    /// The definitions as the property `schema` sees them: its own blocks first, then the root's.
+    fn within(self, schema: &'a Value) -> Self {
+        Self {
+            own: Blocks::of(schema),
+            root: self.root,
+        }
+    }
+
+    /// The schema a local pointer names: `#/$defs/Name` or `#/definitions/Name` an entry, the
+    /// property's own block before the root's, with the pointer's escapes (`~1` for `/`, `~0` for
+    /// `~`) undone; `#` itself nothing, since it would name the property's own document once the
+    /// engine compiles it alone.
     fn resolve(self, pointer: &str) -> Option<&'a Value> {
         let mut segments = pointer.strip_prefix("#/")?.split('/');
-        let mut node = match segments.next()? {
-            "$defs" => self.defs?,
-            "definitions" => self.definitions?,
-            _ => return None,
-        };
+        let block = segments.next()?;
+        let name = segments.next()?.replace("~1", "/").replace("~0", "~");
+        let mut node = [self.own, self.root]
+            .into_iter()
+            .find_map(|blocks| blocks.named(block)?.get(&name))?;
         for segment in segments {
             node = node.get(segment.replace("~1", "/").replace("~0", "~"))?;
         }
@@ -136,7 +176,8 @@ impl<'a> Definitions<'a> {
     /// Whether every local pointer in `schema` names something, and every pointer in what it
     /// names, as far as the pointers reach: the definitions travel with the property, so a pointer
     /// at nothing inside one of them reaches the engine too. A definition that names itself is
-    /// followed once.
+    /// followed once, and no more than [`POINTERS_FOLLOWED_AT_MOST`] pointers are followed in all,
+    /// so a chain of definitions cannot send the walk arbitrarily deep.
     fn pointers_resolve(self, schema: &Value) -> bool {
         self.pointers_resolve_from(schema, &mut Vec::new())
     }
@@ -150,6 +191,7 @@ impl<'a> Definitions<'a> {
                 let named_resolves = local.is_none_or(|pointer| match self.resolve(pointer) {
                     None => false,
                     Some(_) if followed.iter().any(|seen| seen == pointer) => true,
+                    Some(_) if followed.len() >= POINTERS_FOLLOWED_AT_MOST => false,
                     Some(target) => {
                         followed.push(pointer.to_string());
                         self.pointers_resolve_from(target, followed)
@@ -169,13 +211,14 @@ impl<'a> Definitions<'a> {
     /// stays; the root's fill in the names it lacks. A schema with no local pointer goes as it is.
     fn attached_to(self, schema: &Value) -> Value {
         let mut attached = schema.clone();
-        if self.defs.is_none() && self.definitions.is_none() || !has_local_reference(schema) {
+        let root = self.root;
+        if root.defs.is_none() && root.definitions.is_none() || !has_local_reference(schema) {
             return attached;
         }
         let Some(object) = attached.as_object_mut() else {
             return attached;
         };
-        for (name, block) in [("$defs", self.defs), ("definitions", self.definitions)] {
+        for (name, block) in [("$defs", root.defs), ("definitions", root.definitions)] {
             let Some(Value::Object(entries)) = block else {
                 continue;
             };

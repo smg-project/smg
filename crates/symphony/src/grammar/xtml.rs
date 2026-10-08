@@ -382,6 +382,84 @@ mod tests {
     }
 
     #[test]
+    fn a_propertys_own_definition_stands_before_the_roots() {
+        // The engine gets the property's schema with its own definitions kept and the root's
+        // filling in the rest, so the check reads the same: the property's `Inner` is whole and
+        // the root's `Inner`, which points at nothing, is not the one `Outer` reaches.
+        let call = first_call(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": {
+                    "Outer": {"type": "object", "properties": {"in": {"$ref": "#/$defs/Inner"}}},
+                    "Inner": {"$ref": "#/$defs/Gone"},
+                },
+                "properties": {
+                    "own": {
+                        "$ref": "#/$defs/Outer",
+                        "$defs": {"Inner": {"type": "integer"}},
+                    },
+                    "root": {"$ref": "#/$defs/Outer"},
+                },
+                "required": ["own", "root"],
+            }),
+        )]);
+        let slots = call["elements"][3]["elements"]
+            .as_array()
+            .expect("two slots");
+        assert_eq!(
+            slots[0]["elements"][0]["value"],
+            argument_open("own", "object")
+        );
+        assert_eq!(
+            slots[0]["elements"][1]["json_schema"]["$defs"]["Inner"],
+            value!({"type": "integer"}),
+            "the property's own definition goes to the engine"
+        );
+        assert_eq!(
+            slots[1]["elements"][0]["value"], "<|open|>argument key=\"root\" type=\"",
+            "through the root's Inner the pointer reaches nothing"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_definitions_is_followed_so_far_and_no_further() {
+        // Every link is a different pointer, so cycle detection alone would follow a request's
+        // chain as deep as it goes; the walk stops after a fixed number and the property pins
+        // nothing, which keeps the stack bounded whatever a request sends.
+        let chain = |links: usize| {
+            let mut defs = serde_json::Map::new();
+            for i in 0..links {
+                defs.insert(
+                    format!("D{i}"),
+                    value!({"$ref": format!("#/$defs/D{}", i + 1)}),
+                );
+            }
+            defs.insert(format!("D{links}"), value!({"type": "integer"}));
+            tool(
+                "t",
+                value!({
+                    "type": "object",
+                    "$defs": defs,
+                    "properties": {"p": {"$ref": "#/$defs/D0"}},
+                    "required": ["p"],
+                }),
+            )
+        };
+        let short = first_call(&[chain(10)]);
+        assert_eq!(
+            short["elements"][3]["elements"][0]["elements"][0]["value"],
+            "<|open|>argument key=\"p\" type=\"",
+            "a chain lends no type, since a $ref lends its target's keywords one hop only"
+        );
+        let long = first_call(&[chain(5_000)]);
+        assert_eq!(
+            long["elements"][3]["elements"][0]["elements"][0]["value"],
+            "<|open|>argument key=\"p\" type=\""
+        );
+    }
+
+    #[test]
     fn attribute_values_are_escaped_as_the_template_writes_them() {
         let parameters = value!({
             "type": "object",
