@@ -766,13 +766,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             wanted = int(request.dp_rank)
             load_outputs = [lo for lo in load_outputs if int(lo.dp_rank) == wanted]
 
-        # ModelConfig applies the model's effective grain to these same args.
-        page_size = int(
-            getattr(self.async_llm.server_args, "prefix_granularity", 0)
-            or getattr(self.async_llm.server_args, "page_size", 0)
-            or 0
-        )
-        if load_outputs and page_size <= 0:
+        # Only legacy token pages have a page size. Native snapshots count
+        # LCM allocator blocks, whose packing is independent of launch grain.
+        page_size = int(getattr(self.async_llm.server_args, "page_size", 0) or 0)
+        if load_outputs and snapshots is None and page_size <= 0:
             await context.abort(grpc.StatusCode.UNAVAILABLE, "KV page geometry is unavailable")
             return
         # Fall back to ``server_args.max_total_num_tokens`` for SimpleNamespace test stubs.
@@ -784,8 +781,14 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         max_running_requests = running_window(self.async_llm.server_args)
 
         scheduler_loads = [
-            (convert_snapshot_to_protobuf if snapshots is not None else convert_load_to_protobuf)(
-                snapshots[int(lo.dp_rank)] if snapshots is not None else lo,
+            convert_snapshot_to_protobuf(
+                snapshots[int(lo.dp_rank)],
+                max_total_num_tokens=max_total_num_tokens,
+                max_running_requests=max_running_requests,
+            )
+            if snapshots is not None
+            else convert_load_to_protobuf(
+                lo,
                 page_size=page_size,
                 max_total_num_tokens=max_total_num_tokens,
                 max_running_requests=max_running_requests,

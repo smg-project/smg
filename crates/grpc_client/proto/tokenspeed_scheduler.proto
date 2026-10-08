@@ -389,6 +389,8 @@ message SchedulerLoad {
   int32 num_running_reqs = 2;
   int32 num_waiting_reqs = 3;
   int32 num_total_reqs = 4;
+  // Native LCM caches express allocator occupancy as a token-budget equivalent;
+  // this is not an exact cached-token count. Legacy token-page engines use tokens.
   int32 num_used_tokens = 5;
   int32 max_total_num_tokens = 6;
   int32 max_running_requests = 7;

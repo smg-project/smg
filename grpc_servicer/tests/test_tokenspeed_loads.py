@@ -52,11 +52,11 @@ class TestLoadConversion:
         )
         load = loads_mod.convert_snapshot_to_protobuf(
             snapshot,
-            page_size=128,
             max_total_num_tokens=16384,
             max_running_requests=16,
         )
-        assert load.num_used_tokens == 1024
+        # Used capacity is a token-budget equivalent, not grain * LCM blocks.
+        assert load.num_used_tokens == 8192
         assert load.token_usage == 0.5
         assert load.HasField("active_token_usage")
         assert load.active_token_usage == 0.25

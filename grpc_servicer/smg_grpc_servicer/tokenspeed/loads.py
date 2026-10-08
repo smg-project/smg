@@ -60,22 +60,25 @@ def convert_load_to_protobuf(
 def convert_snapshot_to_protobuf(
     snapshot: Any,
     *,
-    page_size: int,
     max_total_num_tokens: int,
     max_running_requests: int,
 ) -> tokenspeed_scheduler_pb2.SchedulerLoad:
     """Keep allocator occupancy separate from the model's admission capacity.
 
-    Hybrid caches can have several KV pools per logical page. Their usable
-    logical page count cannot be inferred from the advertised token capacity.
-    Cached pages are resident but reclaimable; only active pages exert pressure.
+    Native page counts are LCM allocator blocks, not prefix-sized token pages.
+    Hybrid packing and state reservations prevent an exact token count from
+    being derived from those blocks. Express used capacity as a token-budget
+    equivalent instead; admission/finish traces report actual cached tokens.
+    Cached blocks are resident but reclaimable; only active blocks exert pressure.
     """
     return tokenspeed_scheduler_pb2.SchedulerLoad(
         dp_rank=int(snapshot.dp_rank),
         num_running_reqs=int(snapshot.num_running_reqs),
         num_waiting_reqs=int(snapshot.num_waiting_reqs),
         num_total_reqs=int(snapshot.num_running_reqs + snapshot.num_waiting_reqs),
-        num_used_tokens=int(snapshot.num_used_pages) * page_size,
+        num_used_tokens=(
+            int(snapshot.num_used_pages) * max_total_num_tokens // snapshot.max_total_pages
+        ),
         max_total_num_tokens=max_total_num_tokens,
         token_usage=snapshot.num_used_pages / snapshot.max_total_pages,
         active_token_usage=snapshot.num_active_pages / snapshot.max_total_pages,
