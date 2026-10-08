@@ -27,7 +27,7 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
+        bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, ManualAssignmentMode,
         MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
@@ -241,7 +241,8 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
-    /// Host address to bind the router server
+    /// Host address to bind the router server: an IP literal, IPv6 with or
+    /// without brackets (`0.0.0.0`, `::`, `[::]`, `[fd00::1]`)
     #[arg(long, default_value = "0.0.0.0", help_heading = "Worker Configuration")]
     host: String,
 
@@ -1316,7 +1317,8 @@ struct CliArgs {
     #[arg(long)]
     mesh_server_name: Option<String>,
 
-    /// Bind address for the mesh listener.
+    /// Bind address for the mesh listener: an IP literal, IPv6 with or
+    /// without brackets (`::`, `[::]`).
     #[arg(long, default_value = "0.0.0.0")]
     mesh_host: String,
 
@@ -1565,13 +1567,11 @@ impl CliArgs {
         port: u16,
         field: &str,
     ) -> ConfigResult<std::net::SocketAddr> {
-        let addr = format!("{host}:{port}");
-        addr.parse::<std::net::SocketAddr>()
-            .map_err(|e| ConfigError::InvalidValue {
-                field: field.to_string(),
-                value: host.to_string(),
-                reason: format!("invalid mesh socket address '{addr}': {e}"),
-            })
+        bind_socket_addr(host, port).map_err(|e| ConfigError::InvalidValue {
+            field: field.to_string(),
+            value: host.to_string(),
+            reason: format!("invalid mesh socket address: {e}"),
+        })
     }
 
     fn build_mesh_server_config(&self) -> ConfigResult<Option<MeshServerConfig>> {
@@ -2402,6 +2402,42 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// Mesh bind and advertise hosts go through the shared bind-host rule, so
+    /// IPv6 works with or without brackets, as it does for `--host`.
+    #[test]
+    fn mesh_hosts_accept_both_ipv6_spellings() {
+        for (host, advertise, expected_bind, expected_advertise) in [
+            ("::", "::1", "[::]:39527", "[::1]:39527"),
+            ("[::]", "[::1]", "[::]:39527", "[::1]:39527"),
+            ("0.0.0.0", "127.0.0.1", "0.0.0.0:39527", "127.0.0.1:39527"),
+        ] {
+            let mesh = cli_args_from(&[
+                "--enable-mesh",
+                "--mesh-host",
+                host,
+                "--mesh-advertise-host",
+                advertise,
+            ])
+            .build_mesh_server_config()
+            .unwrap()
+            .unwrap();
+            assert_eq!(mesh.bind_addr.to_string(), expected_bind, "host {host}");
+            assert_eq!(
+                mesh.advertise_addr.to_string(),
+                expected_advertise,
+                "advertise {advertise}"
+            );
+        }
+        let err = cli_args_from(&["--enable-mesh", "--mesh-host", "mesh-host"])
+            .build_mesh_server_config()
+            .err()
+            .expect("a mesh host that is not an IP literal must be rejected");
+        assert!(
+            err.to_string().contains("invalid bind host 'mesh-host'"),
+            "got: {err}"
+        );
     }
 
     /// A grouped ZMQ handshake needs at least one engine, so `0` (and any

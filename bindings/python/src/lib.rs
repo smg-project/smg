@@ -621,10 +621,9 @@ impl Router {
         port: u16,
         field: &str,
     ) -> PyResult<std::net::SocketAddr> {
-        let addr = format!("{host}:{port}");
-        addr.parse::<std::net::SocketAddr>().map_err(|e| {
+        config::bind_socket_addr(host, port).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "Invalid value for {field}='{host}': invalid mesh socket address '{addr}': {e}"
+                "Invalid value for {field}='{host}': invalid mesh socket address: {e}"
             ))
         })
     }

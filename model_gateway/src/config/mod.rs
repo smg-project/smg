@@ -4,7 +4,9 @@ pub(crate) mod validation;
 
 pub use builder::*;
 pub use types::*;
-pub use validation::{validate_mesh_server_name, validate_worker_url};
+pub use validation::{
+    bind_socket_addr, parse_bind_host, validate_mesh_server_name, validate_worker_url,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

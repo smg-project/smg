@@ -1610,14 +1610,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.cors_allowed_origins.clone(),
     )?;
 
-    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
-    let bind_addr = format!("{}:{}", config.host, config.port);
-    info!("Starting server on {}", bind_addr);
-
-    // Parse address and set up graceful shutdown (common to both TLS and non-TLS)
-    let addr: std::net::SocketAddr = bind_addr
-        .parse()
+    // One bind-host rule for every listener: IPv6 with or without brackets.
+    let addr = crate::config::bind_socket_addr(&config.host, config.port)
         .map_err(|e| format!("Invalid address: {e}"))?;
+    info!("Starting server on {addr}");
+
+    // Set up graceful shutdown (common to both TLS and non-TLS)
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();

@@ -68,7 +68,12 @@ pub fn print_banner(host: &str, port: u16, mode: &str) {
     let info: [(&str, String); 4] = [
         ("", PROJECT_NAME.to_string()),
         ("version", VERSION.to_string()),
-        ("listening", format!("{host}:{port}")),
+        (
+            "listening",
+            crate::config::bind_socket_addr(host, port)
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|_| format!("{host}:{port}")),
+        ),
         ("mode", mode.to_string()),
     ];
 

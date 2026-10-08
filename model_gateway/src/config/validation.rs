@@ -1,3 +1,5 @@
+use std::net::{IpAddr, SocketAddr};
+
 use axum::http::HeaderName;
 use sha2::{Digest, Sha256};
 
@@ -85,6 +87,32 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         }
     }
     Ok(())
+}
+
+/// Parse a listener host as operators write it: an IP literal, with or
+/// without the brackets an IPv6 address carries inside a `host:port` string
+/// (`0.0.0.0`, `::`, `[::]`, `::1`, `[fd00::1]`). Every bind flag goes
+/// through this one rule, so `--host`, `--prometheus-host`, the probe
+/// listener and the mesh listener accept the same spellings. A hostname is
+/// not a bind address and is rejected, like anything else that is not an IP
+/// address.
+pub fn parse_bind_host(host: &str) -> Result<IpAddr, String> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<IpAddr>().map_err(|_| {
+        format!(
+            "invalid bind host '{host}': expected an IP address such as \
+             0.0.0.0, ::, [::] or [fd00::1]"
+        )
+    })
+}
+
+/// The socket address a listener binds for `host` (any spelling
+/// [`parse_bind_host`] accepts) and `port`.
+pub fn bind_socket_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    parse_bind_host(host).map(|ip| SocketAddr::new(ip, port))
 }
 
 /// Configuration validator
@@ -761,6 +789,14 @@ impl ConfigValidator {
     }
 
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
+        if let Err(reason) = parse_bind_host(&config.host) {
+            return Err(ConfigError::InvalidValue {
+                field: "host".to_string(),
+                value: config.host.clone(),
+                reason,
+            });
+        }
+
         if config.port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "port".to_string(),
@@ -1018,6 +1054,14 @@ impl ConfigValidator {
                 field: "metrics.host".to_string(),
                 value: metrics.host.clone(),
                 reason: "Host cannot be empty".to_string(),
+            });
+        }
+
+        if let Err(reason) = parse_bind_host(&metrics.host) {
+            return Err(ConfigError::InvalidValue {
+                field: "metrics.host".to_string(),
+                value: metrics.host.clone(),
+                reason,
             });
         }
 
@@ -1294,6 +1338,64 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::worker::ConnectionMode;
+
+    #[test]
+    fn bind_hosts_accept_ipv6_with_or_without_brackets() {
+        for (host, expected) in [
+            ("::", "[::]:30000"),
+            ("[::]", "[::]:30000"),
+            ("::1", "[::1]:30000"),
+            ("[fd00::1]", "[fd00::1]:30000"),
+            ("0.0.0.0", "0.0.0.0:30000"),
+            ("127.0.0.1", "127.0.0.1:30000"),
+        ] {
+            assert_eq!(
+                bind_socket_addr(host, 30000).unwrap().to_string(),
+                expected,
+                "host {host:?}"
+            );
+        }
+        for bad in [
+            "",
+            "localhost",
+            "[::",
+            "::]",
+            "[]",
+            "0.0.0.0:30000",
+            "[::1]:30000",
+        ] {
+            let err = parse_bind_host(bad).unwrap_err();
+            assert!(err.contains("invalid bind host"), "host {bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn server_and_metrics_hosts_are_validated_as_bind_hosts() {
+        let config = |host: &str, metrics_host: &str| RouterConfig {
+            host: host.to_string(),
+            metrics: Some(MetricsConfig {
+                port: 29000,
+                host: metrics_host.to_string(),
+            }),
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for (host, metrics_host) in [("[::]", "::"), ("::", "[::]"), ("0.0.0.0", "0.0.0.0")] {
+            config(host, metrics_host)
+                .validate()
+                .unwrap_or_else(|e| panic!("host {host:?} metrics {metrics_host:?}: {e}"));
+        }
+        match config("localhost", "::").validate() {
+            Err(ConfigError::InvalidValue { field, .. }) => assert_eq!(field, "host"),
+            other => panic!("expected an invalid host, got {other:?}"),
+        }
+        match config("[::]", "metrics").validate() {
+            Err(ConfigError::InvalidValue { field, .. }) => assert_eq!(field, "metrics.host"),
+            other => panic!("expected an invalid metrics host, got {other:?}"),
+        }
+    }
 
     #[test]
     fn igw_disaggregated_modes_reject_bucket_decode_policy() {
