@@ -122,7 +122,7 @@ impl Values<'_> {
             newlines: true,
         };
         match shape(property, definitions, || self.text().value) {
-            Some(("string", _)) => self.text(),
+            Some(("string", Grammar::AnyText { .. })) => self.text(),
             Some(("boolean", _)) => pinned(words(json!({"type": "boolean"}), ["True", "False"])),
             Some(("null", _)) => pinned(words_only(["null", "None"])),
             Some(("object" | "array", value)) => match self.spelling {
@@ -245,6 +245,7 @@ mod tests {
                         "days": {"type": "integer", "minimum": 1},
                         "metric": {"type": "boolean"},
                         "where": {"type": "object", "properties": {"lat": {"type": "number"}}},
+                        "units": {"type": "string", "enum": ["c", "f"]},
                     },
                     "required": ["city", "days", "metric"],
                 }),
@@ -296,6 +297,11 @@ mod tests {
         let place = value!({"type": "json_schema", "json_schema": {
             "type": "object", "properties": {"lat": {"type": "number"}},
         }});
+        // A string enum is one of its values, pinned, not text: the newlines are allowed.
+        let units = value!({"type": "or", "elements": [
+            {"type": "const_string", "value": "c"},
+            {"type": "const_string", "value": "f"},
+        ]});
         assert_eq!(
             payload,
             value!({"format": {
@@ -310,6 +316,7 @@ mod tests {
                             slot("days", days),
                             slot("metric", metric),
                             {"type": "optional", "content": slot("where", place)},
+                            {"type": "optional", "content": slot("units", units)},
                         ]},
                         "end": "</function>\n</tool_call>",
                     },
@@ -363,7 +370,7 @@ mod tests {
         });
         let slots = weather["content"]["elements"]
             .as_array()
-            .expect("four slots");
+            .expect("five slots");
         assert_eq!(
             slots[0]["elements"][3], text,
             "a string, no newline of its own"
