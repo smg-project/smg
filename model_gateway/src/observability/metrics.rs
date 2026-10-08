@@ -159,6 +159,18 @@ pub(crate) const KV_INDEX_MICRO_BUCKETS: &[f64] = &[
     0.262_144,
 ];
 
+/// Histogram buckets for `smg_kv_event_lag_seconds`: the age of a KV event
+/// batch when it is applied, publisher clock to router clock. A batch is
+/// normally a few milliseconds old (publish interval plus transport), and
+/// seconds or more when a relay replays history or the router falls behind,
+/// so the edges run from a tenth of a millisecond to a minute. Without
+/// explicit buckets the recorder renders the family as a summary, whose
+/// per-worker quantiles cannot be aggregated across workers or windows.
+pub(crate) const KV_EVENT_LAG_BUCKETS: &[f64] = &[
+    0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    5.0, 10.0, 30.0, 60.0,
+];
+
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
 /// Call this before [`start_prometheus`] only from a binary or extension that
@@ -750,6 +762,11 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     // summary.
     let match_ratio_matcher = Matcher::Full(String::from("smg_cache_aware_match_ratio"));
 
+    // The KV event lag is milliseconds to seconds, between the request
+    // buckets and the microsecond ones below: its own buckets, or the
+    // recorder renders it as a summary.
+    let kv_lag_matcher = Matcher::Full(String::from("smg_kv_event_lag_seconds"));
+
     // The KV index's lookup and apply times are microseconds: their own
     // buckets, or the recorder renders them as summaries.
     let kv_lookup_matcher = Matcher::Full(String::from("smg_kv_index_lookup_seconds"));
@@ -774,6 +791,8 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         .expect("failed to set KV index lookup buckets")
         .set_buckets_for_metric(kv_apply_matcher, KV_INDEX_MICRO_BUCKETS)
         .expect("failed to set KV event apply buckets")
+        .set_buckets_for_metric(kv_lag_matcher, KV_EVENT_LAG_BUCKETS)
+        .expect("failed to set KV event lag buckets")
         .install_recorder()
         .inspect(|_| {
             #[cfg(all(
