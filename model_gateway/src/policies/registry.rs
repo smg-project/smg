@@ -286,7 +286,7 @@ impl PolicyRegistry {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        cache_trace::begin_selection();
+        cache_trace::begin_selection(workers);
         if let Some(sticky) = self.routing_key_sticky.as_ref() {
             if Self::routing_key_override_applies(policy.name()) {
                 if let Some((key, source)) = self.effective_sticky_key(info) {

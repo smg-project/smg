@@ -2112,6 +2112,16 @@ impl CacheAwarePolicy {
                 })
                 .collect()
         };
+        if cache_trace::enabled() {
+            for candidate in inputs.iter().take(32) {
+                cache_trace::score(serde_json::json!({
+                    "source": "policy_affinity", "worker": candidate.url,
+                    "device_blocks": candidate.device_blocks, "effective_score": candidate.effective_score,
+                    "request_blocks": request.request_blocks, "block_size": request.block_size,
+                    "selection_policy": self.selection.name(),
+                }));
+            }
+        }
         let selected = match self.selection.select(request, &inputs) {
             Pick::None => {
                 self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
@@ -2213,6 +2223,19 @@ impl CacheAwarePolicy {
             waiting_prefill_tokens: waiting.as_deref(),
         };
         let request_blocks = (request_units / self.config.block_size).max(1);
+        if cache_trace::enabled() {
+            for &idx in healthy_indices.iter().take(32) {
+                let holder = matched_tenants
+                    .iter()
+                    .any(|tenant| tenant.as_ref() == workers[idx].url());
+                cache_trace::score(serde_json::json!({
+                    "source": "approximate_tree", "worker": workers[idx].url(),
+                    "matched_units": holder.then_some(matched_units),
+                    "match_status": if holder { "deepest_holder" } else { "shallower_match_unknown" },
+                    "input_units": request.prompt_tokens, "block_size": self.config.block_size,
+                }));
+            }
+        }
         Self::apply_overlap_decay(
             workers,
             &mut candidates,

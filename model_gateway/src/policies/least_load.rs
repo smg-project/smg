@@ -13,7 +13,10 @@ use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 pub use crate::worker::expected_wait::{
     DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
 };
-use crate::worker::{expected_wait::ExpectedWait, load_state::LoadSnapshot, Worker};
+use crate::{
+    observability::cache_trace,
+    worker::{expected_wait::ExpectedWait, load_state::LoadSnapshot, Worker},
+};
 
 /// Dispatches kept per worker between reports. A worker that never reports
 /// (a dark fleet is scored by its live in-flight count instead) would
@@ -471,7 +474,16 @@ impl LeastLoadPolicy {
                             let since_poll = inflight_guard
                                 .get(url)
                                 .map_or(0, |dispatch| dispatch.requests);
-                            (load.total_waiting_reqs().max(0) as u64) + since_poll < cap
+                            let waiting = load.total_waiting_reqs().max(0) as u64;
+                            let eligible = waiting + since_poll < cap;
+                            if cache_trace::enabled() {
+                                cache_trace::gate(serde_json::json!({
+                                    "source": "waiting_queue_cap", "worker": url,
+                                    "waiting_requests": waiting, "since_poll_requests": since_poll,
+                                    "cap": cap, "eligible": eligible,
+                                }));
+                            }
+                            eligible
                         }
                         None => true,
                     }
@@ -493,11 +505,27 @@ impl LeastLoadPolicy {
         // `TIE_EPSILON_SECS` of the minimum (the common idle/homogeneous case
         // scores equal to the digit) are sampled uniformly instead of
         // first-index-wins, which herded ties onto one worker.
+        let observe_score = |idx: usize, score: f64| {
+            if cache_trace::enabled() {
+                let url = workers[idx].url();
+                let load = Self::fresh_load(loads, complete_snapshot, url);
+                cache_trace::score(serde_json::json!({
+                    "source": "expected_wait", "worker": url, "score": score,
+                    "score_unit": if inputs.fleet_has_loads { "seconds" } else { "requests" },
+                    "queued_tokens": load.map(|load| self.queued_tokens(load)),
+                    "drain_rate": load.map(|load| self.drain_rate(load)),
+                    "since_poll_tokens": inflight.get(url).map_or(0, |dispatch| dispatch.tokens),
+                    "fresh_load": load.is_some(),
+                }));
+            }
+        };
         let mut best = first;
         let mut best_score = self.score(&workers[best], &inputs);
+        observe_score(best, best_score);
         let mut tied = 1u32;
         for &idx in rest {
             let s = self.score(&workers[idx], &inputs);
+            observe_score(idx, s);
             if s < best_score - TIE_EPSILON_SECS {
                 best = idx;
                 best_score = s;
