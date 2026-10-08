@@ -34,6 +34,7 @@ enum Branch {
     TargetWorkerHit,
     TargetWorkerMiss,
     RoutingKeyHit,
+    ImplicitKeyHit,
     RandomFallback,
 }
 
@@ -45,6 +46,7 @@ impl Branch {
             Self::TargetWorkerHit => "target_worker_hit",
             Self::TargetWorkerMiss => "target_worker_miss",
             Self::RoutingKeyHit => "routing_key_hit",
+            Self::ImplicitKeyHit => "implicit_key_hit",
             Self::RandomFallback => "random_fallback",
         }
     }
@@ -151,10 +153,12 @@ impl ConsistentHashingPolicy {
             };
         }
 
-        // Priority 3: Implicit routing key from stable headers (session affinity)
+        // Priority 3: Implicit routing key from stable headers (session affinity).
+        // Only headers that identify a client or a session qualify. A credential
+        // (`authorization`) identifies a tenant or a service account, not a
+        // session: every client sharing an API key would hash to one worker.
         let implicit_key = info.headers.and_then(|h| {
-            h.get("authorization")
-                .or_else(|| h.get("x-forwarded-for"))
+            h.get("x-forwarded-for")
                 .or_else(|| h.get("cookie"))
                 .and_then(|v| v.to_str().ok())
                 .filter(|s| !s.is_empty())
@@ -162,7 +166,7 @@ impl ConsistentHashingPolicy {
 
         if let Some(key) = implicit_key {
             return match Self::find_by_consistent_hash(workers, info, key) {
-                Some(idx) => (Some(idx), Branch::RoutingKeyHit),
+                Some(idx) => (Some(idx), Branch::ImplicitKeyHit),
                 None => (None, Branch::NoHealthyWorkers),
             };
         }
@@ -438,6 +442,66 @@ mod tests {
             distribution.len() > 1,
             "Random fallback should distribute across workers"
         );
+    }
+
+    #[test]
+    fn clients_sharing_a_bearer_token_spread_across_workers() {
+        // A service's clients all present the same API key and no routing
+        // key. The credential is not a session signal: the requests must
+        // spread as anonymous ones do instead of landing on one worker.
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&[
+            "http://w0:8000",
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+            "http://w5:8000",
+            "http://w6:8000",
+            "http://w7:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer shared-service-key".parse().unwrap(),
+        );
+        let mut distribution = HashMap::new();
+        for _ in 0..64 {
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(branch, Branch::RandomFallback);
+            *distribution.entry(result.unwrap()).or_insert(0) += 1;
+        }
+        assert!(
+            distribution.len() > 1,
+            "64 requests sharing one bearer token landed on one worker: {distribution:?}"
+        );
+    }
+
+    #[test]
+    fn a_cookie_is_an_implicit_session_key() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("cookie", "session=abc123".parse().unwrap());
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let (first, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, Branch::ImplicitKeyHit);
+        for _ in 0..10 {
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, first);
+            assert_eq!(branch, Branch::ImplicitKeyHit);
+        }
     }
 
     #[test]
