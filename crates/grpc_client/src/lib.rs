@@ -173,11 +173,20 @@ macro_rules! impl_admin_ops {
 }
 pub(crate) use impl_admin_ops;
 
+/// The largest `KvEventBatch` a KV event stream decodes, in place of tonic's
+/// 4 MiB default. A batch carries its blocks' token ids, and a servicer's
+/// state snapshot is cut into chunks of 2,048 blocks: about 4.8 MB at
+/// 1,152-token blocks, which a subscriber at the default limit failed on at
+/// every reconnect. 64 MiB covers such a chunk at any block size an engine
+/// uses while still bounding what one message may allocate.
+pub const KV_EVENT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Shared `subscribe_kv_events()` implementation for all engine clients.
 ///
 /// Each engine's generated proto client has a `subscribe_kv_events` RPC method
 /// with identical signature (using common proto types). This macro provides
-/// the wrapper that returns a `tonic::Streaming<KvEventBatch>`.
+/// the wrapper that returns a `tonic::Streaming<KvEventBatch>`, decoding up to
+/// [`KV_EVENT_MAX_DECODING_MESSAGE_SIZE`] per message.
 macro_rules! impl_subscribe_kv_events {
     () => {
         /// Subscribe to KV cache events from the backend.
@@ -189,7 +198,10 @@ macro_rules! impl_subscribe_kv_events {
             let request = tonic::Request::new($crate::common_proto::SubscribeKvEventsRequest {
                 start_sequence_number,
             });
-            let mut client = self.client.clone();
+            let mut client = self
+                .client
+                .clone()
+                .max_decoding_message_size($crate::KV_EVENT_MAX_DECODING_MESSAGE_SIZE);
             let response = client.subscribe_kv_events(request).await?;
             Ok(response.into_inner())
         }
