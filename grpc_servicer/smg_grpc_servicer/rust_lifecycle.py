@@ -1,6 +1,7 @@
 """The Python-owned lifecycle around a Rust servicer, shared by the vLLM and
 TokenSpeed launchers: a free port and socket directory for the handshake, the
-spawned headless engine as a ``Popen``-shaped handle, its termination, and the
+engine as a ``Popen``-shaped handle (one spawned headless engine, or the
+engine cores a manager started from this process), its termination, and the
 supervision loop that drains on a signal and exits with the engine or the
 server. Nothing here knows which engine it supervises.
 """
@@ -165,6 +166,77 @@ class EngineProcess:
         code = self._process.exitcode
         if code is None:
             raise subprocess.TimeoutExpired("headless engine", timeout or 0)
+        return code
+
+
+class EngineProcessGroup:
+    """A ``Popen``-shaped view of the engine processes a manager started from
+    this process (vLLM's ``CoreEngineProcManager``: its ``processes`` and its
+    ``shutdown(timeout)``), so :func:`supervise` and :func:`terminate_engine`
+    need no second code path.
+
+    Every process is tracked as an :class:`EngineProcess`, so the workers an
+    engine core spawns (its TP ranks) are reaped the same way when a core is
+    killed or exits on its own. ``terminate`` goes through the manager, which
+    signals the cores and force-kills what is still alive after the grace
+    period; it runs once. ``kill`` reaches the processes directly.
+    """
+
+    def __init__(self, manager: Any, *, shutdown_timeout: float | None = None):
+        self._manager = manager
+        self._shutdown_timeout = shutdown_timeout
+        self._engines = [EngineProcess(process) for process in manager.processes]
+        self._exit_code: int | None = None
+        self._shut_down = False
+
+    @property
+    def pid(self) -> int | None:
+        """The first core's pid; :attr:`pids` lists them all."""
+        return self._engines[0].pid if self._engines else None
+
+    @property
+    def pids(self) -> list[int | None]:
+        return [engine.pid for engine in self._engines]
+
+    def poll(self) -> int | None:
+        """``None`` while every core is alive, else the exit code of the first
+        core seen exiting. That exit ends the engine: the manager shuts the
+        other cores down (what vLLM's own liveness monitor does)."""
+        codes = [engine.poll() for engine in self._engines]
+        if self._exit_code is None:
+            self._exit_code = next((code for code in codes if code is not None), None)
+        if self._exit_code is not None and None in codes:
+            self._shutdown()
+        return self._exit_code
+
+    def track(self) -> None:
+        for engine in self._engines:
+            engine.track()
+
+    def terminate(self) -> None:
+        self.track()
+        self._shutdown(self._shutdown_timeout)
+
+    def _shutdown(self, timeout: float | None = None) -> None:
+        if self._shut_down:
+            return
+        self._shut_down = True
+        self._manager.shutdown(timeout=timeout)
+
+    def kill(self) -> None:
+        for engine in self._engines:
+            engine.kill()
+
+    def kill_descendants(self) -> int:
+        return sum(engine.kill_descendants() for engine in self._engines)
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for engine in self._engines:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            engine.wait(remaining)
+        code = self.poll()
+        assert code is not None
         return code
 
 

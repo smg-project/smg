@@ -162,3 +162,62 @@ def test_a_recycled_pid_is_not_killed(tmp_path):
     assert _alive(launcher.pid)
     launcher.kill()
     launcher.wait()
+
+
+class _ManagerOf:
+    """vLLM's process manager as the group sees it, over spawned-shaped launchers."""
+
+    def __init__(self, launchers: list[subprocess.Popen]):
+        self.processes = [_PopenAsSpawned(launcher) for launcher in launchers]
+        self.shutdowns: list[float | None] = []
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        self.shutdowns.append(timeout)
+        for process in self.processes:
+            if process.exitcode is None:
+                process.terminate()
+
+
+def test_group_kill_reaches_the_workers_of_every_core(tmp_path):
+    """Each engine core's workers are tracked and killed with it, as for the
+    single spawned engine."""
+    pid_files = [tmp_path / "a.pid", tmp_path / "b.pid"]
+    launchers = [
+        subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_file}; wait"])
+        for pid_file in pid_files
+    ]
+    workers = [_worker_pid(pid_file) for pid_file in pid_files]
+    engines = rust_lifecycle.EngineProcessGroup(_ManagerOf(launchers))
+    assert engines.pids == [launcher.pid for launcher in launchers]
+    assert engines.poll() is None  # tracks every core's workers
+
+    engines.kill()
+
+    assert engines.wait(timeout=10) == -signal.SIGKILL
+    for worker in workers:
+        _wait_dead(worker, "worker")
+
+
+def test_one_cores_exit_ends_the_group_and_the_cleanup_reaps_every_worker(tmp_path):
+    """A core that exits takes the engine down: the manager shuts the other
+    cores down and `terminate_engine` kills the workers they left."""
+    pid_files = [tmp_path / "a.pid", tmp_path / "b.pid"]
+    launchers = [
+        subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_files[0]}; sleep 1; exit 3"]),
+        subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_files[1]}; wait"]),
+    ]
+    workers = [_worker_pid(pid_file) for pid_file in pid_files]
+    manager = _ManagerOf(launchers)
+    engines = rust_lifecycle.EngineProcessGroup(manager)
+    assert engines.poll() is None
+    deadline = time.monotonic() + 10
+    while engines.poll() is None:
+        assert time.monotonic() < deadline, "the first core never exited"
+        time.sleep(0.05)
+    assert engines.poll() == 3 and manager.shutdowns == [None]
+    assert engines.wait(timeout=10) == 3  # the first exit code; the sibling was terminated
+
+    rust_lifecycle.terminate_engine(engines)
+
+    for worker in workers:
+        _wait_dead(worker, "orphaned worker")

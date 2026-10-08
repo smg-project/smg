@@ -501,6 +501,23 @@ def _stub_frontend_args(monkeypatch):
     _install(monkeypatch, "vllm.entrypoints.launchers.cli_args", FrontendArgs=FrontendArgs)
 
 
+def _stub_engine_exceptions(monkeypatch):
+    """What `serve_rust`'s media bridge import needs from vLLM's exceptions."""
+    _install(
+        monkeypatch,
+        "vllm.exceptions",
+        VLLMNotFoundError=type("VLLMNotFoundError", (Exception,), {}),
+        VLLMClientError=type("VLLMClientError", (Exception,), {}),
+    )
+    _install(monkeypatch, "vllm.v1")
+    _install(monkeypatch, "vllm.v1.engine")
+    _install(
+        monkeypatch,
+        "vllm.v1.engine.exceptions",
+        EngineGenerateError=type("EngineGenerateError", (Exception,), {}),
+    )
+
+
 def test_headless_namespace_is_built_from_the_parsed_args_not_argv(monkeypatch):
     """The `python -m vllm.entrypoints.grpc_server` namespace: engine args
     stay as parsed, the frontend fields it lacks get defaults, and the
@@ -603,6 +620,206 @@ def test_launch_headless_engine_spawns_a_fresh_interpreter(monkeypatch):
     assert engine.pid == 7
 
 
+class _FakeCore:
+    """A `multiprocessing`-shaped engine-core process the fake manager started."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.name = f"EngineCore_DP{pid}"
+        self.exitcode: int | None = None
+        self.events: list[str] = []
+
+    def terminate(self) -> None:
+        self.events.append("terminate")
+        self.exitcode = -15
+
+    def kill(self) -> None:
+        self.events.append("kill")
+        self.exitcode = -9
+
+    def join(self, timeout=None) -> None:
+        self.events.append(f"join:{timeout}")
+
+
+class _FakeManager:
+    """vLLM's `CoreEngineProcManager` as the launch sees it: the keyword
+    arguments, the processes it started (in this process), one-shot shutdown."""
+
+    instances: list[_FakeManager] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.started_in = os.getpid()
+        self.processes = [_FakeCore(1000 + i) for i in range(kwargs["local_engine_count"])]
+        self.events: list[str] = []
+        _FakeManager.instances.append(self)
+
+    def shutdown(self, timeout=None) -> None:
+        self.events.append(f"shutdown:{timeout}")
+        for core in self.processes:
+            if core.exitcode is None:
+                core.terminate()
+
+
+def _parallel(**overrides) -> SimpleNamespace:
+    """The parallel config `create_engine_config(headless=True)` yields for the
+    headless namespace: every engine local, pinned to the handshake port."""
+    parallel = SimpleNamespace(
+        data_parallel_size=2,
+        data_parallel_size_local=2,
+        data_parallel_rank=0,
+        data_parallel_master_ip="127.0.0.1",
+        data_parallel_rpc_port=24321,
+        data_parallel_backend="mp",
+        node_rank_within_dp=0,
+    )
+    for key, value in overrides.items():
+        setattr(parallel, key, value)
+    return parallel
+
+
+def _stub_engine_core_launch(monkeypatch, parallel: SimpleNamespace) -> dict:
+    """Stub what `launch_engine_cores` imports from vLLM; returns the record
+    of `create_engine_config` calls and the headless config it hands out."""
+    recorded: dict = {"configs": []}
+    headless_config = SimpleNamespace(parallel_config=parallel, shutdown_timeout=0)
+    recorded["headless_config"] = headless_config
+
+    class EngineArgs:
+        disable_log_stats = False
+
+        def __init__(self, args):
+            self.args = args
+
+        def create_engine_config(self, usage_context, headless=False):
+            recorded["configs"].append((self.args, usage_context, headless))
+            return headless_config if headless else _config()
+
+    class AsyncEngineArgs:
+        @staticmethod
+        def from_cli_args(args):
+            return EngineArgs(args)
+
+    class Executor:
+        @staticmethod
+        def get_class(vllm_config):
+            recorded["executor_config"] = vllm_config
+            return Executor
+
+    _stub_frontend_args(monkeypatch)
+    _install(monkeypatch, "vllm.engine.arg_utils", AsyncEngineArgs=AsyncEngineArgs)
+    _install(monkeypatch, "vllm.usage.usage_lib", UsageContext=SimpleNamespace(OPENAI_API_SERVER=1))
+    _install(
+        monkeypatch, "vllm.utils.network_utils", get_tcp_uri=lambda ip, port: f"tcp://{ip}:{port}"
+    )
+    _install(monkeypatch, "vllm.v1.engine.utils", CoreEngineProcManager=_FakeManager)
+    _install(monkeypatch, "vllm.v1.executor", Executor=Executor)
+    monkeypatch.setattr(_FakeManager, "instances", [])
+    recorded["Executor"] = Executor
+    return recorded
+
+
+def test_launch_engine_cores_builds_the_manager_in_this_process_as_run_headless_does(monkeypatch):
+    """smg-lab#43: the cores are started by `CoreEngineProcManager` from the
+    servicer process, from the headless config of the same namespace, with
+    the arguments vLLM's `run_headless` passes for the head node; no
+    `multiprocessing` child runs the launcher."""
+    recorded = _stub_engine_core_launch(monkeypatch, _parallel())
+
+    def no_launcher_child(method):
+        raise AssertionError(f"a {method} child was started for the engine launch")
+
+    monkeypatch.setattr(rust.multiprocessing, "get_context", no_launcher_child)
+    args = argparse.Namespace(model="org/m", host=None, port=50051, max_model_len=4096)
+    ns = rust.headless_namespace(args, handshake_port=24321, data_parallel_size=2)
+
+    engine = rust.launch_engine_cores(ns)
+
+    assert isinstance(engine, rust_lifecycle.EngineProcessGroup)
+    (manager,) = _FakeManager.instances
+    assert manager.started_in == os.getpid()
+    assert manager.kwargs == {
+        "local_engine_count": 2,
+        "start_index": 0,
+        "local_start_index": 0,
+        "vllm_config": recorded["headless_config"],
+        "local_client": False,
+        "handshake_address": "tcp://127.0.0.1:24321",
+        "executor_class": recorded["Executor"],
+        "log_stats": True,
+    }
+    assert recorded["executor_config"] is recorded["headless_config"]
+    # The config is the headless one, from the launcher's namespace re-aimed
+    # at the handshake port (not from argv).
+    ((config_args, usage_context, headless),) = recorded["configs"]
+    assert config_args is ns and usage_context == 1 and headless is True
+    assert ns.headless is True and ns.data_parallel_rpc_port == 24321
+    assert engine.pids == [1000, 1001] and engine.pid == 1000 and engine.poll() is None
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"node_rank_within_dp": 1}, {"data_parallel_backend": "ray"}]
+)
+def test_launch_engine_cores_leaves_worker_ranks_and_ray_to_the_spawned_launcher(
+    monkeypatch, overrides
+):
+    """The launcher alone serves a multi-node engine's worker ranks and the
+    ray backend: those still go through the spawned `run_headless`, unchanged."""
+    _stub_engine_core_launch(monkeypatch, _parallel(**overrides))
+    launched: list[argparse.Namespace] = []
+    fallback = FakeEngine()
+
+    def fake_launch(ns):
+        launched.append(ns)
+        return fallback
+
+    monkeypatch.setattr(rust, "launch_headless_engine", fake_launch)
+    ns = rust.headless_namespace(
+        argparse.Namespace(model="org/m", host=None, port=50051),
+        handshake_port=24321,
+        data_parallel_size=2,
+    )
+    assert rust.launch_engine_cores(ns) is fallback
+    assert launched == [ns] and _FakeManager.instances == []
+
+
+def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_path):
+    """smg-lab#43 end to end: `serve_rust` builds the servicer's config, binds
+    the server, then starts the cores in this process against the server's
+    handshake port; the supervisor gets the cores' handle."""
+    recorded = _stub_engine_core_launch(monkeypatch, _parallel())
+    _stub_engine_exceptions(monkeypatch)
+    _install(monkeypatch, "smg")
+    _install(
+        monkeypatch, "smg.servicer", VllmGrpcServer=FakeServer, init_servicer_tracing=lambda: None
+    )
+    monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
+    monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
+    monkeypatch.setattr(rust, "free_port", lambda: 24321)
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    supervised: dict = {}
+
+    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+        supervised["server"], supervised["engine"] = server, engine
+        return 0
+
+    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    args = argparse.Namespace(
+        model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096
+    )
+    assert asyncio.run(rust.serve_rust(args)) == 0
+
+    engine = supervised["engine"]
+    assert isinstance(engine, rust_lifecycle.EngineProcessGroup)
+    (manager,) = _FakeManager.instances
+    assert manager.started_in == os.getpid()
+    assert manager.kwargs["handshake_address"] == supervised["server"].kwargs["handshake_address"]
+    assert manager.kwargs["local_engine_count"] == supervised["server"].kwargs["engine_count"] == 2
+    # Two configs in this process: the servicer's own, then the headless one.
+    assert [(call[1], call[2]) for call in recorded["configs"]] == [(1, False), (1, True)]
+    assert recorded["configs"][0][0] is args and recorded["configs"][1][0].headless is True
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -698,6 +915,54 @@ def test_supervise_drains_then_stops_on_a_signal():
     assert engine.events == ["terminate"]
 
 
+def test_supervise_exits_nonzero_when_an_engine_core_dies_and_shuts_the_others_down():
+    """One core's exit code ends the engine: the loop exits 1, the manager
+    shuts the surviving cores down, nothing is terminated twice."""
+    manager = _FakeManager(local_engine_count=2)
+    server, engine = FakeServer(), rust_lifecycle.EngineProcessGroup(manager)
+
+    def core_dies(_stop):
+        manager.processes[1].exitcode = 3
+
+    assert _run_supervise(server, engine, before=core_dies) == 1
+    assert server.events == ["serving:False", "stop:1.0"]
+    assert manager.events == ["shutdown:None"]
+    assert [core.events for core in manager.processes] == [["terminate"], []]
+    # The exit code is the one that ended the engine, not the sibling's.
+    assert engine.poll() == 3 and engine.wait() == 3
+
+
+def test_supervise_terminates_the_engine_cores_through_the_manager_on_a_signal():
+    manager = _FakeManager(local_engine_count=2)
+    server = FakeServer()
+    server.engine_ready = True
+    engine = rust_lifecycle.EngineProcessGroup(manager, shutdown_timeout=7.0)
+    assert _run_supervise(server, engine, before=lambda stop: stop.set(), drain_secs=0.01) == 0
+    assert server.events == ["serving:False", "stop:1.0"]
+    assert manager.events == ["shutdown:7.0"]
+    # Terminated once each through the manager, waited for, never killed.
+    assert [_signals(core) for core in manager.processes] == [["terminate"], ["terminate"]]
+
+
+def test_engine_process_group_is_popen_shaped():
+    manager = _FakeManager(local_engine_count=2)
+    engine = rust_lifecycle.EngineProcessGroup(manager)
+    assert engine.pid == 1000 and engine.pids == [1000, 1001]
+    assert engine.poll() is None and manager.events == []
+    with pytest.raises(subprocess.TimeoutExpired):
+        engine.wait(timeout=0.1)
+    # `kill` reaches every core directly; the manager's one-shot shutdown is
+    # not relied on for it, and nothing is left for it to do.
+    engine.kill()
+    assert [_signals(core) for core in manager.processes] == [["kill"], ["kill"]]
+    assert engine.wait() == -9 and engine.poll() == -9 and manager.events == []
+    assert engine.kill_descendants() == 0
+
+
+def _signals(core: _FakeCore) -> list[str]:
+    return [event for event in core.events if not event.startswith("join")]
+
+
 def test_configure_logging_gives_the_package_a_handler(monkeypatch):
     import logging
 
@@ -712,7 +977,7 @@ def test_configure_logging_gives_the_package_a_handler(monkeypatch):
 
 def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, tmp_path):
     """The upstream hook hands `serve_rust` its parsed namespace: the Rust
-    server binds the launcher's host/port, the headless engine is launched
+    server binds the launcher's host/port, the engine cores are launched
     from that same namespace (plus the handshake), and both are supervised.
     argv is never consulted, so the `vllm serve <model> --grpc` form works."""
     recorded: dict = {}
@@ -724,6 +989,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
             return SimpleNamespace(create_engine_config=lambda usage_context: _config())
 
     _stub_frontend_args(monkeypatch)
+    _stub_engine_exceptions(monkeypatch)
     _install(monkeypatch, "vllm.engine.arg_utils", AsyncEngineArgs=AsyncEngineArgs)
     _install(monkeypatch, "vllm.usage.usage_lib", UsageContext=SimpleNamespace(OPENAI_API_SERVER=1))
     _install(monkeypatch, "smg")
@@ -739,7 +1005,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
         launched.append(ns)
         return FakeEngine()
 
-    monkeypatch.setattr(rust, "launch_headless_engine", fake_launch)
+    monkeypatch.setattr(rust, "launch_engine_cores", fake_launch)
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
     monkeypatch.setattr(rust, "free_port", lambda: 24321)
     monkeypatch.setattr(sys, "argv", ["vllm", "serve", "org/m", "--grpc", "--port", "50051"])
@@ -779,7 +1045,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     def failing_launch(ns):
         raise RuntimeError("engine would not start")
 
-    monkeypatch.setattr(rust, "launch_headless_engine", failing_launch)
+    monkeypatch.setattr(rust, "launch_engine_cores", failing_launch)
     with pytest.raises(RuntimeError, match="engine would not start"):
         asyncio.run(rust.serve_rust(args))
     assert servers[0].events == ["serving:False", "stop:5.0"]
