@@ -10,6 +10,9 @@
 //! label) and the engine-reported `cached_tokens`. When the mock fleet's admin
 //! API is given, every request is joined with the fleet's record of it, which
 //! carries the arrival-time oracle: the most cached tokens any worker held.
+//! A thinking model's streamed `reasoning_content` counts as output for TTFT
+//! and ITL (reported separately as `reasoning_tokens`), and
+//! `--chat-template-kwargs` reaches the chat template, e.g. to turn thinking off.
 
 // A command-line tool: the summary goes to stdout, progress to stderr.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -95,6 +98,11 @@ struct Args {
     /// Rows of the per-request decision table written to `t4.md`.
     #[arg(long, default_value_t = 40)]
     t4_rows: usize,
+    /// JSON object sent as `chat_template_kwargs` in every request body, for
+    /// example `{"enable_thinking":false}` on a model that reasons by default;
+    /// nothing is sent when absent.
+    #[arg(long, value_parser = parse_json_object)]
+    chat_template_kwargs: Option<Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -124,8 +132,11 @@ struct ReqResult {
     itl_mean_ms: Option<f64>,
     itl_p99_ms: Option<f64>,
     tokens_seen: u32,
+    /// Reasoning deltas (`reasoning_content`) the stream showed: they count
+    /// for TTFT and ITL like text, separately from `tokens_seen`.
+    reasoning_tokens: u32,
     /// Output tokens the engine counted but the stream never showed as text
-    /// (an incomplete UTF-8 piece the detokenizer holds back).
+    /// or reasoning (an incomplete UTF-8 piece the detokenizer holds back).
     invisible_tokens: u32,
     /// The gateway's `x-request-id` (the response id without its uuid tail).
     gateway_request_id: String,
@@ -415,6 +426,36 @@ fn parse_speedup(raw: &str) -> Result<f64, String> {
     }
 }
 
+/// `--chat-template-kwargs` must be a JSON object.
+fn parse_json_object(raw: &str) -> Result<Value, String> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(format!("expected a JSON object, got {raw}")),
+        Err(e) => Err(format!("not JSON: {e}")),
+    }
+}
+
+/// The streaming chat completion for one trace row.
+fn request_body(
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+    chat_template_kwargs: Option<&Value>,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    if let Some(kwargs) = chat_template_kwargs {
+        body["chat_template_kwargs"] = kwargs.clone();
+    }
+    body
+}
+
 /// When a row stamped `trace_ts_ms` is due, relative to the window's first
 /// row at `t0_ms`, at `speedup`. A row stamped before the first one (an
 /// unsorted or hand-edited trace, or a window that starts on a reordered
@@ -450,6 +491,7 @@ struct Job {
     body_prompt: String,
     max_output: u32,
     sent_at_ms: f64,
+    chat_template_kwargs: Option<Value>,
 }
 
 async fn run_one(job: Job) -> ReqResult {
@@ -462,16 +504,15 @@ async fn run_one(job: Job) -> ReqResult {
         body_prompt,
         max_output,
         sent_at_ms,
+        chat_template_kwargs,
     } = job;
     let max_tokens = row.output_length.clamp(1, max_output);
-    let body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": body_prompt}],
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        "stream": true,
-        "stream_options": {"include_usage": true},
-    });
+    let body = request_body(
+        &model,
+        &body_prompt,
+        max_tokens,
+        chat_template_kwargs.as_ref(),
+    );
     let mut result = ReqResult {
         row: row_index,
         trace_ts_ms: row.timestamp,
@@ -541,12 +582,14 @@ async fn run_one(job: Job) -> ReqResult {
 struct StreamObserver {
     request_id: String,
     worker: String,
-    /// The first chunk that carried a token or the finish: a one-token
-    /// answer whose token has no visible text still arrives here.
+    /// The first chunk that carried a token (text or reasoning) or the
+    /// finish: a one-token answer whose token has no visible text still
+    /// arrives here.
     first_signal: Option<Instant>,
     last_token: Option<Instant>,
     itls: Vec<f64>,
     tokens_seen: u32,
+    reasoning_tokens: u32,
     prompt_tokens: u32,
     completion_tokens: u32,
     cached_tokens: u32,
@@ -569,16 +612,26 @@ impl StreamObserver {
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|c| c.first());
-        let has_content = choice
-            .and_then(|c| c.get("delta"))
-            .and_then(|d| d.get("content"))
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty());
+        let delta = choice.and_then(|c| c.get("delta"));
+        let non_empty = |key: &str| {
+            delta
+                .and_then(|d| d.get(key))
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        };
+        let has_content = non_empty("content");
+        // A thinking model streams its reasoning first: `reasoning_content`
+        // on chat deltas (`reasoning` on some engines). It is output too.
+        let has_reasoning = non_empty("reasoning_content") || non_empty("reasoning");
         let finished = choice
             .and_then(|c| c.get("finish_reason"))
             .is_some_and(|f| !f.is_null());
-        if has_content {
-            self.tokens_seen += 1;
+        if has_content || has_reasoning {
+            if has_content {
+                self.tokens_seen += 1;
+            } else {
+                self.reasoning_tokens += 1;
+            }
             if let Some(prev) = self.last_token {
                 self.itls.push((now - prev).as_secs_f64() * 1000.0);
             }
@@ -606,9 +659,10 @@ impl StreamObserver {
         }
     }
 
-    /// Fold the observations into the result. A stream that showed no text
-    /// but finished with a counted output token is a served request whose
-    /// token was invisible; one with no token at all is `no-tokens`.
+    /// Fold the observations into the result. A stream that showed neither
+    /// text nor reasoning but finished with a counted output token is a
+    /// served request whose token was invisible; one with no token at all is
+    /// `no-tokens`.
     fn finish(self, started: Instant, result: &mut ReqResult) {
         result.request_id = self.request_id;
         result.worker = self.worker;
@@ -616,6 +670,8 @@ impl StreamObserver {
         result.completion_tokens = self.completion_tokens;
         result.cached_tokens = self.cached_tokens;
         result.tokens_seen = self.tokens_seen;
+        result.reasoning_tokens = self.reasoning_tokens;
+        let shown = self.tokens_seen + self.reasoning_tokens;
         result.ttft_ms = self
             .first_signal
             .map(|t| (t - started).as_secs_f64() * 1000.0);
@@ -625,11 +681,11 @@ impl StreamObserver {
             result.itl_mean_ms = Some(mean(&self.itls));
             result.itl_p99_ms = Some(percentile(&sorted, 0.99));
         }
-        if result.completion_tokens < self.tokens_seen {
+        if result.completion_tokens < shown {
             // No usage arrived: count what was seen.
-            result.completion_tokens = self.tokens_seen;
+            result.completion_tokens = shown;
         }
-        if self.tokens_seen == 0 && self.completion_tokens > 0 && result.ttft_ms.is_some() {
+        if shown == 0 && self.completion_tokens > 0 && result.ttft_ms.is_some() {
             result.invisible_tokens = self.completion_tokens;
         }
         if result.status == "ok" && (result.ttft_ms.is_none() || result.completion_tokens == 0) {
@@ -1013,6 +1069,7 @@ async fn main() -> Result<()> {
             body_prompt: prompt,
             max_output: args.max_output,
             sent_at_ms: start.elapsed().as_secs_f64() * 1000.0,
+            chat_template_kwargs: args.chat_template_kwargs.clone(),
         };
         set.spawn(async move {
             let _permit = permit;
@@ -1162,6 +1219,7 @@ async fn main() -> Result<()> {
         "ok": ok.len(),
         "errors": scored.len() - ok.len(),
         "invisible_token_requests": ok.iter().filter(|r| r.invisible_tokens > 0).count(),
+        "reasoning_tokens": ok.iter().map(|r| u64::from(r.reasoning_tokens)).sum::<u64>(),
         "speedup": args.speedup,
         "wall_s": wall_s,
         "req_per_s": ok.len() as f64 / wall_s,
@@ -1187,10 +1245,10 @@ async fn main() -> Result<()> {
         args.out.join("summary.json"),
         serde_json::to_string_pretty(&summary)?,
     )?;
-    let mut csv = String::from("row,trace_ts_ms,trace_input_length,sent_at_ms,status,request_id,worker,prompt_tokens,completion_tokens,cached_tokens,oracle_tokens,queued_ms,ttft_ms,latency_ms,itl_mean_ms,itl_p99_ms,tokens_seen,invisible_tokens,gateway_request_id,branch,credit_tokens,agree\n");
+    let mut csv = String::from("row,trace_ts_ms,trace_input_length,sent_at_ms,status,request_id,worker,prompt_tokens,completion_tokens,cached_tokens,oracle_tokens,queued_ms,ttft_ms,latency_ms,itl_mean_ms,itl_p99_ms,tokens_seen,reasoning_tokens,invisible_tokens,gateway_request_id,branch,credit_tokens,agree\n");
     for r in &results {
         csv.push_str(&format!(
-            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{},{}\n",
             r.row,
             r.trace_ts_ms,
             r.trace_input_length,
@@ -1208,6 +1266,7 @@ async fn main() -> Result<()> {
             r.itl_mean_ms.map(|v| format!("{v:.2}")).unwrap_or_default(),
             r.itl_p99_ms.map(|v| format!("{v:.2}")).unwrap_or_default(),
             r.tokens_seen,
+            r.reasoning_tokens,
             r.invisible_tokens,
             r.gateway_request_id,
             r.branch,
@@ -1440,6 +1499,106 @@ mod tests {
         // No usage arrived: the stream is still a served one, counted as seen.
         assert_eq!(result.status, "ok");
         assert_eq!(result.completion_tokens, 3);
+    }
+
+    /// A chat completion chunk whose delta carries the given field.
+    fn delta_chunk(field: &str, text: &str) -> Value {
+        serde_json::from_str(&format!(
+            r#"{{"id":"chatcmpl-r","choices":[{{"index":0,"delta":{{"{field}":"{text}"}},"finish_reason":null}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn reasoning_deltas_count_for_ttft_and_itl() {
+        // A thinking model: two reasoning deltas, then one of text, then the
+        // finish and the usage, as the gateway streams them.
+        let finish: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        let usage: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-r","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}"#,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let mut observer = StreamObserver::default();
+        observer.observe(
+            &delta_chunk("reasoning_content", "think"),
+            started + Duration::from_millis(40),
+        );
+        observer.observe(
+            &delta_chunk("reasoning_content", "more"),
+            started + Duration::from_millis(60),
+        );
+        observer.observe(
+            &delta_chunk("content", "answer"),
+            started + Duration::from_millis(80),
+        );
+        observer.observe(&finish, started + Duration::from_millis(81));
+        observer.observe(&usage, started + Duration::from_millis(82));
+        let mut result = ReqResult {
+            status: "ok".to_string(),
+            ..Default::default()
+        };
+        observer.finish(started, &mut result);
+        assert_eq!(result.status, "ok");
+        assert!((result.ttft_ms.unwrap() - 40.0).abs() < 1.0);
+        assert!((result.itl_mean_ms.unwrap() - 20.0).abs() < 1.0);
+        assert_eq!(result.reasoning_tokens, 2);
+        assert_eq!(result.tokens_seen, 1);
+        assert_eq!(result.completion_tokens, 3);
+        assert_eq!(result.invisible_tokens, 0);
+    }
+
+    #[test]
+    fn a_reasoning_only_stream_is_served_not_invisible() {
+        // The output budget ran out inside the reasoning: no text at all.
+        let finish: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-r","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        let usage: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-r","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let mut observer = StreamObserver::default();
+        observer.observe(
+            &delta_chunk("reasoning", "a"),
+            started + Duration::from_millis(30),
+        );
+        observer.observe(
+            &delta_chunk("reasoning", "b"),
+            started + Duration::from_millis(50),
+        );
+        observer.observe(&finish, started + Duration::from_millis(500));
+        observer.observe(&usage, started + Duration::from_millis(501));
+        let mut result = ReqResult {
+            status: "ok".to_string(),
+            ..Default::default()
+        };
+        observer.finish(started, &mut result);
+        assert_eq!(result.status, "ok");
+        // The first reasoning delta is the first token, not the finish.
+        assert!((result.ttft_ms.unwrap() - 30.0).abs() < 1.0);
+        assert!((result.itl_mean_ms.unwrap() - 20.0).abs() < 1.0);
+        assert_eq!(result.reasoning_tokens, 2);
+        assert_eq!(result.tokens_seen, 0);
+        assert_eq!(result.invisible_tokens, 0);
+    }
+
+    #[test]
+    fn chat_template_kwargs_are_forwarded_only_when_given() {
+        let plain = request_body("m", "hi", 5, None);
+        assert!(plain.get("chat_template_kwargs").is_none());
+        assert_eq!(plain["max_tokens"], 5);
+        let kwargs = parse_json_object(r#"{"enable_thinking": false}"#).unwrap();
+        let body = request_body("m", "hi", 5, Some(&kwargs));
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["messages"][0]["content"], "hi");
+        assert!(parse_json_object("[1]").is_err());
+        assert!(parse_json_object("nope").is_err());
     }
 
     #[test]
