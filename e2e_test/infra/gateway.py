@@ -452,6 +452,7 @@ class Gateway:
         labels: dict[str, str] | None = None,
         worker_type: str | None = None,
         bootstrap_port: int | None = None,
+        spec: dict | None = None,
     ) -> tuple[bool, str | None]:
         """Add a worker to the gateway. Returns (success, worker_id or error).
 
@@ -459,8 +460,10 @@ class Gateway:
         ``{"realtime": "true"}`` to make it eligible for realtime routing).
         ``worker_type`` (``"prefill"``/``"decode"``/``"encode"``) and the
         prefill ``bootstrap_port`` register a disaggregated leg at runtime.
+        ``spec`` adds other ``WorkerSpec`` fields (``kv_connector``,
+        ``kv_role``, ``runtime_type``, ``connection_mode``).
         """
-        body: dict = {"url": worker_url}
+        body: dict = {"url": worker_url, **(spec or {})}
         if labels:
             body["labels"] = labels
         if worker_type:

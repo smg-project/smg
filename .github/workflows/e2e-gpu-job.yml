@@ -53,12 +53,22 @@ on:
         required: false
         type: string
         default: "nixl"
-        description: "KV transfer backend for vLLM PD workers: nixl or mooncake"
+        description: "KV transfer backend for vLLM PD workers: nixl, mooncake or moriio"
+      vllm_moriio_mode:
+        required: false
+        type: string
+        default: ""
+        description: "MoRI-IO transfer mode for vLLM PD workers on the moriio backend: read or write (empty = read)"
+      vllm_moriio_backend:
+        required: false
+        type: string
+        default: ""
+        description: "MoRI-IO transfer engine for vLLM PD workers on the moriio backend: rdma (through the NICs) or xgmi (GPU to GPU on one node) (empty = rdma)"
       kv_backend:
         required: false
         type: string
         default: ""
-        description: "KV transfer backend for every PD worker, whatever the engine (nixl or mooncake); empty keeps each engine's default"
+        description: "KV transfer backend for every PD worker, whatever the engine (nixl, mooncake or moriio); empty keeps each engine's default"
       vllm_extra_kv_backends:
         required: false
         type: string
@@ -99,11 +109,26 @@ on:
         required: false
         type: string
         default: ""
+      gpu_vendor:
+        description: "GPU vendor of the runner: nvidia, or amd for a lane that runs in an engine's ROCm image"
+        required: false
+        type: string
+        default: "nvidia"
+      container_image:
+        description: "Image the job runs in, with container_options; empty keeps vars.SMG_CI_GPU_CONTAINER_IMAGE"
+        required: false
+        type: string
+        default: ""
+      container_options:
+        description: "docker options for container_image (devices, IPC, memlock)"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   run:
     runs-on: ${{ inputs.runner }}
-    container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+    container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":"{0}","options":"{1}"}}', inputs.container_image, inputs.container_options)) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
@@ -112,6 +137,8 @@ jobs:
       E2E_RUNTIME: ${{ inputs.engine }}
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
+      E2E_VLLM_MORIIO_MODE: ${{ inputs.vllm_moriio_mode }}
+      E2E_VLLM_MORIIO_BACKEND: ${{ inputs.vllm_moriio_backend }}
       E2E_KV_BACKEND: ${{ inputs.kv_backend }}
       E2E_VLLM_EXTRA_KV_BACKENDS: ${{ inputs.vllm_extra_kv_backends }}
       E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
@@ -142,8 +169,12 @@ jobs:
         uses: ./.github/actions/setup-sglang
 
       - name: Setup vLLM backend
-        if: inputs.engine == 'vllm'
+        if: inputs.engine == 'vllm' && inputs.gpu_vendor != 'amd'
         uses: ./.github/actions/setup-vllm
+
+      - name: Setup vLLM backend (in vLLM's ROCm image)
+        if: inputs.engine == 'vllm' && inputs.gpu_vendor == 'amd'
+        run: bash scripts/ci_setup_vllm_rocm_image.sh
 
       - name: Setup TRT-LLM backend
         if: inputs.engine == 'trtllm'
@@ -225,7 +256,11 @@ jobs:
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
         run: |
-          bash scripts/ci_killall_sglang.sh "nuke_gpus"
+          if [ "${{ inputs.gpu_vendor }}" = amd ]; then
+            bash scripts/ci_killall_sglang.sh rocm  # the default mode reads nvidia-smi
+          else
+            bash scripts/ci_killall_sglang.sh "nuke_gpus"
+          fi
           pytest ${{ inputs.test_dirs }} \
             --ignore=e2e_test/benchmarks \
             --ignore=e2e_test/bindings_go \
@@ -243,6 +278,13 @@ jobs:
             SUFFIX="-${{ inputs.kv_backend }}"
           elif [ "${{ inputs.engine }}" = "vllm" ]; then
             SUFFIX="-${{ inputs.vllm_kv_backend }}"
+          fi
+          # MoRI-IO lanes differ by transfer mode, and AMD lanes by vendor.
+          if [ -n "${{ inputs.vllm_moriio_mode }}" ]; then
+            SUFFIX="${SUFFIX}-${{ inputs.vllm_moriio_mode }}"
+          fi
+          if [ "${{ inputs.gpu_vendor }}" = amd ]; then
+            SUFFIX="${SUFFIX}-amd"
           fi
           # gRPC and ZMQ chat legs share engine/GPU/test-dir and differ only by
           # wire mode; fold it in so their log artifacts don't collide.

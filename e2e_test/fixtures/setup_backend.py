@@ -38,6 +38,7 @@ from infra import (
     get_runtime,
     launch_cloud_gateway,
 )
+from infra.constants import vllm_kv_backend
 from infra.model_specs import get_model_spec
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
@@ -62,7 +63,7 @@ _WORKER_DEFAULTS = {
     "prefill_tp": None,
     "decode_tp": None,
     # PD only: KV transfer backend per worker of each leg ("nixl" /
-    # "mooncake"), a list one entry per worker; None = the lane's default.
+    # "mooncake" / "moriio"), a list one entry per worker; None = the lane's default.
     "prefill_kv": None,
     "decode_kv": None,
     "gpus": None,
@@ -514,6 +515,38 @@ def _start_pd_leg(
     return workers
 
 
+def _moriio_fleet(engine: str, prefill_kv: list[str] | None, decode_kv: list[str] | None) -> bool:
+    """Whether this PD fleet moves its KV over MoRI-IO; a fleet cannot mix it with others."""
+    if engine != Runtime.VLLM.value:
+        return False
+    backends = {*(prefill_kv or []), *(decode_kv or [])}
+    if prefill_kv is None or decode_kv is None:
+        backends.add(vllm_kv_backend())
+    if "moriio" not in backends:
+        return False
+    if backends != {"moriio"}:
+        raise ValueError(f"a MoRI-IO PD fleet cannot mix KV backends: {sorted(backends)}")
+    return True
+
+
+def _register_moriio_workers(gateway: Gateway, prefill_workers: list, decode_workers: list) -> None:
+    """Register MoRI-IO workers through the API, with the fields SMG's handoff reads.
+
+    Registered by URL on the command line, a worker carries no kv_connector, so
+    the HTTP PD router would pass requests through and decode would recompute
+    the prompt.
+    """
+    for workers, worker_type in ((prefill_workers, "prefill"), (decode_workers, "decode")):
+        for worker in workers:
+            ok, detail = gateway.add_worker(
+                worker.base_url, worker_type=worker_type, spec=worker.moriio_registration()
+            )
+            if not ok:
+                raise RuntimeError(f"registering {worker_type} {worker.base_url} failed: {detail}")
+    gateway.prefill_workers = list(prefill_workers)
+    gateway.decode_workers = list(decode_workers)
+
+
 def _setup_pd(
     model_id,
     model_path,
@@ -532,6 +565,11 @@ def _setup_pd(
     decode_tp = workers_config.get("decode_tp")
     prefill_kv = _per_worker_kv(workers_config.get("prefill_kv"), num_prefill, "prefill")
     decode_kv = _per_worker_kv(workers_config.get("decode_kv"), num_decode, "decode")
+    moriio = _moriio_fleet(engine, prefill_kv, decode_kv)
+    if moriio:
+        # SMG speaks the MoRI-IO handoff only on its HTTP PD router (the gRPC
+        # one answers 501), so a MoRI-IO lane runs every topology over HTTP.
+        connection_mode = ConnectionMode.HTTP
     backend_name = f"pd_{connection_mode.value}"
     runtime_label = RUNTIME_LABELS.get(engine, engine)
 
@@ -607,12 +645,16 @@ def _setup_pd(
                 _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
                 raise
 
-        _start_gateway(
-            gateway,
-            gateway_config,
-            prefill_workers=prefill_workers,
-            decode_workers=decode_workers,
-        )
+        if moriio:
+            _start_gateway(gateway, gateway_config, prefill_workers=[], decode_workers=[])
+            _register_moriio_workers(gateway, prefill_workers, decode_workers)
+        else:
+            _start_gateway(
+                gateway,
+                gateway_config,
+                prefill_workers=prefill_workers,
+                decode_workers=decode_workers,
+            )
         _wait_for_serving(gateway, model_id, model_path)
         logger.info("%s PD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
