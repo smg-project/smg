@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import enum
 import functools
 import hashlib
 import json
@@ -1792,13 +1793,30 @@ def _version_str(version: Any) -> str | None:
 
 
 def _make_json_serializable(obj: Any) -> Any:
-    """Flatten an arbitrary dataclass/config graph into JSON-safe primitives."""
+    """Flatten an arbitrary dataclass/config graph into JSON-safe primitives.
+
+    Anything that carries attributes (a nested dataclass, a plain config
+    object) becomes a dict, so :func:`redact_secrets` sees its keys instead of
+    a ``str`` rendering that could carry a credential past it. Enums, paths,
+    dtypes and the like still render with ``str``.
+    """
     if obj is None or isinstance(obj, str | int | float | bool):
         return obj
     if isinstance(obj, list | tuple | set):
         return [_make_json_serializable(x) for x in obj]
     if isinstance(obj, dict):
         return {str(k): _make_json_serializable(v) for k, v in obj.items()}
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return {
+            f.name: _make_json_serializable(getattr(obj, f.name)) for f in dataclasses.fields(obj)
+        }
+    attrs = getattr(obj, "__dict__", None)
+    if attrs and not isinstance(obj, enum.Enum | type):
+        return {
+            str(k): _make_json_serializable(v)
+            for k, v in attrs.items()
+            if not str(k).startswith("_")
+        }
     return str(obj)
 
 
