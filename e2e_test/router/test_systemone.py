@@ -98,7 +98,8 @@ class TestSystemOne:
         _assert_distribution(score)
         for answer in answers.values():
             assert math.isfinite(answer["x_label_mass"])
-            assert 0 <= answer["x_label_mass"] <= 1
+            # Native mass sums exp(raw logprobs), so rounding can exceed one.
+            assert 0 <= answer["x_label_mass"] <= 1 + 1e-6
         _assert_prefill_usage(result)
 
     @pytest.mark.parametrize(
@@ -161,12 +162,10 @@ class TestSystemOne:
             },
         )
         assert response.status_code == 422, response.text
-        # The gateway must forward the backend's native validation error, including
-        # its location and explicit false value, instead of silently dropping the key.
+        # The native error identifies the forwarded extension. SGLang strips
+        # invalid input values from validation errors before returning them.
         errors = response.json()["detail"]
         assert any(
-            error["type"] == "extra_forbidden"
-            and error["loc"][-1] == "native_extension"
-            and error["input"] is False
+            error["type"] == "extra_forbidden" and error["loc"][-1] == "native_extension"
             for error in errors
         ), errors
