@@ -456,6 +456,37 @@ fn transform_content_field(
     Ok(())
 }
 
+/// Whether rendering `messages` depends on the media-part order: true when
+/// any message, whatever its role, carries a content part that
+/// `transform_content_field` moves under `MediaFirst`. Text-only requests,
+/// and requests whose only typed parts are unknown ones (which never move),
+/// can skip resolving the order, and with it the tokenizer and model-config
+/// lookups the resolution needs. The media plan is not enough for this test:
+/// it skips assistant turns, which render through the same ordering.
+pub(crate) fn chat_has_media_parts(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        let content = match message {
+            ChatMessage::System { content, .. }
+            | ChatMessage::User { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. }
+            | ChatMessage::Root { content, .. } => Some(content),
+            ChatMessage::Assistant { content, .. } => content.as_ref(),
+            ChatMessage::Function { .. } => None,
+        };
+        let Some(MessageContent::Parts(parts)) = content else {
+            return false;
+        };
+        parts.iter().any(|part| match part {
+            ContentPart::ImageUrl { .. }
+            | ContentPart::VideoUrl { .. }
+            | ContentPart::AudioUrl { .. }
+            | ContentPart::InputAudio { .. } => true,
+            ContentPart::Text { .. } | ContentPart::Unknown(_) => false,
+        })
+    })
+}
+
 /// A popped assistant message's prefill: its string content, or its text parts joined in order.
 fn prefill_text(content: &Value) -> Option<String> {
     match content {
@@ -2108,5 +2139,91 @@ mod tests {
             missing_tokenizer_response("served-model", true).status(),
             http::StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+}
+
+#[cfg(test)]
+mod media_part_order_tests {
+    use openai_protocol::common::ImageUrl;
+
+    use super::*;
+
+    fn user(parts: Vec<ContentPart>) -> ChatMessage {
+        ChatMessage::User {
+            content: MessageContent::Parts(parts),
+            name: None,
+            ext: Default::default(),
+        }
+    }
+
+    fn text(text: &str) -> ContentPart {
+        ContentPart::Text {
+            text: text.to_string(),
+        }
+    }
+
+    fn image() -> ContentPart {
+        ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/a.png".to_string(),
+                detail: None,
+                max_long_side_pixel: None,
+            },
+        }
+    }
+
+    #[test]
+    fn text_only_requests_have_nothing_to_order() {
+        let messages = vec![
+            ChatMessage::System {
+                content: MessageContent::Text("be brief".to_string()),
+                name: None,
+                ext: Default::default(),
+            },
+            user(vec![text("hello"), text("world")]),
+            ChatMessage::Assistant {
+                content: Some(MessageContent::Text("hi".to_string())),
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
+                ext: Default::default(),
+            },
+            ChatMessage::Tool {
+                content: MessageContent::Text("4".to_string()),
+                tool_call_id: "c1".to_string(),
+            },
+        ];
+        assert!(!chat_has_media_parts(&messages));
+    }
+
+    #[test]
+    fn unknown_parts_never_move_so_need_no_order() {
+        let messages = vec![user(vec![
+            text("hello"),
+            ContentPart::Unknown(serde_json::Map::new()),
+        ])];
+        assert!(!chat_has_media_parts(&messages));
+    }
+
+    #[test]
+    fn a_user_image_part_needs_the_order() {
+        let messages = vec![user(vec![text("what is this"), image()])];
+        assert!(chat_has_media_parts(&messages));
+    }
+
+    #[test]
+    fn an_assistant_image_part_needs_the_order_too() {
+        // The media plan skips assistant turns; rendering does not.
+        let messages = vec![
+            user(vec![text("hello")]),
+            ChatMessage::Assistant {
+                content: Some(MessageContent::Parts(vec![image(), text("see above")])),
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
+                ext: Default::default(),
+            },
+        ];
+        assert!(chat_has_media_parts(&messages));
     }
 }

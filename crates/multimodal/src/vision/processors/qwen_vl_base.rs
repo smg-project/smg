@@ -1050,30 +1050,41 @@ impl QwenVLProcessorBase {
         block_start: usize,
         band: &mut [u8],
     ) {
-        let block_out = merge_size * merge_size * 3 * temporal_patch_size * patch_size * patch_size;
+        // One patch is laid out [channel][temporal][py][px]; a block holds its
+        // merge_size x merge_size patches row-major.
+        let patch_area = patch_size * patch_size;
+        let channel_run = temporal_patch_size * patch_area;
+        let patch_out = 3 * channel_run;
+        let block_out = merge_size * merge_size * patch_out;
         for (bi, chunk) in band.chunks_mut(block_out).enumerate() {
             let blk = block_start + bi;
             let pr = blk / pc_blocks;
             let pc = blk % pc_blocks;
             let y0 = pr * merged_patch;
             let x0 = pc * merged_patch;
-            let mut o = 0usize;
 
-            for mh in 0..merge_size {
-                for mw in 0..merge_size {
+            for (patch_index, patch) in chunk.chunks_mut(patch_out).enumerate() {
+                let mh = patch_index / merge_size;
+                let mw = patch_index % merge_size;
+                let px0 = x0 + mw * patch_size;
+                // Each source row of the patch is read once and split into
+                // its three channel runs (temporal index 0).
+                for py in 0..patch_size {
+                    let row = y0 + mh * patch_size + py;
+                    let (src, _) =
+                        raw[(row * width + px0) * 3..][..patch_size * 3].as_chunks::<3>();
                     for c in 0..3 {
-                        for _tp in 0..temporal_patch_size {
-                            for py in 0..patch_size {
-                                let row =
-                                    (y0 + mh * patch_size + py) * width + x0 + mw * patch_size;
-                                let mut src_idx = row * 3 + c;
-                                for dst in &mut chunk[o..o + patch_size] {
-                                    *dst = raw[src_idx];
-                                    src_idx += 3;
-                                }
-                                o += patch_size;
-                            }
+                        let run = &mut patch[c * channel_run + py * patch_size..][..patch_size];
+                        for (dst, pixel) in run.iter_mut().zip(src) {
+                            *dst = pixel[c];
                         }
+                    }
+                }
+                // The remaining temporal frames are copies of the first.
+                for channel in patch.chunks_exact_mut(channel_run) {
+                    let (first, rest) = channel.split_at_mut(patch_area);
+                    for frame in rest.chunks_exact_mut(patch_area) {
+                        frame.copy_from_slice(first);
                     }
                 }
             }
@@ -1097,6 +1108,18 @@ impl VisionPreProcessor for QwenVLProcessorBase {
     fn preprocess(
         &self,
         images: &[DynamicImage],
+        config: &PreProcessorConfig,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        let borrowed: Vec<&DynamicImage> = images.iter().collect();
+        self.preprocess_borrowed(&borrowed, config)
+    }
+
+    /// The image pipeline proper. It only reads the images (plan, resize into
+    /// a new buffer, patchify), so callers that already own decoded pixels
+    /// lend them instead of copying.
+    fn preprocess_borrowed(
+        &self,
+        images: &[&DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
@@ -1194,6 +1217,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
                 .zip(errors.iter_mut())
             {
                 scope.spawn(move |_| {
+                    let image: &DynamicImage = image;
                     // BICUBIC (Qwen default) uses the PIL-compatible path; other
                     // filters keep the SIMD path.
                     let resized;

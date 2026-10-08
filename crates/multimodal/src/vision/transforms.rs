@@ -454,7 +454,7 @@ fn fir_image_to_dynamic(
 // (support scaling + fixed-point details), which the vision encoder amplifies
 // into a large embedding shift. This routine replicates Pillow's `Resample.c`
 // algorithm exactly, validated against Pillow.
-const PIL_PRECISION_BITS: i64 = 32 - 8 - 2;
+const PIL_PRECISION_BITS: u32 = 32 - 8 - 2;
 const PIL_BICUBIC_SUPPORT: f64 = 2.0;
 const PIL_LANCZOS_SUPPORT: f64 = 3.0;
 
@@ -514,21 +514,37 @@ fn pil_lanczos(x: f64) -> f64 {
     }
 }
 
-/// Pillow `precompute_coeffs` for one axis: integer (fixed-point) kernels plus
-/// per-output bounds `(start, count)`.
-fn pil_precompute_coeffs(
-    in_size: usize,
-    out_size: usize,
-    filter: PilResizeFilter,
-) -> (Vec<(usize, usize)>, Vec<Vec<i64>>) {
+/// Pillow `precompute_coeffs` for one axis: fixed-point kernels plus the
+/// per-output source window `(start, count)`.
+///
+/// The kernels share one flat buffer with a fixed stride (`ksize`, the widest
+/// window), as in Pillow's `kk[xx * ksize + x]`, rather than one heap `Vec`
+/// per output pixel. Coefficients and the sums they feed are `i32`, which is
+/// what Pillow's 8-bit path uses: a normalized kernel scaled by 2^22 against
+/// 8-bit samples stays well inside the range.
+struct PilKernels {
+    bounds: Vec<(usize, usize)>,
+    coeffs: Vec<i32>,
+    ksize: usize,
+}
+
+impl PilKernels {
+    /// The taps of output index `i` (exactly `bounds[i].1` of them).
+    #[inline]
+    fn taps(&self, i: usize) -> &[i32] {
+        let (_, count) = self.bounds[i];
+        &self.coeffs[i * self.ksize..i * self.ksize + count]
+    }
+}
+
+fn pil_precompute_coeffs(in_size: usize, out_size: usize, filter: PilResizeFilter) -> PilKernels {
     let scale = in_size as f64 / out_size as f64;
     let filterscale = if scale >= 1.0 { scale } else { 1.0 };
     let support = filter.support() * filterscale;
     let inv = 1.0 / filterscale;
-    let coeff_scale = (1_i64 << PIL_PRECISION_BITS) as f64;
+    let coeff_scale = f64::from(1_i32 << PIL_PRECISION_BITS);
 
     let mut bounds = Vec::with_capacity(out_size);
-    let mut kernels = Vec::with_capacity(out_size);
     for xx in 0..out_size {
         let center = (xx as f64 + 0.5) * scale;
         let mut xmin = (center - support + 0.5) as i64;
@@ -540,47 +556,46 @@ fn pil_precompute_coeffs(
             xmax = in_size as i64;
         }
         let xmin = xmin as usize;
-        let xmax = (xmax as usize).saturating_sub(xmin);
+        bounds.push((xmin, (xmax as usize).saturating_sub(xmin)));
+    }
+    let ksize = bounds.iter().map(|&(_, count)| count).max().unwrap_or(0);
 
-        let mut w = vec![0.0_f64; xmax];
+    let mut coeffs = vec![0_i32; out_size * ksize];
+    let mut weights: Vec<f64> = Vec::with_capacity(ksize);
+    for (xx, &(xmin, count)) in bounds.iter().enumerate() {
+        let center = (xx as f64 + 0.5) * scale;
+        weights.clear();
         let mut tot = 0.0;
-        for (x, wx) in w.iter_mut().enumerate() {
+        for x in 0..count {
             let v = filter.weight(((x + xmin) as f64 - center + 0.5) * inv);
-            *wx = v;
+            weights.push(v);
             tot += v;
         }
         if tot != 0.0 {
-            for wx in &mut w {
-                *wx /= tot;
+            for w in &mut weights {
+                *w /= tot;
             }
         }
         // Pillow normalize_coeffs_8bpc: round half away from zero into fixed point.
-        let k: Vec<i64> = w
-            .iter()
-            .map(|&c| {
-                if c < 0.0 {
-                    (-0.5 + c * coeff_scale) as i64
-                } else {
-                    (0.5 + c * coeff_scale) as i64
-                }
-            })
-            .collect();
-        bounds.push((xmin, xmax));
-        kernels.push(k);
+        let taps = &mut coeffs[xx * ksize..xx * ksize + count];
+        for (k, &c) in taps.iter_mut().zip(&weights) {
+            *k = if c < 0.0 {
+                (-0.5 + c * coeff_scale) as i32
+            } else {
+                (0.5 + c * coeff_scale) as i32
+            };
+        }
     }
-    (bounds, kernels)
+    PilKernels {
+        bounds,
+        coeffs,
+        ksize,
+    }
 }
 
 #[inline]
-fn pil_clip8(v: i64) -> u8 {
-    let v = v >> PIL_PRECISION_BITS;
-    if v < 0 {
-        0
-    } else if v > 255 {
-        255
-    } else {
-        v as u8
-    }
+fn pil_clip8(v: i32) -> u8 {
+    (v >> PIL_PRECISION_BITS).clamp(0, 255) as u8
 }
 
 /// Number of threads to split an elementwise or row-banded preprocessing pass
@@ -591,126 +606,74 @@ pub(crate) fn par_threads(out_bytes: usize, out_rows: usize) -> usize {
     task_count(out_bytes, out_rows, 32)
 }
 
-/// Process output rows `[oy0, oy0 + out_band.len()/row_out)` of the horizontal
-/// pass into `out_band`. Horizontal pass preserves row count, so output row i
-/// reads input row `oy0 + i`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "row-band resampler: precomputed coeffs + dims + output band"
-)]
-fn pil_h_band(
-    src: &[u8],
-    bounds: &[(usize, usize)],
-    kernels: &[Vec<i64>],
-    half: i64,
-    in_w: usize,
-    out_w: usize,
-    channels: usize,
-    oy0: usize,
-    out_band: &mut [u8],
-) {
-    let row_out = out_w * channels;
-    for (i, orow) in out_band.chunks_mut(row_out).enumerate() {
-        let y = oy0 + i;
-        let row = &src[y * in_w * channels..(y + 1) * in_w * channels];
-        for xx in 0..out_w {
-            let (xmin, xmax) = bounds[xx];
-            let k = &kernels[xx];
-            for c in 0..channels {
-                let mut ss = half;
-                for x in 0..xmax {
-                    ss += row[(xmin + x) * channels + c] as i64 * k[x];
-                }
-                orow[xx * channels + c] = pil_clip8(ss);
-            }
-        }
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "RGB row-band resampler: precomputed coeffs + dims + output band"
-)]
+/// Horizontal pass for output rows `[oy0, oy0 + out_band.len() / (out_w * 3))`
+/// of interleaved RGB. The pass keeps the row count, so output row `i` reads
+/// input row `oy0 + i`; each output pixel sums a contiguous window of it.
 fn pil_h_band_rgb(
     src: &[u8],
-    bounds: &[(usize, usize)],
-    kernels: &[Vec<i64>],
-    half: i64,
+    kernels: &PilKernels,
+    half: i32,
     in_w: usize,
     out_w: usize,
     oy0: usize,
     out_band: &mut [u8],
 ) {
-    let row_out = out_w * 3;
-    for (i, output_row) in out_band.chunks_mut(row_out).enumerate() {
-        let y = oy0 + i;
-        let row = &src[y * in_w * 3..(y + 1) * in_w * 3];
-        for output_x in 0..out_w {
-            let (source_x, source_columns) = bounds[output_x];
-            let kernel = &kernels[output_x];
-            let mut red = half;
-            let mut green = half;
-            let mut blue = half;
-            let source_start = source_x * 3;
-            let source_end = (source_x + source_columns) * 3;
-            for (pixel, &coefficient) in row[source_start..source_end]
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .zip(kernel)
+    let in_row = in_w * 3;
+    let out_row = out_w * 3;
+    for (i, output_row) in out_band.chunks_mut(out_row).enumerate() {
+        let row = &src[(oy0 + i) * in_row..][..in_row];
+        let (output_pixels, _) = output_row.as_chunks_mut::<3>();
+        for (output_x, output) in output_pixels.iter_mut().enumerate() {
+            let (source_x, source_columns) = kernels.bounds[output_x];
+            let window = &row[source_x * 3..(source_x + source_columns) * 3];
+            let (mut red, mut green, mut blue) = (half, half, half);
+            for (pixel, &coefficient) in
+                window.as_chunks::<3>().0.iter().zip(kernels.taps(output_x))
             {
-                red += pixel[0] as i64 * coefficient;
-                green += pixel[1] as i64 * coefficient;
-                blue += pixel[2] as i64 * coefficient;
+                red += i32::from(pixel[0]) * coefficient;
+                green += i32::from(pixel[1]) * coefficient;
+                blue += i32::from(pixel[2]) * coefficient;
             }
-            let output = output_x * 3;
-            output_row[output] = pil_clip8(red);
-            output_row[output + 1] = pil_clip8(green);
-            output_row[output + 2] = pil_clip8(blue);
+            *output = [pil_clip8(red), pil_clip8(green), pil_clip8(blue)];
         }
     }
 }
 
-/// Resample interleaved `channels`-channel u8 data along the width axis.
-/// `src` is `rows * in_w * channels`; returns `rows * out_w * channels`.
-fn pil_resample_horizontal(
+/// Vertical pass for output rows `[oy0, oy0 + out_band.len() / (width * 3))`
+/// of interleaved RGB.
+///
+/// Each output row is a weighted sum of whole source rows, so the sums run
+/// row by row along the width (one streaming multiply-add per sample) rather
+/// than pixel by pixel across rows. The terms of every sum are the same, in
+/// the same order, so the result is identical to Pillow's per-pixel loop.
+fn pil_v_band_rgb(
     src: &[u8],
-    rows: usize,
-    in_w: usize,
-    out_w: usize,
-    channels: usize,
-    filter: PilResizeFilter,
-) -> Vec<u8> {
-    let (bounds, kernels) = pil_precompute_coeffs(in_w, out_w, filter);
-    let half = 1_i64 << (PIL_PRECISION_BITS - 1);
-    let row_out = out_w * channels;
-    let mut out = vec![0_u8; rows * row_out];
-    let nthreads = par_threads(out.len(), rows);
-    if nthreads <= 1 {
-        pil_h_band(
-            src, &bounds, &kernels, half, in_w, out_w, channels, 0, &mut out,
-        );
-    } else {
-        let chunk_rows = rows.div_ceil(nthreads);
-        parallel_scope(|s| {
-            let (b, k) = (&bounds, &kernels);
-            let mut rest = out.as_mut_slice();
-            let mut oy0 = 0usize;
-            while oy0 < rows {
-                let n = chunk_rows.min(rows - oy0);
-                let (band, tail) = rest.split_at_mut(n * row_out);
-                rest = tail;
-                let start = oy0;
-                s.spawn(move |_| {
-                    pil_h_band(src, b, k, half, in_w, out_w, channels, start, band);
-                });
-                oy0 += n;
+    kernels: &PilKernels,
+    half: i32,
+    width: usize,
+    oy0: usize,
+    out_band: &mut [u8],
+) {
+    let row_len = width * 3;
+    let mut sums = vec![half; row_len];
+    for (i, output_row) in out_band.chunks_mut(row_len).enumerate() {
+        let output_y = oy0 + i;
+        let (source_y, _) = kernels.bounds[output_y];
+        sums.fill(half);
+        for (y, &coefficient) in kernels.taps(output_y).iter().enumerate() {
+            let row = &src[(source_y + y) * row_len..][..row_len];
+            for (sum, &value) in sums.iter_mut().zip(row) {
+                *sum += i32::from(value) * coefficient;
             }
-        });
+        }
+        for (output, &sum) in output_row.iter_mut().zip(&sums) {
+            *output = pil_clip8(sum);
+        }
     }
-    out
 }
 
+/// Resample interleaved RGB along the width axis. `src` is
+/// `rows * in_w * 3` bytes; returns `rows * out_w * 3`.
 fn pil_resample_horizontal_rgb(
     src: &[u8],
     rows: usize,
@@ -718,17 +681,17 @@ fn pil_resample_horizontal_rgb(
     out_w: usize,
     filter: PilResizeFilter,
 ) -> Vec<u8> {
-    let (bounds, kernels) = pil_precompute_coeffs(in_w, out_w, filter);
-    let half = 1_i64 << (PIL_PRECISION_BITS - 1);
+    let kernels = pil_precompute_coeffs(in_w, out_w, filter);
+    let half = 1_i32 << (PIL_PRECISION_BITS - 1);
     let row_out = out_w * 3;
     let mut out = vec![0_u8; rows * row_out];
     let nthreads = par_threads(out.len(), rows);
     if nthreads <= 1 {
-        pil_h_band_rgb(src, &bounds, &kernels, half, in_w, out_w, 0, &mut out);
+        pil_h_band_rgb(src, &kernels, half, in_w, out_w, 0, &mut out);
     } else {
         let chunk_rows = rows.div_ceil(nthreads);
         parallel_scope(|scope| {
-            let (bounds, kernels) = (&bounds, &kernels);
+            let kernels = &kernels;
             let mut rest = out.as_mut_slice();
             let mut output_y = 0;
             while output_y < rows {
@@ -737,7 +700,7 @@ fn pil_resample_horizontal_rgb(
                 rest = tail;
                 let start = output_y;
                 scope.spawn(move |_| {
-                    pil_h_band_rgb(src, bounds, kernels, half, in_w, out_w, start, band);
+                    pil_h_band_rgb(src, kernels, half, in_w, out_w, start, band);
                 });
                 output_y += band_rows;
             }
@@ -746,126 +709,8 @@ fn pil_resample_horizontal_rgb(
     out
 }
 
-/// Process output rows `[oy0, oy0 + out_band.len()/row_out)` of the vertical
-/// pass into `out_band`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "row-band resampler: precomputed coeffs + dims + output band"
-)]
-fn pil_v_band(
-    src: &[u8],
-    bounds: &[(usize, usize)],
-    kernels: &[Vec<i64>],
-    half: i64,
-    width: usize,
-    channels: usize,
-    oy0: usize,
-    out_band: &mut [u8],
-) {
-    let row_out = width * channels;
-    for (i, orow) in out_band.chunks_mut(row_out).enumerate() {
-        let yy = oy0 + i;
-        let (ymin, ymax) = bounds[yy];
-        let k = &kernels[yy];
-        for x in 0..width {
-            for c in 0..channels {
-                let mut ss = half;
-                for y in 0..ymax {
-                    ss += src[((ymin + y) * width + x) * channels + c] as i64 * k[y];
-                }
-                orow[x * channels + c] = pil_clip8(ss);
-            }
-        }
-    }
-}
-
-fn pil_v_band_rgb(
-    src: &[u8],
-    bounds: &[(usize, usize)],
-    kernels: &[Vec<i64>],
-    half: i64,
-    width: usize,
-    oy0: usize,
-    out_band: &mut [u8],
-) {
-    let row_out = width * 3;
-    for (i, output_row) in out_band.chunks_mut(row_out).enumerate() {
-        let output_y = oy0 + i;
-        let (source_y, source_rows) = bounds[output_y];
-        let kernel = &kernels[output_y];
-        let blocked_width = width / 4 * 4;
-        for x in (0..blocked_width).step_by(4) {
-            let mut sums = [[half; 3]; 4];
-            for (y, &coefficient) in kernel.iter().take(source_rows).enumerate() {
-                let source = ((source_y + y) * width + x) * 3;
-                for (pixel, sums) in sums.iter_mut().enumerate() {
-                    let input = source + pixel * 3;
-                    sums[0] += src[input] as i64 * coefficient;
-                    sums[1] += src[input + 1] as i64 * coefficient;
-                    sums[2] += src[input + 2] as i64 * coefficient;
-                }
-            }
-            let output = x * 3;
-            for (pixel, sums) in sums.iter().enumerate() {
-                let target = output + pixel * 3;
-                output_row[target] = pil_clip8(sums[0]);
-                output_row[target + 1] = pil_clip8(sums[1]);
-                output_row[target + 2] = pil_clip8(sums[2]);
-            }
-        }
-        for x in blocked_width..width {
-            let mut red = half;
-            let mut green = half;
-            let mut blue = half;
-            for (y, &coefficient) in kernel.iter().take(source_rows).enumerate() {
-                let source = ((source_y + y) * width + x) * 3;
-                red += src[source] as i64 * coefficient;
-                green += src[source + 1] as i64 * coefficient;
-                blue += src[source + 2] as i64 * coefficient;
-            }
-            let output = x * 3;
-            output_row[output] = pil_clip8(red);
-            output_row[output + 1] = pil_clip8(green);
-            output_row[output + 2] = pil_clip8(blue);
-        }
-    }
-}
-
-/// Resample interleaved `channels`-channel u8 data along the height axis.
-fn pil_resample_vertical(
-    src: &[u8],
-    in_h: usize,
-    width: usize,
-    out_h: usize,
-    channels: usize,
-    filter: PilResizeFilter,
-) -> Vec<u8> {
-    let (bounds, kernels) = pil_precompute_coeffs(in_h, out_h, filter);
-    let half = 1_i64 << (PIL_PRECISION_BITS - 1);
-    let row_out = width * channels;
-    let mut out = vec![0_u8; out_h * row_out];
-    let nthreads = par_threads(out.len(), out_h);
-    if nthreads <= 1 {
-        pil_v_band(src, &bounds, &kernels, half, width, channels, 0, &mut out);
-    } else {
-        let chunk_rows = out_h.div_ceil(nthreads);
-        parallel_scope(|s| {
-            let (b, k) = (&bounds, &kernels);
-            let mut rest = out.as_mut_slice();
-            let mut oy0 = 0usize;
-            while oy0 < out_h {
-                let n = chunk_rows.min(out_h - oy0);
-                let (band, tail) = rest.split_at_mut(n * row_out);
-                rest = tail;
-                let start = oy0;
-                s.spawn(move |_| pil_v_band(src, b, k, half, width, channels, start, band));
-                oy0 += n;
-            }
-        });
-    }
-    out
-}
-
+/// Resample interleaved RGB along the height axis. `src` is
+/// `in_h * width * 3` bytes; returns `out_h * width * 3`.
 fn pil_resample_vertical_rgb(
     src: &[u8],
     in_h: usize,
@@ -873,17 +718,17 @@ fn pil_resample_vertical_rgb(
     out_h: usize,
     filter: PilResizeFilter,
 ) -> Vec<u8> {
-    let (bounds, kernels) = pil_precompute_coeffs(in_h, out_h, filter);
-    let half = 1_i64 << (PIL_PRECISION_BITS - 1);
+    let kernels = pil_precompute_coeffs(in_h, out_h, filter);
+    let half = 1_i32 << (PIL_PRECISION_BITS - 1);
     let row_out = width * 3;
     let mut out = vec![0_u8; out_h * row_out];
     let nthreads = par_threads(out.len(), out_h);
     if nthreads <= 1 {
-        pil_v_band_rgb(src, &bounds, &kernels, half, width, 0, &mut out);
+        pil_v_band_rgb(src, &kernels, half, width, 0, &mut out);
     } else {
         let chunk_rows = out_h.div_ceil(nthreads);
         parallel_scope(|scope| {
-            let (bounds, kernels) = (&bounds, &kernels);
+            let kernels = &kernels;
             let mut rest = out.as_mut_slice();
             let mut output_y = 0;
             while output_y < out_h {
@@ -892,7 +737,7 @@ fn pil_resample_vertical_rgb(
                 rest = tail;
                 let start = output_y;
                 scope.spawn(move |_| {
-                    pil_v_band_rgb(src, bounds, kernels, half, width, start, band);
+                    pil_v_band_rgb(src, kernels, half, width, start, band);
                 });
                 output_y += rows;
             }
@@ -901,20 +746,16 @@ fn pil_resample_vertical_rgb(
     out
 }
 
-/// Pillow-exact BICUBIC resize (RGB8), matching
-/// `PIL.Image.resize(.., BICUBIC)`.
-pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes(
-        rgb.as_raw(),
-        in_w,
-        in_h,
-        out_w,
-        out_h,
-        false,
-        PilResizeFilter::Bicubic,
-    );
+/// Pillow-exact resize of a `DynamicImage` to RGB8. An RGB8 source is
+/// resampled in place from its own buffer; other layouts are converted first.
+fn resize_pil_image(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    filter: PilResizeFilter,
+) -> DynamicImage {
+    let (in_w, in_h, data) = rgb_bytes(image);
+    let output = resize_pil_bytes(&data, in_w as u32, in_h as u32, out_w, out_h, filter);
     #[expect(
         clippy::expect_used,
         reason = "output is exactly out_w*out_h*3 bytes by construction"
@@ -922,6 +763,12 @@ pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
     DynamicImage::ImageRgb8(
         RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
     )
+}
+
+/// Pillow-exact BICUBIC resize (RGB8), matching
+/// `PIL.Image.resize(.., BICUBIC)`.
+pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Bicubic)
 }
 
 /// PIL-exact bicubic resize over borrowed interleaved RGB bytes.
@@ -949,15 +796,7 @@ pub fn resize_bicubic_pil_rgb(
             "PIL bicubic RGB target {out_w}x{out_h} must be non-empty"
         )));
     }
-    let output = resize_pil_bytes(
-        data,
-        width,
-        height,
-        out_w,
-        out_h,
-        true,
-        PilResizeFilter::Bicubic,
-    );
+    let output = resize_pil_bytes(data, width, height, out_w, out_h, PilResizeFilter::Bicubic);
     RgbImage::from_raw(out_w, out_h, output).ok_or_else(|| {
         TransformError::ShapeError(format!(
             "failed to build PIL bicubic RGB image for {out_w}x{out_h}"
@@ -968,24 +807,7 @@ pub fn resize_bicubic_pil_rgb(
 /// Pillow-exact LANCZOS resize (RGB8), matching
 /// `PIL.Image.resize(.., LANCZOS)`.
 pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes(
-        rgb.as_raw(),
-        in_w,
-        in_h,
-        out_w,
-        out_h,
-        false,
-        PilResizeFilter::Lanczos,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "output is exactly out_w*out_h*3 bytes by construction"
-    )]
-    DynamicImage::ImageRgb8(
-        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
-    )
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Lanczos)
 }
 
 fn resize_pil_bytes(
@@ -994,7 +816,6 @@ fn resize_pil_bytes(
     in_h: u32,
     out_w: u32,
     out_h: u32,
-    joint_rgb: bool,
     filter: PilResizeFilter,
 ) -> Vec<u8> {
     let (in_w, in_h, out_w, out_h) = (in_w as usize, in_h as usize, out_w as usize, out_h as usize);
@@ -1007,23 +828,13 @@ fn resize_pil_bytes(
     } else if in_w == out_w && in_h == out_h {
         data.to_vec()
     } else if in_w == out_w {
-        if joint_rgb {
-            pil_resample_vertical_rgb(data, in_h, in_w, out_h, filter)
-        } else {
-            pil_resample_vertical(data, in_h, in_w, out_h, 3, filter)
-        }
+        pil_resample_vertical_rgb(data, in_h, in_w, out_h, filter)
     } else {
-        let horiz = if joint_rgb {
-            pil_resample_horizontal_rgb(data, in_h, in_w, out_w, filter)
-        } else {
-            pil_resample_horizontal(data, in_h, in_w, out_w, 3, filter)
-        };
+        let horiz = pil_resample_horizontal_rgb(data, in_h, in_w, out_w, filter);
         if in_h == out_h {
             horiz
-        } else if joint_rgb {
-            pil_resample_vertical_rgb(&horiz, in_h, out_w, out_h, filter)
         } else {
-            pil_resample_vertical(&horiz, in_h, out_w, out_h, 3, filter)
+            pil_resample_vertical_rgb(&horiz, in_h, out_w, out_h, filter)
         }
     }
 }
@@ -1427,20 +1238,18 @@ mod tests {
         }
 
         for (out_w, out_h) in [(src_w, 17), (19, src_h), (src_w, src_h)] {
-            let horizontal = pil_resample_horizontal(
+            let horizontal = pil_resample_horizontal_rgb(
                 &data,
                 src_h as usize,
                 src_w as usize,
                 out_w as usize,
-                3,
                 PilResizeFilter::Bicubic,
             );
-            let expected = pil_resample_vertical(
+            let expected = pil_resample_vertical_rgb(
                 &horizontal,
                 src_h as usize,
                 out_w as usize,
                 out_h as usize,
-                3,
                 PilResizeFilter::Bicubic,
             );
             let actual = resize_bicubic_pil_rgb(&data, src_w, src_h, out_w, out_h)

@@ -350,12 +350,12 @@ impl MiniMaxM3VisionProcessor {
     /// Otherwise the whole batch is copied, not just the staged images, so the base gets one slice.
     fn raise_images(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<Option<Vec<DynamicImage>>, TransformError> {
         let below_floor =
             |image: &DynamicImage| Self::raised_dimensions(image.width(), image.height()).is_some();
-        if !config.do_resize.unwrap_or(true) || !images.iter().any(below_floor) {
+        if !config.do_resize.unwrap_or(true) || !images.iter().any(|image| below_floor(image)) {
             return Ok(None);
         }
         // Vet every image first so an off-contract input is rejected before any pixel work.
@@ -373,7 +373,7 @@ impl MiniMaxM3VisionProcessor {
                         resize_bicubic_pil(image, width, height)
                     }
                     Some((width, height)) => resize(image, width, height, filter),
-                    None => image.clone(),
+                    None => (*image).clone(),
                 },
             );
         }
@@ -412,9 +412,18 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         images: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        let borrowed: Vec<&DynamicImage> = images.iter().collect();
+        self.preprocess_borrowed(&borrowed, config)
+    }
+
+    fn preprocess_borrowed(
+        &self,
+        images: &[&DynamicImage],
+        config: &PreProcessorConfig,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let layered = self.for_request(config)?;
         let Some(raised) = layered.raise_images(images, config)? else {
-            return layered.inner.preprocess(images, config);
+            return layered.inner.preprocess_borrowed(images, config);
         };
         let mut out = layered.inner.preprocess(&raised, config)?;
         // Report the caller's sizes, not the raised ones.

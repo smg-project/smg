@@ -396,6 +396,38 @@ fn order_media_parts(parts: Vec<Value>, media_order: MediaPartOrder) -> Vec<Valu
     }
 }
 
+/// Whether rendering `messages` depends on the media-part order: true when a
+/// user message carries a block that `convert_user_message` turns into a part
+/// `order_media_parts` hoists under `MediaFirst`: an image, a document, or a
+/// tool result with images. A document is not media the plan fetches, so the
+/// media plan alone cannot answer this. Assistant and system content never
+/// carries such parts.
+pub(crate) fn messages_have_media_parts(messages: &[InputMessage]) -> bool {
+    messages.iter().any(|message| {
+        if !matches!(message.role, messages::Role::User) {
+            return false;
+        }
+        let InputContent::Blocks(blocks) = &message.content else {
+            return false;
+        };
+        blocks.iter().any(|block| match block {
+            InputContentBlock::Image(_) | InputContentBlock::Document(_) => true,
+            InputContentBlock::ToolResult(tool_result) => {
+                tool_result_image_blocks(tool_result).next().is_some()
+            }
+            InputContentBlock::Text(_)
+            | InputContentBlock::ToolUse(_)
+            | InputContentBlock::Thinking(_)
+            | InputContentBlock::RedactedThinking(_)
+            | InputContentBlock::ServerToolUse(_)
+            | InputContentBlock::SearchResult(_)
+            | InputContentBlock::WebSearchToolResult(_)
+            | InputContentBlock::ToolSearchToolResult(_)
+            | InputContentBlock::ToolReference(_) => false,
+        })
+    })
+}
+
 // ============================================================================
 // Type adapters: Messages API → Chat API types
 // ============================================================================
@@ -996,5 +1028,112 @@ mod tests {
             cache_control: None,
         };
         assert_eq!(tool_result_image_blocks(&empty).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod media_part_order_tests {
+    use messages::{InputMessage, Role, TextBlock};
+
+    use super::*;
+
+    fn user(blocks: Vec<InputContentBlock>) -> InputMessage {
+        InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(blocks),
+        }
+    }
+
+    fn text_block(text: &str) -> InputContentBlock {
+        InputContentBlock::Text(TextBlock {
+            text: text.to_string(),
+            cache_control: None,
+            citations: None,
+        })
+    }
+
+    fn image_block() -> messages::ImageBlock {
+        messages::ImageBlock {
+            source: messages::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            },
+            cache_control: None,
+        }
+    }
+
+    fn document_block() -> InputContentBlock {
+        InputContentBlock::Document(messages::DocumentBlock {
+            source: messages::DocumentSource::Text {
+                data: "quarterly report".to_string(),
+            },
+            cache_control: None,
+            title: None,
+            context: None,
+            citations: None,
+        })
+    }
+
+    fn tool_result(content: Option<ToolResultContent>) -> InputContentBlock {
+        InputContentBlock::ToolResult(messages::ToolResultBlock {
+            tool_use_id: "tu_1".to_string(),
+            content,
+            is_error: None,
+            cache_control: None,
+        })
+    }
+
+    #[test]
+    fn text_only_requests_have_nothing_to_order() {
+        let messages = vec![
+            InputMessage {
+                role: Role::User,
+                content: InputContent::String("hello".to_string()),
+            },
+            InputMessage {
+                role: Role::Assistant,
+                content: InputContent::String("hi".to_string()),
+            },
+            user(vec![text_block("more"), text_block("text")]),
+            user(vec![tool_result(Some(ToolResultContent::String(
+                "4".to_string(),
+            )))]),
+        ];
+        assert!(!messages_have_media_parts(&messages));
+    }
+
+    #[test]
+    fn a_document_block_needs_the_order_even_without_images() {
+        // `[text, document]` renders as authored or document-first depending
+        // on the resolved order, so the lookup cannot be skipped.
+        let messages = vec![user(vec![text_block("summarize"), document_block()])];
+        assert!(messages_have_media_parts(&messages));
+    }
+
+    #[test]
+    fn an_image_block_needs_the_order() {
+        let messages = vec![user(vec![
+            text_block("what is this"),
+            InputContentBlock::Image(image_block()),
+        ])];
+        assert!(messages_have_media_parts(&messages));
+    }
+
+    #[test]
+    fn a_tool_result_image_needs_the_order() {
+        let messages = vec![user(vec![tool_result(Some(ToolResultContent::Blocks(
+            vec![messages::ToolResultContentBlock::Image(image_block())],
+        )))])];
+        assert!(messages_have_media_parts(&messages));
+    }
+
+    #[test]
+    fn assistant_blocks_are_not_ordered() {
+        // `convert_assistant_message` keeps text, tool calls and thinking only.
+        let messages = vec![InputMessage {
+            role: Role::Assistant,
+            content: InputContent::Blocks(vec![InputContentBlock::Image(image_block())]),
+        }];
+        assert!(!messages_have_media_parts(&messages));
     }
 }

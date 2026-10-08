@@ -158,6 +158,16 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
             .preprocess(images, config)
     }
 
+    fn preprocess_borrowed(
+        &self,
+        images: &[&DynamicImage],
+        config: &PreProcessorConfig,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.with_image_preprocessor_config(config)
+            .inner
+            .preprocess_borrowed(images, config)
+    }
+
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],

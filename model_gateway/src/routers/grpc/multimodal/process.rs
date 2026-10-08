@@ -480,19 +480,18 @@ async fn preprocess_modality(
                 .ok_or_else(|| {
                     anyhow::anyhow!("No vision processor found for model: {model_id_owned}")
                 })?;
-            // Decoded (and cloned) inside the blocking closure, off the async
-            // runtime.
-            let raw_images: Vec<image::DynamicImage> = images
+            // Decoded inside the blocking closure, off the async runtime, and
+            // lent to the processor: the frames keep the pixels.
+            let raw_images: Vec<&image::DynamicImage> = images
                 .iter()
                 .map(|frame| {
                     frame
                         .image()
-                        .cloned()
                         .map_err(llm_multimodal::MultiModalError::Media)
                 })
                 .collect::<Result<_, _>>()?;
             processor
-                .preprocess(&raw_images, &pp_config)
+                .preprocess_borrowed(&raw_images, &pp_config)
                 .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
         }
         MediaBatch::Videos(videos) => {
@@ -653,12 +652,11 @@ async fn preprocess_image_batch(
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
     tokio::task::spawn_blocking(move || {
-        let raw_images: Vec<image::DynamicImage> = images
+        let raw_images: Vec<&image::DynamicImage> = images
             .iter()
             .map(|frame| {
                 frame
                     .image()
-                    .cloned()
                     .map_err(llm_multimodal::MultiModalError::Media)
             })
             .collect::<Result<_, _>>()?;
@@ -666,7 +664,7 @@ async fn preprocess_image_batch(
             .find(&model_id, model_type.as_deref())
             .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;
         processor
-            .preprocess(&raw_images, &pp_config)
+            .preprocess_borrowed(&raw_images, &pp_config)
             .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
     })
     .await

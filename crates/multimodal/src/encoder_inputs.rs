@@ -241,8 +241,13 @@ impl EncoderInput {
                 let standard = patches.as_standard_layout();
                 let src = standard.as_slice().unwrap_or(&[]);
                 fill_rows(&mut out, src, row, |dst, src| {
-                    for (i, (d, &v)) in dst.iter_mut().zip(src).enumerate() {
-                        *d = table[(i / block) % 3][v as usize];
+                    for (channel, (dst, src)) in
+                        dst.chunks_mut(block).zip(src.chunks(block)).enumerate()
+                    {
+                        let table = &table[channel % 3];
+                        for (d, &v) in dst.iter_mut().zip(src) {
+                            *d = table[v as usize];
+                        }
                     }
                 });
                 Cow::Owned(
@@ -451,10 +456,14 @@ impl<'a> EncoderInputView<'a> {
                     EncoderDtype::Float32 => {
                         let table = norm.table_f32();
                         fill_rows_bytes(out, src, row, 4, |dst, src| {
-                            for (i, (d, &v)) in
-                                dst.as_chunks_mut::<4>().0.iter_mut().zip(src).enumerate()
+                            let (dst, _) = dst.as_chunks_mut::<4>();
+                            for (channel, (dst, src)) in
+                                dst.chunks_mut(block).zip(src.chunks(block)).enumerate()
                             {
-                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
+                                let table = &table[channel % 3];
+                                for (d, &v) in dst.iter_mut().zip(src) {
+                                    *d = table[v as usize].to_le_bytes();
+                                }
                             }
                         });
                     }
@@ -466,10 +475,14 @@ impl<'a> EncoderInputView<'a> {
                         };
                         let table = norm.table_u16(convert);
                         fill_rows_bytes(out, src, row, 2, |dst, src| {
-                            for (i, (d, &v)) in
-                                dst.as_chunks_mut::<2>().0.iter_mut().zip(src).enumerate()
+                            let (dst, _) = dst.as_chunks_mut::<2>();
+                            for (channel, (dst, src)) in
+                                dst.chunks_mut(block).zip(src.chunks(block)).enumerate()
                             {
-                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
+                                let table = &table[channel % 3];
+                                for (d, &v) in dst.iter_mut().zip(src) {
+                                    *d = table[v as usize].to_le_bytes();
+                                }
                             }
                         });
                     }

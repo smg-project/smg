@@ -75,15 +75,27 @@ pub(crate) async fn prepare_chat_like(
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
+        // Normalize media once. The same plan drives placeholder resolution,
+        // rendering, fetching, preprocessing, and final count validation.
+        let media_plan = multimodal::media_plan_chat(&request.messages);
+
         // Resolve media-part ordering from the model registry so it stays owned
         // by the per-model spec. Falls back to vLLM-compatible media-first when
-        // the model has no multimodal components or matches no spec.
+        // the model has no multimodal components or matches no spec. The
+        // resolution needs the tokenizer and model-config lookups, so it is
+        // skipped when no message carries a part the ordering could move
+        // (media parts in any role; the plan alone misses assistant turns).
         let model_id = ctx.input.model_id.as_str();
-        let tokenizer_entry = ctx
-            .components
-            .tokenizer_registry
-            .get_by_name(model_id)
-            .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
+        let needs_media_order =
+            !media_plan.is_empty() || utils::chat_has_media_parts(&request.messages);
+        let tokenizer_entry = if needs_media_order {
+            ctx.components
+                .tokenizer_registry
+                .get_by_name(model_id)
+                .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id))
+        } else {
+            None
+        };
         let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
             (Some(mm_components), Some(entry)) => {
                 multimodal::resolve_media_part_order(
@@ -98,9 +110,6 @@ pub(crate) async fn prepare_chat_like(
             _ => llm_multimodal::MediaPartOrder::MediaFirst,
         };
 
-        // Normalize media once. The same plan drives placeholder resolution,
-        // rendering, fetching, preprocessing, and final count validation.
-        let media_plan = multimodal::media_plan_chat(&request.messages);
         let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
             (None, None)
         } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
