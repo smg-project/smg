@@ -27,6 +27,7 @@ pub mod engine;
 pub mod event;
 pub mod format;
 pub mod formats;
+pub mod grammar;
 pub mod input;
 pub mod json;
 pub mod markers;
@@ -42,6 +43,7 @@ pub use formats::{
     deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
     qwen3, seed_oss, xlam,
 };
+pub use grammar::{Grammar, Tag};
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};

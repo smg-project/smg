@@ -255,6 +255,13 @@ impl Format {
             .map(|transition| transition.to)
     }
 
+    /// Every row of the table as `(from, on, to)`, in the order the rows were added.
+    pub(crate) fn transitions(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        self.transitions
+            .iter()
+            .map(|transition| (transition.from, transition.on, transition.to))
+    }
+
     /// The call syntax, for a format with an arguments state.
     pub(crate) fn call_syntax(&self) -> Option<&CallSyntax> {
         self.calls.as_ref()
