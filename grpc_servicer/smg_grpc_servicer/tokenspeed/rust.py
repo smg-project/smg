@@ -28,6 +28,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
@@ -238,7 +239,7 @@ async def serve_rust(server_args: Any) -> int:
             getattr(server_args, "model", ""),
         )
     server = TokenSpeedGrpcServer(
-        bind_address=f"{host}:{port}",
+        bind_address=host_port(host, port),
         ipc_base_url=f"ipc://{socket_dir}/tokenspeed-servicer-{os.getpid()}",
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=engine_count,

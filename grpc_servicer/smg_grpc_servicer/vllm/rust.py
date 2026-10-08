@@ -49,6 +49,7 @@ import os
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
+from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
@@ -423,7 +424,7 @@ async def serve_rust(args: argparse.Namespace) -> int:
     init_servicer_tracing()
     server = VllmGrpcServer(
         # `vllm serve` leaves host unset and upstream binds all interfaces then.
-        bind_address=f"{getattr(args, 'host', None) or '0.0.0.0'}:{args.port}",
+        bind_address=host_port(getattr(args, "host", None) or "0.0.0.0", args.port),
         # Per process, not per requested port: `--port 0` launchers would
         # otherwise share one path and unlink each other's sockets.
         ipc_base_url=f"ipc://{socket_dir}/servicer-{os.getpid()}",

@@ -27,6 +27,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
+from smg_grpc_servicer.hostport import host_port, loopback_target
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, resolve_servicer_impl, serve_rust
@@ -243,7 +244,7 @@ async def serve_grpc(
         reflection.enable_server_reflection(SERVICE_NAMES, server)
 
         # Start server
-        listen_addr = f"{server_args.host}:{server_args.port}"
+        listen_addr = host_port(server_args.host, server_args.port)
         if server_args.ssl_certfile and server_args.ssl_keyfile:
             if server_args.ssl_keyfile_password:
                 raise ValueError(
@@ -421,7 +422,7 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
     """Execute warmup for gRPC server by checking health and sending test request."""
     try:
         # Connect to the gRPC server
-        grpc_url = f"{server_args.host}:{server_args.port}"
+        grpc_url = loopback_target(server_args.host, server_args.port)
         channel = grpc.insecure_channel(
             grpc_url,
             options=[
