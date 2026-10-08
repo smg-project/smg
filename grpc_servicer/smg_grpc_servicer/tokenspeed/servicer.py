@@ -1792,28 +1792,35 @@ def _version_str(version: Any) -> str | None:
     return None if version is None else str(version)
 
 
-def _make_json_serializable(obj: Any) -> Any:
+def _make_json_serializable(obj: Any, _path: frozenset[int] = frozenset()) -> Any:
     """Flatten an arbitrary dataclass/config graph into JSON-safe primitives.
 
     Anything that carries attributes (a nested dataclass, a plain config
     object) becomes a dict, so :func:`redact_secrets` sees its keys instead of
     a ``str`` rendering that could carry a credential past it. Enums, paths,
-    dtypes and the like still render with ``str``.
+    dtypes and the like still render with ``str``. ``_path`` holds the ids of
+    the containers on the current descent: a back-reference (a sub-config
+    pointing at its parent) renders with ``str`` instead of recursing forever,
+    while the same object reached twice by different paths is expanded twice.
     """
     if obj is None or isinstance(obj, str | int | float | bool):
         return obj
+    if id(obj) in _path:
+        return str(obj)
+    path = _path | {id(obj)}
     if isinstance(obj, list | tuple | set):
-        return [_make_json_serializable(x) for x in obj]
+        return [_make_json_serializable(x, path) for x in obj]
     if isinstance(obj, dict):
-        return {str(k): _make_json_serializable(v) for k, v in obj.items()}
+        return {str(k): _make_json_serializable(v, path) for k, v in obj.items()}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         return {
-            f.name: _make_json_serializable(getattr(obj, f.name)) for f in dataclasses.fields(obj)
+            f.name: _make_json_serializable(getattr(obj, f.name), path)
+            for f in dataclasses.fields(obj)
         }
     attrs = getattr(obj, "__dict__", None)
     if attrs and not isinstance(obj, enum.Enum | type):
         return {
-            str(k): _make_json_serializable(v)
+            str(k): _make_json_serializable(v, path)
             for k, v in attrs.items()
             if not str(k).startswith("_")
         }
