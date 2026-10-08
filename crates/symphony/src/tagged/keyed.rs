@@ -71,9 +71,11 @@ fn is_name(text: &str) -> bool {
         .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '{' | '}' | '<' | '>'))
 }
 
-/// The four tags a family spells its keyed arguments with, and what its template writes after the
-/// call's name and after each key's closing tag: nothing, or a newline. The assembler reads a call
-/// either way; the grammar derived from a table spells the one its template writes.
+/// The four tags a family spells its keyed arguments with, and `between`: the template's newline,
+/// written after the call's name, after each key's closing tag and before the call's close (Ling,
+/// GLM 4.5 and 4.6), or nothing anywhere (GLM 4.7 and later, IQuest, Hy4). The field tells the two
+/// spellings apart; the places are the spelling's. The assembler reads a call either way; the
+/// grammar derived from a table spells the one its template writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tags {
     pub key_open: &'static str,
@@ -93,8 +95,8 @@ impl Tags {
         between: "",
     };
 
-    /// The plain tags with the template's newline after the call's name and after each
-    /// `</arg_key>`: Ling, GLM 4.5 and 4.6.
+    /// The plain tags with the template's newline after the call's name, after each `</arg_key>`
+    /// and before `</tool_call>`: Ling, GLM 4.5 and 4.6.
     pub const LING: Self = Self {
         between: "\n",
         ..Self::PLAIN

@@ -22,7 +22,8 @@
 //! write none of the table's markers nor the call syntax's inner tags, closed by the thought's
 //! close, so the forced call follows the reasoning instead of replacing it, as the gateway's
 //! `wrap_in_reasoning_prefix` does. A table without a thought has nothing to wrap, and the tag
-//! comes back as it is.
+//! comes back as it is; a thought that closes somewhere other than content has no prefix yet, and
+//! the table gives `None` rather than a tag the model could write inside its thought.
 //!
 //! Not derived yet, so [`Format::grammar`] gives `None` for them: the tagged syntax (Qwen 3.5 and
 //! later, Seed-OSS), keyed arguments in another spelling than the compact one (Ling's newlines,
@@ -175,7 +176,8 @@ impl Format {
     /// `at_least_one` asks for at least one call (`tool_choice` `required`, a named function, or
     /// an allowed-tools list in `required` mode). With `reasoning_open`, the prompt left the model
     /// inside its thought, and the tag follows a reasoning prefix the thought's close ends; a
-    /// table without a thought has no prefix, and the tag comes back as it is.
+    /// table without a thought has no prefix, and the tag comes back as it is; a table whose
+    /// thought closes somewhere other than content has no prefix yet, and gives `None`.
     pub fn grammar(
         &self,
         tools: &[Tool],
@@ -206,9 +208,10 @@ impl Format {
         if !reasoning_open {
             return Some(calls);
         }
-        let Some(think_close) = self.marker(Emits::Reasoning, Emits::Content) else {
+        if !self.has_state(Emits::Reasoning) {
             return Some(calls);
-        };
+        }
+        let think_close = self.marker(Emits::Reasoning, Emits::Content)?;
         let mut excludes: Vec<String> = self.terminal_texts().map(str::to_string).collect();
         let inner: &[&str] = match self.call_syntax() {
             Some(CallSyntax::Keyed(tags)) => &[
@@ -360,6 +363,12 @@ impl Format {
         self.transitions()
             .find(|&(source, _, target)| self.emits(source) == from && self.emits(target) == to)
             .map(|(_, on, _)| self.terminal_text(on))
+    }
+
+    /// Whether a row of the table enters or leaves a state emitting `emits`.
+    fn has_state(&self, emits: Emits) -> bool {
+        self.transitions()
+            .any(|(source, _, target)| self.emits(source) == emits || self.emits(target) == emits)
     }
 }
 
@@ -537,6 +546,34 @@ mod tests {
         let bare = formats::qwen2_5().grammar(&tools, true, false);
         assert!(bare.is_some());
         assert_eq!(formats::qwen2_5().grammar(&tools, true, true), bare);
+    }
+
+    #[test]
+    fn a_thought_that_closes_somewhere_other_than_content_has_no_prefix_yet() {
+        // A thought that closes into the calls block, as Kimi K3's closes into its message: the
+        // tag derives without the prefix, but a prefix ending at the block's opener would force
+        // the call inside the thought, so with the reasoning open the table gives `None`.
+        let into_the_block = Format::new("into_the_block")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("calls_open", "<calls>")
+            .terminal("calls_close", "</calls>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "calls")
+            .transition("content", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "content")
+            .calls(CallSyntax::Json);
+        let tools = weather_tools();
+        assert!(into_the_block.grammar(&tools, true, false).is_some());
+        assert!(into_the_block.grammar(&tools, true, true).is_none());
     }
 
     #[test]
