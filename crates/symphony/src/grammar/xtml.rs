@@ -5,7 +5,8 @@
 //! the thought open in thinking mode and the answer otherwise, and a block the model could not
 //! reach from there would force the calls inside a region the model can never close. So the tag
 //! has one way in per state the block is entered from, that state's own close followed by the
-//! opener, each closed by the block's close, and the opener and the closes trigger it. Inside, one
+//! opener, each closed by the block's close, and each way's first text (the opener from the turn
+//! itself, the close from the thought or the answer) triggers it. Inside, one
 //! or more calls, each `<|open|>call tool="NAME" index="N"<|sep|>`, its arguments and the call's
 //! close, with the name as the request gives it (`&` and `"` escaped as the template does).
 //!
@@ -22,7 +23,7 @@
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
-use super::{CallMarkers, Grammar, Tag};
+use super::{CallMarkers, Grammar, Tag, WayIn};
 
 const OPEN: &str = "<|open|>";
 const CLOSE: &str = "<|close|>";
@@ -45,24 +46,16 @@ pub(super) fn calls(
     );
     let content = Grammar::Plus(Box::new(one_call));
     let tags = block
-        .before_open
+        .ways_in
         .iter()
-        .map(|before| {
-            Tag::new(
-                format!("{before}{}", block.open),
-                content.clone(),
-                block.close,
-            )
-        })
+        .map(|way| Tag::new(way.begin(), content.clone(), block.close))
         .collect();
-    let mut triggers = vec![block.open.to_string()];
-    triggers.extend(
-        block
-            .before_open
-            .iter()
-            .filter(|before| !before.is_empty())
-            .map(|before| before.to_string()),
-    );
+    let mut triggers: Vec<String> = Vec::new();
+    for trigger in block.ways_in.iter().map(WayIn::trigger) {
+        if !triggers.iter().any(|known| known == trigger) {
+            triggers.push(trigger.to_string());
+        }
+    }
     Some(Grammar::TriggeredTags {
         triggers,
         tags,

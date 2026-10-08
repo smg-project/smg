@@ -180,13 +180,39 @@ struct CallMarkers<'a> {
     call_close: &'a str,
 }
 
-/// A block of calls: the terminals into and out of its wrapper state, and what the model writes
-/// before the opener on each way in, one per state the block is entered from, in the order of the
-/// states: nothing from the turn's own state, the state's own close from a thought or an answer.
+/// A block of calls: the terminals into and out of its wrapper state, and its ways in, one per
+/// state the block is entered from, in the order of the states.
 struct Block<'a> {
     open: &'a str,
     close: &'a str,
-    before_open: Vec<&'a str>,
+    ways_in: Vec<WayIn<'a>>,
+}
+
+/// One way into a block of calls: from the turn's own state, the opener of that state's row into
+/// the block; from a thought or an answer, that region's close first, then the opener of its own
+/// row, so the model closes what the prompt left open on its way to the calls. A region with no
+/// close of its own has no way in, and the block no grammar.
+struct WayIn<'a> {
+    close: Option<&'a str>,
+    open: &'a str,
+}
+
+impl WayIn<'_> {
+    /// What the model writes to enter the block this way.
+    fn begin(&self) -> String {
+        format!("{}{}", self.close.unwrap_or(""), self.open)
+    }
+
+    /// The text that triggers this way in: the close when there is one, else the opener.
+    fn trigger(&self) -> &str {
+        self.close.unwrap_or(self.open)
+    }
+}
+
+/// A region's two markers: the terminal of the row into its state, and of the row back out.
+struct Region<'a> {
+    open: &'a str,
+    close: &'a str,
 }
 
 impl Format {
@@ -231,7 +257,7 @@ impl Format {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return Some(calls);
         };
-        let think_close = self.close_of(reasoning, |_| false)?;
+        let think_close = self.region(reasoning, |_| false)?.close;
         let mut excludes: Vec<String> = self.terminal_texts().map(str::to_string).collect();
         let inner: &[&str] = match self.call_syntax() {
             Some(CallSyntax::Keyed(tags)) => &[
@@ -358,11 +384,12 @@ impl Format {
         ]))
     }
 
-    /// The call markers the rows give: the opener and the close of the arguments state, and of
-    /// the wrapper state with a row into it when the calls sit in a block.
+    /// The call markers the rows give: the region of the arguments state, and of the wrapper state
+    /// with a row into it when the calls sit in a block.
     fn call_markers(&self) -> Option<CallMarkers<'_>> {
         let arguments = self.state_emitting(Emits::Arguments)?;
         let is_arguments = |state: usize| self.emits(state) == Emits::Arguments;
+        let call = self.region(arguments, |_| false)?;
         let block = self
             .transitions()
             .find(|&(source, _, target)| {
@@ -370,21 +397,20 @@ impl Format {
             })
             .map(|(source, _, _)| source);
         let block = match block {
-            Some(state) => Some(Block {
-                open: self.opener_of(state, is_arguments)?,
-                close: self.close_of(state, is_arguments)?,
-                before_open: self
-                    .entered_from(state, is_arguments)
-                    .into_iter()
-                    .map(|from| self.close_of_region(from).unwrap_or(""))
-                    .collect(),
-            }),
+            Some(state) => {
+                let Region { open, close } = self.region(state, is_arguments)?;
+                Some(Block {
+                    open,
+                    close,
+                    ways_in: self.ways_into(state, is_arguments)?,
+                })
+            }
             None => None,
         };
         Some(CallMarkers {
             block,
-            call_open: self.opener_of(arguments, |_| false)?,
-            call_close: self.close_of(arguments, |_| false)?,
+            call_open: call.open,
+            call_close: call.close,
         })
     }
 
@@ -406,43 +432,59 @@ impl Format {
         from
     }
 
-    /// The text of the terminal of a row into `state` from a state it is entered from: the
-    /// region's opener.
-    fn opener_of(&self, state: usize, within: impl Fn(usize) -> bool) -> Option<&str> {
-        self.transitions()
-            .find(|&(source, _, target)| target == state && source != state && !within(source))
-            .map(|(_, on, _)| self.terminal_text(on))
-    }
-
-    /// The text of the terminal of a row from `state` back to a state it is entered from, other
-    /// than the end of the turn: the region's close. The two states name it, not the order of the
+    /// The markers of the region `state` is: its close is the terminal of the row from `state`
+    /// back to a state it is entered from, other than the end of the turn, and its opener the
+    /// terminal of that state's row into `state`. The states name the two, not the order of the
     /// rows.
-    fn close_of(&self, state: usize, within: impl Fn(usize) -> bool + Copy) -> Option<&str> {
+    fn region(&self, state: usize, within: impl Fn(usize) -> bool + Copy) -> Option<Region<'_>> {
         let from = self.entered_from(state, within);
         let turn_close = self.turn_close();
-        self.transitions()
-            .find(|&(source, on, target)| {
-                source == state && from.contains(&target) && Some(on) != turn_close
+        let (_, close, home) = self.transitions().find(|&(source, on, target)| {
+            source == state && from.contains(&target) && Some(on) != turn_close
+        })?;
+        let (_, open, _) = self
+            .transitions()
+            .find(|&(source, _, target)| source == home && target == state)?;
+        Some(Region {
+            open: self.terminal_text(open),
+            close: self.terminal_text(close),
+        })
+    }
+
+    /// The ways into the block `state` is, one per state it is entered from, in the order of the
+    /// states: the terminal of that state's row into the block, after the close of the region the
+    /// state is, except for the turn's own state. `None` when a state on the way has no close.
+    fn ways_into(
+        &self,
+        state: usize,
+        within: impl Fn(usize) -> bool + Copy,
+    ) -> Option<Vec<WayIn<'_>>> {
+        self.entered_from(state, within)
+            .into_iter()
+            .map(|from| {
+                let (_, open, _) = self
+                    .transitions()
+                    .find(|&(source, _, target)| source == from && target == state)?;
+                let close = match from {
+                    0 => None,
+                    region => Some(self.region(region, |_| false)?.close),
+                };
+                Some(WayIn {
+                    close,
+                    open: self.terminal_text(open),
+                })
             })
-            .map(|(_, on, _)| self.terminal_text(on))
+            .collect()
     }
 
-    /// The close of the region `state` is, or `None` for the turn's own state, where the opener
-    /// leaves the engine and which no row opens as a region.
-    fn close_of_region(&self, state: usize) -> Option<&str> {
-        (state != 0)
-            .then(|| self.close_of(state, |_| false))
-            .flatten()
-    }
-
-    /// The terminal with a row from every state: the end of the turn, which ends whatever is
-    /// open, and so closes no region of its own.
+    /// The terminal that every state has a row for, each back to the turn's own state: the end of
+    /// the turn, which ends whatever is open and closes no region of its own.
     fn turn_close(&self) -> Option<usize> {
         let terminals = self.terminal_texts().count();
         (0..terminals).find(|&on| {
             (0..self.states()).all(|state| {
                 self.transitions()
-                    .any(|(source, t, _)| source == state && t == on)
+                    .any(|(source, t, target)| source == state && t == on && target == 0)
             })
         })
     }
@@ -625,10 +667,11 @@ mod tests {
     }
 
     #[test]
-    fn a_thought_that_closes_somewhere_other_than_content_has_no_prefix_yet() {
-        // A thought that closes into the calls block, as Kimi K3's closes into its message: the
-        // tag derives without the prefix, but a prefix ending at the block's opener would force
-        // the call inside the thought, so with the reasoning open the table gives `None`.
+    fn a_thought_without_a_close_of_its_own_gives_no_grammar() {
+        // A thought that closes into the calls block and nowhere else: the block is entered from a
+        // region with no close of its own, so there is no way in that closes what the prompt left
+        // open, and the table gives `None` rather than a tag the model could write inside its
+        // thought, with the reasoning open or not.
         let into_the_block = Format::new("into_the_block")
             .terminal("think_open", "<think>")
             .terminal("think_close", "</think>")
@@ -648,8 +691,92 @@ mod tests {
             .transition("calls", "calls_close", "content")
             .calls(CallSyntax::Json);
         let tools = weather_tools();
-        assert!(into_the_block.grammar(&tools, true, false).is_some());
+        assert!(into_the_block.grammar(&tools, true, false).is_none());
         assert!(into_the_block.grammar(&tools, true, true).is_none());
+    }
+
+    #[test]
+    fn a_blocks_opener_is_the_row_from_the_state_its_close_returns_to() {
+        // The block is entered by two terminals, `<calls-from-thought>` from the thought (the
+        // first row in) and `<calls>` from content; its close returns to content, so `<calls>` is
+        // its opener, whichever row comes first, and DSML writes it as the block's opening.
+        let two_doors = Format::new("two_doors")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("from_thought", "<calls-from-thought>")
+            .terminal("calls_open", "<calls>")
+            .terminal("calls_close", "</calls>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("reasoning", "from_thought", "calls")
+            .transition("content", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "content")
+            .calls(CallSyntax::Dsml);
+        let tools = weather_tools();
+        let payload = two_doors
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(payload["format"]["elements"][0]["value"], "\n\n<calls>\n");
+    }
+
+    #[test]
+    fn kimi_k3_derives_the_same_tag_whatever_the_order_of_its_rows() {
+        // Kimi K3's rows in reverse: the end of the turn is still the terminal every state's row
+        // sends back to the turn's state, the block's close is still the tools tag and not that
+        // end, and the three ways in keep the order of the states.
+        let rows = [
+            ("message", "think_open", "reasoning"),
+            ("reasoning", "think_close", "message"),
+            ("reasoning", "response_open", "content"),
+            ("reasoning", "tools_open", "tools"),
+            ("reasoning", "message_close", "message"),
+            ("message", "response_open", "content"),
+            ("content", "response_close", "message"),
+            ("content", "message_close", "message"),
+            ("content", "tools_open", "tools"),
+            ("message", "tools_open", "tools"),
+            ("tools", "call_open", "call"),
+            ("call", "call_close", "tools"),
+            ("call", "call_open", "call"),
+            ("call", "tools_close", "message"),
+            ("call", "message_close", "message"),
+            ("tools", "tools_close", "message"),
+            ("tools", "message_close", "message"),
+            ("message", "message_close", "message"),
+        ];
+        let mut reversed = Format::new("kimi_k3_reversed")
+            .terminal("think_open", "<|open|>think<|sep|>")
+            .terminal("think_close", "<|close|>think<|sep|>")
+            .terminal("response_open", "<|open|>response<|sep|>")
+            .terminal("response_close", "<|close|>response<|sep|>")
+            .terminal("tools_open", "<|open|>tools<|sep|>")
+            .terminal("tools_close", "<|close|>tools<|sep|>")
+            .terminal("call_open", "<|open|>call tool=\"")
+            .terminal("call_close", "<|close|>call<|sep|>")
+            .terminal("message_close", "<|close|>message<|sep|>")
+            .state("message", Emits::Wrapper)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("tools", Emits::Wrapper)
+            .state("call", Emits::Arguments);
+        for (from, on, to) in rows.iter().rev() {
+            reversed = reversed.transition(from, on, to);
+        }
+        let reversed = reversed.calls(CallSyntax::Xtml);
+        let tools = weather_tools();
+        assert_eq!(
+            reversed.grammar(&tools, true, true),
+            formats::kimi_k3().grammar(&tools, true, true)
+        );
     }
 
     #[test]
