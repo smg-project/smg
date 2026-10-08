@@ -1900,21 +1900,29 @@ impl CacheAwarePolicy {
     /// although another holds its prefix, the recompute accepted: shallow
     /// overlaps first (at most [`DIVERT_SHALLOW_SHARE`] of the request), any
     /// hit once a window of `divert_every` hits passed without a shallow
-    /// one; never while the thin worker has anything in flight unless its
-    /// last diversion is older than [`DIVERT_WINDOW_MS`] (the stamp lives on
-    /// the worker, so it survives the table's rebuilds), so a hot fleet is
-    /// not disturbed; and only until its index crosses the thinness ratio of
-    /// the fleet's level. Equal loads draw uniformly like the slice. A fleet
-    /// with no thin worker returns before any clock read or counter: this
-    /// costs the steady state nothing. Protection and the liveness vetoes
-    /// apply through the routing state as everywhere; the pick is credited
-    /// through the expected-wait selector like the slice's.
+    /// one, but a deep hit only away from a holder with more in flight than
+    /// the thin worker (the least loaded of the request's deepest holders in
+    /// `candidates`, where the request goes otherwise): recomputing a deep
+    /// overlap is worth it where the request would queue, not on an idle
+    /// fleet, where a single client's multi-turn continuations were
+    /// recomputed from scratch on every worker joining a scale-out, one
+    /// continuation in eight losing its whole context; never while the thin
+    /// worker has anything in flight unless its last diversion is older than
+    /// [`DIVERT_WINDOW_MS`] (the stamp lives on the worker, so it survives
+    /// the table's rebuilds), so a hot fleet is not disturbed; and only until
+    /// its index crosses the thinness ratio of the fleet's level. Equal loads
+    /// draw uniformly like the slice. A fleet with no thin worker returns
+    /// before any clock read or counter: this costs the steady state nothing.
+    /// Protection and the liveness vetoes apply through the routing state as
+    /// everywhere; the pick is credited through the expected-wait selector
+    /// like the slice's.
     fn warmup_divert(
         &self,
         workers: &[Arc<dyn Worker>],
         table: &PoolTable,
         indexer: &KvIndex,
         info: &SelectWorkerInfo,
+        candidates: &[OverlapCandidate],
         overlap_share: f64,
     ) -> Option<usize> {
         if table.thin.is_empty() {
@@ -1935,6 +1943,23 @@ impl CacheAwarePolicy {
         if !due {
             return None;
         }
+        // What a deep hit's thin worker is measured against: the least
+        // loaded of the request's deepest holders, read only once a deep hit
+        // is due. A thin worker among them recomputes nothing and is exempt.
+        let deepest: Vec<usize> = if shallow {
+            Vec::new()
+        } else {
+            let best = candidates
+                .iter()
+                .map(|candidate| candidate.raw_score)
+                .fold(0.0_f64, f64::max);
+            candidates
+                .iter()
+                .filter(|candidate| candidate.raw_score >= best)
+                .map(|candidate| candidate.idx)
+                .collect()
+        };
+        let holder_load = deepest.iter().map(|&holder| workers[holder].load()).min();
         let now = liveness::now_ms();
         let mut pick: Option<(usize, usize)> = None;
         let mut tied = 0u32;
@@ -1953,6 +1978,11 @@ impl CacheAwarePolicy {
                 continue;
             }
             if state.load > 0 && now < worker.divert_until_ms() {
+                continue;
+            }
+            if holder_load.is_some_and(|holder_load| state.load >= holder_load)
+                && !deepest.contains(&idx)
+            {
                 continue;
             }
             match pick {
@@ -2367,6 +2397,7 @@ impl CacheAwarePolicy {
             &table,
             indexer,
             info,
+            &candidates,
             best_overlap / request_blocks,
         ) {
             Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
@@ -5619,6 +5650,11 @@ mod tests {
             indexer,
             heads,
         } = fleet_with_holders(7);
+        // The holders are busy, as on those runs: a deep hit is diverted
+        // only from a holder with more in flight than the thin worker.
+        for holder in &workers[..7] {
+            holder.increment_load();
+        }
         let emptied = indexer.worker_id("http://w7:8000").unwrap();
         // A request: a holder's 60-block head and a four-block tail of its own.
         let request = |i: usize| -> Vec<u32> {
@@ -5710,6 +5746,13 @@ mod tests {
             indexer,
             heads,
         } = fleet_with_holders_of(7, 4_096);
+        // The holders are busy (twenty in flight each, a loaded fleet): the
+        // diverted requests pile up on the thin worker, below that.
+        for holder in &workers[..7] {
+            for _ in 0..20 {
+                holder.increment_load();
+            }
+        }
         let thin = indexer.worker_id("http://w7:8000").unwrap();
         // The growth baselines date from the first table, built on the empty
         // fleet as on the run; the regrowth comes after.
@@ -5812,6 +5855,55 @@ mod tests {
             policy.divert_hits.load(Ordering::Relaxed),
             hits,
             "no hit counted, let alone diverted, once no worker is thin"
+        );
+    }
+
+    #[test]
+    fn a_deep_continuation_stays_with_its_idle_holder() {
+        // A scale-out under one client: the joining worker is thin, and
+        // every continuation of the client's sessions is a deep hit (60 of
+        // 64 blocks) on a holder with nothing in flight. Diverting one
+        // recomputes its whole context on the empty worker for a wait it
+        // would not have had: none is diverted, however many hits pass.
+        let HolderFleet {
+            policy,
+            workers,
+            heads,
+            ..
+        } = fleet_with_holders(7);
+        let request = |i: usize| -> Vec<u32> {
+            let mut tokens = heads[i % 7].clone();
+            tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+            tokens
+        };
+        let select = |tokens: &[u32]| -> usize {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        for i in 0..64 {
+            assert_eq!(
+                select(&request(i)),
+                i % 7,
+                "a deep hit left its idle holder for the thin worker (decision {i})"
+            );
+        }
+        // Busy holders: the recompute buys the request a shorter wait and
+        // the thin worker its cache, so the diversion resumes at once (the
+        // hits above have long passed a window).
+        for holder in &workers[..7] {
+            holder.increment_load();
+        }
+        assert_eq!(
+            select(&request(64)),
+            7,
+            "with busy holders a due deep hit goes to the thin worker"
         );
     }
 
