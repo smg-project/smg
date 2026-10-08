@@ -139,7 +139,7 @@ pub async fn call_worker(
     let Some(base) = worker.control_url.as_deref() else {
         return Err(no_control_endpoint(
             worker,
-            "no `rl.control_url` label: launch the engine with a routable --rl-control-host (a wildcard bind is not advertised), or set the label at registration",
+            "no `rl.control_url` label: set it at registration or through the worker update route (a TokenSpeed gRPC engine advertises it when launched with a routable --rl-control-host)",
         ));
     };
     let client = worker.control_client.as_ref().map_err(|e| {

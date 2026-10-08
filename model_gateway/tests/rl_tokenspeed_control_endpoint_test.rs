@@ -7,9 +7,10 @@
 //! named in `failed[]`, and the gRPC `/generate` path reports the version the
 //! engine stamped on the response.
 //!
-//! Each test builds its own fleet on its own pair of mock HTTP ports: the HTTP
-//! mock binds the port it is configured with, and the tests in one binary run
-//! concurrently, so a shared pair would race for the same listener.
+//! Each test builds its own fleet on ephemeral mock HTTP ports (the HTTP mock
+//! picks a free port when given 0, and the request recorder is registered under
+//! that port before the gateway sends anything), so the tests in one binary can
+//! run concurrently without racing for a listener.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -102,6 +103,7 @@ async fn start_mock_grpc_engine(server_args: BTreeMap<String, String>) -> u16 {
         engine: mock_worker::engine::EngineParams::default(),
         server_args,
         weight_version: Some(ENGINE_VERSION.to_string()),
+        ..mock_worker::config::Config::default()
     });
     tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
     port
@@ -146,6 +148,15 @@ async fn grpc_rl_context() -> Arc<AppContext> {
     config.rl.control_timeout_secs = 5;
 
     common::create_test_context_with_tokenizer_registry(config, registry).await
+}
+
+/// The port a started mock reports in its URL.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn port_of(url: &str) -> u16 {
+    url.rsplit(':').next().unwrap().parse().unwrap()
 }
 
 fn mock_http(port: u16) -> MockWorkerConfig {
@@ -259,15 +270,15 @@ struct Fleet {
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-async fn fleet(control_port: u16, sglang_port: u16) -> Fleet {
-    let control_recorder = RequestRecorder::new();
-    set_request_recorder(control_port, control_recorder.clone());
-    let mut control_app = MockWorker::new(mock_http(control_port));
+async fn fleet() -> Fleet {
+    let mut control_app = MockWorker::new(mock_http(0));
     let control_url = control_app.start().await.unwrap();
-    let sglang_recorder = RequestRecorder::new();
-    set_request_recorder(sglang_port, sglang_recorder.clone());
-    let mut sglang = MockWorker::new(mock_http(sglang_port));
+    let control_recorder = RequestRecorder::new();
+    set_request_recorder(port_of(&control_url), control_recorder.clone());
+    let mut sglang = MockWorker::new(mock_http(0));
     let sglang_url = sglang.start().await.unwrap();
+    let sglang_recorder = RequestRecorder::new();
+    set_request_recorder(port_of(&sglang_url), sglang_recorder.clone());
 
     let ctx = grpc_rl_context().await;
     let router: Arc<dyn RouterTrait> = Arc::from(
@@ -342,7 +353,7 @@ impl Fleet {
 
 #[tokio::test]
 async fn discovery_reports_the_advertised_endpoint_and_capabilities() {
-    let f = fleet(18921, 18922).await;
+    let f = fleet().await;
 
     let ts = f.by_engine("tokenspeed", true);
     assert_eq!(ts["connection_mode"], "grpc");
@@ -381,7 +392,7 @@ async fn discovery_reports_the_advertised_endpoint_and_capabilities() {
 
 #[tokio::test]
 async fn proxy_reaches_the_control_endpoint_with_the_worker_bearer() {
-    let f = fleet(18923, 18924).await;
+    let f = fleet().await;
     let id = f.id("tokenspeed", true);
 
     let resp = f
@@ -407,7 +418,7 @@ async fn proxy_reaches_the_control_endpoint_with_the_worker_bearer() {
 
 #[tokio::test]
 async fn fanout_over_workers_with_endpoints_is_200_and_hits_each_once() {
-    let f = fleet(18925, 18926).await;
+    let f = fleet().await;
     let ts = f.id("tokenspeed", true);
     let sglang = f.id("sglang", true);
 
@@ -442,7 +453,7 @@ async fn fanout_over_workers_with_endpoints_is_200_and_hits_each_once() {
 
 #[tokio::test]
 async fn fanout_names_the_worker_without_an_endpoint() {
-    let f = fleet(18927, 18928).await;
+    let f = fleet().await;
     let resp = f
         .app
         .clone()
@@ -475,7 +486,7 @@ async fn fanout_names_the_worker_without_an_endpoint() {
 
 #[tokio::test]
 async fn grpc_generate_reports_the_engine_stamped_version() {
-    let f = fleet(18929, 18930).await;
+    let f = fleet().await;
 
     let resp = f
         .router

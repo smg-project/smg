@@ -190,10 +190,10 @@ impl RequestRecorder {
             .clone()
     }
 
-    /// The `authorization` header of each RL control request received,
-    /// oldest first (RL control routes only; not aligned with
-    /// [`Self::bodies`]). `None` is a request that arrived without the
-    /// header.
+    /// The `authorization` header of every RL control request received,
+    /// oldest first, bodyless requests and simulated failures included (so
+    /// not aligned with [`Self::bodies`], which only has the requests that
+    /// carried JSON). `None` is a request that arrived without the header.
     #[expect(
         clippy::expect_used,
         reason = "test helper - panicking on failure is intentional"
@@ -268,9 +268,9 @@ fn record_request(port: u16, version: Version, body: &serde_json::Value) {
     }
 }
 
-/// Record the `authorization` header of one RL control request. Only the
-/// RL control routes call it, so this vector is shorter than `bodies` when
-/// the recorder's port also served other routes.
+/// Record the `authorization` header of one RL control request: every
+/// control request, before the failure simulation and whether or not it
+/// carried a body.
 fn record_authorization(port: u16, value: Option<String>) {
     let recorder = request_recorders_table()
         .lock()
@@ -1553,6 +1553,13 @@ async fn rl_control_handler(
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let config = config.read().await;
+    record_authorization(
+        config.port,
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+    );
 
     if should_fail(&config) {
         return (
@@ -1564,13 +1571,6 @@ async fn rl_control_handler(
 
     if let Some(Json(body)) = body {
         record_request(config.port, version, &body);
-        record_authorization(
-            config.port,
-            headers
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string),
-        );
     }
 
     Json(json!({"success": true, "message": "ok"})).into_response()
