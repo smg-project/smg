@@ -56,8 +56,8 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, qwen2_5, qwen3,
-        seed_oss, xlam,
+        deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
+        qwen3, seed_oss, xlam,
     },
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
@@ -372,6 +372,18 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::IQuest,
         GenerationPrompt::OpensTheThought,
     ),
+    // Content and nothing else: templates without a thought or a call syntax, whose parse sets
+    // hold content alone.
+    (
+        "tinyllama-1.1b-chat-v1.0",
+        Family::Plain,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "phi-4-mini-instruct",
+        Family::Plain,
+        GenerationPrompt::Plain,
+    ),
     // Python calls: Olmo 3 has no thought; LFM2.5 writes its own `<think>`.
     ("olmo-3-7b-instruct", Family::Olmo3, GenerationPrompt::Plain),
     (
@@ -436,6 +448,8 @@ enum Family {
     MinimaxM3,
     /// [`kimi_k3`]: XTML, whose argument tags name their own values' types.
     KimiK3,
+    /// [`plain`]: content and nothing else.
+    Plain,
 }
 
 impl Family {
@@ -477,6 +491,7 @@ impl Family {
             Self::Xlam => xlam(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
+            Self::Plain => plain(),
         }
     }
 
@@ -487,10 +502,12 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4, Olmo 3, xLAM and Kimi K3 read neither of the probes' Qwen markers:
-            // `</think>` stays reasoning text and the fenced `<tool_call>` block stays content, as
-            // the reference says.
-            Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam | Self::KimiK3 => &[],
+            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3 and the plain table read neither of the probes'
+            // Qwen markers: `</think>` stays reasoning text and the fenced `<tool_call>` block
+            // stays content, as the reference says.
+            Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam | Self::KimiK3 | Self::Plain => {
+                &[]
+            }
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
             // but not `<tool_call>`.

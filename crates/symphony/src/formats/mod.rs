@@ -14,6 +14,8 @@
 //! whose arguments are an XML tree, and a separator token the table ignores. [`kimi_k3()`] is
 //! Kimi K3: a turn of tagged regions, `think`, `response` and `tools`, the last holding `call`
 //! blocks whose argument tags name each value's type.
+//! [`plain()`] is the table for a template that writes the message's content and nothing else: one
+//! state, no marker.
 //!
 //! [`Format`]: crate::Format
 //! [`Engine`]: crate::Engine
@@ -27,6 +29,7 @@ pub mod lfm2_5;
 pub mod ling;
 pub mod minimax_m3;
 pub mod olmo3;
+pub mod plain;
 pub mod qwen2_5;
 pub mod qwen3;
 pub mod seed_oss;
@@ -41,6 +44,7 @@ pub use lfm2_5::lfm2_5;
 pub use ling::ling;
 pub use minimax_m3::minimax_m3;
 pub use olmo3::olmo3;
+pub use plain::plain;
 pub use qwen2_5::qwen2_5;
 pub use qwen3::qwen3;
 pub use seed_oss::seed_oss;

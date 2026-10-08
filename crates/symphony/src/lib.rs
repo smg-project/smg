@@ -39,8 +39,8 @@ pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
 pub use format::{CallSyntax, Emits, Format};
 pub use formats::{
-    deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, qwen2_5, qwen3,
-    seed_oss, xlam,
+    deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
+    qwen3, seed_oss, xlam,
 };
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};

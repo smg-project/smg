@@ -162,6 +162,10 @@ fn kimi_k3() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::kimi_k3(), Declared::default()))
 }
 
+fn plain() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::plain(), Declared::default()))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -232,6 +236,11 @@ const FORMATS: &[Subject] = &[
         name: "kimi k3",
         new: kimi_k3,
         outputs: KIMI_K3_OUTPUTS,
+    },
+    Subject {
+        name: "plain",
+        new: plain,
+        outputs: PLAIN_OUTPUTS,
     },
 ];
 
@@ -347,6 +356,19 @@ const KIMI_K3_OUTPUTS: &[&str] = &[
      <|close|>tools<|sep|><|close|>message<|sep|>",
     "<|open|>think<|sep|>Only a thought.",
     "Plain prose with no marker at all.",
+    "",
+];
+
+/// The plain table: prose of every shape, the other families' markers as prose, and nothing.
+const PLAIN_OUTPUTS: &[&str] = &[
+    "Janet sells 16 - 3 - 4 = <<16-3-4=9>>9 duck eggs a day.\nShe makes 9 * 2 = $<<9*2=18>>18 \
+     every day at the farmer\u{2019}s market.\n#### 18",
+    "```diff\ndiff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n```",
+    "<think>a plan</think>Sure.<tool_call>{\"name\": \"f\", \"arguments\": {}}</tool_call>",
+    "[{\"name\": \"f\", \"arguments\": {\"a\": 1}}]",
+    "You're welcome! Let me know if there's anything else. ",
+    "\n\nLeading and trailing whitespace stay.\n\n",
+    "日本語のテキストと emoji 🙂 and a tab\tand a backslash \\",
     "",
 ];
 
