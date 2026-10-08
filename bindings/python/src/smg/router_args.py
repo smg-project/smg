@@ -556,8 +556,8 @@ class RouterArgs:
             type=float,
             default=RouterArgs.least_load_default_throughput,
             help=(
-                "Fallback generation throughput (tokens/s) for least_load when a"
-                " backend reports no live throughput"
+                "Fallback generation throughput (tokens/s) for least_load when no"
+                " candidate reports a live throughput"
             ),
         )
         routing_group.add_argument(

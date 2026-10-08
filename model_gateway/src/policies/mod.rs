@@ -150,7 +150,9 @@ pub struct CacheAwareConfig {
     /// mean by this many requests AND by `balance_rel_threshold`. Requiring
     /// both keeps the gate quiet on steady-state variance at low means
     /// (absolute) without going blind to a deep queue at high means
-    /// (relative).
+    /// (relative). Outside the fleet-wide KV-pressure fallback, a request
+    /// with no cache match routes among the workers under the same gate, so
+    /// a burst of misses is bounded by the same margins.
     pub balance_abs_threshold: usize,
     /// Relative load margin (multiple of the healthy-fleet mean) for the
     /// per-request candidate gate; fires only together with

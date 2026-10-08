@@ -102,9 +102,12 @@ impl SincePollDispatch {
 ///   `waiting_reqs · p̄`, keeping the queue visible in time units rather than
 ///   scoring a backlogged worker as idle. Only a backend reporting neither
 ///   scores `queued_tokens = 0`;
-/// - zero/absent throughput (backend reports no generation rate): falls back to
-///   the configured `default_throughput`, so the work term stays in seconds and
-///   the KV barrier stays relevant;
+/// - zero/absent throughput (backend reports no generation rate, or reports
+///   one for a rank with nothing running, which is a stale gauge rather than a
+///   rate; see [`live_throughput`]): scored at the fleet's nominal rate, the
+///   mean live rate among the candidates, or the configured
+///   `default_throughput` when none has one, so the work term stays in
+///   seconds and the KV barrier stays relevant;
 /// - a worker with no fresh snapshot while peers report: its live in-flight is
 ///   converted to a drain-time estimate (`load · p̄ / fleet_nominal_throughput`)
 ///   so it is comparable to reporting workers, not scored on a raw count;
@@ -122,8 +125,8 @@ impl SincePollDispatch {
 /// - `kv_pressure_weight` (λ_t, default `0.15` s) — weight of the KV-pressure
 ///   barrier. Raise it to steer harder away from near-full KV; lower it to
 ///   weight raw drain time more.
-/// - `default_throughput` (default `2000` tok/s) — drain rate used when a
-///   backend reports no live `gen_throughput`. Set it to the fleet's measured
+/// - `default_throughput` (default `2000` tok/s) — drain rate used when no
+///   candidate reports a live `gen_throughput`. Set it to the fleet's measured
 ///   per-replica generation rate; it co-tunes with `kv_pressure_weight`.
 /// - `mean_prefill_tokens` (p̄, default `1024`) — per-request token estimate for
 ///   the in-flight term when the request's token count is unknown at routing
@@ -151,8 +154,8 @@ pub struct LeastLoadPolicy {
     /// Mean prefill length (tokens) for estimating in-flight token-work when a
     /// request's token count is unknown at routing time.
     mean_prefill_tokens: u32,
-    /// Fallback throughput (tokens/s) for the `/throughput` term when a backend
-    /// reports no live `gen_throughput`.
+    /// Fallback throughput (tokens/s) for the `/throughput` term when no
+    /// candidate reports a live `gen_throughput`.
     default_throughput: f64,
     /// Per-worker waiting-queue cap; `0` disables the veto.
     max_waiting_requests: u32,
@@ -172,6 +175,25 @@ struct ScoreInputs<'a> {
     /// The best-known reporting peer's score: what a worker without a
     /// fresh report scores before its own in-flight.
     peer_baseline: f64,
+}
+
+/// Generation rate a report can be scored against: the sum over ranks with
+/// requests running.
+///
+/// An engine never clears `gen_throughput`: it is the rate of the last decode
+/// interval, so an idle rank reports a residual (SGLang: the ~0.3 tok/s of
+/// its last one-token health generation) or nothing at all. A dispatch
+/// divided by a residual reads as thousands of seconds, so a burst followed
+/// whichever worker happened to report the larger stale number until the
+/// next poll. A rank with nothing running contributes no rate; a worker with
+/// none is scored at the fleet's nominal rate, like one that never reports a
+/// rate.
+fn live_throughput(load: &WorkerLoadResponse) -> f64 {
+    load.loads
+        .iter()
+        .filter(|rank| rank.num_running_reqs > 0)
+        .map(|rank| rank.gen_throughput)
+        .sum()
 }
 
 impl LeastLoadPolicy {
@@ -272,7 +294,8 @@ impl LeastLoadPolicy {
     ///
     /// `inflight` maps worker URL -> token-work dispatched since its last poll.
     /// `nominal_throughput` (a peer-derived mean) estimates drain rate for a
-    /// worker missing a fresh snapshot; `fleet_has_loads` is false only when no
+    /// worker missing a fresh snapshot or reporting no live rate;
+    /// `fleet_has_loads` is false only when no
     /// worker reports at all, in which case we fall back to join-shortest-queue
     /// on the live in-flight count (which, unlike the since-poll estimate,
     /// reflects completions and so suits backends that never report loads).
@@ -292,7 +315,7 @@ impl LeastLoadPolicy {
                 let queued_tokens = self.queued_tokens(load);
                 ExpectedWait::new(
                     queued_tokens,
-                    self.drain_rate(load),
+                    Self::drain_rate(load, nominal_throughput),
                     load.effective_token_usage(),
                     self.kv_pressure_weight,
                 )
@@ -329,25 +352,30 @@ impl LeastLoadPolicy {
     }
 
     /// The drain rate a reporting worker's wait is priced at: its live
-    /// generation rate, else the configured default.
-    fn drain_rate(&self, load: &WorkerLoadResponse) -> f64 {
-        let live = load.total_gen_throughput();
+    /// generation rate, else `nominal_throughput`. No live rate (none
+    /// reported, or only idle ranks; see [`live_throughput`]) means the
+    /// fleet's nominal rate, so an idle worker beside busy peers reads as
+    /// fast as they are, not slower; with no live rate anywhere that is the
+    /// configured default.
+    fn drain_rate(load: &WorkerLoadResponse, nominal_throughput: f64) -> f64 {
+        let live = live_throughput(load);
         if live > 0.0 {
             live
         } else {
-            self.default_throughput
+            nominal_throughput
         }
     }
 
     /// The scoring inputs for one pass over `candidates`: the nominal drain
-    /// rate (mean of the positive reports) that stands in for a worker
-    /// missing a fresh snapshot; whether anyone reports at all, which
-    /// separates a partial gap (estimate the missing worker at the nominal
-    /// rate) from a dark fleet (join-shortest-queue on live in-flight); and
-    /// the best-known reporting peer's score, which a worker without a report
-    /// starts from: never better than a worker whose load is known, never
-    /// starved by one. The baseline is computed only when some candidate
-    /// lacks a report, so the common all-reporting case pays nothing for it.
+    /// rate (mean of the live rates, see [`live_throughput`]) that stands in
+    /// for a worker missing a fresh snapshot or a live rate; whether anyone
+    /// reports at all, which separates a partial gap (estimate the missing
+    /// worker at the nominal rate) from a dark fleet (join-shortest-queue on
+    /// live in-flight); and the best-known reporting peer's score, which a
+    /// worker without a report starts from: never better than a worker whose
+    /// load is known, never starved by one. The baseline is computed only
+    /// when some candidate lacks a report, so the common all-reporting case
+    /// pays nothing for it.
     fn score_inputs<'a>(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -359,7 +387,7 @@ impl LeastLoadPolicy {
         let (tp_sum, tp_count) = candidates
             .iter()
             .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
-            .map(|l| l.total_gen_throughput())
+            .map(live_throughput)
             .filter(|t| *t > 0.0)
             .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
         let nominal_throughput = if tp_count > 0 {
@@ -668,7 +696,8 @@ mod tests {
         }
     }
 
-    /// One DP rank with the given queued tokens, KV utilization, and throughput.
+    /// One DP rank with the given queued tokens, KV utilization, and live
+    /// throughput (a request is running, so the rate gauge counts).
     fn make_load(
         num_waiting_uncached_tokens: i32,
         token_usage: f64,
@@ -679,7 +708,7 @@ mod tests {
             dp_rank_count: 1,
             loads: vec![SchedulerLoadSnapshot {
                 dp_rank: 0,
-                num_running_reqs: 0,
+                num_running_reqs: 1,
                 num_waiting_reqs: 0,
                 num_waiting_uncached_tokens,
                 num_total_reqs: 0,
@@ -1189,6 +1218,77 @@ mod tests {
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn idle_rank_rate_is_not_a_live_throughput() {
+        // Only a rank with requests running has a live rate; an idle rank's
+        // gauge is whatever its last decode interval left behind.
+        let mut load = make_load(0, 0.1, 0.36);
+        load.loads[0].num_running_reqs = 0;
+        assert_eq!(live_throughput(&load), 0.0);
+
+        load.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 1,
+            num_running_reqs: 4,
+            gen_throughput: 800.0,
+            ..Default::default()
+        });
+        assert_eq!(live_throughput(&load), 800.0);
+    }
+
+    #[test]
+    fn stale_idle_rate_does_not_herd_a_burst() {
+        // Two idle workers: a reports the ~0.36 tok/s residual of its last
+        // one-token health generation, b reports nothing. Scored against the
+        // residual, a's first dispatch would read as 1024 / 0.36 ≈ 2800 s and
+        // the rest of the burst would follow b until the next poll. Neither
+        // rate is live, so both score at the default throughput and the
+        // burst water-fills.
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut a = make_load(0, 0.1, 0.36);
+        a.loads[0].num_running_reqs = 0;
+        let mut b = make_load(0, 0.1, 0.0);
+        b.loads[0].num_running_reqs = 0;
+        policy.update_loads(&HashMap::from([
+            ("http://a:8000".to_string(), a),
+            ("http://b:8000".to_string(), b),
+        ]));
+
+        let mut picks = [0usize; 2];
+        for _ in 0..8 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            picks[idx] += 1;
+        }
+        assert_eq!(picks, [4, 4]);
+    }
+
+    #[test]
+    fn idle_worker_is_scored_at_its_busy_peers_rate() {
+        // a is busy at 8000 tok/s; b is idle, its gauge a stale residual. At a
+        // flat 2000 tok/s a dispatch to b would read as four times one to a
+        // and a would take four of every five; at its peers' nominal rate the
+        // two score alike and the burst water-fills.
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut b = make_load(0, 0.1, 0.36);
+        b.loads[0].num_running_reqs = 0;
+        policy.update_loads(&HashMap::from([
+            ("http://a:8000".to_string(), make_load(0, 0.1, 8000.0)),
+            ("http://b:8000".to_string(), b),
+        ]));
+
+        let mut picks = [0usize; 2];
+        for _ in 0..8 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            picks[idx] += 1;
+        }
+        assert_eq!(picks, [4, 4]);
     }
 
     #[test]

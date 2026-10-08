@@ -460,8 +460,8 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
     least_load_kv_pressure_weight: f64,
 
-    /// Fallback generation throughput (tokens/s) for least_load when a backend
-    /// reports no live throughput
+    /// Fallback generation throughput (tokens/s) for least_load when no
+    /// candidate reports a live throughput
     #[arg(long, default_value_t = 2000.0, help_heading = "Routing Policy")]
     least_load_default_throughput: f64,
 

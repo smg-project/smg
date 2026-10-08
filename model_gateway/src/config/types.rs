@@ -962,7 +962,7 @@ pub enum PolicyConfig {
         #[serde(default = "default_least_load_mean_prefill")]
         mean_prefill_tokens: u32,
         /// Fallback generation throughput (tokens/s) for the expected-wait term
-        /// when a backend reports no live `gen_throughput`. Set to the fleet's
+        /// when no candidate reports a live `gen_throughput`. Set to the fleet's
         /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
