@@ -2113,6 +2113,9 @@ impl CacheAwarePolicy {
                 .collect()
         };
         if cache_trace::enabled() {
+            if inputs.len() > 32 {
+                cache_trace::mark_truncated();
+            }
             for candidate in inputs.iter().take(32) {
                 cache_trace::score(serde_json::json!({
                     "source": "policy_affinity", "worker": candidate.url,
@@ -2224,6 +2227,9 @@ impl CacheAwarePolicy {
         };
         let request_blocks = (request_units / self.config.block_size).max(1);
         if cache_trace::enabled() {
+            if healthy_indices.len() > 32 {
+                cache_trace::mark_truncated();
+            }
             for &idx in healthy_indices.iter().take(32) {
                 let holder = matched_tenants
                     .iter()

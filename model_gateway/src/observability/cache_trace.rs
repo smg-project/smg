@@ -119,6 +119,12 @@ pub(crate) fn score(value: Value) {
     }
 }
 
+pub(crate) fn mark_truncated() {
+    if enabled() {
+        let _ = CAPTURE.try_with(|capture| capture.borrow_mut().truncated = true);
+    }
+}
+
 pub(crate) fn selection(
     policy: &str,
     origin: &str,
