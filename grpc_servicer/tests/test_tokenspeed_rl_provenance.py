@@ -205,6 +205,29 @@ def test_nested_objects_are_flattened_before_redaction():
     }
 
 
+def test_back_references_do_not_recurse_forever():
+    """A sub-config that points back at its parent used to be a str() leaf; now
+    that objects are expanded, the back-reference must stop the descent (and
+    render as a string) while a shared object on two separate paths is still
+    expanded on both."""
+
+    class Node:
+        def __init__(self, name):
+            self.name = name
+            self.parent = None
+
+    root, child = Node("root"), Node("child")
+    child.parent = root
+    root.child = child
+    flat = servicer_mod._make_json_serializable({"cfg": root})
+    assert flat["cfg"]["child"]["name"] == "child"
+    assert isinstance(flat["cfg"]["child"]["parent"], str), "the back-reference is a leaf"
+
+    shared = Node("shared")
+    twice = servicer_mod._make_json_serializable({"a": shared, "b": shared})
+    assert twice["a"] == twice["b"] == {"name": "shared", "parent": None}
+
+
 class TestGetModelInfo:
     def test_weight_version_is_the_live_server_args_value(self):
         s = _servicer()
