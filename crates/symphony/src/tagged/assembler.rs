@@ -50,7 +50,26 @@ const FUNCTION_OPEN: usize = 0;
 const PARAMETER_OPEN: usize = 1;
 const PARAMETER_CLOSE: usize = 2;
 const FUNCTION_CLOSE: usize = 3;
-const TAGS: [&str; 4] = ["<function=", "<parameter=", "</parameter>", "</function>"];
+/// The four tags of the syntax: a function's opening up to its name, a parameter's opening up to
+/// its key, a parameter's close, a function's close.
+pub const TAGS: [&str; 4] = ["<function=", "<parameter=", "</parameter>", "</function>"];
+
+/// What a template writes around a parameter's value: Qwen 3.5 and Qwen3-Coder put the value on a
+/// line of its own, a newline after `<parameter=KEY>` and one before `</parameter>`; Seed-OSS
+/// writes it between the two tags directly. The assembler reads a call either way; the grammar
+/// derived from a table spells the one its template writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spelling {
+    pub around_value: &'static str,
+}
+
+impl Spelling {
+    /// The value on a line of its own: Qwen 3.5 and later, Qwen3-Coder.
+    pub const OWN_LINE: Self = Self { around_value: "\n" };
+
+    /// The value between its tags directly: Seed-OSS.
+    pub const INLINE: Self = Self { around_value: "" };
+}
 const WITHOUT_A_FUNCTION: &str = "a tool call without a function tag";
 const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
 const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";

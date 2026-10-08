@@ -18,9 +18,10 @@
 //! name and schema. What the syntax inside the markers constrains comes from the call syntax: a
 //! JSON object around each tool's schema for the JSON family; the engines' `glm_xml` style of a
 //! schema for keyed arguments in the compact spelling, and the table's own tags written one pair
-//! per property for Ling's newlines and Hy4's suffixed tags (the `keyed` module); a tag grammar
-//! per parameter for DSML; for Kimi K3's XTML, one argument tag per property of the schema (the
-//! `xtml` module). The gateway's
+//! per property for Ling's newlines and Hy4's suffixed tags (the `keyed` module); `<function=`
+//! and `<parameter=` tags, one per property, for Qwen 3.5's and Seed-OSS's tagged syntax (the
+//! `tagged` module); a tag grammar per parameter for DSML; for Kimi K3's XTML, one argument tag
+//! per property of the schema (the `xtml` module). The gateway's
 //! old parsers wrote these tags by hand, one function per parser; where one exists for a format
 //! Symphony has, the derived tag is pinned to it in the tests, so the switch changes nothing an
 //! engine sees.
@@ -37,20 +38,21 @@
 //! other state, its own row into the block. So the model closes whatever the prompt left open on
 //! its way to the calls, whichever that was.
 //!
-//! Not derived yet, so [`Format::grammar`] gives `None` for them: the tagged syntax (Qwen 3.5 and
-//! later, Seed-OSS), MiniMax M3's XML tree, the pythonic tables, xLAM's list, and a table without
-//! calls. The gateway then takes the JSON-schema path, as it does for those models today.
+//! Not derived yet, so [`Format::grammar`] gives `None` for them: MiniMax M3's XML tree, the
+//! pythonic tables, xLAM's list, and a table without calls. The gateway then takes the JSON-schema
+//! path, as it does for those models today.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    tagged::{self, dsml},
+    tagged::{assembler::TAGS as TAGGED_TAGS, dsml, keyed::Tags as KeyedTags},
 };
 
 mod keyed;
 mod schema;
+mod tagged;
 mod xtml;
 
 /// A structural-tag grammar, as the engines take it.
@@ -267,7 +269,7 @@ impl Format {
         let markers = self.call_markers()?;
         let calls = match self.call_syntax()? {
             CallSyntax::Json => Self::json_calls(&markers, &named, at_least_one),
-            CallSyntax::Keyed(tags) if *tags == tagged::keyed::Tags::PLAIN => {
+            CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
                 Self::keyed_calls(&markers, &named, at_least_one)
             }
             CallSyntax::Dsml => Self::dsml_calls(&markers, &named, at_least_one)?,
@@ -279,9 +281,11 @@ impl Format {
                 let ways_in = self.ways_into(markers.block.as_ref()?.state);
                 return xtml::calls(&markers, &ways_in, &named, at_least_one);
             }
-            CallSyntax::Tagged | CallSyntax::Pythonic | CallSyntax::JsonList | CallSyntax::Xml => {
-                return None
+            CallSyntax::Tagged(spelling) => {
+                let ways_in = self.ways_into_block(&markers);
+                tagged::calls(&markers, &ways_in, *spelling, &named, at_least_one)
             }
+            CallSyntax::Pythonic | CallSyntax::JsonList | CallSyntax::Xml => return None,
         };
         if !reasoning_open {
             return Some(calls);
@@ -301,6 +305,7 @@ impl Format {
                 tags.value_close,
             ],
             Some(CallSyntax::Dsml) => &[dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
+            Some(CallSyntax::Tagged(_)) => &TAGGED_TAGS,
             _ => &[],
         };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
@@ -663,7 +668,7 @@ mod tests {
         assert_eq!(payload["format"]["tags"][0]["end"], "</iquest_tool_call>");
         // Ling writes the template's newlines between the tags, which the compact style does not,
         // so its table says so and its tag is written from its own tags (the `keyed` module).
-        assert_eq!(tagged::keyed::Tags::LING.between, "\n");
+        assert_eq!(KeyedTags::LING.between, "\n");
     }
 
     #[test]
@@ -1056,8 +1061,6 @@ mod tests {
             .grammar(&[tool("", None, value!({}))], true, false)
             .is_none());
         for format in [
-            formats::qwen3(CallSyntax::Tagged),
-            formats::seed_oss(),
             formats::minimax_m3(),
             formats::olmo3(),
             formats::lfm2_5(),

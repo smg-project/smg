@@ -22,5 +22,5 @@ pub mod value;
 pub mod xml;
 pub mod xtml;
 
-pub use assembler::Assembler;
+pub use assembler::{Assembler, Spelling};
 pub use value::{json, Declared, Kind};

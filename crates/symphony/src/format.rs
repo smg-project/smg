@@ -34,7 +34,7 @@
 //! [`Engine`]: crate::Engine
 //! [`formats`]: crate::formats
 
-use crate::tagged::keyed;
+use crate::tagged::{self, keyed};
 
 /// How the model writes a call between the call markers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,8 +42,9 @@ pub enum CallSyntax {
     /// One JSON object, `{"name": …, "arguments": {…}}`: Qwen3.
     Json,
     /// `<function=NAME>` and then `<parameter=KEY>` around each value's text, typed by the
-    /// request's tools, which reach the engine with the request: Qwen 3.5 and later, Qwen3-Coder.
-    Tagged,
+    /// request's tools, which reach the engine with the request, in the family's spelling of what
+    /// stands around a value: Qwen 3.5 and later, Qwen3-Coder, Seed-OSS.
+    Tagged(tagged::Spelling),
     /// DeepSeek's DSML: the arguments state is one `<｜DSML｜ invoke name="…">` block, whose
     /// parameter tags carry a `string` attribute that types each value. The terminal that enters
     /// the state is the invoke tag's opening, and the one that leaves it is the invoke's closing
