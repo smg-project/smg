@@ -31,9 +31,11 @@ const SEP: &str = "<|sep|>";
 /// The call's count of the turn's calls, from one.
 const INDEX: &str = "[1-9][0-9]*";
 
-/// The block of calls for `tools`, or `None` for a table whose calls sit in no block.
+/// The block of calls for `tools`, entered by `ways_in`, or `None` for a table whose calls sit
+/// in no block.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
+    ways_in: &[WayIn<'_>],
     tools: &[&Tool],
     at_least_one: bool,
 ) -> Option<Grammar> {
@@ -45,13 +47,12 @@ pub(super) fn calls(
             .collect(),
     );
     let content = Grammar::Plus(Box::new(one_call));
-    let tags = block
-        .ways_in
+    let tags = ways_in
         .iter()
         .map(|way| Tag::new(way.begin(), content.clone(), block.close))
         .collect();
     let mut triggers: Vec<String> = Vec::new();
-    for trigger in block.ways_in.iter().map(WayIn::trigger) {
+    for trigger in ways_in.iter().map(WayIn::trigger) {
         if !triggers.iter().any(|known| known == trigger) {
             triggers.push(trigger.to_string());
         }
