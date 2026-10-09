@@ -3143,6 +3143,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admission_hooks_hold_and_pace_requests_before_the_engine_sees_them() {
+        let engine = live();
+        // Neither hook set: a request is admitted at once.
+        let t0 = Instant::now();
+        engine.admit().await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t0.elapsed()
+        );
+        // The hold: every admission waits the delay.
+        engine.fault_admit_delay_ms(150);
+        let t0 = Instant::now();
+        engine.admit().await;
+        assert!(
+            t0.elapsed() >= Duration::from_millis(150),
+            "held for the delay: {:?}",
+            t0.elapsed()
+        );
+        engine.fault_admit_delay_ms(0);
+        // The cap: admissions are spaced 1/per_sec apart, the first one free.
+        engine.fault_admit_per_sec(10);
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            engine.admit().await;
+        }
+        assert!(
+            t0.elapsed() >= Duration::from_millis(200),
+            "three admissions at 10/s take two slots: {:?}",
+            t0.elapsed()
+        );
+        let status = engine.fault_status();
+        assert_eq!((status.admit_delay_ms, status.admit_per_sec), (0, 10));
+        // Cleared: at once again.
+        engine.fault_admit_per_sec(0);
+        let t0 = Instant::now();
+        engine.admit().await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn cached_tokens_for_reports_the_engine_truth() {
         let engine = live();
         let prompt: Vec<u32> = (0..64).collect();
