@@ -1,4 +1,5 @@
 mod deepseek_v41;
+mod gemma4;
 mod glm53_flash;
 mod inkling;
 mod kimi_k25;
@@ -16,6 +17,7 @@ pub mod transcription;
 
 use deepseek_v41::DeepseekV41VisionSpec;
 pub use deepseek_v41::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
+use gemma4::Gemma4Spec;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
@@ -45,6 +47,8 @@ impl ModelRegistry {
             specs: vec![
                 // DeepSeek-V4.1 matches only its own model_type / id, so it can lead.
                 LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
+                // Gemma 4 matches its own model_type / id only.
+                LazySpec::new(|| Box::new(Gemma4Spec)),
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
@@ -196,5 +200,37 @@ pub(super) mod test_helpers {
             item_sizes: sizes,
             model_specific,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::registry::test_helpers::TestTokenizer;
+
+    /// A checkpoint of this family resolves to a spec by its `model_type`
+    /// alone (the served id is often an opaque path).
+    #[test]
+    fn the_registry_resolves_the_gemma4_family() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({
+            "model_type": "gemma4",
+            "image_token_id": 258880,
+            "boi_token_id": 255999,
+            "eoi_token_id": 258882,
+            "video_token_id": 258884
+        });
+        let metadata = ModelMetadata {
+            model_id: "/models/local-checkpoint",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry
+            .lookup(&metadata)
+            .expect("the gemma4 family has a spec");
+        assert_eq!(spec.name(), "gemma4");
     }
 }

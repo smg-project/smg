@@ -6,6 +6,7 @@
 //! # Supported Models
 //!
 //! - **DeepSeek-V4.1** (`deepseek_v41`): contain-fit resize with gray padding, 14px patches and a 3x3 aligner downsample
+//! - **Gemma 4** (`gemma4`): Aspect-preserving block-aligned resize, 16px patches padded to the soft-token budget, with video as frames
 //! - **GLM-5.3-Flash** (`glm53_flash`): Aspect-preserving aligned-canvas image/video preprocessing
 //! - **LLaVA 1.5** (`llava`): CLIP-based preprocessing with configurable aspect ratio
 //! - **LLaVA-NeXT** (`llava`): Multi-crop anyres processing
@@ -23,6 +24,7 @@
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 
 pub mod deepseek_v41;
+pub mod gemma4;
 pub mod glm53_flash;
 pub mod inkling;
 pub mod kimi_k25;
@@ -40,6 +42,7 @@ pub mod qwen3_vl;
 pub mod qwen_vl_base;
 
 pub use deepseek_v41::DeepseekV41Processor;
+pub use gemma4::Gemma4Processor;
 pub use glm53_flash::Glm53FlashProcessor;
 pub use inkling::InklingImageProcessor;
 pub use kimi_k25::KimiK25Processor;

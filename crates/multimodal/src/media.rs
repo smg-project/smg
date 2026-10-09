@@ -97,6 +97,11 @@ pub enum FrameSampling {
     Even,
     /// One frame per sampling interval from the start, plus the last frame.
     Interval,
+    /// Every frame of a clip with at most `max_frames`; a longer clip gives
+    /// `max_frames` spread evenly from the first frame to the last
+    /// (`numpy.linspace(0, n - 1, max_frames)` truncated to integers), the
+    /// way vLLM's default video loader samples. The rate is not a factor.
+    UpTo { max_frames: usize },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1388,6 +1393,9 @@ fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -
     match cfg.sampling {
         FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
         FrameSampling::Interval => interval_frame_indices(total_frames, fps, cfg),
+        FrameSampling::UpTo { max_frames } => {
+            spread_evenly(total_frames, total_frames.min(max_frames.max(1)))
+        }
     }
 }
 
@@ -2955,6 +2963,51 @@ mod video_sampling_tests {
                 0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255,
                 270, 285, 299
             ]
+        );
+    }
+
+    fn up_to_cfg(max_frames: usize) -> VideoFetchConfig {
+        VideoFetchConfig {
+            sampling: FrameSampling::UpTo { max_frames },
+            ..VideoFetchConfig::default()
+        }
+    }
+
+    /// `numpy.linspace(0, n - 1, min(n, 32), dtype=int)`, the engine's default
+    /// video loader; the min/max frame counts and the rate play no part.
+    #[test]
+    fn up_to_sampling_takes_every_frame_or_spreads_the_budget() {
+        assert_eq!(
+            sampled_frame_indices(16, 8.0, up_to_cfg(32)),
+            (0..16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sampled_frame_indices(32, 30.0, up_to_cfg(32)),
+            (0..32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sampled_frame_indices(50, 10.0, up_to_cfg(32)),
+            vec![
+                0, 1, 3, 4, 6, 7, 9, 11, 12, 14, 15, 17, 18, 20, 22, 23, 25, 26, 28, 30, 31, 33,
+                34, 36, 37, 39, 41, 42, 44, 45, 47, 49
+            ]
+        );
+        assert_eq!(
+            sampled_frame_indices(36, 12.0, up_to_cfg(32)),
+            vec![
+                0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24,
+                25, 27, 28, 29, 30, 31, 32, 33, 35
+            ]
+        );
+        let long = sampled_frame_indices(1000, 30.0, up_to_cfg(32));
+        assert_eq!(long.len(), 32);
+        assert_eq!((long[0], long[1], long[16], long[31]), (0, 32, 515, 999));
+        assert_eq!(sampled_frame_indices(1, 30.0, up_to_cfg(32)), vec![0]);
+        assert_eq!(sampled_frame_indices(2, 30.0, up_to_cfg(32)), vec![0, 1]);
+        assert_eq!(sampled_frame_indices(5, 30.0, up_to_cfg(0)), vec![0]);
+        assert_eq!(
+            sampled_frame_indices(0, 30.0, up_to_cfg(32)),
+            Vec::<usize>::new()
         );
     }
 

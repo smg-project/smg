@@ -46,8 +46,9 @@ pub use processor::{
     ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor, VisionProcessorRegistry,
 };
 pub use processors::{
-    DeepseekV41Processor, Glm53FlashProcessor, Llama4VisionProcessor, LlavaNextProcessor,
-    LlavaProcessor, MiniMaxM3VisionProcessor, Phi3VisionProcessor, Phi4VisionProcessor,
-    PixtralProcessor, Qwen2VLProcessor, Qwen3OmniVisionProcessor, Qwen3VLProcessor,
+    DeepseekV41Processor, Gemma4Processor, Glm53FlashProcessor, Llama4VisionProcessor,
+    LlavaNextProcessor, LlavaProcessor, MiniMaxM3VisionProcessor, Phi3VisionProcessor,
+    Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor, Qwen3OmniVisionProcessor,
+    Qwen3VLProcessor,
 };
 pub use transforms::TransformError;
