@@ -27,7 +27,10 @@
 //! padding, added tokens with `single_word`/`lstrip`/`rstrip`) simply has no
 //! native path. `add_special_tokens = true` also stays with `tokenizers`.
 
-use std::cell::RefCell;
+use std::{
+    cell::RefCell,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use rustc_hash::FxHashMap;
@@ -49,8 +52,15 @@ const BYTE_LEVEL_PATTERN: &str =
 /// Pieces up to this many bytes are cached per thread; longer ones are rare
 /// and tokenized every time.
 const CACHED_PIECE_MAX_BYTES: usize = 64;
-/// Entries a thread's piece cache holds for one encoder before it is cleared.
+/// Entries a thread's piece cache holds for one encoder before it is cleared,
+/// at most; see `PIECE_CACHE_TOTAL_CAPACITY`.
 const PIECE_CACHE_CAPACITY: usize = 16_384;
+/// Entries all threads together hold for one encoder: a thread's own cap is
+/// this divided by the number of threads that have encoded with the encoder
+/// (and never more than `PIECE_CACHE_CAPACITY`), so the piece caches of one
+/// tokenizer stay under about 40 MB however many runtime and blocking threads
+/// encode with it, and they are freed with the encoder.
+const PIECE_CACHE_TOTAL_CAPACITY: usize = 262_144;
 
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
@@ -158,6 +168,8 @@ pub(crate) struct NativeEncoder {
     /// they go when it does: tokenizers are added and removed at runtime, and
     /// a thread never has to notice that an encoder it encoded with is gone.
     piece_cache: ThreadLocal<RefCell<PieceIds>>,
+    /// Threads that hold a piece cache of this encoder.
+    threads: AtomicUsize,
 }
 
 impl std::fmt::Debug for NativeEncoder {
@@ -230,6 +242,7 @@ impl NativeEncoder {
             stages,
             alphabet: bytes_char(),
             piece_cache: ThreadLocal::new(),
+            threads: AtomicUsize::new(0),
         })
     }
 
@@ -353,7 +366,10 @@ impl NativeEncoder {
     ) -> bool {
         let bytes = piece.as_bytes();
         let cacheable = bytes.len() <= CACHED_PIECE_MAX_BYTES;
-        let cache = self.piece_cache.get_or_default();
+        let cache = self.piece_cache.get_or(|| {
+            self.threads.fetch_add(1, Ordering::Relaxed);
+            RefCell::default()
+        });
         if cacheable {
             if let Some(found) = cache.borrow().get(bytes) {
                 ids.extend_from_slice(found);
@@ -369,12 +385,20 @@ impl NativeEncoder {
         }
         if cacheable {
             let mut pieces = cache.borrow_mut();
-            if pieces.len() >= PIECE_CACHE_CAPACITY {
+            if pieces.len() >= self.piece_cache_share() {
                 pieces.clear();
             }
             pieces.insert(bytes.into(), ids[start..].into());
         }
         true
+    }
+
+    /// Entries one thread's piece cache may hold: the total shared among the
+    /// threads that have encoded with this encoder, `PIECE_CACHE_CAPACITY` at
+    /// most.
+    fn piece_cache_share(&self) -> usize {
+        (PIECE_CACHE_TOTAL_CAPACITY / self.threads.load(Ordering::Relaxed).max(1))
+            .clamp(1, PIECE_CACHE_CAPACITY)
     }
 }
 
@@ -934,5 +958,60 @@ mod tests {
         assert_eq!(caches.len(), threads, "{caches:?}");
         assert!(caches.iter().all(|&entries| entries > 0), "{caches:?}");
         drop(native);
+    }
+
+    /// Distinct words for distinct `i`: distinct pieces.
+    fn word(mut i: u32) -> String {
+        let mut word = String::new();
+        loop {
+            word.push(char::from(b'a' + (i % 26) as u8));
+            i /= 26;
+            if i == 0 {
+                return word;
+            }
+        }
+    }
+
+    #[test]
+    fn piece_caches_stay_within_their_bound_across_threads() {
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+        let shape = &shapes()[0];
+        let tokenizer = tokenizer_of(shape, &mut state);
+        let mut native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let model = tokenizer.get_model();
+        let threads = 24u32;
+        let barrier = std::sync::Barrier::new(threads as usize);
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let (native, barrier) = (&native, &barrier);
+                scope.spawn(move || {
+                    native.encode(model, "warm").expect("ids");
+                    barrier.wait();
+                    // More distinct pieces than one thread's share, and
+                    // together far more than the total.
+                    let text: String = (0..15_000)
+                        .map(|i| format!(" {}", word(i * threads + t)))
+                        .collect();
+                    native.encode(model, &text).expect("ids");
+                });
+            }
+        });
+        assert_eq!(native.threads.load(Ordering::Relaxed), threads as usize);
+        let share = native.piece_cache_share();
+        assert!(share < PIECE_CACHE_CAPACITY, "{share}");
+        let caches: Vec<usize> = native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().len())
+            .collect();
+        assert_eq!(caches.len(), threads as usize, "{caches:?}");
+        assert!(
+            caches.iter().all(|&entries| entries <= share),
+            "share {share}, caches {caches:?}"
+        );
+        assert!(
+            caches.iter().sum::<usize>() <= PIECE_CACHE_TOTAL_CAPACITY,
+            "{caches:?}"
+        );
     }
 }
