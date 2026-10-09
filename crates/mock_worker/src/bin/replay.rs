@@ -13,10 +13,11 @@
 //! A thinking model's streamed `reasoning_content` counts as output for TTFT
 //! and ITL (reported separately as `reasoning_tokens`), and
 //! `--chat-template-kwargs` reaches the chat template, e.g. to turn thinking off.
-//! By default every request gets a connection of its own (`--connections
-//! fresh`), so a request is never queued behind a stream in flight on a
-//! reused keep-alive connection, which would show as one stream's worth of
-//! TTFT on an otherwise idle gateway.
+//! Requests share HTTP/1.1 keep-alive connections by default (`--connections
+//! pooled`); `--connections fresh` gives every request a connection of its
+//! own, for tail-sensitive runs, so a request is never queued behind a stream
+//! in flight on a reused connection, which would show as one stream's worth
+//! of TTFT on an otherwise idle gateway.
 
 // A command-line tool: the summary goes to stdout, progress to stderr.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -107,13 +108,15 @@ struct Args {
     /// nothing is sent when absent.
     #[arg(long, value_parser = parse_json_object)]
     chat_template_kwargs: Option<Value>,
-    /// How requests use connections: `fresh` opens a connection per request
-    /// and has it closed after the response, so a request never shares a
-    /// connection with a stream in flight; `pooled` reuses HTTP/1.1
+    /// How requests use connections: `pooled` (the default) reuses HTTP/1.1
     /// keep-alive connections, fewer handshakes, but a request can be handed
     /// a connection whose previous response is still streaming and then
-    /// waits for that stream to end before the gateway reads it.
-    #[arg(long, value_enum, default_value_t = Connections::Fresh)]
+    /// waits for that stream to end before the gateway reads it (rare: a
+    /// few per hundred thousand streamed requests); `fresh` opens a
+    /// connection per request and has it closed after the response, so a
+    /// request never shares a connection with a stream in flight, the
+    /// choice for tail-sensitive runs (max TTFT, stall hunting).
+    #[arg(long, value_enum, default_value_t = Connections::Pooled)]
     connections: Connections,
 }
 
