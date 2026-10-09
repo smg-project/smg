@@ -567,7 +567,8 @@ struct CliArgs {
     #[arg(long, help_heading = "PD Disaggregation")]
     prefill_queue_size: Option<usize>,
 
-    /// Maximum time in seconds a request may wait for Prefill admission (default: 60 when enabled)
+    /// Maximum time in seconds a request may wait for Prefill admission (default: 60 when enabled);
+    /// in the gRPC router the wait is also held to --queue-timeout-secs, counted from admission
     #[arg(long, help_heading = "PD Disaggregation")]
     prefill_queue_timeout_secs: Option<u64>,
 
@@ -980,7 +981,8 @@ struct CliArgs {
     /// Maximum time in seconds a request can wait in queue, and the longest a
     /// request may sit inside the gRPC router ahead of worker selection (counted
     /// from its admission, or its acceptance without an admission layer) before
-    /// it is refused with a 503; the HTTP relay and PD routers are not bounded
+    /// it is refused with a 503, the prefill admission wait of a PD or EPD request
+    /// included; the HTTP relay and the HTTP PD router are not bounded
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 

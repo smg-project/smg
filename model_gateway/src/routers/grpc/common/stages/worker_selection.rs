@@ -147,6 +147,24 @@ impl WorkerSelectionStage {
     fn refuse_if_expired(&self, ctx: &RequestContext, accepted: Instant) -> Option<Response> {
         let timeout = self.queue_timeout?;
         let waited = waited_past_timeout(accepted, Instant::now(), timeout)?;
+        Some(Self::queue_timeout_refusal(ctx, waited, timeout))
+    }
+
+    /// What is left of the bound for a request accepted at `accepted`: the
+    /// prefill admission wait of a PD or EPD request is held to it, so an
+    /// expired request leaves the prefill queue at the bound instead of
+    /// holding its place until a slot opens.
+    fn remaining_budget(&self, accepted: Option<Instant>) -> Option<Duration> {
+        let timeout = self.queue_timeout?;
+        Some(timeout.saturating_sub(accepted?.elapsed()))
+    }
+
+    /// The 503 of a request that waited `waited`, past the queue timeout.
+    fn queue_timeout_refusal(
+        ctx: &RequestContext,
+        waited: Duration,
+        timeout: Duration,
+    ) -> Response {
         Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_SELECTION_TIMEOUT);
         debug!(
             model_id = %ctx.input.model_id,
@@ -167,7 +185,39 @@ impl WorkerSelectionStage {
             .headers_mut()
             .insert(RETRY_AFTER, HeaderValue::from(SHED_RETRY_AFTER_SECS));
         mark_non_retryable(&mut response);
-        Some(response)
+        response
+    }
+
+    /// `admission`, a prefill admission wait, held to the remaining budget of
+    /// the bound: when the budget runs out the waiter is dropped (its queue
+    /// ticket goes with it) and the request is refused as one held past the
+    /// queue timeout; without a bound the wait is the prefill queue's own.
+    async fn admit_within_budget<T, F>(
+        &self,
+        ctx: &RequestContext,
+        accepted: Option<Instant>,
+        admission: F,
+    ) -> Result<T, Response>
+    where
+        F: std::future::Future<Output = Result<T, Response>>,
+    {
+        match (
+            self.remaining_budget(accepted),
+            self.queue_timeout,
+            accepted,
+        ) {
+            (Some(budget), Some(timeout), Some(accepted)) => {
+                match tokio::time::timeout(budget, admission).await {
+                    Ok(result) => result,
+                    Err(_) => Err(Self::queue_timeout_refusal(
+                        ctx,
+                        accepted.elapsed(),
+                        timeout,
+                    )),
+                }
+            }
+            _ => admission.await,
+        }
     }
 }
 
@@ -294,10 +344,14 @@ impl PipelineStage for WorkerSelectionStage {
             }
             WorkerSelectionMode::PrefillDecode => {
                 let (pair, guard) = self
-                    .admit_pd_pair(model_id, inputs, sticky_key, None, media_refs)
+                    .admit_within_budget(
+                        ctx,
+                        accepted,
+                        self.admit_pd_pair(model_id, inputs, sticky_key, None, media_refs),
+                    )
                     .await?;
-                // The prefill admission wait can outlast the bound; a request
-                // past it gives its claim back instead of taking a worker.
+                // An admission that lands right at the bound still gives its
+                // claim back instead of taking a worker.
                 if let Some(refused) =
                     accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted))
                 {
@@ -329,11 +383,15 @@ impl PipelineStage for WorkerSelectionStage {
                     }
                 };
                 let ((encode_assignments, prefill, decode, runtime_type), guard) = self
-                    .admit_encode_prefill_decode_workers(
-                        model_id,
-                        inputs,
-                        sticky_key,
-                        &encode_item_hashes,
+                    .admit_within_budget(
+                        ctx,
+                        accepted,
+                        self.admit_encode_prefill_decode_workers(
+                            model_id,
+                            inputs,
+                            sticky_key,
+                            &encode_item_hashes,
+                        ),
                     )
                     .await?;
                 if let Some(refused) =
@@ -2994,8 +3052,8 @@ mod tests {
     }
 
     /// A PD request that passes the check and then waits for prefill
-    /// admission past the bound is refused once admitted, and its claim goes
-    /// back instead of a worker being taken.
+    /// admission is held to the remaining budget: it leaves the prefill queue
+    /// at the bound, refused, before a slot opens, and holds no claim.
     #[tokio::test]
     async fn the_bound_is_checked_again_after_the_prefill_admission_wait() {
         let registry = Arc::new(WorkerRegistry::new());
@@ -3025,14 +3083,24 @@ mod tests {
             async move {
                 let mut ctx = prepared_ctx(registry, Some(Instant::now()));
                 let result = stage.execute(&mut ctx).await;
-                (result, ctx.state.pd_prefill_guard.is_some())
+                (result, ctx.state.pd_prefill_guard.is_some(), Instant::now())
             }
         });
         wait_for_queued(&admission, 1).await;
         tokio::time::sleep(Duration::from_millis(120)).await;
+        let freed_at = Instant::now();
         drop(occupied);
 
-        let (result, holds_claim) = queued.await.expect("waiter should join");
+        let (result, holds_claim, refused_at) = queued.await.expect("waiter should join");
+        assert!(
+            refused_at < freed_at,
+            "refused at the bound, while still queued, not once a slot opened"
+        );
+        assert_eq!(
+            admission.queued_requests(),
+            0,
+            "the expired waiter left the queue"
+        );
         let refused = result.expect_err("admitted past the bound, the request is refused");
         assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
