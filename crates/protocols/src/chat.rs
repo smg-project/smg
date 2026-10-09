@@ -17,7 +17,7 @@ use super::{
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
     ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
-    profile::ProviderProfile,
+    profile::{ModelProfile, ProviderProfile},
     validated::Normalizable,
 };
 
@@ -176,6 +176,16 @@ pub struct ChatCompletionRequest {
 
     /// ID of the model to use
     pub model: String,
+
+    /// Trusted gateway metadata, resolved before normalization. Never accepted from or sent over JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resolved_model_profile: Option<ModelProfile>,
+
+    /// Canonical identity for model-specific defaults, independent of the public serving name.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resolved_model_id: Option<String>,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
     #[validate(range(min = -2.0, max = 2.0))]
@@ -430,6 +440,20 @@ impl ThinkingParam {
 }
 
 impl ChatCompletionRequest {
+    /// The resolved contract stays fixed even if dispatch rewrites the serving name.
+    pub fn model_profile(&self) -> ModelProfile {
+        self.resolved_model_profile
+            .unwrap_or_else(|| ModelProfile::for_model(&self.model))
+    }
+
+    pub fn profile_model_id(&self) -> &str {
+        self.resolved_model_id.as_deref().unwrap_or(&self.model)
+    }
+
+    pub fn provider_profile(&self) -> ProviderProfile {
+        self.model_profile().provider()
+    }
+
     /// The thinking preference stated by `thinking.type`, if any.
     pub fn thinking_toggle(&self) -> Option<bool> {
         self.thinking.as_ref().and_then(ThinkingParam::toggle)
@@ -659,7 +683,7 @@ fn validate_chat_cross_parameters(
     }
 
     // 8. Provider-profile contract rules, selected from the model id
-    ProviderProfile::for_model(&req.model).validate_chat(req)?;
+    req.provider_profile().validate_chat(req)?;
 
     Ok(())
 }
@@ -669,7 +693,7 @@ impl ChatCompletionRequest {
     /// request's provider profile defines them (Kimi K3 dynamic tools on
     /// system and developer messages; see [`ProviderProfile::dynamic_tools`]).
     pub fn dynamic_tools(&self) -> impl Iterator<Item = &Tool> {
-        ProviderProfile::for_model(&self.model).dynamic_tools(self)
+        self.provider_profile().dynamic_tools(self)
     }
 
     /// Every tool the model will see: the request-level `tools` followed by
@@ -707,7 +731,7 @@ impl Normalizable for ChatCompletionRequest {
     /// 3. Clear deprecated fields and log warnings
     /// 4. Apply OpenAI defaults for tool_choice
     fn normalize(&mut self) {
-        ProviderProfile::for_model(&self.model).normalize_chat(self);
+        self.provider_profile().normalize_chat(self);
 
         // Migrate deprecated max_tokens → max_completion_tokens
         #[expect(deprecated)]
@@ -767,6 +791,10 @@ impl Normalizable for ChatCompletionRequest {
 // ============================================================================
 
 impl GenerationRequest for ChatCompletionRequest {
+    fn provider_profile(&self) -> ProviderProfile {
+        ChatCompletionRequest::provider_profile(self)
+    }
+
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
     }

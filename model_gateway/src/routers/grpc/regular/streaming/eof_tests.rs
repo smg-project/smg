@@ -1124,3 +1124,50 @@ async fn messages_tool_arguments_need_an_open_block() {
         assert_eq!(inputs, [input]);
     }
 }
+
+#[tokio::test]
+async fn explicit_k3_profile_controls_streaming_tool_ids_on_generic_names() {
+    for forced in [false, true] {
+        let text = if forced {
+            r#"{"city":"Tokyo"}"#
+        } else {
+            r#"[{"name":"lookup","parameters":{"city":"Tokyo"}}]"#
+        };
+        let (stream, server) =
+            scripted_stream(vec![chunk(0, text), complete(0, "stop")], "0").await;
+        let (tx, rx) = sse_channel();
+        let mut spec = chat_spec(true);
+        spec.model_profile = ModelProfile::KimiK3;
+        spec.provider = ProviderProfile::Kimi;
+        spec.history_tool_calls_count = 3;
+        spec.expected_choices = 1;
+        if forced {
+            spec.tool_choice = Some(
+                serde_json::from_value(serde_json::json!({
+                    "type":"function","function":{"name":"lookup"}
+                }))
+                .unwrap(),
+            );
+        }
+        let result = processor(true)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        let ids: Vec<_> = events
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["tool_calls"][0]["id"].as_str())
+            .collect();
+        assert_eq!(ids, ["lookup_3"], "forced={forced}: {events:?}");
+    }
+}

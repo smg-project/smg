@@ -16,6 +16,7 @@ use openai_protocol::{
     completion::{CompletionChoice, CompletionResponse},
     generate::{GenerateMetaInfo, GenerateResponse},
     messages::{self, Message},
+    profile::ModelProfile,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -165,6 +166,7 @@ impl ResponseProcessor {
                     original_request.tool_choice.as_ref(),
                     model,
                     history_tool_calls_count,
+                    Some(original_request.model_profile),
                 );
             } else if tool_parser_available {
                 (tool_calls, processed_text) = self
@@ -174,6 +176,7 @@ impl ResponseProcessor {
                         tool_parser_name,
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
+                        Some(original_request.model_profile),
                     )
                     .await;
             }
@@ -334,6 +337,7 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
+        profile: Option<ModelProfile>,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
         let pooled_parser =
@@ -361,7 +365,8 @@ impl ResponseProcessor {
                     .enumerate()
                     .map(|(index, tc)| {
                         // Generate ID for this tool call
-                        let id = utils::generate_tool_call_id(
+                        let id = utils::generate_tool_call_id_with_profile(
+                            profile,
                             model,
                             &tc.function.name,
                             index,
@@ -683,6 +688,7 @@ impl ResponseProcessor {
                     chat_tool_choice.as_ref(),
                     model,
                     messages_request.history_tool_calls_count,
+                    None,
                 );
             } else if tool_parser_available {
                 (tool_calls, processed_text) = self
@@ -692,6 +698,7 @@ impl ResponseProcessor {
                         tool_parser_name.as_deref(),
                         &messages_request.chat_tools,
                         messages_request.history_tool_calls_count,
+                        None,
                     )
                     .await;
             }
@@ -1025,6 +1032,50 @@ mod responses_finish_reason_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/common/scripted_tokenizer.rs"
         ));
+    }
+
+    #[tokio::test]
+    async fn explicit_k3_profile_controls_nonstream_tool_ids_on_generic_names() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
+            "<tool_call>\n{\"name\":\"user_tool\",\"arguments\":{}}\n</tool_call>",
+        ));
+        let mut request: ChatCompletionRequest=serde_json::from_value(serde_json::json!({
+            "model":"vllm-model","messages":[{"role":"user","content":"call the tool"}],
+            "tools":[{"type":"function","function":{"name":"user_tool","parameters":{"type":"object"}}}]
+        })).unwrap();
+        request.resolved_model_profile = Some(ModelProfile::KimiK3);
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+            output_ids: vec![100],
+            finish_reason: "stop".into(),
+            ..Default::default()
+        });
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let choice = processor
+            .process_single_choice(
+                &complete,
+                0,
+                &ChatResponseSpec::from(&request),
+                "vllm-model",
+                &tokenizer,
+                &mut decoder,
+                3,
+                false,
+                true,
+                None,
+                Some("qwen"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(choice.message.tool_calls.unwrap()[0].id, "user_tool_3");
     }
 
     #[tokio::test]

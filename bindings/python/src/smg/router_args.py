@@ -26,6 +26,16 @@ PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
 DISCOVERY_PROVIDER_CHOICES = ["kubernetes"]
+MODEL_PROFILE_CHOICES = (
+    "openai",
+    "kimi",
+    "kimi_k3",
+    "minimax",
+    "zai",
+    "zai_glm_5_3",
+    "deepseek_v4",
+    "deepseek_v4_1",
+)
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -325,6 +335,8 @@ class RouterArgs:
     # Per-tenant token/request rate limiting
     tenant_rate_limit_enabled: bool = False
     tenant_rate_limit_config: str | None = None
+
+    model_profiles: dict[str, str] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def add_cli_args(
@@ -1362,6 +1374,17 @@ class RouterArgs:
                 " Matching is case-sensitive."
             ),
         )
+        k8s_group.add_argument(
+            f"--{prefix}model-profile",
+            type=str,
+            action="append",
+            default=[],
+            help=(
+                "Pin a Chat Completions contract for a canonical model. "
+                "Format: <model>=<profile>; aliases inherit the canonical profile. "
+                "Profiles: " + ", ".join(MODEL_PROFILE_CHOICES)
+            ),
+        )
         # Prometheus configuration
         prometheus_group.add_argument(
             f"--{prefix}prometheus-port",
@@ -2128,6 +2151,9 @@ class RouterArgs:
         args_dict["model_aliases"] = cls._parse_model_aliases(
             cli_args_dict.get(f"{prefix}model_alias", [])
         )
+        args_dict["model_profiles"] = cls._parse_model_profiles(
+            cli_args_dict.get(f"{prefix}model_profile", [])
+        )
 
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
@@ -2205,6 +2231,21 @@ class RouterArgs:
                     key, value = token.split("=", 1)
                     selector[key] = value
         return selector
+
+    @staticmethod
+    def _parse_model_profiles(entries):
+        profiles = {}
+        for entry in entries or []:
+            if "=" not in entry:
+                raise ValueError("Expected model profile format: <canonical-model>=<profile>")
+            model, profile = entry.split("=", 1)
+            if not model.strip() or profile not in MODEL_PROFILE_CHOICES:
+                raise ValueError(f"Invalid model profile {entry!r}")
+            previous = profiles.get(model)
+            if previous is not None and previous != profile:
+                raise ValueError(f"Model {model!r} has conflicting profiles")
+            profiles[model] = profile
+        return profiles
 
     @staticmethod
     def _parse_model_aliases(alias_list):

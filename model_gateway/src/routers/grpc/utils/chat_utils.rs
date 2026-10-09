@@ -22,6 +22,7 @@ use openai_protocol::{
         ToolChoiceValue,
     },
     generate::GenerateFinishReason,
+    profile::ModelProfile,
 };
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -724,6 +725,7 @@ pub(crate) fn parse_json_schema_response(
     tool_choice: Option<&ToolChoice>,
     model: &str,
     history_tool_calls_count: usize,
+    profile: Option<ModelProfile>,
 ) -> (Option<Vec<ToolCall>>, String) {
     match tool_choice {
         Some(ToolChoice::Function { function, .. }) => {
@@ -731,7 +733,8 @@ pub(crate) fn parse_json_schema_response(
             match serde_json::from_str::<Value>(processed_text) {
                 Ok(params) => {
                     let tool_call = ToolCall {
-                        id: generate_tool_call_id(
+                        id: generate_tool_call_id_with_profile(
+                            profile,
                             model,
                             &function.name,
                             0,
@@ -767,7 +770,8 @@ pub(crate) fn parse_json_schema_response(
                             let parameters = obj.get("parameters")?;
 
                             Some(ToolCall {
-                                id: generate_tool_call_id(
+                                id: generate_tool_call_id_with_profile(
+                                    profile,
                                     model,
                                     &name,
                                     i,
@@ -860,6 +864,23 @@ pub(crate) fn generate_tool_call_id(
     } else {
         // Kimi-K2 format: functions.{name}:{global_index}.
         format!("functions.{}:{}", tool_name, history_count + tool_index)
+    }
+}
+
+/// Generate Chat Completions IDs from trusted profile metadata. Other APIs retain
+/// their existing name-based behavior by passing `None`.
+pub(crate) fn generate_tool_call_id_with_profile(
+    profile: Option<ModelProfile>,
+    model: &str,
+    tool_name: &str,
+    tool_index: usize,
+    history_count: usize,
+) -> String {
+    match profile {
+        Some(ModelProfile::KimiK3) => format!("{tool_name}_{}", history_count + tool_index),
+        Some(ModelProfile::Kimi) => format!("functions.{tool_name}:{}", history_count + tool_index),
+        Some(_) => format!("call_{}", &Uuid::now_v7().simple().to_string()[..24]),
+        None => generate_tool_call_id(model, tool_name, tool_index, history_count),
     }
 }
 

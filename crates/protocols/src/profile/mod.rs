@@ -25,6 +25,88 @@ use crate::{
     ext::retain_if,
 };
 
+/// A model's configured contract, independent of its serving name.
+/// Family-wide values preserve shared behavior; versioned values pin model-specific rules.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub enum ModelProfile {
+    #[serde(rename = "openai")]
+    OpenAi,
+    #[serde(rename = "kimi")]
+    Kimi,
+    #[serde(rename = "kimi_k3")]
+    KimiK3,
+    #[serde(rename = "minimax")]
+    Minimax,
+    #[serde(rename = "zai")]
+    Zai,
+    #[serde(rename = "zai_glm_5_3")]
+    ZaiGlm53,
+    #[serde(rename = "deepseek_v4")]
+    DeepSeekV4,
+    #[serde(rename = "deepseek_v4_1")]
+    DeepSeekV41,
+}
+
+impl ModelProfile {
+    pub const VALUES: [&'static str; 8] = [
+        "openai",
+        "kimi",
+        "kimi_k3",
+        "minimax",
+        "zai",
+        "zai_glm_5_3",
+        "deepseek_v4",
+        "deepseek_v4_1",
+    ];
+
+    /// Infer the same contract as the legacy name-based selection.
+    pub fn for_model(model: &str) -> Self {
+        match ProviderProfile::for_model(model) {
+            ProviderProfile::OpenAi => Self::OpenAi,
+            ProviderProfile::Kimi if kimi::is_k3(model) => Self::KimiK3,
+            ProviderProfile::Kimi => Self::Kimi,
+            ProviderProfile::Minimax => Self::Minimax,
+            ProviderProfile::Zai if zai::is_glm53(model) => Self::ZaiGlm53,
+            ProviderProfile::Zai => Self::Zai,
+            ProviderProfile::DeepSeek if deepseek::is_v41_model(model) => Self::DeepSeekV41,
+            ProviderProfile::DeepSeek => Self::DeepSeekV4,
+        }
+    }
+
+    pub fn provider(self) -> ProviderProfile {
+        match self {
+            Self::OpenAi => ProviderProfile::OpenAi,
+            Self::Kimi | Self::KimiK3 => ProviderProfile::Kimi,
+            Self::Minimax => ProviderProfile::Minimax,
+            Self::Zai | Self::ZaiGlm53 => ProviderProfile::Zai,
+            Self::DeepSeekV4 | Self::DeepSeekV41 => ProviderProfile::DeepSeek,
+        }
+    }
+}
+
+impl std::str::FromStr for ModelProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "openai" => Ok(Self::OpenAi),
+            "kimi" => Ok(Self::Kimi),
+            "kimi_k3" => Ok(Self::KimiK3),
+            "minimax" => Ok(Self::Minimax),
+            "zai" => Ok(Self::Zai),
+            "zai_glm_5_3" => Ok(Self::ZaiGlm53),
+            "deepseek_v4" => Ok(Self::DeepSeekV4),
+            "deepseek_v4_1" => Ok(Self::DeepSeekV41),
+            _ => Err(format!(
+                "Unknown model profile '{value}'; expected one of {}",
+                Self::VALUES.join(", ")
+            )),
+        }
+    }
+}
+
 /// Provider dialect for a request, selected from the model id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProfile {
@@ -73,11 +155,10 @@ impl ProviderProfile {
     /// Matches the way the tool and reasoning parser factories do: any
     /// `/`-separated segment that starts with a vendor marker selects the
     /// profile, so `kimi-k3`, `/models/Kimi-K3`, `moonshotai/kimi-k2` and
-    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. Aliases are not
-    /// visible here, because normalization runs before alias resolution: an
-    /// aliased vendor model falls back to the OpenAI baseline, any extension
-    /// it carried is dropped with a warning, and a `root` message is rejected
-    /// outright, so that role needs a canonical MiniMax model id.
+    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. This is the
+    /// standalone protocol fallback. The gateway resolves registered aliases
+    /// and explicit model contracts before normalization and stores the result
+    /// on the request, independently of its wire model name.
     /// DeepSeek is narrower: only the calibrated V4 / V4.1 model segments
     /// and `deepseek-flash` alias select its profile; older versions and
     /// unrecognized suffixes keep the baseline.

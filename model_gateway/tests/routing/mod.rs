@@ -8,6 +8,7 @@ pub mod header_routing_hints_test;
 pub mod load_balancing_test;
 pub mod manual_routing_test;
 pub mod model_alias_test;
+pub mod model_profile_test;
 pub mod payload_size_test;
 pub mod pd_routing_test;
 pub mod policy_completion_test;

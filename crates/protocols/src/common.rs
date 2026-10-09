@@ -109,6 +109,13 @@ impl CachePartition<'_> {
 /// Implemented by ChatCompletionRequest, CompletionRequest, GenerateRequest,
 /// EmbeddingRequest, RerankRequest, and ResponsesRequest
 pub trait GenerationRequest: Send + Sync {
+    /// The request's protocol contract, including any trusted gateway override.
+    fn provider_profile(&self) -> crate::profile::ProviderProfile {
+        self.get_model()
+            .map(crate::profile::ProviderProfile::for_model)
+            .unwrap_or(crate::profile::ProviderProfile::OpenAi)
+    }
+
     /// Check if the request is for streaming
     fn is_stream(&self) -> bool;
 

@@ -572,6 +572,7 @@ struct Router {
     /// The keyword-only `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
+    model_profiles: HashMap<String, String>,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -652,6 +653,21 @@ impl Router {
             DiscoveryConfig, KubernetesDiscoveryConfig, MetricsConfig,
             PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
+
+        let model_profiles = self
+            .model_profiles
+            .iter()
+            .map(|(model, value)| {
+                let profile = value
+                    .parse::<openai_protocol::profile::ModelProfile>()
+                    .map_err(|reason| config::ConfigError::InvalidValue {
+                        field: "model_profiles".to_string(),
+                        value: value.clone(),
+                        reason,
+                    })?;
+                Ok((model.clone(), profile))
+            })
+            .collect::<config::ConfigResult<HashMap<_, _>>>()?;
 
         // Validate the transport mode up front. The CLI (value_parser) and the
         // argparse path (choices) already reject bad values; this covers direct
@@ -1020,6 +1036,7 @@ impl Router {
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
             .model_aliases(self.model_aliases.clone())
+            .model_profiles(model_profiles)
             .maybe_oracle(oracle)
             .maybe_postgres(postgres_config)
             .maybe_redis(redis_config)
@@ -1262,6 +1279,7 @@ impl Router {
         // Keyword-only, so it never takes a positional slot.
         *,
         discovery = None,
+        model_profiles = HashMap::new(),
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1446,6 +1464,7 @@ impl Router {
         tenant_rate_limit_enabled: bool,
         tenant_rate_limit_config: Option<String>,
         discovery: Option<Bound<'_, PyAny>>,
+        model_profiles: HashMap<String, String>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
         if service_discovery && discovery.is_some() {
@@ -1658,6 +1677,7 @@ impl Router {
             tenant_rate_limit_enabled,
             tenant_rate_limit_config,
             discovery,
+            model_profiles,
         })
     }
 

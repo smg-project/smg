@@ -19,6 +19,7 @@ use serde_json::Value;
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent, ThinkingType},
     common::ContentPart,
+    profile::ModelProfile,
 };
 
 /// The vendor's sampling defaults, applied when the client omits the field so
@@ -65,12 +66,14 @@ fn model_matches(model: &str, markers: &[&str]) -> bool {
 
 /// The GLM-5.3 series (`GLM-5.3`, `glm-5.3-flash`, `glm5.3-air`), whose
 /// thinking rules were recorded and are documented as its own.
-fn is_glm53(model: &str) -> bool {
+pub(super) fn is_glm53(model: &str) -> bool {
     model_matches(model, &GLM53_MARKERS)
 }
 
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
-    if model_matches(&req.model, &DEFAULTS_MARKERS) {
+    if req.model_profile() == ModelProfile::ZaiGlm53
+        || model_matches(req.profile_model_id(), &DEFAULTS_MARKERS)
+    {
         req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
         req.top_p.get_or_insert(DEFAULT_TOP_P);
     }
@@ -84,7 +87,7 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
 }
 
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
-    let glm53 = is_glm53(&req.model);
+    let glm53 = req.model_profile() == ModelProfile::ZaiGlm53;
     validate_thinking_type(req, glm53)?;
     if glm53 {
         validate_thinking_enabled(req)?;

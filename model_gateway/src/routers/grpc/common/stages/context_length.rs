@@ -93,7 +93,7 @@ pub(crate) fn enforce_output_budget(
     let RequestType::Chat(request) = request_type else {
         return Ok(());
     };
-    if ProviderProfile::for_model(&request.model) != ProviderProfile::Zai {
+    if request.provider_profile() != ProviderProfile::Zai {
         return Ok(());
     }
     let Some(limit) = selection_context_length(workers, model_id) else {

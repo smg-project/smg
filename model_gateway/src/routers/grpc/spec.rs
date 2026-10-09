@@ -17,7 +17,7 @@ use openai_protocol::{
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::{self, CreateMessageRequest},
-    profile::ProviderProfile,
+    profile::{ModelProfile, ProviderProfile},
     responses::ResponsesRequest,
 };
 use serde_json::Value;
@@ -75,6 +75,8 @@ pub(crate) struct ChatResponseSpec {
     /// Provider dialect of the model the client asked for, as request
     /// validation selects it; picks provider-specific response behaviour.
     pub provider: ProviderProfile,
+    /// The resolved version-specific contract, independent of dispatch model names.
+    pub model_profile: ModelProfile,
     pub separate_reasoning: bool,
     pub tool_choice: Option<ToolChoice>,
     pub tools: Option<Vec<Tool>>,
@@ -103,7 +105,8 @@ pub(crate) struct ChatResponseSpec {
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
         Self {
-            provider: ProviderProfile::for_model(&request.model),
+            provider: request.provider_profile(),
+            model_profile: request.model_profile(),
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
@@ -114,7 +117,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
                 let tools: Vec<Tool> = request.effective_tools().cloned().collect();
                 let scanned = request.tools.is_some()
                     || !tools.is_empty()
-                    || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools();
+                    || request.provider_profile().parses_tool_calls_without_tools();
                 scanned.then_some(tools)
             },
             history_tool_calls_count: utils::get_history_tool_calls_count(request),
