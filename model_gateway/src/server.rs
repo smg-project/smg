@@ -917,6 +917,13 @@ pub fn build_app(
             .route("/v1/classify", post(v1_classify))
             .route("/v1/decisions", post(v1_decisions))
             .route("/v1/systemone", post(v1_systemone))
+            // Bound the buffered body read: inside admission, so a stalled
+            // upload releases its permit, and inside the stream-vs-buffer
+            // decision, since the streamed relay has its own watchdog.
+            .route_layer(axum::middleware::from_fn_with_state(
+                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config),
+                middleware::request_body_timeout_middleware,
+            ))
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
             // declined requests pass to the handlers untouched.
             .route_layer(axum::middleware::from_fn_with_state(
