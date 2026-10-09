@@ -68,7 +68,7 @@ _WORKER_DEFAULTS = {
     "gpus": None,
     "extra_engine_args": None,
     # PD only: spawn every prefill/decode worker first and wait afterwards.
-    "parallel_start": False,
+    "parallel_start": True,
 }
 
 # Track worker startup failures — fail fast after repeated failures
@@ -478,7 +478,7 @@ def _start_pd_leg(
     extra_env: dict[str, str] | None = None,
 ) -> list:
     """Start one PD leg; a per-worker KV backend list starts the workers one by one."""
-    if kv_backends is None:
+    if kv_backends is None and not wait_ready:
         return _start_workers_tracked(
             model_id=model_id,
             engine=engine,
@@ -494,23 +494,27 @@ def _start_pd_leg(
         )
     spec_tp = tp or get_model_spec(model_id).get("tp", 1)
     workers: list = []
-    for i, backend in enumerate(kv_backends):
-        workers.extend(
-            _start_workers_tracked(
-                model_id=model_id,
-                engine=engine,
-                mode=mode,
-                count=1,
-                worker_type=worker_type,
-                log_dir=log_dir,
-                gpu_offset=gpu_offset + i * spec_tp,
-                wait_ready=wait_ready,
-                tp=tp,
-                kv_backend=backend,
-                extra_engine_args=extra_engine_args,
-                extra_env=extra_env,
+    try:
+        for i, backend in enumerate(kv_backends or [None] * count):
+            workers.extend(
+                _start_workers_tracked(
+                    model_id=model_id,
+                    engine=engine,
+                    mode=mode,
+                    count=1,
+                    worker_type=worker_type,
+                    log_dir=log_dir,
+                    gpu_offset=gpu_offset + i * spec_tp,
+                    wait_ready=wait_ready,
+                    tp=tp,
+                    kv_backend=backend,
+                    extra_engine_args=extra_engine_args,
+                    extra_env=extra_env,
+                )
             )
-        )
+    except Exception:
+        stop_workers(workers)
+        raise
     return workers
 
 
@@ -556,6 +560,9 @@ def _setup_pd(
     prefill_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("prefill_args"))
     decode_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("decode_args"))
     all_workers: list = []
+    deadline = time.monotonic() + effective_startup_timeout(
+        spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+    )
     try:
         prefill_workers = _start_pd_leg(
             model_id=model_id,
@@ -597,12 +604,14 @@ def _setup_pd(
             # a user launching a fleet does.
             # One deadline for the fleet, and a failed load still counts toward
             # the session's fail-fast budget as it does on the sequential path.
-            deadline = time.monotonic() + effective_startup_timeout(
-                spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
-            )
             try:
                 for worker in all_workers:
-                    worker.wait_ready(max(1, int(deadline - time.monotonic())))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"Workers for {model_id} did not become healthy within the startup bound"
+                        )
+                    worker.wait_ready(max(1, int(remaining)))
             except (TimeoutError, RuntimeError):
                 _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
                 raise
