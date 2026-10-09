@@ -679,13 +679,13 @@ def build_summary(adapter, records):
         body = resp.get("body")
         if isinstance(body, dict):
             usage = body.get("usage") or {}
-            it = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
-            ot = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+            n_in = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+            n_out = usage.get("output_tokens") or usage.get("completion_tokens") or 0
             model = body.get("model")
             pi, po = price_for(model)
-            in_tok += it
-            out_tok += ot
-            cost += (it / 1e6) * pi + (ot / 1e6) * po
+            in_tok += n_in
+            out_tok += n_out
+            cost += (n_in / 1e6) * pi + (n_out / 1e6) * po
     total = len(records)
     ran = total - n_skipped
     # distinct behaviors per category: the volume-vs-signal metric — how many

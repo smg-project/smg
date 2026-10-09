@@ -42,6 +42,7 @@ repos:
             crates/multimodal/tests/fixtures/.*|
             crates/response_template/tests/fixtures/.*|
             crates/symphony/tests/fixtures/slices/.*|
+            vendor_probe/baselines/.*|
             target/.*
           )$
 
