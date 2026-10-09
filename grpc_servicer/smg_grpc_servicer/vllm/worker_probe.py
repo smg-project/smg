@@ -35,11 +35,14 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import shlex
 import socket
 import struct
 import sys
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+
+from smg_grpc_servicer.hostport import host_port
 
 #: vLLM's ``--master-port`` default.
 DEFAULT_MASTER_PORT = 29501
@@ -136,18 +139,41 @@ def read_connections(tables: Iterable[str] = DEFAULT_TABLES) -> list[Connection]
     return connections
 
 
+def _arguments(cmdline: bytes) -> list[str]:
+    """The command line's words. An entry that holds a whole shell command
+    (``sh -c "vllm serve ... --master-port 29600"``) is split into its words
+    too, so the flags inside it are found."""
+    words: list[str] = []
+    for part in cmdline.split(b"\0"):
+        if not part:
+            continue
+        text = part.decode("utf-8", "replace")
+        if any(c.isspace() for c in text):
+            try:
+                words.extend(shlex.split(text))
+                continue
+            except ValueError:
+                pass
+        words.append(text)
+    return words
+
+
 def master_from_cmdline(cmdline: bytes) -> tuple[str | None, int | None]:
     """``--master-addr`` and ``--master-port`` as the engine's command line
-    carries them (``--flag value`` or ``--flag=value``); ``None`` for a
-    flag that is absent or unreadable."""
-    arguments = [part.decode("utf-8", "replace") for part in cmdline.split(b"\0") if part]
+    carries them (``--flag value`` or ``--flag=value``, with ``-`` or ``_``
+    in the flag's name, inside a shell wrapper's one argument too); ``None``
+    for a flag that is absent or unreadable."""
+    arguments = _arguments(cmdline)
     values: dict[str, str] = {}
     for index, argument in enumerate(arguments):
-        for flag in ("--master-addr", "--master-port"):
-            if argument == flag and index + 1 < len(arguments):
-                values[flag] = arguments[index + 1]
-            elif argument.startswith(f"{flag}="):
-                values[flag] = argument[len(flag) + 1 :]
+        name, _, inline = argument.partition("=")
+        flag = name.replace("_", "-")
+        if flag not in ("--master-addr", "--master-port"):
+            continue
+        if inline or "=" in argument:
+            values[flag] = inline
+        elif index + 1 < len(arguments):
+            values[flag] = arguments[index + 1]
     address = values.get("--master-addr") or None
     try:
         port = int(values["--master-port"]) if "--master-port" in values else None
@@ -187,15 +213,17 @@ def check(leader_addresses: set[Address], port: int, connections: Iterable[Conne
         if connection.port == port and connection.remote in leader_addresses
     ]
     established = sum(1 for connection in to_leader if connection.established)
-    where = ", ".join(f"{address}" for address in sorted(leader_addresses, key=str))
+    where = ", ".join(
+        host_port(str(address), port) for address in sorted(leader_addresses, key=str)
+    )
     if established:
         return Verdict(
-            True, f"{established} established connection(s) to the leader's store {where}:{port}"
+            True, f"{established} established connection(s) to the leader's store {where}"
         )
     stale = ", ".join(sorted(connection.state_name for connection in to_leader)) or "none"
     return Verdict(
         False,
-        f"no established connection to the leader's store {where}:{port} "
+        f"no established connection to the leader's store {where} "
         f"(connections to it: {stale}): the ranks are not attached to a live leader",
     )
 
@@ -250,10 +278,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     leader, port = args.leader, args.port
+    port_source = "--port"
     if leader is None or port is None:
         cmdline_leader, cmdline_port = master_from_cmdline(_read_cmdline(args.cmdline))
         leader = leader or cmdline_leader
-        port = port or cmdline_port or DEFAULT_MASTER_PORT
+        if port is None:
+            port = cmdline_port
+            port_source = f"--master-port in {args.cmdline}"
+        if port is None:
+            port = DEFAULT_MASTER_PORT
+            port_source = f"the default; no --master-port in {args.cmdline}"
     if leader is None:
         print(
             f"worker probe: no leader: pass --leader, or --master-addr in {args.cmdline}",
@@ -261,7 +295,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
     verdict = probe(leader, port)
-    print(f"worker probe: {'alive' if verdict.alive else 'NOT alive'}: {verdict.reason}")
+    print(
+        f"worker probe: {'alive' if verdict.alive else 'NOT alive'}: {verdict.reason} "
+        f"(store port {port} from {port_source})"
+    )
     return 0 if verdict.alive else 1
 
 
