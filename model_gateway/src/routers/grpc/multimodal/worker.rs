@@ -457,6 +457,8 @@ impl WorkerMediaPipeline {
             .collect::<Result<Vec<_>, _>>()?;
         let plan = MediaPlan::new(parts);
         let tokenizer = self.tokenizer.as_ref();
+        // This worker holds requests to its own engine's limits through the
+        // components' limit overrides; there is no fleet to consult here.
         let placeholders = prepare_placeholder_tokens(
             &plan,
             &self.model_id,
@@ -464,6 +466,7 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
+            &HashMap::new(),
         )
         .await
         .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;

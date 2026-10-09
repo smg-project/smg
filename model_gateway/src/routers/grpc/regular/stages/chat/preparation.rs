@@ -120,6 +120,10 @@ pub(crate) async fn prepare_chat_like(
                 }
             };
 
+            // The per-request media limits the model's workers advertise for
+            // their engine, which the plan is held to before any fetch.
+            let engine_limits =
+                multimodal::engine_item_limits(&ctx.components.worker_registry, model_id);
             let placeholders = multimodal::prepare_placeholder_tokens(
                 &media_plan,
                 model_id,
@@ -127,6 +131,7 @@ pub(crate) async fn prepare_chat_like(
                 mm_components,
                 &tokenizer_id,
                 &tokenizer_source,
+                &engine_limits,
             )
             .await
             .map_err(|e| {

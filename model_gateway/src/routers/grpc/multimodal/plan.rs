@@ -4,10 +4,16 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use llm_multimodal::{MediaContentPart, MediaPartOrder, Modality, ModelMetadata};
+use llm_multimodal::{
+    registry::modality_limit_override, MediaContentPart, MediaPartOrder, Modality, ModelMetadata,
+};
 use llm_tokenizer::TokenizerTrait;
 
-use super::{config::MultimodalComponents, RegistryTokenizer};
+use super::{
+    config::MultimodalComponents,
+    item_limits::{check_item_counts, effective_item_limits, limit_numbers, EngineItemLimit},
+    RegistryTokenizer,
+};
 
 /// Ordered media extracted from an API request.
 ///
@@ -127,6 +133,11 @@ impl PlaceholderTokens {
 
 /// Validate a multimodal request against the model spec and resolve the
 /// structural anchors for its active modalities in one config/spec lookup.
+///
+/// `engine_limits` are the per-request media limits the model's workers
+/// advertise for their engine ([`super::engine_item_limits`]): the request is
+/// held to them here, before any fetch, as the engine's own front end would
+/// (it never sees the precomputed inputs the router sends).
 pub(crate) async fn prepare_placeholder_tokens(
     plan: &MediaPlan,
     model_id: &str,
@@ -134,6 +145,7 @@ pub(crate) async fn prepare_placeholder_tokens(
     components: &MultimodalComponents,
     tokenizer_id: &str,
     tokenizer_source: &str,
+    engine_limits: &HashMap<Modality, EngineItemLimit>,
 ) -> Result<PlaceholderTokens> {
     anyhow::ensure!(!plan.is_empty(), "multimodal media plan is empty");
     let model_config = components
@@ -150,17 +162,29 @@ pub(crate) async fn prepare_placeholder_tokens(
         .model_registry
         .lookup(&metadata)
         .with_context(|| format!("multimodal not supported for model: {model_id}"))?;
+    let spec_limits = spec.modality_limits(&metadata).map_err(|error| {
+        anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
+    })?;
+    // The router's own limits, capped by the engine's where its workers
+    // advertise one; the refusal names the limit and what set it.
+    let limits = effective_item_limits(
+        &spec_limits,
+        engine_limits,
+        &components.modality_limit_overrides,
+        modality_limit_override,
+    );
+    check_item_counts(plan, &limits).map_err(|error| anyhow::anyhow!("{error}"))?;
     let requested = plan
         .modalities()
         .iter()
         .map(|&modality| (modality, plan.count(modality)))
         .collect::<Vec<_>>();
-    spec.validate_media_request_with_limits(
-        &metadata,
-        &requested,
-        &components.modality_limit_overrides,
-    )
-    .map_err(|error| anyhow::anyhow!("invalid media request for model {}: {error}", spec.name()))?;
+    // The same numbers for the spec's own validation, so nothing downstream
+    // loosens what the engine takes.
+    spec.validate_media_request_with_limits(&metadata, &requested, &limit_numbers(&limits))
+        .map_err(|error| {
+            anyhow::anyhow!("invalid media request for model {}: {error}", spec.name())
+        })?;
     let mut placeholders = PlaceholderTokens::default();
     for &modality in plan.modalities() {
         let token = spec
@@ -249,9 +273,93 @@ pub(crate) fn validate_rendered_media_anchors(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use llm_multimodal::PreProcessorConfig;
     use llm_tokenizer::mock::MockTokenizer;
 
-    use super::*;
+    use super::{
+        super::{
+            config::{MultimodalConfigRegistry, MultimodalModelConfig},
+            settings::MultimodalSettings,
+        },
+        *,
+    };
+    use crate::worker::RuntimeType;
+
+    fn image_urls(count: usize) -> MediaPlan {
+        MediaPlan::new((0..count).map(|i| MediaContentPart::ImageUrl {
+            url: format!("https://example.com/{i}.png"),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }))
+    }
+
+    /// The limit the model's workers advertise for their engine refuses a plan
+    /// above it before any placeholder work, naming the limit and the engine's
+    /// knob; without one the same plan goes on into the spec's own resolution.
+    #[tokio::test]
+    async fn placeholder_preparation_holds_the_plan_to_the_engines_limits() {
+        let components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .unwrap();
+        components.config_registry.insert(
+            "tok".to_string(),
+            Arc::new(MultimodalModelConfig {
+                config: serde_json::json!({"model_type": "llava", "image_token_index": 32000}),
+                preprocessor_config: PreProcessorConfig::default(),
+                video_preprocessor_config: None,
+            }),
+        );
+        let tokenizer = MockTokenizer::new();
+        let plan = image_urls(2);
+        let engine = HashMap::from([(
+            Modality::Image,
+            EngineItemLimit {
+                limit: 1,
+                runtime: RuntimeType::Vllm,
+            },
+        )]);
+        let error = prepare_placeholder_tokens(
+            &plan,
+            "org/llava",
+            &tokenizer,
+            &components,
+            "tok",
+            "unused",
+            &engine,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("2 image items")
+                && error.contains("limit of 1")
+                && error.contains("the engine's --limit-mm-per-prompt"),
+            "{error}"
+        );
+        // Without an engine limit the plan passes the count check and reaches
+        // the placeholder resolution (which the mock tokenizer, lacking the
+        // token, then refuses).
+        let error = prepare_placeholder_tokens(
+            &plan,
+            "org/llava",
+            &tokenizer,
+            &components,
+            "tok",
+            "unused",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("limit of"), "{error}");
+    }
 
     #[test]
     fn media_plan_preserves_media_order_and_counts() {
