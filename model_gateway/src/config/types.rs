@@ -287,6 +287,9 @@ pub struct RouterConfig {
     /// permit is held for the full response, including streaming bodies.
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
+    /// Longest a request may wait inside the gateway: in the admission queue,
+    /// and from acceptance to worker selection (a request still ahead of
+    /// selection after this long is refused with a 503).
     pub queue_timeout_secs: u64,
     /// Maximum in-flight Prefill requests per worker in PD or EPD mode.
     /// A non-positive value disables the limit.

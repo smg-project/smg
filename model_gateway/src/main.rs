@@ -977,7 +977,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 100, help_heading = "Rate Limiting")]
     queue_size: usize,
 
-    /// Maximum time in seconds a request can wait in queue
+    /// Maximum time in seconds a request can wait in queue, and the longest a
+    /// request may sit inside the router ahead of worker selection before it
+    /// is refused with a 503
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 

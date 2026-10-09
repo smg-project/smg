@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -124,6 +124,9 @@ impl GrpcRouter {
             multimodal,
         });
 
+        // The admission queue's timeout also bounds how long an accepted
+        // request may sit ahead of worker selection.
+        let queue_timeout = Duration::from_secs(ctx.router_config.queue_timeout_secs);
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -134,6 +137,7 @@ impl GrpcRouter {
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
             ctx.rate_limit_manager.clone(),
+            queue_timeout,
         );
         // Deps for the parser-free endpoints (completion/embeddings/classify).
         // Only completion's stage list actually reads `rate_limit_manager`;
@@ -143,6 +147,7 @@ impl GrpcRouter {
             policy_registry.clone(),
             ctx.prefill_admission.clone(),
             ctx.rate_limit_manager.clone(),
+            queue_timeout,
         );
 
         // Present in every mode: chat/generate, messages, completion.

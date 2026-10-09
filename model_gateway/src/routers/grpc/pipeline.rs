@@ -10,7 +10,10 @@
 //! The plan is held until the retry window closes (first non-retryable
 //! response).
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::response::{IntoResponse, Response};
 use openai_protocol::{
@@ -117,6 +120,9 @@ pub(crate) struct PipelineDeps {
     /// `None` when tenant rate limiting is disabled; read only by the
     /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// `--queue-timeout-secs`: a request still ahead of worker selection this
+    /// long after the gateway accepted it is refused instead of dispatched.
+    queue_timeout: Duration,
 }
 
 impl PipelineDeps {
@@ -135,6 +141,7 @@ impl PipelineDeps {
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        queue_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
@@ -145,6 +152,7 @@ impl PipelineDeps {
             configured_tool_parser,
             configured_reasoning_parser,
             rate_limit_manager,
+            queue_timeout,
         }
     }
 
@@ -155,6 +163,7 @@ impl PipelineDeps {
         policy_registry: Arc<PolicyRegistry>,
         prefill_admission: Option<Arc<PrefillAdmission>>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        queue_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
@@ -165,6 +174,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager,
+            queue_timeout,
         }
     }
 
@@ -230,6 +240,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager: None,
+            queue_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -289,7 +300,8 @@ impl RequestPipeline {
             deps.policy_registry.clone(),
             mode.worker_selection(),
             deps.prefill_admission.clone(),
-        );
+        )
+        .with_queue_timeout(deps.queue_timeout);
         let plan_kind = mode.plan_kind();
         let inject_pd_metadata = mode.inject_pd_metadata();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
@@ -1604,7 +1616,13 @@ mod alias_pipeline_tests {
             .unwrap();
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None, None);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            policy_registry,
+            None,
+            None,
+            Duration::from_secs(60),
+        );
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
             tokenizer_registry,
@@ -2092,6 +2110,7 @@ mod request_release_tests {
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             prefill_admission,
             None,
+            Duration::from_secs(60),
         );
         RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
     }
@@ -2105,6 +2124,7 @@ mod request_release_tests {
             Arc::new(PolicyRegistry::new(policy)),
             None,
             None,
+            Duration::from_secs(60),
         );
         RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
             .expect("completion pipeline")
@@ -3216,6 +3236,7 @@ mod request_release_tests {
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             None,
             None,
+            Duration::from_secs(60),
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");

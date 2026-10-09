@@ -1,6 +1,6 @@
 //! Tenant resolution and request-meta insertion for serving paths.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use axum::{
     body::Body,
@@ -15,6 +15,12 @@ use crate::{
     config::{RouterConfig, TenantResolutionConfig},
     tenant::{canonical_tenant_key, DataPlaneCaller, RouteRequestMeta, TenantIdentity, TenantKey},
 };
+
+/// When the gateway accepted the request: stamped on the route request meta
+/// as it is built, before admission, so every later stage can bound the time
+/// a request has already spent inside the gateway.
+#[derive(Clone, Copy, Debug)]
+pub struct AcceptedAt(pub Instant);
 
 #[derive(Clone)]
 pub struct TenantResolutionState {
@@ -69,7 +75,8 @@ pub fn resolve_route_request_meta(
     state: &TenantResolutionState,
     request: &Request<Body>,
 ) -> RouteRequestMeta {
-    let meta = RouteRequestMeta::new(resolve_raw_tenant_key(state, request));
+    let meta = RouteRequestMeta::new(resolve_raw_tenant_key(state, request))
+        .with_extension(AcceptedAt(Instant::now()));
     // Carry the middleware request id so backend request ids derive from it
     // (RequestIdLayer runs outside this middleware).
     match request.extensions().get::<RequestId>() {
@@ -190,6 +197,19 @@ mod tests {
                 .map(|request_id| request_id.0.as_str()),
             Some("chatcmpl-abc123")
         );
+    }
+
+    #[tokio::test]
+    async fn request_meta_is_stamped_with_its_acceptance_time() {
+        let state = resolution_state();
+        let before = Instant::now();
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+
+        let request_meta = resolve_route_request_meta(&state, &request);
+        let accepted = request_meta
+            .extension::<AcceptedAt>()
+            .expect("the meta carries when the gateway accepted the request");
+        assert!(accepted.0 >= before && accepted.0 <= Instant::now());
     }
 
     #[tokio::test]
