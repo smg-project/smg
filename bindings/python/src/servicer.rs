@@ -511,6 +511,8 @@ fn native_media_options(
     };
     // The engine's own video frame budget (`0`: every frame); absent when
     // the launcher could not tell, which leaves each spec to its constant.
+    // `video_loader_rule` names a loader rule the pipeline cannot follow; the
+    // pipeline refuses it for a spec that samples the way the loader does.
     let video_frame_budget = count("video_frame_budget")?;
     let fetch_timeout_ms: u64 = item("fetch_timeout_ms")?
         .map(|v| v.extract())
@@ -551,6 +553,7 @@ fn native_media_options(
             allowed_domains,
             fetch_timeout: Duration::from_millis(fetch_timeout_ms),
             video_frame_budget,
+            video_loader_rule: string("video_loader_rule")?,
         },
         source: string("source")?.unwrap_or_else(|| "default".to_string()),
         max_inflight: count("max_inflight")?.unwrap_or(4).max(1),

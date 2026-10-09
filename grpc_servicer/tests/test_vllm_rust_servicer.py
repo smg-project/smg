@@ -437,6 +437,7 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
         "engine_item_limits": None,
         "max_item_bytes": 10,
         "video_frame_budget": None,
+        "video_loader_rule": None,
         "source": "flag",
     }
     # The engine's own per-prompt limits ride along for the pipeline to enforce.
@@ -468,18 +469,31 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
     config.model_config.multimodal_config.media_io_kwargs = {}
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
     # A loader of its own (video_backend in the kwargs or the environment) or a
-    # frame rate thinning by duration: rules the pipeline cannot follow, refused.
+    # frame rate above zero, which thins by duration: rules the pipeline cannot
+    # follow go along by name, and the pipeline refuses them only for a family
+    # that samples the way the loader does. The budget rides along regardless.
+
+    def rule():
+        return rust.smg_media_options(config, settings, str(tmp_path))["video_loader_rule"]
+
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "x"}}
-    with pytest.raises(ValueError, match="video_backend"):
-        rust.smg_media_options(config, settings, str(tmp_path))
+    assert rule() == "--media-io-kwargs video.video_backend=x"
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "opencv"}}
+    assert rule() is None, "the default loader by name is no rule"
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": 1}}
-    with pytest.raises(ValueError, match="video.fps"):
-        rust.smg_media_options(config, settings, str(tmp_path))
+    assert rule() == "--media-io-kwargs video.fps=1"
+    for no_cap in (-1, 0, "0"):
+        config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": no_cap}}
+        assert rule() is None, f"fps={no_cap!r} thins nothing"
     config.model_config.multimodal_config.media_io_kwargs = {}
     monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv_dynamic")
-    with pytest.raises(ValueError, match="VLLM_VIDEO_LOADER_BACKEND"):
-        rust.smg_media_options(config, settings, str(tmp_path))
+    assert rule() == "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic"
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": 2}}
+    assert rule() == "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic; --media-io-kwargs video.fps=2"
+    config.model_config.multimodal_config.media_io_kwargs = {}
     monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv")
+    assert rule() is None
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
     monkeypatch.delenv("VLLM_VIDEO_LOADER_BACKEND", raising=False)
     monkeypatch.delenv(mm_processor.ENV_MAX_VIDEO_FRAMES, raising=False)
