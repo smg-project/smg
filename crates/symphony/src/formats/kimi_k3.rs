@@ -534,4 +534,85 @@ mod tests {
             );
         }
     }
+
+    /// The generation prompt's tail with thinking off: the assistant's message opened, and its
+    /// answer's region.
+    const PROMPT_THINKING_OFF: &str =
+        "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>";
+
+    /// A short answer and the turn's closing structure, one token each: how a cut by
+    /// `max_tokens` lands between them.
+    const PONG: [&str; 10] = [
+        "P",
+        "ong",
+        ".",
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+        "",
+    ];
+
+    fn reasoning(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tag_the_end_of_the_output_cut_short_is_dropped_not_released_as_content() {
+        // The output cut after 8 of the turn's 10 tokens ends in `<|close|>message`, a tag the
+        // cut left unfinished (smg-lab #116): it begins with a whole `<|close|>` token, which the
+        // model cannot write as text, so it is wrapping, never content. Cut after 7 the same
+        // holds for the bare `<|close|>`; cut after 6, or whole, the answer stands alone.
+        for cut in [6, 7, 8, 9] {
+            let events = run(PROMPT_THINKING_OFF, &PONG[..cut]);
+            assert_eq!(
+                content(&events),
+                "Pong.",
+                "cut after {cut} tokens: {events:?}"
+            );
+            assert_eq!(
+                bytes(&events),
+                PONG[..cut].concat(),
+                "cut after {cut} tokens: every byte accounted for"
+            );
+        }
+        let events = run(PROMPT_THINKING_OFF, &PONG[..8]);
+        assert!(
+            events.contains(&dropped("<|close|>message")),
+            "the tag cut short is dropped as wrapping: {events:?}"
+        );
+        let events = run(PROMPT_THINKING_OFF, &PONG[..7]);
+        assert!(
+            events.contains(&dropped("<|close|>")),
+            "the structural token alone is a tag cut short too: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_thought_cut_inside_its_closing_tag_keeps_the_thought_alone() {
+        // Thinking on: the prompt opened the thought, the cut falls inside `<|close|>think<|sep|>`.
+        // The thought is the thought; the unfinished tag reaches neither field.
+        let events = run(PROMPT, &["Thought", "<|close|>", "think"]);
+        assert_eq!(reasoning(&events), "Thought", "{events:?}");
+        assert_eq!(content(&events), "", "{events:?}");
+        assert!(events.contains(&dropped("<|close|>think")), "{events:?}");
+        assert_eq!(bytes(&events), "Thought<|close|>think");
+    }
+
+    #[test]
+    fn a_tail_shorter_than_a_structural_token_stays_text_at_the_end() {
+        // Inside a structural token the bytes so far may be text (`<|clo` could be the model's
+        // own, and no stream splits the token anyway), so they stay, as every parser keeps a
+        // partial marker at the end of the output.
+        let events = run(PROMPT_THINKING_OFF, &["Pong.", "<|clo"]);
+        assert_eq!(content(&events), "Pong.<|clo", "{events:?}");
+    }
 }
