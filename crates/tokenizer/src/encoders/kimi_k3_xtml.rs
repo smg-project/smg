@@ -15,9 +15,8 @@
 //! `<|sep|>`, `<|end_of_msg|>` and media anchors with special tokens allowed,
 //! everything else — tag names, attribute pieces, message text of every role,
 //! reasoning, tool arguments, internal system messages — as ordinary BPE. A
-//! marker string inside message text therefore never becomes a control id
-//! (the one exception is the gateway's `<|media_pad|>` anchor, see below), and
-//! attribute pieces (`" role"`, `="`, value, `"`) are separate BPE units.
+//! marker string inside message text therefore never becomes a control id,
+//! and attribute pieces (`" role"`, `="`, value, `"`) are separate BPE units.
 //! `render_kimi_k3_xtml_prompt` reproduces that segmentation piece by piece
 //! for the tiktoken backend, which encodes it and hands the caller a deferred
 //! encode; [`apply_kimi_k3_xtml_with_effort_default`] is that prompt joined
@@ -33,7 +32,8 @@
 //! gateway passes content parts through (OpenAI format), each image part
 //! becomes one `<|media_pad|>` control anchor at its authored position, and
 //! prompt expansion replaces it — see `llm_multimodal::registry::kimi_k3`. A
-//! literal anchor inside string content is kept as a control segment too.
+//! literal anchor spelled inside message text stays text, as the checkpoint's
+//! own encoder keeps it.
 
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
