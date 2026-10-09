@@ -29,6 +29,19 @@ use crate::error::{Error, Result};
 /// since `base` plus one, so that it is never this.
 const NEVER: u64 = 0;
 
+/// `at + after`, or a deadline that never comes when the sum does not fit an
+/// `Instant`: a bound of thousands of years means "no bound", not a panic in
+/// the background task that owns the handshake.
+fn deadline(at: Instant, after: Duration) -> Instant {
+    at.checked_add(after).unwrap_or_else(far_future)
+}
+
+/// Thirty years out: past any start, within what every platform's `Instant`
+/// holds.
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(30 * 365 * 24 * 60 * 60)
+}
+
 /// Signs of life from outside the ZMQ wire. The lifecycle owner that launched
 /// the engine process calls [`EngineLiveness::touch`] while it sees the
 /// process alive; the handshake's silence bound then counts from the latest
@@ -57,7 +70,8 @@ impl EngineLiveness {
     /// Record a sign of life now.
     pub fn touch(&self) {
         let millis = u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
-        self.last_seen_millis.fetch_max(millis + 1, Ordering::Release);
+        self.last_seen_millis
+            .fetch_max(millis + 1, Ordering::Release);
     }
 
     /// When the engine was last seen alive; `None` before the first touch.
@@ -124,7 +138,7 @@ impl StartupClock {
         loop {
             let now = Instant::now();
             if let Some(ceiling) = self.budget.ceiling {
-                if now >= self.started + ceiling {
+                if now >= deadline(self.started, ceiling) {
                     return Err(Error::StartupCeiling { stage, ceiling });
                 }
             }
@@ -134,19 +148,19 @@ impl StartupClock {
                 .as_ref()
                 .and_then(EngineLiveness::last_seen)
                 .map_or(last_message, |seen| seen.max(last_message));
-            let silence_deadline = last_sign + self.budget.silence;
+            let silence_deadline = deadline(last_sign, self.budget.silence);
             if now >= silence_deadline {
                 return Err(Error::HandshakeTimeout {
                     stage,
                     timeout: self.budget.silence,
                 });
             }
-            let deadline = self.budget.ceiling.map_or(silence_deadline, |ceiling| {
-                (self.started + ceiling).min(silence_deadline)
+            let next = self.budget.ceiling.map_or(silence_deadline, |ceiling| {
+                deadline(self.started, ceiling).min(silence_deadline)
             });
             tokio::select! {
                 output = &mut future => return Ok(output),
-                () = sleep_until(deadline) => {}
+                () = sleep_until(next) => {}
             }
         }
     }
@@ -223,6 +237,23 @@ mod tests {
             "{error}"
         );
         assert!(started.elapsed() >= ceiling);
+    }
+
+    /// A bound too large for an `Instant` is no bound, not a panic: the
+    /// handshake runs in a background task whose panic would leave the link
+    /// neither connected nor failed.
+    #[tokio::test]
+    async fn bounds_beyond_the_clock_never_come() {
+        let clock = StartupClock::new(StartupBudget {
+            silence: Duration::MAX,
+            ceiling: Some(Duration::MAX),
+            liveness: Some(EngineLiveness::new()),
+        });
+        let ready = async {
+            sleep(SILENCE / 4).await;
+            "READY"
+        };
+        assert_eq!(clock.wait("READY", ready).await.unwrap(), "READY");
     }
 
     #[test]
