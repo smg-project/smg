@@ -181,6 +181,7 @@ pub mod metrics_labels {
     // Discovery sources
     pub const DISCOVERY_STATIC: &str = "static";
     pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
+    pub const DISCOVERY_FILE: &str = "file";
     pub const DISCOVERY_CONSUL: &str = "consul";
     pub const DISCOVERY_MANUAL: &str = "manual";
 
@@ -188,6 +189,11 @@ pub mod metrics_labels {
     pub const REGISTRATION_SUCCESS: &str = "success";
     pub const REGISTRATION_FAILED: &str = "failed";
     pub const DEREGISTRATION_RECONCILED: &str = "reconciled";
+
+    // Discovery snapshot errors: the source could not be read, or was read
+    // and rejected as invalid
+    pub const SNAPSHOT_ERROR_UNREADABLE: &str = "unreadable";
+    pub const SNAPSHOT_ERROR_INVALID: &str = "invalid";
 
     // Rate limit results
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";

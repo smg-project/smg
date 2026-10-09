@@ -458,6 +458,16 @@ class TestDiscoveryMapping:
     def test_untagged_mapping_reads_as_kubernetes(self):
         _Router(worker_urls=[], discovery=self.kubernetes_fields())
 
+    def test_file_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={"provider": "file", "path": "/run/smg/workers.json"},
+        )
+
+    def test_file_mapping_needs_a_path(self):
+        with pytest.raises(ValueError, match="path"):
+            _Router(worker_urls=[], discovery={"provider": "file"})
+
     def test_mapping_and_service_discovery_conflict(self):
         with pytest.raises(ValueError, match="not both"):
             _Router(

@@ -14,6 +14,7 @@ on:
       - model_gateway/src/main.rs
       - model_gateway/tests/k8s_discovery_test.rs
       - e2e_test/kind_discovery/**
+      - e2e_test/file_discovery/**
       - .github/workflows/e2e-kind-discovery.yml
   workflow_dispatch:
     inputs:
@@ -68,3 +69,13 @@ jobs:
             SMG_GATEWAY_IMAGE=smg-gateway:e2e \
             pytest e2e_test/kind_discovery \
             --confcutdir e2e_test/kind_discovery -m kind -v
+
+      # Host processes only (the smg and mock-worker binaries built above),
+      # so it runs even when the kind lane failed.
+      - name: Run file discovery e2e
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          pip install pytest requests
+          SMG_FILE_E2E=1 pytest e2e_test/file_discovery \
+            --confcutdir e2e_test/file_discovery -v

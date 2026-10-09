@@ -25,7 +25,7 @@ COMMON_POLICY_CHOICES = [
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
-DISCOVERY_PROVIDER_CHOICES = ["kubernetes"]
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file"]
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -327,6 +327,10 @@ class RouterArgs:
     # Per-tenant token/request rate limiting
     tenant_rate_limit_enabled: bool = False
     tenant_rate_limit_config: str | None = None
+    # File discovery (discovery_provider="file"): the JSON manifest, and how
+    # often to reread it (None = 30s).
+    discovery_file: str | None = None
+    discovery_check_interval_secs: int | None = None
 
     @staticmethod
     def add_cli_args(
@@ -359,6 +363,9 @@ class RouterArgs:
         )
         k8s_group = parser.add_argument_group(
             "Service Discovery (Kubernetes)", "Kubernetes-based worker discovery"
+        )
+        file_discovery_group = parser.add_argument_group(
+            "Service Discovery (File)", "Workers listed in a JSON manifest"
         )
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
@@ -1266,6 +1273,21 @@ class RouterArgs:
             choices=DISCOVERY_PROVIDER_CHOICES,
             default=None,
             help="Worker discovery provider. Give this or --service-discovery, not both",
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-file",
+            type=str,
+            default=None,
+            help=(
+                "JSON manifest listing the workers, for --discovery-provider file."
+                " It may be created after startup"
+            ),
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-check-interval-secs",
+            type=int,
+            default=None,
+            help="Seconds between rereads of the --discovery-file manifest (default: 30)",
         )
         k8s_group.add_argument(
             f"--{prefix}selector",

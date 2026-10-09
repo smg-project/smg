@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -28,11 +28,12 @@ use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, ManualAssignmentMode,
-        MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
-        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
+        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind,
+        ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig,
+        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
@@ -131,6 +132,8 @@ impl std::fmt::Display for Backend {
 pub enum DiscoveryProvider {
     #[value(name = "kubernetes")]
     Kubernetes,
+    #[value(name = "file")]
+    File,
 }
 
 #[derive(Parser, Debug)]
@@ -785,9 +788,18 @@ struct CliArgs {
         long,
         value_enum,
         conflicts_with = "service_discovery",
-        help_heading = "Service Discovery (Kubernetes)"
+        help_heading = "Service Discovery"
     )]
     discovery_provider: Option<DiscoveryProvider>,
+
+    /// JSON manifest listing the workers, for `--discovery-provider file`. It
+    /// may be created after startup
+    #[arg(long, help_heading = "Service Discovery (File)")]
+    discovery_file: Option<PathBuf>,
+
+    /// Seconds between rereads of the `--discovery-file` manifest (default: 30)
+    #[arg(long, help_heading = "Service Discovery (File)")]
+    discovery_check_interval_secs: Option<u64>,
 
     /// Label selector for Kubernetes service discovery (format: key=value)
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -1933,28 +1945,51 @@ impl CliArgs {
 
         let policy = self.parse_policy(&self.policy);
 
-        let discovery = self
-            .selected_discovery_provider()
-            .map(|provider| match provider {
-                DiscoveryProvider::Kubernetes => {
-                    DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
-                        namespace: self.service_discovery_namespace.clone(),
-                        port: self.service_discovery_port,
-                        check_interval_secs: 60,
-                        selector: Self::parse_selector(&self.selector),
-                        encode_selector: Self::parse_selector(&self.encode_selector),
-                        prefill_selector: Self::parse_selector(&self.prefill_selector),
-                        decode_selector: Self::parse_selector(&self.decode_selector),
-                        bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-                        worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                        kv_connector_annotation: self.kv_connector_annotation.clone(),
-                        kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
-                        router_selector: Self::parse_selector(&self.router_selector),
-                        router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                        model_id_source: self.model_id_from.clone(),
-                    })
-                }
+        // A provider's own flags are ignored under another provider, as the
+        // Kubernetes flags always were without discovery. The file flags have
+        // no other use, so giving them without the file provider is an error.
+        let provider = self.selected_discovery_provider();
+        if provider != Some(DiscoveryProvider::File)
+            && (self.discovery_file.is_some() || self.discovery_check_interval_secs.is_some())
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--discovery-file and --discovery-check-interval-secs apply only to \
+                         --discovery-provider file"
+                    .to_string(),
             });
+        }
+        let discovery = match provider {
+            None => None,
+            Some(DiscoveryProvider::Kubernetes) => {
+                Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
+                    namespace: self.service_discovery_namespace.clone(),
+                    port: self.service_discovery_port,
+                    check_interval_secs: 60,
+                    selector: Self::parse_selector(&self.selector),
+                    encode_selector: Self::parse_selector(&self.encode_selector),
+                    prefill_selector: Self::parse_selector(&self.prefill_selector),
+                    decode_selector: Self::parse_selector(&self.decode_selector),
+                    bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                    worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                    kv_connector_annotation: self.kv_connector_annotation.clone(),
+                    kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                    router_selector: Self::parse_selector(&self.router_selector),
+                    router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
+                    model_id_source: self.model_id_from.clone(),
+                }))
+            }
+            Some(DiscoveryProvider::File) => Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: self
+                    .discovery_file
+                    .clone()
+                    .ok_or_else(|| ConfigError::MissingRequired {
+                        field: "--discovery-file".to_string(),
+                    })?,
+                check_interval_secs: self
+                    .discovery_check_interval_secs
+                    .unwrap_or(DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS),
+            })),
+        };
 
         let metrics = Some(MetricsConfig {
             port: self.prometheus_port,
@@ -2912,12 +2947,119 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
+    /// `--discovery-provider file` builds a file configuration with the
+    /// interval defaulted. Worker discovery runs from it; router discovery,
+    /// configured only inside Kubernetes discovery, does not.
+    #[test]
+    fn discovery_provider_file_builds_a_file_config() {
+        let cli = cli_args_from(&[
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "/run/smg/workers.json",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router.discovery,
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: "/run/smg/workers.json".into(),
+                check_interval_secs: DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+            }))
+        );
+        // Recovery by removal works here too: the next reread re-adds the worker.
+        assert!(router.health_check.remove_unhealthy_workers);
+
+        let server = cli.to_server_config(router).unwrap();
+        assert!(matches!(
+            server.service_discovery_config,
+            Some(RuntimeDiscoveryConfig::File(_))
+        ));
+        assert!(server.mesh_discovery_config.is_none());
+
+        let tuned = cli_args_from(&[
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "w.json",
+            "--discovery-check-interval-secs",
+            "5",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert!(matches!(
+            tuned.discovery,
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                check_interval_secs: 5,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn file_provider_needs_a_manifest() {
+        let err = cli_args_from(&["--discovery-provider", "file"])
+            .to_router_config(vec![], vec![])
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MissingRequired { ref field } if field == "--discovery-file"),
+            "{err}"
+        );
+    }
+
+    /// The file flags configure nothing else, so a forgotten
+    /// `--discovery-provider file` is reported instead of ignored.
+    #[test]
+    fn file_flags_need_the_file_provider() {
+        for args in [
+            &["--discovery-file", "w.json"][..],
+            &["--discovery-check-interval-secs", "5"][..],
+            &[
+                "--service-discovery",
+                "--selector",
+                "app=w",
+                "--discovery-file",
+                "w.json",
+            ][..],
+        ] {
+            let err = cli_args_from(args)
+                .to_router_config(vec![], vec![])
+                .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::IncompatibleConfig { .. }),
+                "{args:?}: {err}"
+            );
+        }
+    }
+
+    /// Under the file provider the Kubernetes flags are ignored, the router
+    /// selector included, as they are without discovery.
+    #[test]
+    fn kubernetes_flags_are_ignored_under_the_file_provider() {
+        let cli = cli_args_from(&[
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "w.json",
+            "--selector",
+            "app=w",
+            "--service-discovery-namespace",
+            "prod",
+            "--router-selector",
+            "role=router",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(matches!(router.discovery, Some(DiscoveryConfig::File(_))));
+        let server = cli.to_server_config(router).unwrap();
+        assert!(server.mesh_discovery_config.is_none());
+    }
+
     /// IGW mode follows the selected provider, whichever spelling selected it.
     #[test]
     fn selecting_a_discovery_provider_enables_igw() {
         for selection in [
             &["--service-discovery"][..],
             &["--discovery-provider", "kubernetes"][..],
+            &["--discovery-provider", "file", "--discovery-file", "w.json"][..],
         ] {
             let mut cli = cli_args_from(selection);
             assert!(cli.enable_igw_for_discovery(), "{selection:?}");

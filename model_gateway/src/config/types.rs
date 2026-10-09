@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -1156,13 +1157,24 @@ impl PolicyConfig {
 /// predates the tag; see [`deserialize_discovery`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per router, built at startup; boxing the Kubernetes variant would complicate every construction and match to save a few hundred bytes"
+)]
 pub enum DiscoveryConfig {
     Kubernetes(KubernetesDiscoveryConfig),
+    File(FileDiscoveryConfig),
 }
 
 impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
     fn from(config: KubernetesDiscoveryConfig) -> Self {
         Self::Kubernetes(config)
+    }
+}
+
+impl From<FileDiscoveryConfig> for DiscoveryConfig {
+    fn from(config: FileDiscoveryConfig) -> Self {
+        Self::File(config)
     }
 }
 
@@ -1279,6 +1291,24 @@ impl Default for KubernetesDiscoveryConfig {
             model_id_source: None,
         }
     }
+}
+
+/// How often the file-discovery manifest is reread when no interval is given.
+pub const DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
+
+fn default_file_discovery_check_interval_secs() -> u64 {
+    DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS
+}
+
+/// File worker discovery: the workers listed in a JSON manifest on disk.
+///
+/// The manifest is reread in full every `check_interval_secs`, and may be
+/// absent at startup: discovery keeps retrying until a writer creates it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileDiscoveryConfig {
+    pub path: PathBuf,
+    #[serde(default = "default_file_discovery_check_interval_secs")]
+    pub check_interval_secs: u64,
 }
 
 pub use smg_external_router::RetryConfig;
@@ -2521,6 +2551,24 @@ discovery:
             config.discovery,
             Some(DiscoveryConfig::Kubernetes(_))
         ));
+    }
+
+    /// The file provider is the tag plus its path; the interval defaults.
+    #[test]
+    fn tagged_file_discovery_reads_with_the_default_interval() {
+        let discovery = read_discovery(serde_json::json!({
+            "provider": "file",
+            "path": "/run/smg/workers.json",
+        }));
+        assert_eq!(
+            discovery,
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: "/run/smg/workers.json".into(),
+                check_interval_secs: DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+            }))
+        );
+        let written = serde_json::to_value(discovery.unwrap()).unwrap();
+        assert_eq!(written["provider"], "file");
     }
 
     #[test]
