@@ -804,15 +804,16 @@ class TestServicerWiring:
         is reported as such and a variable behind a flag the launcher has still
         gets its deprecation line."""
         pytest.importorskip("vllm")
+        # The servicer reads the slot of the installed module, not of the copy
+        # this file loads from its path.
+        from smg_grpc_servicer.vllm import mm_processor as installed
         from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
 
         parsed = types.SimpleNamespace(
-            **{f"mm_{name}": None for name in mm_processor._MM_SETTING_SPECS}, model="m"
+            **{f"mm_{name}": None for name in installed._MM_SETTING_SPECS}, model="m"
         )
         parsed.mm_processor = "off"
-        monkeypatch.setattr(
-            mm_processor, "_launcher_settings", mm_processor.MmSettings.from_args(parsed)
-        )
+        monkeypatch.setattr(installed, "_launcher_settings", installed.MmSettings.from_args(parsed))
         monkeypatch.delenv("SMG_VLLM_MM_PROCESSOR", raising=False)
         monkeypatch.setenv("SMG_VLLM_MM_MAX_INFLIGHT", "3")
 
