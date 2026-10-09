@@ -213,6 +213,7 @@ async fn streaming_forwards_unknown_tool_names() {
             description: None,
             parameters: json!({"type": "object"}),
             strict: None,
+            extra: Default::default(),
         },
     }];
     let mut parser = DeepSeekDsmlParser::v41();
@@ -353,6 +354,7 @@ fn structural_tag_mirrors_vllm_forced_grammar() {
             description: None,
             parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
             strict: None,
+            extra: Default::default(),
         },
     }];
     let tag = DeepSeekDsmlParser::build_v41_structural_tag(&tools, true);

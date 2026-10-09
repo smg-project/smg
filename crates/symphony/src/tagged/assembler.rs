@@ -674,6 +674,7 @@ mod tests {
                     "note": {"type": ["string", "null"]},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }
@@ -898,6 +899,7 @@ mod tests {
                     },
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }]);
         let call = "<function=f>\n<parameter=metrics>\n[]\n</parameter>\n</function>";

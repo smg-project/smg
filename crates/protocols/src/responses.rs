@@ -529,12 +529,27 @@ pub enum NamespaceTool {
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct FunctionTool {
     /// Flatten to match Responses API tool JSON shape.
     #[serde(flatten)]
     pub function: Function,
+}
+
+/// A function tool rejects keys outside its schema, as the sibling tool
+/// structs do with `deny_unknown_fields`. The function object collects such
+/// keys in [`Function::extra`] (the chat API keeps them for the template), and
+/// serde does not support `deny_unknown_fields` on a struct that flattens a
+/// struct with a flattened map of its own, so the check is made here.
+impl<'de> Deserialize<'de> for FunctionTool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["name", "description", "parameters", "strict"];
+        let function = Function::deserialize(deserializer)?;
+        if let Some(key) = function.extra.keys().next() {
+            return Err(serde::de::Error::unknown_field(key, FIELDS));
+        }
+        Ok(Self { function })
+    }
 }
 
 /// File search tool configuration.

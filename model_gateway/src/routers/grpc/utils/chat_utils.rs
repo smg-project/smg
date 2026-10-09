@@ -1923,6 +1923,32 @@ mod tests {
         assert_eq!(prefix, "Sure!");
     }
 
+    /// A tool definition carries whatever the client wrote beyond name,
+    /// description, parameters and strict (the `response` schema of a BFCL
+    /// tool); the template renders the tool object as given, so the typed
+    /// request hands it on whole and in the client's order.
+    #[test]
+    fn tool_fields_beyond_the_schema_reach_the_template_in_order() {
+        let function = json!({
+            "name": "authenticate",
+            "description": "Authenticate a user.",
+            "parameters": {"type": "object", "properties": {"user": {"type": "string"}}},
+            "response": {"type": "dict", "properties": {"ok": {"type": "boolean"}}}
+        });
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Log me in"}],
+            "tools": [{"type": "function", "function": function.clone()}]
+        }))
+        .unwrap();
+
+        let rendered = render_with(Default::default(), &request);
+        assert_eq!(
+            rendered["tools"][0]["function"].to_string(),
+            function.to_string()
+        );
+    }
+
     /// Without the capability a tool call's `arguments` string is parsed into
     /// an object before rendering (what Transformers templates expect); with
     /// it the string reaches the renderer as written, so a native renderer can

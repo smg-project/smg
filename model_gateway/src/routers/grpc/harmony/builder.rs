@@ -1521,6 +1521,7 @@ mod tests {
                             "required": ["prompt"]
                         }),
                         strict: None,
+                        extra: Default::default(),
                     },
                 }),
             ]),

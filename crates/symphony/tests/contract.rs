@@ -63,6 +63,7 @@ fn qwen3_tagged() -> Box<dyn Parser> {
                     "note": {"type": ["string", "null"]},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
     ))
@@ -86,6 +87,7 @@ fn seed_oss() -> Box<dyn Parser> {
                     "note": {"type": ["string", "null"]},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
     ))
@@ -107,6 +109,7 @@ fn keyed_tools() -> Declared {
                 "note": {"type": ["string", "null"]},
             }}),
             strict: None,
+            extra: Default::default(),
         },
     }])
 }
@@ -154,6 +157,7 @@ fn minimax_m3() -> Box<dyn Parser> {
                     "opts": {"type": "object", "properties": {"unit": {"type": "string"}}},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
     ))

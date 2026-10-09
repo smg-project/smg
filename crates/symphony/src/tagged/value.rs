@@ -673,6 +673,7 @@ mod tests {
                 description: None,
                 parameters: value!({"type": "object", "properties": properties}),
                 strict: None,
+                extra: Default::default(),
             },
         }
     }
@@ -1327,6 +1328,7 @@ mod tests {
                 description: None,
                 parameters,
                 strict: None,
+                extra: Default::default(),
             },
         }]);
         assert_eq!(declared.kind("f", "owner"), Some(Kind::Object));
@@ -1373,6 +1375,7 @@ mod tests {
                 description: None,
                 parameters,
                 strict: None,
+                extra: Default::default(),
             },
         }]);
         assert_eq!(declared.kind("f", "a"), Some(Kind::String));
@@ -1402,6 +1405,7 @@ mod tests {
                 description: None,
                 parameters,
                 strict: None,
+                extra: Default::default(),
             },
         }]);
         assert_eq!(declared.kind("f", "meta"), Some(Kind::Object));
@@ -1462,6 +1466,7 @@ mod tests {
                 description: None,
                 parameters,
                 strict: None,
+                extra: Default::default(),
             },
         }
     }

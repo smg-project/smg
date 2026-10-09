@@ -1089,6 +1089,7 @@ mod tests {
                             "properties": { "query": { "type": "string" } },
                         }),
                         strict: None,
+                        extra: Default::default(),
                     },
                 }),
                 ResponseTool::Mcp(McpTool {

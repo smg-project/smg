@@ -586,6 +586,7 @@ mod tests {
                 description: None,
                 parameters,
                 strict,
+                extra: Default::default(),
             },
         }
     }

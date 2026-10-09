@@ -171,6 +171,7 @@ async fn test_mistral_streaming_closing_bracket() {
             description: Some("Get weather".to_string()),
             parameters: json!({}),
             strict: None,
+            extra: Default::default(),
         },
     }];
 
@@ -230,6 +231,7 @@ async fn test_mistral_streaming_bracket_in_text_after_tools() {
             description: Some("Get weather".to_string()),
             parameters: json!({}),
             strict: None,
+            extra: Default::default(),
         },
     }];
 

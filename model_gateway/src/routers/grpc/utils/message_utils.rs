@@ -415,6 +415,7 @@ pub(crate) fn custom_tool_to_chat_tool(tool: &messages::CustomTool) -> ChatTool 
             description: tool.description.clone(),
             parameters,
             strict: None,
+            extra: Default::default(),
         },
     }
 }
