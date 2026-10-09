@@ -27,14 +27,12 @@
 //! padding, added tokens with `single_word`/`lstrip`/`rstrip`) simply has no
 //! native path. `add_special_tokens = true` also stays with `tokenizers`.
 
-use std::{
-    cell::RefCell,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::cell::RefCell;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
+use thread_local::ThreadLocal;
 use tokenizers::{models::ModelWrapper, Model, Tokenizer as HfTokenizer};
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 
@@ -51,18 +49,11 @@ const BYTE_LEVEL_PATTERN: &str =
 /// Pieces up to this many bytes are cached per thread; longer ones are rare
 /// and tokenized every time.
 const CACHED_PIECE_MAX_BYTES: usize = 64;
-/// Entries per encoder in a thread's piece cache before it is cleared.
+/// Entries a thread's piece cache holds for one encoder before it is cleared.
 const PIECE_CACHE_CAPACITY: usize = 16_384;
-
-static NEXT_ENCODER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
-
-thread_local! {
-    /// Each encoder's piece cache on this thread, by encoder id.
-    static PIECE_CACHE: RefCell<FxHashMap<u64, PieceIds>> = RefCell::new(FxHashMap::default());
-}
 
 /// A literal split string as the regex that matches it, the way `Split`
 /// compiles a `String` pattern: every non-alphanumeric character escaped.
@@ -156,7 +147,6 @@ enum Segment<'t> {
 
 /// The native encode path of one tokenizer; see the module documentation.
 pub(crate) struct NativeEncoder {
-    id: u64,
     normalizer: Normalizer,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
@@ -164,6 +154,10 @@ pub(crate) struct NativeEncoder {
     normalized_added: Option<AddedTokens>,
     stages: Vec<Stage>,
     alphabet: [char; 256],
+    /// Each thread's cache from piece bytes to ids. The encoder owns them, so
+    /// they go when it does: tokenizers are added and removed at runtime, and
+    /// a thread never has to notice that an encoder it encoded with is gone.
+    piece_cache: ThreadLocal<RefCell<PieceIds>>,
 }
 
 impl std::fmt::Debug for NativeEncoder {
@@ -230,12 +224,12 @@ impl NativeEncoder {
         raw.sort();
         normalized.sort();
         Some(Self {
-            id: NEXT_ENCODER_ID.fetch_add(1, Ordering::Relaxed),
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
             normalized_added: AddedTokens::build(&normalized)?,
             stages,
             alphabet: bytes_char(),
+            piece_cache: ThreadLocal::new(),
         })
     }
 
@@ -359,15 +353,10 @@ impl NativeEncoder {
     ) -> bool {
         let bytes = piece.as_bytes();
         let cacheable = bytes.len() <= CACHED_PIECE_MAX_BYTES;
+        let cache = self.piece_cache.get_or_default();
         if cacheable {
-            let hit = PIECE_CACHE.with(|cache| {
-                let cache = cache.borrow();
-                cache
-                    .get(&self.id)
-                    .and_then(|pieces| pieces.get(bytes))
-                    .map(|found| ids.extend_from_slice(found))
-            });
-            if hit.is_some() {
+            if let Some(found) = cache.borrow().get(bytes) {
+                ids.extend_from_slice(found);
                 return true;
             }
         }
@@ -379,31 +368,13 @@ impl NativeEncoder {
             Err(_) => return false,
         }
         if cacheable {
-            PIECE_CACHE.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                let pieces = cache.entry(self.id).or_default();
-                if pieces.len() >= PIECE_CACHE_CAPACITY {
-                    pieces.clear();
-                }
-                pieces.insert(bytes.into(), ids[start..].into());
-            });
+            let mut pieces = cache.borrow_mut();
+            if pieces.len() >= PIECE_CACHE_CAPACITY {
+                pieces.clear();
+            }
+            pieces.insert(bytes.into(), ids[start..].into());
         }
         true
-    }
-}
-
-impl Drop for NativeEncoder {
-    fn drop(&mut self) {
-        // This thread's share of the cache; other threads drop theirs when
-        // they next see an id they do not know, which never happens for a
-        // retired id, so they keep it until they exit. Encoders live as long
-        // as the tokenizer registry, so that is the process lifetime in
-        // practice.
-        let _ = PIECE_CACHE.try_with(|cache| {
-            if let Ok(mut cache) = cache.try_borrow_mut() {
-                cache.remove(&self.id);
-            }
-        });
     }
 }
 
@@ -933,5 +904,35 @@ mod tests {
             }
         }
         assert!(NativeEncoder::from_tokenizer(&tokenizer).is_none());
+    }
+
+    #[test]
+    fn piece_caches_belong_to_their_encoder() {
+        // Each thread that encodes gets its own cache, held by the encoder
+        // rather than by the thread, so a removed tokenizer frees all of them.
+        let mut state = 0x1357_9BDF_2468_ACE0u64;
+        let shape = &shapes()[0];
+        let tokenizer = tokenizer_of(shape, &mut state);
+        let mut native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let model = tokenizer.get_model();
+        let threads = 4;
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let (native, barrier) = (&native, &barrier);
+                scope.spawn(move || {
+                    native.encode(model, "the same words again").expect("ids");
+                    barrier.wait();
+                });
+            }
+        });
+        let caches: Vec<usize> = native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().len())
+            .collect();
+        assert_eq!(caches.len(), threads, "{caches:?}");
+        assert!(caches.iter().all(|&entries| entries > 0), "{caches:?}");
+        drop(native);
     }
 }
