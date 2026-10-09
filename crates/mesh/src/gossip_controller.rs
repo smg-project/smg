@@ -43,7 +43,7 @@ use tracing as log;
 use tracing::{instrument, Instrument};
 
 use super::{
-    mtls::MTLSManager,
+    mtls::{tls_server_name, MTLSManager},
     service::{
         broadcast_node_states,
         gossip::{
@@ -733,11 +733,10 @@ impl GossipController {
             .map_err(|e| anyhow::anyhow!("Invalid peer endpoint {connect_url}: {e}"))?;
 
         if let Some(mtls_manager) = self.mtls_manager.clone() {
-            let tls_domain = endpoint
-                .uri()
-                .host()
-                .map(str::to_owned)
-                .unwrap_or_else(|| peer_name.clone());
+            let tls_domain = endpoint.uri().host().map_or_else(
+                || peer_name.clone(),
+                |host| tls_server_name(host).to_owned(),
+            );
             let ca_certificate = mtls_manager
                 .load_ca_certificate()
                 .await

@@ -7837,6 +7837,7 @@ dependencies = [
  "metrics",
  "num-bigint 0.4.8",
  "num-traits",
+ "openssl",
  "parking_lot",
  "prost",
  "prost-build",
