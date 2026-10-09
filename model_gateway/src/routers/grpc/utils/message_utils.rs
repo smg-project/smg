@@ -92,16 +92,42 @@ pub fn process_messages(
         None => None, // Let template use its default behavior
     };
 
-    // Step 6: Apply chat template
+    // Step 6: Apply chat template. A trailing assistant message with text is
+    // a prefill the response continues. As for chat `continue_final_message`,
+    // a renderer that continues it natively keeps it; any other gets it
+    // popped and its text appended after the generation prompt. Only the
+    // text survives that, so a message that also has thinking stays a
+    // closed turn there.
+    let continues_final_assistant = continues_final_assistant(request);
+    let native_continuation = continues_final_assistant
+        && tokenizer
+            .renderer_capabilities()
+            .native_assistant_continuation;
+    let text_only = transformed_messages
+        .last()
+        .and_then(Value::as_object)
+        .is_some_and(|message| message.keys().all(|key| key == "role" || key == "content"));
+    let assistant_prefix = if continues_final_assistant && !native_continuation && text_only {
+        transformed_messages
+            .pop()
+            .and_then(|message| message.get("content")?.as_str().map(str::to_string))
+    } else {
+        None
+    };
     let params = ChatTemplateParams {
-        add_generation_prompt: true,
+        add_generation_prompt: !native_continuation,
+        continue_final_message: native_continuation,
         tools: tools_json.as_deref(),
         thinking,
         ..Default::default()
     };
 
     let rendered = tokenizer
-        .apply_chat_template_with_encoding(&transformed_messages, params, None)
+        .apply_chat_template_with_encoding(
+            &transformed_messages,
+            params,
+            assistant_prefix.as_deref(),
+        )
         .map_err(|e| format!("Failed to apply chat template: {e}"))?;
 
     // Step 7: Build ProcessedMessages
@@ -118,6 +144,27 @@ pub fn process_messages(
         },
         rendered.encoding,
     ))
+}
+
+/// Whether the request ends with an assistant message that has text and no
+/// tool call: a prefill the response continues rather than a closed turn.
+/// A tool call ends the turn; continuing after the text would drop it, as
+/// transformers' `continue_final_message` cuts the prompt there.
+pub(crate) fn continues_final_assistant(request: &CreateMessageRequest) -> bool {
+    request.messages.last().is_some_and(|message| {
+        message.role == messages::Role::Assistant
+            && match &message.content {
+                InputContent::String(_) => true,
+                InputContent::Blocks(blocks) => {
+                    blocks
+                        .iter()
+                        .any(|block| matches!(block, InputContentBlock::Text(_)))
+                        && !blocks
+                            .iter()
+                            .any(|block| matches!(block, InputContentBlock::ToolUse(_)))
+                }
+            }
+    })
 }
 
 // ============================================================================
@@ -996,5 +1043,160 @@ mod tests {
             cache_control: None,
         };
         assert_eq!(tool_result_image_blocks(&empty).count(), 0);
+    }
+
+    /// A user turn, then `assistant` as the last message.
+    fn ending_with(assistant: Value) -> CreateMessageRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "Hello"}, assistant]
+        }))
+        .unwrap()
+    }
+
+    fn render(request: &CreateMessageRequest, tokenizer: &dyn Tokenizer) -> String {
+        process_messages(request, tokenizer, None, None, MediaPartOrder::MediaFirst)
+            .unwrap()
+            .0
+            .text
+    }
+
+    /// A trailing assistant message with text is a prefill: a Jinja template
+    /// continues it inside the turn it renders for it, header included,
+    /// instead of closing it and opening a new turn.
+    #[test]
+    fn trailing_assistant_text_is_continued_inside_its_turn() {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                r"
+{%- for m in messages -%}
+{%- if m.role == 'assistant' -%}{{- '<|turn|>assistant<|to|>user<|body|>' + m.content + '<|end|>' -}}
+{%- else -%}{{- '<|turn|>' + m.role + '<|body|>' + m.content + '<|end|>' -}}{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|turn|>assistant' -}}{%- endif -%}"
+                    .to_string(),
+            )
+            .unwrap();
+        let request = ending_with(json!({"role": "assistant", "content": [
+            {"type": "text", "text": "Sure"}
+        ]}));
+        assert!(continues_final_assistant(&request));
+        assert_eq!(
+            render(&request, &tokenizer),
+            "<|turn|>user<|body|>Hello<|end|><|turn|>assistant<|to|>user<|body|>Sure"
+        );
+    }
+
+    /// A renderer without native continuation gets the prefill appended
+    /// after the generation prompt, as chat `continue_final_message` does.
+    #[test]
+    fn trailing_assistant_text_follows_the_generation_prompt_elsewhere() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let request = ending_with(json!({"role": "assistant", "content": "Sure"}));
+        assert_eq!(render(&request, &tokenizer), "user: Hello\nassistant: Sure");
+    }
+
+    /// A trailing assistant message without text (tool calls only) is not a
+    /// prefill: it is rendered as a closed turn before a new one.
+    #[test]
+    fn trailing_tool_use_still_opens_a_new_turn() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let request = ending_with(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        ]}));
+        assert!(!continues_final_assistant(&request));
+        assert_eq!(
+            render(&request, &tokenizer),
+            "user: Hello\nassistant: \nassistant: "
+        );
+    }
+
+    /// An assistant turn as Qwen3 renders one: reasoning before the text,
+    /// tool calls after it.
+    const REASONING_TEXT_CALLS: &str = r"
+{%- for m in messages -%}
+{{- '<|im_start|>' + m.role + '\n' -}}
+{%- if m.role == 'assistant' -%}
+{%- if m.reasoning_content -%}{{- '<think>' + m.reasoning_content + '</think>' -}}{%- endif -%}
+{{- m.content or '' -}}
+{%- for tc in m.tool_calls or [] -%}{{- '<tool_call>' + tc.function.name + '</tool_call>' -}}{%- endfor -%}
+{%- else -%}{{- m.content -}}{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}{%- endif -%}";
+
+    fn jinja(template: &str) -> llm_tokenizer::TiktokenTokenizer {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer.set_chat_template(template.to_string()).unwrap();
+        tokenizer
+    }
+
+    /// Text followed by a tool call is a closed turn: continuing after the
+    /// text would drop the call, since transformers' `continue_final_message`
+    /// cuts the prompt there.
+    #[test]
+    fn trailing_text_with_tool_use_is_a_closed_turn() {
+        let request = ending_with(json!({"role": "assistant", "content": [
+            {"type": "text", "text": "Sure"},
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        ]}));
+        assert!(!continues_final_assistant(&request));
+        assert_eq!(
+            render(&request, &jinja(REASONING_TEXT_CALLS)),
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n\
+             Sure<tool_call>f</tool_call><|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    /// Thinking then text is continued after the text, its reasoning kept, as
+    /// transformers continues it.
+    #[test]
+    fn trailing_thinking_and_text_is_continued_with_its_reasoning() {
+        let request = ending_with(json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "s"},
+            {"type": "text", "text": "Sure"}
+        ]}));
+        assert!(continues_final_assistant(&request));
+        assert_eq!(
+            render(&request, &jinja(REASONING_TEXT_CALLS)),
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>plan</think>Sure"
+        );
+    }
+
+    /// Without native continuation only the text would follow the generation
+    /// prompt, so a message that also has thinking or a tool call is a
+    /// closed turn and keeps them.
+    #[test]
+    fn mixed_trailing_assistant_keeps_its_fields_elsewhere() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new().with_json_chat_template();
+        let thinking = json!({"type": "thinking", "thinking": "plan", "signature": "s"});
+        let text = json!({"type": "text", "text": "Sure"});
+        let tool_use = json!({"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}});
+        let cases = [
+            (
+                json!([thinking, text]),
+                json!({"role": "assistant", "content": "Sure", "reasoning_content": "plan"}),
+            ),
+            (
+                json!([text, tool_use]),
+                json!({"role": "assistant", "content": "Sure", "tool_calls": [
+                    {"id": "toolu_1", "type": "function", "function": {"name": "f", "arguments": {}}}
+                ]}),
+            ),
+        ];
+        for (content, kept) in cases {
+            let request = ending_with(json!({"role": "assistant", "content": content}));
+            let rendered = render(&request, &tokenizer);
+            let rendered: Value = serde_json::from_str(&rendered)
+                .unwrap_or_else(|_| panic!("text appended after the prompt: {rendered}"));
+            assert_eq!(rendered["add_generation_prompt"], json!(true));
+            assert_eq!(rendered["messages"][1], kept);
+        }
     }
 }

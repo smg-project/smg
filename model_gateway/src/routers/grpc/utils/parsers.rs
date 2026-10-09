@@ -290,9 +290,10 @@ pub fn chat_reasoning_starts_in_prefill(
     )
 }
 
-/// [`should_mark_reasoning_started`] for a Messages API request: the
+/// [`reasoning_starts_in_prefill`] for a Messages API request: the
 /// `thinking` block is the user's preference (`enabled`/`adaptive` on,
-/// `disabled` off, absent → the template's default).
+/// `disabled` off, absent → the template's default), and a trailing
+/// assistant message with text and no tool call is continued.
 pub fn messages_reasoning_starts_in_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
     tokenizer: &dyn Tokenizer,
@@ -303,7 +304,13 @@ pub fn messages_reasoning_starts_in_prefill(
         Some(ThinkingConfig::Disabled) => Some(false),
         None => None,
     };
-    should_mark_reasoning_started(user_thinking, tokenizer)
+    reasoning_starts_in_prefill(
+        None,
+        None,
+        user_thinking,
+        super::message_utils::continues_final_assistant(request),
+        tokenizer,
+    )
 }
 
 /// Whether a tool constraint already carries the model's reasoning block: a
@@ -672,6 +679,48 @@ mod tests {
         assert!(!should_mark_reasoning_started(
             resolve_user_thinking(Some(&none_kw), Some("high"), None, &tok),
             &tok
+        ));
+    }
+
+    /// A Messages prefill (trailing assistant text) continued natively is
+    /// rendered past the turn's reasoning, so the parser is not armed; a
+    /// trailing tool call, with or without text, opens a new turn and a
+    /// popped prefill follows the generation prompt, and both arm as before.
+    #[test]
+    fn messages_prefill_continued_natively_does_not_arm() {
+        let request = |last: Value| -> openai_protocol::messages::CreateMessageRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "q"}, last]
+            }))
+            .expect("messages request")
+        };
+        let prefill = request(serde_json::json!({"role": "assistant", "content": "a"}));
+        let tool_use = request(serde_json::json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        ]}));
+        let text_and_tool_use = request(serde_json::json!({"role": "assistant", "content": [
+            {"type": "text", "text": "a"},
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        ]}));
+        let thinking_on =
+            || llm_tokenizer::MockTokenizer::new().with_thinking_toggle(ThinkingToggle::DefaultOn);
+        let native =
+            thinking_on().with_renderer_capabilities(llm_tokenizer::traits::RendererCapabilities {
+                native_assistant_continuation: true,
+                ..Default::default()
+            });
+
+        assert!(!messages_reasoning_starts_in_prefill(&prefill, &native));
+        assert!(messages_reasoning_starts_in_prefill(&tool_use, &native));
+        assert!(messages_reasoning_starts_in_prefill(
+            &text_and_tool_use,
+            &native
+        ));
+        assert!(messages_reasoning_starts_in_prefill(
+            &prefill,
+            &thinking_on()
         ));
     }
 

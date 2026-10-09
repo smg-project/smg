@@ -477,6 +477,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
             stop_sequences: None,
+            continues_final_assistant: false,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -867,6 +868,7 @@ async fn messages_blocks_and_inputs(
         history_tool_calls_count: 0,
         chat_tools: chat_spec(true).tools.unwrap(),
         stop_sequences: None,
+        continues_final_assistant: false,
     };
     let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
     frames.push(complete(0, "stop"));

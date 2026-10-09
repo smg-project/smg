@@ -813,7 +813,12 @@ impl TokenizerTrait for TiktokenTokenizer {
                 raw_tool_call_arguments: true,
                 ..RendererCapabilities::default()
             },
-            Renderer::Jinja | Renderer::KimiK25Tools => RendererCapabilities::default(),
+            // Both render through the Jinja template, which continues a
+            // trailing assistant message the way transformers does.
+            Renderer::Jinja | Renderer::KimiK25Tools => RendererCapabilities {
+                native_assistant_continuation: true,
+                ..RendererCapabilities::default()
+            },
         }
     }
 
@@ -1517,7 +1522,10 @@ mod tests {
         let jinja = TiktokenTokenizer::from_dir(jinja.path()).unwrap();
         assert_eq!(
             jinja.renderer_capabilities(),
-            RendererCapabilities::default()
+            RendererCapabilities {
+                native_assistant_continuation: true,
+                ..RendererCapabilities::default()
+            }
         );
     }
 

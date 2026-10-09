@@ -606,7 +606,8 @@ pub(crate) fn process_chat_messages_with_placeholders(
                 .and_then(|v| v.as_str())
                 == Some("assistant");
         // Renderers that continue a trailing assistant message natively
-        // (DeepSeek-V4.1: rendered without EOS and without a generation
+        // (Jinja templates, cut right after the message as transformers
+        // does; DeepSeek-V4.1: rendered without EOS and without a generation
         // header) keep the message and are called without a generation
         // prompt; other templates get the message popped and its content
         // appended after the generation prompt as a prefix.
@@ -617,6 +618,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
 
         let params = ChatTemplateParams {
             add_generation_prompt: !native_continuation,
+            continue_final_message: native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
@@ -1886,6 +1888,38 @@ mod tests {
         assert_eq!(native["messages"][1]["content"], "Sure");
         assert_eq!(native["add_generation_prompt"], json!(false));
         assert_eq!(native["assistant_prefix"], json!(""));
+    }
+
+    /// An assistant turn that opens with a header the generation prompt
+    /// lacks: the continued text must follow the header.
+    const HEADER_TEMPLATE: &str = r"
+{%- for m in messages -%}
+{%- if m.role == 'assistant' -%}{{- '<|turn|>assistant<|to|>user<|body|>' + m.content + '<|end|>' -}}
+{%- else -%}{{- '<|turn|>' + m.role + '<|body|>' + m.content + '<|end|>' -}}{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|turn|>assistant' -}}{%- endif -%}";
+
+    /// A Jinja template continues the trailing assistant message inside the
+    /// turn it renders for it, as transformers does.
+    #[test]
+    fn jinja_template_continues_inside_the_assistant_turn() {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(HEADER_TEMPLATE.to_string())
+            .unwrap();
+        let (processed, _) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(
+            processed.text,
+            "<|turn|>user<|body|>Hello<|end|><|turn|>assistant<|to|>user<|body|>Sure"
+        );
     }
 
     /// Under the OpenAI content format the popped assistant message keeps its
