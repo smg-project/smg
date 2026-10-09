@@ -31,6 +31,10 @@
 //!   `<|close|>think<|sep|>` at once, and the engine's prompt replay puts the output inside the
 //!   thought first. The turn opener is the message tag with the assistant's role, so an earlier
 //!   turn's regions move nothing.
+//! - **`<|open|>` and `<|close|>` are structural tokens.** Each is one token of the vocabulary,
+//!   so an output cut by `max_tokens` inside a tag (`<|close|>message` with no `<|sep|>` after
+//!   it) ends in a tail the model cannot have written as text: the engine drops it at the end of
+//!   the output, as the engine's own streaming parser does, instead of releasing it as content.
 
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -49,6 +53,8 @@ pub fn kimi_k3() -> Format {
         .terminal("call_open", "<|open|>call tool=\"")
         .terminal("call_close", xtml::CALL_CLOSE)
         .terminal("message_close", "<|close|>message<|sep|>")
+        .structural_token("<|open|>")
+        .structural_token("<|close|>")
         .state("message", Emits::Wrapper)
         .state("reasoning", Emits::Reasoning)
         .state("content", Emits::Content)
@@ -614,5 +620,58 @@ mod tests {
         // partial marker at the end of the output.
         let events = run(PROMPT_THINKING_OFF, &["Pong.", "<|clo"]);
         assert_eq!(content(&events), "Pong.<|clo", "{events:?}");
+    }
+
+    #[test]
+    fn a_call_cut_after_an_arguments_close_keeps_every_byte_in_order() {
+        // The output cut right after the `<|close|>` of a number argument, inside a call: the
+        // assembler still holds the argument's bytes, which came before the cut tag, so the call
+        // ends first (its bytes, malformed, and its end) and the cut tag is dropped after them;
+        // every byte in exactly one event, in the output's order, and none of it content.
+        let tokens = [
+            "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"n\" type=\"number\"<|sep|>",
+            "1.5",
+            "<|close|>",
+        ];
+        let events = run(PROMPT_THINKING_OFF, &tokens);
+        assert_eq!(bytes(&events), tokens.concat(), "{events:?}");
+        assert_eq!(content(&events), "", "{events:?}");
+        let end = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .unwrap_or_else(|| panic!("the call ends: {events:?}"));
+        let cut = events
+            .iter()
+            .position(|event| *event == dropped("<|close|>"))
+            .unwrap_or_else(|| panic!("the cut tag is dropped: {events:?}"));
+        assert!(
+            end < cut,
+            "the call's bytes leave before the cut tag: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
+                    if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
+            )),
+            "the unfinished argument is the call's malformed bytes: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_tag_the_state_keeps_as_text_when_whole_stays_text() {
+        // Content has no row for the thought's close, so a whole `<|close|>think<|sep|>` there is
+        // text, where the model put it; the same tag cut short is text too, not a drop: the cut
+        // is judged as the whole tag would be. (In the thought, where the table has the row, the
+        // cut tag is dropped: `a_thought_cut_inside_its_closing_tag_keeps_the_thought_alone`.)
+        let whole = run(
+            PROMPT_THINKING_OFF,
+            &["Pong.", "<|close|>", "think", "<|sep|>"],
+        );
+        assert_eq!(content(&whole), "Pong.<|close|>think<|sep|>", "{whole:?}");
+        let cut = run(PROMPT_THINKING_OFF, &["Pong.", "<|close|>", "think"]);
+        assert_eq!(content(&cut), "Pong.<|close|>think", "{cut:?}");
+        assert_eq!(bytes(&cut), "Pong.<|close|>think");
     }
 }
