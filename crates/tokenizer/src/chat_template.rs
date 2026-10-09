@@ -17,7 +17,7 @@ use minijinja::{
         parse, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
-    value::Kwargs,
+    value::{Kwargs, ValueKind},
     Environment, Error as MinijinjaError, ErrorKind, Value,
 };
 use serde::Serialize;
@@ -948,6 +948,66 @@ fn generation_tag(tag: &str) -> Option<(usize, String)> {
     ))
 }
 
+/// Jinja2's `dict()` is Python's: it builds a map from nothing, from a
+/// mapping or from an iterable of key/value pairs, keyword arguments are
+/// written over the result, and a repeated key keeps its first position with
+/// its last value. Templates merge a schema's `$defs` entry into the property
+/// that references it as `dict((defs | items | list) + (spec | items | list))`;
+/// minijinja's own `dict` takes a mapping only and answers the pair list with
+/// a bare "invalid operation".
+fn dict_function(
+    value: Option<Value>,
+    kwargs: Kwargs,
+) -> std::result::Result<Value, MinijinjaError> {
+    let mut pairs: Vec<(Value, Value)> = Vec::new();
+    match value {
+        None => {}
+        Some(value) if value.is_undefined() => {}
+        Some(value) if value.kind() == ValueKind::Map => {
+            if let Some(iter) = value.as_object().and_then(|object| object.try_iter_pairs()) {
+                pairs.extend(iter);
+            }
+        }
+        Some(value) => {
+            let not_iterable = |kind: ValueKind| {
+                MinijinjaError::new(
+                    ErrorKind::InvalidOperation,
+                    format!("dict() takes a mapping or an iterable of key/value pairs, not {kind}"),
+                )
+            };
+            if value.is_none() {
+                return Err(not_iterable(value.kind()));
+            }
+            let items = value.try_iter().map_err(|_| not_iterable(value.kind()))?;
+            for (index, item) in items.enumerate() {
+                let pair: Vec<Value> = item
+                    .try_iter()
+                    .map_err(|_| {
+                        MinijinjaError::new(
+                            ErrorKind::InvalidOperation,
+                            format!("cannot convert dictionary update sequence element #{index} to a sequence"),
+                        )
+                    })?
+                    .collect();
+                let [key, item_value] = <[Value; 2]>::try_from(pair).map_err(|pair| {
+                    MinijinjaError::new(
+                        ErrorKind::InvalidOperation,
+                        format!(
+                            "dictionary update sequence element #{index} has length {}; 2 is required",
+                            pair.len()
+                        ),
+                    )
+                })?;
+                pairs.push((key, item_value));
+            }
+        }
+    }
+    for name in kwargs.args() {
+        pairs.push((Value::from(name), kwargs.peek::<Value>(name)?));
+    }
+    Ok(Value::from_iter(pairs))
+}
+
 /// Build a pre-configured `Environment<'static>` with the given template string,
 /// Python-compat method callback, and custom `tojson` filter already registered.
 /// The template is stored under the name `"chat"` using owned storage so the
@@ -977,6 +1037,8 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     // like ensure_ascii, separators, and sort_keys that HuggingFace templates use
     env.add_filter("tojson", tojson_filter);
     env.add_function("raise_exception", raise_exception);
+    // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
+    env.add_function("dict", dict_function);
 
     Ok(env)
 }
@@ -1412,6 +1474,41 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("strftime_now"), "{error}");
+    }
+
+    /// Jinja2's `dict()` is Python's: it builds a map from nothing, from a
+    /// mapping or from an iterable of key/value pairs, keyword arguments are
+    /// written over the result, and a repeated key keeps its first position
+    /// with its last value. A template merges a schema's `$defs` entry into
+    /// the property that references it as `dict((a | items | list) + (b |
+    /// items | list))`; the engine's own `dict` takes a mapping only.
+    #[test]
+    fn dict_builds_a_map_from_pairs_as_python_does() {
+        let template = "{{ dict([('a', 1), ('b', 2), ('a', 3)]) | tojson }}|\
+                        {{ dict({'x': 1}, y=2) | tojson }}|{{ dict() | tojson }}|\
+                        {{ dict((messages[0].defs | items | list) + \
+                        (messages[0].spec | items | rejectattr('0', 'equalto', '$ref') | list)) | tojson }}";
+        let messages = [serde_json::json!({
+            "role": "user",
+            "defs": {"type": "string", "pattern": "^[A-Z]{3}$"},
+            "spec": {"$ref": "#/$defs/airport", "description": "IATA code"},
+        })];
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            r#"{"a": 3, "b": 2}|{"x": 1, "y": 2}|{}|{"type": "string", "pattern": "^[A-Z]{3}$", "description": "IATA code"}"#
+        );
+
+        // An element that is not a key/value pair is an error, as in Python.
+        let processor = ChatTemplateProcessor::new("{{ dict([['a']]) }}".to_string()).unwrap();
+        let error = processor
+            .apply_chat_template(&[], ChatTemplateParams::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2 is required"), "{error}");
     }
 
     #[test]
