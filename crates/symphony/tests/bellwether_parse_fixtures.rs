@@ -18,8 +18,10 @@
 //! that leaves it unset or empty replays every case. A second parity test replays
 //! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
-//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves; it
-//! skips the slugs bellwether has not recorded yet, and says so. When a preview run sets
+//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves,
+//! on as many threads as the run has CPUs, each model's report written in the table's order as
+//! soon as it and the models before it are done; it skips the slugs bellwether has not recorded
+//! yet, and says so. When a preview run sets
 //! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows the classes of difference the recorded
 //! sets have ([`Allowance`]): a reference argument whose type contradicts the one the tool
 //! declares, which the template writes the same way as the string; reasoning in a reference whose
@@ -48,7 +50,17 @@
 
 mod common;
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{BufRead, BufReader},
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+};
 
 use common::{bytes_of, chunkings, prompt, replay, replay_after};
 use openai_protocol::common::Tool;
@@ -931,7 +943,8 @@ impl Said {
 #[test]
 #[expect(
     clippy::print_stderr,
-    reason = "the skip notice is test diagnostic output"
+    clippy::print_stdout,
+    reason = "the skip notice and the per-case report are test diagnostic output"
 )]
 fn qwen3_parse_fixtures_match_the_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
@@ -948,7 +961,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
         "no parse fixtures under {}",
         root.display()
     );
-    let failures = parity(
+    let Parity { report, failures } = parity(
         &fixtures,
         &ids,
         &|fixture| Family::Qwen3.engine(SLUG, fixture),
@@ -957,6 +970,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
         &[],
         Family::Qwen3.think_markers(),
     );
+    print!("{report}");
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
@@ -964,7 +978,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
 #[expect(
     clippy::print_stderr,
     clippy::print_stdout,
-    reason = "the skip notice and the per-case report are test diagnostic output"
+    reason = "the skip notices and the per-case reports are test diagnostic output"
 )]
 fn every_recorded_qwen_model_parses_like_its_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
@@ -976,29 +990,21 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
     };
     let mut failures = Vec::new();
     let mut recorded = 0;
-    for &(slug, family, prompt) in MODELS {
-        let dir = root.join(slug).join("parse");
-        if !dir.is_dir() {
-            eprintln!("skipping {slug}: bellwether has not recorded its parse sets yet");
-            continue;
-        }
-        if let Some((_, reason)) = SKIPPED.iter().find(|(skipped, _)| *skipped == slug) {
-            eprintln!("skipping {slug}: {reason}");
-            continue;
-        }
-        let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
-        println!("{slug} ({family:?}, {prompt:?}):");
-        failures.extend(parity(
-            &fixtures,
-            &ids,
-            &|fixture| family.engine(slug, fixture),
-            &|fixture| prompt.tail(fixture, family),
-            &family.known_differences(slug, prompt),
-            &family.allowances(slug, prompt),
-            family.think_markers(),
-        ));
-        recorded += 1;
-    }
+    in_order(
+        MODELS,
+        |&(slug, family, prompt)| replay_model(&root, slug, family, prompt),
+        |replayed| match replayed {
+            Replayed::Skipped(notice) => eprintln!("{notice}"),
+            Replayed::Compared {
+                report,
+                failures: of_model,
+            } => {
+                print!("{report}");
+                failures.extend(of_model);
+                recorded += 1;
+            }
+        },
+    );
     if recorded == 0 {
         eprintln!(
             "skipping: none of the table's slugs is recorded under {}",
@@ -1008,16 +1014,106 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
-/// case's `prompt_tail`, on every chunking, prints one line per case, and returns every difference
-/// that neither `known_differences` nor `allowed` allows. `every_id` is the id of every case the
-/// set files hold, before any sample thinned them: a listed difference no longer among them is a
-/// failure too, so the list cannot rot.
+/// What replaying one of [`MODELS`] gave: the notice for a slug the run leaves out, or the
+/// report a serial run would have printed for the model and the differences nothing allows.
+enum Replayed {
+    Skipped(String),
+    Compared {
+        report: String,
+        failures: Vec<String>,
+    },
+}
+
+/// Replay one of [`MODELS`]: its parse sets under `root`, read as [`read_fixtures`] reads them,
+/// through its table after its prompt tail, with its known differences and allowances.
 #[expect(
-    clippy::print_stdout,
     clippy::panic,
-    reason = "the per-case report is diagnostic output; a fixture that cannot be replayed ends \
-              the test with its id"
+    reason = "a set that cannot be read ends the test with its path"
+)]
+fn replay_model(
+    root: &std::path::Path,
+    slug: &str,
+    family: Family,
+    prompt: GenerationPrompt,
+) -> Replayed {
+    let dir = root.join(slug).join("parse");
+    if !dir.is_dir() {
+        return Replayed::Skipped(format!(
+            "skipping {slug}: bellwether has not recorded its parse sets yet"
+        ));
+    }
+    if let Some((_, reason)) = SKIPPED.iter().find(|(skipped, _)| *skipped == slug) {
+        return Replayed::Skipped(format!("skipping {slug}: {reason}"));
+    }
+    let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let Parity { report, failures } = parity(
+        &fixtures,
+        &ids,
+        &|fixture| family.engine(slug, fixture),
+        &|fixture| prompt.tail(fixture, family),
+        &family.known_differences(slug, prompt),
+        &family.allowances(slug, prompt),
+        family.think_markers(),
+    );
+    Replayed::Compared {
+        report: format!("{slug} ({family:?}, {prompt:?}):\n{report}"),
+        failures,
+    }
+}
+
+/// Run `each` on every item, on as many threads as the run has CPUs, each thread taking the
+/// next item from a shared index, and hand what it gives to `then` in the items' order, each
+/// as soon as it and the ones before it are done. A panic in `each` ends the run once the items
+/// in flight are done, as it would on one thread.
+fn in_order<I: Sync, T: Send>(items: &[I], each: impl Fn(&I) -> T + Sync, mut then: impl FnMut(T)) {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(items.len())
+        .max(1);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let (next, each) = (&next, &each);
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(index) else {
+                    break;
+                };
+                if tx.send((index, each(item))).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(tx);
+        let mut pending = BTreeMap::new();
+        let mut done = 0;
+        for (index, outcome) in rx {
+            pending.insert(index, outcome);
+            while let Some(outcome) = pending.remove(&done) {
+                then(outcome);
+                done += 1;
+            }
+        }
+    });
+}
+
+/// What [`parity`] gave for a set: the report, one line per case and the set's summary, as a
+/// serial run would have printed it, and every difference that nothing allows.
+struct Parity {
+    report: String,
+    failures: Vec<String>,
+}
+
+/// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
+/// case's `prompt_tail`, on every chunking, reports one line per case and the set's summary, and
+/// returns with them every difference that neither `known_differences` nor `allowed` allows.
+/// `every_id` is the id of every case the set files hold, before any sample thinned them: a
+/// listed difference no longer among them is a failure too, so the list cannot rot.
+#[expect(
+    clippy::panic,
+    reason = "a fixture that cannot be replayed ends the test with its id"
 )]
 fn parity(
     fixtures: &[Fixture],
@@ -1027,13 +1123,14 @@ fn parity(
     known_differences: &[KnownDifference],
     allowed: &[Allowance],
     think_markers: (&str, &str),
-) -> Vec<String> {
+) -> Parity {
     let known = |id: &str| {
         known_differences
             .iter()
             .find(|known| known.id == after_slug(id))
     };
     let mut failures = Vec::new();
+    let mut out = String::new();
     let (mut bitwise, mut separators_only, mut listed, mut allowed_count) = (0, 0, 0, 0);
     let (mut token_plans_run, mut without_pieces) = (0, 0);
     for fixture in fixtures {
@@ -1163,9 +1260,9 @@ fn parity(
                 fixture.id
             ));
         }
-        println!("  {verdict:34} {}", fixture.id);
+        out.push_str(&format!("  {verdict:34} {}\n", fixture.id));
         if let Some(listed_case) = known(&fixture.id) {
-            println!("  {:34} {}", "", listed_case.reason);
+            out.push_str(&format!("  {:34} {}\n", "", listed_case.reason));
         }
     }
     // A listed case that is no longer among the fixtures would let the list rot. The check reads
@@ -1179,13 +1276,16 @@ fn parity(
         }
     }
     let sample = sample_note(sample_every());
-    println!(
+    out.push_str(&format!(
         "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, \
          {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} token plans \
-         replayed, {without_pieces} cases without output_pieces",
+         replayed, {without_pieces} cases without output_pieces\n",
         fixtures.len()
-    );
-    failures
+    ));
+    Parity {
+        report: out,
+        failures,
+    }
 }
 
 /// The allowance that covers the difference between `said` and `expected`, if one of `allowed`
@@ -1699,9 +1799,10 @@ fn step_for(file: &std::path::Path, every: usize) -> usize {
     }
 }
 
-/// Every `every`-th of `items`, the first included: the same slice of a set every run.
-fn sampled<T>(items: Vec<T>, every: usize) -> Vec<T> {
-    items.into_iter().step_by(every.max(1)).collect()
+/// Whether the case at `index` of its set is in the sample: every `every`-th from the first, the
+/// same slice of a set every run.
+fn kept(index: usize, every: usize) -> bool {
+    index.is_multiple_of(every.max(1))
 }
 
 /// The cases a slug's set files gave.
@@ -1727,19 +1828,27 @@ fn read_fixtures(dir: &std::path::Path) -> Result<Cases, String> {
     let mut fixtures = Vec::new();
     let mut ids = Vec::new();
     for file in files {
-        let text = fs::read_to_string(&file)
-            .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-        let mut of_this_set = Vec::new();
-        for (number, line) in text.lines().enumerate() {
+        let step = step_for(&file, every);
+        let reader = BufReader::new(
+            fs::File::open(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?,
+        );
+        // The set is read a line at a time, every case parsed as before, and a case outside the
+        // sample dropped as it is read, so the run holds the sampled cases and one line of a
+        // set, however many models are in flight.
+        let mut index = 0;
+        for (number, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| format!("cannot read {}: {e}", file.display()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let fixture: Fixture = serde_json::from_str(line)
+            let fixture: Fixture = serde_json::from_str(&line)
                 .map_err(|e| format!("{}:{}: {e}", file.display(), number + 1))?;
-            of_this_set.push(fixture);
+            ids.push(fixture.id.clone());
+            if kept(index, step) {
+                fixtures.push(fixture);
+            }
+            index += 1;
         }
-        ids.extend(of_this_set.iter().map(|fixture| fixture.id.clone()));
-        fixtures.extend(sampled(of_this_set, step_for(&file, every)));
     }
     Ok(Cases { fixtures, ids })
 }
@@ -1781,10 +1890,11 @@ fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
 
 #[test]
 fn a_sample_keeps_every_nth_case_of_a_set_from_its_first() {
-    assert_eq!(sampled((0..10).collect::<Vec<_>>(), 3), [0, 3, 6, 9]);
-    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 1), [0, 1, 2, 3]);
-    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 10), [0]);
-    assert!(sampled(Vec::<u8>::new(), 2).is_empty());
+    let sampled = |cases: usize, every| (0..cases).filter(|&i| kept(i, every)).collect::<Vec<_>>();
+    assert_eq!(sampled(10, 3), [0, 3, 6, 9]);
+    assert_eq!(sampled(4, 1), [0, 1, 2, 3]);
+    assert_eq!(sampled(4, 10), [0]);
+    assert!(sampled(0, 2).is_empty());
 }
 
 #[test]
