@@ -179,8 +179,8 @@ _p(
 _p(
     "openai.chat.core.max-tokens-legacy-classic",
     C,
-    _classic(max_tokens=64),
-    note="max_tokens accepted on classic models",
+    {"model": "@MODEL_CLASSIC", "messages": [_u("Say hi in one word.")], "max_tokens": 64},
+    note="the legacy cap alone (with max_completion_tokens as well the vendor rejects the pair)",
 )
 _p(
     "openai.chat.core.max-completion-tokens-16",
@@ -334,7 +334,8 @@ _p(
     "openai.chat.params.max-tokens-and-max-completion-tokens",
     P,
     _classic(max_tokens=64, max_completion_tokens=64),
-    note="both caps given",
+    expect="error",
+    note="both caps given: invalid_parameter_combination at the vendor",
 )
 _p("openai.chat.params.temp-on-reasoning", P, _base(temperature=0.5), expect="error")
 _p("openai.chat.params.max-tokens-on-reasoning", P, _base(max_tokens=64), expect="error")
