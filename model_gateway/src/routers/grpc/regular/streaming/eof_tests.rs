@@ -373,7 +373,9 @@ async fn chat_role_chunk_goes_out_on_the_first_engine_output() {
     let data = text.trim().strip_prefix("data: ").expect("SSE data line");
     let event: Value = serde_json::from_str(data).expect("SSE JSON");
     assert_eq!(event["choices"][0]["delta"]["role"], "assistant");
-    assert!(event["choices"][0]["delta"]["content"].is_null());
+    // The role chunk carries an empty content, the shape the engines' own
+    // servers send (role once, content ""), not a null.
+    assert_eq!(event["choices"][0]["delta"]["content"], "");
     gate_tx.send(()).expect("open the gate");
     let events = collect_events(rx).await;
     task.await.expect("stream task").expect("stream processed");

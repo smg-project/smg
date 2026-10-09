@@ -237,7 +237,7 @@ mod tests {
             wire(delta(0, &Event::Content(Text::uncounted("Hello")))),
             json!({
                 "index": 0,
-                "delta": {"role": "assistant", "content": "Hello", "reasoning_content": null},
+                "delta": {"role": "assistant", "content": "Hello"},
                 "logprobs": null,
                 "finish_reason": null,
             })
@@ -277,7 +277,6 @@ mod tests {
                         "type": "function",
                         "function": {"name": "get_weather"},
                     }],
-                    "reasoning_content": null,
                 },
                 "logprobs": null,
                 "finish_reason": null,
@@ -299,7 +298,6 @@ mod tests {
                 "delta": {
                     "role": "assistant",
                     "tool_calls": [{"index": 1, "function": {"arguments": "{\"city\":"}}],
-                    "reasoning_content": null,
                 },
                 "logprobs": null,
                 "finish_reason": null,
@@ -318,7 +316,7 @@ mod tests {
             wire(delta(3, &finish)),
             json!({
                 "index": 3,
-                "delta": {"reasoning_content": null},
+                "delta": {},
                 "logprobs": null,
                 "finish_reason": "length",
             })
