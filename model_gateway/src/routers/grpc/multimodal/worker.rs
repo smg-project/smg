@@ -82,6 +82,11 @@ pub struct WorkerMediaSettings {
     pub max_item_bytes: Option<usize>,
     pub allowed_domains: Option<Vec<String>>,
     pub fetch_timeout: Duration,
+    /// The engine's own video frame budget: its `--media-io-kwargs`
+    /// `video.num_frames` when set (`0` for every frame), else its loader's
+    /// default; `None` when unknown. A spec that samples the way the engine's
+    /// loader does takes it in place of its own constant.
+    pub video_frame_budget: Option<usize>,
 }
 
 /// What set a modality's effective per-request item limit.
@@ -389,6 +394,7 @@ impl WorkerMediaPipeline {
                 .collect(),
             processing: MmProcessingMode::Worker,
             inflight: None,
+            video_frame_budget: settings.video_frame_budget,
         };
         Ok(Self {
             components,
@@ -434,6 +440,11 @@ impl WorkerMediaPipeline {
             .collect();
         limits.sort();
         limits.join(", ")
+    }
+
+    /// The engine's video frame budget the pipeline samples under, if known.
+    pub fn video_frame_budget(&self) -> Option<usize> {
+        self.components.video_frame_budget
     }
 
     /// Process one request's references against its prompt, which carries
@@ -903,6 +914,7 @@ mod unsupported_model_tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -940,6 +952,7 @@ mod unsupported_model_tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
         };
         let message = unsupported_model_message(
             &settings,

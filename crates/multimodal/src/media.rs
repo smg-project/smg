@@ -104,6 +104,25 @@ pub enum FrameSampling {
     UpTo { max_frames: usize },
 }
 
+impl FrameSampling {
+    /// This sampling under the engine's own video frame budget (vLLM's
+    /// `--media-io-kwargs` `video.num_frames`, else its loader's default): a
+    /// spec that samples the way the engine's loader does takes the budget in
+    /// place of its own constant, so a clip costs what it costs on the
+    /// engine's own server; `0` is every frame, as vLLM reads a non-positive
+    /// count. The rate-based samplers are not the loader's and keep their
+    /// rule; `None` leaves the spec's choice.
+    pub fn with_frame_budget(self, budget: Option<usize>) -> Self {
+        match (self, budget) {
+            (Self::UpTo { .. }, Some(0)) => Self::UpTo {
+                max_frames: usize::MAX,
+            },
+            (Self::UpTo { .. }, Some(max_frames)) => Self::UpTo { max_frames },
+            (sampling, _) => sampling,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct VideoFetchConfig {
     pub min_frames: usize,
@@ -2578,6 +2597,44 @@ fn skip_ppm_whitespace_and_comments(bytes: &[u8], pos: &mut usize) {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+
+    /// The engine's frame budget replaces only the loader-style budget: the
+    /// rate-based samplers keep their rule, `0` means every frame, `None`
+    /// changes nothing.
+    #[test]
+    fn frame_budget_applies_to_the_loader_style_sampler_only() {
+        let loader = FrameSampling::UpTo { max_frames: 32 };
+        assert_eq!(
+            loader.with_frame_budget(Some(16)),
+            FrameSampling::UpTo { max_frames: 16 }
+        );
+        assert_eq!(
+            loader.with_frame_budget(Some(0)),
+            FrameSampling::UpTo {
+                max_frames: usize::MAX
+            }
+        );
+        assert_eq!(loader.with_frame_budget(None), loader);
+        assert_eq!(
+            FrameSampling::Even.with_frame_budget(Some(16)),
+            FrameSampling::Even
+        );
+        assert_eq!(
+            FrameSampling::Interval.with_frame_budget(Some(16)),
+            FrameSampling::Interval
+        );
+        // A 50-frame clip under a budget of 16 is sampled like the loader does.
+        let cfg = VideoFetchConfig {
+            sampling: loader.with_frame_budget(Some(16)),
+            ..VideoFetchConfig::default()
+        };
+        assert_eq!(super::sampled_frame_indices(50, 10.0, cfg).len(), 16);
+        let cfg = VideoFetchConfig {
+            sampling: loader.with_frame_budget(Some(0)),
+            ..VideoFetchConfig::default()
+        };
+        assert_eq!(super::sampled_frame_indices(50, 10.0, cfg).len(), 50);
+    }
 
     use bytes::Bytes;
     use futures::stream;

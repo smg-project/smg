@@ -215,10 +215,13 @@ Worker-side media processing uses the same `--mm-processor` /
   the same way. It serves the model families that pipeline supports
   (`crates/multimodal`), takes `http`, `https` and `data` references, reads
   the model's `config.json` and preprocessor configs from the tokenizer
-  directory the launcher resolved, and refuses a request above the engine's
-  own `--limit-mm-per-prompt` as the engine's server does (`--mm-max-items`
-  and `SMG_*_MAX_COUNT` tighten those limits, never loosen them). An engine
-  that normalizes pixels on device
+  directory the launcher resolved, refuses a request above the engine's own
+  `--limit-mm-per-prompt` as the engine's server does (`--mm-max-items` and
+  `SMG_*_MAX_COUNT` tighten those limits, never loosen them), and samples a
+  video to the engine's own frame budget (`--media-io-kwargs`
+  `video.num_frames`, else its loader's default) where the family's processor
+  takes the loader's frames, so a clip costs the same tokens as on the engine's
+  own server. An engine that normalizes pixels on device
   (vLLM's `mm_device_do_normalize`, on by default for the Qwen-VL family)
   takes raw `uint8` pixels, and the pipeline writes those for it; a model
   whose processor cannot emit raw pixels is refused at startup under that

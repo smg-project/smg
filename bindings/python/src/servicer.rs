@@ -509,6 +509,9 @@ fn native_media_options(
             })?,
         None => serde_json::Map::new(),
     };
+    // The engine's own video frame budget (`0`: every frame); absent when
+    // the launcher could not tell, which leaves each spec to its constant.
+    let video_frame_budget = count("video_frame_budget")?;
     let fetch_timeout_ms: u64 = item("fetch_timeout_ms")?
         .map(|v| v.extract())
         .transpose()?
@@ -547,6 +550,7 @@ fn native_media_options(
             max_item_bytes: count("max_item_bytes")?,
             allowed_domains,
             fetch_timeout: Duration::from_millis(fetch_timeout_ms),
+            video_frame_budget,
         },
         source: string("source")?.unwrap_or_else(|| "default".to_string()),
         max_inflight: count("max_inflight")?.unwrap_or(4).max(1),
@@ -743,6 +747,7 @@ impl PyVllmGrpcServer {
                 pixel_format = ?pipeline.pixel_format(),
                 max_inflight = native.max_inflight,
                 item_limits = %pipeline.item_limits_summary(),
+                video_frame_budget = ?pipeline.video_frame_budget(),
                 "smg media processor ready"
             );
             config.media_processor = Some(Arc::new(SmgMediaProcessor {
