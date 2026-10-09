@@ -510,4 +510,5 @@ class TestRouterPositionalSignature:
             "tenant_rate_limit_enabled",
             "tenant_rate_limit_config",
             "jemalloc_prof_dir",
+            "tokenizer_cache_l0_max_memory",
         ]

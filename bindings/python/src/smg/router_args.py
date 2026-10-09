@@ -166,7 +166,6 @@ class RouterArgs:
     # Tokenizer cache configuration
     tokenizer_cache_enable_l0: bool = False
     tokenizer_cache_l0_max_entries: int = 10000
-    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
     tokenizer_cache_enable_l1: bool = False
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     # Parser configuration
@@ -337,6 +336,9 @@ class RouterArgs:
     mesh_tls_ca_cert: str | None = None
     mesh_tls_cert: str | None = None
     mesh_tls_key: str | None = None
+    # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory);
+    # appended last for the same reason
+    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
 
     @staticmethod
     def add_cli_args(
@@ -1748,7 +1750,7 @@ class RouterArgs:
             default=RouterArgs.tokenizer_cache_l0_max_memory,
             help="Maximum memory for L0 tokenizer cache in bytes: texts, ids and per-entry overhead (default: 256MB)",
         )
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-l1-max-memory",
             type=int,
             default=RouterArgs.tokenizer_cache_l1_max_memory,

@@ -1672,7 +1672,6 @@ class TestRouterArgsFieldOrder:
         "disable_tokenizer_autoload",
         "tokenizer_cache_enable_l0",
         "tokenizer_cache_l0_max_entries",
-        "tokenizer_cache_l0_max_memory",
         "tokenizer_cache_enable_l1",
         "tokenizer_cache_l1_max_memory",
         "reasoning_parser",
@@ -1782,6 +1781,7 @@ class TestRouterArgsFieldOrder:
         "mesh_tls_ca_cert",
         "mesh_tls_cert",
         "mesh_tls_key",
+        "tokenizer_cache_l0_max_memory",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1841,6 +1841,7 @@ class TestRouterArgsFieldOrder:
             "priority_scheduler_tenant_metric_top_n",
             "tenant_rate_limit_enabled",
             "tenant_rate_limit_config",
+            "tokenizer_cache_l0_max_memory",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
