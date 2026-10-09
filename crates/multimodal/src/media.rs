@@ -1554,8 +1554,12 @@ async fn decode_video_with_ffmpeg(
     };
     // A container claiming more frames than its stream holds leaves the
     // selection short. The engine's loader then sizes the clip by the frames
-    // it can see; the rate-based samplings resample instead.
-    if matches!(cfg.sampling, FrameSampling::UpTo { .. }) {
+    // it can see; the rate-based samplings resample instead. Counting the
+    // frames decodes the stream once more, so a selection that ran past the
+    // command timeout is not counted: the count would time out as well.
+    if matches!(cfg.sampling, FrameSampling::UpTo { .. })
+        && !is_video_command_timeout(&selected_error)
+    {
         if let Some(resized) = probe_decoded_frame_count(input_path)
             .await
             .ok()
@@ -1755,6 +1759,14 @@ fn checked_decoded_rgb_bytes(
     Ok(bytes)
 }
 
+/// What `run_video_command_output` writes into the error of a command that ran past the timeout.
+const VIDEO_COMMAND_TIMED_OUT: &str = "timed out after";
+
+/// `true` for the error of a command that ran past the timeout.
+fn is_video_command_timeout(error: &MediaConnectorError) -> bool {
+    matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_COMMAND_TIMED_OUT))
+}
+
 async fn run_video_command_output(
     mut command: Command,
     program: &'static str,
@@ -1778,7 +1790,7 @@ async fn run_video_command_output(
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(MediaConnectorError::Io(error)),
         Err(_) => Err(MediaConnectorError::VideoDecode(format!(
-            "{program} timed out after {:.3} seconds",
+            "{program} {VIDEO_COMMAND_TIMED_OUT} {:.3} seconds",
             timeout.as_secs_f64()
         ))),
     }
@@ -3614,6 +3626,19 @@ mod video_sampling_tests {
         let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
         assert_eq!(info.source_fps, Some(25.0));
         assert_eq!((info.total_frames, info.container_frames), (None, None));
+    }
+
+    #[test]
+    fn a_timed_out_command_is_told_apart_from_other_decode_failures() {
+        assert!(is_video_command_timeout(&MediaConnectorError::VideoDecode(
+            "ffmpeg timed out after 30.000 seconds".to_string()
+        )));
+        assert!(!is_video_command_timeout(
+            &MediaConnectorError::VideoDecode("ffmpeg produced 31 frames, expected 32".to_string())
+        ));
+        assert!(!is_video_command_timeout(&MediaConnectorError::Timeout(
+            Duration::from_secs(30)
+        )));
     }
 
     #[test]
