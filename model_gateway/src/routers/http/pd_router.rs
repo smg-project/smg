@@ -2287,6 +2287,8 @@ impl PDRouter {
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
+        // Every leg built here is sent; counted per leg, on its worker.
+        Metrics::record_worker_request(worker.url(), worker.model_id());
         let mut request = attach_sized_body(
             worker
                 .http_client()
@@ -2737,6 +2739,7 @@ impl RouterTrait for PDRouter {
             headers,
             worker.api_key(),
         );
+        Metrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request).await {
             Ok(res) => res,
             Err(e) => {

@@ -1922,6 +1922,10 @@ impl WorkerRegistry {
             self.bump_global_routing_epoch();
         }
 
+        // The worker's request counter starts at zero with its registration,
+        // so a worker that gets no traffic shows as such.
+        Metrics::init_worker_requests(worker.url(), worker.model_id());
+
         // Update model index for O(1) lookups using copy-on-write.
         for model_id in Self::worker_model_ids(&worker) {
             self.add_worker_to_model_index(&model_id, worker.clone());

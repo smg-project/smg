@@ -691,6 +691,9 @@ async fn execute_single(
 
     let prompt_tokens = u64::try_from(proto_request.prompt_len()).unwrap_or(u64::MAX);
     let streaming = proto_request.stream();
+    if let Some(worker) = workers.single() {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
     let result = client.generate(proto_request).await;
     workers.record_outcome(result.cb_status_code());
 
@@ -754,6 +757,9 @@ async fn execute_single_embed(
         )
     })?;
 
+    if let Some(worker) = workers.single() {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
     let result = client.embed(proto_request).await;
     workers.record_outcome(result.cb_status_code());
 
@@ -822,6 +828,12 @@ async fn execute_parallel_pd(
     // its partner fails can be moved off the request path.
     let mut prefill_client = prefill_client.clone();
     let mut decode_client = decode_client.clone();
+    for worker in [workers.prefill_worker(), workers.decode_worker()]
+        .into_iter()
+        .flatten()
+    {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
     let prefill_dispatch: PdLegDispatch =
         Box::pin(async move { prefill_client.generate(prefill_request).await });
     let decode_dispatch: PdLegDispatch =
@@ -1253,6 +1265,9 @@ async fn execute_sequential_pd(
     // Send to prefill, wait for completion
     let (prefill_label, decode_label) = pd_leg_labels(workers);
     let prefill_start = Instant::now();
+    if let Some(prefill) = workers.prefill_worker() {
+        Metrics::record_worker_request(prefill.url(), prefill.model_id());
+    }
     let mut prefill_stream = prefill_client
         .generate(prefill_request)
         .await
@@ -1411,6 +1426,9 @@ async fn execute_sequential_pd(
     }
 
     // Send request to decode
+    if let Some(decode) = workers.decode_worker() {
+        Metrics::record_worker_request(decode.url(), decode.model_id());
+    }
     let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
         workers.record_outcome_decode(e.http_status().as_u16());
         Metrics::record_worker_error(

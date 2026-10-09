@@ -332,6 +332,10 @@ pub(crate) fn init_metrics() {
         "smg_worker_requests_active",
         "Currently running requests per worker"
     );
+    describe_counter!(
+        "smg_worker_requests_total",
+        "Requests dispatched to a worker by worker (URL) and model, counted at each send"
+    );
     describe_gauge!(
         "smg_worker_health",
         "Worker health status (1=healthy, 0=unhealthy)"
@@ -1652,6 +1656,28 @@ impl Metrics {
     }
 
     /// Set running requests per worker
+    /// A request dispatched to a worker (each attempt, each PD leg), counted
+    /// at the send. The per-worker gauges miss short requests and cannot be
+    /// summed over a window, so this is how the share of traffic per worker
+    /// is read from the scrape.
+    pub fn record_worker_request(worker_url: &str, model_id: &str) {
+        Self::worker_requests(worker_url, model_id).increment(1);
+    }
+
+    /// A worker registered: its request counter exists from zero, so a
+    /// worker that gets no traffic shows as such instead of being absent.
+    pub fn init_worker_requests(worker_url: &str, model_id: &str) {
+        Self::worker_requests(worker_url, model_id).increment(0);
+    }
+
+    fn worker_requests(worker_url: &str, model_id: &str) -> metrics::Counter {
+        counter!(
+            "smg_worker_requests_total",
+            "worker" => intern_string(worker_url),
+            "model" => intern_model_label(model_id)
+        )
+    }
+
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         let worker_interned = intern_string(worker);
         gauge!(
