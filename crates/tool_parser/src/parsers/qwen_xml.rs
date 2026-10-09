@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
 use regex::Regex;
@@ -19,6 +21,8 @@ use crate::{
 /// - Tool Call Tags: `<tool_call>` and `</tool_call>` wrap each individual call
 /// - XML-style function declaration: `<function=name>`
 /// - XML-style parameters: `<parameter=key>value</parameter>`
+/// - String-typed parameter values stream as they are generated; other types
+///   arrive whole once their value is complete (coercion needs all of it)
 ///
 /// Reference: https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8?chat_template=default
 pub struct QwenXmlParser {
@@ -52,6 +56,44 @@ pub struct QwenXmlParser {
     /// Precompiled regex patterns for XML format parsing
     xml_function_pattern: Regex,
     xml_param_pattern: Regex,
+    xml_param_open_pattern: Regex,
+
+    /// The string parameter whose value is being streamed, if any
+    open_parameter: Option<OpenParameter>,
+}
+
+/// Closing tags a parameter value runs into. A suffix of the buffer that is a
+/// prefix of one of them is held back until the next chunk decides.
+const CLOSING_TAGS: [&str; 3] = ["</parameter>", "</function>", "</tool_call>"];
+
+/// A string-typed `<parameter>` whose `</parameter>` has not arrived yet.
+///
+/// Its value is streamed as it is generated, JSON-escaped and trimmed like
+/// the complete parse, instead of being held until the parameter closes.
+struct OpenParameter {
+    key: String,
+    /// Offset in the buffer of the first byte after the opening tag.
+    value_start: usize,
+    /// Offset in the buffer up to which the value has been streamed. `None`
+    /// until the first non-whitespace byte: the `"key": "` prefix goes out
+    /// with it, so a parameter without a value yet is never invented.
+    streamed_end: Option<usize>,
+    /// The escaped value streamed so far; only the remainder goes out when
+    /// the parameter closes.
+    sent: String,
+    /// A JSON string literal (`"..."`), which the complete parse unwraps: it
+    /// is left to arrive whole.
+    literal: bool,
+}
+
+/// The body of `text` as a JSON string, without the surrounding quotes.
+fn json_string_body(text: &str) -> String {
+    let quoted = serde_json::to_string(text).unwrap_or_default();
+    quoted
+        .strip_prefix('"')
+        .and_then(|body| body.strip_suffix('"'))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Parse a raw parameter value, similar to Python's `_safe_val`.
@@ -113,6 +155,8 @@ impl QwenXmlParser {
             Regex::new(r"<function=([^>]+)>").expect("Valid XML function pattern");
         let xml_param_pattern = Regex::new(r"(?s)<parameter=([^>]+)>(.*?)</parameter>")
             .expect("Valid XML parameter pattern");
+        let xml_param_open_pattern =
+            Regex::new(r"<parameter=([^>]+)>").expect("Valid XML parameter start pattern");
 
         Self {
             extractor,
@@ -128,6 +172,8 @@ impl QwenXmlParser {
             current_parameters: serde_json::Map::new(),
             xml_function_pattern,
             xml_param_pattern,
+            xml_param_open_pattern,
+            open_parameter: None,
         }
     }
 
@@ -258,6 +304,176 @@ impl QwenXmlParser {
         calls
     }
 
+    /// Close the string parameter streamed so far once its `</parameter>` has
+    /// arrived: its remainder goes out before the buffer's complete parameters
+    /// are parsed, which records it so that it is not sent a second time.
+    fn finish_closed_parameter(
+        &mut self,
+        tools: &[Tool],
+        parameter_end: usize,
+    ) -> Vec<ToolCallItem> {
+        let closed_at = self.open_parameter.as_ref().and_then(|open| {
+            self.buffer[open.value_start..parameter_end]
+                .find("</parameter>")
+                .map(|close| open.value_start + close)
+        });
+        let Some(value_end) = closed_at else {
+            return Vec::new();
+        };
+        let param_types = helpers::param_types_for_function(tools, &self.current_function_name);
+        self.finish_open_parameter(&param_types, value_end)
+    }
+
+    /// Stream the value of the parameter still open at the end of the buffer
+    /// when its declared type is `string`. Other types need the complete value
+    /// for coercion and keep arriving whole from `parse_and_stream_parameters`,
+    /// which runs first: the open parameter follows every complete one.
+    fn stream_open_parameter(&mut self, tools: &[Tool], parameter_end: usize) -> Vec<ToolCallItem> {
+        let mut calls = Vec::new();
+        let param_types = helpers::param_types_for_function(tools, &self.current_function_name);
+
+        // The last opening tag without a closing tag is the parameter now open.
+        let region = &self.buffer[..parameter_end];
+        let Some(open_tag) = self.xml_param_open_pattern.captures_iter(region).last() else {
+            return calls;
+        };
+        let value_start = open_tag.get(0).map_or(parameter_end, |m| m.end());
+        let value_region = &region[value_start..];
+        if value_region.contains("</parameter>") {
+            return calls;
+        }
+        let key = open_tag.get(1).map_or("", |m| m.as_str()).trim();
+        if param_types.get(key).map(String::as_str) != Some("string") {
+            return calls;
+        }
+        if self
+            .open_parameter
+            .as_ref()
+            .is_none_or(|open| open.key != key || open.value_start != value_start)
+        {
+            self.open_parameter = Some(OpenParameter {
+                key: key.to_string(),
+                value_start,
+                streamed_end: None,
+                sent: String::new(),
+                literal: false,
+            });
+        }
+
+        // The value runs to a closing tag (a `</function>` without the
+        // `</parameter>` ends it too); a suffix that may begin one is held back.
+        let region_end = match value_region.find("</function>") {
+            Some(end) => value_start + end,
+            None => {
+                let held = CLOSING_TAGS
+                    .iter()
+                    .filter_map(|tag| helpers::ends_with_partial_token(value_region, tag))
+                    .max()
+                    .unwrap_or(0);
+                parameter_end - held
+            }
+        };
+
+        let tool_index = self.current_tool_id as usize;
+        let Some(open) = self.open_parameter.as_mut() else {
+            return calls;
+        };
+        if open.literal {
+            return calls;
+        }
+        let from = match open.streamed_end {
+            Some(end) => end,
+            None => {
+                let raw = &self.buffer[value_start..region_end];
+                let from = value_start + (raw.len() - raw.trim_start().len());
+                if from >= region_end {
+                    return calls;
+                }
+                if self.buffer[from..].starts_with('"') {
+                    open.literal = true;
+                    return calls;
+                }
+                from
+            }
+        };
+        if region_end <= from {
+            return calls;
+        }
+        let fresh = self.buffer[from..region_end].trim_end();
+        if fresh.is_empty() {
+            return calls;
+        }
+        let body = json_string_body(fresh);
+        let mut delta = String::new();
+        if open.streamed_end.is_none() {
+            let key_json =
+                serde_json::to_string(&open.key).unwrap_or_else(|_| format!("\"{}\"", open.key));
+            delta.push_str(if self.streamed_args_for_tool[tool_index].is_empty() {
+                "{"
+            } else {
+                ", "
+            });
+            delta.push_str(&key_json);
+            delta.push_str(": \"");
+        }
+        delta.push_str(&body);
+        open.sent.push_str(&body);
+        open.streamed_end = Some(from + fresh.len());
+        self.streamed_args_for_tool[tool_index].push_str(&delta);
+        calls.push(ToolCallItem {
+            tool_index,
+            name: None,
+            parameters: delta,
+        });
+        calls
+    }
+
+    /// Close the streamed parameter whose value ends at `value_end`: hand out
+    /// what the complete value still lacks and the closing quote, and record
+    /// the parameter so `parse_and_stream_parameters` does not send it again.
+    fn finish_open_parameter(
+        &mut self,
+        param_types: &HashMap<String, String>,
+        value_end: usize,
+    ) -> Vec<ToolCallItem> {
+        let Some(open) = self.open_parameter.take() else {
+            return Vec::new();
+        };
+        if open.streamed_end.is_none() {
+            return Vec::new();
+        }
+        let tool_index = self.current_tool_id as usize;
+        let value = coerce_value(
+            &self.buffer[open.value_start..value_end],
+            param_types.get(&open.key).map(String::as_str),
+        );
+        let full = serde_json::to_string(&value).unwrap_or_default();
+        let body = full
+            .strip_prefix('"')
+            .and_then(|body| body.strip_suffix('"'))
+            .unwrap_or_default();
+        // What was streamed cannot be retracted: should the complete value
+        // not extend it, the quote alone closes the string.
+        let mut tail = body
+            .strip_prefix(open.sent.as_str())
+            .unwrap_or_default()
+            .to_string();
+        tail.push('"');
+        self.streamed_args_for_tool[tool_index].push_str(&tail);
+        if let Some(arguments) = self.prev_tool_call_arr[tool_index]
+            .get_mut("arguments")
+            .and_then(Value::as_object_mut)
+        {
+            arguments.insert(open.key.clone(), value.clone());
+        }
+        self.current_parameters.insert(open.key, value);
+        vec![ToolCallItem {
+            tool_index,
+            name: None,
+            parameters: tail,
+        }]
+    }
+
     /// Shared non-streaming parse, schema-aware when `tools` are provided.
     fn parse_complete_inner(
         &self,
@@ -307,6 +523,7 @@ impl QwenXmlParser {
         self.current_tool_name_sent = false;
         self.current_function_name.clear();
         self.current_parameters.clear();
+        self.open_parameter = None;
     }
 }
 
@@ -427,25 +644,37 @@ impl ToolParser for QwenXmlParser {
                 }
             }
 
-            // Parse parameters (only complete ones)
+            // Parse parameters: string values as they stream, the rest once complete
             if self.current_tool_name_sent {
                 let end_pos = self.buffer.find(self.tool_call_end_token);
                 let parameter_end = end_pos.unwrap_or(self.buffer.len());
-                let param_calls = self.parse_and_stream_parameters(tools, parameter_end);
-                calls.extend(param_calls);
+                // In buffer order: the streamed parameter that just closed,
+                // the complete parameters, then the one still open.
+                calls.extend(self.finish_closed_parameter(tools, parameter_end));
+                calls.extend(self.parse_and_stream_parameters(tools, parameter_end));
+                calls.extend(self.stream_open_parameter(tools, parameter_end));
 
                 // Check if tool call is complete
                 if let Some(end_pos) = end_pos {
                     // Parameter fragments leave the root open; braces in values are data.
+                    // A string still streaming when the call closes is closed with it.
+                    let unclosed_string = self
+                        .open_parameter
+                        .take()
+                        .is_some_and(|open| open.streamed_end.is_some());
                     let current_args =
                         &mut self.streamed_args_for_tool[self.current_tool_id as usize];
-                    let closing = if current_args.is_empty() { "{}" } else { "}" };
+                    let mut closing = String::new();
+                    if unclosed_string {
+                        closing.push('"');
+                    }
+                    closing.push_str(if current_args.is_empty() { "{}" } else { "}" });
                     calls.push(ToolCallItem {
                         tool_index: self.current_tool_id as usize,
                         name: None,
-                        parameters: closing.to_string(),
+                        parameters: closing.clone(),
                     });
-                    current_args.push_str(closing);
+                    current_args.push_str(&closing);
 
                     // Complete the tool call
                     self.buffer =
@@ -471,6 +700,18 @@ impl ToolParser for QwenXmlParser {
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         let tool_index = self.prev_tool_call_arr.len().checked_sub(1)?;
+        // A string value the stream ended in is closed with what arrived.
+        if self
+            .open_parameter
+            .as_ref()
+            .is_some_and(|open| open.streamed_end.is_some())
+        {
+            return Some(vec![ToolCallItem {
+                tool_index,
+                name: None,
+                parameters: "\"}".to_string(),
+            }]);
+        }
         let actual = self.streamed_args_for_tool.get(tool_index)?;
         let expected = self.prev_tool_call_arr[tool_index].get("arguments")?;
         // XML parameters use spaced JSON, unlike the generic compact-prefix recovery.
@@ -656,5 +897,190 @@ mod tests {
             .unwrap();
         let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["content"], Value::String(literal.to_string()));
+    }
+
+    fn bash_tool() -> Vec<Tool> {
+        vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "bash".to_string(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"}
+                    }
+                }),
+                strict: None,
+            },
+        }]
+    }
+
+    /// Feed `chunks` and collect the argument deltas (name-less items with
+    /// parameters) together with the index of the chunk that produced each.
+    async fn argument_deltas(
+        parser: &mut QwenXmlParser,
+        chunks: &[&str],
+        tools: &[Tool],
+    ) -> Vec<(usize, String)> {
+        let mut deltas = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            for call in parser.parse_incremental(chunk, tools).await.unwrap().calls {
+                if call.name.is_none() && !call.parameters.is_empty() {
+                    deltas.push((index, call.parameters));
+                }
+            }
+        }
+        deltas
+    }
+
+    // The value of a string parameter goes out as it is generated (smg-lab#27):
+    // the first argument bytes follow the name within a few tokens instead of
+    // the whole value arriving once `</parameter>` closes it.
+    #[tokio::test]
+    async fn test_string_values_stream_before_the_parameter_closes() {
+        let tools = bash_tool();
+        let chunks = [
+            "<tool_call>",
+            "\n",
+            "<function=",
+            "bash",
+            ">\n",
+            "<parameter=",
+            "command",
+            ">\n",
+            "ls",
+            " -",
+            "la",
+            " /",
+            "tmp",
+            "\n",
+            "</parameter>",
+            "\n</function>",
+            "\n</tool_call>",
+        ];
+        let close_at = chunks.iter().position(|c| *c == "</parameter>").unwrap();
+        let mut parser = QwenXmlParser::new();
+        let deltas = argument_deltas(&mut parser, &chunks, &tools).await;
+
+        assert!(deltas.len() > 2, "arguments arrived as {deltas:?}");
+        assert_eq!(deltas[0], (8, "{\"command\": \"ls".to_string()));
+        let before_close = deltas.iter().filter(|(at, _)| *at < close_at).count();
+        assert_eq!(before_close, 5, "{deltas:?}");
+        let joined: String = deltas.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(joined, "{\"command\": \"ls -la /tmp\"}");
+        assert!(parser.get_unstreamed_tool_args().is_none());
+        assert!(parser.take_unstreamed_normal_text().is_empty());
+    }
+
+    // Whatever the chunking, the streamed arguments re-assemble to exactly
+    // the complete parse: escaped like JSON, trimmed like the XML value.
+    #[tokio::test]
+    async fn test_streamed_string_values_match_the_complete_parse_at_every_split() {
+        let tools = bash_tool();
+        let command = "<parameter=command>\n  echo \"a\\b\"\t<tag> \n\n</parameter>\n";
+        let timeout = "<parameter=timeout>30</parameter>\n";
+        // Both orders: a chunk may carry a complete parameter and the start of
+        // the string one.
+        for text in [
+            format!("<tool_call>\n<function=bash>\n{command}{timeout}</function>\n</tool_call>"),
+            format!("<tool_call>\n<function=bash>\n{timeout}{command}</function>\n</tool_call>"),
+        ] {
+            let (_, complete) = QwenXmlParser::new()
+                .parse_complete_with_tools(&text, &tools)
+                .await
+                .unwrap();
+            let expected: Value = serde_json::from_str(&complete[0].function.arguments).unwrap();
+            assert_eq!(expected["command"], "echo \"a\\b\"\t<tag>");
+            assert_eq!(expected["timeout"], 30);
+
+            let mut feeds: Vec<Vec<String>> = vec![text.chars().map(|c| c.to_string()).collect()];
+            for (split, _) in text.char_indices().skip(1) {
+                feeds.push(vec![text[..split].to_string(), text[split..].to_string()]);
+            }
+            for chunks in feeds {
+                let mut parser = QwenXmlParser::new();
+                let mut args = String::new();
+                for chunk in &chunks {
+                    for call in parser.parse_incremental(chunk, &tools).await.unwrap().calls {
+                        args.push_str(&call.parameters);
+                    }
+                }
+                assert!(parser.get_unstreamed_tool_args().is_none(), "{chunks:?}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&args).ok().as_ref(),
+                    Some(&expected),
+                    "args {args}; chunks {chunks:?}"
+                );
+            }
+        }
+    }
+
+    // Coercion needs the complete value: non-string parameters and JSON
+    // string literals (which the complete parse unwraps) still arrive whole.
+    #[tokio::test]
+    async fn test_values_that_need_the_complete_text_arrive_whole() {
+        let tools = bash_tool();
+        for (text, expected) in [
+            (
+                "<tool_call><function=bash><parameter=timeout>30</parameter></function></tool_call>",
+                ["{\"timeout\": 30", "}"],
+            ),
+            (
+                "<tool_call><function=bash><parameter=command>\"ls\"</parameter></function></tool_call>",
+                ["{\"command\": \"ls\"", "}"],
+            ),
+        ] {
+            let chunks: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+            let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+            let mut parser = QwenXmlParser::new();
+            let deltas: Vec<String> = argument_deltas(&mut parser, &chunk_refs, &tools)
+                .await
+                .into_iter()
+                .map(|(_, delta)| delta)
+                .collect();
+            assert_eq!(deltas, expected);
+        }
+    }
+
+    // A value the stream ends in is closed with what arrived, as the engine's
+    // own streaming parser does; a parameter without any value is not invented.
+    #[tokio::test]
+    async fn test_end_of_stream_closes_a_partially_streamed_value() {
+        let tools = bash_tool();
+        let mut parser = QwenXmlParser::new();
+        let deltas = argument_deltas(
+            &mut parser,
+            &[
+                "<tool_call><function=bash><parameter=command>ls -l",
+                "a /tm",
+            ],
+            &tools,
+        )
+        .await;
+        let mut args: String = deltas.into_iter().map(|(_, d)| d).collect();
+        assert_eq!(args, "{\"command\": \"ls -la /tm");
+        for item in parser.get_unstreamed_tool_args().unwrap() {
+            args.push_str(&item.parameters);
+        }
+        assert_eq!(args, "{\"command\": \"ls -la /tm\"}");
+        assert!(parser.take_unstreamed_normal_text().is_empty());
+
+        let mut parser = QwenXmlParser::new();
+        let deltas = argument_deltas(
+            &mut parser,
+            &["<tool_call><function=bash><parameter=command>\n"],
+            &tools,
+        )
+        .await;
+        assert!(deltas.is_empty(), "{deltas:?}");
+        let pending: String = parser
+            .get_unstreamed_tool_args()
+            .unwrap()
+            .into_iter()
+            .map(|item| item.parameters)
+            .collect();
+        assert_eq!(pending, "{}");
     }
 }
