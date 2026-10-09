@@ -13,7 +13,7 @@ use smg_data_connector::{
 use smg_mcp::McpOrchestrator;
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{KvIndexKind, RouterConfig},
@@ -127,6 +127,25 @@ fn start_prefill_admission_notifier(
         }
     });
     Ok(())
+}
+
+/// In-flight requests admitted per available core when
+/// `max_concurrent_requests` is unset.
+pub(crate) const DEFAULT_INFLIGHT_PER_CORE: usize = 1024;
+
+/// Floor of the derived in-flight bound, so a router with few cores still
+/// admits a fleet's worth of long-lived streams.
+pub(crate) const DEFAULT_INFLIGHT_FLOOR: usize = 4096;
+
+/// The in-flight bound used when `max_concurrent_requests` is unset (-1):
+/// 1024 per available core, at least 4096. Far above a healthy router's
+/// in-flight count (arrival rate x latency), and the point past which an
+/// overloaded router sheds instead of queueing without bound: every parked
+/// request holds its body and its encoding until it is served, so growth
+/// without a bound only ends at the memory limit.
+pub(crate) fn default_max_concurrent_requests() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    (cores * DEFAULT_INFLIGHT_PER_CORE).max(DEFAULT_INFLIGHT_FLOOR)
 }
 
 pub struct AppContextBuilder {
@@ -565,23 +584,44 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create rate limiter based on config
+    /// Create the admission bucket from config: an explicit
+    /// `max_concurrent_requests` is the cap, 0 disables admission control,
+    /// and the unset value (-1) takes the host-derived default so an
+    /// overloaded router sheds instead of queueing without bound.
     fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
-        self.rate_limiter = match config.max_concurrent_requests {
-            n if n <= 0 => None,
+        let capacity = match config.max_concurrent_requests {
+            0 => {
+                info!(
+                    "Admission bound disabled (max_concurrent_requests = 0): in-flight requests are unbounded"
+                );
+                self.rate_limiter = None;
+                return self;
+            }
+            n if n < 0 => {
+                let bound = default_max_concurrent_requests();
+                info!(
+                    "Admission bound: at most {bound} in-flight requests (default: {DEFAULT_INFLIGHT_PER_CORE} per available core, at least {DEFAULT_INFLIGHT_FLOOR}; --max-concurrent-requests overrides it, 0 disables it)"
+                );
+                bound
+            }
             n => {
-                // No refill unless explicitly configured: the cap bounds
-                // standing concurrency, not admission rate.
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(0);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
+                let bound = n as usize;
+                info!(
+                    "Admission bound: at most {bound} in-flight requests (max_concurrent_requests)"
+                );
+                bound
             }
         };
+        // No refill unless explicitly configured: the cap bounds
+        // standing concurrency, not admission rate.
+        let rate_limit_tokens = config
+            .rate_limit_tokens_per_second
+            .filter(|&t| t > 0)
+            .unwrap_or(0);
+        self.rate_limiter = Some(Arc::new(TokenBucket::new(
+            capacity,
+            rate_limit_tokens as usize,
+        )));
         self
     }
 
@@ -944,6 +984,45 @@ mod tests {
 
         bucket.return_tokens_sync(1.0);
         assert!(bucket.try_acquire(1.0).is_ok());
+    }
+
+    /// With no explicit cap the admission bucket still exists, sized by the
+    /// host-derived default: the request past the bound is rejected instead
+    /// of queued without limit, and a completion frees a slot again.
+    #[test]
+    fn unset_concurrency_cap_gets_a_host_derived_bound() {
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&RouterConfig::default())
+            .rate_limiter
+            .expect("the unset cap must still bound in-flight requests");
+        let bound = default_max_concurrent_requests();
+        assert!(bound >= DEFAULT_INFLIGHT_FLOOR);
+
+        for admitted in 0..bound {
+            assert!(
+                bucket.try_acquire(1.0).is_ok(),
+                "request {admitted} is within the bound of {bound}"
+            );
+        }
+        assert!(
+            bucket.try_acquire(1.0).is_err(),
+            "the request past the bound must be rejected, not admitted"
+        );
+
+        bucket.return_tokens_sync(1.0);
+        assert!(bucket.try_acquire(1.0).is_ok());
+    }
+
+    #[test]
+    fn zero_concurrency_cap_disables_admission_control() {
+        let config = RouterConfig {
+            max_concurrent_requests: 0,
+            ..RouterConfig::default()
+        };
+        assert!(AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .is_none());
     }
 
     #[tokio::test]

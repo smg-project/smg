@@ -944,8 +944,11 @@ struct CliArgs {
     cors_allowed_origins: Vec<String>,
 
     // ==================== Rate Limiting ====================
-    /// Maximum standing concurrent requests (-1 to disable). Each admission
-    /// permit is held for the full response, including streaming bodies.
+    /// Maximum standing concurrent requests. Each admission permit is held
+    /// for the full response, including streaming bodies. -1 (default)
+    /// derives the bound from the host (1024 per available core, at least
+    /// 4096) so an overloaded router sheds with 429/503 instead of queueing
+    /// without bound; 0 disables the bound.
     #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
     max_concurrent_requests: i32,
 

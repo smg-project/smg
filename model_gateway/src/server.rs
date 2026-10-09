@@ -1469,11 +1469,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         };
 
     if app_context.rate_limiter.is_none() {
-        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+        info!("Admission control is disabled (max_concurrent_requests = 0)");
     } else if admission_queue.is_none() {
         debug!(
-            "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
-            config.router_config.max_concurrent_requests
+            "Admission queue disabled (queue_size = 0): requests past the in-flight bound are rejected at once"
         );
     }
 

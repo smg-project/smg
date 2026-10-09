@@ -271,8 +271,9 @@ pub struct RouterConfig {
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
-    /// Standing-concurrency cap; -1 disables. Each admission permit is
-    /// held for the full response, including streaming bodies.
+    /// Standing-concurrency cap. -1 (default) derives it from the host (1024
+    /// per available core, at least 4096); 0 disables it. Each admission
+    /// permit is held for the full response, including streaming bodies.
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,

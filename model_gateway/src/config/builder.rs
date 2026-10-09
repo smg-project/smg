@@ -409,8 +409,9 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Remove the in-flight bound entirely (`max_concurrent_requests = 0`).
     pub fn disable_rate_limiting(mut self) -> Self {
-        self.config.max_concurrent_requests = -1;
+        self.config.max_concurrent_requests = 0;
         self
     }
 

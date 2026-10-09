@@ -1418,7 +1418,8 @@ class RouterArgs:
             help=(
                 "Maximum standing concurrent requests; each admission permit"
                 " is held for the full response, including streaming bodies."
-                " Set to -1 to disable."
+                " -1 (default) derives the bound from the host (1024 per"
+                " available core, at least 4096); 0 disables it."
             ),
         )
         rate_limit_group.add_argument(
