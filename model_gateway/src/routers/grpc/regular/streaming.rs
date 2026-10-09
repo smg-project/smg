@@ -9,14 +9,14 @@ use std::{
 };
 
 use axum::response::Response;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::future::try_join_all;
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
     traits::Tokenizer,
 };
 use openai_protocol::{
-    chat::ChatCompletionStreamResponse,
+    chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice},
     common::{
         ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
         ToolChoiceValue, Usage,
@@ -414,8 +414,6 @@ impl StreamingProcessor {
         // Per-index stop decoders (each index needs its own state for n>1 support)
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
 
-        // Reusable SSE formatting buffer to avoid allocations per chunk
-        let mut sse_buffer = Vec::with_capacity(512);
         // Reusable SSE encoder for the post-loop flush / tool / finish / usage
         // chunks, which previously each did `to_string` + `format!`.
         let mut sse_encoder = SseEncoder::new();
@@ -425,6 +423,13 @@ impl StreamingProcessor {
         let model = &dispatch.model;
         let created = dispatch.created;
         let system_fingerprint = dispatch.weight_version.as_deref();
+
+        // The per-chunk SSE frames: the invariant head of every chunk of this
+        // stream is serialized once here; per chunk only its choice (and usage)
+        // is serialized into `sse_buffer`, whose written bytes are split off
+        // for the channel instead of being copied.
+        let chunk_frame = ChatChunkFrame::new(request_id, model, created, system_fingerprint);
+        let mut sse_buffer = BytesMut::with_capacity(4096);
 
         // Per-request effective parser names (model-card override → configured).
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
@@ -650,16 +655,17 @@ impl StreamingProcessor {
 
             // Send first chunk with role
             if is_firsts.get(&index).copied().unwrap_or(true) {
-                let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                    .created(created)
-                    .add_choice_role(index, "assistant")
-                    .maybe_system_fingerprint(system_fingerprint)
-                    .maybe_usage(usage.clone())
-                    .build();
-                Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk, emit_usage_null);
-                tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                    .await
-                    .map_err(|_| "Failed to send first chunk".to_string())?;
+                let first_choice = assistant_choice(index, None, None, None);
+                Self::send_chunk(
+                    tx,
+                    &mut sse_buffer,
+                    &chunk_frame,
+                    &first_choice,
+                    usage.as_ref(),
+                    emit_usage_null,
+                )
+                .await
+                .map_err(|()| "Failed to send first chunk".to_string())?;
                 is_firsts.insert(index, false);
             }
 
@@ -669,7 +675,7 @@ impl StreamingProcessor {
 
             // Reasoning content handling
             let in_reasoning = if separate_reasoning && reasoning_parser_available {
-                let (normal_text, reasoning_chunk, in_reasoning) = self
+                let (normal_text, reasoning_choice, in_reasoning) = self
                     .process_reasoning_stream(
                         (!final_chunk).then_some(delta.as_str()),
                         index,
@@ -677,25 +683,25 @@ impl StreamingProcessor {
                         thinking_override,
                         think_in_prefill,
                         reasoning_parser_name.as_deref(),
-                        request_id,
                         model,
-                        created,
-                        system_fingerprint,
                     )
                     .await;
-                if let Some(mut chunk) = reasoning_chunk {
-                    chunk.usage = usage.clone();
+                if let Some(mut choice) = reasoning_choice {
                     // The chunk's token logprobs ride on its reasoning delta when
                     // none of its text is content, as on a content delta.
                     if normal_text.is_empty() {
-                        if let Some(choice) = chunk.choices.first_mut() {
-                            choice.logprobs = choice_logprobs.take();
-                        }
+                        choice.logprobs = choice_logprobs.take();
                     }
-                    Self::format_sse_chunk_into(&mut sse_buffer, &chunk, emit_usage_null);
-                    tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                        .await
-                        .map_err(|_| "Failed to send reasoning chunk".to_string())?;
+                    Self::send_chunk(
+                        tx,
+                        &mut sse_buffer,
+                        &chunk_frame,
+                        &choice,
+                        usage.as_ref(),
+                        emit_usage_null,
+                    )
+                    .await
+                    .map_err(|()| "Failed to send reasoning chunk".to_string())?;
                 }
                 delta = normal_text;
                 in_reasoning
@@ -716,17 +722,14 @@ impl StreamingProcessor {
                     && tool_choice_enabled
                     && (tool_parser_available || used_json_schema)
                 {
-                    let tool_chunks = if is_specific_function {
+                    let tool_choices = if is_specific_function {
                         // Handle specific function case - emit tool call deltas with arguments
                         Self::process_specific_function_stream(
                             &delta,
                             index,
                             &mut has_tool_calls,
                             tool_choice.as_ref(),
-                            request_id,
                             model,
-                            created,
-                            system_fingerprint,
                             history_tool_calls_count,
                         )
                     } else {
@@ -738,22 +741,24 @@ impl StreamingProcessor {
                             &mut has_tool_calls,
                             tools_ref,
                             tool_parser_name.as_deref(),
-                            request_id,
                             model,
-                            created,
-                            system_fingerprint,
                             history_tool_calls_count,
                             used_json_schema,
                         )
                         .await
                     };
 
-                    for mut chunk in tool_chunks {
-                        chunk.usage = usage.clone();
-                        Self::format_sse_chunk_into(&mut sse_buffer, &chunk, emit_usage_null);
-                        tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                            .await
-                            .map_err(|_| "Failed to send tool call chunk".to_string())?;
+                    for choice in &tool_choices {
+                        Self::send_chunk(
+                            tx,
+                            &mut sse_buffer,
+                            &chunk_frame,
+                            choice,
+                            usage.as_ref(),
+                            emit_usage_null,
+                        )
+                        .await
+                        .map_err(|()| "Failed to send tool call chunk".to_string())?;
                     }
 
                     // Always skip regular content when tool parsing is active
@@ -764,16 +769,18 @@ impl StreamingProcessor {
 
             // Regular content emission
             if !delta.is_empty() {
-                let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                    .created(created)
-                    .add_choice_content_with_logprobs(index, "assistant", delta, choice_logprobs)
-                    .maybe_system_fingerprint(system_fingerprint)
-                    .maybe_usage(usage.clone())
-                    .build();
-                Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk, emit_usage_null);
-                tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                    .await
-                    .map_err(|_| "Failed to send content chunk".to_string())?;
+                let mut choice = assistant_choice(index, Some(delta), None, None);
+                choice.logprobs = choice_logprobs;
+                Self::send_chunk(
+                    tx,
+                    &mut sse_buffer,
+                    &chunk_frame,
+                    &choice,
+                    usage.as_ref(),
+                    emit_usage_null,
+                )
+                .await
+                .map_err(|()| "Failed to send content chunk".to_string())?;
             }
         }
 
@@ -1564,6 +1571,8 @@ impl StreamingProcessor {
 
     /// Helper: Process reasoning content in streaming mode
     /// `None` marks EOF and releases the parser's held text.
+    /// Returns the normal text, the choice carrying the reasoning delta (if any)
+    /// and whether the parser is still inside reasoning.
     #[expect(clippy::too_many_arguments)]
     async fn process_reasoning_stream(
         &self,
@@ -1576,11 +1585,8 @@ impl StreamingProcessor {
         // disagree with the upfront availability check if the worker registry
         // changed mid-stream, turning the `expect` below into a panic.
         reasoning_parser_name: Option<&str>,
-        request_id: &str,
         model: &str,
-        created: u64,
-        system_fingerprint: Option<&str>,
-    ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
+    ) -> (String, Option<ChatStreamChoice>, bool) {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         #[expect(
             clippy::expect_used,
@@ -1618,18 +1624,12 @@ impl StreamingProcessor {
                     reasoning_text,
                     normal_text,
                 }) => {
-                    let chunk = if reasoning_text.is_empty() {
+                    let choice = if reasoning_text.is_empty() {
                         None
                     } else {
-                        Some(
-                            ChatCompletionStreamResponse::builder(request_id, model)
-                                .created(created)
-                                .add_choice_reasoning(index, reasoning_text)
-                                .maybe_system_fingerprint(system_fingerprint)
-                                .build(),
-                        )
+                        Some(assistant_choice(index, None, Some(reasoning_text), None))
                     };
-                    return (normal_text, chunk, in_reasoning);
+                    return (normal_text, choice, in_reasoning);
                 }
                 Err(e) => {
                     warn!("Reasoning parsing error: {}", e);
@@ -1641,18 +1641,14 @@ impl StreamingProcessor {
     }
 
     /// Helper: Process specific function case - emit tool call deltas with arguments
-    #[expect(clippy::too_many_arguments)]
     fn process_specific_function_stream(
         delta: &str,
         index: u32,
         has_tool_calls: &mut HashMap<u32, bool>,
         tool_choice: Option<&ToolChoice>,
-        request_id: &str,
         model: &str,
-        created: u64,
-        system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
-    ) -> Vec<ChatCompletionStreamResponse> {
+    ) -> Vec<ChatStreamChoice> {
         let mut chunks = Vec::new();
 
         if let Some(ToolChoice::Function { function, .. }) = tool_choice {
@@ -1669,24 +1665,38 @@ impl StreamingProcessor {
                     history_tool_calls_count,
                 );
 
-                chunks.push(
-                    ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_tool_name(index, tool_call_id, function.name.clone())
-                        .maybe_system_fingerprint(system_fingerprint)
-                        .build(),
-                );
+                chunks.push(assistant_choice(
+                    index,
+                    None,
+                    None,
+                    Some(vec![ToolCallDelta {
+                        index: 0,
+                        id: Some(tool_call_id),
+                        tool_type: Some("function".to_string()),
+                        function: Some(FunctionCallDelta {
+                            name: Some(function.name.clone()),
+                            arguments: None,
+                        }),
+                    }]),
+                ));
             }
 
             // Emit arguments delta
             if !delta.is_empty() {
-                chunks.push(
-                    ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_tool_args(index, delta.to_string())
-                        .maybe_system_fingerprint(system_fingerprint)
-                        .build(),
-                );
+                chunks.push(assistant_choice(
+                    index,
+                    None,
+                    None,
+                    Some(vec![ToolCallDelta {
+                        index: 0,
+                        id: None,
+                        tool_type: None,
+                        function: Some(FunctionCallDelta {
+                            name: None,
+                            arguments: Some(delta.to_string()),
+                        }),
+                    }]),
+                ));
             }
         }
 
@@ -1704,13 +1714,10 @@ impl StreamingProcessor {
         tools: &[Tool],
         // Resolved once per request by the caller (see process_reasoning_stream).
         tool_parser_name: Option<&str>,
-        request_id: &str,
         model: &str,
-        created: u64,
-        system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
         use_json_parser: bool,
-    ) -> Vec<ChatCompletionStreamResponse> {
+    ) -> Vec<ChatStreamChoice> {
         let mut chunks = Vec::new();
 
         // Create fresh parser for this index (not pooled, to avoid state pollution)
@@ -1736,13 +1743,7 @@ impl StreamingProcessor {
                 Ok(StreamingParseResult { normal_text, calls }) => {
                     // Emit normal text if present
                     if !normal_text.is_empty() {
-                        chunks.push(
-                            ChatCompletionStreamResponse::builder(request_id, model)
-                                .created(created)
-                                .add_choice_content(index, "assistant", normal_text)
-                                .maybe_system_fingerprint(system_fingerprint)
-                                .build(),
-                        );
+                        chunks.push(assistant_choice(index, Some(normal_text), None, None));
                     }
 
                     // Emit tool call chunks
@@ -1778,13 +1779,12 @@ impl StreamingProcessor {
                             }),
                         };
 
-                        chunks.push(
-                            ChatCompletionStreamResponse::builder(request_id, model)
-                                .created(created)
-                                .add_choice_tool_call_delta(index, tool_call_delta)
-                                .maybe_system_fingerprint(system_fingerprint)
-                                .build(),
-                        );
+                        chunks.push(assistant_choice(
+                            index,
+                            None,
+                            None,
+                            Some(vec![tool_call_delta]),
+                        ));
                     }
 
                     return chunks;
@@ -1798,27 +1798,19 @@ impl StreamingProcessor {
         chunks
     }
 
-    /// Format a response as SSE chunk into a reusable buffer
-    /// This avoids allocations by reusing the same buffer across multiple chunks
-    #[inline]
-    fn format_sse_chunk_into(
-        buffer: &mut Vec<u8>,
-        chunk: &ChatCompletionStreamResponse,
+    /// Write one chat chunk carrying `choice` into `buffer` and hand its bytes
+    /// to the channel without copying them: `buffer` keeps its spare capacity
+    /// (and reclaims the rest once the client side has let go of the chunk).
+    async fn send_chunk(
+        tx: &SseSender,
+        buffer: &mut BytesMut,
+        frame: &ChatChunkFrame,
+        choice: &ChatStreamChoice,
+        usage: Option<&Usage>,
         emit_usage_null: bool,
-    ) {
-        buffer.clear();
-        buffer.extend_from_slice(b"data: ");
-        if let Err(e) = serde_json::to_writer(
-            &mut *buffer,
-            &ChatChunkWithUsage::new(chunk, emit_usage_null),
-        ) {
-            error!("Failed to serialize SSE chunk: {}", e);
-            buffer.clear();
-            buffer.extend_from_slice(b"data: ");
-            let error_msg = json!({"error": "serialization_failed"}).to_string();
-            buffer.extend_from_slice(error_msg.as_bytes());
-        }
-        buffer.extend_from_slice(b"\n\n");
+    ) -> Result<(), ()> {
+        frame.write_chunk(buffer, choice, usage, emit_usage_null);
+        tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())
     }
 
     // =========================================================================
@@ -3582,6 +3574,95 @@ impl<'a> ChatChunkWithUsage<'a> {
             chunk,
             usage: (emit_usage_null && chunk.usage.is_none()).then_some(()),
         }
+    }
+}
+
+/// The SSE frame of the per-token chat chunks of one stream.
+///
+/// Every chunk of a stream repeats the same `id`, `object`, `created`,
+/// `model` and `system_fingerprint`; only its choice and usage differ. The
+/// head up to and including `"choices":[` is serialized once per stream and
+/// copied in front of each chunk, so a chunk costs the serialization of its
+/// choice and usage only. The bytes are exactly those of a serialized
+/// [`ChatChunkWithUsage`] (the chunk-level `usage: null` placeholder included).
+struct ChatChunkFrame {
+    head: Vec<u8>,
+}
+
+impl ChatChunkFrame {
+    fn new(request_id: &str, model: &str, created: u64, system_fingerprint: Option<&str>) -> Self {
+        let mut head = Vec::with_capacity(192);
+        head.extend_from_slice(b"data: {\"id\":");
+        Self::push_json(&mut head, request_id);
+        head.extend_from_slice(b",\"object\":\"chat.completion.chunk\",\"created\":");
+        Self::push_json(&mut head, &created);
+        head.extend_from_slice(b",\"model\":");
+        Self::push_json(&mut head, model);
+        if let Some(system_fingerprint) = system_fingerprint {
+            head.extend_from_slice(b",\"system_fingerprint\":");
+            Self::push_json(&mut head, system_fingerprint);
+        }
+        head.extend_from_slice(b",\"choices\":[");
+        Self { head }
+    }
+
+    /// Serializing a string or an integer into memory cannot fail.
+    fn push_json<T: Serialize + ?Sized>(head: &mut Vec<u8>, value: &T) {
+        let _ = serde_json::to_writer(head, value);
+    }
+
+    /// Append `data: {...}\n\n` for `choice` (and `usage`, or the `null`
+    /// placeholder when `emit_usage_null`) to `buffer`.
+    fn write_chunk(
+        &self,
+        buffer: &mut BytesMut,
+        choice: &ChatStreamChoice,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        let mut serialized = serde_json::to_writer((&mut *buffer).writer(), choice);
+        if serialized.is_ok() {
+            buffer.extend_from_slice(b"]");
+            if let Some(usage) = usage {
+                buffer.extend_from_slice(b",\"usage\":");
+                serialized = serde_json::to_writer((&mut *buffer).writer(), usage);
+            } else if emit_usage_null {
+                buffer.extend_from_slice(b",\"usage\":null");
+            }
+        }
+        match serialized {
+            Ok(()) => buffer.extend_from_slice(b"}"),
+            Err(e) => {
+                error!("Failed to serialize SSE chunk: {}", e);
+                buffer.truncate(start);
+                buffer.extend_from_slice(b"data: {\"error\":\"serialization_failed\"}");
+            }
+        }
+        buffer.extend_from_slice(b"\n\n");
+    }
+}
+
+/// A streamed choice whose delta speaks as the assistant, carrying whichever
+/// of `content`, `reasoning_content` and `tool_calls` the caller sets.
+fn assistant_choice(
+    index: u32,
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<ToolCallDelta>>,
+) -> ChatStreamChoice {
+    ChatStreamChoice {
+        index,
+        delta: ChatMessageDelta {
+            role: Some("assistant".to_string()),
+            content,
+            tool_calls,
+            reasoning_content,
+        },
+        logprobs: None,
+        finish_reason: None,
+        matched_stop: None,
     }
 }
 
