@@ -880,7 +880,7 @@ impl ChatCompletionResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatCompletionMessage {
     pub role: String, // Always "assistant" for responses
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present, `null` on a tool-call turn (as the OpenAI API sends it).
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -1272,5 +1272,25 @@ mod tests {
         assert!(!request.separate_reasoning);
         assert!(!request.stream_reasoning);
         assert!(request.return_hidden_states);
+    }
+
+    #[test]
+    fn tool_call_message_serializes_content_as_null() {
+        let message = super::ChatCompletionMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![crate::common::ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::common::FunctionCallResponse {
+                    name: "get_weather".to_string(),
+                    arguments: Some("{}".to_string()),
+                },
+            }]),
+            reasoning_content: None,
+        };
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value.get("content"), Some(&Value::Null), "{value}");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "get_weather");
     }
 }
