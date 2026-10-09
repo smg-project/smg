@@ -117,6 +117,10 @@ jobs:
           install -m 0755 "$dir/git-lfs-${GIT_LFS_VERSION}/git-lfs" "$dir/git-lfs"
           echo "$dir" >> "$GITHUB_PATH"
           "$dir/git-lfs" version
+          # `git lfs pull` (what `bellwether unpack` runs) refuses to work until
+          # the LFS filters are in the git configuration; set them for the
+          # runner user, outside any repository.
+          "$dir/git-lfs" install --skip-repo
 
       - name: Check out bellwether
         uses: actions/checkout@v7
