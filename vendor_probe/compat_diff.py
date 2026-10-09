@@ -238,7 +238,9 @@ def event_names(record, provider) -> list:
             parsed = ev.get("parsed") or {}
             name = parsed.get("type") or ev.get("event")
         elif provider == "openai-chat":
-            name = chat_chunk_name(ev)
+            # recorded chunks have no event: line and are named by content; a
+            # baseline-synthesized event carries the stored name in "event"
+            name = ev.get("event") or chat_chunk_name(ev)
         else:
             name = ev.get("event")
         if not name:

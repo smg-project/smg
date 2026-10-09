@@ -243,11 +243,12 @@ python -m vendor_probe.baseline \
 
 ### The 2026-10-09 baselines
 
-Recorded by the `pull_request` run of the Vendor Probe workflow on the PR that
-revived this harness (curated tier only: 225 + 163 probes, run 38001344395;
-`gpt-5-nano-2025-08-07` / `gpt-4.1-nano-2025-04-14` and
-`claude-haiku-4-5-20251001`). Two properties of that recording to keep in mind
-when reading a diff against it:
+Recorded by the `pull_request` runs of the Vendor Probe workflow on the PRs
+that revived this harness: first run 38001344395 (Responses + Messages), then
+run 38004101229, which this directory holds (curated tiers only: 225 Responses
++ 163 Messages + 134 Chat Completions probes; `gpt-5-nano-2025-08-07` /
+`gpt-4.1-nano-2025-04-14` and `claude-haiku-4-5-20251001`; ~0.06 USD). Two
+properties of that recording to keep in mind when reading a diff against it:
 
 - The OpenAI organisation behind the CI key has Zero Data Retention: every
   probe that stores a response or reads one back (`previous_response_id`,
@@ -256,13 +257,16 @@ when reading a diff against it:
   behaviour. A gateway that stores (`--history-backend memory`) answers 200
   there; those clusters are annotated in `known_divergences.jsonl`, not
   divergences.
-- Both vendors refused the probes' image inputs (the 1x1 PNG, the wikimedia
-  URL), so the image probes carry the vendors' `400` rather than a 200.
+- Both vendors fail to fetch the probes' image URL, so the image-URL probes
+  carry the vendors' `400`; the base64 image probes are 200 since the 1x1 PNG
+  fixture became a valid PNG (the first run still had the truncated one).
 
 `known_divergences.jsonl` for this date was regenerated with
-`--write-allowlist` from a replay against a gateway in front of a real engine
-(gRPC worker path); each entry's `note` names the tracking issue or the
-recording artefact it comes from. Compared with the 2026-08-21 baselines the
+`--write-allowlist` from a replay of all three families against a gateway in
+front of a real, text-only engine (gRPC worker path); each entry's `note`
+names the tracking issue, the recording artefact or the model-dependent
+behaviour it comes from (clusters whose verdict rests on one chat template's
+refusal are marked as such). Compared with the 2026-08-21 baselines the
 vendors changed field inventories only (OpenAI added `access_programs` and
 `billing`; Anthropic added `container`, `diagnostics`, `stop_details`,
 `usage.cache_creation`, `usage.inference_geo`, `usage.service_tier` and richer
