@@ -245,9 +245,11 @@ def video_frame_budget(model_config, environ: Mapping[str, str] | None = None) -
     count, which vLLM reads as every frame), else the loader's default, under
     the same ``SMG_VLLM_MM_MAX_VIDEO_FRAMES`` cap the other processors apply
     (``clamp_video_frames``); ``None`` when neither is known, which leaves the
-    pipeline's spec to its own constant. A ``video_backend`` in the kwargs
-    selects a loader with its own sampling rule, which the pipeline cannot
-    follow: refused, like any other knob the pipeline has no field for."""
+    pipeline's spec to its own constant. A loader with a sampling rule of its
+    own, which the pipeline cannot follow (``video_backend`` in the kwargs or
+    ``VLLM_VIDEO_LOADER_BACKEND`` other than the default ``opencv``), or a
+    ``video.fps`` that would thin the frames by the clip's duration, is refused,
+    like any other knob the pipeline has no field for."""
     from smg_grpc_servicer.vllm.mm_processor import (
         DEFAULT_MAX_VIDEO_FRAMES,
         ENV_MAX_VIDEO_FRAMES,
@@ -266,6 +268,17 @@ def video_frame_budget(model_config, environ: Mapping[str, str] | None = None) -
         raise ValueError(
             "--media-io-kwargs video.video_backend selects a loader whose sampling the smg "
             "media pipeline cannot follow; drop it or use --mm-processor inprocess or redis"
+        )
+    loader = (source.get("VLLM_VIDEO_LOADER_BACKEND") or "").strip().lower()
+    if loader and loader != "opencv":
+        raise ValueError(
+            f"VLLM_VIDEO_LOADER_BACKEND={loader!r} selects a loader whose sampling the smg "
+            "media pipeline cannot follow; unset it or use --mm-processor inprocess or redis"
+        )
+    if isinstance(video, Mapping) and video.get("fps") is not None:
+        raise ValueError(
+            "--media-io-kwargs video.fps thins the frames by the clip's duration, which the smg "
+            "media pipeline does not apply; drop it or use --mm-processor inprocess or redis"
         )
     default = vllm_default_video_frames()
     max_frames = env_int(source, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0)

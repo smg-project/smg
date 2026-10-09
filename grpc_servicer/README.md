@@ -223,9 +223,11 @@ Worker-side media processing uses the same `--mm-processor` /
   takes the loader's frames, so a clip costs the same tokens as on the engine's
   own server; the budget is read under the same `SMG_VLLM_MM_MAX_VIDEO_FRAMES`
   cap the in-process and Redis processors apply, so an unbounded count stays
-  bounded in `smg` mode too, and a `video_backend` in the engine's media kwargs,
-  a loader whose sampling the pipeline cannot follow, is refused at launch. An
-  engine that normalizes pixels on device
+  bounded in `smg` mode too, and a loader whose sampling the pipeline cannot
+  follow (`video_backend` in the engine's media kwargs, or
+  `VLLM_VIDEO_LOADER_BACKEND` other than `opencv`) or a `video.fps` that thins
+  frames by duration is refused at launch. An engine that normalizes pixels on
+  device
   (vLLM's `mm_device_do_normalize`, on by default for the Qwen-VL family)
   takes raw `uint8` pixels, and the pipeline writes those for it; a model
   whose processor cannot emit raw pixels is refused at startup under that

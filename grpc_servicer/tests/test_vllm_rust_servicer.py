@@ -467,11 +467,21 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 4
     config.model_config.multimodal_config.media_io_kwargs = {}
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
-    # A loader of its own (video_backend) samples by rules the pipeline cannot follow: refused.
+    # A loader of its own (video_backend in the kwargs or the environment) or a
+    # frame rate thinning by duration: rules the pipeline cannot follow, refused.
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "x"}}
     with pytest.raises(ValueError, match="video_backend"):
         rust.smg_media_options(config, settings, str(tmp_path))
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": 1}}
+    with pytest.raises(ValueError, match="video.fps"):
+        rust.smg_media_options(config, settings, str(tmp_path))
     config.model_config.multimodal_config.media_io_kwargs = {}
+    monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv_dynamic")
+    with pytest.raises(ValueError, match="VLLM_VIDEO_LOADER_BACKEND"):
+        rust.smg_media_options(config, settings, str(tmp_path))
+    monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv")
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    monkeypatch.delenv("VLLM_VIDEO_LOADER_BACKEND", raising=False)
     monkeypatch.delenv(mm_processor.ENV_MAX_VIDEO_FRAMES, raising=False)
     # A local model directory with its config is the pipeline's config source.
     (tmp_path / "config.json").write_text("{}")
