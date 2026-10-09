@@ -922,4 +922,37 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn case_insensitive_groups_decline_classes_and_non_ascii_literals() {
+        // Under `(?i:)` the engine folds classes, properties and non-ASCII
+        // literals as well; this matcher folds ASCII letters only, so a
+        // group with anything else is declined rather than matched
+        // differently.
+        assert_eq!(
+            oracle_matches(r"(?i:[a-z]+)", "ABC \u{17F} \u{212A}"),
+            vec![(0, 3), (4, 6), (7, 10)]
+        );
+        assert_eq!(oracle_matches(r"(?i:é)", "É"), vec![(0, 2)]);
+        for (pattern, text) in [
+            (r"(?i:[a-z]+)", "ABC \u{17F} \u{212A}"),
+            (r"(?i:[sdmt]|ll|ve|re)", "'S 'LL"),
+            (r"(?i:\p{Ll})", "A"),
+            (r"(?i:é)", "É"),
+            (r"(?i:'[a-z])", "'S"),
+            (r"(?i:ǆ)", "Ǆ ǅ"),
+        ] {
+            if let Some(parsed) = Pattern::parse(pattern) {
+                assert_eq!(
+                    parsed.find_iter(text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, text),
+                    "{pattern:?} is accepted but matches {text:?} differently from the engine"
+                );
+            }
+            assert!(
+                Pattern::parse(pattern).is_none(),
+                "{pattern:?} must be declined"
+            );
+        }
+    }
 }
