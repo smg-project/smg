@@ -35,6 +35,9 @@ pub struct MockTokenizer {
     native_reasoning_effort_off_values: &'static [&'static str],
     renderer_capabilities: RendererCapabilities,
     content_format: ChatTemplateContentFormat,
+    /// Reported from `think_in_prefill`: the generation prompt opens the
+    /// think block.
+    think_in_prefill: bool,
     /// When set, `apply_chat_template` renders the message list and the
     /// generation-prompt flag as JSON, so a test can assert exactly what
     /// reached the template.
@@ -97,6 +100,7 @@ impl MockTokenizer {
             thinking_key_name: None,
             native_reasoning_effort_values: &[],
             native_reasoning_effort_off_values: &[],
+            think_in_prefill: false,
             renderer_capabilities: RendererCapabilities::default(),
             content_format: ChatTemplateContentFormat::default(),
             json_chat_template: false,
@@ -125,6 +129,12 @@ impl MockTokenizer {
     }
 
     /// Report `toggle` from `thinking_toggle()`.
+    /// Report `value` from `think_in_prefill()`.
+    pub fn with_think_in_prefill(mut self, value: bool) -> Self {
+        self.think_in_prefill = value;
+        self
+    }
+
     pub fn with_thinking_toggle(mut self, toggle: ThinkingToggle) -> Self {
         self.thinking_toggle = toggle;
         self
@@ -236,6 +246,10 @@ impl TokenizerTrait for MockTokenizer {
 
     fn thinking_toggle(&self) -> ThinkingToggle {
         self.thinking_toggle
+    }
+
+    fn think_in_prefill(&self) -> bool {
+        self.think_in_prefill
     }
 
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {

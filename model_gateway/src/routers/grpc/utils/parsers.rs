@@ -509,6 +509,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn template_without_a_switch_starts_in_reasoning_when_its_prompt_opens_the_think_block() {
+        use llm_tokenizer::MockTokenizer;
+        // GLM-5.3: no thinking switch, the generation prompt ends in `<think>`.
+        // No request field can switch thinking off, so none may disarm the parser.
+        let always_thinks = MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::None)
+            .with_think_in_prefill(true);
+        for user_thinking in [None, Some(true), Some(false)] {
+            assert!(
+                should_mark_reasoning_started(user_thinking, &always_thinks),
+                "{user_thinking:?}"
+            );
+        }
+        // A template without a switch that leaves the think block to the model
+        // starts in content mode, as before.
+        let never_prefills = MockTokenizer::new().with_thinking_toggle(ThinkingToggle::None);
+        for user_thinking in [None, Some(true), Some(false)] {
+            assert!(!should_mark_reasoning_started(
+                user_thinking,
+                &never_prefills
+            ));
+        }
+    }
+
+    #[test]
     fn resolve_thinking_pref_precedence() {
         // Explicit toggle > native template effort > typed toggle > reasoning_effort mapping.
         assert_eq!(

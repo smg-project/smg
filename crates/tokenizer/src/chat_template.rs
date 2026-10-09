@@ -1931,6 +1931,37 @@ mod tests {
     }
 
     #[test]
+    fn clear_thinking_is_not_a_thinking_switch() {
+        // GLM-5.3: the template reads `clear_thinking` and `reasoning_effort`
+        // and always opens the think block; it has no switch.
+        let template =
+            "{%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}\
+                        {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}";
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::None, None)
+        );
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+        assert!(state.think_in_prefill());
+
+        // A real `thinking` variable is still a switch, in each spelling.
+        for template in [
+            "{% if thinking is defined and not thinking %}off{% endif %}",
+            "{% if thinking == false %}off{% endif %}",
+            "{% if thinking %}on{% endif %}",
+            "{% set thinking = thinking %}",
+        ] {
+            assert_eq!(
+                detect_thinking_toggle(template),
+                (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking)),
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
     fn test_chat_template_state_invalid_template() {
         let result = ChatTemplateState::new(Some("{% invalid".to_string()));
         assert!(result.is_err());
