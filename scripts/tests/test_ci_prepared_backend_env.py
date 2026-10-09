@@ -78,7 +78,7 @@ if [ "$*" = 'pip show flashinfer-python' ]; then echo 'Version: 0.7.0'; fi
             self.metadata(name, version)
         for name in ("vllm", "sglang", "torchcodec"):
             self.packages.joinpath(f"{name}.py").touch()
-        self.packages.joinpath("torch.py").write_text("class version: cuda = '13.2'\n")
+        self.write_torch()
         self.packages.joinpath("flashinfer.py").write_text("__version__ = '0.7.0'\n")
         for name in ("nixl", "mooncake"):
             self.packages.joinpath(name).mkdir()
@@ -98,6 +98,21 @@ if [ "$*" = 'pip show flashinfer-python' ]; then echo 'Version: 0.7.0'; fi
         path = self.tools / name
         path.write_text(source)
         path.chmod(0o755)
+
+    def write_torch(self, cuda_version="13.2"):
+        self.packages.joinpath("torch.py").write_text(
+            "import os\n"
+            f"class version: cuda = {cuda_version!r}\n"
+            "class cuda:\n"
+            "    @staticmethod\n"
+            "    def is_available(): return os.environ.get('TEST_CUDA_AVAILABLE', '1') == '1'\n"
+            "    @staticmethod\n"
+            "    def synchronize(): pass\n"
+            "def empty(*args, **kwargs):\n"
+            "    if os.environ.get('TEST_CUDA_ALLOCATION_FAIL') == '1':\n"
+            "        raise RuntimeError('CUDA allocation failed')\n"
+            "    return object()\n"
+        )
 
     def python_wrapper(self):
         return f"""#!{sys.executable}
@@ -167,7 +182,7 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
             with self.subTest(backend=backend):
                 if backend == "sglang":
                     self.metadata("torch", "2.13.0")
-                    self.packages.joinpath("torch.py").write_text("class version: cuda = '13.0'\n")
+                    self.write_torch("13.0")
                 venv = self.make_prepared(backend)
                 self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND=backend)
                 self.assertEqual(self.job.joinpath(".venv").resolve(), venv)
@@ -186,8 +201,9 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
         venv = self.make_prepared("vllm")
         with self.scripts.joinpath("ci_install_vllm.sh").open("a") as f:
             f.write("\n# changed dependency recipe\n")
-        self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="vllm")
+        result = self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="vllm")
         self.assertNotEqual(self.job.joinpath(".venv").resolve(), venv)
+        self.assertIn("using a fresh environment", result.stdout)
         self.run_script("ci_install_vllm.sh")
         self.assertIn("vllm==0.31.0 --torch-backend=auto", self.commands())
         self.assertIn("sudo apt-get", self.commands())
@@ -222,6 +238,30 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
         self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="vllm")
         self.assertNotEqual(self.job.joinpath(".venv").resolve(), venv)
 
+    def test_unusable_cuda_rejects_prepared_environment(self):
+        for env in ({"TEST_CUDA_AVAILABLE": "0"}, {"TEST_CUDA_ALLOCATION_FAIL": "1"}):
+            with self.subTest(env=env):
+                venv = self.make_prepared("vllm")
+                result = self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="vllm", **env)
+                self.assertNotEqual(self.job.joinpath(".venv").resolve(), venv)
+                self.assertIn("using a fresh environment", result.stdout)
+
+    def test_cpu_build_can_reuse_cuda_wheels_without_a_gpu(self):
+        venv = self.make_prepared("vllm")
+        self.run_script(
+            "ci_setup_python_venv.sh",
+            SMG_CI_BACKEND="vllm",
+            SMG_BUILD_PREPARED_ENV="1",
+            TEST_CUDA_AVAILABLE="0",
+            TEST_CUDA_ALLOCATION_FAIL="1",
+        )
+        self.assertEqual(self.job.joinpath(".venv").resolve(), venv)
+
+    def test_fresh_environment_keeps_legacy_install_with_unavailable_cuda(self):
+        self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="vllm", TEST_CUDA_AVAILABLE="0")
+        self.run_script("ci_install_vllm.sh", TEST_CUDA_AVAILABLE="0")
+        self.assertIn("vllm==0.31.0 --torch-backend=auto", self.commands())
+
     def test_cpu_build_requires_driver_profile_and_never_bakes_pr_packages(self):
         result = subprocess.run(
             ["bash", str(self.scripts / "ci_install_vllm.sh")],
@@ -245,7 +285,7 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
 
     def test_sglang_cpu_build_preserves_pypi_recipe_and_bakes_both_transports(self):
         self.metadata("torch", "2.13.0")
-        self.packages.joinpath("torch.py").write_text("class version: cuda = '13.0'\n")
+        self.write_torch("13.0")
         self.run_script("ci_setup_python_venv.sh")
         self.run_script("ci_install_sglang.sh", SMG_BUILD_PREPARED_ENV="1")
         self.assertIn("sglang[all]==0.5.21", self.commands())
@@ -255,7 +295,7 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
         self.assertNotIn("pip install -e ", self.commands())
 
     def test_cpu_torch_cannot_be_marked_as_prepared(self):
-        self.packages.joinpath("torch.py").write_text("class version: cuda = None\n")
+        self.write_torch(None)
         with self.assertRaises(subprocess.CalledProcessError) as error:
             self.make_prepared("vllm")
         self.assertIn("require CUDA-enabled PyTorch", error.exception.stderr)
@@ -281,6 +321,26 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
                         TEST_DRIVER_ABSENT="1",
                     )
                 self.assertIn("libcuda.so.1", error.exception.stderr)
+
+    def test_sglang_mooncake_probe_requires_explicit_transport(self):
+        for transport in (
+            {"E2E_SGLANG_TRANSFER_BACKEND": "mooncake"},
+            {"E2E_KV_BACKEND": "mooncake"},
+            {"E2E_KV_BACKEND": "mooncake", "E2E_SGLANG_TRANSFER_BACKEND": "nixl"},
+        ):
+            with self.subTest(transport=transport):
+                self.run_script("ci_setup_python_venv.sh")
+                with self.assertRaises(subprocess.CalledProcessError) as error:
+                    self.run_script("ci_install_sglang.sh", TEST_DRIVER_ABSENT="1", **transport)
+                self.assertIn("libcuda.so.1", error.exception.stderr)
+        for transport in (
+            {},
+            {"E2E_SGLANG_TRANSFER_BACKEND": "nixl"},
+            {"E2E_KV_BACKEND": "nixl", "E2E_SGLANG_TRANSFER_BACKEND": "mooncake"},
+        ):
+            with self.subTest(transport=transport):
+                self.run_script("ci_setup_python_venv.sh")
+                self.run_script("ci_install_sglang.sh", TEST_DRIVER_ABSENT="1", **transport)
 
     def test_root_with_sudo_present_installs_backends_without_sudo(self):
         self.run_script("ci_setup_python_venv.sh", TEST_UID="0")

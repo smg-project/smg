@@ -20,6 +20,17 @@ smg_prepared_env_matches() {
     [ -x "$venv/bin/python" ] && [ -f "$venv/.smg-ci-recipe" ] || return 1
     manifest="$(smg_prepared_env_manifest "$backend" "$venv" 2>/dev/null)" || return 1
     [ "$(cat "$venv/.smg-ci-recipe")" = "$manifest" ] || return 1
+    # CPU builds validate CUDA wheels; GPU jobs must also validate this device.
+    if [ "${SMG_BUILD_PREPARED_ENV:-0}" != 1 ]; then
+        "$venv/bin/python" - <<'PY' || return 1
+import torch
+
+if not torch.cuda.is_available():
+    raise RuntimeError("prepared environment cannot use CUDA on this runner")
+torch.empty(1, device="cuda")
+torch.cuda.synchronize()
+PY
+    fi
 }
 
 smg_prepared_env_manifest() {

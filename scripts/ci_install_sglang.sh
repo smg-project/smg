@@ -119,12 +119,16 @@ if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = 
     echo "nixl import canary OK"
 fi
 
-if [ "${SMG_BUILD_PREPARED_ENV:-0}" = 1 ]; then
-    python3 -c "import torch, sglang, flashinfer"
+python3 -c "import torch, sglang, flashinfer"
+# Probe only explicit Mooncake lanes; unset transport preserves baseline setup.
+if [ "${E2E_KV_BACKEND:-${E2E_SGLANG_TRANSFER_BACKEND:-}}" = mooncake ] \
+    || [ "${SMG_BUILD_PREPARED_ENV:-0}" = 1 ]; then
     # TransferEngine links the GPU driver's libcuda.so.1, absent on CPU builders.
-    echo "Deferring Mooncake driver import to the GPU job"
-else
-    python3 -c "import torch, sglang, flashinfer; from mooncake.engine import TransferEngine"
+    if [ "${SMG_BUILD_PREPARED_ENV:-0}" = 1 ]; then
+        echo "Deferring Mooncake driver import to the GPU job"
+    else
+        python3 -c "import torch; from mooncake.engine import TransferEngine"
+    fi
 fi
 
 if [ "${SMG_BUILD_PREPARED_ENV:-0}" = 1 ]; then

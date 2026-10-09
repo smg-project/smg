@@ -47,6 +47,8 @@ if [ -n "${SMG_CI_BACKEND:-}" ]; then
     SMG_BAKED_VENV=""
     if smg_prepared_env_matches "$SMG_CI_BACKEND" "$PREPARED_VENV"; then
         SMG_BAKED_VENV="$PREPARED_VENV"
+    else
+        echo "Prepared $SMG_CI_BACKEND environment unavailable or incompatible; using a fresh environment"
     fi
 fi
 
