@@ -600,12 +600,13 @@ impl RequestPipeline {
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&RetryConfig>,
     ) -> Result<RunOutcome, Response> {
-        if !cache_trace::enabled() {
+        let requested = cache_trace::requested(ctx.input.headers.as_ref());
+        if !cache_trace::enabled() && !requested {
             return self.run_inner(ctx, metrics_endpoint, retry_config).await;
         }
         let root_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref())
             .map(str::to_owned);
-        Box::pin(cache_trace::scope(async {
+        Box::pin(cache_trace::scope(requested, async {
             let result = self.run_inner(ctx, metrics_endpoint, retry_config).await;
             if let Err(response) = &result {
                 cache_trace::failure(root_id.as_deref(), response.status().as_u16());
@@ -2502,6 +2503,57 @@ mod request_release_tests {
             } else {
                 assert!(trace_header.is_none());
             }
+        }
+    }
+
+    /// `x-smg-cache-trace: 1` on a request returns that request's decision
+    /// record, with the chosen worker, whatever the process switches say.
+    #[tokio::test]
+    async fn a_request_header_opts_into_the_decision_record_with_its_worker() {
+        let port = spawn_stub(GatedScheduler::default()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-cache-trace", http::HeaderValue::from_static("1"));
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                Some(headers),
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let trace: serde_json::Value =
+            serde_json::from_str(response.headers()["x-smg-cache-trace"].to_str().unwrap())
+                .unwrap();
+        assert_eq!(trace["attempt"], 0);
+        assert_eq!(trace["selections"][0]["worker"], worker.url());
+        assert_eq!(trace["selections"][0]["origin"], "policy");
+        assert!(trace["selections"][0].get("candidates").is_none());
+        assert_eq!(response.headers()["x-smg-routed-worker-id"], worker.url());
+
+        // Without the request header the process switches decide, as before.
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        if !std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1") {
+            assert!(response.headers().get("x-smg-cache-trace").is_none());
         }
     }
 

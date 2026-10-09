@@ -10,12 +10,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use http::HeaderMap;
 use serde_json::{json, Value};
 
 use crate::worker::Worker;
 
 #[derive(Default)]
 struct Capture {
+    /// The request asked for its decision record (`x-smg-cache-trace: 1`).
+    header_requested: bool,
     prediction: Value,
     selections: Vec<Value>,
     truncated: bool,
@@ -50,12 +53,30 @@ tokio::task_local! {
     static CAPTURE: RefCell<Capture>;
 }
 
-/// Evidence is captured when either of its two consumers is switched on:
-/// the INFO line (`SMG_CACHE_TRACE=1`) or the response header
-/// (`SMG_CACHE_TRACE_HEADER=1`). Unset both and nothing is observed.
+/// Evidence is captured when one of its two consumers is switched on for
+/// the process, the INFO line (`SMG_CACHE_TRACE=1`) or the response header
+/// (`SMG_CACHE_TRACE_HEADER=1`), and for the request that asked for its own
+/// record with the `x-smg-cache-trace: 1` request header (see [`scope`]).
+/// Unset both and nothing is observed for the requests that did not ask.
 pub(crate) fn enabled() -> bool {
+    configured() || CAPTURE.try_with(|_| ()).is_ok()
+}
+
+/// The process-wide switches: either one captures every request.
+fn configured() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| log_enabled() || header_enabled())
+}
+
+/// The request header that asks for this one request's decision record in
+/// the response, whatever the process switches say and with no log line.
+pub(crate) const REQUEST_HEADER: &str = "x-smg-cache-trace";
+
+/// Whether the request asked for its decision record (`x-smg-cache-trace: 1`).
+pub(crate) fn requested(headers: Option<&HeaderMap>) -> bool {
+    headers
+        .and_then(|headers| headers.get(REQUEST_HEADER))
+        .is_some_and(|value| value.as_bytes().trim_ascii() == b"1")
 }
 
 /// `SMG_CACHE_TRACE=1`: the evidence of a dispatch (one in every
@@ -205,11 +226,15 @@ pub(crate) fn begin_selection(workers: &[Arc<dyn Worker>]) {
     }
 }
 
-pub(crate) async fn scope<F: Future>(future: F) -> F::Output {
-    if enabled() {
-        CAPTURE
-            .scope(RefCell::new(Capture::default()), future)
-            .await
+/// Run `future` with a capture in scope when a process switch is on or the
+/// request asked for its header (`header_requested`); otherwise as it is.
+pub(crate) async fn scope<F: Future>(header_requested: bool, future: F) -> F::Output {
+    if configured() || header_requested {
+        let capture = Capture {
+            header_requested,
+            ..Capture::default()
+        };
+        CAPTURE.scope(RefCell::new(capture), future).await
     } else {
         future.await
     }
@@ -310,8 +335,9 @@ pub(crate) fn dispatch(
             "unattributed_prediction": std::mem::take(&mut capture.prediction),
             "cache_evidence": "unknown",
         });
-        let (header, line) = emit(value, log_enabled(), header_enabled(), sampler(), max_bytes());
-        if header_enabled() && header.is_none() {
+        let header_wanted = header_enabled() || capture.header_requested;
+        let (header, line) = emit(value, log_enabled(), header_wanted, sampler(), max_bytes());
+        if header_wanted && header.is_none() {
             tracing::info!(target: "smg::cache_trace", "Cache trace header omitted: size or encoding limit");
         }
         if let Some(encoded) = line {
@@ -328,7 +354,7 @@ fn gateway_header(value: &Value) -> Option<String> {
         .map(|selection| {
             json!({
                 "policy": selection["policy"], "origin": selection["origin"],
-                "prediction": selection["prediction"],
+                "worker": selection["worker"], "prediction": selection["prediction"],
             })
         })
         .collect();
@@ -385,11 +411,15 @@ mod tests {
                 "gates": [{"spill": true}]}],
         });
         let encoded = gateway_header(&evidence).unwrap();
-        assert!(!encoded.contains("worker"));
+        assert!(!encoded.contains("candidate-worker"));
         assert!(!encoded.contains("gates"));
         let decoded: Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded["engine_ids"], json!(["engine"]));
         assert_eq!(decoded["attempt"], 1);
+        assert_eq!(
+            decoded["selections"][0]["worker"], "selected-worker",
+            "the chosen worker joins the record"
+        );
         evidence["root_id"] = Value::String("x".repeat(2049));
         assert!(gateway_header(&evidence).is_none());
     }
@@ -496,5 +526,42 @@ mod tests {
             outcomes.iter().filter(|(_, line)| line.is_some()).count(),
             2
         );
+    }
+
+    #[test]
+    fn the_request_header_asks_for_this_requests_record() {
+        let mut headers = HeaderMap::new();
+        assert!(!requested(None));
+        assert!(!requested(Some(&headers)));
+        headers.insert(REQUEST_HEADER, http::HeaderValue::from_static("0"));
+        assert!(!requested(Some(&headers)));
+        headers.insert(REQUEST_HEADER, http::HeaderValue::from_static(" 1 "));
+        assert!(requested(Some(&headers)));
+    }
+
+    #[tokio::test]
+    async fn a_requesting_scope_captures_its_request_alone() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("grpc://worker:50051").build());
+        let workers = vec![worker];
+        scope(true, async {
+            assert!(enabled(), "the request asked: its evidence is captured");
+            begin_selection(&workers);
+            selection("random", "policy", &workers, Some(0));
+            let header = dispatch(Some("root"), 0, vec!["engine".into()], true, "regular")
+                .expect("the header for the request that asked");
+            let header: Value = serde_json::from_str(&header).unwrap();
+            assert_eq!(header["root_id"], "root");
+            assert_eq!(header["selections"][0]["worker"], "grpc://worker:50051");
+            assert_eq!(header["selections"][0]["policy"], "random");
+        })
+        .await;
+        assert_eq!(
+            enabled(),
+            configured(),
+            "outside that request only the process switches count"
+        );
+        scope(false, async { assert_eq!(enabled(), configured()) }).await;
     }
 }

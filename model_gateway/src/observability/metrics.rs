@@ -1956,6 +1956,57 @@ impl Metrics {
         .set(if http2 { 1.0 } else { 0.0 });
     }
 
+    /// A worker's KV event subscription starts: its integrity families
+    /// exist from zero, so a scrape tells "no gap, no resync yet" from "no
+    /// series". Every label value the recording paths emit is enumerated
+    /// here (the gap outcomes and the failure reasons are the call sites'
+    /// literals, the resync reasons `ResyncReason::as_str`). An
+    /// `increment(0)` creates a series and leaves an existing one alone,
+    /// so a worker added again keeps its counts.
+    pub fn init_kv_event_series(worker_url: &str) {
+        let worker = intern_string(worker_url);
+        for outcome in [
+            "replay_requested",
+            "unrecovered_kept",
+            "unrecovered_cleared",
+        ] {
+            counter!(
+                "smg_kv_event_gaps_total",
+                "worker" => Arc::clone(&worker),
+                "outcome" => outcome
+            )
+            .increment(0);
+        }
+        counter!("smg_kv_event_missed_batches_total", "worker" => Arc::clone(&worker)).increment(0);
+        for reason in [
+            "out_of_range",
+            "data_loss",
+            "publisher_restart",
+            "gap_cleared",
+            "snapshot",
+        ] {
+            counter!(
+                "smg_kv_event_resyncs_total",
+                "worker" => Arc::clone(&worker),
+                "reason" => reason
+            )
+            .increment(0);
+        }
+        for reason in ["panic", "join_error", "intern_failed"] {
+            counter!(
+                "smg_kv_event_subscription_failures_total",
+                "worker" => Arc::clone(&worker),
+                "reason" => reason
+            )
+            .increment(0);
+        }
+        counter!("smg_kv_event_parentless_stores_total", "worker" => Arc::clone(&worker))
+            .increment(0);
+        counter!("smg_kv_event_parentless_blocks_total", "worker" => Arc::clone(&worker))
+            .increment(0);
+        gauge!("smg_kv_event_degraded_ranks", "worker" => worker).set(0.0);
+    }
+
     /// Record a KV event subscription task failure (panic, join error, or
     /// worker-id intern failure)
     pub fn record_kv_event_subscription_failure(worker_url: &str, reason: &'static str) {
