@@ -240,6 +240,30 @@ fn k3_tokenizer_reports_raw_tool_call_arguments() {
     assert!(!caps.native_assistant_continuation, "{caps:?}");
 }
 
+/// The K3 tokenizer hands the gateway the renderer's own thinking decision
+/// (a typed `disabled` beats an effort word; `none` switches it off), a
+/// Jinja-less mock has no rule of its own.
+#[test]
+fn k3_tokenizer_answers_the_renderer_s_thinking_mode() {
+    let (_dir, tok) = k3_tokenizer_without_chat_template();
+    let high = HashMap::from([("reasoning_effort".to_string(), json!("high"))]);
+    assert_eq!(
+        tok.native_thinking_mode(Some(&high), Some(false)),
+        Some(false)
+    );
+    assert_eq!(tok.native_thinking_mode(Some(&high), None), Some(true));
+    let none = HashMap::from([("reasoning_effort".to_string(), json!("none"))]);
+    assert_eq!(
+        tok.native_thinking_mode(Some(&none), Some(true)),
+        Some(false)
+    );
+    assert_eq!(tok.native_thinking_mode(None, None), Some(true));
+    assert_eq!(
+        llm_tokenizer::MockTokenizer::new().native_thinking_mode(Some(&high), Some(false)),
+        None
+    );
+}
+
 /// An image part is exactly one `<|media_pad|>` id at its authored position:
 /// the text ids on either side are untouched and no separator is added.
 #[test]

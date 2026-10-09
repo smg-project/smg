@@ -377,6 +377,14 @@ impl Tokenizer for CachedTokenizer {
         self.inner.renderer_capabilities()
     }
 
+    fn native_thinking_mode(
+        &self,
+        template_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        thinking: Option<bool>,
+    ) -> Option<bool> {
+        self.inner.native_thinking_mode(template_kwargs, thinking)
+    }
+
     fn eos_token_ids(&self) -> &[TokenIdType] {
         self.inner.eos_token_ids()
     }

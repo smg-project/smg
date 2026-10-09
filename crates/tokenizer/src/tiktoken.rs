@@ -23,7 +23,7 @@ use crate::{
         kimi_k25_tools::apply_kimi_k25_tools,
         kimi_k3_xtml::{
             apply_kimi_k3_xtml_with_effort_default, join_segments, render_kimi_k3_xtml_prompt,
-            PromptSegment, RenderedXtml,
+            resolve_thinking as resolve_k3_thinking, PromptSegment, RenderedXtml,
         },
     },
     factory::discover_chat_template_in_dir,
@@ -912,6 +912,19 @@ impl TokenizerTrait for TiktokenTokenizer {
                 ..RendererCapabilities::default()
             },
             Renderer::Jinja | Renderer::KimiK25Tools => RendererCapabilities::default(),
+        }
+    }
+
+    fn native_thinking_mode(
+        &self,
+        template_kwargs: Option<&HashMap<String, serde_json::Value>>,
+        thinking: Option<bool>,
+    ) -> Option<bool> {
+        match self.renderer {
+            // The K3 encoder resolves the mode by its own rule; the parser is
+            // armed from the same answer the prompt was rendered with.
+            Renderer::KimiK3Xtml => Some(resolve_k3_thinking(template_kwargs, thinking)),
+            Renderer::Jinja | Renderer::KimiK25Tools => None,
         }
     }
 
