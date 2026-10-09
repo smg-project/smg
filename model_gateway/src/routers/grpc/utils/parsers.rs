@@ -117,12 +117,17 @@ impl ParserResolver {
 ///
 /// `user_thinking`: `Some(true)` = user enabled thinking, `Some(false)` = user
 /// disabled it, `None` = not specified (use template default).
+///
+/// A template without a switch cannot turn thinking off, whatever the request
+/// asks: when its generation prompt opens the think block (GLM-5.3), the
+/// completion starts inside it and the parser must start there too, or the
+/// reasoning streams as content.
 pub fn should_mark_reasoning_started(
     user_thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
     match tokenizer.thinking_toggle() {
-        ThinkingToggle::None => false,
+        ThinkingToggle::None => tokenizer.think_in_prefill(),
         ThinkingToggle::DefaultOn => user_thinking != Some(false),
         ThinkingToggle::DefaultOff => user_thinking == Some(true),
     }

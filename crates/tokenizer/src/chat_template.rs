@@ -121,11 +121,7 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
     }
 
     let has_enable_thinking = template.contains("enable_thinking");
-    // Trailing space prevents matching "thinking_mode", "thinking_budget", etc.
-    let has_thinking_var = template.contains("if thinking ")
-        || template.contains("thinking is ")
-        || template.contains("thinking ==")
-        || template.contains("set thinking ");
+    let has_thinking_var = mentions_thinking_variable(template);
 
     if !has_enable_thinking && !has_thinking_var {
         return (ThinkingToggle::None, None);
@@ -151,6 +147,30 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 
     // All other models default to thinking ON
     (ThinkingToggle::DefaultOn, Some(key_name))
+}
+
+/// Whether the template reads a variable named exactly `thinking` (`if
+/// thinking ...`, `thinking is ...`, `thinking == ...`, `set thinking ...`).
+/// The word must stand alone: `clear_thinking is defined` (GLM-5.3) or
+/// `thinking_mode`/`thinking_budget` name other variables, and a template
+/// that only reads those has no thinking switch.
+fn mentions_thinking_variable(template: &str) -> bool {
+    const FOLLOWERS: [&str; 3] = [" is ", " ==", " "];
+    template.match_indices("thinking").any(|(start, _)| {
+        let preceded_by_identifier = template[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        if preceded_by_identifier {
+            return false;
+        }
+        let before = &template[..start];
+        let after = &template[start + "thinking".len()..];
+        let keyword_before = before.ends_with("if ") || before.ends_with("set ");
+        (keyword_before && after.starts_with(FOLLOWERS[2]))
+            || after.starts_with(FOLLOWERS[0])
+            || after.starts_with(FOLLOWERS[1])
+    })
 }
 
 /// Detect the content format expected by a Jinja2 chat template
