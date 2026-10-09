@@ -3,6 +3,7 @@
 pub(crate) mod cache_trace;
 pub mod events;
 pub mod gauge_histogram;
+pub mod heap_profile;
 pub mod inflight_tracker;
 pub mod logging;
 pub mod metrics;

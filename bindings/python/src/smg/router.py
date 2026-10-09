@@ -247,6 +247,9 @@ class Router:
         prometheus_host: Host address to bind the Prometheus metrics server. Default:
             None, which binds the unspecified address of host's family (:: for an IPv6
             host, 0.0.0.0 otherwise)
+        jemalloc_prof_dir: Directory where POST /heap_profile writes a jemalloc heap
+            profile of the router (a build with the jemalloc-profiling feature, started
+            with _RJEM_MALLOC_CONF=prof:true,prof_active:true). Default: None
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default:
             False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD

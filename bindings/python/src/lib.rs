@@ -441,6 +441,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     prometheus_duration_buckets: Option<Vec<f64>>,
+    jemalloc_prof_dir: Option<String>,
     request_timeout_secs: u64,
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
@@ -1028,6 +1029,7 @@ impl Router {
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
+            .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .trust_tenant_header(self.trust_tenant_header)
@@ -1137,6 +1139,7 @@ impl Router {
         prometheus_port = None,
         prometheus_host = None,
         prometheus_duration_buckets = None,
+        jemalloc_prof_dir = None,
         request_timeout_secs = 1800,
         shutdown_grace_period_secs = 180,
         request_id_headers = None,
@@ -1327,6 +1330,7 @@ impl Router {
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         prometheus_duration_buckets: Option<Vec<f64>>,
+        jemalloc_prof_dir: Option<String>,
         request_timeout_secs: u64,
         shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
@@ -1550,6 +1554,7 @@ impl Router {
             prometheus_port,
             prometheus_host,
             prometheus_duration_buckets,
+            jemalloc_prof_dir,
             request_timeout_secs,
             shutdown_grace_period_secs,
             request_id_headers,

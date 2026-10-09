@@ -54,6 +54,7 @@ use crate::{
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
+        heap_profile,
         inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -618,6 +619,15 @@ async fn stop_profile(
         .into_response()
 }
 
+/// `POST /heap_profile`: a heap profile of this gateway process, written
+/// under `--jemalloc-prof-dir` by a `jemalloc-profiling` build (see
+/// [`heap_profile`]).
+async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
+    heap_profile::dump_blocking(state.context.router_config.jemalloc_prof_dir.clone())
+        .await
+        .into_response()
+}
+
 async fn get_loads(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -1013,6 +1023,7 @@ pub fn build_app(
         .route("/flush_cache", post(flush_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
+        .route("/heap_profile", post(dump_heap_profile))
         // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))

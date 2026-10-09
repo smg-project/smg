@@ -834,6 +834,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn maybe_jemalloc_prof_dir(mut self, dir: Option<impl Into<String>>) -> Self {
+        self.config.jemalloc_prof_dir = dir.map(|d| d.into());
+        self
+    }
+
     pub fn maybe_log_level(mut self, level: Option<impl Into<String>>) -> Self {
         self.config.log_level = level.map(|l| l.into());
         self

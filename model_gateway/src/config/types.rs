@@ -272,6 +272,11 @@ pub struct RouterConfig {
     pub trace_config: Option<TraceConfig>,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
+    /// Directory for the heap profiles `POST /heap_profile` writes, on a
+    /// build with the `jemalloc-profiling` feature; unset, the route
+    /// answers 404.
+    #[serde(default)]
+    pub jemalloc_prof_dir: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
     #[serde(default)]
     pub storage_context_headers: HashMap<String, String>,
@@ -1494,6 +1499,7 @@ impl Default for RouterConfig {
             trace_config: None,
             log_dir: None,
             log_level: None,
+            jemalloc_prof_dir: None,
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
             tenant_resolution: TenantResolutionConfig::default(),

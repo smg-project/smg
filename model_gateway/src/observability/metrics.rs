@@ -866,6 +866,7 @@ pub fn init_startup_series() {
     // A histogram has no zero to set: registering the first attempt's series
     // publishes the family with an empty distribution.
     let _ = histogram!("smg_worker_retry_backoff_seconds", "attempt" => "1");
+    super::heap_profile::init_series();
 }
 
 /// Publish process-lifetime totals without scanning or retaining tokenizer instances.

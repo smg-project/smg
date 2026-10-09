@@ -75,7 +75,8 @@ pub(crate) fn open_posture_warning(
         "OPEN: POST /workers and PUT/PATCH/DELETE /workers/{id} (register or remove backends by \
          URL), GET /workers and GET /get_loads (the backends' addresses), POST /flush_cache (drops \
          the engines' prefix caches), POST /start_profile and POST /stop_profile (the engines' \
-         profilers), /parse/*, /wasm and /v1/tokenizers; protect them with --control-plane-api-keys \
+         profilers), POST /heap_profile (writes this gateway's heap profile to disk), /parse/*, \
+         /wasm and /v1/tokenizers; protect them with --control-plane-api-keys \
          id:name:admin:<key> or --jwt-issuer/--jwt-audience (the shared --api-key gates them too)"
             .to_string()
     });
@@ -169,6 +170,7 @@ mod tests {
             "/flush_cache",
             "/start_profile",
             "/stop_profile",
+            "/heap_profile",
             "--control-plane-api-keys",
             "--jwt-issuer",
             "/v1/chat/completions",

@@ -892,6 +892,14 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Prometheus Metrics")]
     prometheus_duration_buckets: Vec<f64>,
 
+    // ==================== Profiling ====================
+    /// Directory where `POST /heap_profile` (an admin route) writes a jemalloc
+    /// heap profile of this gateway. Needs a build with the `jemalloc-profiling`
+    /// feature, started with `_RJEM_MALLOC_CONF=prof:true,prof_active:true`;
+    /// unset, the route answers 404
+    #[arg(long, help_heading = "Profiling")]
+    jemalloc_prof_dir: Option<String>,
+
     // ==================== Request Handling ====================
     /// Custom HTTP headers to check for request IDs
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
@@ -2190,6 +2198,7 @@ impl CliArgs {
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
+            .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
             .maybe_request_id_headers(
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
             )
