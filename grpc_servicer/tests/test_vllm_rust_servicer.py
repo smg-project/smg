@@ -491,8 +491,15 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
     assert rule() == "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic"
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": 2}}
     assert rule() == "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic; --media-io-kwargs video.fps=2"
-    config.model_config.multimodal_config.media_io_kwargs = {}
+    # vLLM takes the kwarg over the environment: a kwarg naming opencv silences
+    # a fleet-wide VLLM_VIDEO_LOADER_BACKEND, and a foreign kwarg is the rule
+    # whatever the environment says.
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "opencv"}}
+    assert rule() is None
     monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv")
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "x"}}
+    assert rule() == "--media-io-kwargs video.video_backend=x"
+    config.model_config.multimodal_config.media_io_kwargs = {}
     assert rule() is None
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
     monkeypatch.delenv("VLLM_VIDEO_LOADER_BACKEND", raising=False)

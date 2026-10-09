@@ -379,12 +379,20 @@ impl WorkerMediaPipeline {
             settings.max_items,
             modality_limit_override,
         );
-        if let Some(message) = loader_rule_conflict(
-            settings.video_loader_rule.as_deref(),
-            spec_name,
-            video_sampling,
-        ) {
-            anyhow::bail!(message);
+        // An engine that takes no video (`--limit-mm-per-prompt '{"video": 0}'`,
+        // image-only serving) never samples one, so its loader's rule cannot
+        // matter and a fleet-wide loader setting must not keep it from starting.
+        let serves_video = item_limits
+            .get(&Modality::Video)
+            .is_none_or(|limit| limit.limit > 0);
+        if serves_video {
+            if let Some(message) = loader_rule_conflict(
+                settings.video_loader_rule.as_deref(),
+                spec_name,
+                video_sampling,
+            ) {
+                anyhow::bail!(message);
+            }
         }
         let vision_processor_registry = Arc::new(VisionProcessorRegistry::with_defaults());
         if settings.pixel_format == PixelFormat::RawU8 {

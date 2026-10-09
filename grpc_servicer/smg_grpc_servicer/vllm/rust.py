@@ -190,9 +190,12 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     does the engine's video frame budget (``--media-io-kwargs``
     ``video.num_frames``, else its loader's default), so a clip costs the same
     tokens as on the engine's own server for the families whose processor
-    takes the loader's frames; a sampling rule of the loader the pipeline
-    cannot follow goes along by name (``video_loader_rule``), and the pipeline
-    refuses it for those families only.
+    takes the loader's frames (unless ``SMG_VLLM_MM_MAX_VIDEO_FRAMES`` caps the
+    budget below the engine's count, when the pipeline samples fewer frames
+    than the engine's server would, as the cap intends); a sampling rule of
+    the loader the pipeline cannot follow goes along by name
+    (``video_loader_rule``), and the pipeline refuses it for those families
+    only.
     """
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
@@ -279,7 +282,8 @@ def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) ->
     """A sampling rule of the engine's video loader that the smg pipeline
     cannot follow, named the way the launcher was given it, or ``None``: a
     loader other than the default ``opencv`` (``video.video_backend`` in
-    ``--media-io-kwargs`` or ``VLLM_VIDEO_LOADER_BACKEND``), or a ``video.fps``
+    ``--media-io-kwargs``, else ``VLLM_VIDEO_LOADER_BACKEND``, in vLLM's own
+    order of precedence), or a ``video.fps``
     above zero, which thins the frames by the clip's duration (vLLM's default
     ``-1`` and ``0`` do not). The pipeline refuses the rule at launch for a
     family that samples the way the loader does (Gemma 4); the families with a
@@ -291,11 +295,15 @@ def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) ->
     video = kwargs.get("video") if isinstance(kwargs, Mapping) else None
     video = video if isinstance(video, Mapping) else {}
     rules: list[str] = []
+    # vLLM takes the kwarg over the environment (`kwargs.pop("video_backend")
+    # or envs.VLLM_VIDEO_LOADER_BACKEND`), so only the loader it ends up with
+    # counts: a kwarg naming opencv silences a fleet-wide environment setting.
     backend = video.get("video_backend")
-    if backend is not None and str(backend).strip().lower() != "opencv":
-        rules.append(f"--media-io-kwargs video.video_backend={backend}")
     loader = (source.get("VLLM_VIDEO_LOADER_BACKEND") or "").strip()
-    if loader and loader.lower() != "opencv":
+    if backend is not None:
+        if str(backend).strip().lower() != "opencv":
+            rules.append(f"--media-io-kwargs video.video_backend={backend}")
+    elif loader and loader.lower() != "opencv":
         rules.append(f"VLLM_VIDEO_LOADER_BACKEND={loader}")
     fps = video.get("fps")
     if fps is not None:
