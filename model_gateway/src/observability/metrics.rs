@@ -355,6 +355,10 @@ pub(crate) fn init_metrics() {
         "smg_pd_admission_sheds_total",
         "PD dispatches shed because no decode admission slot freed in time"
     );
+    describe_gauge!(
+        "smg_pd_admission_window",
+        "Running window the PD admission gate bounds a decode worker by; 0 when the engine reports none and admission is off for that worker"
+    );
 
     // Layer 3: Worker metrics
     describe_gauge!(
@@ -1559,6 +1563,14 @@ impl Metrics {
         counter!("smg_pd_admission_sheds_total").increment(1);
     }
 
+    /// Publish a decode worker's PD admission window: the running window the
+    /// gate claims rooms against, 0 when the engine reports none and the gate
+    /// abstains for that worker.
+    pub fn set_pd_admission_window(worker_url: &str, window: Option<u16>) {
+        let worker = intern_string(worker_url);
+        gauge!("smg_pd_admission_window", "worker" => worker).set(window.map_or(0.0, f64::from));
+    }
+
     /// Set the number of requests SMG has admitted to a prefill worker.
     pub fn set_pd_prefill_admission_inflight(worker_url: &str, count: usize) {
         let worker = intern_string(worker_url);
@@ -2335,6 +2347,7 @@ impl Metrics {
 
         // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
         // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
+        gauge!("smg_pd_admission_window", "worker" => Arc::clone(&worker)).set(-1.0);
         gauge!("smg_worker_cb_state", "worker" => Arc::clone(&worker)).set(-1.0);
         gauge!("smg_worker_health", "worker" => worker).set(-1.0);
     }

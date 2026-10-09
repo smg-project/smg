@@ -980,7 +980,7 @@ fn pick_prost_fields(labels: &mut HashMap<String, String>, s: &prost_types::Stru
 mod tests {
     use std::collections::BTreeMap;
 
-    use smg_grpc_client::{sglang_proto, tokenspeed_proto};
+    use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto};
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo};
 
@@ -1006,6 +1006,27 @@ mod tests {
         prost_types::Value {
             kind: Some(prost_types::value::Kind::NumberValue(n)),
         }
+    }
+
+    /// The vLLM servicer's running window flattens into the `max_num_seqs`
+    /// label the PD admission gate and the capacity tracker read; an engine
+    /// that reports none (the proto default) leaves no label, as before.
+    #[test]
+    fn server_info_to_labels_vllm_carries_the_running_window() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            kv_connector: "NixlConnector".to_string(),
+            max_num_seqs: 64,
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(labels.get("max_num_seqs").map(String::as_str), Some("64"));
+        assert_eq!(
+            labels.get("kv_connector").map(String::as_str),
+            Some("NixlConnector")
+        );
+
+        let unknown = ServerInfo::Vllm(Box::default());
+        assert!(!unknown.to_labels().contains_key("max_num_seqs"));
     }
 
     /// The `/workers` metadata path for TokenSpeed: curated `server_args` keys

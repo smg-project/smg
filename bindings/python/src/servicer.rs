@@ -555,6 +555,7 @@ impl PyVllmGrpcServer {
         pooler_use_activation = None,
         pooler_dimensions = None,
         mm_device_do_normalize = false,
+        max_num_seqs = 0,
         media_processor = None,
         smg_media_processor = None,
         engine_startup_timeout_secs = None,
@@ -597,6 +598,7 @@ impl PyVllmGrpcServer {
         pooler_use_activation: Option<bool>,
         pooler_dimensions: Option<u32>,
         mm_device_do_normalize: bool,
+        max_num_seqs: i32,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
         engine_startup_timeout_secs: Option<f64>,
@@ -645,6 +647,7 @@ impl PyVllmGrpcServer {
             pooler_use_activation,
             pooler_dimensions,
             mm_device_do_normalize,
+            max_num_seqs,
         };
         let mut config = VllmServicerConfig {
             bind_address,

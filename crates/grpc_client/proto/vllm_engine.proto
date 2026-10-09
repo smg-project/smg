@@ -447,6 +447,12 @@ message GetServerInfoResponse {
   // the pixels' own `uint8` bytes and would normalize anything else twice.
   // Flattened into the `mm_device_do_normalize` worker label.
   bool mm_device_do_normalize = 19;
+
+  // The scheduler's running window (`--max-num-seqs`): how many requests the
+  // engine runs at once. Flattened into the `max_num_seqs` worker label, the
+  // bound the router's PD admission gate claims decode rooms against and its
+  // fleet capacity accounting sums; 0 when unknown leaves both as they were.
+  int32 max_num_seqs = 20;
 }
 
 // =====================

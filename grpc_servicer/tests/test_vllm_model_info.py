@@ -139,3 +139,24 @@ def test_server_facts_build_the_proto_as_they_are(monkeypatch):
     assert (facts["kv_connector"], facts["kv_role"], facts["kv_engine_id"]) == ("", "", "")
     assert "block_size" not in facts and "model_dtype" not in facts
     vllm_engine_pb2.GetServerInfoResponse(**facts)
+
+
+def test_server_facts_carry_the_running_window():
+    config = SimpleNamespace(
+        model_config=_model_config(),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=64),
+    )
+    assert model_info.running_window(config) == 64
+    facts = model_info.server_facts(config)
+    assert facts["max_num_seqs"] == 64
+    response = vllm_engine_pb2.GetServerInfoResponse(**facts)
+    assert response.max_num_seqs == 64
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(response.SerializeToString())
+    assert parsed.max_num_seqs == 64
+    # A config without a resolved window reports the proto default, which the
+    # router reads as "no window" (and says so), never an invented figure.
+    assert model_info.running_window(SimpleNamespace()) == 0
+    for window in (None, 0, -1, True, "64"):
+        config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=window))
+        assert model_info.running_window(config) == 0, window

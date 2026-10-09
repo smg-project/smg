@@ -131,10 +131,23 @@ def mm_device_do_normalize(vllm_config: Any) -> bool:
     return bool(getattr(mm_config, "mm_device_do_normalize", False))
 
 
+def running_window(vllm_config: Any) -> int:
+    """The scheduler's running window (``--max-num-seqs``): how many requests
+    the engine runs at once, which ``GetServerInfo`` advertises as
+    ``max_num_seqs`` for the Router's PD admission gate and its fleet capacity
+    accounting; 0 when the config does not carry it, which leaves both as
+    they were."""
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    window = getattr(scheduler, "max_num_seqs", None)
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        return 0
+    return int(window)
+
+
 def server_facts(vllm_config: Any) -> dict[str, Any]:
     """`GetServerInfo`'s config-derived fields, keyed as the proto names them:
-    the PD identity and pairing facts, the data-parallel size, this host's
-    `/dev/shm` identity."""
+    the PD identity and pairing facts, the data-parallel size, the running
+    window, this host's `/dev/shm` identity."""
     kv_config = getattr(vllm_config, "kv_transfer_config", None)
     kv_connector, kv_engine_id, kv_role = "", "", ""
     if kv_config is not None:
@@ -148,6 +161,7 @@ def server_facts(vllm_config: Any) -> dict[str, Any]:
         "kv_role": str(kv_role),
         "kv_engine_id": str(kv_engine_id or ""),
         "data_parallel_size": int(vllm_config.parallel_config.data_parallel_size),
+        "max_num_seqs": running_window(vllm_config),
         "shm_namespace_id": mm_shm.shm_namespace_id(),
         "pairing_protocol": pairing_protocol_from_env(),
         **pairing_fields(vllm_config),

@@ -10,6 +10,7 @@ use wfaas::{
 
 use crate::{
     observability::metrics::Metrics,
+    routers::common::pd_admission,
     worker::{
         registry::WorkerId,
         worker::{ConnectionModeExt, WorkerTypeExt},
@@ -139,6 +140,10 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
                 worker.model_id(),
                 worker_id
             );
+            // A decode worker's running window is the PD admission bound; one
+            // that reports none leaves the gate off for it, which is said here
+            // rather than inferred later from absent series.
+            pd_admission::announce_decode_window(worker.as_ref());
             worker_ids.push(worker_id);
         }
 

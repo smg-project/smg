@@ -171,8 +171,24 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         model_dtype,
         shm_namespace_id: model.shm_namespace_id.clone(),
         mm_device_do_normalize: model.mm_device_do_normalize,
+        max_num_seqs: max_num_seqs(state),
         ..Default::default()
     }
+}
+
+/// The scheduler's running window: the launcher's `--max-num-seqs`, else the
+/// handshake's; 0 before the engine is up on a launcher that reported none.
+fn max_num_seqs(state: &State) -> i32 {
+    if state.model.max_num_seqs > 0 {
+        return state.model.max_num_seqs;
+    }
+    state
+        .engine
+        .client
+        .get()
+        .and_then(ZmqEngineClient::ready_response)
+        .map(|ready| i32::try_from(ready.max_num_seqs).unwrap_or(i32::MAX))
+        .unwrap_or_default()
 }
 
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
@@ -184,9 +200,7 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
 pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
     let client = state.engine()?;
     let ready = client.ready_response();
-    let max_running_requests = ready
-        .map(|ready| i32::try_from(ready.max_num_seqs).unwrap_or(i32::MAX))
-        .unwrap_or_default();
+    let max_running_requests = max_num_seqs(state);
     let max_total_num_tokens = ready
         .and_then(|ready| ready.kv_cache_size_tokens)
         .map(|tokens| i32::try_from(tokens).unwrap_or(i32::MAX))

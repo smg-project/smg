@@ -1144,6 +1144,12 @@ async fn info_rpcs_report_config_and_handshake_facts() {
     assert_eq!(server.kv_engine_id, "eng-a");
     assert_eq!(server.kv_cache_dtype, "auto");
     assert_eq!(server.shm_namespace_id, "boot:42");
+    // The running window the Router's PD admission gate bounds dispatch by:
+    // the handshake's, for a launcher that reported none.
+    assert_eq!(
+        server.max_num_seqs,
+        i32::try_from(ready.max_num_seqs).unwrap()
+    );
 
     // Before any output batch, loads are zero-filled per rank (the Router
     // reads an empty list as no report), stamped with the engine's version.
@@ -1171,6 +1177,30 @@ async fn info_rpcs_report_config_and_handshake_facts() {
         .map(|_| ())
         .unwrap_err();
     assert_eq!(status.code(), Code::Unimplemented);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The launcher's `--max-num-seqs` is the window `GetServerInfo` advertises
+/// and `GetLoads` reports, over the handshake's figure.
+#[tokio::test]
+async fn the_launchers_running_window_wins_over_the_handshakes() {
+    let mut model = model_info();
+    model.max_num_seqs = 64;
+    let mut h = harness(model, None).await;
+    let server = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(server.max_num_seqs, 64);
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.loads[0].max_running_requests, 64);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

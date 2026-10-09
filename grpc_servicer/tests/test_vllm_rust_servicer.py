@@ -346,6 +346,15 @@ def test_model_info_advertises_device_side_normalization():
     assert rust.model_info_from_config(config)["mm_device_do_normalize"] is True
 
 
+def test_model_info_carries_the_running_window():
+    # The Rust servicer advertises the launcher's `--max-num-seqs` as the
+    # Python servicer does; a config without one leaves the handshake's.
+    assert rust.model_info_from_config(_config())["max_num_seqs"] == 0
+    config = _config()
+    config.scheduler_config = SimpleNamespace(max_num_seqs=64)
+    assert rust.model_info_from_config(config)["max_num_seqs"] == 64
+
+
 def test_model_info_mirrors_the_python_servicer(monkeypatch):
     monkeypatch.setenv("SMG_PAIRING_PROTOCOL", " nixl ")
     info = rust.model_info_from_config(_config())

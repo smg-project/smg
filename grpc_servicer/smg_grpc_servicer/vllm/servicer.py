@@ -68,6 +68,7 @@ from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
     mm_device_do_normalize,
     model_facts,
+    running_window,
     server_facts,
 )
 
@@ -111,9 +112,7 @@ def _kv_capacity_tokens(engine) -> int:
 
 def _max_running_requests(engine) -> int:
     """The scheduler's running window (``max_num_seqs``), when exposed."""
-    scheduler = getattr(getattr(engine, "vllm_config", None), "scheduler_config", None)
-    window = getattr(scheduler, "max_num_seqs", None)
-    return window if isinstance(window, int) and window > 0 else 0
+    return running_window(getattr(engine, "vllm_config", None))
 
 
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
@@ -699,6 +698,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             GetServerInfoResponse protobuf
         """
         facts = server_facts(self.engine.vllm_config)
+        # The running window is the newest field; a proto package predating
+        # it takes the rest and leaves the Router's admission gate off.
+        max_num_seqs = facts.pop("max_num_seqs", 0)
         mm_processor = ""
         mm_media_ref_schemes = ""
         # A --language-model-only engine accepts no multimodal inputs, so it
@@ -725,6 +727,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # engine raw pixels; likewise absent from an older proto package.
         if "mm_device_do_normalize" in info.DESCRIPTOR.fields_by_name:
             info.mm_device_do_normalize = mm_device_do_normalize(self.engine.vllm_config)
+        if max_num_seqs and "max_num_seqs" in info.DESCRIPTOR.fields_by_name:
+            info.max_num_seqs = max_num_seqs
         return info
 
     async def GetLoads(
