@@ -212,6 +212,9 @@ impl KvEventMonitor {
     /// and every cursor and counts a `snapshot` resync; every chunk is applied
     /// outside the admission rules and moves its rank's cursor to its stamp,
     /// which the relay chose so that live events continue after the last one.
+    /// The chunk's blocks are accounted like an applied batch's: counted under
+    /// `op="snapshot"` (they are the relay's record, not stores the publisher
+    /// sent) and reflected in the worker's index-blocks gauge.
     fn admit_snapshot_chunk(
         batch: &KvEventBatch,
         chunk: &KvSnapshotChunk,
@@ -268,12 +271,20 @@ impl KvEventMonitor {
         }
         on_batch(batch);
         let counters_before = state.index.counters;
+        let mut snapshot_blocks = 0usize;
         for event in &batch.events {
+            if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
+                snapshot_blocks += stored.blocks.len();
+            }
             Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
         Self::record_parentless(worker_url, &state.index.counters, &counters_before);
+        if snapshot_blocks > 0 {
+            Metrics::record_kv_event_blocks(worker_url, "snapshot", snapshot_blocks);
+        }
         Self::record_lag(worker_url, batch.timestamp);
         Metrics::record_kv_event_batch(worker_url, "snapshot");
+        Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
         if let Some(progress) = &mut state.snapshot {
             progress.applied += 1;
             if progress.applied >= progress.count {
@@ -484,6 +495,86 @@ mod tests {
             );
             assert_eq!(sim.indexer.worker_block_count(sim.worker), 0);
             assert_eq!(index_blocks(&handle), Some(0.0), "{kind:?}: cleared");
+        });
+    }
+
+    /// A subscription served by a relay snapshot accounts its blocks the way
+    /// the live path does: once the chunks are applied the worker's gauge
+    /// reads the index's count, the snapshot's blocks are counted under
+    /// `op="snapshot"`, and the live events after it keep counting from there.
+    #[test]
+    fn a_relay_snapshot_sets_the_worker_gauge_and_counts_its_blocks() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let series = |name: &str, labels: &[&str]| -> Option<f64> {
+            handle
+                .render()
+                .lines()
+                .find(|line| {
+                    line.starts_with(name) && labels.iter().all(|label| line.contains(label))
+                })
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        };
+        let worker = "worker=\"grpc://w1:9000\"";
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            // The relay's live set at the cut (sequence 5): five blocks in two chunks.
+            let chunks = snapshot_chunks(
+                5,
+                None,
+                &[
+                    vec![stored(None, &[1, 2, 3])],
+                    vec![stored(Some(3), &[4, 5])],
+                ],
+                5,
+            );
+            for chunk in &chunks {
+                assert_eq!(sim.feed(chunk), BatchOutcome::Applied);
+            }
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 5);
+            assert_eq!(
+                series("smg_kv_index_blocks{", &[worker]),
+                Some(5.0),
+                "the gauge reads the snapshot's live set"
+            );
+            assert_eq!(
+                series("smg_kv_event_blocks_total{", &[worker, "op=\"snapshot\""]),
+                Some(5.0),
+                "the snapshot's blocks are counted"
+            );
+            assert_eq!(
+                series("smg_kv_event_blocks_total{", &[worker, "op=\"stored\""]),
+                None,
+                "a snapshot is not a publisher's store"
+            );
+
+            // Live events after the cut keep both moving.
+            assert_eq!(
+                sim.feed(&batch(6, None, vec![stored(Some(5), &[6, 7])])),
+                BatchOutcome::Applied
+            );
+            assert_eq!(
+                sim.feed(&batch(7, None, vec![removed(&[7])])),
+                BatchOutcome::Applied
+            );
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 6);
+            assert_eq!(series("smg_kv_index_blocks{", &[worker]), Some(6.0));
+            assert_eq!(
+                series("smg_kv_event_blocks_total{", &[worker, "op=\"stored\""]),
+                Some(2.0)
+            );
+            assert_eq!(
+                series("smg_kv_event_blocks_total{", &[worker, "op=\"removed\""]),
+                Some(1.0)
+            );
+            assert_eq!(
+                series("smg_kv_event_blocks_total{", &[worker, "op=\"snapshot\""]),
+                Some(5.0),
+                "the snapshot count stands"
+            );
         });
     }
 

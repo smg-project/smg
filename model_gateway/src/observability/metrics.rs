@@ -446,7 +446,8 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_kv_event_blocks_total",
-        "Blocks named by applied KV events, by worker and op (stored, removed)"
+        "Blocks named by applied KV events, by worker and op (stored, removed; snapshot: \
+         the live set a relay state snapshot listed)"
     );
     describe_histogram!(
         "smg_kv_event_apply_seconds",
