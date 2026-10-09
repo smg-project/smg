@@ -580,7 +580,11 @@ impl StreamingProcessor {
 
                     // Process logprobs if present
                     let choice_logprobs = chunk.output_logprobs().map(|ref proto_logprobs| {
-                        utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer)
+                        utils::convert_proto_to_openai_logprobs(
+                            proto_logprobs,
+                            &tokenizer,
+                            original_request.top_logprobs,
+                        )
                     });
 
                     Some((index, chunk_text, choice_logprobs))

@@ -90,6 +90,8 @@ pub(crate) struct ChatResponseSpec {
     /// `n`, normalized.
     pub expected_choices: u32,
     pub logprobs: bool,
+    /// Alternatives per token the client asked for; none when absent.
+    pub top_logprobs: Option<u32>,
     pub stop: Option<StringOrArray>,
     pub stop_token_ids: Option<Vec<u32>>,
     pub no_stop_trim: bool,
@@ -125,6 +127,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             continues_final_assistant: utils::continues_final_assistant(request),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
+            top_logprobs: request.top_logprobs,
             stop: request.stop.clone(),
             stop_token_ids: request.stop_token_ids.clone(),
             no_stop_trim: request.no_stop_trim,

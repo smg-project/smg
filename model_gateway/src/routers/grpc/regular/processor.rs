@@ -206,7 +206,11 @@ impl ResponseProcessor {
 
         // Step 4: Convert output logprobs if present
         let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
-            utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer)
+            utils::convert_proto_to_openai_logprobs(
+                proto_logprobs,
+                tokenizer,
+                original_request.top_logprobs,
+            )
         });
 
         // Step 5: Build ChatCompletionMessage (proper response message type)
