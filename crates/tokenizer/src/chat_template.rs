@@ -1438,8 +1438,9 @@ impl ChatTemplateState {
     pub fn set(&mut self, template: String) -> Result<()> {
         let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
             detect_all(&template);
-        self.developer_role_supported = detect_developer_role_support(&template);
+        let developer_role_supported = detect_developer_role_support(&template);
         let env = build_environment(template)?;
+        self.developer_role_supported = developer_role_supported;
         self.content_format = content_format;
         self.thinking_toggle = thinking_toggle;
         self.thinking_key_name = thinking_key_name;
