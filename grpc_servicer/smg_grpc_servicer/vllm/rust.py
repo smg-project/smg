@@ -73,6 +73,10 @@ SERVICER_IMPL_ENV = "SMG_VLLM_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_VLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS"
+# Set to 0/false/no/off to keep vLLM's KV event publisher off when the
+# launcher was given no --kv-events-config (see `default_kv_events_config`).
+KV_EVENTS_ENV = "SMG_VLLM_SERVICER_KV_EVENTS"
+_OFF_VALUES = ("0", "false", "no", "off")
 # vLLM's own knob for how it starts its processes; the engine cores launched
 # from this process are spawned unless the deployment chose otherwise.
 MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
@@ -129,6 +133,38 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
         "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
     }
+
+
+def default_kv_events_config(
+    args: argparse.Namespace, environ: Mapping[str, str] | None = None
+) -> Any | None:
+    """Turn vLLM's KV event publisher on when the launcher was given no
+    ``--kv-events-config``; returns the configuration applied, or None.
+
+    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
+    vLLM publishes none unless started with ``--kv-events-config
+    '{"enable_kv_cache_events": true, "publisher": "zmq"}'``: a launcher
+    without it got a router that routed blind, with one WARN per worker as
+    the only trace. Under the Rust servicer the namespace that lacks the
+    option gets exactly that configuration (vLLM's own defaults for the rest:
+    the ZMQ endpoint and its port, the topic), before the engine args and the
+    engine cores are built from it, so publisher and relay agree. An explicit
+    ``--kv-events-config`` is kept as given, off included;
+    ``SMG_VLLM_SERVICER_KV_EVENTS=0`` keeps the publisher off without one.
+    """
+    source = os.environ if environ is None else environ
+    if getattr(args, "kv_events_config", None) is not None:
+        return None
+    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
+        return None
+    try:
+        from vllm.config import KVEventsConfig
+
+        config: Any = KVEventsConfig(enable_kv_cache_events=True, publisher="zmq")
+    except ImportError:  # the launcher's parser hands the config over as JSON too
+        config = {"enable_kv_cache_events": True, "publisher": "zmq"}
+    args.kv_events_config = config
+    return config
 
 
 def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[str, Any] | None:
@@ -339,9 +375,23 @@ async def serve_rust(args: argparse.Namespace) -> int:
     from vllm.usage.usage_lib import UsageContext
 
     configure_logging()
+    if default_kv_events_config(args) is not None:
+        logger.info(
+            "KV event publishing enabled: no --kv-events-config was given, so vLLM's ZMQ "
+            "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+            "--kv-events-config to configure it, or set %s=0 to leave it off",
+            KV_EVENTS_ENV,
+        )
     engine_args = AsyncEngineArgs.from_cli_args(args)
     vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
     info = model_info_from_config(vllm_config)
+    if info["kv_events_endpoint"]:
+        logger.info("SubscribeKvEvents relays vLLM's KV events from %s", info["kv_events_endpoint"])
+    else:
+        logger.warning(
+            "SubscribeKvEvents is off (KV cache events disabled, or a publisher other than "
+            "zmq): a cache-aware router sees nothing of this engine's cache"
+        )
     model_config = vllm_config.model_config
     tokenizer_dir = resolve_tokenizer_dir(
         str(getattr(model_config, "tokenizer", None) or model_config.model),

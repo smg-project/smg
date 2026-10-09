@@ -975,6 +975,43 @@ def test_configure_logging_gives_the_package_a_handler(monkeypatch):
     assert root.handlers or pkg.handlers
 
 
+def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer(monkeypatch):
+    """A launcher without --kv-events-config left vLLM publishing nothing and
+    the router's cache-aware routing blind (smg-lab #1): the Rust path turns
+    the ZMQ publisher on itself unless told otherwise."""
+    expected = {"enable_kv_cache_events": True, "publisher": "zmq"}
+    # Nothing given (no vLLM importable here: the JSON form the parser takes).
+    args = argparse.Namespace(model="org/m")
+    applied = rust.default_kv_events_config(args, environ={})
+    assert applied == expected
+    assert args.kv_events_config is applied
+    args = argparse.Namespace(model="org/m", kv_events_config=None)
+    assert rust.default_kv_events_config(args, environ={}) == expected
+    # The opt-out.
+    for value in ("0", "false", "No", " off "):
+        args = argparse.Namespace(model="org/m", kv_events_config=None)
+        assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: value}) is None
+        assert args.kv_events_config is None
+    args = argparse.Namespace(model="org/m")
+    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}) == expected
+    # An explicit configuration is kept as given, off included.
+    given = SimpleNamespace(enable_kv_cache_events=False, publisher="null")
+    args = argparse.Namespace(model="org/m", kv_events_config=given)
+    assert rust.default_kv_events_config(args, environ={}) is None
+    assert args.kv_events_config is given
+    # vLLM's own dataclass once it is importable.
+
+    class KVEventsConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    _install(monkeypatch, "vllm.config", KVEventsConfig=KVEventsConfig)
+    args = argparse.Namespace(model="org/m")
+    applied = rust.default_kv_events_config(args, environ={})
+    assert isinstance(applied, KVEventsConfig) and applied.kwargs == expected
+    assert args.kv_events_config is applied
+
+
 def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, tmp_path):
     """The upstream hook hands `serve_rust` its parsed namespace: the Rust
     server binds the launcher's host/port, the engine cores are launched
@@ -1067,3 +1104,8 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert ns.headless is True and ns.max_model_len == 4096
     assert ns.data_parallel_rpc_port == 24321
     assert ns.data_parallel_size == 2 and ns.data_parallel_size_local == 2
+    # No --kv-events-config was given: the engine args and the engine cores
+    # both see the publisher on.
+    kv_events = {"enable_kv_cache_events": True, "publisher": "zmq"}
+    assert recorded["engine_args_from"].kv_events_config == kv_events
+    assert ns.kv_events_config == kv_events

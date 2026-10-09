@@ -176,8 +176,10 @@ contract the Python servicer serves: text generation, PD disaggregation
 (inline and `/dev/shm` tensors), worker-side media processing (`media_refs`,
 below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
 FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
-directory) and `SubscribeKvEvents` (`--kv-events-config` with the ZMQ
-publisher). Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
+directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which Rust mode
+turns on by itself when the launcher is given no `--kv-events-config`; an
+explicit one is kept as given, and `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the
+publisher off). Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
 `SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
 `SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800: how long the servicer
 waits for the engine's handshake; an engine's first start on a host
