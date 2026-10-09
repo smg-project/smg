@@ -2,9 +2,11 @@
 
 ``python -m smg_grpc_servicer.tokenspeed`` (what ``ts serve`` spawns) serves
 ``tokenspeed.grpc.scheduler.TokenSpeedScheduler`` from Python over TokenSpeed's
-in-process ``AsyncLLM``. With ``SMG_TOKENSPEED_SERVICER_IMPL=rust`` the same
-entrypoint hands the process to :func:`serve_rust` before an ``AsyncLLM`` or a
-Python gRPC server exists: the contract is served by the Rust
+in-process ``AsyncLLM``. With ``--servicer-impl rust`` (this package's flag on
+that launcher, see :func:`add_servicer_impl_argument`;
+``SMG_TOKENSPEED_SERVICER_IMPL=rust`` is the fallback the flag overrides) the
+same entrypoint hands the process to :func:`serve_rust` before an ``AsyncLLM``
+or a Python gRPC server exists: the contract is served by the Rust
 :class:`smg.servicer.TokenSpeedGrpcServer` on a Rust-owned thread, and the
 scheduler(s) run headless in a spawned child through TokenSpeed's own
 ``launch_scheduler_headless`` (what ``ts serve --headless`` runs), dialing the
@@ -19,13 +21,14 @@ emulates: ``FlushCache`` and profiling answer UNIMPLEMENTED, ranked
 
 from __future__ import annotations
 
+import argparse
 import copy
 import dataclasses
 import json
 import logging
 import multiprocessing
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port
@@ -59,16 +62,62 @@ _OFF_VALUES = ("0", "false", "no", "off")
 # endpoint, the topic).
 DEFAULT_KV_EVENTS_CONFIG = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
 IMPLS = ("python", "rust")
+SERVICER_IMPL_FLAG = "--servicer-impl"
+# Where the implementation choice came from, for the startup log line.
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
 
 
-def resolve_servicer_impl(environ: Mapping[str, str] | None = None) -> str:
-    """Which implementation serves this process: ``$SMG_TOKENSPEED_SERVICER_IMPL``,
-    else python."""
+def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
+    """Add ``--servicer-impl`` to a launcher's parser that lacks it; returns
+    whether it was added."""
+    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
+    if SERVICER_IMPL_FLAG in actions:
+        return False
+    parser.add_argument(
+        SERVICER_IMPL_FLAG,
+        dest="servicer_impl",
+        choices=list(IMPLS),
+        default=None,
+        help=(
+            "Which implementation serves the gRPC contract: the Python servicer (default) "
+            "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
+            f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
+        ),
+    )
+    return True
+
+
+def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
+    """Which implementation serves this process: ``args.servicer_impl`` when
+    the launcher carried the flag, else ``$SMG_TOKENSPEED_SERVICER_IMPL``, else
+    python."""
+    return servicer_impl_source(args, environ)[0]
+
+
+def servicer_impl_source(
+    args: Any = None, environ: Mapping[str, str] | None = None
+) -> tuple[str, str]:
+    """:func:`resolve_servicer_impl`'s answer with where it came from:
+    ``flag``, ``env`` or ``default``.
+
+    A decision made with the launcher's flag in hand is written back to the
+    environment, so the headless scheduler child and anything that reads only
+    the variable agree with it when ``--servicer-impl python`` overrides an
+    exported ``rust``."""
     source = os.environ if environ is None else environ
-    value = str(source.get(SERVICER_IMPL_ENV) or "python").strip().lower()
+    value = getattr(args, "servicer_impl", None) if args is not None else None
+    origin = SOURCE_FLAG
+    if not value:
+        value = source.get(SERVICER_IMPL_ENV)
+        origin = SOURCE_ENV if value else SOURCE_DEFAULT
+    value = str(value or "python").strip().lower()
     if value not in IMPLS:
         raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    return value
+    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
+        source[SERVICER_IMPL_ENV] = value
+    return value, origin
 
 
 # ---------------------------------------------------------------------------

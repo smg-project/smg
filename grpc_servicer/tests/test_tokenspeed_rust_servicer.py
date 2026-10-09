@@ -8,11 +8,15 @@ TokenSpeed: the facts get a fake model config and a stub servicer module,
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import dataclasses
+import importlib.util
 import json
+import os
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -88,11 +92,157 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
     assert pkg.serve_rust is rust.serve_rust
 
 
-def test_resolve_servicer_impl_reads_the_env():
+def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
     assert rust.resolve_servicer_impl(environ={}) == "python"
     assert rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": " Rust "}) == "rust"
-    with pytest.raises(ValueError, match="SMG_TOKENSPEED_SERVICER_IMPL"):
+    args = argparse.Namespace(servicer_impl="rust")
+    assert rust.resolve_servicer_impl(args, environ={}) == "rust"
+    # The flag wins over the environment, in both directions.
+    assert (
+        rust.resolve_servicer_impl(args, environ={"SMG_TOKENSPEED_SERVICER_IMPL": "python"})
+        == "rust"
+    )
+    args = argparse.Namespace(servicer_impl="python")
+    assert (
+        rust.resolve_servicer_impl(args, environ={"SMG_TOKENSPEED_SERVICER_IMPL": "rust"})
+        == "python"
+    )
+    # An unset launcher flag falls through to the env.
+    args = argparse.Namespace(servicer_impl=None)
+    assert (
+        rust.resolve_servicer_impl(args, environ={"SMG_TOKENSPEED_SERVICER_IMPL": "rust"}) == "rust"
+    )
+    with pytest.raises(ValueError, match="SMG_TOKENSPEED_SERVICER_IMPL must be one of"):
         rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "go"})
+    with pytest.raises(ValueError, match="SMG_TOKENSPEED_SERVICER_IMPL must be one of"):
+        rust.resolve_servicer_impl(argparse.Namespace(servicer_impl="go"), environ={})
+
+
+def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back():
+    assert rust.servicer_impl_source(environ={}) == ("python", "default")
+    assert rust.servicer_impl_source(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "rust"}) == (
+        "rust",
+        "env",
+    )
+    # `--servicer-impl python` with `rust` still exported: the flag decides,
+    # and the environment the headless child inherits says the same.
+    environ = {"SMG_TOKENSPEED_SERVICER_IMPL": "rust"}
+    args = argparse.Namespace(servicer_impl="python")
+    assert rust.servicer_impl_source(args, environ=environ) == ("python", "flag")
+    assert environ == {"SMG_TOKENSPEED_SERVICER_IMPL": "python"}
+    # Without a flag in hand nothing is written.
+    environ = {}
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("python", "default")
+    assert environ == {}
+
+
+def test_the_flag_joins_a_parser_once_with_argparse_validation():
+    parser = argparse.ArgumentParser(prog="launcher")
+    assert rust.add_servicer_impl_argument(parser) is True
+    assert rust.add_servicer_impl_argument(parser) is False
+    assert "--servicer-impl {python,rust}" in parser.format_help()
+    assert "SMG_TOKENSPEED_SERVICER_IMPL" in parser.format_help()
+    assert parser.parse_args([]).servicer_impl is None
+    assert parser.parse_args(["--servicer-impl", "rust"]).servicer_impl == "rust"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--servicer-impl", "go"])
+
+
+@pytest.fixture
+def launcher(monkeypatch):
+    """``python -m smg_grpc_servicer.tokenspeed`` with TokenSpeed's argument
+    parsing and both serving paths stood in for: ``prepare_server_args``
+    records the argv it is handed (and prints a help line on --help, as
+    TokenSpeed's parser would, then exits), the two servers record which ran."""
+    calls = {"argv": None, "served": None}
+
+    def prepare_server_args(argv):
+        calls["argv"] = list(argv)
+        if any(arg in ("-h", "--help") for arg in argv):
+            print("usage: tokenspeed [--model MODEL] (TokenSpeed's own help)")
+            raise SystemExit(0)
+        return FakeServerArgs(model=argv[argv.index("--model") + 1])
+
+    _install(
+        monkeypatch,
+        "tokenspeed.runtime.utils.server_args",
+        prepare_server_args=prepare_server_args,
+        ServerArgs=FakeServerArgs,
+    )
+
+    async def serve_grpc(server_args):
+        calls["served"] = ("python", server_args)
+
+    _install(monkeypatch, "smg_grpc_servicer.tokenspeed.server", serve_grpc=serve_grpc)
+    path = Path(rust.__file__).with_name("__main__.py")
+    spec = importlib.util.spec_from_file_location("test_tokenspeed_launcher", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    async def serve_rust(server_args):
+        calls["served"] = ("rust", server_args)
+        return 3
+
+    monkeypatch.setattr(module, "serve_rust", serve_rust)
+    monkeypatch.setattr(module, "uvloop", None)
+    return module, calls
+
+
+def test_the_launcher_takes_the_flag_ahead_of_tokenspeeds_args(launcher, monkeypatch, caplog):
+    module, calls = launcher
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
+    with caplog.at_level("INFO", logger=module.logger.name):
+        with pytest.raises(SystemExit) as raised:
+            module.main(["--model", "org/m", "--servicer-impl", "rust", "--port", "50051"])
+    assert raised.value.code == 3
+    # TokenSpeed's parser never sees this package's flag; the rest is verbatim.
+    assert calls["argv"] == ["--model", "org/m", "--port", "50051"]
+    assert calls["served"][0] == "rust" and calls["served"][1].model == "org/m"
+    assert "Servicer implementation: rust (source=flag)" in caplog.text
+    # The decision reaches the environment the headless child inherits.
+    assert os.environ[rust.SERVICER_IMPL_ENV] == "rust"
+
+
+def test_the_launcher_falls_back_to_the_environment_then_python(launcher, monkeypatch, caplog):
+    module, calls = launcher
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "rust")
+    with caplog.at_level("INFO", logger=module.logger.name):
+        with pytest.raises(SystemExit) as raised:
+            module.main(["--model", "org/m"])
+    assert raised.value.code == 3 and calls["served"][0] == "rust"
+    assert calls["argv"] == ["--model", "org/m"]
+    assert "Servicer implementation: rust (source=env)" in caplog.text
+    # `--servicer-impl python` overrides the exported `rust`, environment included.
+    caplog.clear()
+    with caplog.at_level("INFO", logger=module.logger.name):
+        module.main(["--servicer-impl=python", "--model", "org/m"])
+    assert calls["served"][0] == "python" and calls["argv"] == ["--model", "org/m"]
+    assert "Servicer implementation: python (source=flag)" in caplog.text
+    assert os.environ[rust.SERVICER_IMPL_ENV] == "python"
+    # Neither: the Python servicer, and the environment is left alone.
+    monkeypatch.delenv(rust.SERVICER_IMPL_ENV)
+    caplog.clear()
+    with caplog.at_level("INFO", logger=module.logger.name):
+        module.main(["--model", "org/m"])
+    assert calls["served"][0] == "python"
+    assert "Servicer implementation: python (source=default)" in caplog.text
+    assert rust.SERVICER_IMPL_ENV not in os.environ
+
+
+def test_the_launcher_lists_the_flag_ahead_of_tokenspeeds_help(launcher, capsys):
+    module, calls = launcher
+    with pytest.raises(SystemExit) as raised:
+        module.main(["--help"])
+    assert raised.value.code == 0
+    out = capsys.readouterr().out
+    assert "--servicer-impl {python,rust}" in out
+    assert out.index("--servicer-impl") < out.index("TokenSpeed's own help")
+    assert calls["argv"] == ["--help"]
+    # An invalid choice is refused by this package's parser, before TokenSpeed's runs.
+    calls["argv"] = None
+    with pytest.raises(SystemExit) as raised:
+        module.main(["--model", "org/m", "--servicer-impl", "go"])
+    assert raised.value.code == 2 and calls["argv"] is None
 
 
 def test_model_facts_mirror_the_python_servicer(monkeypatch):

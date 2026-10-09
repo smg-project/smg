@@ -249,11 +249,21 @@ python -m smg_grpc_servicer.mlx --model meta-llama/Llama-2-7b-hf --host 0.0.0.0 
 ### TokenSpeed
 
 ```bash
+# Python (default)
 python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0.0.0.0 --port 50051
+
+# Rust request path, same entrypoint
+python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0.0.0.0 --port 50051 --servicer-impl rust
+
+# The environment form, overridden by the flag when both are given
+SMG_TOKENSPEED_SERVICER_IMPL=rust python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --port 50051
 ```
 
-This is the process `ts serve` spawns for its gRPC worker. With
-`SMG_TOKENSPEED_SERVICER_IMPL=rust` the same process serves the
+This is the process `ts serve` spawns for its gRPC worker; `--servicer-impl`
+is this package's flag (listed first by `--help`, ahead of TokenSpeed's own
+flags), and `SMG_TOKENSPEED_SERVICER_IMPL` is the fallback the flag overrides
+(flag, then the environment, then `python`; the launcher logs which one
+decided). With `--servicer-impl rust` the same process serves the
 `tokenspeed.grpc.scheduler.TokenSpeedScheduler` contract from Rust
 (`smg.servicer.TokenSpeedGrpcServer`, which needs the `smg` wheel): the
 launcher computes the model and server facts from TokenSpeed's own config,
