@@ -9,7 +9,10 @@
 //! middleware then answers 408 and the admission guard around the response
 //! releases the permit as the response drops. Both clocks run only while the
 //! consumer is waiting on the client: a parsed body, a request parked at
-//! admission or a slow handler never trips them.
+//! admission or a slow handler never trips them. A read the payload limit
+//! ended is answered here too, as 413: the limit layers sit outside this
+//! wrapper, which boxes their error once more, past where the JSON
+//! extractor's own 413 branch looks for it.
 
 use std::{
     future::Future,
@@ -40,10 +43,13 @@ use crate::{config::types::RouterConfig, routers::error::create_error};
 pub const REQUEST_BODY_STALLED: &str = "request_body_stalled";
 /// Error code of a body still incomplete at the request timeout.
 pub const REQUEST_BODY_TIMEOUT: &str = "request_body_timeout";
+/// Error code of a body that crossed the payload limit (`max_payload_size`).
+pub const REQUEST_BODY_TOO_LARGE: &str = "request_body_too_large";
 
 const READING: u8 = 0;
 const STALLED: u8 = 1;
 const TIMED_OUT: u8 = 2;
+const TOO_LARGE: u8 = 3;
 
 /// The two clocks of a buffered body read, from the router config.
 #[derive(Clone, Copy, Debug)]
@@ -68,9 +74,10 @@ impl RequestBodyTimeouts {
 }
 
 /// Route-layer middleware: wraps the request body in the watchdog and turns
-/// a read the watchdog ended into `408` with the matching error code. The
-/// handler's own rejection of the failed read (the JSON extractor's 400) is
-/// replaced, so the client learns why its upload ended.
+/// a read the watchdog ended into `408` with the matching error code, and a
+/// read the payload limit ended into `413`. The handler's own rejection of
+/// the failed read (the JSON extractor's 400) is replaced, so the client
+/// learns why its upload ended.
 pub async fn request_body_timeout_middleware(
     State(timeouts): State<RequestBodyTimeouts>,
     request: Request<Body>,
@@ -105,8 +112,29 @@ pub async fn request_body_timeout_middleware(
                 format!("Request body was not complete after {timeout_secs} seconds"),
             )
         }
+        TOO_LARGE => create_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            REQUEST_BODY_TOO_LARGE,
+            "Request body exceeded the payload limit (max_payload_size)",
+        ),
         _ => response,
     }
+}
+
+/// Whether a failed read is the payload limit's `LengthLimitError`, however
+/// many body wrappers boxed it on the way in. The limit layers sit outside
+/// this one, and every `Body::new` over a wrapped body adds a layer of
+/// `axum::Error`; the JSON extractor's 413 branch, like axum's own, looks
+/// two layers deep, which this wrapper's layer put the limit error beyond.
+fn crossed_payload_limit(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = source {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// Body wrapper that fails the read when the client stalls or the total
@@ -163,6 +191,9 @@ impl http_body::Body for TimedBody {
             Poll::Pending => {}
             Poll::Ready(frame) => {
                 this.stall_timer = None;
+                if matches!(&frame, Some(Err(err)) if crossed_payload_limit(err)) {
+                    this.outcome.store(TOO_LARGE, Ordering::Release);
+                }
                 return Poll::Ready(frame);
             }
         }
@@ -319,5 +350,30 @@ mod tests {
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
         assert_eq!(error_code(response).await, REQUEST_BODY_TIMEOUT);
         assert!(started.elapsed() >= Duration::from_secs(10));
+    }
+
+    /// A read the payload limit cut short is 413 request_body_too_large,
+    /// whatever the handler made of the failed read: the limit layer sits
+    /// outside the watchdog, so its error reaches the handler boxed once
+    /// more, past where the extractors look for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_over_the_payload_limit_is_413_request_body_too_large() {
+        let app = app(timeouts(5, 60)).layer(tower_http::limit::RequestBodyLimitLayer::new(8));
+        let response = app
+            .oneshot(echo(Body::from("more than eight bytes")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error_code(response).await, "request_body_too_large");
+    }
+
+    /// Any other failed read keeps the handler's own answer.
+    #[tokio::test(start_paused = true)]
+    async fn another_failed_read_keeps_the_handlers_answer() {
+        let body = Body::from_stream(stream::iter([Err::<Bytes, _>(std::io::Error::other(
+            "connection reset",
+        ))]));
+        let response = app(timeouts(5, 60)).oneshot(echo(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
