@@ -165,7 +165,7 @@ def collect_models(records: dict) -> dict:
 def main(argv=None):
     ap = argparse.ArgumentParser(description="distill probe recordings into a compat baseline")
     ap.add_argument("--results", required=True, help="raw recording dir (results.jsonl[.gz])")
-    ap.add_argument("--provider", required=True, choices=["openai", "anthropic"])
+    ap.add_argument("--provider", required=True, choices=["openai", "anthropic", "openai-chat"])
     ap.add_argument("--out", required=True, help="baseline output dir")
     ap.add_argument("--probe-set-sha", default=None, help="git sha of the probe set recorded")
     ap.add_argument("--run-id", default=None, help="recording workflow run id")

@@ -21,6 +21,7 @@ runs the recorder, and `vendor_probe/**` feeds the `agentic` change family in
 vendor_probe/
   probes/openai_responses.py     # curated tier: ~225 probes, plain data
   probes/anthropic_messages.py   # curated tier: ~163 probes, plain data
+  probes/openai_chat_completions.py  # curated tier: ~134 probes (Chat Completions)
   genmatrix.py                   # generated tier: ~6.5K OpenAI / ~5.1K Anthropic
   runner.py                      # async httpx runner + provider adapters
   compat_diff.py                 # structural differ (+ --baseline gate mode)
@@ -106,12 +107,32 @@ The PR-triggered workflow run stays on the curated tier; `workflow_dispatch`
 defaults to `tier=all` at concurrency 24 (`tier`, `concurrency`, `budget`
 inputs).
 
+## Chat Completions tier
+
+`probes/openai_chat_completions.py` covers the Chat Completions surface with
+the same conventions (provider `openai-chat`, replay target `smg-openai-chat`,
+no generated tier yet): plain / system / developer / multi-turn / content
+parts, streaming with and without `stream_options.include_usage` (n, stop,
+max-token cuts, tools, logprobs, json_schema), the classic sampling parameters
+(temperature, top_p, seed, n, stop, penalties, logit_bias, logprobs), tools
+(auto / required / named / none, parallel on and off, strict, `$defs`,
+scripted tool-result round trips that do not depend on the model calling a
+tool, the legacy `functions` surface), structured outputs, images by data URL
+and URL, and 55 error probes (bad JSON, unknown fields, every numeric bound,
+tool/tool_choice/tool-message pairing mistakes, response_format mistakes,
+auth). Chat Completions streams carry no `event:` line, so the fingerprint
+names each chunk by what it carries (`delta.role`, `delta.content`,
+`delta.tool_calls`, `...finish:<reason>`, `usage`, `[DONE]`); the differ
+treats the content-bound kinds and the stop/length finish classes as
+mock-limited, like the other families.
+
 ## Dual-target replay (SMG diff)
 
 ```bash
 export SMG_BASE_URL=http://localhost:8080 SMG_API_KEY=...
 python -m vendor_probe.runner --provider smg-openai    --out results/smg-openai
 python -m vendor_probe.runner --provider smg-anthropic --out results/smg-anthropic
+python -m vendor_probe.runner --provider smg-openai-chat --out results/smg-openai-chat
 ```
 
 The `smg-*` adapters reuse the same probe matrices with SMG's base_url/auth

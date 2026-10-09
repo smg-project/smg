@@ -77,6 +77,9 @@ from pathlib import Path
 _VOLATILE_RES = [
     (re.compile(r"\b(resp|msg|conv|rs|fc|ws|ig|cu|lc|mcp|msg_batch)_[A-Za-z0-9_-]{6,}"), "<id>"),
     (re.compile(r"\breq_[A-Za-z0-9]{6,}"), "<req>"),
+    (re.compile(r"\bchatcmpl-[A-Za-z0-9_-]{6,}"), "<id>"),
+    (re.compile(r"\bcall_[A-Za-z0-9_-]{6,}"), "<id>"),
+    (re.compile(r"\bfp_[a-f0-9]{6,}"), "<fp>"),
     (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), "<uuid>"),
     (re.compile(r"\b\d{9,}\b"), "<ts>"),
     (re.compile(r"\b(gpt|claude|codex|computer-use|o[134])[A-Za-z0-9.\-]*"), "<model>"),
@@ -97,6 +100,15 @@ _CONTENT_DEPENDENT_PATH_PREFIXES = {
     "anthropic": (
         "content[]",  # block mix: text / tool_use / thinking
         "usage.server_tool_use",  # present only when server tools ran
+    ),
+    "openai-chat": (
+        "choices[].message.tool_calls",  # whether the model called a tool
+        "choices[].message.function_call",
+        "choices[].message.reasoning",
+        "choices[].message.reasoning_content",
+        "choices[].message.annotations",
+        "choices[].logprobs.content[]",  # one entry per generated token
+        "choices[].logprobs.refusal",
     ),
 }
 
@@ -155,11 +167,24 @@ _CONTENT_DEPENDENT_EVENTS = {
         "thinking_delta",
         "input_json_delta",
     ),
+    # Chat Completions chunks are named by content (runner.chat_chunk_name);
+    # which kinds appear and how often is the model's choice.
+    "openai-chat": (
+        "delta.content",
+        "delta.tool_calls",
+        "delta.reasoning",
+        "delta.refusal",
+        "delta.content+usage",
+        "delta.reasoning+content",
+        "delta.empty",
+    ),
 }
 
 # Event names whose *repetition count* is token-count-bound. Runs are collapsed
 # for everyone; these are also deduped against arity mismatches entirely.
-_DELTAISH = re.compile(r"(\.delta$|^ping$|^content_block_delta$)")
+_DELTAISH = re.compile(
+    r"(\.delta$|^ping$|^content_block_delta$|^delta\.(content|tool_calls|reasoning|refusal)$)"
+)
 
 _SEVERITY_ORDER = ["S1", "S2", "S3", "S4", "benign", "mock-limited", "exact"]
 _SEV_RANK = {s: i for i, s in enumerate(_SEVERITY_ORDER)}
@@ -212,6 +237,8 @@ def event_names(record, provider) -> list:
         if provider == "anthropic":
             parsed = ev.get("parsed") or {}
             name = parsed.get("type") or ev.get("event")
+        elif provider == "openai-chat":
+            name = chat_chunk_name(ev)
         else:
             name = ev.get("event")
         if not name:
@@ -227,6 +254,42 @@ def event_names(record, provider) -> list:
 # naturally (completed). Both collapse to <terminal> in the core comparison;
 # response.failed / error do NOT — failing differently is structural.
 _TERMINAL_EQUIV = {"response.completed", "response.incomplete"}
+# The same for a Chat Completions finish chunk: stop vs length is content-bound.
+_CHAT_FINISH_EQUIV = re.compile(r"\.finish:(stop|length)\b")
+
+
+def chat_chunk_name(ev):
+    """Chat Completions chunk naming, identical to ``runner.chat_chunk_name``
+    (kept self-contained so the differ needs no runner import)."""
+    if (ev.get("data") or "").strip() == "[DONE]":
+        return "[DONE]"
+    parsed = ev.get("parsed")
+    if not isinstance(parsed, dict):
+        return "?"
+    if "error" in parsed:
+        return "error"
+    choices = parsed.get("choices") or []
+    if not choices:
+        return "usage" if parsed.get("usage") else "chunk.empty"
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    delta = choice.get("delta") or {}
+    parts = []
+    if "role" in delta:
+        parts.append("role")
+    if delta.get("content"):
+        parts.append("content")
+    if delta.get("tool_calls") or delta.get("function_call"):
+        parts.append("tool_calls")
+    if delta.get("reasoning_content") or delta.get("reasoning"):
+        parts.append("reasoning")
+    if delta.get("refusal"):
+        parts.append("refusal")
+    name = "delta." + "+".join(parts) if parts else "delta.empty"
+    if choice.get("finish_reason"):
+        name += f".finish:{choice['finish_reason']}"
+    if parsed.get("usage"):
+        name += "+usage"
+    return name
 
 
 def collapse_runs(names: list) -> tuple:
@@ -548,7 +611,17 @@ def compare_events(v_names, s_names, provider):
             base = n.rstrip("+")
             if base in content_events:
                 continue
-            out.append("<terminal>" if base in _TERMINAL_EQUIV else n)
+            if base in _TERMINAL_EQUIV:
+                out.append("<terminal>")
+            elif provider == "openai-chat":
+                # the finish chunk's delta parts are content-bound too: keep the
+                # finish reason class, drop what rode along with it
+                m = re.search(r"\.finish:[a-z_]+", base)
+                finish = _CHAT_FINISH_EQUIV.sub(".finish:<terminal>", m.group(0)) if m else ""
+                suffix = "+usage" if base.endswith("+usage") else ""
+                out.append(("finish" + finish + suffix) if m else n)
+            else:
+                out.append(n)
         return tuple(out)
 
     v_core, s_core = strip(v_seq), strip(s_seq)
@@ -947,7 +1020,7 @@ def main(argv=None):
     ap.add_argument(
         "--provider",
         required=True,
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "openai-chat"],
         help="protocol family (drives SSE parsing + content-dependence tables)",
     )
     ap.add_argument("--out", required=True, help="output dir (report.md + diff.jsonl)")
