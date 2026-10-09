@@ -368,3 +368,53 @@ fn segment_encoding_matches_vendor_token_ids() {
         );
     }
 }
+
+/// The checkpoint tokenizer encodes a text in 400,000-character windows, so
+/// a longer text's ids are not the whole text's: the merge across the seam
+/// does not happen (`" dog"` at the seam becomes `" "` + `"dog"`), on the
+/// plain encode and inside the rendered prompt alike. Counts and ids from
+/// the `tiktoken` library with the checkpoint's windows on the same text.
+#[test]
+fn long_text_encodes_in_the_checkpoint_windows() {
+    let model_dir = common::ensure_kimi_k3_cached();
+    let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(9_000);
+    assert_eq!(text.chars().count(), 405_000);
+
+    let ids = tok.encode(&text, false).expect("encode");
+    let ids = ids.token_ids();
+    assert_eq!(
+        ids.len(),
+        90_002,
+        "one encode of the whole text gives 90,001"
+    );
+    assert_eq!(&ids[88_888..88_894], &[220, 31039, 13, 646, 5072, 16331]);
+    let whole = text.chars().take(400_000).collect::<String>();
+    assert_eq!(
+        tok.encode(&whole, false).expect("encode").token_ids().len(),
+        88_889
+    );
+
+    let messages = vec![json!({"role": "user", "content": text})];
+    let rendered = tok
+        .apply_chat_template_with_encoding(
+            &messages,
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("render should succeed");
+    let PromptEncoding::Deferred(job) = rendered.encoding else {
+        panic!("K3 must defer its encode");
+    };
+    let prompt = job.run().expect("deferred encode should succeed");
+    let prompt = prompt.token_ids();
+    assert!(
+        prompt
+            .windows(ids.len())
+            .any(|window| window[0] == ids[0] && window == ids),
+        "the message's ids are not in the prompt as encoded on their own"
+    );
+}

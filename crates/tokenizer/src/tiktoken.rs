@@ -196,6 +196,9 @@ pub struct TiktokenTokenizer {
     /// for a vocabulary whose ids lie too far apart for a dense table, which
     /// streams through the generic decoder.
     byte_level: Option<Arc<ByteLevelTable>>,
+    /// Encode a text in the pieces the checkpoint's own tokenizer cuts it
+    /// into (see [`checkpoint_pieces`]): the Kimi family's `tokenization_kimi.py`.
+    checkpoint_pieces: bool,
 }
 
 /// Supported Tiktoken models
@@ -261,6 +264,7 @@ impl TiktokenTokenizer {
             skip_token_ids,
             renderer: Renderer::Jinja,
             byte_level,
+            checkpoint_pieces: false,
         })
     }
 
@@ -311,7 +315,8 @@ impl TiktokenTokenizer {
         // special-token slots starting at `len(mergeable_ranks)`; all other
         // tiktoken models use the cl100k pattern unchanged. Reuse the
         // already-parsed tokenizer_config.json so we don't re-read it.
-        let pattern = if kimi_k2_tokenizer::matches(tokenizer_config_value.as_ref(), dir) {
+        let kimi = kimi_k2_tokenizer::matches(tokenizer_config_value.as_ref(), dir);
+        let pattern = if kimi {
             kimi_k2_tokenizer::apply_reserved_special_tokens(
                 &mut config.added_tokens,
                 encoder.len(),
@@ -377,6 +382,8 @@ impl TiktokenTokenizer {
             skip_token_ids: config.skip_token_ids,
             renderer,
             byte_level,
+            // The same file gives the pattern and the piece rule.
+            checkpoint_pieces: kimi,
         })
     }
 
@@ -573,21 +580,95 @@ pub fn is_tiktoken_file(path: &Path) -> bool {
         .is_some_and(|name| name == "tiktoken.model" || name.ends_with(".tiktoken"))
 }
 
+/// The Kimi family's `tokenization_kimi.py` (`_encode_text_piece`) hands
+/// tiktoken at most this many characters at a time ...
+const CHECKPOINT_WINDOW_CHARS: usize = 400_000;
+/// ... and, inside a window, cuts a run of more than this many consecutive
+/// whitespace or consecutive non-whitespace characters
+/// (`_split_whitespaces_or_nonwhitespaces`).
+const CHECKPOINT_RUN_CHARS: usize = 25_000;
+
+/// The pieces the Kimi checkpoint tokenizer encodes one by one and
+/// concatenates: windows of [`CHECKPOINT_WINDOW_CHARS`] characters, each cut
+/// again where a run of whitespace or of non-whitespace continues past its
+/// [`CHECKPOINT_RUN_CHARS`]-th character (that character starts the next
+/// piece; a change of kind restarts the count). A BPE merge never crosses a
+/// cut, so the ids of a text longer than a window, or holding a longer run,
+/// are not the ids of the whole text, and the engine's ids are the pieces'.
+/// Any other text is one piece.
+fn checkpoint_pieces(text: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut window_start = 0;
+    let mut window_chars = 0;
+    for (at, _) in text.char_indices() {
+        if window_chars == CHECKPOINT_WINDOW_CHARS {
+            cut_runs(&text[window_start..at], &mut pieces);
+            window_start = at;
+            window_chars = 0;
+        }
+        window_chars += 1;
+    }
+    if !text.is_empty() {
+        cut_runs(&text[window_start..], &mut pieces);
+    }
+    pieces
+}
+
+/// One window of [`checkpoint_pieces`], cut at its long runs.
+fn cut_runs<'a>(window: &'a str, pieces: &mut Vec<&'a str>) {
+    let mut run_is_space = window.chars().next().is_some_and(python_isspace);
+    let mut run_chars = 0;
+    let mut piece_start = 0;
+    for (at, c) in window.char_indices() {
+        let is_space = python_isspace(c);
+        if run_is_space == is_space {
+            run_chars += 1;
+            if run_chars > CHECKPOINT_RUN_CHARS {
+                pieces.push(&window[piece_start..at]);
+                piece_start = at;
+                run_chars = 1;
+            }
+        } else {
+            run_is_space = is_space;
+            run_chars = 1;
+        }
+    }
+    pieces.push(&window[piece_start..]);
+}
+
+/// Python's `str.isspace`, which the checkpoint classifies the runs with:
+/// Unicode white space plus the ASCII separators U+001C..U+001F.
+fn python_isspace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
 /// Piecewise encode for a segmented prompt: control pieces with special
-/// tokens recognized, text pieces as ordinary BPE. The allowed-special set is
-/// built once per prompt; `encode_with_special_tokens` would rebuild it for
-/// every piece, and a Kimi prompt has hundreds of control pieces.
-fn encode_segments(bpe: &CoreBPE, segments: &[PromptSegment]) -> Result<Vec<TokenIdType>> {
+/// tokens recognized, text pieces as ordinary BPE, each segment in the
+/// checkpoint's pieces when `checkpoint_pieces` is set. The allowed-special
+/// set is built once per prompt; `encode_with_special_tokens` would rebuild
+/// it for every piece, and a Kimi prompt has hundreds of control pieces.
+fn encode_segments(
+    bpe: &CoreBPE,
+    segments: &[PromptSegment],
+    checkpoint_pieces: bool,
+) -> Result<Vec<TokenIdType>> {
     let allowed = bpe.special_tokens();
     let mut ids = Vec::new();
     for segment in segments {
-        if segment.allow_special {
-            let (piece, _) = bpe
-                .encode(&segment.text, &allowed)
-                .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
-            ids.extend(piece);
+        let pieces = if checkpoint_pieces {
+            self::checkpoint_pieces(&segment.text)
         } else {
-            ids.extend(bpe.encode_ordinary(&segment.text));
+            vec![segment.text.as_str()]
+        };
+        for piece in pieces {
+            if segment.allow_special {
+                let (ids_of_piece, _) = bpe
+                    .encode(piece, &allowed)
+                    .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
+                ids.extend(ids_of_piece);
+            } else {
+                ids.extend(bpe.encode_ordinary(piece));
+            }
         }
     }
     Ok(ids)
@@ -599,7 +680,14 @@ impl Encoder for TiktokenTokenizer {
         // backends, which tiktoken has no concept of) and always recognizes
         // special-token patterns, so chat-template tokens like <|media_pad|> stay
         // atomic instead of splitting into BPE sub-tokens.
-        let tokens = self.tokenizer.encode_with_special_tokens(input);
+        let tokens = if self.checkpoint_pieces {
+            checkpoint_pieces(input)
+                .into_iter()
+                .flat_map(|piece| self.tokenizer.encode_with_special_tokens(piece))
+                .collect()
+        } else {
+            self.tokenizer.encode_with_special_tokens(input)
+        };
         Ok(Encoding::Tiktoken(tokens))
     }
 
@@ -745,10 +833,13 @@ impl TokenizerTrait for TiktokenTokenizer {
             render_kimi_k3_xtml_prompt(messages, &params, assistant_prefix)?;
         let text = join_segments(&segments);
         // Piecewise encoding makes the stub's own count its share of the full encode.
+        let checkpoint_pieces = self.checkpoint_pieces;
         let unbilled_prompt_tokens =
-            encode_segments(&self.tokenizer, &segments[pending])?.len() as u32;
+            encode_segments(&self.tokenizer, &segments[pending], checkpoint_pieces)?.len() as u32;
         let bpe = Arc::clone(&self.tokenizer);
-        let job = EncodeJob::new(move || encode_segments(&bpe, &segments).map(Encoding::Tiktoken));
+        let job = EncodeJob::new(move || {
+            encode_segments(&bpe, &segments, checkpoint_pieces).map(Encoding::Tiktoken)
+        });
         Ok(ChatTemplateOutput {
             text,
             encoding: PromptEncoding::Deferred(job),
@@ -1387,10 +1478,10 @@ mod tests {
         let tokenizer = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
         let bpe = &tokenizer.tokenizer;
 
-        let control = encode_segments(bpe, &[PromptSegment::control("<|open|>")]).unwrap();
+        let control = encode_segments(bpe, &[PromptSegment::control("<|open|>")], false).unwrap();
         assert_eq!(control, vec![300]);
 
-        let text = encode_segments(bpe, &[PromptSegment::text("<|open|>")]).unwrap();
+        let text = encode_segments(bpe, &[PromptSegment::text("<|open|>")], false).unwrap();
         assert!(
             !text.contains(&300),
             "marker in a text segment must not become a control id: {text:?}"
@@ -1404,6 +1495,7 @@ mod tests {
                 PromptSegment::text("message"),
                 PromptSegment::text("<|open|>"),
             ],
+            false,
         )
         .unwrap();
         assert_eq!(mixed.iter().filter(|&&id| id == 300).count(), 1);
@@ -1415,6 +1507,89 @@ mod tests {
         // The flat encode still maps every marker string to its control id.
         let flat = tokenizer.encode("<|open|>message<|open|>", false).unwrap();
         assert_eq!(flat.token_ids().iter().filter(|&&id| id == 300).count(), 2);
+    }
+
+    #[test]
+    fn checkpoint_pieces_cut_at_the_window_and_at_long_runs() {
+        assert_eq!(checkpoint_pieces(""), Vec::<&str>::new());
+        // Up to one window of characters (not bytes) is one piece when no run
+        // is long; the next character starts the second window.
+        let window = "\u{e9} ".repeat(CHECKPOINT_WINDOW_CHARS / 2);
+        assert_eq!(checkpoint_pieces(&window), vec![window.as_str()]);
+        let longer = format!("{window}x");
+        assert_eq!(checkpoint_pieces(&longer), vec![window.as_str(), "x"]);
+        // A run of 25,000 is whole; the run's next character starts a new
+        // piece, and the piece before it carries the window's earlier runs.
+        let run = "x".repeat(CHECKPOINT_RUN_CHARS);
+        assert_eq!(checkpoint_pieces(&run), vec![run.as_str()]);
+        let over = format!("ab {run}x");
+        assert_eq!(checkpoint_pieces(&over), vec![&over[..over.len() - 1], "x"]);
+        // A change of kind restarts the count.
+        let two = format!("{run} {run}");
+        assert_eq!(checkpoint_pieces(&two), vec![two.as_str()]);
+        // Whitespace runs are cut the same way; U+001C..U+001F are whitespace
+        // to Python's `str.isspace`, which the checkpoint uses.
+        let seps = format!("a{}b", "\u{1c}".repeat(CHECKPOINT_RUN_CHARS + 1));
+        assert_eq!(
+            checkpoint_pieces(&seps),
+            vec![&seps[..seps.len() - 2], "\u{1c}b"]
+        );
+    }
+
+    /// A `tokenization_kimi` checkpoint encodes in the checkpoint's pieces,
+    /// so the merge the one-piece encode makes across a cut does not happen;
+    /// any other tiktoken vocabulary encodes the whole text as before.
+    #[test]
+    fn kimi_checkpoints_encode_in_the_checkpoint_pieces() {
+        // 'a' 0, 'b' 1, 'ab' 2
+        const MODEL: &str = "YQ== 0\nYg== 1\nYWI= 2\n";
+        let kimi = tempfile::tempdir().unwrap();
+        std::fs::write(kimi.path().join("tiktoken.model"), MODEL).unwrap();
+        std::fs::write(
+            kimi.path().join("tokenizer_config.json"),
+            r#"{"tokenizer_class": "TikTokenTokenizer",
+                "auto_map": {"AutoTokenizer": ["tokenization_kimi.TikTokenTokenizer", null]},
+                "added_tokens_decoder": {}}"#,
+        )
+        .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("tiktoken.model"), MODEL).unwrap();
+        std::fs::write(
+            other.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder": {}}"#,
+        )
+        .unwrap();
+        let kimi = TiktokenTokenizer::from_dir(kimi.path()).unwrap();
+        let other = TiktokenTokenizer::from_dir(other.path()).unwrap();
+        assert!(kimi.checkpoint_pieces);
+        assert!(!other.checkpoint_pieces);
+
+        // 25,001 letters: the checkpoint cuts before the last one, so it
+        // cannot merge with its neighbour.
+        let text = format!("{}b", "a".repeat(CHECKPOINT_RUN_CHARS));
+        let whole: Vec<TokenIdType> = std::iter::repeat_n(0, CHECKPOINT_RUN_CHARS - 1)
+            .chain([2])
+            .collect();
+        let pieces: Vec<TokenIdType> = std::iter::repeat_n(0, CHECKPOINT_RUN_CHARS)
+            .chain([1])
+            .collect();
+        assert_eq!(kimi.encode(&text, false).unwrap().token_ids(), &pieces[..]);
+        assert_eq!(other.encode(&text, false).unwrap().token_ids(), &whole[..]);
+        let segment = [PromptSegment::text(&text)];
+        assert_eq!(
+            encode_segments(&kimi.tokenizer, &segment, kimi.checkpoint_pieces).unwrap(),
+            pieces
+        );
+        assert_eq!(
+            encode_segments(&kimi.tokenizer, &segment, false).unwrap(),
+            whole
+        );
+        // Below the cut nothing changes.
+        let short = format!("{}b", "a".repeat(CHECKPOINT_RUN_CHARS - 1));
+        assert_eq!(
+            kimi.encode(&short, false).unwrap().token_ids(),
+            other.encode(&short, false).unwrap().token_ids()
+        );
     }
 
     #[test]
@@ -1443,6 +1618,7 @@ mod tests {
             &render_kimi_k3_xtml_prompt(&messages, &params(), None)
                 .unwrap()
                 .segments,
+            tokenizer.checkpoint_pieces,
         )
         .unwrap();
         assert_eq!(ids.token_ids(), &expected[..]);
