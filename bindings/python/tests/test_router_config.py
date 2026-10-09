@@ -501,4 +501,11 @@ class TestRouterPositionalSignature:
             "worker_warmup_divert_every",
             "selection_policy",
             "selection_accounting_ttl_ms",
+            "tenant_api_keys",
+            "priority_scheduler_enabled",
+            "priority_scheduler_default_max_class",
+            "priority_scheduler_config",
+            "priority_scheduler_tenant_metric_top_n",
+            "tenant_rate_limit_enabled",
+            "tenant_rate_limit_config",
         ]

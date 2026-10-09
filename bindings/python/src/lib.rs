@@ -560,6 +560,15 @@ struct Router {
     worker_warmup_divert_every: u64,
     selection_policy: String,
     selection_accounting_ttl_ms: u64,
+    /// Per-tenant data-plane keys as `(tenant_id, key)` pairs; each resolves
+    /// to its own tenant identity (`auth:<tenant_id>`) on top of `api_key`.
+    tenant_api_keys: Vec<(String, String)>,
+    priority_scheduler_enabled: bool,
+    priority_scheduler_default_max_class: String,
+    priority_scheduler_config: Option<String>,
+    priority_scheduler_tenant_metric_top_n: u32,
+    tenant_rate_limit_enabled: bool,
+    tenant_rate_limit_config: Option<String>,
     /// The keyword-only `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
@@ -938,6 +947,12 @@ impl Router {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .priority_scheduler_enabled(self.priority_scheduler_enabled)
+            .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
+            .priority_scheduler_config(self.priority_scheduler_config.clone())
+            .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
+            .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
+            .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
             .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
             .prefill_queue_size(self.prefill_queue_size)
             .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
@@ -979,6 +994,15 @@ impl Router {
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .history_backend(history_backend)
             .maybe_api_key(self.api_key.as_ref())
+            .tenant_api_keys(
+                self.tenant_api_keys
+                    .iter()
+                    .map(|(tenant_id, key)| config::TenantApiKeyEntry {
+                        tenant_id: tenant_id.clone(),
+                        key: key.clone(),
+                    })
+                    .collect(),
+            )
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
@@ -1228,6 +1252,13 @@ impl Router {
         worker_warmup_divert_every = 8,
         selection_policy = String::from("cache-aware-default"),
         selection_accounting_ttl_ms = 0,
+        tenant_api_keys = vec![],
+        priority_scheduler_enabled = false,
+        priority_scheduler_default_max_class = String::from("default"),
+        priority_scheduler_config = None,
+        priority_scheduler_tenant_metric_top_n = 32,
+        tenant_rate_limit_enabled = false,
+        tenant_rate_limit_config = None,
         // Keyword-only, so it never takes a positional slot.
         *,
         discovery = None,
@@ -1407,6 +1438,13 @@ impl Router {
         worker_warmup_divert_every: u64,
         selection_policy: String,
         selection_accounting_ttl_ms: u64,
+        tenant_api_keys: Vec<(String, String)>,
+        priority_scheduler_enabled: bool,
+        priority_scheduler_default_max_class: String,
+        priority_scheduler_config: Option<String>,
+        priority_scheduler_tenant_metric_top_n: u32,
+        tenant_rate_limit_enabled: bool,
+        tenant_rate_limit_config: Option<String>,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
@@ -1612,6 +1650,13 @@ impl Router {
             worker_warmup_divert_every,
             selection_policy,
             selection_accounting_ttl_ms,
+            tenant_api_keys,
+            priority_scheduler_enabled,
+            priority_scheduler_default_max_class,
+            priority_scheduler_config,
+            priority_scheduler_tenant_metric_top_n,
+            tenant_rate_limit_enabled,
+            tenant_rate_limit_config,
             discovery,
         })
     }

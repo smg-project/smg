@@ -312,6 +312,19 @@ class RouterArgs:
     # The cache-aware selection policy and the optimistic accounting TTL
     selection_policy: str = "cache-aware-default"
     selection_accounting_ttl_ms: int = 0
+    # Tenant resolution: trust an upstream tenant header, and its name
+    trust_tenant_header: bool = False
+    tenant_header_name: str = "x-smg-tenant-id"
+    # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
+    tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
+    # Priority-aware admission scheduler
+    priority_scheduler_enabled: bool = False
+    priority_scheduler_default_max_class: str = "default"
+    priority_scheduler_config: str | None = None
+    priority_scheduler_tenant_metric_top_n: int = 32
+    # Per-tenant token/request rate limiting
+    tenant_rate_limit_enabled: bool = False
+    tenant_rate_limit_config: str | None = None
 
     @staticmethod
     def add_cli_args(
@@ -393,6 +406,15 @@ class RouterArgs:
         )
         rl_group = parser.add_argument_group(
             "RL Control Plane", "Worker discovery and engine-route passthrough for RL training"
+        )
+        dp_auth_group = parser.add_argument_group(
+            "Data Plane Authentication", "Per-tenant API keys for the serving path"
+        )
+        scheduler_group = parser.add_argument_group(
+            "Priority Scheduler", "Priority-aware admission scheduler"
+        )
+        tenant_rate_limit_group = parser.add_argument_group(
+            "Tenant Rate Limit", "Per-tenant token and request rate limiting"
         )
 
         if use_router_prefix:
@@ -1402,6 +1424,18 @@ class RouterArgs:
             help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
         request_group.add_argument(
+            f"--{prefix}trust-tenant-header",
+            action="store_true",
+            default=False,
+            help="Trust an upstream-provided tenant header for canonical tenant resolution.",
+        )
+        request_group.add_argument(
+            f"--{prefix}tenant-header-name",
+            type=str,
+            default=RouterArgs.tenant_header_name,
+            help="Header name to use when --trust-tenant-header is enabled.",
+        )
+        request_group.add_argument(
             f"--{prefix}cors-allowed-origins",
             type=str,
             nargs="*",
@@ -1444,6 +1478,58 @@ class RouterArgs:
                 "Token bucket refill rate (tokens per second). Unset or 0 ="
                 " no refill: --max-concurrent-requests bounds standing"
                 " concurrency alone."
+            ),
+        )
+
+        # Priority scheduler configuration
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-enabled",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable the priority-aware admission scheduler. When unset (default),"
+                " the legacy concurrency-limit middleware stays wired."
+            ),
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-default-max-class",
+            type=str,
+            default=RouterArgs.priority_scheduler_default_max_class,
+            help=(
+                "Max priority class for tenants not listed in the scheduler YAML"
+                " (system | interactive | default | bulk)."
+            ),
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-config",
+            type=str,
+            default=None,
+            help="Optional path to the priority-scheduler YAML config.",
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-tenant-metric-top-n",
+            type=int,
+            default=RouterArgs.priority_scheduler_tenant_metric_top_n,
+            help='Cap on per-tenant scheduler metric label cardinality (top-N + "other").',
+        )
+
+        # Tenant rate limit configuration
+        tenant_rate_limit_group.add_argument(
+            f"--{prefix}tenant-rate-limit-enabled",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable per-tenant LLM token/request rate limiting. When unset (default),"
+                " no rate limiter is constructed."
+            ),
+        )
+        tenant_rate_limit_group.add_argument(
+            f"--{prefix}tenant-rate-limit-config",
+            type=str,
+            default=None,
+            help=(
+                "Path to the tenant-rate-limit YAML. Required when"
+                " --tenant-rate-limit-enabled is set."
             ),
         )
 
@@ -1847,6 +1933,18 @@ class RouterArgs:
                 " Useful when the dp aware scheduling strategy is enabled."
             ),
         )
+        dp_auth_group.add_argument(
+            f"--{prefix}tenant-api-key",
+            type=str,
+            action="append",
+            default=[],
+            metavar="TENANT_ID:KEY",
+            help=(
+                "Per-tenant API keys for serving-path auth (format: tenant_id:key,"
+                " repeatable). Layers on top of --api-key, each resolving to its own"
+                " tenant identity."
+            ),
+        )
         auth_group.add_argument(
             f"--{prefix}control-plane-api-keys",
             type=str,
@@ -2045,6 +2143,11 @@ class RouterArgs:
             cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
         )
 
+        # Parse per-tenant data-plane API keys
+        args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(
+            cli_args_dict.get(f"{prefix}tenant_api_key", [])
+        )
+
         return cls(**args_dict)
 
     def selected_discovery_provider(self) -> str | None:
@@ -2216,6 +2319,27 @@ class RouterArgs:
             if role_lower not in ("admin", "user"):
                 raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
             parsed_keys.append((key_id, name, key, role_lower))
+        return parsed_keys
+
+    @staticmethod
+    def _parse_tenant_api_keys(api_keys_list):
+        """Parse per-tenant data-plane keys from --tenant-api-key arguments.
+
+        Format: tenant_id:key, split at the first ':' with both parts trimmed,
+        as the Rust CLI parses it. The key is never echoed in an error.
+        """
+        if not api_keys_list:
+            return []
+
+        parsed_keys = []
+        for key_str in api_keys_list:
+            tenant_id, sep, key = key_str.partition(":")
+            if not sep:
+                raise ValueError(
+                    "Invalid --tenant-api-key value: expected 'tenant_id:key'"
+                    " (missing ':' separator)"
+                )
+            parsed_keys.append((tenant_id.strip(), key.strip()))
         return parsed_keys
 
     @staticmethod

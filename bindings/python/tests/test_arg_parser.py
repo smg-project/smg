@@ -758,6 +758,84 @@ class TestParseRouterArgs:
         assert defaults.selection_policy == "cache-aware-default"
         assert defaults.selection_accounting_ttl_ms == 0
 
+    def test_parse_tenancy_flags(self):
+        """The tenancy flags of the Rust CLI reach RouterArgs: tenant header
+        trust, per-tenant data-plane keys, the priority scheduler and the
+        tenant rate limit, with the CLI's defaults when the flags are absent."""
+        router_args = parse_router_args(
+            [
+                "--trust-tenant-header",
+                "--tenant-header-name",
+                "x-acme-tenant",
+                "--tenant-api-key",
+                "team-red:secret-red",
+                "--tenant-api-key",
+                " team-blue : secret:with:colons ",
+                "--priority-scheduler-enabled",
+                "--priority-scheduler-default-max-class",
+                "interactive",
+                "--priority-scheduler-config",
+                "/etc/smg/scheduler.yaml",
+                "--priority-scheduler-tenant-metric-top-n",
+                "8",
+                "--tenant-rate-limit-enabled",
+                "--tenant-rate-limit-config",
+                "/etc/smg/rate-limit.yaml",
+            ]
+        )
+        assert router_args.trust_tenant_header is True
+        assert router_args.tenant_header_name == "x-acme-tenant"
+        assert router_args.tenant_api_keys == [
+            ("team-red", "secret-red"),
+            ("team-blue", "secret:with:colons"),
+        ]
+        assert router_args.priority_scheduler_enabled is True
+        assert router_args.priority_scheduler_default_max_class == "interactive"
+        assert router_args.priority_scheduler_config == "/etc/smg/scheduler.yaml"
+        assert router_args.priority_scheduler_tenant_metric_top_n == 8
+        assert router_args.tenant_rate_limit_enabled is True
+        assert router_args.tenant_rate_limit_config == "/etc/smg/rate-limit.yaml"
+
+        defaults = parse_router_args([])
+        assert defaults.trust_tenant_header is False
+        assert defaults.tenant_header_name == "x-smg-tenant-id"
+        assert defaults.tenant_api_keys == []
+        assert defaults.priority_scheduler_enabled is False
+        assert defaults.priority_scheduler_default_max_class == "default"
+        assert defaults.priority_scheduler_config is None
+        assert defaults.priority_scheduler_tenant_metric_top_n == 32
+        assert defaults.tenant_rate_limit_enabled is False
+        assert defaults.tenant_rate_limit_config is None
+
+    def test_tenant_api_key_without_separator_is_rejected(self):
+        """A key without the ':' separator fails to parse, and the error does
+        not echo the value (it may be the plaintext credential)."""
+        with pytest.raises(ValueError, match="missing ':' separator") as excinfo:
+            parse_router_args(["--tenant-api-key", "no-separator-secret"])
+        assert "no-separator-secret" not in str(excinfo.value)
+
+    def test_prefixed_tenancy_flags(self):
+        """The --router-prefixed tenancy flags reach the same fields."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            [
+                "--router-trust-tenant-header",
+                "--router-tenant-api-key",
+                "team-red:secret-red",
+                "--router-tenant-rate-limit-enabled",
+                "--router-tenant-rate-limit-config",
+                "/etc/smg/rate-limit.yaml",
+            ]
+        )
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.trust_tenant_header is True
+        assert router_args.tenant_api_keys == [("team-red", "secret-red")]
+        assert router_args.tenant_rate_limit_enabled is True
+        assert router_args.tenant_rate_limit_config == "/etc/smg/rate-limit.yaml"
+
     def test_prefixed_disable_overload_protection_flag(self):
         """The --router-prefixed disable flag reaches the same field."""
         parser = argparse.ArgumentParser()
@@ -1656,6 +1734,15 @@ class TestRouterArgsFieldOrder:
         "worker_warmup_divert_every",
         "selection_policy",
         "selection_accounting_ttl_ms",
+        "trust_tenant_header",
+        "tenant_header_name",
+        "tenant_api_keys",
+        "priority_scheduler_enabled",
+        "priority_scheduler_default_max_class",
+        "priority_scheduler_config",
+        "priority_scheduler_tenant_metric_top_n",
+        "tenant_rate_limit_enabled",
+        "tenant_rate_limit_config",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1705,6 +1792,15 @@ class TestRouterArgsFieldOrder:
             "worker_warmup_divert_every",
             "selection_policy",
             "selection_accounting_ttl_ms",
+            "trust_tenant_header",
+            "tenant_header_name",
+            "tenant_api_keys",
+            "priority_scheduler_enabled",
+            "priority_scheduler_default_max_class",
+            "priority_scheduler_config",
+            "priority_scheduler_tenant_metric_top_n",
+            "tenant_rate_limit_enabled",
+            "tenant_rate_limit_config",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
