@@ -44,14 +44,16 @@
 //! every other model has been compared.
 //!
 //! A difference is a finding, not something to hide: every known one is listed
-//! in [`KNOWN_DIFFERENCES`] with its reason and where it is tracked, the run
-//! fails on any other, on a listed case that starts matching, and on a listed
-//! case that the loaded fixtures no longer contain, so the list cannot rot.
+//! in [`KNOWN_DIFFERENCES`] with its reason and where it is tracked, by id or
+//! by a prefix when a cause covers a model or a set wholesale; the run fails
+//! on any other, on a listed case that starts matching, and on a listed case
+//! that the loaded fixtures no longer contain, so the list cannot rot.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{BufRead, BufReader, Read},
+    ops::Bound,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -69,9 +71,33 @@ const KINDS: [&str; 2] = ["render", "parse"];
 /// content would be.
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
-/// Cases known to differ from the reference, by fixture id, each with the
-/// reason and where it is tracked.
+/// Cases known to differ from the reference, each with the reason and where
+/// it is tracked: a fixture id, `<slug>/render/<name>` or `<slug>/parse/<name>`,
+/// or a prefix ending in `*`, which stands for every case whose id begins
+/// with what is before it (`<slug>/render/*` for a model's whole render side,
+/// `<slug>/render/mgsm-th-*` for one of its sets). A prefix is for a cause
+/// that covers a model or a set wholesale, a reference recorded with another
+/// pre-tokenizer for instance, and is held to the rule an id is: the run
+/// fails when no loaded case under it differs any more, and when no loaded
+/// case is under it at all.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
+
+/// The reason `known` lists for `id`: the entry that is the id itself, else
+/// the first prefix entry the id begins with; none when the id is not listed.
+fn known_reason<'a>(known: &BTreeMap<&'a str, &'a str>, id: &str) -> Option<&'a str> {
+    known.get(id).copied().or_else(|| {
+        known
+            .iter()
+            .find(|(entry, _)| prefix_of(entry).is_some_and(|prefix| id.starts_with(prefix)))
+            .map(|(_, reason)| *reason)
+    })
+}
+
+/// What a prefix entry stands for: the part before its trailing `*`; none for
+/// an entry that is one fixture id.
+fn prefix_of(entry: &str) -> Option<&str> {
+    entry.strip_suffix('*')
+}
 
 /// `fixtures/<slug>/manifest.toml`: the model and the revision its fixtures
 /// were recorded at.
@@ -193,7 +219,7 @@ impl Report {
         tally.ids += ids;
         if let Err(why) = outcome {
             tally.differ += 1;
-            let listed = known.get(id.as_str()).map_or(String::new(), |reason| {
+            let listed = known_reason(known, &id).map_or(String::new(), |reason| {
                 format!("\n          known: {reason}")
             });
             println!("  differs {id}: {why}{listed}");
@@ -236,7 +262,7 @@ impl Report {
         let unexpected: Vec<String> = self
             .differences
             .iter()
-            .filter(|(id, _)| !known.contains_key(id.as_str()))
+            .filter(|(id, _)| known_reason(known, id).is_none())
             .map(|(id, why)| format!("{id}: {why}"))
             .collect();
         if !unexpected.is_empty() {
@@ -248,7 +274,10 @@ impl Report {
         let healed: Vec<&str> = known
             .keys()
             .copied()
-            .filter(|id| self.seen.contains(*id) && !self.differences.contains_key(*id))
+            .filter(|entry| match prefix_of(entry) {
+                Some(prefix) => self.seen_under(prefix) && !self.differs_under(prefix),
+                None => self.seen.contains(*entry) && !self.differences.contains_key(*entry),
+            })
             .collect();
         if !healed.is_empty() {
             failures.push(format!(
@@ -259,9 +288,13 @@ impl Report {
         let gone: Vec<&str> = known
             .keys()
             .copied()
-            .filter(|id| {
-                let dir = id.rsplit_once('/').map_or("", |(dir, _)| dir);
-                self.loaded_dirs.contains(dir) && !self.seen.contains(*id)
+            .filter(|entry| {
+                let dir = entry.rsplit_once('/').map_or("", |(dir, _)| dir);
+                self.loaded_dirs.contains(dir)
+                    && match prefix_of(entry) {
+                        Some(prefix) => !self.seen_under(prefix),
+                        None => !self.seen.contains(*entry),
+                    }
             })
             .collect();
         if !gone.is_empty() {
@@ -272,6 +305,22 @@ impl Report {
             ));
         }
         failures
+    }
+
+    /// Whether a compared case's id begins with `prefix`.
+    fn seen_under(&self, prefix: &str) -> bool {
+        self.seen
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .next()
+            .is_some_and(|id| id.starts_with(prefix))
+    }
+
+    /// Whether a differing case's id begins with `prefix`.
+    fn differs_under(&self, prefix: &str) -> bool {
+        self.differences
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .next()
+            .is_some_and(|(id, _)| id.starts_with(prefix))
     }
 }
 
@@ -312,8 +361,13 @@ fn encode_and_incremental_decode_match_the_reference() {
         assert!(
             slug.is_some_and(|s| !s.is_empty())
                 && matches!(kind, Some("render" | "parse"))
-                && name.is_some_and(|n| !n.is_empty() && !n.contains('/')),
-            "KNOWN_DIFFERENCES entry {id} is not <slug>/render/<name> or <slug>/parse/<name>"
+                && name.is_some_and(|n| {
+                    !n.is_empty()
+                        && !n.contains('/')
+                        && n.find('*').is_none_or(|at| at == n.len() - 1)
+                }),
+            "KNOWN_DIFFERENCES entry {id} is not <slug>/render/<name> or <slug>/parse/<name>, with \
+             `*` only at the end, as a prefix"
         );
     }
     let report =
@@ -870,6 +924,15 @@ fn render_line(id: &str, model: &str) -> String {
     )
 }
 
+/// One render line whose ids are not what the mock tokenizer encodes its text
+/// to.
+fn differing_line(id: &str, model: &str) -> String {
+    format!(
+        "{{\"id\":\"{id}\",\"kind\":\"render\",\"model\":\"{model}\",\
+         \"reference\":{{\"input_ids\":[2],\"text\":\"Hello\"}}}}\n"
+    )
+}
+
 /// One parse line whose ids the mock tokenizer decodes to its pieces.
 fn parse_line(id: &str, model: &str) -> String {
     format!(
@@ -1041,6 +1104,66 @@ fn a_model_whose_tokenizer_does_not_load_fails_the_run_after_the_others() {
     assert_eq!(failures.len(), 1, "{failures:#?}");
     assert!(
         failures[0].contains("a: no tokenizer.json"),
+        "{failures:#?}"
+    );
+}
+
+#[test]
+fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
+    let model = "org/m";
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        (
+            "m/sets.toml",
+            &sets_toml(&[("render/common", 1), ("render/mgsm-th", 2)]),
+        ),
+        (
+            "m/render/common.jsonl",
+            &render_line("m/render/common-1", model),
+        ),
+        (
+            "m/render/mgsm-th.jsonl",
+            &(differing_line("m/render/mgsm-th-1", model)
+                + &differing_line("m/render/mgsm-th-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let listed = BTreeMap::from([("m/render/mgsm-th-*", "recorded with another pre-tokenizer")]);
+    let report = compare(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    // The prefix covers both differing cases, so nothing fails the run.
+    assert_eq!(report.failures(root.path(), &listed), Vec::<String>::new());
+    // Without it the two are unlisted.
+    let failures = report.failures(root.path(), &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("m/render/mgsm-th-1") && failures[0].contains("m/render/mgsm-th-2"),
+        "{failures:#?}"
+    );
+    // A prefix under which every loaded case matches must go, and so must one
+    // that no loaded case begins with.
+    let stale = BTreeMap::from([
+        ("m/render/common-*", "matches now"),
+        ("m/render/mgsm-bn-*", "no such set"),
+        ("m/render/mgsm-th-*", "recorded with another pre-tokenizer"),
+    ]);
+    let failures = report.failures(root.path(), &stale);
+    assert_eq!(failures.len(), 2, "{failures:#?}");
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contains("matching the reference now")
+                && failure.contains("m/render/common-*")
+                && !failure.contains("mgsm")
+        }),
+        "{failures:#?}"
+    );
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contains("no longer among the loaded fixtures")
+                && failure.contains("m/render/mgsm-bn-*")
+                && !failure.contains("mgsm-th")
+        }),
         "{failures:#?}"
     );
 }
