@@ -209,12 +209,14 @@ All under the admin API; `{worker}` is a worker name (`grpc:<port>`,
 `zmq:<index>`) or `all`. A hook applies to every KV-event transport of the
 worker (gRPC `SubscribeKvEvents` and the ZMQ publisher alike) and answers with
 the worker's hook state (`drop_pending`, `dropped_total`, `delay_ms`,
-`paused`, `generation`, `restarts`).
+`admit_delay_ms`, `admit_per_sec`, `paused`, `generation`, `restarts`).
 
 | Hook | Effect |
 |------|--------|
 | `POST /admin/fault/{worker}/drop?batches=N` | the next N event batches are not published (lost on the wire; they stay in the replay buffer, so a gap replay recovers them) |
 | `POST /admin/fault/{worker}/delay?ms=D` | every batch is published D ms after its pass ends (0 clears) |
+| `POST /admin/fault/{worker}/admit-delay?ms=D` | every new gRPC request is held D ms before the engine sees it (0 clears): the gateway has dispatched it, the load record does not count it yet, as a backlog in transit between the two would behave |
+| `POST /admin/fault/{worker}/admit-rate?per_sec=R` | at most R new gRPC requests per second enter the engine (0 clears); the rest wait their turn, unseen by the load record: a throttled input path whose backlog grows while the gateway keeps sending |
 | `POST /admin/fault/{worker}/restart-publisher` | the publisher restarts: gRPC sequence numbers start over at 1 and the ZMQ sequence at 0, the replay buffers are emptied, the cache is kept (no `AllBlocksCleared`); `generation` increments |
 | `POST /admin/fault/{worker}/pause` | the engine freezes after its current pass: no passes, no tokens, no events; requests queue (and count as waiting); health and `GetLoads` keep answering |
 | `POST /admin/fault/{worker}/resume` | the engine runs again |

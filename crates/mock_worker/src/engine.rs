@@ -537,7 +537,7 @@ struct EngineShared {
 }
 
 /// Fault hooks the admin API switches on: batches lost on the wire, delayed
-/// publishing, a frozen engine, a publisher restart.
+/// publishing, delayed admission, a frozen engine, a publisher restart.
 #[derive(Default)]
 struct Faults {
     /// Event batches still to lose on the wire.
@@ -545,6 +545,16 @@ struct Faults {
     dropped_total: AtomicU64,
     /// Publishing delay after a pass ends, in ms.
     delay_ms: AtomicU64,
+    /// How long each new request is held before the engine sees it, in ms:
+    /// a backlog in transit between the gateway and the engine's queue. The
+    /// load record does not count a held request.
+    admit_delay_ms: AtomicU64,
+    /// At most this many new requests per second enter the engine (0 = no
+    /// cap); the rest wait their turn, unseen by the load record: a
+    /// throttled input path.
+    admit_per_sec: AtomicU64,
+    /// The next admission slot under the cap.
+    admit_next: tokio::sync::Mutex<Option<Instant>>,
     /// The engine is frozen: no passes until resumed.
     paused: AtomicBool,
     /// Publisher generation; a restart bumps it.
@@ -558,6 +568,8 @@ pub(crate) struct FaultStatus {
     pub drop_pending: u32,
     pub dropped_total: u64,
     pub delay_ms: u64,
+    pub admit_delay_ms: u64,
+    pub admit_per_sec: u64,
     pub paused: bool,
     pub generation: u64,
     pub restarts: u64,
@@ -747,6 +759,47 @@ impl Engine {
         self.shared.faults.delay_ms.store(ms, Ordering::Relaxed);
     }
 
+    /// Hold every new request `ms` milliseconds before the engine sees it
+    /// (0 clears): the gateway has dispatched it, the load record does not
+    /// count it yet.
+    pub(crate) fn fault_admit_delay_ms(&self, ms: u64) {
+        self.shared
+            .faults
+            .admit_delay_ms
+            .store(ms, Ordering::Relaxed);
+    }
+
+    /// Let at most `per_sec` new requests per second into the engine (0
+    /// clears); the rest wait their turn, unseen by the load record.
+    pub(crate) fn fault_admit_per_sec(&self, per_sec: u64) {
+        self.shared
+            .faults
+            .admit_per_sec
+            .store(per_sec, Ordering::Relaxed);
+    }
+
+    /// The admission gate a new request passes before the engine sees it:
+    /// the hold, then the rate cap. Returns at once while neither is set.
+    pub(crate) async fn admit(&self) {
+        let faults = &self.shared.faults;
+        let hold = Duration::from_millis(faults.admit_delay_ms.load(Ordering::Relaxed));
+        if !hold.is_zero() {
+            tokio::time::sleep(hold).await;
+        }
+        let per_sec = faults.admit_per_sec.load(Ordering::Relaxed);
+        if per_sec == 0 {
+            return;
+        }
+        let slot = {
+            let mut next = faults.admit_next.lock().await;
+            let now = Instant::now();
+            let at = next.map_or(now, |next| next.max(now));
+            *next = Some(at + Duration::from_secs_f64(1.0 / per_sec as f64));
+            at
+        };
+        tokio::time::sleep_until(slot.into()).await;
+    }
+
     /// Restart the publisher: sequence numbers start over, the replay buffer
     /// is emptied, the cache is kept. Returns once the actor has applied it
     /// (after its current pass, at most), so a status read right after sees
@@ -775,6 +828,8 @@ impl Engine {
             drop_pending: f.drop_batches.load(Ordering::Relaxed),
             dropped_total: f.dropped_total.load(Ordering::Relaxed),
             delay_ms: f.delay_ms.load(Ordering::Relaxed),
+            admit_delay_ms: f.admit_delay_ms.load(Ordering::Relaxed),
+            admit_per_sec: f.admit_per_sec.load(Ordering::Relaxed),
             paused: f.paused.load(Ordering::Relaxed),
             generation: f.generation.load(Ordering::Relaxed),
             restarts: f.restarts.load(Ordering::Relaxed),

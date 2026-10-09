@@ -150,6 +150,10 @@ impl TokenSpeedScheduler for MockScheduler {
                 .and_then(|s| s.max_new_tokens)
                 .unwrap_or(self.cfg.output_tokens);
             let stream_chunks = req.stream;
+            // The admission hooks: the request is held here, between the
+            // gateway and the engine, as a backlog in transit would hold it;
+            // the load record does not see it until it lands.
+            engine.admit().await;
             let (tx, rx) = mpsc::unbounded_channel();
             engine.submit(NewRequest {
                 request_id: request_id.clone(),

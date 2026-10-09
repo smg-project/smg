@@ -55,6 +55,8 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}", get(fault_status))
         .route("/admin/fault/{worker}/drop", post(fault_drop))
         .route("/admin/fault/{worker}/delay", post(fault_delay))
+        .route("/admin/fault/{worker}/admit-delay", post(fault_admit_delay))
+        .route("/admin/fault/{worker}/admit-rate", post(fault_admit_rate))
         .route(
             "/admin/fault/{worker}/restart-publisher",
             post(fault_restart_publisher),
@@ -108,6 +110,8 @@ fn status_json(e: &Engine) -> Value {
         "drop_pending": s.drop_pending,
         "dropped_total": s.dropped_total,
         "delay_ms": s.delay_ms,
+        "admit_delay_ms": s.admit_delay_ms,
+        "admit_per_sec": s.admit_per_sec,
         "paused": s.paused,
         "generation": s.generation,
         "restarts": s.restarts,
@@ -243,6 +247,28 @@ async fn fault_delay(
         Err(response) => return response,
     };
     apply(&worker, |e| e.fault_delay_ms(ms))
+}
+
+async fn fault_admit_delay(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let ms: u64 = match param(&q, "ms") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_admit_delay_ms(ms))
+}
+
+async fn fault_admit_rate(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let per_sec: u64 = match param(&q, "per_sec") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_admit_per_sec(per_sec))
 }
 
 async fn fault_restart_publisher(Path(worker): Path<String>) -> Response {
