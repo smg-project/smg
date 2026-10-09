@@ -103,11 +103,12 @@ def register() -> None:
             os.environ[SERVICER_IMPL_ENV] = impl
         if mm_flags:
             # Upstream's launcher builds the Python servicer without its
-            # namespace; that servicer reads the environment, so the flags'
-            # values go there too.
-            from smg_grpc_servicer.vllm.mm_processor import export_mm_flags
+            # namespace: the parsed settings are kept for it in this process
+            # (so a flag stays `source=flag`), and the set values go into the
+            # environment too.
+            from smg_grpc_servicer.vllm.mm_processor import carry_mm_flags
 
-            export_mm_flags(parsed)
+            carry_mm_flags(parsed)
         return parsed, extras
 
     FlexibleArgumentParser.parse_known_args = parse_known_args  # type: ignore[method-assign]

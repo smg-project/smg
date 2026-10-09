@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import importlib.util
 import logging
+import os
 import sys
 import types
 from dataclasses import dataclass
@@ -456,6 +457,36 @@ class TestLauncherFlags:
         for argv in (["--mm-processor", "sidecar"], ["--mm-max-inflight", "many"]):
             with pytest.raises(SystemExit):
                 parser.parse_args(argv)
+
+    def test_carry_mm_flags_keeps_the_settings_for_a_servicer_built_without_them(
+        self, monkeypatch, caplog
+    ):
+        """Upstream's launcher builds the servicer without its namespace: the
+        settings the plugin kept from the parse are what the servicer resolves
+        when given none, so a flag's value stays `source=flag` and a variable
+        behind a flag the launcher has still gets its deprecation line; the
+        set values reach the environment as well."""
+        monkeypatch.setattr(mm_processor, "_launcher_settings", None)
+        monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "off")
+        assert mm_processor.launcher_settings() is None
+        parser = argparse.ArgumentParser(prog="grpc_server")
+        mm_processor.add_mm_arguments(parser)
+        kept = mm_processor.carry_mm_flags(parser.parse_args(["--mm-processor", "inprocess"]))
+        assert mm_processor.launcher_settings() is kept
+        assert kept.flags_defined == frozenset(mm_processor._MM_SETTING_SPECS)
+        assert os.environ["SMG_VLLM_MM_PROCESSOR"] == "inprocess"
+        # The servicer's own expression, given no settings.
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_INFLIGHT": "7"}
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = (
+                None or mm_processor.launcher_settings() or mm_processor.MmSettings()
+            ).resolve(env=env)
+        assert (resolved.processor, resolved.source) == ("inprocess", "flag")
+        assert (resolved.max_inflight, resolved.sources["max_inflight"]) == (7, "env")
+        assert [r.getMessage() for r in caplog.records] == [
+            "SMG_VLLM_MM_MAX_INFLIGHT is deprecated in favour of --mm-max-inflight; env support"
+            " ends in the next minor release"
+        ]
 
     def test_export_mm_flags_carries_the_values_to_a_servicer_without_the_namespace(self):
         parser = argparse.ArgumentParser(prog="grpc_server")

@@ -58,6 +58,7 @@ from smg_grpc_servicer.vllm.mm_processor import (
     MmProcessorUnavailable,
     MmSettings,
     build_mm_processor,
+    launcher_settings,
 )
 from smg_grpc_servicer.vllm.mm_salt import (
     engine_accepts_mm_inputs,
@@ -178,8 +179,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Args:
             async_llm: The EngineClient instance (e.g. AsyncLLM)
             start_time: The server start time, in seconds since epoch
-            mm_settings: The launcher's `--mm-*` flags; None (an older
-                launcher) resolves everything from the environment
+            mm_settings: The launcher's `--mm-*` flags; None takes the
+                settings the plugin kept from this process's launcher parse
+                (upstream's launcher builds the servicer without its
+                namespace), else an older launcher resolves everything from
+                the environment
         """
         # The Rust path takes the process before this class exists; reaching
         # here with the flag set means the launcher never consulted it.
@@ -197,7 +201,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # from the requests this servicer forwards (vLLM's stats carry none).
         self._loads = LoadTracker()
         # Flag > env > default, resolved once so each value names its source.
-        self._mm_settings = (mm_settings or MmSettings()).resolve()
+        self._mm_settings = (mm_settings or launcher_settings() or MmSettings()).resolve()
         # Worker-side media processing (media_refs); None keeps refs rejected.
         self._mm_processor = build_mm_processor(async_llm, settings=self._mm_settings)
         # One cap over all the multimodal work this servicer runs off the event

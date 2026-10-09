@@ -796,6 +796,36 @@ def add_mm_arguments(parser: argparse.ArgumentParser) -> list[str]:
     return added
 
 
+# The `--mm-*` settings the launcher parsed in this process, kept for a
+# servicer the launcher builds without its namespace (upstream's gRPC launcher
+# constructs `VllmEngineServicer(async_llm, start_time)`): read when the
+# servicer is given none, so a flag's value keeps `source=flag` and
+# `flags_defined` keeps the deprecation line for a variable behind a flag.
+_launcher_settings: MmSettings | None = None
+
+
+def remember_launcher_settings(settings: MmSettings | None) -> None:
+    """Keep the launcher's parsed `--mm-*` settings for `launcher_settings`."""
+    global _launcher_settings  # noqa: PLW0603 — one launcher per process
+    _launcher_settings = settings
+
+
+def launcher_settings() -> MmSettings | None:
+    """The `--mm-*` settings the launcher parsed in this process, if any."""
+    return _launcher_settings
+
+
+def carry_mm_flags(args: Any) -> MmSettings:
+    """What the plugin does with a gRPC launcher's parsed `--mm-*` flags: keep
+    them for the servicer this process builds (`launcher_settings`), and
+    carry the set values into the environment for anything that reads only
+    that. Returns the settings kept."""
+    settings = MmSettings.from_args(args)
+    remember_launcher_settings(settings)
+    export_mm_flags(args)
+    return settings
+
+
 def export_mm_flags(args: Any, environ: MutableMapping[str, str] = os.environ) -> dict[str, str]:
     """Carry a parsed namespace's `--mm-*` values into the environment, for a
     servicer the launcher builds without its namespace (upstream's gRPC
