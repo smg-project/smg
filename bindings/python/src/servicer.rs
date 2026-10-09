@@ -456,7 +456,10 @@ struct NativeMediaOptions {
     max_inflight: usize,
 }
 
-fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOptions> {
+fn native_media_options(
+    options: &Bound<'_, PyDict>,
+    served_model_name: &str,
+) -> PyResult<NativeMediaOptions> {
     let item = |key: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
         Ok(options.get_item(key)?.filter(|value| !value.is_none()))
     };
@@ -491,6 +494,7 @@ fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOpti
         settings: WorkerMediaSettings {
             model_dir: required("model_dir")?,
             model_id: required("model_id")?,
+            served_model_name: Some(served_model_name.to_string()),
             pixel_format: if raw_pixels {
                 PixelFormat::RawU8
             } else {
@@ -611,11 +615,12 @@ impl PyVllmGrpcServer {
             .map(|bridge| PythonMediaProcessor::new(&bridge))
             .transpose()?
             .map(|processor| Arc::new(processor) as Arc<dyn MediaProcessor>);
+        let served_model_name = served_model_name.unwrap_or_else(|| model_path.clone());
         let native = smg_media_processor
-            .map(|options| native_media_options(&options))
+            .map(|options| native_media_options(&options, &served_model_name))
             .transpose()?;
         let model = VllmModelInfo {
-            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            served_model_name,
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
             model_path,
             is_generation,

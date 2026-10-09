@@ -58,6 +58,9 @@ pub struct WorkerMediaSettings {
     pub model_dir: String,
     /// The id the model specs match on: the served model path or Hub id.
     pub model_id: String,
+    /// The name the model is served under, for messages an operator reads;
+    /// `model_id` is often a loader's cache directory.
+    pub served_model_name: Option<String>,
     pub pixel_format: PixelFormat,
     /// The engine's dtype (`bfloat16`, `float16`, `float32`); normalized
     /// pixels are written in it directly, so nothing downstream casts them.
@@ -108,6 +111,52 @@ pub enum WorkerMediaError {
     /// A pipeline failure.
     #[error("{0}")]
     Internal(String),
+}
+
+/// Why the pipeline refuses a model it has no spec for, in the terms an
+/// operator acts on: the model type and architectures from its config and
+/// the served name first, then the families the pipeline supports and the
+/// modes that would start the deployment; the loader's path (often a cache
+/// directory under a streaming loader) last.
+fn unsupported_model_message(
+    settings: &WorkerMediaSettings,
+    config: &serde_json::Value,
+    supported: &[&str],
+) -> String {
+    let model_type = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let architectures: Vec<&str> = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+        .unwrap_or_default();
+    let mut facts = Vec::new();
+    if !architectures.is_empty() {
+        facts.push(format!("architectures [{}]", architectures.join(", ")));
+    }
+    if let Some(served) = settings
+        .served_model_name
+        .as_deref()
+        .filter(|served| *served != settings.model_id)
+    {
+        facts.push(format!("served as {served:?}"));
+    }
+    let facts = if facts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", facts.join(", "))
+    };
+    let mut supported: Vec<&str> = supported.to_vec();
+    supported.sort_unstable();
+    format!(
+        "multimodal processing is not supported for model_type {model_type:?}{facts}; the smg \
+         pipeline supports: {}; use --mm-processor inprocess or redis to process media with \
+         the engine's own processors, or off (model path: {})",
+        supported.join(", "),
+        settings.model_id
+    )
 }
 
 /// The pipeline for one served model.
@@ -171,10 +220,11 @@ impl WorkerMediaPipeline {
                 .lookup(&metadata)
                 .map(|spec| spec.name())
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "multimodal processing is not supported for model {}",
-                        settings.model_id
-                    )
+                    anyhow::anyhow!(unsupported_model_message(
+                        &settings,
+                        &loaded.config,
+                        &model_registry.spec_names()
+                    ))
                 })?
         };
         let vision_processor_registry = Arc::new(VisionProcessorRegistry::with_defaults());
@@ -535,5 +585,86 @@ mod processor_kwargs_tests {
         let message = error.to_string();
         assert!(message.contains(r#"["fps", "num_frames"]"#), "{message}");
         assert!(message.contains("--mm-processor inprocess"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod unsupported_model_tests {
+    use llm_tokenizer::MockTokenizer;
+
+    use super::*;
+
+    /// A family without a spec is refused in the terms an operator acts on:
+    /// the model type and architectures, the served name, the families the
+    /// pipeline supports and the modes that would start the deployment; the
+    /// loader's directory (a cache path under a streaming loader) comes last.
+    #[tokio::test]
+    async fn a_family_without_a_spec_is_refused_by_model_type_with_the_supported_families() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "gemma4", "architectures": ["Gemma4ForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let settings = WorkerMediaSettings {
+            model_dir: path.clone(),
+            model_id: path.clone(),
+            served_model_name: Some("m6".to_string()),
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "bfloat16".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+        };
+        let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
+            .await
+            .err()
+            .expect("no spec for this family");
+        let message = format!("{error:#}");
+        assert!(message.contains(r#"model_type "gemma4""#), "{message}");
+        assert!(
+            message.contains("Gemma4ForConditionalGeneration"),
+            "{message}"
+        );
+        assert!(message.contains(r#"served as "m6""#), "{message}");
+        for family in ["qwen3_vl", "kimi_k3", "llama4"] {
+            assert!(message.contains(family), "{family} missing: {message}");
+        }
+        assert!(message.contains("--mm-processor inprocess"), "{message}");
+        assert!(
+            message.find("model_type").unwrap() < message.find(&path).unwrap(),
+            "the path is the last detail: {message}"
+        );
+    }
+
+    /// A served name that is the path itself is not repeated.
+    #[test]
+    fn the_served_name_is_omitted_when_it_is_the_path() {
+        let settings = WorkerMediaSettings {
+            model_dir: "/models/x".to_string(),
+            model_id: "/models/x".to_string(),
+            served_model_name: Some("/models/x".to_string()),
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "bfloat16".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+        };
+        let message = unsupported_model_message(
+            &settings,
+            &serde_json::json!({"model_type": "gemma4"}),
+            &["qwen_vl", "llava"],
+        );
+        assert_eq!(
+            message,
+            "multimodal processing is not supported for model_type \"gemma4\"; the smg pipeline \
+             supports: llava, qwen_vl; use --mm-processor inprocess or redis to process media \
+             with the engine's own processors, or off (model path: /models/x)"
+        );
     }
 }

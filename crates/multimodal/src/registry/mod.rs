@@ -75,6 +75,12 @@ impl ModelRegistry {
         }
         None
     }
+
+    /// The names of the model families this registry has a spec for, in
+    /// lookup order: what a refusal can list for the operator.
+    pub fn spec_names(&self) -> Vec<&'static str> {
+        self.specs.iter().map(|spec| spec.get().name()).collect()
+    }
 }
 
 impl Default for ModelRegistry {
