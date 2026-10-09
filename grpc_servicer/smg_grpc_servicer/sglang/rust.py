@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port
+from smg_grpc_servicer.mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
@@ -177,6 +178,11 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol
+    # The engine's own per-request media limits, flat, as the Python servicer
+    # adds them: the Router's media pipeline holds requests to them.
+    item_limits = sglang_item_limits(server_args)
+    if item_limits:
+        args_dict[MM_ITEM_LIMITS_KEY] = item_limits
     try:
         from sglang.version import __version__ as sglang_version
     except ImportError:  # the launcher's unit tests run without SGLang

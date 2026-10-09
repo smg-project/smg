@@ -879,6 +879,10 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // The operator's explicit protocol, which the servicer reads from the
     // engine's SMG_PAIRING_PROTOCOL environment.
     "pairing_protocol",
+    // The engine's own per-request media limits (`--limit-mm-data-per-request`),
+    // flattened by the servicer to `image=1,video=1`: the gateway's own media
+    // pipeline holds requests to them, as the engine's front end would.
+    "mm_item_limits",
 ];
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
@@ -914,6 +918,9 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "kv_cache_dtype",
     "attention_backend",
     "pairing_protocol",
+    // The engine's own per-request media limits, flattened by the servicer as
+    // for SGLang (`image=4`); TokenSpeed's engine has none to advertise today.
+    "mm_item_limits",
     // RL control plane (crates/rl): where the engine's SGLang-compatible
     // control app listens and what it implements. The engine advertises
     // these; SMG's discovery turns them into the labels the RL crate reads.
@@ -1081,6 +1088,7 @@ mod tests {
                         "rl.reports_weight_version".to_string(),
                         string_value("true"),
                     ),
+                    ("mm_item_limits".to_string(), string_value("image=4")),
                     // Not in TOKENSPEED_GRPC_KEYS — must not become a label.
                     ("host".to_string(), string_value("127.0.0.1")),
                 ]),
@@ -1155,6 +1163,11 @@ mod tests {
             labels.get("rl.reports_weight_version").map(String::as_str),
             Some("true")
         );
+        // The engine's per-request media limits, for the media pipeline.
+        assert_eq!(
+            labels.get("mm_item_limits").map(String::as_str),
+            Some("image=4")
+        );
         // scheduler_info and transient runtime state never become labels.
         assert!(!labels.contains_key("status"));
         assert!(!labels.contains_key("active_requests"));
@@ -1186,6 +1199,10 @@ mod tests {
                     ("page_size".to_string(), number_value(64.0)),
                     ("attention_backend".to_string(), string_value("fa3")),
                     ("pairing_protocol".to_string(), string_value("kv-v1")),
+                    (
+                        "mm_item_limits".to_string(),
+                        string_value("image=1,video=1"),
+                    ),
                     // Not in SGLANG_GRPC_KEYS — must not become a label.
                     ("api_key".to_string(), string_value("secret")),
                 ]),
@@ -1234,6 +1251,11 @@ mod tests {
         assert_eq!(
             labels.get("pairing_protocol").map(String::as_str),
             Some("kv-v1")
+        );
+        // The engine's per-request media limits, for the media pipeline.
+        assert_eq!(
+            labels.get("mm_item_limits").map(String::as_str),
+            Some("image=1,video=1")
         );
     }
 

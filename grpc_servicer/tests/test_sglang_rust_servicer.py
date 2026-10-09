@@ -119,6 +119,19 @@ def test_server_facts_carry_the_router_labels_and_the_window(monkeypatch):
     assert facts["max_running_requests"] == 32
     assert facts["data_parallel_size"] == 2
     assert facts["scheduler_info_json"] == "{}"
+    # Without --limit-mm-data-per-request the engine has no per-request media
+    # limit to advertise: the Router keeps its own caps.
+    assert "mm_item_limits" not in args
+
+
+def test_server_facts_carry_the_engines_media_limits_flat(monkeypatch):
+    # SGLang's --limit-mm-data-per-request is a JSON object per modality; the
+    # Router's label readers take flat values only, so it rides along flat.
+    monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
+    facts = rust.server_facts(_server_args(limit_mm_data_per_request={"image": 1, "video": 1}))
+    args = json.loads(facts["server_args_json"])
+    assert args["mm_item_limits"] == "image=1,video=1"
+    assert args["limit_mm_data_per_request"] == {"image": 1, "video": 1}
 
 
 def test_server_facts_carry_the_kv_events_publisher(monkeypatch):

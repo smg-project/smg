@@ -287,6 +287,13 @@ matters more than the servicer's CPU).
 sglang serve --model-path meta-llama/Llama-2-7b-hf --grpc-mode
 ```
 
+Both SGLang servicers advertise the engine's `--limit-mm-data-per-request` as
+the flat `mm_item_limits` label (`image=1,video=1`) in `GetServerInfo`'s
+`server_args`, so a router that preprocesses media itself holds requests to
+the engine's limits: the precomputed inputs it sends bypass the tokenizer
+manager's own check. Without the flag the engine has no such limit and the
+label is absent.
+
 #### KV-event recovery
 
 To retain cache knowledge across a recoverable event gap, configure SGLang's
