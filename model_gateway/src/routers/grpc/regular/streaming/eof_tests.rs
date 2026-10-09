@@ -331,6 +331,105 @@ async fn chat_eof_tail_passes_through_buffered_tool_text_in_order() {
         .all(|event| event["choices"][0]["delta"]["tool_calls"].is_null()));
 }
 
+/// The Kimi K3 parsers on an output `max_tokens` cuts inside the turn's closing
+/// structure: no marker reaches the content, streamed or whole.
+#[tokio::test]
+async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_content() {
+    // Thinking off: the prompt opened the response channel; the model answers and
+    // closes the turn, one marker a token. Cut after 8 of the 10 tokens the client
+    // used to receive `Pong.<|close|>message` (smg-lab #115); after 6, and at the
+    // natural end, `Pong.`.
+    let tokens = [
+        "P",
+        "ong",
+        ".",
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+    ];
+    for (cut, finish) in [(6, "length"), (8, "length"), (9, "stop")] {
+        let text: String = tokens[..cut].concat();
+        let resolver = || {
+            utils::ParserResolver::new(
+                Arc::new(WorkerRegistry::new()),
+                Some("kimi_k3".to_string()),
+                Some("kimi_k3".to_string()),
+            )
+        };
+        // Streamed, a chunk per token.
+        let mut frames: Vec<_> = tokens[..cut].iter().map(|token| chunk(0, token)).collect();
+        frames.push(complete(0, finish));
+        let (stream, server) = scripted_stream(frames, "0").await;
+        let (tx, rx) = sse_channel();
+        let processor = StreamingProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            resolver(),
+            "vllm",
+        );
+        let result = processor
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                chat_spec(false),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "Pong.",
+            "streamed, cut after {cut} tokens"
+        );
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
+        assert!(
+            events
+                .iter()
+                .any(|event| event["choices"][0]["finish_reason"] == finish),
+            "{events:?}"
+        );
+        // Whole, the non-streaming path.
+        let mut last = complete(0, finish);
+        if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+            complete.output_ids = text.chars().map(u32::from).collect();
+        }
+        let (stream, server) = scripted_stream(vec![chunk(0, &text), last], "0").await;
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let response = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            resolver(),
+        )
+        .process_non_streaming_chat_response(
+            context::ExecutionResult::Single { stream },
+            chat_spec(false),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+            false,
+        )
+        .await
+        .unwrap_or_else(|response| panic!("{}", response.status()));
+        server.abort();
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            response["choices"][0]["message"]["content"], "Pong.",
+            "whole, cut after {cut} tokens"
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], finish);
+    }
+}
+
 #[tokio::test]
 async fn chat_stream_error_does_not_flush_a_success_tail() {
     let (result, events) = chat_events(
