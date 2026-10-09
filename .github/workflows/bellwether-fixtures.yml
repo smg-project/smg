@@ -71,7 +71,7 @@ env:
 jobs:
   fixture-tests:
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    timeout-minutes: 60
+    timeout-minutes: 190
     permissions:
       contents: read
     steps:
@@ -171,11 +171,17 @@ jobs:
       # One invocation, so the test targets build with the same features (the
       # tokenizer files are downloaded over the TLS backend the gateway
       # enables), and the pattern takes in every test file named bellwether_*
-      # in these crates.
+      # in these crates. The pinned commit records 78 models: the tokenizer
+      # harness takes about an hour on the CPU runner and the gateway's render
+      # parity about as long, so the step has the time for both and a margin;
+      # Symphony's replay runs on 1 case in 200 of each benchmark set (its
+      # SYMPHONY_SAMPLE_EVERY switch, the hand-written sets whole), as the
+      # whole replay of every recorded model takes hours.
       - name: Run the tests that read bellwether
-        timeout-minutes: 45
+        timeout-minutes: 170
         env:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
+          SYMPHONY_SAMPLE_EVERY: "200"
         run: |
           source "$HOME/.cargo/env"
           cargo test -p llm-tokenizer -p smg -p smg-symphony --test 'bellwether_*' -- --nocapture

@@ -80,7 +80,89 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// pre-tokenizer for instance, and is held to the rule an id is: the run
 /// fails when no loaded case under it differs any more, and when no loaded
 /// case is under it at all.
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
+    (
+        "qwen-agentworld-35b-a3b/render/*",
+        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
+         combining marks from their letters where tokenizer.json keeps them \
+         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
+         smg-project/bellwether#104, the pin bump that follows removes this entry",
+    ),
+    (
+        "qwen-drive-1.0-4b/render/*",
+        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
+         combining marks from their letters where tokenizer.json keeps them \
+         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
+         smg-project/bellwether#104, the pin bump that follows removes this entry",
+    ),
+    (
+        "qwen3.5-27b/render/*",
+        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
+         combining marks from their letters where tokenizer.json keeps them \
+         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
+         smg-project/bellwether#104, the pin bump that follows removes this entry",
+    ),
+    (
+        "qwen3.5-2b/render/*",
+        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
+         combining marks from their letters where tokenizer.json keeps them \
+         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
+         smg-project/bellwether#104, the pin bump that follows removes this entry",
+    ),
+    (
+        "qwen3.5-9b/render/*",
+        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
+         combining marks from their letters where tokenizer.json keeps them \
+         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
+         smg-project/bellwether#104, the pin bump that follows removes this entry",
+    ),
+    (
+        "qwen3.8-2.4t-a95b/render/*",
+        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
+         combining marks from their letters where tokenizer.json keeps them \
+         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
+         smg-project/bellwether#104, the pin bump that follows removes this entry",
+    ),
+    (
+        "qwen3.8-flash-next/render/*",
+        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
+         combining marks from their letters where tokenizer.json keeps them \
+         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
+         smg-project/bellwether#104, the pin bump that follows removes this entry",
+    ),
+    (
+        "phi-4-multimodal-instruct/render/*",
+        "the reference's ids follow transformers' GPT2Tokenizer pattern, which splits \
+         contractions, digit runs and punctuation as GPT-2 does where tokenizer.json carries \
+         an o200k-style regex (smg-project/smg-lab#102); re-recorded with the file's encoder \
+         in smg-project/bellwether#104, the pin bump that follows removes this entry",
+    ),
+    (
+        "tinyllama-1.1b-chat-v1.0/render/*",
+        "the reference's ids follow transformers' LlamaTokenizer with legacy=false, which \
+         prepends the dummy space once per input where tokenizer.json's normalizer prepends \
+         it per segment, so no dummy space follows a special token (smg-project/smg-lab#104); \
+         re-recorded with the file's encoder in smg-project/bellwether#104, the pin bump that \
+         follows removes this entry",
+    ),
+];
+
+/// Models whose tokenizer is known not to load, with the reason and where it
+/// is tracked, so the run compares the others: an unlisted model that does
+/// not load fails the run, and so does a listed one whose tokenizer loads
+/// now, so the list cannot rot.
+const KNOWN_UNLOADED: &[(&str, &str)] = &[
+    (
+        "qwen3-omni-30b-a3b-instruct",
+        "the checkpoint ships vocab.json and merges.txt and neither tokenizer.json nor \
+         tiktoken.model, the files the tokenizer reads (smg-project/smg-lab#111)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking",
+        "the checkpoint ships vocab.json and merges.txt and neither tokenizer.json nor \
+         tiktoken.model, the files the tokenizer reads (smg-project/smg-lab#111)",
+    ),
+];
 
 /// The reason `known` lists for `id`: the entry that is the id itself, else
 /// the first prefix entry the id begins with; none when the id is not listed.
@@ -228,17 +310,39 @@ impl Report {
     }
 
     /// What fails the run; empty when it passes.
-    fn failures(&self, root: &Path, known: &BTreeMap<&str, &str>) -> Vec<String> {
+    fn failures(
+        &self,
+        root: &Path,
+        known: &BTreeMap<&str, &str>,
+        known_unloaded: &BTreeMap<&str, &str>,
+    ) -> Vec<String> {
         let mut failures = Vec::new();
-        if !self.unloaded.is_empty() {
-            let models: Vec<String> = self
-                .unloaded
-                .iter()
-                .map(|(slug, why)| format!("{slug}: {why}"))
-                .collect();
+        let unlisted: Vec<String> = self
+            .unloaded
+            .iter()
+            .filter(|(slug, _)| !known_unloaded.contains_key(slug.as_str()))
+            .map(|(slug, why)| format!("{slug}: {why}"))
+            .collect();
+        if !unlisted.is_empty() {
             failures.push(format!(
                 "models not compared, because their tokenizer did not load:\n{}",
-                models.join("\n")
+                unlisted.join("\n")
+            ));
+        }
+        let loads_now: Vec<&str> = known_unloaded
+            .keys()
+            .copied()
+            .filter(|slug| {
+                self.loaded_dirs.iter().any(|dir| {
+                    dir.strip_prefix(*slug)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
+            })
+            .collect();
+        if !loads_now.is_empty() {
+            failures.push(format!(
+                "listed in KNOWN_UNLOADED but their tokenizer loads now; remove: {}",
+                loads_now.join(", ")
             ));
         }
         if !self.mismatches.is_empty() {
@@ -370,9 +474,10 @@ fn encode_and_incremental_decode_match_the_reference() {
              `*` only at the end, as a prefix"
         );
     }
+    let known_unloaded: BTreeMap<&str, &str> = KNOWN_UNLOADED.iter().copied().collect();
     let report =
         compare(&root, &manifests, &known, load_tokenizer).unwrap_or_else(|e| panic!("{e}"));
-    let failures = report.failures(&root, &known);
+    let failures = report.failures(&root, &known, &known_unloaded);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -1006,7 +1111,7 @@ fn the_cases_read_must_be_the_cases_sets_toml_lists() {
             ("m/render/extra".to_string(), Some(1), None),
         ]
     );
-    let failures = report.failures(root.path(), &BTreeMap::new());
+    let failures = report.failures(root.path(), &BTreeMap::new(), &BTreeMap::new());
     assert_eq!(failures.len(), 1, "{failures:#?}");
     for set in ["m/render/bfcl-simple", "m/render/common", "m/render/extra"] {
         assert!(failures[0].contains(set), "{set} is not in {failures:#?}");
@@ -1100,10 +1205,24 @@ fn a_model_whose_tokenizer_does_not_load_fails_the_run_after_the_others() {
         [("a".to_string(), "no tokenizer.json".to_string())]
     );
     assert_eq!(report.seen, BTreeSet::from(["b/render/x".to_string()]));
-    let failures = report.failures(root.path(), &BTreeMap::new());
+    let failures = report.failures(root.path(), &BTreeMap::new(), &BTreeMap::new());
     assert_eq!(failures.len(), 1, "{failures:#?}");
     assert!(
         failures[0].contains("a: no tokenizer.json"),
+        "{failures:#?}"
+    );
+    // Listed as known not to load, "a" no longer fails the run; a listed model
+    // whose tokenizer loads must leave the list.
+    let listed = BTreeMap::from([("a", "ships neither tokenizer.json nor tiktoken.model")]);
+    assert_eq!(
+        report.failures(root.path(), &BTreeMap::new(), &listed),
+        Vec::<String>::new()
+    );
+    let stale = BTreeMap::from([("a", "does not load"), ("b", "does not load")]);
+    let failures = report.failures(root.path(), &BTreeMap::new(), &stale);
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("loads now") && failures[0].ends_with("remove: b"),
         "{failures:#?}"
     );
 }
@@ -1133,9 +1252,12 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
     let report = compare(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
     assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
     // The prefix covers both differing cases, so nothing fails the run.
-    assert_eq!(report.failures(root.path(), &listed), Vec::<String>::new());
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
     // Without it the two are unlisted.
-    let failures = report.failures(root.path(), &BTreeMap::new());
+    let failures = report.failures(root.path(), &BTreeMap::new(), &BTreeMap::new());
     assert_eq!(failures.len(), 1, "{failures:#?}");
     assert!(
         failures[0].contains("m/render/mgsm-th-1") && failures[0].contains("m/render/mgsm-th-2"),
@@ -1148,7 +1270,7 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
         ("m/render/mgsm-bn-*", "no such set"),
         ("m/render/mgsm-th-*", "recorded with another pre-tokenizer"),
     ]);
-    let failures = report.failures(root.path(), &stale);
+    let failures = report.failures(root.path(), &stale, &BTreeMap::new());
     assert_eq!(failures.len(), 2, "{failures:#?}");
     assert!(
         failures.iter().any(|failure| {
