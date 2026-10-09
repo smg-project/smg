@@ -240,16 +240,12 @@ const RESPONSE_FORMAT_KEY: &str = "response_format";
 /// request `chat_template_kwargs`, forwarding each verbatim. The chat template
 /// owns interpretation (level→value mapping, `tool_choice`/`response_format`
 /// rendering, defaulting, and validation); an explicit `chat_template_kwargs`
-/// entry wins.
+/// entry wins, except for `reasoning_effort`: the request-level effort
+/// (`thinking.effort`, else the top-level field) is written over an entry,
+/// as the engine's own server renders it.
 fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
     let kwargs_capacity = 3 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
     let mut combined = HashMap::with_capacity(kwargs_capacity);
-    if let Some(reasoning_effort) = request.effective_reasoning_effort() {
-        combined.insert(
-            REASONING_EFFORT_KEY.to_string(),
-            Value::String(reasoning_effort.to_string()),
-        );
-    }
     if let Some(tool_choice) = &request.tool_choice {
         if let Ok(value) = serde_json::to_value(tool_choice) {
             combined.insert(TOOL_CHOICE_KEY.to_string(), value);
@@ -262,6 +258,12 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     }
     if let Some(template_kwargs) = &request.chat_template_kwargs {
         combined.extend(template_kwargs.clone());
+    }
+    if let Some(reasoning_effort) = request.effective_reasoning_effort() {
+        combined.insert(
+            REASONING_EFFORT_KEY.to_string(),
+            Value::String(reasoning_effort.to_string()),
+        );
     }
     combined
 }
@@ -511,6 +513,20 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 
     // No filtering needed - return original request
     std::borrow::Cow::Borrowed(body)
+}
+
+/// The request whose tools the template renders. A named `tool_choice`
+/// renders every tool, as the engine's own server renders it (the named call
+/// is forced by the tool constraint, built from `callable_tools`); an
+/// `allowed_tools` choice renders its subset; any other request renders as
+/// it is.
+pub(crate) fn request_as_rendered(
+    request: &ChatCompletionRequest,
+) -> std::borrow::Cow<'_, ChatCompletionRequest> {
+    match request.tool_choice {
+        Some(ToolChoice::Function { .. }) => std::borrow::Cow::Borrowed(request),
+        _ => filter_chat_request_by_tool_choice(request),
+    }
 }
 
 /// Process chat messages and apply template (shared by both routers)
@@ -1529,6 +1545,60 @@ mod tests {
         assert_eq!(result[0]["content"], "question\n<image>");
     }
 
+    /// A named `tool_choice` renders every tool (the engine's own server
+    /// renders them all and forces the call with its grammar), while the
+    /// constraint still targets the named tool; an `allowed_tools` subset
+    /// still narrows the rendered list.
+    #[test]
+    fn a_named_tool_choice_renders_every_tool() {
+        let request = |tool_choice: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "q"}],
+                "tools": [
+                    {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}}},
+                    {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
+                ],
+                "tool_choice": tool_choice,
+            }))
+            .expect("chat request")
+        };
+        let names = |request: &ChatCompletionRequest| -> Vec<String> {
+            request
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.function.name.clone())
+                .collect()
+        };
+
+        let named = request(json!({"type": "function", "function": {"name": "get_weather"}}));
+        assert_eq!(
+            names(&request_as_rendered(&named)),
+            ["get_weather", "get_time"]
+        );
+        assert_eq!(
+            named
+                .callable_tools()
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["get_weather"]
+        );
+
+        let allowed = request(json!({
+            "type": "allowed_tools", "mode": "auto",
+            "tools": [{"type": "function", "name": "get_time"}]
+        }));
+        assert_eq!(names(&request_as_rendered(&allowed)), ["get_time"]);
+
+        let auto = request(json!("auto"));
+        assert_eq!(
+            names(&request_as_rendered(&auto)),
+            ["get_weather", "get_time"]
+        );
+    }
+
     fn effort_request(reasoning_effort: Option<&str>) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "inkling-chat".to_string(),
@@ -1554,16 +1624,28 @@ mod tests {
         assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
     }
 
+    /// The request-level `reasoning_effort` is written over a
+    /// `chat_template_kwargs` entry, as the engine's own server renders it;
+    /// the other entries pass through, and the entry stands when the request
+    /// carries no field.
     #[test]
-    fn chat_template_kwargs_override_top_level_effort() {
+    fn top_level_effort_overrides_a_chat_template_kwargs_entry() {
         let mut request = effort_request(Some("high"));
         request.chat_template_kwargs = Some(HashMap::from([
             (REASONING_EFFORT_KEY.to_string(), json!("low")),
             ("custom".to_string(), json!(true)),
         ]));
         let kwargs = build_chat_template_kwargs(&request);
-        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
         assert_eq!(kwargs.get("custom"), Some(&Value::Bool(true)));
+
+        let mut request = effort_request(None);
+        request.chat_template_kwargs = Some(HashMap::from([(
+            REASONING_EFFORT_KEY.to_string(),
+            json!("low"),
+        )]));
+        let kwargs = build_chat_template_kwargs(&request);
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
     }
 
     fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatCompletionRequest {
@@ -1584,14 +1666,14 @@ mod tests {
         let kwargs = build_chat_template_kwargs(&request);
         assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("max")));
 
-        // An explicit chat_template_kwargs entry outranks both.
+        // The request-level effort outranks an explicit chat_template_kwargs entry too.
         let mut request = thinking_request(json!({"effort": "low"}), Some("max"));
         request.chat_template_kwargs = Some(HashMap::from([(
             REASONING_EFFORT_KEY.to_string(),
             json!("high"),
         )]));
         let kwargs = build_chat_template_kwargs(&request);
-        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
     }
 
     #[test]

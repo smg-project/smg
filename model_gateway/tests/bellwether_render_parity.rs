@@ -60,7 +60,7 @@ use std::{
 };
 
 use llm_tokenizer::{create_tokenizer, traits::Tokenizer, MockTokenizer};
-use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
+use openai_protocol::{chat::ChatCompletionRequest, common::ToolChoice, validated::Normalizable};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use smg::routers::grpc::utils::process_chat_messages;
@@ -1973,7 +1973,8 @@ fn in_order<T: Send>(
 /// every chat request (the provider profile's rewrites, deprecated-field
 /// migration, the `tool_choice` default; a request the gateway would answer
 /// with 400 is a difference, not a rendering), then the tools narrowed by
-/// `tool_choice` as the chat preparation stage does before rendering.
+/// `tool_choice` as the chat preparation stage does before rendering (every
+/// tool for a named choice, the subset for `allowed_tools`).
 /// `process_chat_messages` then renders it exactly as the gateway does before
 /// tokenizing, and the ids are the flat encode of that text, which is the
 /// gateway's tokenize step for a renderer that returns text to encode.
@@ -1987,8 +1988,12 @@ fn render(tok: &dyn Tokenizer, model: &str, request: &Value) -> Result<Rendered,
     request
         .validate()
         .map_err(|e| format!("the gateway rejects this request with 400: {e}"))?;
-    // `filter_chat_request_by_tool_choice`, crate-private, applies this rule.
+    // `request_as_rendered`, crate-private, applies this rule: a named
+    // `tool_choice` renders every tool (the engine's own server renders them
+    // all and forces the call with its grammar); an `allowed_tools` choice
+    // renders its subset.
     let narrowed = match (&request.tools, &request.tool_choice) {
+        (Some(_), Some(ToolChoice::Function { .. })) => None,
         (Some(tools), Some(choice)) => choice.narrow_tools(tools),
         _ => None,
     };
