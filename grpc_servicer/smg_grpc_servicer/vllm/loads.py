@@ -165,3 +165,19 @@ def scheduler_load_fields(
     if max_running_requests > 0:
         fields["max_running_requests"] = int(max_running_requests)
     return fields
+
+
+class RankLoadTrackers:
+    """Keep request estimates in the same global rank space as scheduler stats.
+
+    Unassigned requests on a DP frontend cannot be attributed until the engine
+    exposes their chosen rank. They must not contribute to any rank's estimate.
+    """
+
+    def __init__(self, ranks, *, clock=time.monotonic):
+        self._trackers = {rank: LoadTracker(clock=clock) for rank in ranks}
+
+    def for_rank(self, rank: int | None) -> LoadTracker | None:
+        if rank is None and len(self._trackers) == 1:
+            return next(iter(self._trackers.values()))
+        return self._trackers.get(rank)

@@ -247,11 +247,10 @@ impl NativeLoadsPath {
 
     /// Where to probe this route on `worker`.
     fn probe_url(self, worker: &Arc<dyn Worker>) -> String {
-        let base = worker.url();
         match self {
             // Sections beyond `core` degrade gracefully: an engine that does
             // not report them omits the fields, which deserialize to `None`.
-            Self::Engine => format!("{base}/v1/loads?include=core,disagg,queues,memory"),
+            Self::Engine => worker.endpoint_url("/v1/loads?include=core,disagg,queues,memory"),
             // A gateway serves a whole fleet, so an unscoped `/loads` blends
             // every model it fronts. A worker registered for exactly one
             // model must be asked about that model alone.
@@ -259,9 +258,9 @@ impl NativeLoadsPath {
                 [card] => {
                     let model: String =
                         url::form_urlencoded::byte_serialize(card.id.as_bytes()).collect();
-                    format!("{base}/loads?model={model}")
+                    worker.endpoint_url(&format!("/loads?model={model}"))
                 }
-                _ => format!("{base}/loads"),
+                _ => worker.endpoint_url("/loads"),
             },
         }
     }
@@ -916,8 +915,8 @@ impl WorkerMonitor {
     /// a worker, and `/v1/loads` on an engine. Which one a worker answered on
     /// is memoized, so the extra attempt costs one 404 per worker, once.
     ///
-    /// Every backend is normalized into a single-rank [`WorkerLoadResponse`]
-    /// whose `token_usage` field drives the load-aware policies. Returns
+    /// Engine responses are scoped to the virtual worker's DP rank, if any.
+    /// Gateway fleet rollups retain their worker annotations. Returns
     /// `None` on failure so the caller records the load as unavailable (`-1`).
     ///
     /// `native_loads_memo` is the shared probe memo, or `None` for callers
@@ -938,7 +937,7 @@ impl WorkerMonitor {
             match Self::probe_native_loads(worker, path).await {
                 NativeLoads::Available(load) => {
                     memo.record_answered(path);
-                    response = Some(load);
+                    response = Some((path, load));
                     break;
                 }
                 NativeLoads::Absent => memo.record_absent(path),
@@ -952,9 +951,14 @@ impl WorkerMonitor {
                 store.insert(worker.url().to_string(), memo);
             }
         }
-        if response.is_some() {
+        if let Some((path, load)) = response {
             liveness::on_contact(worker);
-            return response;
+            // A native response with a missing rank is unavailable, not a
+            // reason to substitute the backend-wide Prometheus average.
+            return match path {
+                NativeLoadsPath::Engine => load.for_dp_rank(worker.dp_rank()),
+                NativeLoadsPath::Gateway => (!load.loads.is_empty()).then_some(load),
+            };
         }
 
         match worker.metadata().spec.runtime_type {
@@ -993,9 +997,9 @@ impl WorkerMonitor {
         }
 
         match resp.json::<WorkerLoadResponse>().await {
-            Ok(response) if !response.loads.is_empty() => NativeLoads::Available(response),
-            // Our schema, no ranks reported yet — keep probing.
-            Ok(_) => NativeLoads::Inconclusive,
+            // An empty native snapshot is still authoritative: no rank has
+            // telemetry yet. Do not turn it into an aggregate fallback.
+            Ok(response) => NativeLoads::Available(response),
             // A 200 that is not a load response means something else is
             // mounted here; that is as definitive as a 404.
             Err(_) => NativeLoads::Absent,
@@ -1007,7 +1011,7 @@ impl WorkerMonitor {
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
     async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = format!("{}/metrics", worker.url());
+        let url = worker.endpoint_url("/metrics");
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
@@ -1033,7 +1037,7 @@ impl WorkerMonitor {
     /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
     /// in v0.5.4+, so detect whichever is present and use it throughout.
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = format!("{}/metrics", worker.url());
+        let url = worker.endpoint_url("/metrics");
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
@@ -1110,13 +1114,9 @@ impl WorkerMonitor {
         // poll that times out is a slow worker, not a dead one: the keepalive
         // on the connection is what reports those.
         match tokio::time::timeout(LOAD_POLL_DEADLINE, backend_client.get_loads()).await {
-            Ok(Ok(load)) if !load.loads.is_empty() => {
+            Ok(Ok(load)) => {
                 liveness::on_contact(worker);
-                Some(load)
-            }
-            Ok(Ok(_)) => {
-                liveness::on_contact(worker);
-                None
+                load.for_dp_rank(worker.dp_rank())
             }
             Ok(Err(e)) => {
                 debug!("backend GetLoads failed for {}: {e}", worker.url());
@@ -2402,6 +2402,14 @@ mod native_loads_tests {
     const NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
         "num_waiting_reqs":4,"num_waiting_uncached_tokens":900,"token_usage":0.25}]}"#;
 
+    const NATIVE_DP_BODY: &str = r#"{"dp_rank_count":2,"loads":[
+        {"dp_rank":0,"num_running_reqs":3,"token_usage":0.25},
+        {"dp_rank":1,"num_running_reqs":9,"token_usage":0.75}]}"#;
+
+    const GATEWAY_FLEET_BODY: &str = r#"{"dp_rank_count":2,"loads":[
+        {"worker":"http://engine-a","dp_rank":0,"num_running_reqs":3},
+        {"worker":"http://engine-b","dp_rank":0,"num_running_reqs":9}]}"#;
+
     struct Stub {
         url: String,
         /// `/v1/loads` hits.
@@ -2480,6 +2488,22 @@ mod native_loads_tests {
 
     fn vllm_worker(url: &str) -> Arc<dyn Worker> {
         vllm_worker_with_overload(url, OverloadUpdate::default())
+    }
+
+    fn vllm_dp_worker(url: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("a"))
+                .dp_config(rank, size)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
     }
 
     /// Worker carrying a per-worker overload block — protection for it is
@@ -2876,6 +2900,52 @@ mod native_loads_tests {
     }
 
     #[tokio::test]
+    async fn native_loads_are_projected_to_the_virtual_worker_rank() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
+        let worker = vllm_dp_worker(&stub.url, 1, 2);
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, None)
+            .await
+            .expect("rank 1 load response");
+
+        assert_eq!(resp.dp_rank_count, 1);
+        assert_eq!(resp.loads.len(), 1);
+        assert_eq!(resp.loads[0].dp_rank, 1);
+        assert_eq!(resp.loads[0].num_running_reqs, 9);
+    }
+
+    #[tokio::test]
+    async fn missing_native_rank_never_uses_prometheus_average() {
+        for body in [NATIVE_BODY, r#"{"loads":[]}"#] {
+            let stub = spawn_engine(StatusCode::OK, body).await;
+            let worker = vllm_dp_worker(&stub.url, 1, 2);
+            let memo = DashMap::new();
+            for _ in 0..2 {
+                assert!(WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                    .await
+                    .is_none());
+            }
+            assert_eq!(stub.probes.load(Ordering::SeqCst), 2);
+            assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_fleet_loads_are_not_projected_as_engine_dp_ranks() {
+        let stub = spawn_gateway(GATEWAY_FLEET_BODY).await;
+        let worker = vllm_dp_worker(&stub.url, 1, 2);
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, None)
+            .await
+            .expect("gateway fleet load response");
+
+        assert_eq!(resp.loads.len(), 2);
+        assert!(resp.loads.iter().all(|load| load.worker.is_some()));
+        assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn absent_native_endpoint_falls_back_and_is_probed_once() {
         let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
         let worker = vllm_worker(&stub.url);
@@ -2947,9 +3017,9 @@ mod native_loads_tests {
         let memo = DashMap::new();
 
         for _ in 0..2 {
-            WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            assert!(WorkerMonitor::fetch_http_load(&worker, Some(&memo))
                 .await
-                .expect("metrics fallback");
+                .is_none());
         }
 
         let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");

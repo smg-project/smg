@@ -10,7 +10,6 @@ import hashlib
 import itertools
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
-from datetime import datetime, timezone
 from pathlib import Path
 
 import grpc
@@ -49,7 +48,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 # The launcher imports this module before it defines serve_grpc: the moment
 # the servicer switch has to be in place (see launcher_switch).
 from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
-from smg_grpc_servicer.vllm.loads import LoadTracker, scheduler_load_fields
+from smg_grpc_servicer.vllm.loads import RankLoadTrackers
 from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
@@ -70,6 +69,7 @@ from smg_grpc_servicer.vllm.model_info import (
     model_facts,
     server_facts,
 )
+from smg_grpc_servicer.vllm.scheduler_loads import build_loads_response, managed_ranks
 
 from .mm_keys import (
     batches_missing_pixels,
@@ -97,57 +97,6 @@ def _prompt_length(prompt) -> int:
         ids = prompt.get("prompt_token_ids")
         return len(ids) if ids is not None else 0
     return 0
-
-
-def _kv_capacity_tokens(engine) -> int:
-    """The KV cache's token capacity, when the engine config exposes it."""
-    cache = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
-    blocks = getattr(cache, "num_gpu_blocks", None)
-    block_size = getattr(cache, "block_size", None)
-    if isinstance(blocks, int) and isinstance(block_size, int) and blocks > 0 and block_size > 0:
-        return blocks * block_size
-    return 0
-
-
-def _max_running_requests(engine) -> int:
-    """The scheduler's running window (``max_num_seqs``), when exposed."""
-    scheduler = getattr(getattr(engine, "vllm_config", None), "scheduler_config", None)
-    window = getattr(scheduler, "max_num_seqs", None)
-    return window if isinstance(window, int) and window > 0 else 0
-
-
-def _latest_scheduler_stats(engine, engine_idx: int = 0):
-    """Best-effort read of the most recent ``SchedulerStats`` snapshot.
-
-    vLLM has no synchronous "current stats" accessor on ``AsyncLLM``/``EngineClient``;
-    ``SchedulerStats`` arrive asynchronously and are cached on the stat loggers. This
-    reaches into ``engine.logger_manager.stat_loggers`` and returns the freshest
-    snapshot, handling the logger-shape variants:
-
-    - ``LoggingStatLogger``                  -> ``.last_scheduler_stats``
-    - ``AggregatedLoggingStatLogger`` (DP)   -> ``.last_scheduler_stats_dict[idx]``
-    - ``PerEngineStatLoggerAdapter``         -> ``.per_engine_stat_loggers[idx]``
-    - ``PrometheusStatLogger``               -> skipped (no cached snapshot)
-
-    Returns ``None`` when stats logging is disabled (``--disable-log-stats``) or no
-    engine step has produced outputs yet.
-    """
-    logger_manager = getattr(engine, "logger_manager", None)
-    if logger_manager is None:
-        return None
-    for sl in getattr(logger_manager, "stat_loggers", None) or []:
-        per = getattr(sl, "last_scheduler_stats_dict", None)
-        if isinstance(per, dict) and engine_idx in per:
-            return per[engine_idx]
-        stats = getattr(sl, "last_scheduler_stats", None)
-        if stats is not None:
-            return stats
-        per_engine = getattr(sl, "per_engine_stat_loggers", None)
-        if isinstance(per_engine, dict) and engine_idx in per_engine:
-            nested = getattr(per_engine[engine_idx], "last_scheduler_stats", None)
-            if nested is not None:
-                return nested
-    return None
 
 
 class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
@@ -194,7 +143,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self._kv_events_config = resolve_kv_events_config(async_llm)
         # Queued token-work, generation throughput and hit rate for GetLoads,
         # from the requests this servicer forwards (vLLM's stats carry none).
-        self._loads = LoadTracker()
+        self._loads = RankLoadTrackers(managed_ranks(async_llm))
         # Flag > env > default, resolved once so each value names its source.
         self._mm_settings = (mm_settings or MmSettings()).resolve()
         # Worker-side media processing (media_refs); None keeps refs rejected.
@@ -312,6 +261,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # What a PD prefill leg learned about its media, for the decode leg.
         media_identity = None
         engine_started = False
+        load_tracker = self._loads.for_rank(
+            request.data_parallel_rank if request.HasField("data_parallel_rank") else None
+        )
         try:
             arrival_time = time.time()
             kv_transfer_params = params_from_request(request)
@@ -430,7 +382,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Track which indices have sent their first chunk
             seen_indices: set[int] = set()
 
-            self._loads.submitted(request_id, _prompt_length(prompt))
+            if load_tracker is not None:
+                load_tracker.submitted(request_id, _prompt_length(prompt))
             async for output in self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -440,14 +393,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     request.data_parallel_rank if request.HasField("data_parallel_rank") else None
                 ),
             ):
-                if not engine_started:
-                    self._loads.first_output(
+                if not engine_started and load_tracker is not None:
+                    load_tracker.first_output(
                         request_id,
                         len(output.prompt_token_ids or ()),
                         getattr(output, "num_cached_tokens", 0) or 0,
                     )
                 engine_started = True
-                self._loads.generated(sum(len(c.token_ids) for c in output.outputs))
+                if load_tracker is not None:
+                    load_tracker.generated(sum(len(c.token_ids) for c in output.outputs))
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -507,7 +461,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
             await context.abort(code, str(e))
         finally:
-            self._loads.finished(request_id)
+            if load_tracker is not None:
+                load_tracker.finished(request_id)
 
     async def _notify_kv_transfer_rejected(
         self,
@@ -732,61 +687,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: vllm_engine_pb2.GetLoadsRequest,
         context: grpc.aio.ServicerContext,
     ) -> vllm_engine_pb2.GetLoadsResponse:
-        """
-        Handle load-metric requests.
-
-        Reads the latest SchedulerStats snapshot cached on the engine's stat
-        loggers and maps it onto a single-DP-rank SchedulerLoad: ``token_usage``
-        carries KV-cache utilization ([0,1)) and ``num_running_reqs`` /
-        ``num_waiting_reqs`` report queue depth. ``num_waiting_uncached_tokens``,
-        ``gen_throughput`` and ``cache_hit_rate`` come from this servicer's own
-        bookkeeping of the requests it forwards (``smg_grpc_servicer.vllm.loads``),
-        since vLLM's stats do not carry them.
-
-        Always returns exactly one SchedulerLoad entry (zero-filled when no
-        snapshot is available yet, e.g. with --disable-log-stats or before the
-        first engine step) so callers treat the worker as responsive rather than
-        dropping the poll.
-
-        Note: ``request.dp_rank`` and ``request.include`` are accepted but not yet
-        applied — vLLM reports a single DP rank (``dp_rank_count=1``) with only
-        core metrics, so there is nothing to filter. They are reserved for future
-        multi-DP / sectioned-metrics support.
-
-        Args:
-            request: The GetLoadsRequest protobuf
-            context: gRPC context
-
-        Returns:
-            GetLoadsResponse protobuf
-        """
-        stats = _latest_scheduler_stats(self.engine)
-        if stats is not None:
-            num_running = int(getattr(stats, "num_running_reqs", 0) or 0)
-            num_waiting = int(getattr(stats, "num_waiting_reqs", 0) or 0)
-            kv_usage = float(getattr(stats, "kv_cache_usage", 0.0) or 0.0)
-        else:
-            num_running = 0
-            num_waiting = 0
-            kv_usage = 0.0
-
-        load = vllm_engine_pb2.SchedulerLoad(
-            **scheduler_load_fields(
-                num_running,
-                num_waiting,
-                kv_usage,
-                self._loads.estimate(num_waiting),
-                max_total_num_tokens=_kv_capacity_tokens(self.engine),
-                max_running_requests=_max_running_requests(self.engine),
-            )
-        )
-
-        return vllm_engine_pb2.GetLoadsResponse(
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            version=VLLM_VERSION,
-            dp_rank_count=1,
-            loads=[load],
-        )
+        """Report cached scheduler loads with request estimates for each known rank."""
+        try:
+            return build_loads_response(self.engine, request, VLLM_VERSION, trackers=self._loads)
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
     async def GetTokenizer(
         self,
