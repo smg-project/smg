@@ -975,6 +975,33 @@ fn render_chat_template(
     Ok(rendered)
 }
 
+/// The messages with every string `content` of a non-tool message replaced by
+/// a one-item text part list, or `None` when no message has one.
+fn string_content_as_text_parts(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+    fn needs_wrap(message: &serde_json::Value) -> bool {
+        message
+            .get("content")
+            .is_some_and(serde_json::Value::is_string)
+            && message.get("role").and_then(serde_json::Value::as_str) != Some("tool")
+    }
+    if !messages.iter().any(needs_wrap) {
+        return None;
+    }
+    let wrapped = messages
+        .iter()
+        .map(|message| {
+            if !needs_wrap(message) {
+                return message.clone();
+            }
+            let mut message = message.clone();
+            let text = message["content"].take();
+            message["content"] = serde_json::json!([{ "type": "text", "text": text }]);
+            message
+        })
+        .collect();
+    Some(wrapped)
+}
+
 /// Chat template processor using Jinja2 - simple wrapper like HuggingFace
 pub struct ChatTemplateProcessor {
     env: Environment<'static>,
@@ -1124,6 +1151,19 @@ impl ChatTemplateState {
                  https://huggingface.co/docs/transformers/main/en/chat_templating",
             )
         })?;
+
+        // vLLM hands an "openai"-format template every message's string content
+        // as a one-item text part list (`_parse_chat_message_content`: a `str`
+        // becomes `[{"type": "text", "text": ...}]`, and in that format the
+        // parts stay dicts), so such a template always takes its parts branch.
+        // Render the same way, so that a template whose two branches differ (a
+        // separator after every part, a truthiness check on the content)
+        // produces the engine's prompt for string content too. A tool result
+        // stays a string: vLLM joins its text parts back into one.
+        let wrapped = (self.content_format == ChatTemplateContentFormat::OpenAI)
+            .then(|| string_content_as_text_parts(messages))
+            .flatten();
+        let messages = wrapped.as_deref().unwrap_or(messages);
 
         // Apply the resolved thinking preference under the template's own toggle
         // key (`enable_thinking` vs `thinking`, per detection). Skip entirely
