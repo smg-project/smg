@@ -310,9 +310,12 @@ carried by the wire's control call) all answer as the Python servicer does.
 What the wire does not carry is reported, not emulated: multimodal inputs and
 hidden states are refused, PD/EPD disaggregation stays with the Python
 implementation (the worker refuses to start on the Rust path in those modes),
-and LoRA loading and `SubscribeKvEvents` answer UNIMPLEMENTED, as they do on
-the Python servicer. SGLang's HTTP sidecar (metrics and profiling endpoints)
-is not started on this path.
+and LoRA loading answers UNIMPLEMENTED, as it does on the Python servicer.
+`SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which Rust mode
+turns on by itself when the launcher is given no `--kv-events-config` (an
+explicit one is kept as given; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the
+publisher off). SGLang's HTTP sidecar (metrics and profiling endpoints) is not
+started on this path.
 
 #### Headless over ZMQ (no SGLang change)
 

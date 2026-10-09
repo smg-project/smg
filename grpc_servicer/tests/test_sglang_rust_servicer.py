@@ -166,6 +166,41 @@ def test_server_facts_refuse_non_finite_floats():
         rust.server_facts(_server_args(mem_fraction_static=float("nan")))
 
 
+def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer():
+    """A launcher without --kv-events-config left SGLang publishing nothing and
+    the router's cache-aware routing blind (smg-lab #1): the Rust path turns
+    the ZMQ publisher on itself unless told otherwise."""
+    expected = '{"publisher": "zmq"}'
+    # Nothing given: SGLang's own defaults behind the ZMQ publisher.
+    args = _server_args()
+    assert rust.default_kv_events_config(args, environ={}) == expected
+    assert args.kv_events_config == expected
+    assert rust.kv_events_publisher(args) == ("tcp://*:5557", "", "")
+    args = _server_args(kv_events_config=None)
+    assert rust.default_kv_events_config(args, environ={}) == expected
+    args = _server_args(kv_events_config="")
+    assert rust.default_kv_events_config(args, environ={}) == expected
+    # The opt-out.
+    for value in ("0", "false", "No", " off "):
+        args = _server_args(kv_events_config=None)
+        assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: value}) is None
+        assert args.kv_events_config is None
+    args = _server_args()
+    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}) == expected
+    # An explicit configuration is kept as given, off included.
+    for given in ('{"publisher": "null"}', '{"publisher": "zmq", "endpoint": "tcp://*:6100"}'):
+        args = _server_args(kv_events_config=given)
+        assert rust.default_kv_events_config(args, environ={}) is None
+        assert args.kv_events_config == given
+    # Server args that cannot be written are left alone.
+
+    class Frozen:
+        __slots__ = ()
+        kv_events_config = None
+
+    assert rust.default_kv_events_config(Frozen(), environ={}) is None
+
+
 def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatch, tmp_path):
     created = {}
 
@@ -210,6 +245,8 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert created["engine_count"] == 1 and created["tokenizer_dir"] == "/tok"
     assert created["model_path"] == "org/model" and created["sglang_version"] == "x"
     assert launched == {"args": args, "port": 24321}
+    # No --kv-events-config was given: the headless scheduler publishes.
+    assert args.kv_events_config == '{"publisher": "zmq"}'
 
 
 def test_serve_grpc_hands_the_process_to_rust_when_the_flag_says_so(monkeypatch):

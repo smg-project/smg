@@ -46,6 +46,14 @@ SERVICER_IMPL_ENV = "SMG_SGLANG_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_SGLANG_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_SGLANG_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS"
+# Set to 0/false/no/off to keep SGLang's KV event publisher off when the
+# launcher was given no --kv-events-config (see `default_kv_events_config`).
+KV_EVENTS_ENV = "SMG_SGLANG_SERVICER_KV_EVENTS"
+_OFF_VALUES = ("0", "false", "no", "off")
+# What a launcher without --kv-events-config gets under the Rust servicer:
+# the ZMQ publisher, with SGLang's own defaults for the rest (the endpoint,
+# the topic; no replay socket).
+DEFAULT_KV_EVENTS_CONFIG = '{"publisher": "zmq"}'
 IMPLS = ("python", "rust")
 
 
@@ -213,6 +221,38 @@ def kv_events_publisher(server_args: Any) -> tuple[str, str, str]:
     )
 
 
+def default_kv_events_config(
+    server_args: Any, environ: Mapping[str, str] | None = None
+) -> str | None:
+    """Turn SGLang's KV event publisher on when the launcher was given no
+    ``--kv-events-config``; returns the configuration applied, or None.
+
+    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
+    SGLang publishes none unless started with ``--kv-events-config
+    '{"publisher": "zmq"}'``: a launcher without it got a router that routed
+    blind, with one WARN per worker as the only trace. Under the Rust
+    servicer the server args that lack the option get exactly that
+    configuration before the facts and the headless scheduler are built from
+    them, so publisher and relay agree. An explicit ``--kv-events-config`` is
+    kept as given, off included; ``SMG_SGLANG_SERVICER_KV_EVENTS=0`` keeps
+    the publisher off without one.
+    """
+    source = os.environ if environ is None else environ
+    if getattr(server_args, "kv_events_config", None):
+        return None
+    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
+        return None
+    try:
+        server_args.kv_events_config = DEFAULT_KV_EVENTS_CONFIG
+    except AttributeError:  # frozen server args: left as they are
+        logger.warning(
+            "kv_events_config cannot be set on %s; KV event publishing stays as configured",
+            type(server_args).__name__,
+        )
+        return None
+    return DEFAULT_KV_EVENTS_CONFIG
+
+
 # ---------------------------------------------------------------------------
 # Headless scheduler: this package's launcher, dialing this servicer
 # ---------------------------------------------------------------------------
@@ -277,12 +317,28 @@ async def serve_rust(server_args: Any) -> int:
     from smg.servicer import SglangGrpcServer, init_servicer_tracing
 
     init_servicer_tracing(None)
+    if default_kv_events_config(server_args) is not None:
+        logger.info(
+            "KV event publishing enabled: no --kv-events-config was given, so SGLang's ZMQ "
+            "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+            "--kv-events-config to configure it, or set %s=0 to leave it off",
+            KV_EVENTS_ENV,
+        )
     handshake_port = int(os.environ.get(HANDSHAKE_PORT_ENV) or 0) or free_port()
     socket_dir = default_socket_dir()
     os.makedirs(socket_dir, mode=0o700, exist_ok=True)
     host = getattr(server_args, "host", None) or "0.0.0.0"
     port = int(getattr(server_args, "port", 0) or 0)
     facts = {**model_facts(server_args), **server_facts(server_args)}
+    if facts.get("kv_events_endpoint"):
+        logger.info(
+            "SubscribeKvEvents relays SGLang's KV events from %s", facts["kv_events_endpoint"]
+        )
+    else:
+        logger.warning(
+            "SubscribeKvEvents is off (no ZMQ KV event publisher configured): a cache-aware "
+            "router sees nothing of this engine's cache"
+        )
     engine_count = facts["data_parallel_size"]
     if engine_count > 1:
         logger.info(
