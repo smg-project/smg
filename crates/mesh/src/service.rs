@@ -9,10 +9,7 @@ use std::{
 use anyhow::Result;
 use parking_lot::RwLock;
 use tokio::sync::watch;
-use tonic::{
-    transport::{ClientTlsConfig, Endpoint},
-    Request,
-};
+use tonic::{transport::Endpoint, Request};
 use tracing as log;
 
 use crate::transport::limits::MAX_MESSAGE_SIZE;
@@ -477,23 +474,19 @@ pub async fn try_ping(
             || peer_name.clone(),
             |host| tls_server_name(host).to_owned(),
         );
-        let ca_certificate = mtls_manager.load_ca_certificate().await.map_err(|e| {
-            tonic::Status::unavailable(format!(
-                "Failed to load mTLS CA certificate for {peer_name}: {e}"
-            ))
-        })?;
-
-        endpoint = endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .domain_name(tls_domain)
-                    .ca_certificate(ca_certificate),
-            )
+        let tls = mtls_manager
+            .client_tls_config(&tls_domain)
+            .await
             .map_err(|e| {
                 tonic::Status::unavailable(format!(
-                    "Failed to configure TLS endpoint for {peer_name}: {e}"
+                    "Failed to load the mTLS identity for {peer_name}: {e}"
                 ))
             })?;
+        endpoint = endpoint.tls_config(tls).map_err(|e| {
+            tonic::Status::unavailable(format!(
+                "Failed to configure TLS endpoint for {peer_name}: {e}"
+            ))
+        })?;
     }
 
     let channel = endpoint.connect().await.map_err(|e| {
@@ -561,7 +554,9 @@ mod tests {
 
     use rustls::crypto::ring;
     use tokio::net::TcpListener;
-    use tonic::transport::{server::TcpIncoming, Identity, Server, ServerTlsConfig};
+    use tonic::transport::{
+        server::TcpIncoming, Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig,
+    };
     use tracing as log;
     use tracing_subscriber::{
         filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
@@ -806,5 +801,156 @@ mod tests {
             .unwrap_or_else(|e| panic!("ping over TLS to {peer} failed: {e}"));
 
         assert_eq!(update.address, peer.to_string());
+    }
+
+    fn mtls_config(certs: &MtlsTestCerts) -> MTLSConfig {
+        MTLSConfig {
+            ca_cert_path: certs.ca_cert_path.clone(),
+            server_cert_path: certs.node_cert_path.clone(),
+            server_key_path: certs.node_key_path.clone(),
+            require_client_cert: true,
+            rotation_check_interval: Duration::from_secs(300),
+        }
+    }
+
+    fn node_state(name: &str, addr: SocketAddr) -> NodeState {
+        NodeState {
+            name: name.to_string(),
+            address: addr.to_string(),
+            status: NodeStatus::Alive as i32,
+            version: 1,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// A mesh node with mTLS on (client certificates required), bound to an
+    /// ephemeral port of `ip`, joining `init_peer` when given.
+    async fn mtls_node(
+        name: &str,
+        ip: IpAddr,
+        init_peer: Option<SocketAddr>,
+        certs: &MtlsTestCerts,
+    ) -> (SocketAddr, MeshServerHandler) {
+        let listener = TcpListener::bind((ip, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, handler) = MeshServerBuilder::new(name.to_string(), addr, addr, init_peer)
+            .with_mtls(mtls_config(certs))
+            .build();
+        let name = name.to_string();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test node runs in the background for the duration of the assertion"
+        )]
+        tokio::spawn(async move {
+            if let Err(e) = server.start_with_listener(listener).await {
+                tracing::error!("Mesh node {name} failed: {e}");
+            }
+        });
+        wait_for(
+            || std::net::TcpStream::connect(addr).is_ok(),
+            Duration::from_secs(5),
+            "mesh listener started",
+        )
+        .await;
+        (addr, handler)
+    }
+
+    /// Two nodes with mTLS on `ip`: B joins A (the gossip ping), then a value
+    /// put on A reaches B (the sync stream).
+    async fn mesh_forms_with_mtls_over(ip: IpAddr) {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let (addr_a, handler_a) = mtls_node("A", ip, None, &certs).await;
+        let (_addr_b, handler_b) = mtls_node("B", ip, Some(addr_a), &certs).await;
+
+        wait_for(
+            || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
+            Duration::from_secs(20),
+            "A and B see each other over mTLS",
+        )
+        .await;
+
+        handler_a
+            .mesh_kv()
+            .configs()
+            .put("config:tls", b"on".to_vec());
+        wait_for(
+            || handler_b.mesh_kv().configs().get("config:tls").as_deref() == Some(b"on".as_slice()),
+            Duration::from_secs(20),
+            "A's value reaches B over the sync stream",
+        )
+        .await;
+
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mesh_forms_with_mtls_over_ipv4() {
+        mesh_forms_with_mtls_over(Ipv4Addr::LOCALHOST.into()).await;
+    }
+
+    #[tokio::test]
+    async fn mesh_forms_with_mtls_over_ipv6() {
+        // Nothing to assert on a host without an IPv6 loopback.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        mesh_forms_with_mtls_over(Ipv6Addr::LOCALHOST.into()).await;
+    }
+
+    #[tokio::test]
+    async fn a_dialer_without_a_client_certificate_is_refused() {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
+
+        let trusting_only = ClientTlsConfig::new()
+            .domain_name(addr_a.ip().to_string())
+            .ca_certificate(Certificate::from_pem(
+                std::fs::read(&certs.ca_cert_path).unwrap(),
+            ));
+        let endpoint = Endpoint::from_shared(format!("https://{addr_a}"))
+            .unwrap()
+            .tls_config(trusting_only)
+            .unwrap()
+            .connect_timeout(Duration::from_secs(5));
+        let ping = GossipMessage {
+            payload: Some(gossip_message::Payload::Ping(Ping { state_sync: None })),
+        };
+        let refused = match endpoint.connect().await {
+            Err(_) => true,
+            Ok(channel) => gossip_client::GossipClient::new(channel)
+                .ping_server(Request::new(ping))
+                .await
+                .is_err(),
+        };
+
+        assert!(
+            refused,
+            "a dialer without a client certificate must be refused"
+        );
+        handler_a.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_dialer_with_a_foreign_ca_is_refused() {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let foreign = MtlsTestCerts::generate();
+        let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
+
+        let result = try_ping(
+            &node_state("A", addr_a),
+            Some(gossip_message::Payload::Ping(Ping { state_sync: None })),
+            Some(Arc::new(MTLSManager::new(mtls_config(&foreign)))),
+        )
+        .await;
+
+        assert!(result.is_err(), "a foreign CA must be refused: {result:?}");
+        handler_a.shutdown();
     }
 }
