@@ -74,14 +74,23 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
         cfg.kv_zmq_for(index, 0)
             .map(|kv| crate::kv_zmq::serve(engine.clone(), kv))
     });
+    let max_message_bytes = cfg.grpc_max_message_bytes;
     let service = MockScheduler {
         cfg,
         engine,
         capture,
     };
     let server = async {
+        // tonic's 4 MiB default would refuse the Generate of a long prompt (a
+        // million token ids are a few megabytes as varints, more with the
+        // prompt text alongside); the limit follows the config: none by
+        // default, as the engine servicers run.
         if let Err(e) = Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(service))
+            .add_service(
+                TokenSpeedSchedulerServer::new(service)
+                    .max_decoding_message_size(max_message_bytes)
+                    .max_encoding_message_size(max_message_bytes),
+            )
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
         {

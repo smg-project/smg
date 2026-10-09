@@ -44,6 +44,11 @@ pub struct Config {
     /// Context length advertised to the gateway (`max_context_length`,
     /// `max_req_input_len`, `max_model_len`).
     pub context_length: u32,
+    /// Largest gRPC message a worker decodes or encodes, in bytes. A gateway
+    /// sends a prompt's token ids as one `Generate`, and a million of them are
+    /// a few megabytes; tonic's own default (4 MiB) refuses that, while the
+    /// engine servicers run without a limit, so none is the default.
+    pub grpc_max_message_bytes: usize,
     /// vLLM-wire ZMQ KV-event publishers (realistic engines only): the first
     /// PUB port; worker `i` publishes on `base + 2i` and answers replay on
     /// `base + 2i + 1`. Off when `None`.
@@ -153,6 +158,7 @@ impl Default for Config {
             engine: EngineParams::default(),
             admin_port: None,
             context_length: 32768,
+            grpc_max_message_bytes: usize::MAX,
             kv_events_zmq_base_port: None,
             kv_events_replay: true,
             kv_events_topic: String::new(),
@@ -244,6 +250,9 @@ impl Config {
                 }
                 "--context-length" => {
                     cfg.context_length = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--grpc-max-message-bytes" => {
+                    cfg.grpc_max_message_bytes = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--kv-events-zmq-base-port" => {
                     cfg.kv_events_zmq_base_port = Some(parse(value(&mut args, &flag)?, &flag)?);
@@ -361,6 +370,8 @@ fn usage() -> String {
        --http-count <n>         number of HTTP workers (default 0)\n\
        --grpc-base-port <port>  first gRPC port (required if --grpc-count > 0)\n\
        --grpc-count <n>         number of gRPC workers (default 0)\n\
+       --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
+                                (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
        --zmq-count <n>          number of ZMQ mock EngineCore ranks (default 0)\n\
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\
@@ -447,5 +458,20 @@ mod tests {
             cfg.replay.capture,
             Some(PathBuf::from("/tmp/generate.jsonl"))
         );
+    }
+
+    #[test]
+    fn grpc_message_limit_is_off_by_default_and_settable() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let cfg = parse(&grpc).expect("gRPC flags parse");
+        assert_eq!(
+            cfg.grpc_max_message_bytes,
+            usize::MAX,
+            "no limit by default"
+        );
+
+        let cfg = parse(&[&grpc[..], &["--grpc-max-message-bytes", "4194304"]].concat())
+            .expect("--grpc-max-message-bytes parses");
+        assert_eq!(cfg.grpc_max_message_bytes, 4_194_304);
     }
 }

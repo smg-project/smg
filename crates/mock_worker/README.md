@@ -227,6 +227,19 @@ the worker's hook state (`drop_pending`, `dropped_total`, `delay_ms`,
 |----------|--------|
 | `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `block_size` (the engine's own prefix match, last-block rule included) |
 | `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, so a gateway's hit-rate claim can be checked against what the engines actually served |
+## Long prompts
+
+A gRPC worker decodes and encodes messages of any size by default, as the
+engine servicers do. `--grpc-max-message-bytes <n>` sets a limit; tonic's own
+default, 4 MiB, refused the `Generate` of a million-token prompt (its ids
+alone are about 2 MB as varints, and a gateway that sends the prompt text
+alongside adds the text's bytes on top). What bounds a long prompt end to end
+on the gateway's gRPC path: the gateway's HTTP body limit
+(`--max-payload-size`, 512 MiB by default), the context length the worker
+advertises (`--context-length`), and the worker's decode limit. The gateway
+sends `Generate` with no size limit of its own and decodes each response
+message up to tonic's 4 MiB default, which a streamed chunk never approaches.
+
 ## Capturing requests
 
 `--capture PATH` appends every gRPC `Generate` request a worker receives to
