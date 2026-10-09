@@ -236,13 +236,15 @@ def test_plugin_parses_the_mm_flags_and_exports_them_for_the_python_servicer(mon
     carries their values into the environment, where a servicer built without
     the namespace (upstream's launcher) reads them."""
     pytest.importorskip("vllm")
-    from smg_grpc_servicer.vllm import plugin
+    from smg_grpc_servicer.vllm import mm_processor, plugin
     from smg_grpc_servicer.vllm.mm_processor import MmSettings
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    # Recorded, so teardown undoes what the parse step exports.
+    # Recorded, so teardown undoes what the parse step exports...
     monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "off")
     monkeypatch.setenv("SMG_VLLM_MM_MAX_ITEMS", "1")
+    # ...and the settings it keeps for a servicer built without the namespace.
+    monkeypatch.setattr(mm_processor, "_launcher_settings", None)
     monkeypatch.setitem(
         sys.modules,
         "__main__",
@@ -256,6 +258,7 @@ def test_plugin_parses_the_mm_flags_and_exports_them_for_the_python_servicer(mon
     assert (args.mm_processor, args.mm_max_items) == ("smg", 4)
     assert os.environ["SMG_VLLM_MM_PROCESSOR"] == "smg"
     assert os.environ["SMG_VLLM_MM_MAX_ITEMS"] == "4"
+    assert mm_processor.launcher_settings() == MmSettings.from_args(args)
     assert "--mm-processor" in parser.format_help()
     resolved = MmSettings.from_args(args).resolve(env={})
     assert (resolved.processor, resolved.max_items, resolved.source) == ("smg", 4, "flag")

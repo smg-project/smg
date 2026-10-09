@@ -798,6 +798,40 @@ class TestServicerWiring:
         assert servicer._mm_processor is None
         assert servicer._mm_settings.source == "default"
 
+    def test_a_servicer_built_without_settings_takes_the_launchers(self, monkeypatch, caplog):
+        """Upstream's launcher builds the servicer without its namespace: it
+        resolves the settings the plugin kept from the parse, so a flag's value
+        is reported as such and a variable behind a flag the launcher has still
+        gets its deprecation line."""
+        pytest.importorskip("vllm")
+        from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+
+        parsed = types.SimpleNamespace(
+            **{f"mm_{name}": None for name in mm_processor._MM_SETTING_SPECS}, model="m"
+        )
+        parsed.mm_processor = "off"
+        monkeypatch.setattr(
+            mm_processor, "_launcher_settings", mm_processor.MmSettings.from_args(parsed)
+        )
+        monkeypatch.delenv("SMG_VLLM_MM_PROCESSOR", raising=False)
+        monkeypatch.setenv("SMG_VLLM_MM_MAX_INFLIGHT", "3")
+
+        class _Engine:
+            vllm_config = type("VC", (), {"kv_events_config": None})()
+            model_config = type("MC", (), {"is_multimodal_model": False})()
+
+        with caplog.at_level("WARNING", logger="mm_processor"):
+            servicer = VllmEngineServicer(_Engine(), start_time=0.0)
+        assert servicer._mm_processor is None
+        assert servicer._mm_settings.source == "flag"
+        assert servicer._mm_limit == 3
+        assert servicer._mm_settings.sources["max_inflight"] == "env"
+        assert any(
+            "SMG_VLLM_MM_MAX_INFLIGHT is deprecated in favour of --mm-max-inflight"
+            in r.getMessage()
+            for r in caplog.records
+        )
+
     def test_launcher_settings_take_precedence_and_name_their_source(self, monkeypatch, caplog):
         pytest.importorskip("vllm")
         from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
