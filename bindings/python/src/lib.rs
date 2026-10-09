@@ -1139,7 +1139,6 @@ impl Router {
         prometheus_port = None,
         prometheus_host = None,
         prometheus_duration_buckets = None,
-        jemalloc_prof_dir = None,
         request_timeout_secs = 1800,
         shutdown_grace_period_secs = 180,
         request_id_headers = None,
@@ -1285,6 +1284,7 @@ impl Router {
         priority_scheduler_tenant_metric_top_n = 32,
         tenant_rate_limit_enabled = false,
         tenant_rate_limit_config = None,
+        jemalloc_prof_dir = None,
         // Keyword-only, so it never takes a positional slot.
         *,
         discovery = None,
@@ -1330,7 +1330,6 @@ impl Router {
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         prometheus_duration_buckets: Option<Vec<f64>>,
-        jemalloc_prof_dir: Option<String>,
         request_timeout_secs: u64,
         shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
@@ -1474,6 +1473,7 @@ impl Router {
         priority_scheduler_tenant_metric_top_n: u32,
         tenant_rate_limit_enabled: bool,
         tenant_rate_limit_config: Option<String>,
+        jemalloc_prof_dir: Option<String>,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.

@@ -1749,6 +1749,7 @@ class TestRouterArgsFieldOrder:
         "priority_scheduler_tenant_metric_top_n",
         "tenant_rate_limit_enabled",
         "tenant_rate_limit_config",
+        "jemalloc_prof_dir",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

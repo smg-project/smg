@@ -115,8 +115,6 @@ class RouterArgs:
     prometheus_port: int | None = None
     prometheus_host: str | None = None
     prometheus_duration_buckets: list[float] | None = None
-    # Heap profiles of the router process (a jemalloc-profiling build)
-    jemalloc_prof_dir: str | None = None
     # Request ID headers configuration
     request_id_headers: list[str] | None = None
     # HTTP header to storage hook context mapping
@@ -332,6 +330,9 @@ class RouterArgs:
     # Per-tenant token/request rate limiting
     tenant_rate_limit_enabled: bool = False
     tenant_rate_limit_config: str | None = None
+    # Heap profiles of the router process (a jemalloc-profiling build); appended
+    # last: positional callers bind the fields by position
+    jemalloc_prof_dir: str | None = None
 
     @staticmethod
     def add_cli_args(
