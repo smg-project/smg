@@ -171,6 +171,17 @@ pub(crate) const KV_EVENT_LAG_BUCKETS: &[f64] = &[
     5.0, 10.0, 30.0, 60.0,
 ];
 
+/// Histogram buckets for `smg_worker_retry_backoff_seconds`: the delay slept
+/// before a retried upstream call. The schedule is exponential with jitter,
+/// from the configured initial backoff (50 ms by default) to the configured
+/// maximum (30 s by default), so the edges run from ten milliseconds to a
+/// minute. Without explicit buckets the recorder renders the family as a
+/// summary, whose per-attempt quantiles cannot be aggregated across gateways
+/// or time windows.
+pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
 /// Jemalloc's run-time options for a long-running gateway, for every final
 /// artifact (the `smg` executable, the Python extension) to export as
 /// `_rjem_malloc_conf` next to its `#[global_allocator]`. With the stock
@@ -894,6 +905,10 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let kv_lookup_matcher = Matcher::Full(String::from("smg_kv_index_lookup_seconds"));
     let kv_apply_matcher = Matcher::Full(String::from("smg_kv_event_apply_seconds"));
 
+    // The retry backoff is tens of milliseconds to the configured maximum
+    // (seconds): its own buckets, or the recorder renders it as a summary.
+    let retry_backoff_matcher = Matcher::Full(String::from("smg_worker_retry_backoff_seconds"));
+
     let handle = PrometheusBuilder::new()
         .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
@@ -915,6 +930,8 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         .expect("failed to set KV event apply buckets")
         .set_buckets_for_metric(kv_lag_matcher, KV_EVENT_LAG_BUCKETS)
         .expect("failed to set KV event lag buckets")
+        .set_buckets_for_metric(retry_backoff_matcher, WORKER_RETRY_BACKOFF_BUCKETS)
+        .expect("failed to set worker retry backoff buckets")
         .install_recorder()
         .inspect(|_| {
             #[cfg(all(
