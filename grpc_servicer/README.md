@@ -194,10 +194,11 @@ checkpoint streaming in for an hour, still completes, while an engine that
 exits fails fast regardless), `SMG_VLLM_SERVICER_STARTUP_CEILING_SECS`
 (default 14400: the most a start may take however alive the engine is; 0
 lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
-(default 1: one runtime worker carries about 100k output tokens/s on one
-connection with its lock uncontended; raise it to 2-4 when one engine serves
-more than about 512 concurrent streams and their inter-token p99 matters more
-than the servicer's CPU).
+(default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
+TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
+tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
+engine serves more than about 512 concurrent streams and their inter-token p99
+matters more than the servicer's CPU).
 
 Worker-side media processing uses the same `--mm-processor` /
 `SMG_VLLM_MM_PROCESSOR` setting as the Python servicer, with one more choice:
@@ -274,10 +275,11 @@ given; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off). Tuning:
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800, as for vLLM
 above), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
-(default 1: one runtime worker carries about 100k output tokens/s on one
-connection with its lock uncontended; raise it to 2-4 when one engine serves
-more than about 512 concurrent streams and their inter-token p99 matters more
-than the servicer's CPU).
+(default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
+TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
+tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
+engine serves more than about 512 concurrent streams and their inter-token p99
+matters more than the servicer's CPU).
 
 ### SGLang
 
