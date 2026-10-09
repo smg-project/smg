@@ -884,9 +884,10 @@ impl Engine {
 
     /// What the armed request fault does to the request arriving now; `None`
     /// when no fault applies. A `Requests(n)` scope is spent by one, an
-    /// elapsed `Until` disarms the fault. A status answered before admission
-    /// and a stall are counted here; a cut is counted where the stream is
-    /// actually cut (an output no longer than `after_tokens` is never cut).
+    /// elapsed `Until` disarms the fault. A stall is counted here; a status
+    /// answered before admission is counted by the worker path that answers
+    /// it ([`Engine::record_failure`], after the stall), a cut where the stream
+    /// is actually cut (an output no longer than `after_tokens` is never cut).
     pub(crate) fn inject(&self) -> Option<Injected> {
         let faults = &self.shared.faults;
         let mut armed = faults.fail.lock().unwrap_or_else(|p| p.into_inner());
@@ -907,9 +908,6 @@ impl Engine {
         if !fault.stall.is_zero() {
             faults.stalled_total.fetch_add(1, Ordering::Relaxed);
         }
-        if fault.status != 0 && fault.after_tokens.is_none() {
-            faults.failed_total.fetch_add(1, Ordering::Relaxed);
-        }
         Some(Injected {
             status: fault.status,
             stall: fault.stall,
@@ -923,8 +921,32 @@ impl Engine {
         Arc::clone(&self.shared.faults.cut_total)
     }
 
+    /// One request answered with the fault's status before admission; the
+    /// worker paths call it at the point where they return that status.
+    pub(crate) fn record_failure(&self) {
+        self.shared
+            .faults
+            .failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn fault_status(&self) -> FaultStatus {
         let f = &self.shared.faults;
+        // A timed fault whose deadline passed without another request reads as
+        // disarmed, as the next request would find it.
+        let fail = {
+            let mut armed = f.fail.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(RequestFault {
+                scope: FaultScope::Until(at),
+                ..
+            }) = *armed
+            {
+                if Instant::now() >= at {
+                    *armed = None;
+                }
+            }
+            *armed
+        };
         FaultStatus {
             drop_pending: f.drop_batches.load(Ordering::Relaxed),
             dropped_total: f.dropped_total.load(Ordering::Relaxed),
@@ -934,7 +956,7 @@ impl Engine {
             paused: f.paused.load(Ordering::Relaxed),
             generation: f.generation.load(Ordering::Relaxed),
             restarts: f.restarts.load(Ordering::Relaxed),
-            fail: *f.fail.lock().unwrap_or_else(|p| p.into_inner()),
+            fail,
             failed_total: f.failed_total.load(Ordering::Relaxed),
             cut_total: f.cut_total.load(Ordering::Relaxed),
             stalled_total: f.stalled_total.load(Ordering::Relaxed),
@@ -3198,8 +3220,12 @@ mod tests {
         assert_eq!(status.fail, None, "cleared once spent");
         assert_eq!(
             (status.failed_total, status.cut_total, status.stalled_total),
-            (2, 0, 0)
+            (0, 0, 0),
+            "a refusal is counted by the path that answers it"
         );
+        engine.record_failure();
+        engine.record_failure();
+        assert_eq!(engine.fault_status().failed_total, 2);
     }
 
     #[tokio::test]
@@ -3218,6 +3244,11 @@ mod tests {
         );
         assert!(engine.fault_status().fail.is_some(), "still armed");
         tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            engine.fault_status().fail,
+            None,
+            "an elapsed fault reads as disarmed before the next request"
+        );
         assert_eq!(engine.inject(), None, "elapsed");
         let status = engine.fault_status();
         assert_eq!(status.fail, None, "disarmed once elapsed");
@@ -3239,7 +3270,11 @@ mod tests {
         assert!(engine.inject().is_some());
         engine.fault_fail(None);
         assert_eq!(engine.inject(), None, "cleared");
-        assert_eq!(engine.fault_status().failed_total, 2);
+        assert_eq!(
+            engine.fault_status().failed_total,
+            0,
+            "inject() counts no refusal of its own"
+        );
     }
 
     #[tokio::test]

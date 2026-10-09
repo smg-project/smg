@@ -176,6 +176,7 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
                 tokio::time::sleep(fault.stall).await;
             }
             if fault.status != 0 && fault.after_tokens.is_none() {
+                engine.record_failure();
                 return injected_error(fault.status);
             }
         }

@@ -171,6 +171,7 @@ impl TokenSpeedScheduler for MockScheduler {
                     tokio::time::sleep(fault.stall).await;
                 }
                 if fault.status != 0 && fault.after_tokens.is_none() {
+                    engine.record_failure();
                     return Err(injected_status(fault.status));
                 }
             }
