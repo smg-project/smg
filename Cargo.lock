@@ -7666,12 +7666,14 @@ name = "smg-auth"
 version = "1.2.3"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "http",
  "jsonwebtoken",
  "lru",
  "parking_lot",
  "reqwest 0.13.4",
+ "rsa",
  "serde",
  "serde_json",
  "sha2 0.11.0",

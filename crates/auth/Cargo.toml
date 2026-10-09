@@ -36,7 +36,9 @@ sha2 = "0.11"
 url = "2.5"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+base64 = "0.22"
+rsa = "0.9"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 
 [lints]
 workspace = true
