@@ -1027,6 +1027,43 @@ fn render_instant() -> DateTime<FixedOffset> {
         .unwrap_or_else(|| Local::now().fixed_offset())
 }
 
+/// Whether the template mentions the `developer` role at all (vLLM's
+/// `_detect_developer_role_support`): a template that never names it has no
+/// branch for it, and the renderer rewrites developer messages to system ones.
+fn detect_developer_role_support(template: &str) -> bool {
+    template.contains("\"developer\"") || template.contains("'developer'")
+}
+
+/// The messages with every `developer` message rewritten as a `system`
+/// message without its `tools` field (vLLM's `_convert_developer_to_system`).
+/// `None` when no message has the role, so the caller keeps its slice.
+fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+    let is_developer =
+        |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("developer");
+    if !messages.iter().any(is_developer) {
+        return None;
+    }
+    Some(
+        messages
+            .iter()
+            .map(|m| {
+                if !is_developer(m) {
+                    return m.clone();
+                }
+                let mut rewritten = m.clone();
+                if let Some(fields) = rewritten.as_object_mut() {
+                    fields.insert(
+                        "role".to_string(),
+                        serde_json::Value::String("system".to_string()),
+                    );
+                    fields.remove("tools");
+                }
+                rewritten
+            })
+            .collect(),
+    )
+}
+
 fn render_chat_template(
     env: &Environment<'_>,
     messages: &[serde_json::Value],
@@ -1217,6 +1254,10 @@ pub struct ChatTemplateState {
     thinking_key_name: Option<ThinkingKeyName>,
     /// Whether the template injects `<think>` in the generation prompt.
     think_in_prefill: bool,
+    /// Whether the template has a branch for the `developer` role. When it
+    /// has none, `apply` renders developer messages as system messages, as
+    /// vLLM's HF renderer does, instead of letting the template drop them.
+    developer_role_supported: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1234,6 +1275,9 @@ impl ChatTemplateState {
     pub fn new(template: Option<String>) -> Result<Self> {
         let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
             template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
+        let developer_role_supported = template
+            .as_deref()
+            .is_none_or(detect_developer_role_support);
         let env = template.map(build_environment).transpose()?;
         Ok(Self {
             env,
@@ -1241,6 +1285,7 @@ impl ChatTemplateState {
             thinking_toggle,
             thinking_key_name,
             think_in_prefill,
+            developer_role_supported,
         })
     }
 
@@ -1255,6 +1300,7 @@ impl ChatTemplateState {
             thinking_toggle: ThinkingToggle::None,
             thinking_key_name: None,
             think_in_prefill: false,
+            developer_role_supported: true,
         }
     }
 
@@ -1284,6 +1330,22 @@ impl ChatTemplateState {
             .then(|| string_content_as_text_parts(messages))
             .flatten();
         let messages = wrapped.as_deref().unwrap_or(messages);
+
+        // A template without a `developer` branch renders nothing for a
+        // developer message; vLLM's renderer hands such a template the message
+        // as a system message, and so does this one (`tools` on it dropped).
+        let converted;
+        let messages: &[serde_json::Value] = if self.developer_role_supported {
+            messages
+        } else {
+            match developer_messages_as_system(messages) {
+                Some(rewritten) => {
+                    converted = rewritten;
+                    &converted
+                }
+                None => messages,
+            }
+        };
 
         // Apply the resolved thinking preference under the template's own toggle
         // key (`enable_thinking` vs `thinking`, per detection). Skip entirely
@@ -1329,6 +1391,7 @@ impl ChatTemplateState {
     pub fn set(&mut self, template: String) -> Result<()> {
         let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
             detect_all(&template);
+        self.developer_role_supported = detect_developer_role_support(&template);
         let env = build_environment(template)?;
         self.content_format = content_format;
         self.thinking_toggle = thinking_toggle;
