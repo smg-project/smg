@@ -26,7 +26,9 @@ pub use super::deepseek_v32::ThinkingMode;
 /// Which reasoning-effort prompt revision the checkpoint was trained with.
 ///
 /// The 0731 refresh shifted the levels down one: the original's `max` text
-/// became 0731's `high`, and 0731's `max` is a new, stronger prompt.
+/// became 0731's `high`, and 0731's `max` is a new, stronger prompt. vLLM's
+/// port of the encoder renders the refreshed table for every V4 checkpoint,
+/// so it is also what a checkpoint directory without its own encoder gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EffortEncoding {
     /// `DeepSeek-V4-Flash` / `-DSpark` / `-Pro`.

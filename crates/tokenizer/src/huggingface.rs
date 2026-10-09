@@ -624,14 +624,17 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 
     fn thinking_toggle(&self) -> ThinkingToggle {
         match self.renderer {
-            // DeepSeek V3.2 and V4 encoders gate thinking on the `thinking`
+            // The DeepSeek V3.2 encoder gates thinking on the `thinking`
             // kwarg, default off. The Jinja processor has no knowledge of
             // the native encoder so we must report it directly.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => ThinkingToggle::DefaultOff,
-            // V4.1 defaults thinking ON: `reasoning_effort: "none"` or an
+            Renderer::DeepseekV32 => ThinkingToggle::DefaultOff,
+            // V4 defaults thinking ON like the engine's own server (vLLM's
+            // `tokenizers/deepseek_v4.py`): `thinking: false`, its
+            // `enable_thinking` alias or `reasoning_effort: "none"` turns it
+            // off. V4.1 defaults thinking ON: `reasoning_effort: "none"` or an
             // explicit `thinking: false` (or vLLM's `enable_thinking` alias,
             // see `renderer_capabilities`) turns it off.
-            Renderer::DeepseekV41 => ThinkingToggle::DefaultOn,
+            Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => ThinkingToggle::DefaultOn,
             Renderer::Jinja => self.chat_template.thinking_toggle(),
         }
     }
@@ -655,9 +658,14 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 
     fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
         match self.renderer {
-            // The native DeepSeek renderers switch off on the protocol's
+            // V4 reads `reasoning_effort` as the engine's own server does:
+            // `"none"` is chat mode, every other value (`"minimal"` included,
+            // which vLLM maps to the low effort) keeps thinking on. Declaring
+            // the off word keeps the gateway's parser arming on that rule.
+            Renderer::DeepseekV4(_) => &["none"],
+            // The native V3.2/V4.1 renderers switch off on the protocol's
             // `none`/`minimal`, so they declare no words of their own.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => &[],
+            Renderer::DeepseekV32 | Renderer::DeepseekV41 => &[],
             Renderer::Jinja => self.chat_template.native_reasoning_effort_off_values(),
         }
     }
@@ -683,7 +691,12 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 native_assistant_continuation: true,
                 raw_tool_call_arguments: true,
             },
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::Jinja => {
+            // The V4 shim reads vLLM's `enable_thinking` alias too.
+            Renderer::DeepseekV4(_) => crate::traits::RendererCapabilities {
+                enable_thinking_alias: true,
+                ..crate::traits::RendererCapabilities::default()
+            },
+            Renderer::DeepseekV32 | Renderer::Jinja => {
                 crate::traits::RendererCapabilities::default()
             }
         }
@@ -747,23 +760,25 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
     Renderer::Jinja
 }
 
-/// Pick the effort-prompt revision for a V4 checkpoint. `config.json` and
-/// `tokenizer_config.json` are identical across the V4 family, so the only
-/// discriminator is the shipped `encoding/encoding_dsv4.py`; when it is
-/// absent, fall back to a `0731` marker in the path (covers HF-hub cache
-/// dirs like `models--deepseek-ai--DeepSeek-V4-Flash-0731/...`).
+/// Pick the effort-prompt revision for a V4 checkpoint. `config.json`,
+/// `tokenizer_config.json` and `generation_config.json` do not tell the
+/// revisions apart (the DSpark checkpoints share the 0731 config with the
+/// original effort table), so the only discriminator is the shipped
+/// `encoding/encoding_dsv4.py`. Without it (a tokenizer directory streamed
+/// from a worker carries no `encoding/`), render the table the engine's own
+/// server renders: vLLM's port of the encoder carries the refreshed table for
+/// every V4 checkpoint.
 fn detect_dsv4_effort_encoding(dir: &Path) -> deepseek_v4::EffortEncoding {
     match std::fs::read_to_string(dir.join("encoding").join("encoding_dsv4.py")) {
         Ok(source) => deepseek_v4::EffortEncoding::detect_from_encoder_source(&source),
-        Err(_) if dir.to_string_lossy().contains("0731") => deepseek_v4::EffortEncoding::V0731,
-        Err(_) => deepseek_v4::EffortEncoding::Original,
+        Err(_) => deepseek_v4::EffortEncoding::V0731,
     }
 }
 
 // ---------------------------------------------------------------------------
 // DeepSeek V3.2 / V4 dispatch shims
 // ---------------------------------------------------------------------------
-/// Derive the V3.2 / V4 thinking mode. These native encoders bypass
+/// Derive the V3.2 thinking mode. The native encoder bypasses
 /// `ChatTemplateState::apply`, so this is where the resolved thinking preference
 /// is consumed. An explicit `template_kwargs["thinking"]` wins; otherwise fall
 /// back to `params.thinking` (resolved from `reasoning_effort` / Anthropic
@@ -839,6 +854,47 @@ fn apply_deepseek_v32(
     deepseek_v32::encode_messages(msgs, thinking_mode, &encode_params)
         .map_err(|e| Error::msg(format!("DeepSeek V3.2 encode failed: {e}")))
 }
+/// V4's explicit thinking toggle: `template_kwargs["thinking"]`, else vLLM's
+/// `enable_thinking` alias (the gateway reads the two keys in the same order
+/// when it arms the reasoning parser, see `renderer_capabilities`).
+fn explicit_thinking_v4(params: &ChatTemplateParams) -> Option<bool> {
+    let kwargs = params.template_kwargs?;
+    kwargs
+        .get("thinking")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            kwargs
+                .get("enable_thinking")
+                .and_then(serde_json::Value::as_bool)
+        })
+}
+
+/// DeepSeek V4 chat-template shim, rendering what the engine's own server
+/// renders (vLLM's `tokenizers/deepseek_v4.py`): thinking is on unless the
+/// request says otherwise, and a thinking prompt carries the `high` effort
+/// unless `reasoning_effort` names another level.
+///
+/// The thinking mode mirrors the gateway's parser-arming precedence
+/// (`resolve_thinking_pref` in `model_gateway/src/routers/grpc/utils/parsers.rs`),
+/// so the rendered prompt and the arming decision agree on every request:
+/// 1. an explicit `thinking` / `enable_thinking` kwarg decides;
+/// 2. else the `reasoning_effort` kwarg: `"none"` switches thinking off (the
+///    renderer's off word), any other string keeps it on;
+/// 3. else `params.thinking` (the gateway's projection of the typed
+///    `thinking.type` toggle, else `Some(false)` for a `none`/`minimal`
+///    effective `reasoning_effort`);
+/// 4. else on ([`ThinkingToggle::DefaultOn`]).
+///
+/// `reasoning_effort` maps as vLLM maps it: `max` is the top level, `low`,
+/// `minimal` and `medium` the bottom one (which renders no prefix), every
+/// other string and an absent value `high`. Which text a level renders is
+/// the detected revision's table (see `detect_dsv4_effort_encoding`).
+///
+/// Deliberate divergence from vLLM's Python: there `reasoning_effort: "none"`
+/// forces chat mode even over an explicit `thinking: true`. Here the explicit
+/// toggle wins, because the gateway arms the reasoning parser from the
+/// explicit toggle first, and rendering chat mode for that contradictory
+/// input would have the armed parser swallow the whole answer as reasoning.
 fn apply_deepseek_v4(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
@@ -846,18 +902,28 @@ fn apply_deepseek_v4(
 ) -> Result<String> {
     let owned = inject_tools_into_messages(messages, params.tools);
     let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(messages);
-    // Values the revision doesn't recognize are ignored, matching the
-    // template-owns-interpretation contract for merged public efforts.
-    let reasoning_effort = params
+    let effort_kwarg = params
         .template_kwargs
         .and_then(|k| k.get("reasoning_effort"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| effort_encoding.parse_native(s));
-    // A recognized effort implies thinking; an explicit toggle still wins.
-    let thinking_mode = if explicit_thinking(params).unwrap_or_else(|| reasoning_effort.is_some()) {
-        deepseek_v32::ThinkingMode::Thinking
+        .and_then(serde_json::Value::as_str);
+    let (effort_mode, requested_effort) = match effort_kwarg {
+        None => (None, None),
+        Some("none") => (Some(false), None),
+        Some("max") => (Some(true), Some(deepseek_v4::ReasoningEffort::Max)),
+        Some("low" | "minimal" | "medium") => (Some(true), Some(deepseek_v4::ReasoningEffort::Low)),
+        Some(_) => (Some(true), Some(deepseek_v4::ReasoningEffort::High)),
+    };
+    let thinking_on = explicit_thinking_v4(params)
+        .or(effort_mode)
+        .or(params.thinking)
+        .unwrap_or(true);
+    let (thinking_mode, reasoning_effort) = if thinking_on {
+        (
+            deepseek_v32::ThinkingMode::Thinking,
+            requested_effort.or(Some(deepseek_v4::ReasoningEffort::High)),
+        )
     } else {
-        deepseek_v32::ThinkingMode::Chat
+        (deepseek_v32::ThinkingMode::Chat, None)
     };
     let encode_params = deepseek_v4::EncodeParams {
         add_default_bos_token: true,
