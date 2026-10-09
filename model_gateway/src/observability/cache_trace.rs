@@ -3,7 +3,10 @@
 use std::{
     cell::RefCell,
     future::Future,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -55,6 +58,104 @@ pub(crate) fn enabled() -> bool {
 fn header_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1"))
+}
+
+/// One dispatch line in every `every` dispatches, counted per process.
+struct Sampler {
+    every: u64,
+    dispatches: AtomicU64,
+}
+
+impl Sampler {
+    const fn new(every: u64) -> Self {
+        Self {
+            every,
+            dispatches: AtomicU64::new(0),
+        }
+    }
+
+    fn admit(&self) -> bool {
+        self.every <= 1
+            || self
+                .dispatches
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(self.every)
+    }
+}
+
+/// `SMG_CACHE_TRACE_SAMPLE=N`: log the evidence of one dispatch in every N
+/// (default 1: every dispatch). The response header is not sampled.
+fn sampler() -> &'static Sampler {
+    static SAMPLER: OnceLock<Sampler> = OnceLock::new();
+    SAMPLER.get_or_init(|| {
+        Sampler::new(parse_sample(
+            std::env::var("SMG_CACHE_TRACE_SAMPLE").ok().as_deref(),
+        ))
+    })
+}
+
+/// `SMG_CACHE_TRACE_MAX_BYTES=B`: an evidence line longer than B bytes drops
+/// its candidate, score and gate lists and keeps the decision record (see
+/// [`compact`]). Unset or unparsable: no cap.
+fn max_bytes() -> Option<usize> {
+    static MAX_BYTES: OnceLock<Option<usize>> = OnceLock::new();
+    *MAX_BYTES
+        .get_or_init(|| parse_max_bytes(std::env::var("SMG_CACHE_TRACE_MAX_BYTES").ok().as_deref()))
+}
+
+fn parse_sample(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|every| *every > 0)
+        .unwrap_or(1)
+}
+
+fn parse_max_bytes(value: Option<&str>) -> Option<usize> {
+    value.and_then(|value| value.trim().parse().ok())
+}
+
+/// The dispatch's evidence line: `None` when the sampler skips it, compacted
+/// when it is longer than the cap.
+fn log_line(value: Value, sampler: &Sampler, cap: Option<usize>) -> Option<String> {
+    sampler.admit().then(|| encode_capped(value, cap))
+}
+
+fn encode_capped(mut value: Value, cap: Option<usize>) -> String {
+    let encoded = value.to_string();
+    if cap.is_some_and(|cap| encoded.len() > cap) {
+        compact(&mut value);
+        return value.to_string();
+    }
+    encoded
+}
+
+/// Drop the lists that grow with the fleet (per-candidate state, scores and
+/// gates: ~116 bytes per candidate) and keep the decision record: ids,
+/// policy, origin, the chosen worker and the prediction. Each selection
+/// records how many entries of each list it dropped; the line is marked
+/// `capped`.
+fn compact(value: &mut Value) {
+    const LISTS: [&str; 3] = ["candidates", "scores", "gates"];
+    if let Some(selections) = value.get_mut("selections").and_then(Value::as_array_mut) {
+        for selection in selections.iter_mut().filter_map(Value::as_object_mut) {
+            let elided = LISTS
+                .iter()
+                .filter_map(|list| {
+                    let dropped = selection.remove(*list)?;
+                    Some((
+                        (*list).to_string(),
+                        json!(dropped.as_array().map_or(0, Vec::len)),
+                    ))
+                })
+                .collect();
+            selection.insert("elided".to_string(), Value::Object(elided));
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.remove("unattributed_gates");
+        object.remove("gates");
+        object.insert("capped".to_string(), json!(true));
+    }
 }
 
 fn timestamp_ns() -> u64 {
@@ -181,17 +282,17 @@ pub(crate) fn dispatch(
             "unattributed_prediction": std::mem::take(&mut capture.prediction),
             "cache_evidence": "unknown",
         });
-        let encoded = value.to_string();
-        tracing::info!(target: "smg::cache_trace", evidence = %encoded, "Cache routing dispatch");
-        if header_enabled() {
+        let header = header_enabled().then(|| {
             let header = gateway_header(&value);
             if header.is_none() {
                 tracing::info!(target: "smg::cache_trace", "Cache trace header omitted: size or encoding limit");
             }
             header
-        } else {
-            None
+        }).flatten();
+        if let Some(encoded) = log_line(value, sampler(), max_bytes()) {
+            tracing::info!(target: "smg::cache_trace", evidence = %encoded, "Cache routing dispatch");
         }
+        header
     }).ok().flatten()
 }
 
@@ -223,6 +324,7 @@ pub(crate) fn failure(root_id: Option<&str>, status: u16) {
             let evidence = json!({"root_id": root_id, "status": status,
                 "selections": capture.selections, "gates": capture.gates,
                 "truncated": capture.truncated});
+            let evidence = encode_capped(evidence, max_bytes());
             tracing::info!(target: "smg::cache_trace", evidence = %evidence, "Cache routing failure");
         });
     }
@@ -265,5 +367,83 @@ mod tests {
         assert_eq!(decoded["attempt"], 1);
         evidence["root_id"] = Value::String("x".repeat(2049));
         assert!(gateway_header(&evidence).is_none());
+    }
+
+    fn fleet_evidence(candidates: usize) -> Value {
+        let candidates: Vec<Value> = (0..candidates)
+            .map(|index| {
+                json!({
+                    "worker": format!("http://10.0.0.{index}:8000"), "load": index, "healthy": true,
+                    "overloaded": false, "registry_revision": 7, "backend_cache_epoch": null,
+                })
+            })
+            .collect();
+        json!({
+            "schema": 1, "root_id": "root", "dispatch_id": "dispatch", "attempt": 1,
+            "engine_ids": ["engine"], "engine_ids_complete": true, "truncated": false,
+            "selections": [{"policy": "cache_aware", "origin": "policy", "worker": "http://10.0.0.3:8000",
+                "prediction": {"source": "approximate_tree", "overlap_blocks": 4},
+                "candidates": candidates, "candidates_complete": true,
+                "scores": [{"worker": "http://10.0.0.3:8000", "score": 0.9}],
+                "gates": [{"spill": false}]}],
+            "unattributed_gates": [{"spill": true}],
+        })
+    }
+
+    #[test]
+    fn sample_knob_logs_one_dispatch_in_every_n() {
+        assert_eq!(parse_sample(None), 1);
+        assert_eq!(parse_sample(Some("0")), 1);
+        assert_eq!(parse_sample(Some("many")), 1);
+        assert_eq!(parse_sample(Some(" 100 ")), 100);
+        let every_request = Sampler::new(1);
+        assert!((0..10).all(|_| every_request.admit()));
+        let one_in_hundred = Sampler::new(100);
+        let logged = (0..1000)
+            .filter(|_| log_line(fleet_evidence(32), &one_in_hundred, None).is_some())
+            .count();
+        assert_eq!(logged, 10);
+        assert!(
+            Sampler::new(100).admit(),
+            "the first dispatch is always logged"
+        );
+    }
+
+    #[test]
+    fn byte_cap_keeps_the_decision_record_and_drops_the_candidate_lists() {
+        assert_eq!(parse_max_bytes(None), None);
+        assert_eq!(parse_max_bytes(Some("bytes")), None);
+        assert_eq!(parse_max_bytes(Some("1024")), Some(1024));
+        let full = encode_capped(fleet_evidence(32), None);
+        assert!(
+            full.len() > 3000,
+            "32 candidates make the line {} bytes",
+            full.len()
+        );
+        assert_eq!(encode_capped(fleet_evidence(32), Some(full.len())), full);
+        let capped = encode_capped(fleet_evidence(32), Some(1024));
+        assert!(capped.len() < 1024, "capped line is {} bytes", capped.len());
+        let decoded: Value = serde_json::from_str(&capped).unwrap();
+        assert_eq!(decoded["capped"], json!(true));
+        assert_eq!(decoded["root_id"], "root");
+        assert_eq!(decoded["engine_ids"], json!(["engine"]));
+        let selection = &decoded["selections"][0];
+        assert_eq!(selection["policy"], "cache_aware");
+        assert_eq!(selection["worker"], "http://10.0.0.3:8000");
+        assert_eq!(selection["prediction"]["overlap_blocks"], 4);
+        assert!(selection.get("candidates").is_none());
+        assert!(selection.get("scores").is_none());
+        assert_eq!(
+            selection["elided"],
+            json!({"candidates": 32, "scores": 1, "gates": 1})
+        );
+        assert!(decoded.get("unattributed_gates").is_none());
+        let failure = encode_capped(
+            json!({"root_id": "root", "status": 503, "selections": [], "gates": [{"spill": true}], "truncated": false}),
+            Some(0),
+        );
+        let decoded: Value = serde_json::from_str(&failure).unwrap();
+        assert_eq!(decoded["status"], 503);
+        assert!(decoded.get("gates").is_none());
     }
 }
