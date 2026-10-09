@@ -298,3 +298,53 @@ async fn test_glm47_nested_json_in_arg_values() {
     assert!(args["data"].is_object());
     assert!(args["list"].is_array());
 }
+
+/// On a thinking prompt the forced call's grammar must not hold the model to
+/// anything it may already have written. An engine that runs a reasoning
+/// parser (vLLM, SGLang) applies the grammar only once the model has closed
+/// its own `</think>`, so a reasoning block in front of the calls, closed by
+/// `</think>`, is owed a second time: the model can neither call nor end the
+/// turn until it has written another `</think>`, and fills the gap with a
+/// fabricated observation and answer. Whatever precedes the calls is free
+/// text with nothing owed at its end.
+#[test]
+fn test_glm47_forced_call_grammar_owes_nothing_before_the_calls_on_a_thinking_prompt() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("glm47_moe");
+    let tools = create_test_tools();
+    let named: ToolChoice = serde_json::from_value(serde_json::json!({
+        "type": "function",
+        "function": {"name": tools[0].function.name}
+    }))
+    .unwrap();
+    for (choice, selected) in [
+        (ToolChoice::Value(ToolChoiceValue::Required), tools.as_slice()),
+        (named, &tools[..1]),
+    ] {
+        let Some(ToolConstraint::StructuralTag(tag)) = registry
+            .generate_tool_constraint(parser, selected, &choice, true)
+            .unwrap()
+        else {
+            panic!("expected a structural tag for {choice:?}");
+        };
+        let tag: serde_json::Value = serde_json::from_str(&tag).unwrap();
+        let format = &tag["format"];
+        let calls = if format["type"] == "sequence" {
+            let elements = format["elements"].as_array().unwrap();
+            assert_eq!(elements.len(), 2, "{choice:?}: {format}");
+            assert_eq!(
+                elements[0]["type"], "any_text",
+                "{choice:?}: free text before the calls, nothing the model owes: {format}"
+            );
+            assert!(elements[0].get("end").is_none(), "{choice:?}: {format}");
+            &elements[1]
+        } else {
+            format
+        };
+        assert_eq!(calls["type"], "triggered_tags", "{choice:?}: {format}");
+        assert_eq!(calls["triggers"], serde_json::json!(["<tool_call>"]));
+        assert_eq!(calls["at_least_one"], true);
+        assert_eq!(calls["tags"].as_array().unwrap().len(), selected.len());
+    }
+}
