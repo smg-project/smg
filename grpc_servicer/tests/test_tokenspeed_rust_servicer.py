@@ -200,6 +200,43 @@ def test_headless_server_args_dial_the_servicer():
     assert args.zmq_msgpack is False
 
 
+def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer():
+    """A launcher without --kv-events-config left TokenSpeed publishing nothing
+    and the router's cache-aware routing blind (smg-lab #1): the Rust path
+    turns the ZMQ publisher on itself unless told otherwise."""
+    expected = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
+    # Nothing given: TokenSpeed's own defaults behind the ZMQ publisher.
+    args = FakeServerArgs()
+    assert rust.default_kv_events_config(args, environ={}) == expected
+    assert args.kv_events_config == expected
+    resolved = rust.resolve_kv_events_config(args)
+    assert resolved is not None and resolved.endpoint == "tcp://*:5557"
+    args = FakeServerArgs(kv_events_config="")
+    assert rust.default_kv_events_config(args, environ={}) == expected
+    # The opt-out.
+    for value in ("0", "false", "No", " off "):
+        args = FakeServerArgs()
+        assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: value}) is None
+        assert args.kv_events_config is None
+    args = FakeServerArgs()
+    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}) == expected
+    # An explicit configuration is kept as given, off included.
+    for given in (
+        '{"enable_kv_cache_events": false}',
+        '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5600"}',
+    ):
+        args = FakeServerArgs(kv_events_config=given)
+        assert rust.default_kv_events_config(args, environ={}) is None
+        assert args.kv_events_config == given
+    # Server args that cannot be written are left alone.
+
+    class Frozen:
+        __slots__ = ()
+        kv_events_config = None
+
+    assert rust.default_kv_events_config(Frozen(), environ={}) is None
+
+
 def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatch, tmp_path):
     """The Rust server binds the launcher's host:port, the scheduler is
     launched headless against the handshake port, both are supervised."""
@@ -257,6 +294,8 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert server["model_path"] == "org/m"
     headless = recorded["headless"]
     assert headless.zmq_msgpack is True and headless.skip_tokenizer_init is True
+    # No --kv-events-config was given: the headless scheduler publishes.
+    assert headless.kv_events_config == '{"enable_kv_cache_events": true, "publisher": "zmq"}'
     assert headless.data_parallel_rpc_port == 24321
     supervised_server, engine, drain_secs = recorded["supervised"]
     assert isinstance(supervised_server, FakeServer)

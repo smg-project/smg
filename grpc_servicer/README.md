@@ -250,7 +250,10 @@ and supervises both. What that wire does not carry is reported, not emulated:
 prompt logprobs are refused, and PD/EPD disaggregation stays with the Python
 implementation, as do the RL control-plane extras (the `rl.*` advertisement,
 the live `weight_version` on generate responses, `is_paused`); the Rust server
-redacts credentials from `server_args` the same way. Tuning:
+redacts credentials from `server_args` the same way. `SubscribeKvEvents` relays
+TokenSpeed's ZMQ KV-event publisher, which Rust mode turns on by itself when
+the launcher is given no `--kv-events-config` (an explicit one is kept as
+given; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off). Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800, as for vLLM

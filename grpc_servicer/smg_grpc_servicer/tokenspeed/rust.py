@@ -49,6 +49,14 @@ SERVICER_IMPL_ENV = "SMG_TOKENSPEED_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS"
+# Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
+# launcher was given no --kv-events-config (see `default_kv_events_config`).
+KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
+_OFF_VALUES = ("0", "false", "no", "off")
+# What a launcher without --kv-events-config gets under the Rust servicer:
+# the ZMQ publisher, with TokenSpeed's own defaults for the rest (the
+# endpoint, the topic).
+DEFAULT_KV_EVENTS_CONFIG = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
 IMPLS = ("python", "rust")
 
 
@@ -171,6 +179,39 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     }
 
 
+def default_kv_events_config(
+    server_args: Any, environ: Mapping[str, str] | None = None
+) -> str | None:
+    """Turn TokenSpeed's KV event publisher on when the launcher was given no
+    ``--kv-events-config``; returns the configuration applied, or None.
+
+    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
+    TokenSpeed publishes none unless started with ``--kv-events-config
+    '{"enable_kv_cache_events": true, "publisher": "zmq"}'``: a launcher
+    without it got a router that routed blind, with one WARN per worker as
+    the only trace. Under the Rust servicer the server args that lack the
+    option get exactly that configuration before the facts and the headless
+    scheduler are built from them, so publisher and relay agree. An explicit
+    ``--kv-events-config`` is kept as given, off included;
+    ``SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`` keeps the publisher off without
+    one.
+    """
+    source = os.environ if environ is None else environ
+    if getattr(server_args, "kv_events_config", None):
+        return None
+    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
+        return None
+    try:
+        server_args.kv_events_config = DEFAULT_KV_EVENTS_CONFIG
+    except AttributeError:  # frozen server args: left as they are
+        logger.warning(
+            "kv_events_config cannot be set on %s; KV event publishing stays as configured",
+            type(server_args).__name__,
+        )
+        return None
+    return DEFAULT_KV_EVENTS_CONFIG
+
+
 # ---------------------------------------------------------------------------
 # Headless scheduler: TokenSpeed's own launch, dialing this servicer
 # ---------------------------------------------------------------------------
@@ -224,12 +265,28 @@ async def serve_rust(server_args: Any) -> int:
     from smg.servicer import TokenSpeedGrpcServer, init_servicer_tracing
 
     init_servicer_tracing(os.environ.get("RUST_LOG") and None)
+    if default_kv_events_config(server_args) is not None:
+        logger.info(
+            "KV event publishing enabled: no --kv-events-config was given, so TokenSpeed's ZMQ "
+            "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+            "--kv-events-config to configure it, or set %s=0 to leave it off",
+            KV_EVENTS_ENV,
+        )
     handshake_port = int(os.environ.get(HANDSHAKE_PORT_ENV) or 0) or free_port()
     socket_dir = default_socket_dir()
     os.makedirs(socket_dir, mode=0o700, exist_ok=True)
     host = getattr(server_args, "host", None) or "0.0.0.0"
     port = int(getattr(server_args, "port", 0) or 0)
     facts = {**model_facts(server_args), **server_facts(server_args)}
+    if facts.get("kv_events_endpoint"):
+        logger.info(
+            "SubscribeKvEvents relays TokenSpeed's KV events from %s", facts["kv_events_endpoint"]
+        )
+    else:
+        logger.warning(
+            "SubscribeKvEvents is off (KV cache events disabled, or a publisher other than "
+            "zmq): a cache-aware router sees nothing of this engine's cache"
+        )
     engine_count = facts["data_parallel_size"]
     tokenizer_dir = tokenizer_dir_for(server_args)
     if tokenizer_dir is None:
