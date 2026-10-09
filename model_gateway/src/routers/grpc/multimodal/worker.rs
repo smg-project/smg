@@ -30,7 +30,7 @@ use super::{
     process::process_multimodal_plan,
     RegistryTokenizer,
 };
-use crate::routers::grpc::proto_wrapper::vllm_mm_identity;
+use crate::{routers::grpc::proto_wrapper::vllm_mm_identity, worker::http_client::build_client};
 
 /// A worker serves one model: the config registry's one key.
 const CONFIG_KEY: &str = "worker";
@@ -190,10 +190,12 @@ impl WorkerMediaPipeline {
                  --mm-device-do-normalize=false or use --mm-processor inprocess"
             );
         }
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("building the media HTTP client")?;
+        let client = build_client(
+            || reqwest::Client::builder().timeout(Duration::from_secs(30)),
+            false,
+            "media HTTP client",
+        )
+        .map_err(anyhow::Error::msg)?;
         let connector = MediaConnector::new(
             client,
             MediaConnectorConfig {

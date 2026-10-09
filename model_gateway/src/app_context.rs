@@ -30,8 +30,8 @@ use crate::{
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        liveness, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor,
-        WorkerRegistry, WorkerService,
+        http_client::build_client, liveness, KvEventMonitor, PrefillAdmission,
+        WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, WorkflowEngines},
 };
@@ -197,6 +197,40 @@ impl AppContext {
             .build()
             .map_err(|e| e.to_string())
         })
+    }
+}
+
+/// Whether a worker URL given in the configuration needs TLS. Discovered
+/// workers are not known yet when the shared client is built.
+fn has_https_worker(config: &RouterConfig) -> bool {
+    use crate::config::RoutingMode;
+
+    let https = |url: &str| url.starts_with("https://");
+    match &config.mode {
+        RoutingMode::Regular { worker_urls }
+        | RoutingMode::OpenAI { worker_urls }
+        | RoutingMode::Anthropic { worker_urls }
+        | RoutingMode::Gemini { worker_urls } => worker_urls.iter().any(|url| https(url)),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => {
+            prefill_urls.iter().any(|(url, _)| https(url))
+                || decode_urls.iter().any(|url| https(url))
+        }
+        RoutingMode::EncodePrefillDecode {
+            encode_urls,
+            prefill_urls,
+            decode_urls,
+            ..
+        } => {
+            encode_urls
+                .iter()
+                .chain(prefill_urls)
+                .any(|(url, _)| https(url))
+                || decode_urls.iter().any(|url| https(url))
+        }
     }
 }
 
@@ -531,8 +565,13 @@ impl AppContextBuilder {
     ///
     /// Uses the rustls TLS backend when TLS/mTLS is configured (client cert or
     /// CA certs provided) for PKCS#8 key support; plain HTTP skips TLS setup.
+    /// A host without a native CA root store is tolerated unless TLS is
+    /// needed (see [`build_client`]).
     fn with_client(mut self, config: &RouterConfig, timeout_secs: u64) -> Result<Self, String> {
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
+        // With a client identity, a CA bundle or an HTTPS worker URL, TLS is
+        // needed: a missing root store is then an error, not worked around.
+        let tls_required = has_tls_config || has_https_worker(config);
 
         // Idle pooled connections must expire before the backend server's
         // keep-alive closes them (vLLM/SGLang default: 5s), or checkout races
@@ -541,44 +580,55 @@ impl AppContextBuilder {
             0 => None,
             secs => Some(Duration::from_secs(secs)),
         };
-        let mut client_builder = Client::builder()
-            .pool_idle_timeout(pool_idle_timeout)
-            .pool_max_idle_per_host(500)
-            .timeout(Duration::from_secs(timeout_secs))
-            .connect_timeout(Duration::from_secs(10))
-            .tcp_nodelay(true)
-            .tcp_keepalive(Some(Duration::from_secs(30)));
-
-        // Force rustls backend when TLS is configured
+        // mTLS client identity and CA certificates for verifying worker TLS
+        // (both loaded during config creation), parsed once: the builder
+        // closure runs again if the first build fails for want of a root store.
+        let identity = config
+            .client_identity
+            .as_deref()
+            .map(reqwest::Identity::from_pem)
+            .transpose()
+            .map_err(|e| format!("Failed to create client identity: {e}"))?;
+        let ca_certificates = config
+            .ca_certificates
+            .iter()
+            .map(|pem| reqwest::Certificate::from_pem(pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
         if has_tls_config {
-            client_builder = client_builder.use_rustls_tls();
             debug!("Using rustls TLS backend for TLS/mTLS connections");
         }
-
-        // Configure mTLS client identity if provided (certificates already loaded during config creation)
-        if let Some(identity_pem) = &config.client_identity {
-            let identity = reqwest::Identity::from_pem(identity_pem)
-                .map_err(|e| format!("Failed to create client identity: {e}"))?;
-            client_builder = client_builder.identity(identity);
+        if identity.is_some() {
             debug!("mTLS client authentication enabled");
         }
-
-        // Add CA certificates for verifying worker TLS (certificates already loaded during config creation)
-        for ca_cert in &config.ca_certificates {
-            let cert = reqwest::Certificate::from_pem(ca_cert)
-                .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
-            client_builder = client_builder.add_root_certificate(cert);
-        }
-        if !config.ca_certificates.is_empty() {
+        if !ca_certificates.is_empty() {
             debug!(
                 "Added {} CA certificate(s) for worker verification",
-                config.ca_certificates.len()
+                ca_certificates.len()
             );
         }
 
-        let client = client_builder
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+        let make_builder = || {
+            let mut client_builder = Client::builder()
+                .pool_idle_timeout(pool_idle_timeout)
+                .pool_max_idle_per_host(500)
+                .timeout(Duration::from_secs(timeout_secs))
+                .connect_timeout(Duration::from_secs(10))
+                .tcp_nodelay(true)
+                .tcp_keepalive(Some(Duration::from_secs(30)));
+            // Force rustls backend when TLS is configured
+            if has_tls_config {
+                client_builder = client_builder.use_rustls_tls();
+            }
+            if let Some(identity) = &identity {
+                client_builder = client_builder.identity(identity.clone());
+            }
+            for cert in &ca_certificates {
+                client_builder = client_builder.add_root_certificate(cert.clone());
+            }
+            client_builder
+        };
+        let client = build_client(make_builder, tls_required, "HTTP client")?;
 
         self.client = Some(client);
         Ok(self)
@@ -924,6 +974,45 @@ mod tests {
             axum::serve(listener, app).await.expect("echo serve");
         });
         format!("http://{addr}/probe")
+    }
+
+    /// Child-process body of the root-store test below (see
+    /// `worker::http_client::no_root_store`); a no-op unless the case
+    /// variable is set.
+    #[test]
+    fn child_with_client_without_native_roots() {
+        use crate::worker::http_client::no_root_store;
+
+        if std::env::var(no_root_store::CASE).is_err() {
+            return;
+        }
+        AppContextBuilder::new()
+            .with_client(&RouterConfig::default(), 5)
+            .expect("a gateway without TLS configuration starts without a root store");
+    }
+
+    #[test]
+    fn the_gateway_client_builds_without_a_native_root_store() {
+        use crate::worker::http_client::no_root_store;
+
+        no_root_store::run(
+            &no_root_store::test_name(module_path!(), "child_with_client_without_native_roots"),
+            "plaintext",
+        );
+    }
+
+    #[test]
+    fn https_worker_urls_make_tls_required() {
+        use crate::config::RoutingMode;
+
+        let with_worker = |url: &str| RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![url.to_string()],
+            },
+            ..RouterConfig::default()
+        };
+        assert!(!has_https_worker(&with_worker("http://worker:8000")));
+        assert!(has_https_worker(&with_worker("https://worker:8443")));
     }
 
     fn built_client(upstream_http2: bool) -> Client {
