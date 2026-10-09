@@ -2,10 +2,7 @@
 //! with IP SANs for both loopback addresses and a DNS SAN for `localhost`,
 //! written as PEM files because the mTLS configuration takes paths.
 
-use std::{
-    path::PathBuf,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::path::PathBuf;
 
 use openssl::{
     asn1::{Asn1Integer, Asn1Time},
@@ -20,12 +17,10 @@ use openssl::{
     },
 };
 
-static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
-
-/// PEM files of a test CA and of a node certificate it signed; the directory
-/// is removed on drop.
+/// PEM files of a test CA and of a node certificate it signed, in a private
+/// temporary directory of their own (created exclusively, removed on drop).
 pub(crate) struct MtlsTestCerts {
-    dir: PathBuf,
+    _dir: tempfile::TempDir,
     pub(crate) ca_cert_path: PathBuf,
     pub(crate) node_cert_path: PathBuf,
     pub(crate) node_key_path: PathBuf,
@@ -35,21 +30,19 @@ impl MtlsTestCerts {
     /// A fresh CA and a node certificate with the SANs `IP:::1`,
     /// `IP:127.0.0.1` and `DNS:localhost`.
     pub(crate) fn generate() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "smg-mesh-mtls-{}-{}",
-            std::process::id(),
-            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("create the certificate directory");
+        let dir = tempfile::Builder::new()
+            .prefix("smg-mesh-mtls-")
+            .tempdir()
+            .expect("create the certificate directory");
 
         let ca_key = p256_key();
         let ca_cert = ca_certificate(&ca_key);
         let node_key = p256_key();
         let node_cert = node_certificate(&node_key, &ca_cert, &ca_key);
 
-        let ca_cert_path = dir.join("ca.pem");
-        let node_cert_path = dir.join("node.pem");
-        let node_key_path = dir.join("node-key.pem");
+        let ca_cert_path = dir.path().join("ca.pem");
+        let node_cert_path = dir.path().join("node.pem");
+        let node_key_path = dir.path().join("node-key.pem");
         std::fs::write(&ca_cert_path, ca_cert.to_pem().expect("CA PEM")).expect("write the CA");
         std::fs::write(&node_cert_path, node_cert.to_pem().expect("node PEM"))
             .expect("write the node certificate");
@@ -62,17 +55,11 @@ impl MtlsTestCerts {
         .expect("write the node key");
 
         Self {
-            dir,
+            _dir: dir,
             ca_cert_path,
             node_cert_path,
             node_key_path,
         }
-    }
-}
-
-impl Drop for MtlsTestCerts {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
