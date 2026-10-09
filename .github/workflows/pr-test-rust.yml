@@ -405,7 +405,13 @@ jobs:
   # uploaded and summarized.
   benchmarks:
     needs: [build-wheel, detect-changes]
-    if: needs.detect-changes.outputs.symphony-only != 'true'
+    # A 4-GPU runner for 36 minutes: on pull requests only with the full
+    # tier or a change to the benchmark suite itself.
+    if: >-
+      needs.detect-changes.outputs.symphony-only != 'true'
+      && (github.event_name != 'pull_request'
+          || needs.detect-changes.outputs.e2e-full == 'true'
+          || needs.detect-changes.outputs.benchmarks == 'true')
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -486,13 +492,20 @@ jobs:
       pull-requests: read
       packages: read
     outputs:
-      common: ${{ steps.filter.outputs.common }}
-      chat-completions: ${{ steps.filter.outputs.chat-completions }}
+      # The e2e tiers; the table above the GPU jobs maps paths to lanes. A
+      # path no filter claims lands in `unknown`, which selects the full
+      # matrix: an unlisted path never skips a GPU lane.
+      e2e-full: ${{ steps.filter.outputs.engine == 'true' || steps.filter.outputs.unknown == 'true' }}
+      e2e-core: ${{ steps.filter.outputs.core }}
+      e2e-mm: ${{ steps.filter.outputs.mm }}
+      e2e-pd: ${{ steps.filter.outputs.pd }}
+      e2e-epd: ${{ steps.filter.outputs.epd }}
       completions: ${{ steps.filter.outputs.completions }}
       agentic: ${{ steps.filter.outputs.agentic }}
       embeddings: ${{ steps.filter.outputs.embeddings }}
       realtime: ${{ steps.filter.outputs.realtime }}
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
+      benchmarks: ${{ steps.filter.outputs.benchmarks }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
       # Symphony is not wired into the gateway yet: a change confined to its crate and the
       # lock file runs the CPU checks only, and every GPU lane below skips on this flag.
@@ -534,79 +547,236 @@ jobs:
           # behave exactly as before: any changed file matching any pattern.
           predicate-quantifier: 'some-with-excludes'
           filters: |
-            common:
-              - 'model_gateway/**'
-              - 'crates/protocols/**'
-              - 'bindings/**'
-              - 'e2e_test/conftest.py'
-              - 'e2e_test/infra/**'
-              - 'e2e_test/fixtures/**'
-              - 'Cargo.lock'
-              - '.github/actions/**'
-              - '.github/workflows/pr-test-rust.yml'
-              - '.github/workflows/e2e-gpu-job.yml'
-              - 'scripts/ci_setup_python_venv.sh'
-              - 'scripts/ci_retry.sh'
-              - 'scripts/ci_apt_mirror.sh'
-              - 'scripts/ci_ensure_python_headers.sh'
-              - 'scripts/ci_install_sglang.sh'
-              - 'scripts/ci_install_vllm.sh'
-              - 'scripts/ci_install_tokenspeed.sh'
-              - 'scripts/ci_install_flashinfer.py'
-              - '.github/versions/tokenspeed.ref'
-              - 'scripts/ci_install_e2e_deps.sh'
-              - 'scripts/ci_killall_sglang.sh'
-              - 'scripts/ci_build_wheel.sh'
-              - 'crates/tokenizer/**'
-              - 'crates/tool_parser/**'
-              # Router-embedded crates: changes here alter gateway behavior
-              # across every API surface, so they must trigger the e2e lanes.
-              - 'crates/auth/**'
-              - 'crates/kv_index/**'
-              - 'crates/mesh/**'
-              - 'crates/mm_rdma/**'
-              - 'crates/rl/**'
-              - 'crates/wasm/**'
-              - 'crates/workflow/**'
-            chat-completions:
-              - 'crates/reasoning_parser/**'
-              - 'crates/multimodal/**'
-              - 'crates/grpc_client/**'
-              # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes and the
-              # Rust-servicer lane, which gate on this filter.
+            # Engine-facing paths: every lane runs. The servicers and the
+            # wire crates, the gateway modules that speak to engines or
+            # assemble their topologies (routers, worker registry, config,
+            # the top-level wiring), the launcher every lane starts the
+            # gateway through, the harness, the chat and router suites
+            # (collected by most lanes), and the CI plumbing shared by the
+            # GPU jobs.
+            engine:
+              - 'crates/engine_servicer/**'
               - 'crates/engine_zmq_client/**'
               - 'crates/engine_zmq_adapter/**'
-              - 'crates/engine_servicer/**'
-              - 'crates/mock_worker/**'
+              - 'crates/grpc_client/**'
               - 'grpc_servicer/**'
+              - 'model_gateway/src/main.rs'
+              - 'model_gateway/src/app_context.rs'
+              - 'model_gateway/src/health.rs'
+              - 'model_gateway/src/config/**'
+              - 'model_gateway/src/routers/**'
+              - 'model_gateway/src/worker/**'
+              - 'model_gateway/Cargo.toml'
+              - 'model_gateway/build.rs'
+              - 'bindings/python/**'
+              - '!bindings/python/tests/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'pytest.ini'
+              - 'e2e_test/__init__.py'
+              - 'e2e_test/conftest.py'
+              - 'e2e_test/pyproject.toml'
+              - 'e2e_test/infra/**'
+              - 'e2e_test/fixtures/**'
               - 'e2e_test/chat_completions/**'
+              - '!e2e_test/chat_completions/test_epd_multimodal.py'
               - 'e2e_test/router/**'
-              - 'scripts/ci_install_vllm.sh'
-              - 'scripts/ci_install_trtllm.sh'
-              - 'scripts/ci_apt_mirror.sh'
-              - 'scripts/ci_install_tokenspeed.sh'
-              - 'scripts/ci_install_flashinfer.py'
-              - 'scripts/ci_tokenspeed_image_tag.sh'
-              - 'scripts/ci_fetch_tokenspeed_prebuilt.sh'
+              - '!e2e_test/router/test_pd_*.py'
+              - '.github/workflows/pr-test-rust.yml'
+              - '.github/workflows/e2e-gpu-job.yml'
+              - '.github/actions/**'
               - '.github/versions/tokenspeed.ref'
+              - 'scripts/ci_*'
+              - '!scripts/ci_agentic_svc_deps.sh'
+              - '!scripts/ci_node_health.py'
+              - '!scripts/ci_prune_tokenspeed_images.sh'
+              - '!**/*.md'
+            # Gateway code that no engine path depends on, and the crates the
+            # gateway alone links: one real-engine chat lane plus the router
+            # suite. The engine sub-trees above match this filter too; the
+            # union is the full matrix.
+            core:
+              - 'model_gateway/src/**'
+              - 'crates/tokenizer/**'
+              - 'crates/tool_parser/**'
+              - 'crates/reasoning_parser/**'
+              - 'crates/protocols/**'
+              - 'crates/multimodal/**'
+              - 'crates/mm_rdma/**'
+              - 'crates/rl/**'
+              - 'crates/workflow/**'
+              - 'clients/python/**'
+              - '!clients/python/tests/**'
+              - 'clients/openapi-gen/**'
+              - '.cargo/**'
+              - '!**/*.md'
+            # The media crate also runs worker-side, inside the vLLM
+            # servicer's in-process processor: the mm-worker lane.
+            mm:
+              - 'crates/multimodal/**'
+              - '!**/*.md'
+            # The PD suites: the PD lanes and their prerequisites.
+            pd:
+              - 'e2e_test/router/test_pd_*.py'
+            # The EPD suite is the only one that routes cache-aware, so it is
+            # the lane that observes the prefix index.
+            epd:
+              - 'e2e_test/chat_completions/test_epd_multimodal.py'
+              - 'crates/kv_index/**'
+              - 'crates/radix_tree/**'
+              - 'model_gateway/src/policies/cache_aware.rs'
+              - 'model_gateway/src/policies/cache_namespace.rs'
+              - '!**/*.md'
+            # Per-API lanes. The protocol crate defines every API's types,
+            # so it adds each API lane to the core tier.
+            completions:
+              - 'e2e_test/completions/**'
+              - 'crates/protocols/**'
+              - '!**/*.md'
+            embeddings:
+              - 'e2e_test/embeddings/**'
+              - 'crates/protocols/**'
+              - '!**/*.md'
+            realtime:
+              - 'e2e_test/realtime/**'
+              - 'crates/protocols/**'
+              - '!**/*.md'
+            # The Responses/Messages lanes (local sglang and the vendors):
+            # MCP, storage, the provider bridge the Responses pipeline is
+            # built on, the storage-hook WASM runtime, and their endpoints.
             agentic:
               - 'crates/mcp/**'
               - 'crates/data_connector/**'
+              - 'crates/external_router/**'
+              - 'crates/wasm/**'
+              - 'crates/protocols/**'
+              - 'model_gateway/src/endpoints/responses/**'
+              - 'model_gateway/src/endpoints/conversations/**'
+              - 'model_gateway/src/wasm/**'
               - 'e2e_test/responses/**'
               - 'e2e_test/messages/**'
               - 'scripts/ci_agentic_svc_deps.sh'
-              - 'scripts/ci_apt_mirror.sh'
               - 'scripts/oracle_flyway/**'
-            completions:
-              - 'crates/grpc_client/**'
-              - 'grpc_servicer/**'
-              - 'e2e_test/completions/**'
-            embeddings:
-              - 'e2e_test/embeddings/**'
-            realtime:
-              - 'e2e_test/realtime/**'
+              - '!**/*.md'
             go-bindings:
               - 'e2e_test/bindings_go/**'
+              - 'bindings/golang/**'
+              - '!**/*.md'
+            benchmarks:
+              - 'e2e_test/benchmarks/**'
+            # No GPU lane can observe these: documentation, the mock worker
+            # and Symphony (not linked into the gateway), mesh and auth (no
+            # suite enables them), the CPU-only test trees, scripts and
+            # workflows the GPU jobs do not run. Listed so the lint below
+            # can prove every exclusion of `unknown` is claimed by a filter;
+            # a path that also appears in a tier above belongs to that tier.
+            cpu-only:
+              - '**/*.md'
+              - 'docs/**'
+              - 'LICENSE'
+              - 'Makefile'
+              - 'clippy.toml'
+              - 'rustfmt.toml'
+              - 'ruff.toml'
+              - 'mypy.ini'
+              - '.dockerignore'
+              - '.gitignore'
+              - '.pre-commit-config.yaml'
+              - '.github/**'
+              - 'assets/**'
+              - 'deploy/**'
+              - 'docker/**'
+              - 'examples/**'
+              - 'scripts/**'
+              - 'crates/auth/**'
+              - 'crates/mesh/**'
+              - 'crates/mock_worker/**'
+              - 'crates/symphony/**'
+              - 'model_gateway/tests/**'
+              - 'model_gateway/benches/**'
+              - 'bindings/python/tests/**'
+              - 'clients/python/tests/**'
+              - 'clients/rust/**'
+              - 'clients/java/**'
+              - 'e2e_test/kind_discovery/**'
+              - 'e2e_test/mlx/**'
+            # The fallback: any changed file outside every path listed above
+            # selects the full matrix. Keep the exclusions in step with the
+            # filters (the gate-integrity lint in `finish` checks that each
+            # one is a positive pattern of another filter).
+            unknown:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+              - '!LICENSE'
+              - '!Makefile'
+              - '!clippy.toml'
+              - '!rustfmt.toml'
+              - '!ruff.toml'
+              - '!mypy.ini'
+              - '!pytest.ini'
+              - '!Cargo.toml'
+              - '!Cargo.lock'
+              - '!.dockerignore'
+              - '!.gitignore'
+              - '!.pre-commit-config.yaml'
+              - '!.cargo/**'
+              - '!.github/**'
+              - '!assets/**'
+              - '!deploy/**'
+              - '!docker/**'
+              - '!examples/**'
+              - '!scripts/**'
+              - '!grpc_servicer/**'
+              - '!model_gateway/src/**'
+              - '!model_gateway/tests/**'
+              - '!model_gateway/benches/**'
+              - '!model_gateway/Cargo.toml'
+              - '!model_gateway/build.rs'
+              - '!bindings/python/**'
+              - '!bindings/golang/**'
+              - '!clients/python/**'
+              - '!clients/openapi-gen/**'
+              - '!clients/rust/**'
+              - '!clients/java/**'
+              - '!crates/auth/**'
+              - '!crates/data_connector/**'
+              - '!crates/engine_servicer/**'
+              - '!crates/engine_zmq_adapter/**'
+              - '!crates/engine_zmq_client/**'
+              - '!crates/external_router/**'
+              - '!crates/grpc_client/**'
+              - '!crates/kv_index/**'
+              - '!crates/mcp/**'
+              - '!crates/mesh/**'
+              - '!crates/mm_rdma/**'
+              - '!crates/mock_worker/**'
+              - '!crates/multimodal/**'
+              - '!crates/protocols/**'
+              - '!crates/radix_tree/**'
+              - '!crates/reasoning_parser/**'
+              - '!crates/rl/**'
+              - '!crates/symphony/**'
+              - '!crates/tokenizer/**'
+              - '!crates/tool_parser/**'
+              - '!crates/wasm/**'
+              - '!crates/workflow/**'
+              - '!e2e_test/__init__.py'
+              - '!e2e_test/conftest.py'
+              - '!e2e_test/pyproject.toml'
+              - '!e2e_test/infra/**'
+              - '!e2e_test/fixtures/**'
+              - '!e2e_test/chat_completions/**'
+              - '!e2e_test/router/**'
+              - '!e2e_test/completions/**'
+              - '!e2e_test/embeddings/**'
+              - '!e2e_test/realtime/**'
+              - '!e2e_test/responses/**'
+              - '!e2e_test/messages/**'
+              - '!e2e_test/bindings_go/**'
+              - '!e2e_test/benchmarks/**'
+              - '!e2e_test/kind_discovery/**'
+              - '!e2e_test/mlx/**'
             symphony:
               - 'crates/symphony/**'
             # Everything that is not Symphony's crate or the lock file. A PR is Symphony-only
@@ -640,9 +810,37 @@ jobs:
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
 
   # --- GPU E2E: organized by GPU tier + API, engine as matrix axis ---
+  #
+  # Pull requests run the lanes their changed paths can reach; pushes to main
+  # (and workflow_dispatch) run every lane. detect-changes classifies the
+  # paths into tiers and each lane's `if` reads them; a change in several
+  # tiers runs the union:
+  #
+  #   e2e-full    engine-facing paths (filter `engine`) and every path no
+  #               filter claims (`unknown`)       -> every lane
+  #   e2e-core    the rest of the gateway, the tokenizer and the parsers,
+  #               protocols, multimodal, rl, workflow, the Python client
+  #                                               -> e2e-1gpu-chat (sglang)
+  #                                                  + e2e-1gpu-gateway
+  #   e2e-mm      crates/multimodal                -> + e2e-1gpu-chat-mm-worker
+  #   e2e-pd      the PD suites                    -> the PD lanes and their
+  #                                                  prerequisites
+  #   e2e-epd     the EPD suite, kv_index, radix_tree, the cache-aware policy
+  #                                               -> e2e-4gpu-epd (+ chat)
+  #   completions / embeddings / realtime / agentic / go-bindings /
+  #   benchmarks  that lane (protocols adds each API lane to the core tier)
+  #   cpu-only    docs, the mock worker, Symphony, mesh, auth, the CPU test
+  #               trees, non-CI scripts, other workflows -> no GPU lane
+  #
+  # The gate-integrity lint in `finish` checks that every lane keeps the
+  # main-push rule, reads a declared tier output, and that `unknown`
+  # excludes nothing a filter has not claimed.
 
   # === 1 GPU ===
 
+  # The representative lane: the sglang chat suite runs for every gateway
+  # change (the core tier) and is the prerequisite of the 4-GPU chat and
+  # EPD lanes. The other engines run in e2e-1gpu-chat-engines below.
   e2e-1gpu-chat:
     name: e2e-1gpu-chat (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -653,8 +851,9 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+              && (needs.detect-changes.outputs.e2e-full == 'true'
+                  || needs.detect-changes.outputs.e2e-core == 'true'
+                  || needs.detect-changes.outputs.e2e-epd == 'true')))
     # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
     # Qwen2.5-14B) since they're tp=1.
     strategy:
@@ -665,6 +864,33 @@ jobs:
             timeout: 36
             test_timeout: 28
             min_selected: 204 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
+      test_dirs: e2e_test/chat_completions
+      min_selected: ${{ matrix.min_selected }}
+    secrets: inherit
+
+  # The chat suite on the other engines: the full tier only.
+  e2e-1gpu-chat-engines:
+    name: e2e-1gpu-chat-engines (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && needs.detect-changes.outputs.e2e-full == 'true'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           # 21 min end to end on a quiet host (setup ~6 min, tests ~15 min);
           # under runner contention setup alone reached 9 min and the 24 min
           # budget cut the run short. Keep ~30% headroom like the other rows.
@@ -712,8 +938,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+              && needs.detect-changes.outputs.e2e-full == 'true'))
     # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
     # Qwen2.5-14B) since they're tp=1.
     strategy:
@@ -753,8 +978,9 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+              && (needs.detect-changes.outputs.e2e-full == 'true'
+                  || needs.detect-changes.outputs.e2e-mm == 'true'
+                  || needs.detect-changes.outputs.e2e-pd == 'true')))
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -777,8 +1003,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+              && needs.detect-changes.outputs.e2e-full == 'true'))
     # Same single-worker chat suite as e2e-1gpu-chat, driven over the ZMQ
     # direct-backend wire. The collection hook deselects the gRPC-only
     # families (PD, EPD, multi-worker) for a ZMQ lane, so this covers the
@@ -828,8 +1053,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+              && needs.detect-changes.outputs.e2e-full == 'true'))
     # The 1-GPU ZMQ suite with grouped workers: each ZMQ worker launches two
     # DP engines on one socket set (tp=1 models, one GPU per engine), so the
     # gateway's handshake, the connector's least-loaded selection, and
@@ -877,7 +1101,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
+              && (needs.detect-changes.outputs.e2e-full == 'true'
                   || needs.detect-changes.outputs.completions == 'true')))
     strategy:
       fail-fast: false
@@ -909,7 +1133,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
+              && (needs.detect-changes.outputs.e2e-full == 'true'
                   || needs.detect-changes.outputs.embeddings == 'true')))
     strategy:
       fail-fast: false
@@ -941,7 +1165,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
+              && (needs.detect-changes.outputs.e2e-full == 'true'
                   || needs.detect-changes.outputs.realtime == 'true')))
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -954,6 +1178,8 @@ jobs:
       min_selected: 3 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit
 
+  # The router suite runs for every gateway change (the core tier) and is
+  # the prerequisite of the PD lanes.
   e2e-1gpu-gateway:
     name: e2e-1gpu-gateway (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -964,8 +1190,9 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+              && (needs.detect-changes.outputs.e2e-full == 'true'
+                  || needs.detect-changes.outputs.e2e-core == 'true'
+                  || needs.detect-changes.outputs.e2e-pd == 'true')))
     strategy:
       fail-fast: false
       matrix:
@@ -1003,7 +1230,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
+              && (needs.detect-changes.outputs.e2e-full == 'true'
                   || needs.detect-changes.outputs.agentic == 'true')))
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -1027,8 +1254,8 @@ jobs:
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+              && (needs.detect-changes.outputs.e2e-full == 'true'
+                  || needs.detect-changes.outputs.e2e-pd == 'true')))
     strategy:
       fail-fast: false
       matrix:
@@ -1080,8 +1307,8 @@ jobs:
       && needs.e2e-1gpu-chat-mm-worker.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+              && (needs.detect-changes.outputs.e2e-full == 'true'
+                  || needs.detect-changes.outputs.e2e-pd == 'true')))
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1098,7 +1325,16 @@ jobs:
 
   e2e-4gpu-chat:
     name: e2e-4gpu-chat (${{ matrix.engine }})
-    needs: [e2e-1gpu-chat]
+    needs: [e2e-1gpu-chat, e2e-1gpu-chat-engines, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.e2e-1gpu-chat.result == 'success'
+      && needs.e2e-1gpu-chat-engines.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && needs.detect-changes.outputs.e2e-full == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -1124,7 +1360,15 @@ jobs:
 
   e2e-4gpu-gateway:
     name: e2e-4gpu-gateway
-    needs: [e2e-1gpu-gateway]
+    needs: [e2e-1gpu-gateway, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.e2e-1gpu-gateway.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && needs.detect-changes.outputs.e2e-full == 'true'))
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
@@ -1138,6 +1382,15 @@ jobs:
   e2e-4gpu-epd:
     name: e2e-4gpu-epd (tokenspeed)
     needs: [e2e-1gpu-chat, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.e2e-1gpu-chat.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.e2e-full == 'true'
+                  || needs.detect-changes.outputs.e2e-epd == 'true')))
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: tokenspeed
@@ -1165,8 +1418,8 @@ jobs:
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+              && (needs.detect-changes.outputs.e2e-full == 'true'
+                  || needs.detect-changes.outputs.e2e-pd == 'true')))
     strategy:
       fail-fast: false
       matrix:
@@ -1235,7 +1488,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
+              && (needs.detect-changes.outputs.e2e-full == 'true'
                   || needs.detect-changes.outputs.agentic == 'true')))
     permissions:
       contents: read
@@ -1399,7 +1652,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
+              && (needs.detect-changes.outputs.e2e-full == 'true'
                   || needs.detect-changes.outputs.go-bindings == 'true')))
     runs-on: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
@@ -1538,7 +1791,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-engines, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1549,7 +1802,12 @@ jobs:
 
       # Self-check: every e2e-* job defined in this workflow must gate merge
       # via finish.needs AND the failure check below. Keeps a new (or
-      # forgotten) lane from silently becoming non-blocking.
+      # forgotten) lane from silently becoming non-blocking. The second half
+      # checks the path tiers: every lane keeps the main-push rule and reads
+      # a declared detect-changes output (an undeclared one compares '' and
+      # skips the lane on every pull request), and the fallback filter
+      # `unknown` excludes only paths another filter claims (an unclaimed
+      # exclusion would run no GPU lane at all).
       - name: Gate-integrity lint
         run: |
           python3 - <<'EOF'
@@ -1557,6 +1815,8 @@ jobs:
 
           path = ".github/workflows/pr-test-rust.yml"
           src = open(path).read()
+          errors = []
+
           jobs = re.findall(r"^  (e2e-[a-z0-9_-]*):", src, re.M)
           if not jobs:
               sys.exit("gate-integrity lint: found no e2e-* job definitions; lint is broken")
@@ -1578,13 +1838,65 @@ jobs:
               sys.exit("gate-integrity lint: could not locate the 'Check CI result' step")
           check_body = check.group(1)
           missing_check = sorted(j for j in jobs if f"needs.{j}.result" not in check_body)
-          if missing_needs or missing_check:
-              if missing_needs:
-                  print(f"e2e jobs missing from finish.needs: {missing_needs}")
-              if missing_check:
-                  print(f"e2e jobs missing from the finish failure check: {missing_check}")
+          if missing_needs:
+              errors.append(f"e2e jobs missing from finish.needs: {missing_needs}")
+          if missing_check:
+              errors.append(f"e2e jobs missing from the finish failure check: {missing_check}")
+
+          outputs = re.search(
+              r"^  detect-changes:\n.*?^    outputs:\n(.*?)(?=^    \S)", src, re.M | re.S
+          )
+          if not outputs:
+              sys.exit("gate-integrity lint: could not locate detect-changes.outputs")
+          declared = set(re.findall(r"^      ([a-z0-9-]+):", outputs.group(1), re.M))
+          used = set(re.findall(r"needs\.detect-changes\.outputs\.([a-z0-9-]+)", src))
+          undeclared = sorted(used - declared)
+          if undeclared:
+              errors.append(f"conditions read undeclared detect-changes outputs: {undeclared}")
+
+          for job in jobs + ["go-bindings-e2e", "benchmarks"]:
+              jb = re.search(rf"^  {re.escape(job)}:\n(.*?)(?=^  \S|\Z)", src, re.M | re.S)
+              if not jb:
+                  errors.append(f"{job}: job not found")
+                  continue
+              cond = re.search(r"^    if:(.*?)(?=^    [a-z_-]+:)", jb.group(1), re.M | re.S)
+              text = cond.group(1) if cond else ""
+              if "github.event_name != 'pull_request'" not in text:
+                  errors.append(f"{job}: the condition lacks the main-push rule")
+              if "needs.detect-changes.outputs." not in text:
+                  errors.append(f"{job}: the condition reads no detect-changes output")
+
+          block = re.search(r"^          filters: \|\n((?:            .*\n)+)", src, re.M)
+          if not block:
+              sys.exit("gate-integrity lint: could not locate the paths-filter block")
+          current, positives, unknown_neg, unknown_pos = None, set(), [], []
+          for line in block.group(1).splitlines():
+              m = re.match(r"^            ([a-z0-9-]+):\s*$", line)
+              if m:
+                  current = m.group(1)
+                  continue
+              m = re.match(r"^              - '(!?)([^']+)'\s*$", line)
+              if not m or current is None:
+                  continue
+              negated, pattern = m.group(1) == "!", m.group(2)
+              if current == "unknown":
+                  (unknown_neg if negated else unknown_pos).append(pattern)
+              elif not negated:
+                  positives.add(pattern)
+          if unknown_pos != ["**"]:
+              errors.append(f"the unknown filter must match '**' and nothing else: {unknown_pos}")
+          unclaimed = sorted(p for p in unknown_neg if p not in positives)
+          if unclaimed:
+              errors.append(f"paths excluded from the unknown filter that no filter claims: {unclaimed}")
+
+          if errors:
+              print("\n".join(errors))
               sys.exit(1)
-          print(f"OK: all {len(jobs)} e2e-* jobs gate merge: {sorted(jobs)}")
+          print(
+              f"OK: all {len(jobs)} e2e-* jobs gate merge: {sorted(jobs)}; "
+              f"{len(declared)} detect-changes outputs; "
+              f"{len(unknown_neg)} fallback exclusions, all claimed"
+          )
           EOF
 
       - name: Check CI result
@@ -1596,6 +1908,7 @@ jobs:
                 "${{ needs.python-unit-tests.result }}" == "failure" || \
                 "${{ needs.unit-tests.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
+                "${{ needs.e2e-1gpu-chat-engines.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
