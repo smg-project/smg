@@ -311,12 +311,23 @@ scores routing quality end to end.
 
 - Every `hash_id` becomes a deterministic text block (`--words-per-block`, 480
   words, about one token each), so rows that share ids share prompt prefixes
-  after the gateway tokenizes them.
+  after the gateway tokenizes them. Calibrate the knob against the real
+  tokenizer once per model: replay a few hundred rows, fit
+  `prompt_tokens = a + b * blocks` over the successful rows of `requests.csv`
+  (`blocks = ceil(trace_input_length / 512)`; `a` is the chat template's
+  overhead, `b` the tokens one block really produced), then set
+  `--words-per-block` to `480 * 512 / b` so a block is 512 tokens again (a
+  tokenizer with a ~150k vocabulary gives `b` near 481, i.e. 511 words).
 - Requests are sent open-loop at `timestamp / --speedup` as streaming chat
   completions with `stream_options.include_usage`, recording TTFT, inter-token
-  latencies, end-to-end latency, the serving worker (`system_fingerprint`, which
-  the gateway sets from the worker's `weight_version` label), and the
-  engine-reported `cached_tokens`.
+  latencies (a thinking model's streamed `reasoning_content` counts as output
+  for both, and separately as `reasoning_tokens` in the CSV), end-to-end
+  latency, the serving worker (`system_fingerprint`, which the gateway sets
+  from the worker's `weight_version` label), and the engine-reported
+  `cached_tokens`.
+- `--chat-template-kwargs '{"enable_thinking":false}'` sends the object as
+  `chat_template_kwargs` in every request, the way to turn a model's default
+  reasoning off without touching the trace.
 - With `--admin <mock admin url>` each request is joined with the mock fleet's
   record of it (`GET /admin/requests`), adding the arrival-time oracle (the most
   cached tokens any worker held when it arrived) and the queue wait.
