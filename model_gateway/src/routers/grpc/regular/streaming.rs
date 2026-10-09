@@ -10,7 +10,7 @@ use std::{
 
 use axum::response::Response;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::future::try_join_all;
+use futures::{future::try_join_all, FutureExt};
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
     traits::Tokenizer,
@@ -496,11 +496,23 @@ impl StreamingProcessor {
         let mut final_indices: Option<Vec<u32>> = None;
         loop {
             let response = if final_indices.is_none() {
-                grpc_stream
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| format!("Stream error: {}", e.message()))?
+                // Take what the engine has already sent before yielding, so
+                // the chunks of one wake leave as one frame of the response.
+                let item = match grpc_stream.next().now_or_never() {
+                    Some(item) => item,
+                    None => {
+                        Self::flush_chunks(tx, &mut sse_buffer).await?;
+                        grpc_stream.next().await
+                    }
+                };
+                match item.transpose() {
+                    Ok(response) => response,
+                    Err(e) => {
+                        // What was produced before the failure still goes out.
+                        Self::flush_chunks(tx, &mut sse_buffer).await?;
+                        return Err(format!("Stream error: {}", e.message()));
+                    }
+                }
             } else {
                 None
             };
@@ -656,7 +668,7 @@ impl StreamingProcessor {
             // Send first chunk with role
             if is_firsts.get(&index).copied().unwrap_or(true) {
                 let first_choice = assistant_choice(index, None, None, None);
-                Self::send_chunk(
+                Self::push_chunk(
                     tx,
                     &mut sse_buffer,
                     &chunk_frame,
@@ -692,7 +704,7 @@ impl StreamingProcessor {
                     if normal_text.is_empty() {
                         choice.logprobs = choice_logprobs.take();
                     }
-                    Self::send_chunk(
+                    Self::push_chunk(
                         tx,
                         &mut sse_buffer,
                         &chunk_frame,
@@ -749,7 +761,7 @@ impl StreamingProcessor {
                     };
 
                     for choice in &tool_choices {
-                        Self::send_chunk(
+                        Self::push_chunk(
                             tx,
                             &mut sse_buffer,
                             &chunk_frame,
@@ -771,7 +783,7 @@ impl StreamingProcessor {
             if !delta.is_empty() {
                 let mut choice = assistant_choice(index, Some(delta), None, None);
                 choice.logprobs = choice_logprobs;
-                Self::send_chunk(
+                Self::push_chunk(
                     tx,
                     &mut sse_buffer,
                     &chunk_frame,
@@ -783,6 +795,8 @@ impl StreamingProcessor {
                 .map_err(|()| "Failed to send content chunk".to_string())?;
             }
         }
+
+        Self::flush_chunks(tx, &mut sse_buffer).await?;
 
         let usage = continuous_usage.as_ref().map(|tracker| {
             tracker
@@ -1798,10 +1812,11 @@ impl StreamingProcessor {
         chunks
     }
 
-    /// Write one chat chunk carrying `choice` into `buffer` and hand its bytes
-    /// to the channel without copying them: `buffer` keeps its spare capacity
-    /// (and reclaims the rest once the client side has let go of the chunk).
-    async fn send_chunk(
+    /// Write one chat chunk carrying `choice` into `buffer`. The buffer goes
+    /// to the channel as one frame, without a copy, by [`Self::flush_chunks`]
+    /// once the engine has nothing more ready, or here once it holds
+    /// [`CHUNK_FLUSH_BYTES`].
+    async fn push_chunk(
         tx: &SseSender,
         buffer: &mut BytesMut,
         frame: &ChatChunkFrame,
@@ -1810,7 +1825,20 @@ impl StreamingProcessor {
         emit_usage_null: bool,
     ) -> Result<(), ()> {
         frame.write_chunk(buffer, choice, usage, emit_usage_null);
-        tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())
+        if buffer.len() >= CHUNK_FLUSH_BYTES {
+            tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    /// Hand the buffered chunks, if any, to the channel as one frame.
+    async fn flush_chunks(tx: &SseSender, buffer: &mut BytesMut) -> Result<(), String> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        tx.send(Ok(buffer.split().freeze()))
+            .await
+            .map_err(|_| "Failed to send chunks".to_string())
     }
 
     // =========================================================================
@@ -3576,6 +3604,10 @@ impl<'a> ChatChunkWithUsage<'a> {
         }
     }
 }
+
+/// Buffered chat chunks are flushed to the response channel at this size even
+/// while the engine keeps more ready, so one frame stays a bounded burst.
+const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 
 /// The SSE frame of the per-token chat chunks of one stream.
 ///

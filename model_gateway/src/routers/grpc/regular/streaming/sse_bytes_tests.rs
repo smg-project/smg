@@ -244,3 +244,60 @@ async fn chat_stream_bytes_match_the_recorded_fixtures() {
         );
     }
 }
+
+/// Chunks the engine has already delivered leave as one frame: the buffered
+/// stream here has every response ready at once, so the role and content
+/// chunks share a frame and only the finish chunk follows separately.
+#[tokio::test]
+async fn ready_chunks_share_one_frame() {
+    let scenario = Scenario {
+        name: "ready_chunks",
+        with_tools: false,
+        request: request("fixture-model", json!({})),
+        weight_version: None,
+        stop: None,
+        frames: vec![
+            chunk(0, "a"),
+            chunk(0, "b"),
+            chunk(0, "c"),
+            complete(0, "stop"),
+        ],
+        must_contain: r#""content":"c""#,
+    };
+    let (stream, server) = scripted_stream(scenario.frames.clone(), "0").await;
+    let (tx, mut rx) = sse_channel();
+    let request: ChatCompletionRequest =
+        serde_json::from_value(scenario.request.clone()).expect("chat request");
+    let dispatch = context::DispatchMetadata {
+        request_id: "chatcmpl-fixture".to_string(),
+        model: request.model.clone(),
+        created: 1_700_000_000,
+        weight_version: None,
+    };
+    let result = processor(false)
+        .process_streaming_chunks(
+            stream,
+            dispatch,
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            ChatResponseSpec::from(&request),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let mut frames = 0usize;
+    let mut events = 0usize;
+    while let Some(frame) = rx.recv().await {
+        let frame = frame.expect("successful SSE write");
+        frames += 1;
+        events += String::from_utf8_lossy(&frame).matches("data: ").count();
+    }
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(events, 5, "role, three content chunks and the finish chunk");
+    assert!(
+        frames <= 2,
+        "{events} ready events arrived in {frames} frames instead of one plus the finish chunk"
+    );
+}
