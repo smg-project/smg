@@ -99,8 +99,8 @@ def _alive(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat") as stat:  # a zombie is as dead as we need
             return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except FileNotFoundError:
-        return False
+    except (FileNotFoundError, ProcessLookupError):
+        return False  # reaped: before the open (ENOENT), or between it and the read (ESRCH)
 
 
 def _worker_pid(pid_file, deadline_secs: float = 10) -> int:
