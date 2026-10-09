@@ -127,9 +127,10 @@ fn load_prompts(root: &str, set: &str, max_tokens: usize) -> Vec<Prompt> {
             continue;
         }
         let text = std::fs::read_to_string(dir.join(format!("{stem}.txt"))).expect("prompt text");
-        let reference = std::fs::read_to_string(dir.join(format!("{stem}.ids")))
+        let ids_path = dir.join(format!("{stem}.ids"));
+        let reference = std::fs::read_to_string(&ids_path)
             .ok()
-            .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect());
+            .map(|s| reference_ids(&ids_path, &s));
         prompts.push(Prompt {
             name: stem,
             text,
@@ -137,6 +138,20 @@ fn load_prompts(root: &str, set: &str, max_tokens: usize) -> Vec<Prompt> {
         });
     }
     prompts
+}
+
+/// The reference ids of a prompt, one per line: a line that is not an id is
+/// an error (a silently dropped line could make a truncated reference "exact").
+fn reference_ids(path: &std::path::Path, contents: &str) -> Vec<u32> {
+    contents
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let context = format!("{}:{}: not a token id: {line:?}", path.display(), index + 1);
+            line.trim().parse().expect(&context)
+        })
+        .collect()
 }
 
 fn repetitions(tokens: usize) -> usize {
@@ -237,13 +252,19 @@ fn main() {
             );
             if threads > 1 {
                 let text = Arc::new(prompt.text.clone());
+                // Every worker starts its timed loop at the same moment, so
+                // the per-thread time is measured under `threads`-way
+                // contention from the first encode to the last.
+                let start = Arc::new(std::sync::Barrier::new(threads));
                 let t0 = Instant::now();
                 let handles: Vec<_> = (0..threads)
                     .map(|_| {
                         let tok = Arc::clone(&tok);
                         let text = Arc::clone(&text);
+                        let start = Arc::clone(&start);
                         std::thread::spawn(move || {
                             let reps = repetitions(tokens).max(4) / 4;
+                            start.wait();
                             let t0 = Instant::now();
                             for _ in 0..reps {
                                 let e = tok.encode(&text, false).expect("encode");
