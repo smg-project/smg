@@ -85,33 +85,74 @@ async fn request_log_lines_and_the_response_carry_the_trace_id() {
         .expect("router");
     let app = common::test_app::create_test_app_with_context(router.into(), app_context);
 
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .header("traceparent", format!("00-{TRACE_ID}-00f067aa0ba902b7-01"))
-        .body(Body::from(
-            json!({
-                "model": "mock-model",
-                "messages": [{"role": "user", "content": "trace me"}],
-                "max_tokens": 8
-            })
-            .to_string(),
-        ))
-        .expect("request");
-    let response = app.oneshot(request).await.expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let chat = |traceparent: Option<String>, tracestate: Option<&str>| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json");
+        if let Some(traceparent) = traceparent {
+            request = request.header("traceparent", traceparent);
+        }
+        if let Some(tracestate) = tracestate {
+            request = request.header("tracestate", tracestate);
+        }
+        request
+            .body(Body::from(
+                json!({
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": "trace me"}],
+                    "max_tokens": 8
+                })
+                .to_string(),
+            ))
+            .expect("request")
+    };
+    let traceparent_of = |response: &axum::response::Response| -> Vec<String> {
+        let traceparent = response
+            .headers()
+            .get("traceparent")
+            .expect("the response carries traceparent")
+            .to_str()
+            .expect("ascii traceparent");
+        let parts: Vec<String> = traceparent.split('-').map(str::to_owned).collect();
+        assert_eq!(parts.len(), 4, "traceparent {traceparent}");
+        parts
+    };
 
-    // The reply carries the trace context it was served under.
-    let traceparent = response
-        .headers()
-        .get("traceparent")
-        .expect("the response carries traceparent")
-        .to_str()
-        .expect("ascii traceparent");
-    let parts: Vec<&str> = traceparent.split('-').collect();
-    assert_eq!(parts.len(), 4, "traceparent {traceparent}");
-    assert_eq!(parts[1], TRACE_ID, "traceparent {traceparent}");
+    // The caller's trace context: its trace id is echoed, with its tracestate.
+    let response = app
+        .clone()
+        .oneshot(chat(
+            Some(format!("00-{TRACE_ID}-00f067aa0ba902b7-01")),
+            Some("vendor=a"),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(traceparent_of(&response)[1], TRACE_ID);
+    assert_eq!(
+        response
+            .headers()
+            .get("tracestate")
+            .map(|v| v.to_str().ok()),
+        Some(Some("vendor=a")),
+        "the caller's tracestate is echoed"
+    );
+    drop(response);
+
+    // No context: the minted trace id is echoed, and no tracestate.
+    let response = app
+        .clone()
+        .oneshot(chat(None, None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let minted = traceparent_of(&response)[1].clone();
+    assert!(
+        minted.len() == 32 && minted.chars().all(|c| c.is_ascii_hexdigit()),
+        "minted trace id {minted}"
+    );
+    assert_ne!(minted, TRACE_ID);
     assert!(
         response.headers().get("tracestate").is_none(),
         "no tracestate was sent, none is echoed"
@@ -135,9 +176,20 @@ async fn request_log_lines_and_the_response_carry_the_trace_id() {
             .any(|line| line["message"] == "finished processing request"),
         "no request end line among {lines:?}"
     );
-    for line in &lines {
-        assert_eq!(line["span"]["trace_id"], TRACE_ID, "log line {line}");
-    }
+    let trace_ids: Vec<&str> = lines
+        .iter()
+        .map(|line| line["span"]["trace_id"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        trace_ids.iter().filter(|id| **id == TRACE_ID).count(),
+        2,
+        "the caller's id on its two lines: {trace_ids:?}"
+    );
+    assert_eq!(
+        trace_ids.iter().filter(|id| **id == minted).count(),
+        2,
+        "the minted id on its two lines: {trace_ids:?}"
+    );
 }
 
 /// The JSON lines on the `smg::request` / `smg::response` targets.
