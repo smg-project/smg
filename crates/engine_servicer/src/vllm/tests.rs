@@ -2988,3 +2988,83 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     assert!(!server.engine_ready());
     server.stop(Duration::from_secs(5)).unwrap();
 }
+
+/// Many streams on one connection keep their own chunk sequences: every
+/// engine step carries one token for each of them, and each stream sees
+/// exactly its tokens, in order, then its own `Complete` with the full output
+/// and finish reason.
+#[tokio::test]
+async fn concurrent_streams_keep_their_own_chunk_sequences() {
+    const STREAMS: usize = 48;
+    const STEPS: u32 = 6;
+    fn token(stream: usize, step: u32) -> u32 {
+        1000 + u32::try_from(stream).unwrap() * 16 + step
+    }
+    let mut h = harness(model_info(), None).await;
+    let mut streams = Vec::with_capacity(STREAMS);
+    for i in 0..STREAMS {
+        let mut request = generate_request(&format!("c{i}"), true, Vec::new());
+        request.sampling_params.as_mut().unwrap().max_tokens = Some(STEPS);
+        streams.push(
+            h.client
+                .generate(request)
+                .await
+                .expect("generate")
+                .into_inner(),
+        );
+    }
+    let mut ids = BTreeSet::new();
+    for _ in 0..STREAMS {
+        ids.insert(recv_add(&mut h.engine_in).await.request_id);
+    }
+    assert_eq!(ids.len(), STREAMS);
+    for step in 0..STEPS {
+        let last = step + 1 == STEPS;
+        let outputs = (0..STREAMS)
+            .map(|i| EngineCoreOutput {
+                request_id: format!("c{i}"),
+                new_token_ids: vec![token(i, step)],
+                finish_reason: last.then_some(EngineCoreFinishReason::Length),
+                ..Default::default()
+            })
+            .collect();
+        h.engine_out
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 0,
+                outputs,
+                finished_requests: last.then(|| ids.clone()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+    }
+    for (i, stream) in streams.iter_mut().enumerate() {
+        let expected: Vec<u32> = (0..STEPS).map(|step| token(i, step)).collect();
+        let mut got = Vec::new();
+        loop {
+            let message = stream
+                .message()
+                .bounded()
+                .await
+                .unwrap()
+                .expect("a stream ends with its Complete");
+            match message.response {
+                Some(vllm::generate_response::Response::Chunk(chunk)) => {
+                    got.extend(chunk.token_ids);
+                }
+                Some(vllm::generate_response::Response::Complete(done)) => {
+                    assert_eq!(done.output_ids, expected, "stream {i}");
+                    assert_eq!(done.finish_reason, "length", "stream {i}");
+                    assert_eq!(done.completion_tokens, STEPS, "stream {i}");
+                    break;
+                }
+                other => panic!("stream {i}: unexpected response {other:?}"),
+            }
+        }
+        assert_eq!(
+            got, expected,
+            "stream {i}: the chunks are its tokens, in order"
+        );
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+}
