@@ -336,7 +336,7 @@ class Router:
         if provider == "file":
             if not args.discovery_file:
                 raise ValueError("discovery_provider='file' needs discovery_file")
-            discovery = {"provider": "file", "path": args.discovery_file}
+            discovery: dict[str, str | int] = {"provider": "file", "path": args.discovery_file}
             if args.discovery_check_interval_secs is not None:
                 discovery["check_interval_secs"] = args.discovery_check_interval_secs
             args_dict["discovery"] = discovery

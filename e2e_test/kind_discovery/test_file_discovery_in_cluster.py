@@ -33,8 +33,10 @@ needs_images = pytest.mark.skipif(
 
 
 def kubectl(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+    # kubectl's own request timeout defaults to none, so bound the process;
+    # longer than the 180s rollout waits this wraps.
     return subprocess.run(
-        ["kubectl", *args], input=stdin, check=True, capture_output=True, text=True
+        ["kubectl", *args], input=stdin, check=True, capture_output=True, text=True, timeout=300
     )
 
 
