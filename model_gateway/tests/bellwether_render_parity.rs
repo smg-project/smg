@@ -1388,19 +1388,25 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "step3/render/*",
-        "the gateway parses tool-call arguments into objects before rendering and this \
-         template writes them as the API's string, so a call in the history renders \
-         differently (smg-project/smg#2783); and the gateway renders continue_final_message \
-         by popping the assistant turn and appending its text after the generation header, \
-         which does not reproduce this template's continued turn (smg-project/smg#2779); and \
-         add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780); and the typed tool definitions drop the fields \
-         outside the function schema, here the `response` field of the BFCL multi-turn tools, \
-         and this template renders the tool object verbatim (smg-project/smg-lab#105); and \
-         the gateway renders the request's system message as a system turn of its own after \
-         the template's preamble, which already carries it (smg-project/smg-lab#109); and \
-         SMG's request schema types tool-call arguments as a string, as the API and the \
+        "step3/render/bfcl-multi-turn-*",
+        "the typed tool definitions drop the fields outside the function schema, here the \
+         `response` field of the BFCL multi-turn tools, and this template renders the tool \
+         object verbatim (smg-project/smg-lab#105)",
+    ),
+    (
+        "step3/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "step3/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "step3/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
