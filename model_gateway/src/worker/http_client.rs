@@ -11,7 +11,7 @@ use std::{
 };
 
 use openai_protocol::worker::HttpPoolConfig;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::config::RouterConfig;
 
@@ -136,40 +136,153 @@ impl WorkerHttpClientCache {
             0 => None,
             secs => Some(Duration::from_secs(secs)),
         };
-        let mut builder = reqwest::Client::builder()
-            .pool_max_idle_per_host(key.pool_max_idle_per_host)
-            .pool_idle_timeout(pool_idle_timeout)
-            .timeout(Duration::from_secs(key.timeout_secs))
-            .connect_timeout(Duration::from_secs(key.connect_timeout_secs))
-            .tcp_nodelay(true)
-            .tcp_keepalive(Some(Duration::from_secs(30)));
+        let identity = self
+            .client_identity
+            .as_deref()
+            .map(reqwest::Identity::from_pem)
+            .transpose()
+            .map_err(|e| format!("Failed to create client identity: {e}"))?;
+        let ca_certificates = self
+            .ca_certificates
+            .iter()
+            .map(|pem| reqwest::Certificate::from_pem(pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
 
-        if self.upstream_http2 {
-            builder = tune_http2(builder);
-        }
-        if key.http2 {
-            builder = builder.http2_prior_knowledge();
-        }
+        let make_builder = || {
+            let mut builder = reqwest::Client::builder()
+                .pool_max_idle_per_host(key.pool_max_idle_per_host)
+                .pool_idle_timeout(pool_idle_timeout)
+                .timeout(Duration::from_secs(key.timeout_secs))
+                .connect_timeout(Duration::from_secs(key.connect_timeout_secs))
+                .tcp_nodelay(true)
+                .tcp_keepalive(Some(Duration::from_secs(30)));
 
-        if has_tls {
-            builder = builder.use_rustls_tls();
-        }
+            if self.upstream_http2 {
+                builder = tune_http2(builder);
+            }
+            if key.http2 {
+                builder = builder.http2_prior_knowledge();
+            }
 
-        if let Some(identity_pem) = &self.client_identity {
-            let identity = reqwest::Identity::from_pem(identity_pem)
-                .map_err(|e| format!("Failed to create client identity: {e}"))?;
-            builder = builder.identity(identity);
-        }
+            if has_tls {
+                builder = builder.use_rustls_tls();
+            }
+            if let Some(identity) = &identity {
+                builder = builder.identity(identity.clone());
+            }
+            for cert in &ca_certificates {
+                builder = builder.add_root_certificate(cert.clone());
+            }
+            builder
+        };
+        build_client(make_builder, has_tls, "worker HTTP client")
+    }
+}
 
-        for ca_cert in &self.ca_certificates {
-            let cert = reqwest::Certificate::from_pem(ca_cert)
-                .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
-            builder = builder.add_root_certificate(cert);
+/// Build a `reqwest` client, tolerating a host without a native CA root store
+/// when the gateway has no TLS configuration of its own.
+///
+/// `reqwest`'s rustls backend loads the platform's root certificates while the
+/// client is built and refuses to build when it finds none (a minimal
+/// container image without the `ca-certificates` package, for example). A
+/// gateway whose workers are plaintext does not need them: with no client
+/// identity or CA bundle configured, the client is rebuilt without the
+/// platform store (HTTPS upstreams then fail at the handshake with an unknown
+/// issuer, which the warning explains) instead of refusing to start. With TLS
+/// configured the error is returned with its full cause chain, which
+/// `reqwest`'s top-level message ("builder error") omits.
+pub(crate) fn build_client(
+    make_builder: impl Fn() -> reqwest::ClientBuilder,
+    tls_configured: bool,
+    purpose: &str,
+) -> Result<reqwest::Client, String> {
+    let error = match make_builder().build() {
+        Ok(client) => return Ok(client),
+        Err(error) => error,
+    };
+    if tls_configured {
+        return Err(format!("Failed to create {purpose}: {}", describe(&error)));
+    }
+    match make_builder().tls_certs_only(std::iter::empty()).build() {
+        Ok(client) => {
+            warn!(
+                "Failed to create {purpose} with the platform's root certificates ({}); no TLS \
+                 client identity or CA bundle is configured, so it runs without a root store: \
+                 plaintext upstreams work, HTTPS upstreams fail until the ca-certificates \
+                 package is installed or SSL_CERT_FILE/SSL_CERT_DIR names a PEM bundle",
+                describe(&error)
+            );
+            Ok(client)
         }
+        Err(retry_error) => Err(format!(
+            "Failed to create {purpose}: {}",
+            describe(&retry_error)
+        )),
+    }
+}
 
-        builder
-            .build()
-            .map_err(|e| format!("Failed to create worker HTTP client: {e}"))
+/// `reqwest::Error` displays its kind alone ("builder error"); the cause is in
+/// its source chain. Spell the chain out and, when it is the missing platform
+/// root store, say what to do about it.
+fn describe(error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    if text.contains("No CA certificates were loaded") {
+        text.push_str(
+            " (no native CA root store: install the ca-certificates package or point \
+             SSL_CERT_FILE/SSL_CERT_DIR at a PEM bundle)",
+        );
+    }
+    text
+}
+
+/// Test support: run one `#[test]` of this binary in a child process whose
+/// certificate environment names no root certificate at all.
+#[cfg(test)]
+pub(crate) mod no_root_store {
+    use std::process::Command;
+
+    /// Names the case a child-body test runs; unset in the parent process,
+    /// where the child-body tests return at once.
+    pub(crate) const CASE: &str = "SMG_TEST_NO_ROOT_STORE_CASE";
+
+    /// The libtest name of `test` in `module` (a `module_path!()`, which
+    /// carries the crate name libtest leaves out).
+    pub(crate) fn test_name(module: &str, test: &str) -> String {
+        let module = module.strip_prefix("smg::").unwrap_or(module);
+        format!("{module}::{test}")
+    }
+
+    /// Run `test` in a child process with `SSL_CERT_FILE` naming an empty
+    /// bundle and `SSL_CERT_DIR` an empty directory, so the platform
+    /// verifier finds no root certificate, and assert that it passes.
+    pub(crate) fn run(test: &str, case: &str) {
+        let dir =
+            std::env::temp_dir().join(format!("smg-no-root-store-{}-{case}", std::process::id()));
+        let empty_dir = dir.join("certs");
+        std::fs::create_dir_all(&empty_dir).expect("temp dir");
+        let empty_bundle = dir.join("empty.pem");
+        std::fs::write(&empty_bundle, b"").expect("empty bundle");
+
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([test, "--exact", "--test-threads=1"])
+            .env(CASE, case)
+            .env("SSL_CERT_FILE", &empty_bundle)
+            .env("SSL_CERT_DIR", &empty_dir)
+            .output()
+            .expect("run the child test");
+        assert!(
+            output.status.success(),
+            "child test {test} ({case}) failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -186,6 +299,83 @@ mod tests {
             upstream_http2: true,
             ..RouterConfig::default()
         })
+    }
+
+    /// A throwaway self-signed certificate with its key, as a client identity.
+    fn self_signed_identity_pem() -> Vec<u8> {
+        use openssl::{
+            asn1::Asn1Time,
+            hash::MessageDigest,
+            pkey::PKey,
+            rsa::Rsa,
+            x509::{X509NameBuilder, X509},
+        };
+
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "test-client").unwrap();
+        let name = name.build();
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        let mut pem = builder.build().to_pem().unwrap();
+        pem.extend(key.private_key_to_pem_pkcs8().unwrap());
+        pem
+    }
+
+    /// Child-process body of the two root-store tests below (see
+    /// `no_root_store`); a no-op unless the case variable is set.
+    #[test]
+    fn child_builds_without_native_roots() {
+        let Ok(case) = std::env::var(no_root_store::CASE) else {
+            return;
+        };
+        match case.as_str() {
+            "plaintext" => {
+                cache(RouterConfig::default())
+                    .get(&HttpPoolConfig::default(), false)
+                    .expect("a plaintext worker client needs no root store");
+            }
+            "tls" => {
+                let error = cache(RouterConfig {
+                    client_identity: Some(self_signed_identity_pem()),
+                    ..RouterConfig::default()
+                })
+                .get(&HttpPoolConfig::default(), false)
+                .expect_err("a client identity needs a root store");
+                assert!(
+                    error.contains("No CA certificates were loaded"),
+                    "cause missing: {error}"
+                );
+                assert!(error.contains("SSL_CERT_FILE"), "hint missing: {error}");
+            }
+            other => panic!("unknown case {other}"),
+        }
+    }
+
+    #[test]
+    fn plaintext_worker_clients_build_without_a_native_root_store() {
+        no_root_store::run(
+            &no_root_store::test_name(module_path!(), "child_builds_without_native_roots"),
+            "plaintext",
+        );
+    }
+
+    #[test]
+    fn a_missing_root_store_is_named_when_tls_is_configured() {
+        no_root_store::run(
+            &no_root_store::test_name(module_path!(), "child_builds_without_native_roots"),
+            "tls",
+        );
     }
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge

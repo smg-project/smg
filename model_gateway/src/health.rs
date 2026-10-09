@@ -424,16 +424,14 @@ pub fn start_probe_listener(
     port: u16,
     probe_state: Arc<ProbeState>,
 ) -> Result<SocketAddr, String> {
-    // Parse host+port exactly like the main listener (server.rs): a
-    // `host:port` SocketAddr parse handles bracketed IPv6 literals
-    // (`[::1]`, `[::]`) that a bare `IpAddr::parse` of the host rejects, and
-    // a bad host is a hard error rather than a silent rebind to 0.0.0.0
-    // (which would hide a config typo and widen exposure). `port` may be 0
-    // here on purpose — the ephemeral-port tests bind through this path; the
-    // config-sourced value is rejected for 0 at the validation layer.
-    let addr: SocketAddr = format!("{host}:{port}")
-        .parse()
-        .map_err(|err| format!("invalid probe listener host '{host}': {err}"))?;
+    // Parse host+port exactly like the main listener (server.rs), through the
+    // shared bind-host rule: IPv6 with or without brackets (`::`, `[::]`,
+    // `::1`), and a bad host is a hard error rather than a silent rebind to
+    // 0.0.0.0 (which would hide a config typo and widen exposure). `port` may
+    // be 0 here on purpose — the ephemeral-port tests bind through this path;
+    // the config-sourced value is rejected for 0 at the validation layer.
+    let addr = crate::config::bind_socket_addr(host, port)
+        .map_err(|err| format!("probe listener: {err}"))?;
 
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|err| format!("failed to bind probe listener on {addr}: {err}"))?;
@@ -877,6 +875,21 @@ mod tests {
         assert!(body.contains("draining"), "got: {body}");
         let (status, _) = get_probe(&router, "/liveness").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn probe_listener_accepts_ipv6_with_or_without_brackets() {
+        // Nothing to assert on a host without an IPv6 loopback.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        let state = ProbeState::new(InFlightRequestTracker::new());
+        for host in ["::1", "[::1]"] {
+            let addr = start_probe_listener(host, 0, state.clone()).unwrap();
+            assert!(addr.ip().is_ipv6(), "host {host} bound {addr}");
+        }
+        let err = start_probe_listener("probe-host", 0, state).unwrap_err();
+        assert!(err.contains("invalid bind host 'probe-host'"), "got: {err}");
     }
 
     #[tokio::test]

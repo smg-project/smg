@@ -237,6 +237,22 @@ pub(crate) fn batch_sub_id(shared: &str, index: usize, unique: bool) -> String {
     }
 }
 
+/// What a tokenized `Generate` carries as `original_text` next to its ids.
+///
+/// Workers generate from the ids. The text is read only by the worker-side
+/// media processors, which hand it on as the prompt's text next to the ids,
+/// so a request that carries media keeps it; a text-only request sends the
+/// ids alone. The rendered text of a 1M-token prompt is about 4 MB: next to
+/// its ~2 MB of ids it tripled every Generate and stayed resident in the
+/// router for the life of each in-flight request.
+pub(crate) fn wire_prompt_text(rendered_prompt: String, carries_media: bool) -> String {
+    if carries_media {
+        rendered_prompt
+    } else {
+        String::new()
+    }
+}
+
 impl IdStamp {
     /// Re-mint the retained plan's engine id(s) for a retry attempt. A plan
     /// shape that doesn't match the stamp is a build-stage wiring bug: fail
@@ -1467,6 +1483,24 @@ mod epd_restamp_tests {
         assert_eq!(
             kv.bootstrap_host, new_prefill_host,
             "KV rendezvous names the newly selected prefill"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wire_prompt_text_tests {
+    use super::wire_prompt_text;
+
+    #[test]
+    fn a_text_only_request_sends_no_prompt_text() {
+        assert_eq!(wire_prompt_text("<|user|>hello".to_string(), false), "");
+    }
+
+    #[test]
+    fn a_request_with_media_keeps_its_prompt_text() {
+        assert_eq!(
+            wire_prompt_text("<|user|><|image|>describe".to_string(), true),
+            "<|user|><|image|>describe"
         );
     }
 }

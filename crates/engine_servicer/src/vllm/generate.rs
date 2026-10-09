@@ -4,7 +4,7 @@
 //! `Abort` RPC can end.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::{atomic::Ordering, Arc},
@@ -19,7 +19,7 @@ use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
 use tokio::sync::oneshot;
-use tonic::Status;
+use tonic::{metadata::MetadataMap, Status};
 
 use super::{media::process_media_refs, State};
 use crate::{
@@ -29,15 +29,31 @@ use crate::{
 };
 
 /// Handle one `Generate` request against the connected engine.
+/// `trace_headers` is the caller's W3C trace context (see [`trace_headers`]).
 pub(super) async fn generate(
     state: &Arc<State>,
     req: vllm::GenerateRequest,
+    trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
     let client = state.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
-    submit(state, client, req).await
+    submit(state, client, req, trace_headers).await
+}
+
+/// The W3C trace context the Router sent in the call's metadata, in the
+/// shape vLLM's own frontend hands its tracer: the `trace_headers` of the
+/// engine request. `None` when the call carries no context.
+pub(super) fn trace_headers(metadata: &MetadataMap) -> Option<BTreeMap<String, String>> {
+    let headers: BTreeMap<String, String> = ["traceparent", "tracestate"]
+        .into_iter()
+        .filter_map(|name| {
+            let value = metadata.get(name)?.to_str().ok()?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect();
+    (!headers.is_empty()).then_some(headers)
 }
 
 /// The rejection notice a refused PD decode leg owes its prefill side, so the
@@ -108,6 +124,7 @@ async fn submit(
     state: &Arc<State>,
     client: &ZmqEngineClient,
     mut req: vllm::GenerateRequest,
+    trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
     // A PD decode leg refused before admission still owes its prefill side
     // the notice: armed from the first refusal below until the engine can
@@ -169,7 +186,7 @@ async fn submit(
         _ => 0,
     };
     let subs = match client
-        .generate_vllm_streams_with_media(req, processed_media)
+        .generate_vllm_streams_with_media(req, processed_media, trace_headers)
         .await
     {
         Ok(subs) => subs,

@@ -24,7 +24,7 @@ use crate::{
 };
 
 #[derive(Default)]
-struct CharacterTokenizer {
+pub(super) struct CharacterTokenizer {
     special_tokens: SpecialTokens,
 }
 
@@ -75,7 +75,7 @@ impl Tokenizer for CharacterTokenizer {
     }
 }
 
-fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
+pub(super) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
     let token_ids: Vec<_> = text.chars().map(u32::from).collect();
     proto::GenerateResponse {
         response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
@@ -87,11 +87,28 @@ fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
     }
 }
 
-fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
+/// A chunk that also reports one logprob per token.
+pub(super) fn chunk_with_logprobs(index: u32, text: &str) -> proto::GenerateResponse {
+    let mut response = chunk(index, text);
+    if let Some(GenerationEvent::Chunk(chunk)) = &mut response.response {
+        chunk.output_logprobs = Some(proto::OutputLogProbs {
+            token_logprobs: vec![-0.5; chunk.token_ids.len()],
+            token_ids: chunk.token_ids.clone(),
+            top_logprobs: Vec::new(),
+        });
+    }
+    response
+}
+
+pub(super) fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
     complete_with_prompt(index, reason, 1)
 }
 
-fn complete_with_prompt(index: u32, reason: &str, prompt_tokens: u32) -> proto::GenerateResponse {
+pub(super) fn complete_with_prompt(
+    index: u32,
+    reason: &str,
+    prompt_tokens: u32,
+) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenerationEvent::Complete(proto::GenerateComplete {
             index,
@@ -109,7 +126,7 @@ fn complete_with_prompt(index: u32, reason: &str, prompt_tokens: u32) -> proto::
     clippy::disallowed_methods,
     reason = "bounded test fixture; server task is explicitly aborted"
 )]
-async fn scripted_stream(
+pub(super) async fn scripted_stream(
     responses: Vec<proto::GenerateResponse>,
     grpc_status: &'static str,
 ) -> (ProtoStream, JoinHandle<()>) {
@@ -167,7 +184,7 @@ async fn scripted_stream(
     (ProtoStream::Vllm(stream), server)
 }
 
-fn processor(with_tools: bool) -> StreamingProcessor {
+pub(super) fn processor(with_tools: bool) -> StreamingProcessor {
     StreamingProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
@@ -327,6 +344,44 @@ async fn chat_stream_error_does_not_flush_a_success_tail() {
     assert!(events
         .iter()
         .all(|event| event["choices"][0]["finish_reason"].is_null()));
+}
+
+/// Token logprobs reach the client on reasoning deltas as they do on content
+/// deltas: a chunk whose text is all reasoning carries its logprobs there.
+#[tokio::test]
+async fn chat_stream_keeps_logprobs_on_reasoning_deltas() {
+    let (result, events) = chat_events(
+        vec![
+            chunk_with_logprobs(0, "<think>why"),
+            chunk_with_logprobs(0, "</think>ok"),
+            complete(0, "stop"),
+        ],
+        false,
+        "0",
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "why");
+    assert_eq!(chat_text(&events, 0, "content"), "ok");
+    let mut with_text = 0;
+    for event in &events {
+        let choice = &event["choices"][0];
+        let delta = &choice["delta"];
+        let has_text = delta["reasoning_content"].is_string()
+            || delta["content"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty());
+        if has_text {
+            with_text += 1;
+            assert!(
+                choice["logprobs"]["content"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                "text delta without logprobs: {event}"
+            );
+        }
+    }
+    assert!(with_text >= 2, "{events:?}");
 }
 
 #[tokio::test]

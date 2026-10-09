@@ -130,6 +130,17 @@ impl CircuitBreaker {
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         let init_state = CircuitState::Closed;
         Metrics::set_worker_cb_state(&metric_label, init_state.as_int());
+        // Every transition this state machine can make, at zero, so the
+        // family is on the first scrape and `increase()` sees the first trip.
+        for (from, to) in [
+            (CircuitState::Closed, CircuitState::Open),
+            (CircuitState::Open, CircuitState::HalfOpen),
+            (CircuitState::Open, CircuitState::Closed),
+            (CircuitState::HalfOpen, CircuitState::Closed),
+            (CircuitState::HalfOpen, CircuitState::Open),
+        ] {
+            Metrics::init_worker_cb_transition(&metric_label, from.as_str(), to.as_str());
+        }
         Self {
             state: AtomicU8::new(STATE_CLOSED),
             consecutive_failures: AtomicU32::new(0),
@@ -198,7 +209,12 @@ impl CircuitBreaker {
                     self.consecutive_failures.store(0, Ordering::Release);
                     self.consecutive_successes.store(0, Ordering::Release);
 
-                    info!("Circuit breaker state transition: open -> half_open");
+                    info!(
+                        worker_url = %self.metric_label,
+                        from = "open",
+                        to = "half_open",
+                        "Circuit breaker state transition: open -> half_open"
+                    );
                     Metrics::record_worker_cb_transition(&self.metric_label, "open", "half_open");
                     self.publish_state_gauge();
                     self.publish_gauge_metrics();
@@ -240,7 +256,10 @@ impl CircuitBreaker {
             }
             CircuitState::Closed => {}
             CircuitState::Open => {
-                tracing::warn!("Success recorded while circuit is open");
+                tracing::warn!(
+                    worker_url = %self.metric_label,
+                    "Success recorded while circuit is open"
+                );
             }
         }
     }
@@ -293,7 +312,12 @@ impl CircuitBreaker {
 
             let from = old_state.as_str();
             let to = new_state.as_str();
-            info!("Circuit breaker state transition: {} -> {}", from, to);
+            info!(
+                worker_url = %self.metric_label,
+                from,
+                to,
+                "Circuit breaker state transition: {from} -> {to}"
+            );
             Metrics::record_worker_cb_transition(&self.metric_label, from, to);
             self.publish_state_gauge();
             self.publish_gauge_metrics();
@@ -438,7 +462,62 @@ pub struct CircuitBreakerStats {
 mod tests {
     use std::thread;
 
+    use tracing_test::traced_test;
+
     use super::*;
+
+    /// Every transition line names the worker and carries both states as
+    /// fields, so a transition in a fleet's log can be attributed to its
+    /// worker without a scrape of `smg_worker_cb_transitions_total`.
+    #[traced_test]
+    #[test]
+    fn transition_logs_name_the_worker_and_both_states() {
+        let worker_url = "grpc://[fd00::1]:50051";
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_duration: Duration::ZERO,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, worker_url.to_string());
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.force_open();
+        cb.record_success();
+
+        for (from, to) in [
+            ("closed", "open"),
+            ("open", "half_open"),
+            ("half_open", "closed"),
+        ] {
+            assert!(
+                logs_contain(&format!("Circuit breaker state transition: {from} -> {to}")),
+                "{from} -> {to} not logged"
+            );
+            // String fields render quoted in the text format.
+            assert!(logs_contain(&format!(r#"from="{from}" to="{to}""#)));
+        }
+        assert!(logs_contain("Success recorded while circuit is open"));
+        logs_assert(|lines: &[&str]| {
+            let breaker_lines: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("Circuit breaker") || line.contains("circuit is open"))
+                .collect();
+            if breaker_lines.len() != 5 {
+                return Err(format!("expected 5 breaker lines, got {breaker_lines:?}"));
+            }
+            match breaker_lines
+                .iter()
+                .find(|line| !line.contains(&format!("worker_url={worker_url}")))
+            {
+                Some(line) => Err(format!("breaker line without the worker: {line}")),
+                None => Ok(()),
+            }
+        });
+    }
 
     #[test]
     fn test_circuit_breaker_initial_state() {

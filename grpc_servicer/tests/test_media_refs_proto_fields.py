@@ -52,16 +52,21 @@ class TestGetServerInfoResponseMediaFields:
         fields = vllm_engine_pb2.GetServerInfoResponse.DESCRIPTOR.fields_by_name
         assert fields["mm_processor"].number == 16
         assert fields["mm_media_ref_schemes"].number == 17
+        assert fields["mm_item_limits"].number == 21
 
     def test_empty_by_default(self):
         info = vllm_engine_pb2.GetServerInfoResponse()
         assert info.mm_processor == ""
         assert info.mm_media_ref_schemes == ""
+        assert info.mm_item_limits == ""
 
     def test_roundtrip(self):
         info = vllm_engine_pb2.GetServerInfoResponse(
-            mm_processor="inprocess", mm_media_ref_schemes="http,https,data"
+            mm_processor="inprocess",
+            mm_media_ref_schemes="http,https,data",
+            mm_item_limits="image=8,video=2",
         )
         parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
         assert parsed.mm_processor == "inprocess"
         assert parsed.mm_media_ref_schemes == "http,https,data"
+        assert parsed.mm_item_limits == "image=8,video=2"

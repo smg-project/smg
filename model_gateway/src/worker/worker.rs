@@ -593,6 +593,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn token_progress_age(&self) -> Duration {
         Duration::ZERO
     }
+
+    /// Record a load record pushed on the worker's own KV-event stream: from
+    /// here on the worker is expected to be heard from at the stream's
+    /// cadence (see [`super::liveness`]).
+    fn note_load_record(&self) {}
+
+    /// Whether the worker's stream has ever pushed a load record.
+    fn pushes_load_records(&self) -> bool {
+        false
+    }
     /// Record the start of a request whose responses the gateway sees one by
     /// one (a streaming generation to this worker over gRPC): the pile the
     /// wedged rule counts, and the start of its clock when a run begins.
@@ -710,18 +720,31 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// pass the status code returned to the client (e.g., 502 for a send
     /// error, 504 for a timeout).
     fn record_outcome(&self, status_code: u16) {
-        let resilience = self.resilience();
         // Capacity pushback (429 by default) is a routing signal, not a
         // worker fault: the request is retried elsewhere, but no
         // circuit-breaker sample is recorded in either direction — opening
         // the breaker on backpressure would amplify a load spike into
         // unavailability, and crediting a success would close a half-open
         // breaker on a request the worker refused.
-        if resilience.capacity_status_codes.contains(&status_code) {
+        if self
+            .resilience()
+            .capacity_status_codes
+            .contains(&status_code)
+        {
             return;
         }
-        let is_failure = resilience.retryable_status_codes.contains(&status_code);
-        self.record_circuit_breaker_outcome(!is_failure);
+        self.record_circuit_breaker_outcome(!self.is_breaker_failure(status_code));
+    }
+
+    /// Whether `status_code` counts as a circuit-breaker failure for this
+    /// worker: a status in its `retryable_status_codes` that is not capacity
+    /// pushback. The per-request accounting in
+    /// `routers::common::attempt_ledger` asks this before charging, so a
+    /// request's retries charge a worker once.
+    fn is_breaker_failure(&self, status_code: u16) -> bool {
+        let resilience = self.resilience();
+        !resilience.capacity_status_codes.contains(&status_code)
+            && resilience.retryable_status_codes.contains(&status_code)
     }
 
     /// Get the resolved resilience config for this worker.
@@ -1361,6 +1384,9 @@ pub struct WorkerRuntime {
     last_waiting_reqs: AtomicI64,
     /// A transport failure happened since the last contact.
     transport_failed: AtomicBool,
+    /// The worker's KV-event stream has pushed a load record: silence is
+    /// then judged by the stream's cadence (see [`super::liveness`]).
+    pushed_loads: AtomicBool,
     /// In-flight count at the previous liveness sweep.
     last_load_sample: AtomicUsize,
     /// Woken on every contact, so a loop backing off from this worker (the
@@ -1422,6 +1448,7 @@ impl WorkerRuntime {
             last_token_ms: AtomicU64::new(super::liveness::now_ms()),
             last_waiting_reqs: AtomicI64::new(0),
             transport_failed: AtomicBool::new(false),
+            pushed_loads: AtomicBool::new(false),
             last_load_sample: AtomicUsize::new(0),
             contact_wake: Arc::new(Notify::new()),
             admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
@@ -1522,6 +1549,14 @@ impl WorkerRuntime {
 
     pub fn contact_age(&self) -> Duration {
         Self::age_of(self.last_contact_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn note_load_record(&self) {
+        self.pushed_loads.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pushes_load_records(&self) -> bool {
+        self.pushed_loads.load(Ordering::Relaxed)
     }
 
     /// Time without a token or completion, counted from the later of the last
@@ -2252,6 +2287,14 @@ impl Worker for BasicWorker {
 
     fn token_progress_age(&self) -> Duration {
         self.runtime.load().token_progress_age()
+    }
+
+    fn note_load_record(&self) {
+        self.runtime.load().note_load_record();
+    }
+
+    fn pushes_load_records(&self) -> bool {
+        self.runtime.load().pushes_load_records()
     }
 
     fn swap_waiting_reqs(&self, waiting: i64) -> i64 {

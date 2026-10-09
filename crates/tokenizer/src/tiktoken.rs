@@ -14,6 +14,7 @@ use tiktoken_rs::{
 };
 
 use crate::{
+    byte_level::{ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId},
     chat_template::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
@@ -28,8 +29,9 @@ use crate::{
     factory::discover_chat_template_in_dir,
     kimi_k2_tokenizer,
     traits::{
-        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding,
-        RendererCapabilities, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
+        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
+        PromptEncoding, RendererCapabilities, SpecialTokens, TokenIdType,
+        Tokenizer as TokenizerTrait,
     },
 };
 
@@ -190,6 +192,10 @@ pub struct TiktokenTokenizer {
     eos_token_ids: Vec<TokenIdType>,
     skip_token_ids: HashSet<TokenIdType>,
     renderer: Renderer,
+    /// Bytes per id, for the per-stream decoder (see `byte_level`); `None`
+    /// for a vocabulary whose ids lie too far apart for a dense table, which
+    /// streams through the generic decoder.
+    byte_level: Option<Arc<ByteLevelTable>>,
 }
 
 /// Supported Tiktoken models
@@ -242,6 +248,7 @@ impl TiktokenTokenizer {
             TiktokenModel::P50kBase | TiktokenModel::P50kEdit => 50281,
             TiktokenModel::R50kBase => 50257,
         };
+        let byte_level = byte_level_table(&tokenizer, vocab_size, &skip_token_ids);
 
         Ok(TiktokenTokenizer {
             tokenizer,
@@ -253,6 +260,7 @@ impl TiktokenTokenizer {
             eos_token_ids: Vec::new(), // No directory path in from_model
             skip_token_ids,
             renderer: Renderer::Jinja,
+            byte_level,
         })
     }
 
@@ -356,6 +364,7 @@ impl TiktokenTokenizer {
 
         // Detect which chat-template renderer to use based on config.json::architectures
         let renderer = detect_renderer_from_config(dir);
+        let byte_level = byte_level_table(&tokenizer, vocab_size, &config.skip_token_ids);
 
         Ok(TiktokenTokenizer {
             tokenizer,
@@ -367,6 +376,7 @@ impl TiktokenTokenizer {
             eos_token_ids,
             skip_token_ids: config.skip_token_ids,
             renderer,
+            byte_level,
         })
     }
 
@@ -467,6 +477,50 @@ fn build_vocab_maps(
     }
 
     (vocab, reverse_vocab)
+}
+
+/// The largest id range a dense per-id byte table is built for. Every real
+/// vocabulary ends far below it (o200k at 200,019, Kimi K3 at its 163,840
+/// ranks plus the specials); a `tokenizer_config.json` whose added-token ids
+/// lie far beyond the ranks would otherwise cost about nine bytes and one
+/// BPE lookup per id up to the largest one, so such a vocabulary keeps the
+/// generic per-stream decoder instead.
+const MAX_BYTE_LEVEL_TABLE_IDS: usize = 1 << 22;
+
+/// The bytes every id decodes to, read back from the BPE: a rank's byte
+/// string, a special token's text. Every id up to the largest rank or special
+/// id gets an entry; `skip_token_ids` marks the ones `skip_special_tokens`
+/// strips, as `decode` strips them. `None` when the ids reach past
+/// [`MAX_BYTE_LEVEL_TABLE_IDS`].
+fn byte_level_table(
+    bpe: &CoreBPE,
+    vocab_size: usize,
+    skip_token_ids: &HashSet<TokenIdType>,
+) -> Option<Arc<ByteLevelTable>> {
+    let ids_end = skip_token_ids
+        .iter()
+        .map(|&id| id as usize + 1)
+        .max()
+        .unwrap_or(0)
+        .max(vocab_size);
+    if ids_end > MAX_BYTE_LEVEL_TABLE_IDS {
+        tracing::debug!(
+            ids_end,
+            "tiktoken ids too sparse for a per-id byte table; streams use the generic decoder"
+        );
+        return None;
+    }
+    let mut table = ByteLevelTableBuilder::with_capacity(ids_end);
+    for id in 0..ids_end {
+        let Ok(id) = TokenIdType::try_from(id) else {
+            break;
+        };
+        match bpe.decode_bytes(&[id]) {
+            Ok(bytes) => table.push(&bytes, skip_token_ids.contains(&id)),
+            Err(_) => table.push_absent(),
+        }
+    }
+    Some(table.finish())
 }
 
 /// Find a tiktoken model file in the given directory.
@@ -590,6 +644,24 @@ impl Decoder for TiktokenTokenizer {
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
         }
+    }
+
+    /// Every id stands for fixed bytes, so one stream needs only a
+    /// pending-bytes buffer: no window re-decoded per token, and a character
+    /// that merely spans tokens is held back, not a decode failure. An id the
+    /// vocabulary lacks fails the stream, as `decode` fails on it. A
+    /// vocabulary without the table (see [`MAX_BYTE_LEVEL_TABLE_IDS`]) streams
+    /// through the generic decoder.
+    fn incremental_decoder(
+        &self,
+        skip_special_tokens: bool,
+    ) -> Option<Box<dyn IncrementalDecoder>> {
+        let table = self.byte_level.as_ref()?;
+        Some(Box::new(ByteLevelIncremental::new(
+            Arc::clone(table),
+            skip_special_tokens,
+            UnknownId::Reject,
+        )))
     }
 }
 
@@ -807,10 +879,54 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
-    use crate::traits::{Decoder, Encoder, Tokenizer};
+    use crate::{
+        sequence::Sequence,
+        traits::{Decoder, Encoder, Tokenizer},
+    };
 
     const MINIMAL_TIKTOKEN_MODEL: &str = "YQ== 0\nYg== 1\n";
+
+    /// Counts the WARN events of the thread it is the default subscriber on.
+    struct WarnCount(Arc<Mutex<usize>>);
+
+    impl tracing::Subscriber for WarnCount {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Run `f` and count the warnings it logs.
+    fn warnings_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let count = Arc::new(Mutex::new(0));
+        let guard = tracing::subscriber::set_default(WarnCount(Arc::clone(&count)));
+        let out = f();
+        drop(guard);
+        let warnings = *count.lock().unwrap();
+        (out, warnings)
+    }
+
+    /// The pieces the gateway's per-stream decoder emits for `ids`, one per id.
+    fn stream(tokenizer: &Arc<dyn Tokenizer>, ids: &[TokenIdType], skip: bool) -> Vec<String> {
+        let mut sequence = Sequence::new_with_options(Arc::clone(tokenizer), skip);
+        ids.iter()
+            .map(|&id| sequence.append_token(id).unwrap())
+            .collect()
+    }
 
     fn write_minimal_tiktoken_dir(
         tokenizer_config: &str,
@@ -1111,6 +1227,132 @@ mod tests {
         (0u32..256)
             .map(|b| format!("{} {}\n", STANDARD.encode([b as u8]), b))
             .collect()
+    }
+
+    /// The byte vocabulary plus two merges that split characters across
+    /// tokens, the first two bytes of '中' (E4 B8) and of '😀' (F0 9F), a
+    /// special `[EOS]` and a kept `<|open|>`.
+    fn split_vocabulary_dir() -> tempfile::TempDir {
+        let mut model = full_byte_tiktoken_model();
+        model.push_str(&format!("{} 256\n", STANDARD.encode([0xE4, 0xB8])));
+        model.push_str(&format!("{} 257\n", STANDARD.encode([0xF0, 0x9F])));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tiktoken.model"), model).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder": {
+                "300": {"content": "[EOS]", "special": true},
+                "301": {"content": "<|open|>", "special": false}
+            }}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_incremental_decode_holds_a_split_character_without_a_lossy_fallback() {
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(split_vocabulary_dir().path()).unwrap());
+        let ids = tokenizer
+            .encode("a中😀b", false)
+            .unwrap()
+            .token_ids()
+            .to_vec();
+        // '中' over two tokens, '😀' over three.
+        assert_eq!(ids, [0x61, 256, 0xAD, 257, 0x98, 0x80, 0x62]);
+
+        let (pieces, warnings) = warnings_during(|| stream(&tokenizer, &ids, false));
+        assert_eq!(pieces, ["a", "", "中", "", "", "😀", "b"]);
+        assert_eq!(pieces.concat(), tokenizer.decode(&ids, false).unwrap());
+        assert_eq!(
+            warnings, 0,
+            "a character spanning tokens is not a decode failure"
+        );
+    }
+
+    #[test]
+    fn test_incremental_decode_reports_invalid_bytes_once_per_stream() {
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(split_vocabulary_dir().path()).unwrap());
+        // A lone continuation byte, text, a lone lead byte, text.
+        let ids = [0xAD, 0x61, 0xE4, 0x62];
+        let (pieces, warnings) = warnings_during(|| stream(&tokenizer, &ids, false));
+        assert_eq!(pieces, ["", "\u{FFFD}a", "", "\u{FFFD}b"]);
+        assert_eq!(pieces.concat(), tokenizer.decode(&ids, false).unwrap());
+        assert_eq!(warnings, 1, "invalid bytes are reported once per stream");
+    }
+
+    #[test]
+    fn test_incremental_decode_follows_the_skip_flag() {
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(split_vocabulary_dir().path()).unwrap());
+        let ids = [0x61, 300, 301, 0x62];
+        assert_eq!(
+            stream(&tokenizer, &ids, false),
+            ["a", "[EOS]", "<|open|>", "b"]
+        );
+        assert_eq!(stream(&tokenizer, &ids, true), ["a", "", "<|open|>", "b"]);
+    }
+
+    #[test]
+    fn test_incremental_decode_rejects_unknown_ids_like_decode() {
+        let dir = write_minimal_tiktoken_dir(
+            r#"{"added_tokens_decoder": {"2": {"content": "[BOS]", "special": true}}}"#,
+            None,
+        );
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(dir.path()).unwrap());
+        let mut sequence = Sequence::new_with_options(tokenizer, false);
+        assert_eq!(sequence.append_token(0).unwrap(), "a");
+        assert_eq!(sequence.append_token(2).unwrap(), "[BOS]");
+        let err = sequence.append_token(4).unwrap_err();
+        assert!(err.to_string().contains("unknown token id"), "{err}");
+    }
+
+    #[test]
+    fn test_incremental_decode_keeps_the_generic_path_for_distant_ids() {
+        // An added token far beyond the ranks: no per-id table is built for
+        // it, the stream goes through the generic decoder and is still right.
+        let dir = write_minimal_tiktoken_dir(
+            r#"{"added_tokens_decoder": {"100000000": {"content": "[FAR]", "special": true}}}"#,
+            None,
+        );
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(dir.path()).unwrap());
+        assert!(tokenizer.incremental_decoder(false).is_none());
+        assert_eq!(stream(&tokenizer, &[0, 1, 0], false), ["a", "b", "a"]);
+        assert_eq!(
+            stream(&tokenizer, &[0, 100_000_000, 1], false).concat(),
+            tokenizer.decode(&[0, 100_000_000, 1], false).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_incremental_decode_is_exact_on_a_real_vocabulary() {
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap());
+        let texts = [
+            "Hello, 世界! Café naïve 😀👍🏽 ✨ 日本語のテキスト 한국어 Ünïcödé ½ € –",
+            "अनुच्छेद 🇯🇵 🤷\u{200d}♂\u{fe0f} Привет мир<|endoftext|>",
+        ];
+        for text in texts {
+            let ids = tokenizer.encode(text, false).unwrap().token_ids().to_vec();
+            for skip in [false, true] {
+                let (pieces, warnings) = warnings_during(|| stream(&tokenizer, &ids, skip));
+                let joined = pieces.concat();
+                assert_eq!(
+                    joined,
+                    tokenizer.decode(&ids, skip).unwrap(),
+                    "{text:?} skip={skip}"
+                );
+                assert!(!joined.contains('\u{FFFD}'), "{text:?} skip={skip}");
+                assert_eq!(warnings, 0, "{text:?} skip={skip}");
+            }
+        }
+        // The emoji is two tokens here: nothing, then the whole character.
+        let ids = tokenizer.encode("😀", false).unwrap().token_ids().to_vec();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(stream(&tokenizer, &ids, false), ["", "😀"]);
     }
 
     /// A tiktoken directory whose `config.json` selects the K3 renderer and

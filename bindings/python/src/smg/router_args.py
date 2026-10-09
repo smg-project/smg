@@ -129,7 +129,8 @@ class RouterArgs:
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). Unset or 0 = no refill
+    # Sustained admission rate (requests per second), bursting up to
+    # max_concurrent_requests. Unset or 0 = no rate limit
     rate_limit_tokens_per_second: int | None = None
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
@@ -165,6 +166,7 @@ class RouterArgs:
     # Tokenizer cache configuration
     tokenizer_cache_enable_l0: bool = False
     tokenizer_cache_l0_max_entries: int = 10000
+    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
     tokenizer_cache_enable_l1: bool = False
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     # Parser configuration
@@ -303,6 +305,9 @@ class RouterArgs:
     # worker is vetoed; seconds without progress before a loaded one is wedged
     worker_stall_secs: int = 2
     worker_wedge_secs: int = 3
+    # Liveness: seconds without any contact from a worker whose KV-event
+    # stream pushes load records before it is vetoed as unreachable (0 = off)
+    worker_stale_secs: int = 15
     # Warm-up slice for cache-aware routing (see the --worker-warmup-* flags)
     worker_warmup_secs: int = 60
     worker_warmup_share: float = 0.25
@@ -742,6 +747,19 @@ class RouterArgs:
                 " until it makes progress; the bound stretches to the time its"
                 " in-flight prompts may still need in prefill, up to 120 seconds."
                 " Defaults to 3."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-stale-secs",
+            type=int,
+            default=RouterArgs.worker_stale_secs,
+            help=(
+                "Seconds without any contact (a load record, a poll answer, a probe,"
+                " a token) from a worker whose KV-event stream pushes load records,"
+                " after which it is excluded from routing as unreachable until it is"
+                " heard from again; workers that never pushed a record are not"
+                " judged by it. Keep it above the load-monitor interval. 0 disables."
+                " Defaults to 15."
             ),
         )
         routing_group.add_argument(
@@ -1375,10 +1393,11 @@ class RouterArgs:
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
             type=str,
-            default="0.0.0.0",
+            default=None,
             help=(
                 "Host address to bind the Prometheus metrics server. Supports IPv4, IPv6"
-                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces"
+                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: the unspecified"
+                " address of --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)"
             ),
         )
         prometheus_group.add_argument(
@@ -1452,7 +1471,8 @@ class RouterArgs:
             help=(
                 "Maximum standing concurrent requests; each admission permit"
                 " is held for the full response, including streaming bodies."
-                " Set to -1 to disable."
+                " -1 (default) derives the bound from the host (1024 per"
+                " available core, at least 4096); 0 disables it."
             ),
         )
         rate_limit_group.add_argument(
@@ -1475,9 +1495,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
             help=(
-                "Token bucket refill rate (tokens per second). Unset or 0 ="
-                " no refill: --max-concurrent-requests bounds standing"
-                " concurrency alone."
+                "Sustained admission rate in requests per second, bursting up"
+                " to --max-concurrent-requests, which keeps bounding standing"
+                " concurrency. Unset or 0 = no rate limit."
             ),
         )
 
@@ -1700,6 +1720,12 @@ class RouterArgs:
             help="Enable L1 (prefix matching) tokenizer cache (default: False)",
         )
         tokenizer_group.add_argument(
+            f"--{prefix}tokenizer-cache-l0-max-memory",
+            type=int,
+            default=RouterArgs.tokenizer_cache_l0_max_memory,
+            help="Maximum memory for L0 tokenizer cache in bytes: texts, ids and per-entry overhead (default: 256MB)",
+        )
+        parser.add_argument(
             f"--{prefix}tokenizer-cache-l1-max-memory",
             type=int,
             default=RouterArgs.tokenizer_cache_l1_max_memory,

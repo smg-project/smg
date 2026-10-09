@@ -537,7 +537,8 @@ struct EngineShared {
 }
 
 /// Fault hooks the admin API switches on: batches lost on the wire, delayed
-/// publishing, a frozen engine, a publisher restart.
+/// publishing, delayed admission, a frozen engine, a publisher restart, and
+/// requests answered with an error status, held back or cut mid-stream.
 #[derive(Default)]
 struct Faults {
     /// Event batches still to lose on the wire.
@@ -545,11 +546,65 @@ struct Faults {
     dropped_total: AtomicU64,
     /// Publishing delay after a pass ends, in ms.
     delay_ms: AtomicU64,
+    /// How long each new request is held before the engine sees it, in ms:
+    /// a backlog in transit between the gateway and the engine's queue. The
+    /// load record does not count a held request.
+    admit_delay_ms: AtomicU64,
+    /// At most this many new requests per second enter the engine (0 = no
+    /// cap); the rest wait their turn, unseen by the load record: a
+    /// throttled input path.
+    admit_per_sec: AtomicU64,
+    /// The next admission slot under the cap.
+    admit_next: tokio::sync::Mutex<Option<Instant>>,
     /// The engine is frozen: no passes until resumed.
     paused: AtomicBool,
     /// Publisher generation; a restart bumps it.
     generation: AtomicU64,
     restarts: AtomicU64,
+    /// The request fault, while one is armed.
+    fail: Mutex<Option<RequestFault>>,
+    /// Requests answered with the fault's status before admission.
+    failed_total: AtomicU64,
+    /// Streams cut with the fault's status after their first tokens, counted
+    /// by the worker paths where they end the stream (`Engine::cut_counter`).
+    cut_total: Arc<AtomicU64>,
+    /// Requests held back by the fault's stall.
+    stalled_total: AtomicU64,
+}
+
+/// A request fault the admin API arms: what the worker answers instead of
+/// serving, for how long, and whether before admission or after some output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RequestFault {
+    /// The HTTP status to answer (the gRPC worker maps it to a status code);
+    /// 0 serves the request after the stall.
+    pub status: u16,
+    /// How long the request is held before the answer.
+    pub stall: Duration,
+    /// Serve this many tokens, then cut the stream with `status`; `None`
+    /// answers before admission, so the request never counts as served.
+    pub after_tokens: Option<u32>,
+    /// How long the fault stays armed.
+    pub scope: FaultScope,
+}
+
+/// How long a request fault stays armed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultScope {
+    /// Until cleared.
+    Open,
+    /// The next N requests.
+    Requests(u32),
+    /// Every request until this instant.
+    Until(Instant),
+}
+
+/// What the armed request fault does to one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Injected {
+    pub status: u16,
+    pub stall: Duration,
+    pub after_tokens: Option<u32>,
 }
 
 /// The hooks' current state.
@@ -558,9 +613,16 @@ pub(crate) struct FaultStatus {
     pub drop_pending: u32,
     pub dropped_total: u64,
     pub delay_ms: u64,
+    pub admit_delay_ms: u64,
+    pub admit_per_sec: u64,
     pub paused: bool,
     pub generation: u64,
     pub restarts: u64,
+    /// The armed request fault, if any.
+    pub fail: Option<RequestFault>,
+    pub failed_total: u64,
+    pub cut_total: u64,
+    pub stalled_total: u64,
 }
 
 /// What the engine itself would serve from cache for a prompt right now.
@@ -747,6 +809,47 @@ impl Engine {
         self.shared.faults.delay_ms.store(ms, Ordering::Relaxed);
     }
 
+    /// Hold every new request `ms` milliseconds before the engine sees it
+    /// (0 clears): the gateway has dispatched it, the load record does not
+    /// count it yet.
+    pub(crate) fn fault_admit_delay_ms(&self, ms: u64) {
+        self.shared
+            .faults
+            .admit_delay_ms
+            .store(ms, Ordering::Relaxed);
+    }
+
+    /// Let at most `per_sec` new requests per second into the engine (0
+    /// clears); the rest wait their turn, unseen by the load record.
+    pub(crate) fn fault_admit_per_sec(&self, per_sec: u64) {
+        self.shared
+            .faults
+            .admit_per_sec
+            .store(per_sec, Ordering::Relaxed);
+    }
+
+    /// The admission gate a new request passes before the engine sees it:
+    /// the hold, then the rate cap. Returns at once while neither is set.
+    pub(crate) async fn admit(&self) {
+        let faults = &self.shared.faults;
+        let hold = Duration::from_millis(faults.admit_delay_ms.load(Ordering::Relaxed));
+        if !hold.is_zero() {
+            tokio::time::sleep(hold).await;
+        }
+        let per_sec = faults.admit_per_sec.load(Ordering::Relaxed);
+        if per_sec == 0 {
+            return;
+        }
+        let slot = {
+            let mut next = faults.admit_next.lock().await;
+            let now = Instant::now();
+            let at = next.map_or(now, |next| next.max(now));
+            *next = Some(at + Duration::from_secs_f64(1.0 / per_sec as f64));
+            at
+        };
+        tokio::time::sleep_until(slot.into()).await;
+    }
+
     /// Restart the publisher: sequence numbers start over, the replay buffer
     /// is emptied, the cache is kept. Returns once the actor has applied it
     /// (after its current pass, at most), so a status read right after sees
@@ -769,15 +872,94 @@ impl Engine {
         self.shared.resume.notify_one();
     }
 
+    /// Arm a request fault (`None` clears it).
+    pub(crate) fn fault_fail(&self, fault: Option<RequestFault>) {
+        *self
+            .shared
+            .faults
+            .fail
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = fault;
+    }
+
+    /// What the armed request fault does to the request arriving now; `None`
+    /// when no fault applies. A `Requests(n)` scope is spent by one, an
+    /// elapsed `Until` disarms the fault. A stall is counted here; a status
+    /// answered before admission is counted by the worker path that answers
+    /// it ([`Engine::record_failure`], after the stall), a cut where the stream
+    /// is actually cut (an output no longer than `after_tokens` is never cut).
+    pub(crate) fn inject(&self) -> Option<Injected> {
+        let faults = &self.shared.faults;
+        let mut armed = faults.fail.lock().unwrap_or_else(|p| p.into_inner());
+        let fault = (*armed)?;
+        let next_scope = match fault.scope {
+            FaultScope::Until(at) if Instant::now() >= at => {
+                *armed = None;
+                return None;
+            }
+            FaultScope::Requests(n) => n
+                .checked_sub(1)
+                .filter(|left| *left > 0)
+                .map(FaultScope::Requests),
+            scope => Some(scope),
+        };
+        *armed = next_scope.map(|scope| RequestFault { scope, ..fault });
+        drop(armed);
+        if !fault.stall.is_zero() {
+            faults.stalled_total.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(Injected {
+            status: fault.status,
+            stall: fault.stall,
+            after_tokens: fault.after_tokens,
+        })
+    }
+
+    /// The count of streams the request fault actually cut; the worker paths
+    /// bump it at the point where they end a stream with the fault's status.
+    pub(crate) fn cut_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.faults.cut_total)
+    }
+
+    /// One request answered with the fault's status before admission; the
+    /// worker paths call it at the point where they return that status.
+    pub(crate) fn record_failure(&self) {
+        self.shared
+            .faults
+            .failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn fault_status(&self) -> FaultStatus {
         let f = &self.shared.faults;
+        // A timed fault whose deadline passed without another request reads as
+        // disarmed, as the next request would find it.
+        let fail = {
+            let mut armed = f.fail.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(RequestFault {
+                scope: FaultScope::Until(at),
+                ..
+            }) = *armed
+            {
+                if Instant::now() >= at {
+                    *armed = None;
+                }
+            }
+            *armed
+        };
         FaultStatus {
             drop_pending: f.drop_batches.load(Ordering::Relaxed),
             dropped_total: f.dropped_total.load(Ordering::Relaxed),
             delay_ms: f.delay_ms.load(Ordering::Relaxed),
+            admit_delay_ms: f.admit_delay_ms.load(Ordering::Relaxed),
+            admit_per_sec: f.admit_per_sec.load(Ordering::Relaxed),
             paused: f.paused.load(Ordering::Relaxed),
             generation: f.generation.load(Ordering::Relaxed),
             restarts: f.restarts.load(Ordering::Relaxed),
+            fail,
+            failed_total: f.failed_total.load(Ordering::Relaxed),
+            cut_total: f.cut_total.load(Ordering::Relaxed),
+            stalled_total: f.stalled_total.load(Ordering::Relaxed),
         }
     }
 
@@ -3012,6 +3194,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_hook_answers_the_next_n_requests_then_clears() {
+        let engine = live();
+        assert_eq!(engine.inject(), None, "nothing armed");
+        engine.fault_fail(Some(RequestFault {
+            status: 503,
+            stall: Duration::ZERO,
+            after_tokens: None,
+            scope: FaultScope::Requests(2),
+        }));
+        let injected = Injected {
+            status: 503,
+            stall: Duration::ZERO,
+            after_tokens: None,
+        };
+        assert_eq!(engine.inject(), Some(injected));
+        assert_eq!(
+            engine.fault_status().fail.map(|f| f.scope),
+            Some(FaultScope::Requests(1)),
+            "one request left"
+        );
+        assert_eq!(engine.inject(), Some(injected));
+        assert_eq!(engine.inject(), None, "spent");
+        let status = engine.fault_status();
+        assert_eq!(status.fail, None, "cleared once spent");
+        assert_eq!(
+            (status.failed_total, status.cut_total, status.stalled_total),
+            (0, 0, 0),
+            "a refusal is counted by the path that answers it"
+        );
+        engine.record_failure();
+        engine.record_failure();
+        assert_eq!(engine.fault_status().failed_total, 2);
+    }
+
+    #[tokio::test]
+    async fn fail_hook_timed_scope_elapses_and_cuts_count_apart() {
+        let engine = live();
+        engine.fault_fail(Some(RequestFault {
+            status: 500,
+            stall: Duration::from_millis(5),
+            after_tokens: Some(3),
+            scope: FaultScope::Until(Instant::now() + Duration::from_millis(100)),
+        }));
+        let injected = engine.inject().expect("armed");
+        assert_eq!(
+            (injected.status, injected.stall, injected.after_tokens),
+            (500, Duration::from_millis(5), Some(3))
+        );
+        assert!(engine.fault_status().fail.is_some(), "still armed");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            engine.fault_status().fail,
+            None,
+            "an elapsed fault reads as disarmed before the next request"
+        );
+        assert_eq!(engine.inject(), None, "elapsed");
+        let status = engine.fault_status();
+        assert_eq!(status.fail, None, "disarmed once elapsed");
+        assert_eq!(
+            (status.failed_total, status.cut_total, status.stalled_total),
+            (0, 0, 1),
+            "a cut is counted where the stream is cut, not when it is armed"
+        );
+        engine.cut_counter().fetch_add(1, Ordering::Relaxed);
+        assert_eq!(engine.fault_status().cut_total, 1);
+        // Open scope: every request until cleared.
+        engine.fault_fail(Some(RequestFault {
+            status: 429,
+            stall: Duration::ZERO,
+            after_tokens: None,
+            scope: FaultScope::Open,
+        }));
+        assert!(engine.inject().is_some());
+        assert!(engine.inject().is_some());
+        engine.fault_fail(None);
+        assert_eq!(engine.inject(), None, "cleared");
+        assert_eq!(
+            engine.fault_status().failed_total,
+            0,
+            "inject() counts no refusal of its own"
+        );
+    }
+
+    #[tokio::test]
     async fn pause_freezes_the_engine_until_resume() {
         let engine = live();
         engine.pause();
@@ -3084,6 +3350,51 @@ mod tests {
         assert!(
             (0.2..30.0).contains(&age),
             "the batch keeps its creation time, so the delay is visible as lag: {age} s"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_hooks_hold_and_pace_requests_before_the_engine_sees_them() {
+        let engine = live();
+        // Neither hook set: a request is admitted at once.
+        let t0 = Instant::now();
+        engine.admit().await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t0.elapsed()
+        );
+        // The hold: every admission waits the delay.
+        engine.fault_admit_delay_ms(150);
+        let t0 = Instant::now();
+        engine.admit().await;
+        assert!(
+            t0.elapsed() >= Duration::from_millis(150),
+            "held for the delay: {:?}",
+            t0.elapsed()
+        );
+        engine.fault_admit_delay_ms(0);
+        // The cap: admissions are spaced 1/per_sec apart, the first one free.
+        engine.fault_admit_per_sec(10);
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            engine.admit().await;
+        }
+        assert!(
+            t0.elapsed() >= Duration::from_millis(200),
+            "three admissions at 10/s take two slots: {:?}",
+            t0.elapsed()
+        );
+        let status = engine.fault_status();
+        assert_eq!((status.admit_delay_ms, status.admit_per_sec), (0, 10));
+        // Cleared: at once again.
+        engine.fault_admit_per_sec(0);
+        let t0 = Instant::now();
+        engine.admit().await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t0.elapsed()
         );
     }
 

@@ -24,7 +24,10 @@
 //!
 //! Nothing here runs when the engine does not report a window: admission is
 //! not the gateway's to decide then, and dispatch behaves exactly as it did
-//! before this module existed.
+//! before this module existed. That is said once, loudly, when such a decode
+//! worker registers ([`announce_decode_window`]), and the window itself is
+//! published per worker, so a gate that is off is a value an operator can
+//! read rather than an absence of series.
 
 use std::{
     sync::{
@@ -36,9 +39,13 @@ use std::{
 
 use axum::response::Response;
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::{observability::metrics::Metrics, routers::common::overload, worker::Worker};
+use crate::{
+    observability::metrics::Metrics,
+    routers::common::overload,
+    worker::{Worker, WorkerType},
+};
 
 /// Default seconds a PD dispatch may wait for decode rooms. Well under the
 /// engines' bootstrap deadline (120 s on TokenSpeed), so a request that does
@@ -202,6 +209,35 @@ pub(crate) async fn admit_decode(
                 rooms,
             ))
         }
+    }
+}
+
+/// Announce a decode worker's admission bound as it registers.
+///
+/// `admit_decode` abstains for a worker that reports no window, which used to
+/// be invisible: the admission families only appear once the gate acts, so an
+/// operator who turned on PD in front of such engines saw no series and
+/// believed the bound existed (the vLLM servicer reported no window at all
+/// until it advertised `max_num_seqs`). Say it once where the worker joins,
+/// and publish the window (`smg_pd_admission_window`, 0 for none) so "off" is
+/// a number on the scrape. Workers of any other type are not the gate's.
+pub(crate) fn announce_decode_window(worker: &dyn Worker) {
+    if !matches!(worker.worker_type(), WorkerType::Decode) {
+        return;
+    }
+    let window = worker.max_running_requests();
+    Metrics::set_pd_admission_window(worker.url(), window);
+    match window {
+        Some(window) => debug!(
+            worker = worker.url(),
+            window, "PD admission bounds dispatch to this decode worker by its running window"
+        ),
+        None => warn!(
+            worker = worker.url(),
+            "PD admission is off for this decode worker: it reports no running window (no \
+             `max_num_seqs` or `max_running_requests` label), so a burst wider than its \
+             scheduler runs at once queues at the engine instead of waiting at the gateway"
+        ),
     }
 }
 
@@ -385,6 +421,64 @@ mod tests {
         let claim = claim_within(Duration::ZERO, || false).await;
         assert_eq!(claim, Claim::Refused);
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// A decode worker that reports no window is announced once, as a WARN,
+    /// with the gauge at zero; one that reports a window publishes it.
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_unreported_window_is_announced_and_published_as_zero() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let rendered = render_with_recorder(|| {
+            announce_decode_window(decode_worker("grpc://127.0.0.1:9907", None).as_ref());
+            announce_decode_window(decode_worker("grpc://127.0.0.1:9908", Some(64)).as_ref());
+        });
+        logs_assert(|lines: &[&str]| {
+            let warned: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("PD admission is off for this decode worker"))
+                .collect();
+            match warned.as_slice() {
+                [line] if line.contains("grpc://127.0.0.1:9907") => Ok(()),
+                _ => Err(format!(
+                    "one warning, for the worker without a window, expected: {warned:?}"
+                )),
+            }
+        });
+        for (worker, value) in [("9907", " 0"), ("9908", " 64")] {
+            let line = rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with("smg_pd_admission_window{")
+                        && line.contains(&format!("worker=\"grpc://127.0.0.1:{worker}\""))
+                })
+                .unwrap_or_else(|| panic!("no window gauge for {worker}:\n{rendered}"));
+            assert!(line.ends_with(value), "{line}");
+        }
+    }
+
+    /// Only decode workers carry the gate's window; a prefill worker without
+    /// one is not announced.
+    #[tracing_test::traced_test]
+    #[test]
+    fn only_decode_workers_are_announced() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:9909")
+                .model(ModelCard::new("m"))
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let rendered = render_with_recorder(|| announce_decode_window(prefill.as_ref()));
+        assert!(!logs_contain("PD admission is off"));
+        assert!(!rendered.contains("smg_pd_admission_window{"), "{rendered}");
     }
 
     /// The shed is the overload guard's 503, terminal for the retry layer and

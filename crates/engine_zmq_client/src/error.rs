@@ -36,6 +36,11 @@ pub enum Error {
         stage: &'static str,
         timeout: Duration,
     },
+    #[error("startup handshake reached its ceiling of {ceiling:?} while waiting for {stage}")]
+    StartupCeiling {
+        stage: &'static str,
+        ceiling: Duration,
+    },
     #[error("engine input registration timed out after {timeout:?}")]
     InputRegistrationTimeout { timeout: Duration },
     #[error("unexpected startup handshake message: {message}")]

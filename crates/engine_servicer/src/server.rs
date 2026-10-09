@@ -48,12 +48,19 @@ pub(crate) fn record_error(slot: &SharedError, message: String) {
 
 /// Worker threads for a servicer runtime, overridable with
 /// `SMG_SERVICER_WORKER_THREADS`. The per-token work here is small (decode a
-/// batch, fan it out, encode a frame), and a runtime sized to the machine
-/// (tokio's default: one worker per hardware thread, 144 on a large host)
-/// turns every engine output batch into a cross-thread wake-up storm: at 512
-/// concurrent streams it burned about 18 cores where four threads burn under
-/// one, at the same throughput.
-const DEFAULT_WORKER_THREADS: usize = 4;
+/// batch, fan it out, encode a frame), and all of it ends on the one HTTP/2
+/// connection the gateway holds, whose stream store is one mutex that every
+/// per-token send takes several times. With several workers each stream's
+/// send takes that lock from whichever core runs the stream's task: at 32 to
+/// 128 concurrent streams a fifth to a quarter of the servicer's CPU went
+/// into the lock bouncing between cores, and every engine output batch woke
+/// tasks across threads. One worker does the same work in about 40 % less
+/// CPU per token at the same inter-token latency, and carries tens of
+/// thousands of tokens per second. A runtime sized to the machine (tokio's
+/// default: one worker per hardware thread, 144 on a large host) was worse
+/// still: at 512 concurrent streams it burned about 18 cores where four
+/// threads burned under one, at the same throughput.
+const DEFAULT_WORKER_THREADS: usize = 1;
 const WORKER_THREADS_ENV: &str = "SMG_SERVICER_WORKER_THREADS";
 
 fn parse_worker_threads(value: Option<&str>) -> usize {
@@ -251,6 +258,14 @@ pub fn init_tracing(level: Option<&str>) -> Result<(), ServicerError> {
 #[cfg(test)]
 mod worker_threads_tests {
     use super::{parse_worker_threads, DEFAULT_WORKER_THREADS};
+
+    /// One worker by default: every stream's per-token send then takes the
+    /// connection's lock from the same core, and no engine output batch
+    /// wakes tasks across threads.
+    #[test]
+    fn one_worker_by_default() {
+        assert_eq!(parse_worker_threads(None), 1);
+    }
 
     #[test]
     fn worker_threads_default_and_override() {

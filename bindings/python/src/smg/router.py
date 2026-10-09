@@ -245,7 +245,8 @@ class Router:
             selection for decode servers (PD mode only). Default: {}
         prometheus_port: Port to expose Prometheus metrics. Default: None
         prometheus_host: Host address to bind the Prometheus metrics server. Default:
-            None
+            None, which binds the unspecified address of host's family (:: for an IPv6
+            host, 0.0.0.0 otherwise)
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default:
             False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD
@@ -282,14 +283,16 @@ class Router:
         kv_engine_id_annotation: Kubernetes annotation containing KV engine IDs,
             aligned with worker_ports_annotation. Default: 'smg.ai/kv-engine-id'
         request_timeout_secs: Request timeout in seconds. Default: 600
-        max_concurrent_requests: Maximum number of concurrent requests allowed for
-            rate limiting. Default: 256
+        max_concurrent_requests: Maximum standing concurrent requests. -1 derives
+            the bound from the host (1024 per available core, at least 4096); 0
+            disables it. Default: -1
         queue_size: Queue size for pending requests when max concurrent limit reached
             (0 = no queue, return 429 immediately). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue
             before timing out. Default: 60
-        rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If
-            not set, defaults to max_concurrent_requests. Default: None
+        rate_limit_tokens_per_second: Sustained admission rate (requests per
+            second), bursting up to max_concurrent_requests, which keeps bounding
+            standing concurrency. Unset or 0 = no rate limit. Default: None
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all
             origins. Default: []
         health_failure_threshold: Number of consecutive health check failures before

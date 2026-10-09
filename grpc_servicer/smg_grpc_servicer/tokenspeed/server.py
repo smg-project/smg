@@ -17,6 +17,7 @@ from smg_grpc_proto import tokenspeed_scheduler_pb2_grpc
 from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
+from smg_grpc_servicer.hostport import host_port, loopback_target
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.scheduler_launcher import launch_engine
 from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
@@ -162,7 +163,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     )
     reflection.enable_server_reflection(service_names, server)
 
-    listen_addr = f"{server_args.host}:{server_args.port}"
+    listen_addr = host_port(server_args.host, server_args.port)
     server.add_insecure_port(listen_addr)
     logger.info("TokenSpeed gRPC server listening on %s", listen_addr)
 
@@ -231,8 +232,7 @@ def _wait_and_warmup(
         return
 
     # Wildcard bind hosts aren't routable as destinations; dial loopback instead.
-    warmup_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(server_args.host, server_args.host)
-    grpc_url = f"{warmup_host}:{server_args.port}"
+    grpc_url = loopback_target(server_args.host, server_args.port)
     max_message_bytes = _grpc_max_message_bytes()
     channel = grpc.insecure_channel(
         grpc_url,

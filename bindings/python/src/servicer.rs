@@ -14,6 +14,7 @@
 //! run in this process.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -23,7 +24,8 @@ use engine_servicer::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
     ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
     TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
-    VllmServicerConfig, VllmServicerServer, DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    VllmServicerConfig, VllmServicerServer, DEFAULT_ENGINE_STARTUP_CEILING,
+    DEFAULT_ENGINE_STARTUP_TIMEOUT,
 };
 use llm_multimodal::Modality;
 use prost::Message;
@@ -61,6 +63,27 @@ fn startup_timeout(secs: Option<f64>) -> PyResult<Duration> {
             "engine_startup_timeout_secs must be positive, got {secs}"
         ))),
     }
+}
+
+/// The bound on the whole engine start from the launcher's seconds: `None`
+/// is the crate default, `0` is no ceiling.
+fn startup_ceiling(secs: Option<f64>) -> PyResult<Option<Duration>> {
+    let Some(secs) = secs else {
+        return Ok(Some(DEFAULT_ENGINE_STARTUP_CEILING));
+    };
+    if secs == 0.0 {
+        return Ok(None);
+    }
+    if secs < 0.0 || secs.is_nan() {
+        return Err(PyValueError::new_err(format!(
+            "engine_startup_ceiling_secs must be positive, or 0 for no ceiling, got {secs}"
+        )));
+    }
+    Duration::try_from_secs_f64(secs)
+        .map(Some)
+        .map_err(|error| {
+            PyValueError::new_err(format!("engine_startup_ceiling_secs {secs}: {error}"))
+        })
 }
 
 /// Install the Rust tracing subscriber for a process that only hosts a
@@ -456,7 +479,10 @@ struct NativeMediaOptions {
     max_inflight: usize,
 }
 
-fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOptions> {
+fn native_media_options(
+    options: &Bound<'_, PyDict>,
+    served_model_name: &str,
+) -> PyResult<NativeMediaOptions> {
     let item = |key: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
         Ok(options.get_item(key)?.filter(|value| !value.is_none()))
     };
@@ -487,10 +513,28 @@ fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOpti
         .map(|v| v.extract())
         .transpose()?
         .unwrap_or(10_000);
+    // The engine's per-prompt limits by modality name; one the pipeline does
+    // not fetch is of no consequence here.
+    let engine_item_limits = item("engine_item_limits")?
+        .map(|v| v.extract::<HashMap<String, usize>>())
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(modality, limit)| {
+            let modality = match modality.as_str() {
+                "image" => Modality::Image,
+                "video" => Modality::Video,
+                "audio" => Modality::Audio,
+                _ => return None,
+            };
+            Some((modality, limit))
+        })
+        .collect();
     Ok(NativeMediaOptions {
         settings: WorkerMediaSettings {
             model_dir: required("model_dir")?,
             model_id: required("model_id")?,
+            served_model_name: Some(served_model_name.to_string()),
             pixel_format: if raw_pixels {
                 PixelFormat::RawU8
             } else {
@@ -499,6 +543,7 @@ fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOpti
             encoder_dtype: string("encoder_dtype")?.unwrap_or_else(|| "float32".to_string()),
             processor_kwargs,
             max_items: count("max_items")?,
+            engine_item_limits,
             max_item_bytes: count("max_item_bytes")?,
             allowed_domains,
             fetch_timeout: Duration::from_millis(fetch_timeout_ms),
@@ -555,9 +600,12 @@ impl PyVllmGrpcServer {
         pooler_use_activation = None,
         pooler_dimensions = None,
         mm_device_do_normalize = false,
+        mm_item_limits = String::new(),
+        max_num_seqs = 0,
         media_processor = None,
         smg_media_processor = None,
         engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -597,9 +645,12 @@ impl PyVllmGrpcServer {
         pooler_use_activation: Option<bool>,
         pooler_dimensions: Option<u32>,
         mm_device_do_normalize: bool,
+        mm_item_limits: String,
+        max_num_seqs: i32,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
         engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
     ) -> PyResult<Self> {
         if media_processor.is_some() && smg_media_processor.is_some() {
             return Err(PyValueError::new_err(
@@ -611,11 +662,12 @@ impl PyVllmGrpcServer {
             .map(|bridge| PythonMediaProcessor::new(&bridge))
             .transpose()?
             .map(|processor| Arc::new(processor) as Arc<dyn MediaProcessor>);
+        let served_model_name = served_model_name.unwrap_or_else(|| model_path.clone());
         let native = smg_media_processor
-            .map(|options| native_media_options(&options))
+            .map(|options| native_media_options(&options, &served_model_name))
             .transpose()?;
         let model = VllmModelInfo {
-            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            served_model_name,
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
             model_path,
             is_generation,
@@ -645,6 +697,8 @@ impl PyVllmGrpcServer {
             pooler_use_activation,
             pooler_dimensions,
             mm_device_do_normalize,
+            mm_item_limits,
+            max_num_seqs,
         };
         let mut config = VllmServicerConfig {
             bind_address,
@@ -655,6 +709,7 @@ impl PyVllmGrpcServer {
             model,
             media_processor,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
         let inner = py.detach(|| -> PyResult<VllmServicerServer> {
             let Some(native) = native else {
@@ -690,6 +745,7 @@ impl PyVllmGrpcServer {
                 spec = pipeline.spec_name(),
                 pixel_format = ?pipeline.pixel_format(),
                 max_inflight = native.max_inflight,
+                item_limits = %pipeline.item_limits_summary(),
                 "smg media processor ready"
             );
             config.media_processor = Some(Arc::new(SmgMediaProcessor {
@@ -717,6 +773,16 @@ impl PyVllmGrpcServer {
     #[getter]
     fn engine_ready(&self) -> bool {
         self.inner.engine_ready()
+    }
+
+    /// Report that the engine process is alive while the handshake runs: the
+    /// launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the engine
+    /// is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
     }
 
     /// The last fatal error (engine connect or server exit), if any.

@@ -57,6 +57,7 @@ from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_a
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
+from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
 
 logger = logging.getLogger(__name__)
@@ -500,6 +501,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         pairing_protocol = pairing_protocol_from_env()
         if pairing_protocol:
             serializable_args["pairing_protocol"] = pairing_protocol
+        # The engine's own per-request media limits, flat, for the gateway's
+        # media pipeline to hold requests to: the precomputed inputs it sends
+        # bypass the tokenizer manager's own check.
+        item_limits = sglang_item_limits(self.server_args)
+        if item_limits:
+            serializable_args[MM_ITEM_LIMITS_KEY] = item_limits
         server_args_struct.update(serializable_args)
 
         # Convert scheduler_info to Struct

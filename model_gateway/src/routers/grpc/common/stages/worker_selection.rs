@@ -15,7 +15,7 @@ use crate::{
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
         common::{
-            placement::{self, PairFailure, PlacementFailure, PlacementInputs},
+            placement::{self, CandidateFilter, PairFailure, PlacementFailure, PlacementInputs},
             retry::mark_non_retryable,
         },
         error,
@@ -38,6 +38,10 @@ use crate::{
 
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
+
+/// The candidate predicate of a request carrying media references: only
+/// workers that process them themselves.
+const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
 /// Why an EPD selection produced nothing. Only a full Prefill leg is told
 /// apart, for admission; every other failure is judged per leg afterwards by
@@ -165,7 +169,7 @@ impl PipelineStage for WorkerSelectionStage {
             headers,
             rid_key,
             cache_namespace,
-            candidate_filter: media_refs.then_some(accepts_media_refs),
+            candidate_filter: media_refs.then_some(ACCEPTS_MEDIA_REFS),
         };
         let sticky_key = ctx.state.sticky_key.as_deref();
 
@@ -188,7 +192,7 @@ impl PipelineStage for WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     wire,
-                    media_refs,
+                    media_refs.then_some(ACCEPTS_MEDIA_REFS),
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
@@ -203,7 +207,7 @@ impl PipelineStage for WorkerSelectionStage {
             }
             WorkerSelectionMode::PrefillDecode => {
                 let (pair, guard) = self
-                    .admit_pd_pair(model_id, inputs, sticky_key, None)
+                    .admit_pd_pair(model_id, inputs, sticky_key, None, media_refs)
                     .await?;
                 ctx.state.pd_prefill_guard = Some(guard);
                 disaggregated(pair)
@@ -309,6 +313,11 @@ impl WorkerSelectionStage {
         let model_id = ctx.model_id.as_str();
         // The retained wire carries the media-refs pin; the helpers derive it.
         let wire = Some(ctx.wire);
+        let media_refs = ctx.wire.requires_media_refs;
+        // A retry skips the workers that already answered this request
+        // definitively (see `routers::common::attempt_ledger`).
+        let ledger = &ctx.ledger;
+        let admits = |worker: &dyn Worker| ledger.admits(worker);
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
@@ -320,7 +329,7 @@ impl WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     wire,
-                    false,
+                    Some(&admits),
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
@@ -334,18 +343,25 @@ impl WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
+                let pinned = |worker: &dyn Worker| {
+                    (!media_refs || accepts_media_refs(worker)) && admits(worker)
+                };
                 let inputs = PlacementInputs {
                     text,
                     tokens,
                     headers,
                     rid_key,
                     cache_namespace,
-                    candidate_filter: wire
-                        .filter(|w| w.requires_media_refs)
-                        .map(|_| accepts_media_refs as fn(&dyn Worker) -> bool),
+                    candidate_filter: Some(&pinned),
                 };
                 let (pair, guard) = self
-                    .admit_pd_pair(model_id, inputs, ctx.sticky_key.as_deref(), wire)
+                    .admit_pd_pair(
+                        model_id,
+                        inputs,
+                        ctx.sticky_key.as_deref(),
+                        wire,
+                        media_refs,
+                    )
                     .await?;
                 ctx.pd_prefill_guard = Some(guard);
                 disaggregated(pair)
@@ -365,6 +381,7 @@ impl WorkerSelectionStage {
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
         wire: Option<WireConstraint>,
+        media_refs: bool,
     ) -> Result<(PdWorkerPair, PrefillLoadGuard), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
@@ -375,7 +392,7 @@ impl WorkerSelectionStage {
         .await
         .map_err(|error| {
             self.acquire_failure(model_id, error, |failure| {
-                self.pd_pair_failure(model_id, *failure, inputs.candidate_filter.is_some())
+                self.pd_pair_failure(model_id, *failure, media_refs)
             })
         })
     }
@@ -601,7 +618,8 @@ impl WorkerSelectionStage {
     /// (unhealthy, circuit breaker open, or the policy declined). A 503 with
     /// the same code the HTTP router uses: the model exists, the client should
     /// retry, and nothing about its request is wrong. Answering 404 here told
-    /// clients the model was gone while its workers restarted.
+    /// clients the model was gone while its workers restarted. Terminal for
+    /// the pipeline's own retry loop (see `placement::no_available_workers`).
     fn workers_unavailable(&self, model_id: &str) -> Response {
         error!(
             function = "WorkerSelectionStage::execute",
@@ -609,10 +627,9 @@ impl WorkerSelectionStage {
             model_id = %model_id,
             "No available workers for model"
         );
-        error::service_unavailable(
-            "no_available_workers",
-            format!("All workers for model '{model_id}' are unavailable (unhealthy or circuit breaker open)"),
-        )
+        placement::no_available_workers(format!(
+            "All workers for model '{model_id}' are unavailable (unhealthy or circuit breaker open)"
+        ))
     }
 
     /// The response for a failed pair placement. The verdict was judged from
@@ -700,9 +717,19 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
-        media_refs: bool,
+        candidate_filter: Option<CandidateFilter<'_>>,
     ) -> Option<Arc<dyn Worker>> {
-        let media_refs = media_refs || wire.is_some_and(|w| w.requires_media_refs);
+        // A retry pins the retained wire, and with it the media pin, on top of
+        // whatever the caller excludes.
+        let pinned = |worker: &dyn Worker| {
+            accepts_media_refs(worker) && candidate_filter.is_none_or(|accepts| accepts(worker))
+        };
+        let candidate_filter: Option<CandidateFilter<'_>> =
+            if wire.is_some_and(|w| w.requires_media_refs) {
+                Some(&pinned)
+            } else {
+                candidate_filter
+            };
         // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
         // accepts either transport (not HTTP). A retry pins the retained wire.
         placement::select_single(
@@ -717,7 +744,7 @@ impl WorkerSelectionStage {
                 headers,
                 rid_key,
                 cache_namespace,
-                candidate_filter: media_refs.then_some(accepts_media_refs),
+                candidate_filter,
             },
         )
     }
@@ -1058,7 +1085,10 @@ mod tests {
         config::types::PolicyConfig,
         mesh::adapters::tree_sync::RepairEntry,
         policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
-        routers::{common::retry::is_retryable_response, PD_PREFILL_QUEUE_FULL},
+        routers::{
+            common::{attempt_ledger::AttemptLedger, retry::is_retryable_response},
+            PD_PREFILL_QUEUE_FULL,
+        },
         worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation},
     };
 
@@ -1194,7 +1224,7 @@ mod tests {
         );
 
         let ((prefill, selected_decode, _), guard) = stage
-            .admit_pd_pair(model_id, PlacementInputs::default(), None, None)
+            .admit_pd_pair(model_id, PlacementInputs::default(), None, None, false)
             .await
             .unwrap_or_else(|_| panic!("admission should select the non-full prefill worker"));
 
@@ -1246,7 +1276,9 @@ mod tests {
                     tokens: Some(&tokens),
                     ..PlacementInputs::default()
                 };
-                stage.admit_pd_pair(model_id, inputs, None, None).await
+                stage
+                    .admit_pd_pair(model_id, inputs, None, None, false)
+                    .await
             }
         });
         wait_for_queued(&admission, 1).await;
@@ -1303,7 +1335,7 @@ mod tests {
         };
 
         let response = stage
-            .admit_pd_pair(model_id, inputs, None, None)
+            .admit_pd_pair(model_id, inputs, None, None, false)
             .await
             .err()
             .expect("full explicit target must wait or reject, not reassign");
@@ -1645,7 +1677,7 @@ mod tests {
                 rid_key,
                 None,
                 None,
-                false,
+                None,
             )
             .unwrap();
         for rid in ["request-2", "request-3", "request-4"] {
@@ -1658,7 +1690,7 @@ mod tests {
                     policy_registry.derive_rid_key(Some(rid)),
                     None,
                     None,
-                    false,
+                    None,
                 )
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by header key");
@@ -1698,13 +1730,13 @@ mod tests {
         );
 
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, false)
+            .select_single_worker(model_id, None, None, None, None, None, None, None)
             .is_some());
 
         worker_registry.set_worker_overloaded(&workers[0], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None, None, false)
+                .select_single_worker(model_id, None, None, None, None, None, None, None)
                 .is_some(),
             "one eligible worker left still serves"
         );
@@ -1712,7 +1744,7 @@ mod tests {
         worker_registry.set_worker_overloaded(&workers[1], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None, None, false)
+                .select_single_worker(model_id, None, None, None, None, None, None, None)
                 .is_none(),
             "the veto empties the candidate pool"
         );
@@ -1728,7 +1760,7 @@ mod tests {
         // genuinely absent model.
         worker_registry.set_worker_overloaded(&workers[0], false);
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, false)
+            .select_single_worker(model_id, None, None, None, None, None, None, None)
             .is_some());
         assert_eq!(
             stage
@@ -1766,7 +1798,7 @@ mod tests {
         // Any status but Ready is unavailable to routing.
         worker.set_status(WorkerStatus::NotReady);
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, false)
+            .select_single_worker(model_id, None, None, None, None, None, None, None)
             .is_none());
 
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, false);
@@ -1844,6 +1876,7 @@ mod tests {
             root_request_id: None,
             cache_trace: None,
             attempt: 0,
+            ledger: AttemptLedger::default(),
             model_id: model_id.to_string(),
             dispatch_model: model_id.to_string(),
             streaming: false,
@@ -2201,7 +2234,16 @@ mod tests {
 
         for _ in 0..4 {
             let worker = stage
-                .select_single_worker(model_id, None, None, None, None, None, None, true)
+                .select_single_worker(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(ACCEPTS_MEDIA_REFS),
+                )
                 .expect("advertising worker is selectable");
             assert_eq!(worker.url(), capable_url);
         }
@@ -2212,23 +2254,14 @@ mod tests {
             requires_media_refs: true,
         };
         let worker = stage
-            .select_single_worker(
-                model_id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(wire),
-                wire.requires_media_refs,
-            )
+            .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
             .expect("retry re-selection stays on advertising workers");
         assert_eq!(worker.url(), capable_url);
 
         let mut seen = HashMap::new();
         for _ in 0..4 {
             let worker = stage
-                .select_single_worker(model_id, None, None, None, None, None, None, false)
+                .select_single_worker(model_id, None, None, None, None, None, None, None)
                 .expect("any worker without refs");
             *seen.entry(worker.url().to_string()).or_insert(0) += 1;
         }
@@ -2256,7 +2289,16 @@ mod tests {
         );
 
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, true)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ACCEPTS_MEDIA_REFS),
+            )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, true);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2275,7 +2317,7 @@ mod tests {
             requires_media_refs: true,
         };
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, Some(wire), false)
+            .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], Some(wire), false);
         assert_eq!(
@@ -2321,7 +2363,7 @@ mod tests {
             worker_registry.set_worker_overloaded(worker, true);
         }
         let selected = stage
-            .select_single_worker(model_id, None, None, None, None, None, None, false)
+            .select_single_worker(model_id, None, None, None, None, None, None, None)
             .expect("the all-overloaded pool is steered, not refused");
         assert_eq!(
             selected.url(),
@@ -2379,7 +2421,16 @@ mod tests {
             worker_registry.set_worker_overloaded(worker, true);
         }
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, true)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ACCEPTS_MEDIA_REFS),
+            )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, true);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2422,7 +2473,7 @@ mod tests {
             .select_pd_pair(
                 model_id,
                 PlacementInputs {
-                    candidate_filter: Some(accepts_media_refs),
+                    candidate_filter: Some(ACCEPTS_MEDIA_REFS),
                     ..Default::default()
                 },
                 None,
@@ -2481,7 +2532,7 @@ mod tests {
             .select_pd_pair(
                 model_id,
                 PlacementInputs {
-                    candidate_filter: Some(accepts_media_refs),
+                    candidate_filter: Some(ACCEPTS_MEDIA_REFS),
                     ..Default::default()
                 },
                 None,
@@ -2508,7 +2559,7 @@ mod tests {
                 .select_pd_pair(
                     model_id,
                     PlacementInputs {
-                        candidate_filter: Some(accepts_media_refs),
+                        candidate_filter: Some(ACCEPTS_MEDIA_REFS),
                         ..Default::default()
                     },
                     None,

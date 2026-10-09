@@ -82,6 +82,20 @@ pub trait Encoder: Send + Sync {
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>>;
 }
 
+/// Per-stream state that turns generated token ids into text one at a time.
+///
+/// Implementations own whatever they need (pending bytes, a decode window)
+/// and must produce, over a whole stream, the text [`Decoder::decode`] gives
+/// for all of its ids.
+pub trait IncrementalDecoder: Send + Sync {
+    /// Feed one token; returns the text that became final with it (empty when
+    /// the token only extends a multi-byte character or is skipped).
+    fn step(&mut self, token_id: TokenIdType) -> Result<String>;
+
+    /// Forget all state, as for a new stream.
+    fn reset(&mut self);
+}
+
 /// Core decoding trait - can be implemented independently
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
@@ -134,6 +148,17 @@ pub trait Decoder: Send + Sync {
         } else {
             Ok(None)
         }
+    }
+
+    /// A dedicated per-stream decoder, when the backend has a cheaper
+    /// algorithm than [`decode_step`](Self::decode_step) (byte-level BPE
+    /// vocabularies do). `None`, the default, means callers use `decode_step`.
+    fn incremental_decoder(
+        &self,
+        skip_special_tokens: bool,
+    ) -> Option<Box<dyn IncrementalDecoder>> {
+        let _ = skip_special_tokens;
+        None
     }
 }
 

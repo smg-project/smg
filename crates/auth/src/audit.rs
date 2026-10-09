@@ -215,7 +215,9 @@ impl AuditLogger {
         )
         .entered();
 
-        // Log the event
+        // Log the event. The optional fields are recorded as plain string
+        // values and left out when absent: formatted with `?` they would be
+        // Rust `Debug` text (`Some("req-1")`, `None`) inside the JSON log.
         info!(
             target: "smg::audit",
             timestamp = %event.timestamp.to_rfc3339(),
@@ -224,10 +226,10 @@ impl AuditLogger {
             role = %event.role,
             method = %event.method,
             path = %event.path,
-            resource = ?event.resource,
+            resource = event.resource.as_deref(),
             outcome = %event.outcome,
-            request_id = ?event.request_id,
-            details = ?event.details,
+            request_id = event.request_id.as_deref(),
+            details = event.details.as_deref(),
             "control_plane_audit"
         );
     }
@@ -296,6 +298,112 @@ mod tests {
     fn test_audit_outcome_display() {
         assert_eq!(AuditOutcome::Success.to_string(), "success");
         assert_eq!(AuditOutcome::Denied.to_string(), "denied");
+    }
+
+    /// A subscriber that keeps how each field of an event was recorded: as a
+    /// string value (`record_str`) or as `Debug` text (`record_debug`).
+    #[derive(Default)]
+    struct FieldCapture {
+        fields: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl tracing::Subscriber for FieldCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor<'a>(&'a mut Vec<(String, String)>);
+
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0
+                        .push((field.name().to_string(), format!("str:{value}")));
+                }
+
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .push((field.name().to_string(), format!("debug:{value:?}")));
+                }
+            }
+
+            let mut fields = self.fields.lock().unwrap();
+            event.record(&mut Visitor(&mut fields));
+        }
+
+        fn enter(&self, _: &span::Id) {}
+
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    fn recorded_fields(log: impl FnOnce()) -> Vec<(String, String)> {
+        let capture = std::sync::Arc::new(FieldCapture::default());
+        tracing::subscriber::with_default(capture.clone(), log);
+        let fields = capture.fields.lock().unwrap();
+        fields
+            .iter()
+            .filter(|(name, _)| ["resource", "request_id", "details"].contains(&name.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn optional_fields_are_logged_as_plain_values() {
+        let logger = AuditLogger::new(true);
+        let ctx = AuditContext::new(
+            "user@example.com",
+            "jwt",
+            Role::Admin,
+            "POST",
+            "/workers",
+            Some("req-abc"),
+        );
+
+        let fields = recorded_fields(|| logger.log_success(&ctx, Some("worker-123")));
+
+        assert!(
+            fields.contains(&("resource".to_string(), "str:worker-123".to_string())),
+            "resource is not a plain string: {fields:?}"
+        );
+        assert!(
+            fields.contains(&("request_id".to_string(), "str:req-abc".to_string())),
+            "request_id is not a plain string: {fields:?}"
+        );
+        assert!(
+            !fields.iter().any(|(_, value)| value.contains("Some(")),
+            "Debug text in the audit line: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn absent_optional_fields_are_left_out() {
+        let logger = AuditLogger::new(true);
+
+        let fields =
+            recorded_fields(|| logger.log_auth_failure("GET", "/workers", "Invalid token", None));
+
+        assert!(
+            fields.contains(&("details".to_string(), "str:Invalid token".to_string())),
+            "details is not a plain string: {fields:?}"
+        );
+        assert!(
+            !fields
+                .iter()
+                .any(|(name, _)| name == "resource" || name == "request_id"),
+            "absent fields were logged (as `None`): {fields:?}"
+        );
     }
 
     #[test]

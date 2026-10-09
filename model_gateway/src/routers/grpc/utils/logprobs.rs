@@ -57,16 +57,36 @@ pub(crate) fn convert_proto_logprobs(
     }
 }
 
-/// Convert OutputLogProbs to OpenAI ChatLogProbs format using a Tokenizer
+/// Convert OutputLogProbs to OpenAI ChatLogProbs format using a Tokenizer.
+///
+/// `top_logprobs` is the number of alternatives the request asked for per
+/// token (`None` when it asked for none). The engine may report more, e.g.
+/// the chosen token when only its own logprob was requested; the OpenAI API
+/// returns exactly the requested alternatives, an empty list when none were.
 pub(crate) fn convert_proto_to_openai_logprobs(
     proto_logprobs: &ProtoOutputLogProbs,
     tokenizer: &Arc<dyn Tokenizer>,
+    top_logprobs: Option<u32>,
 ) -> ChatLogProbs {
-    convert_proto_logprobs(proto_logprobs, |token_id| {
+    let mut logprobs = convert_proto_logprobs(proto_logprobs, |token_id| {
         tokenizer
             .decode(&[token_id], false)
             .unwrap_or_else(|_| format!("<token_{token_id}>"))
-    })
+    });
+    truncate_top_logprobs(&mut logprobs, top_logprobs.unwrap_or(0) as usize);
+    logprobs
+}
+
+/// Keep at most `requested` alternatives per token.
+fn truncate_top_logprobs(logprobs: &mut ChatLogProbs, requested: usize) {
+    if let ChatLogProbs::Detailed {
+        content: Some(items),
+    } = logprobs
+    {
+        for item in items {
+            item.top_logprobs.truncate(requested);
+        }
+    }
 }
 
 /// Convert OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
@@ -101,4 +121,68 @@ pub(crate) fn convert_generate_input_logprobs(
             vec![logprob_value, Some(token_id as f64)]
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routers::grpc::proto_wrapper::ProtoTopLogProbs;
+
+    /// Two tokens; the engine reports the chosen token and one runner-up as
+    /// alternatives for each, whether or not alternatives were requested.
+    fn proto() -> ProtoOutputLogProbs {
+        ProtoOutputLogProbs {
+            token_logprobs: vec![-0.1, -0.2],
+            token_ids: vec![1, 2],
+            top_logprobs: vec![
+                ProtoTopLogProbs {
+                    values: vec![-0.1, -1.5],
+                    token_ids: vec![1, 3],
+                },
+                ProtoTopLogProbs {
+                    values: vec![-0.2, -1.6],
+                    token_ids: vec![2, 4],
+                },
+            ],
+        }
+    }
+
+    fn alternatives(top_logprobs: Option<u32>) -> Vec<Vec<String>> {
+        let mut logprobs = convert_proto_logprobs(&proto(), |id| format!("t{id}"));
+        truncate_top_logprobs(&mut logprobs, top_logprobs.unwrap_or(0) as usize);
+        let ChatLogProbs::Detailed {
+            content: Some(items),
+        } = logprobs
+        else {
+            panic!("detailed logprobs expected");
+        };
+        assert_eq!(items[0].token, "t1");
+        assert_eq!(items[1].logprob, -0.2);
+        items
+            .iter()
+            .map(|item| item.top_logprobs.iter().map(|t| t.token.clone()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn top_logprobs_are_empty_unless_requested() {
+        assert_eq!(alternatives(None), vec![Vec::<String>::new(), Vec::new()]);
+        assert_eq!(
+            alternatives(Some(0)),
+            vec![Vec::<String>::new(), Vec::new()]
+        );
+    }
+
+    #[test]
+    fn top_logprobs_are_capped_at_the_requested_count() {
+        assert_eq!(alternatives(Some(1)), vec![vec!["t1"], vec!["t2"]]);
+        assert_eq!(
+            alternatives(Some(2)),
+            vec![vec!["t1", "t3"], vec!["t2", "t4"]]
+        );
+        assert_eq!(
+            alternatives(Some(5)),
+            vec![vec!["t1", "t3"], vec!["t2", "t4"]]
+        );
+    }
 }

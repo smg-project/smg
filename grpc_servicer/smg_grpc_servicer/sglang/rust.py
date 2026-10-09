@@ -3,8 +3,11 @@
 ``sglang.launch_server --grpc-mode`` hands the process to this package's
 :func:`smg_grpc_servicer.sglang.server.serve_grpc`, which serves
 ``sglang.grpc.scheduler.SglangScheduler`` from Python over a request manager
-in front of the scheduler. With ``SMG_SGLANG_SERVICER_IMPL=rust`` the same
-entrypoint hands the process to :func:`serve_rust` before any of that exists:
+in front of the scheduler. With ``--servicer-impl rust`` (a flag this package
+adds to SGLang's parser as an SGLang plugin, see
+:mod:`smg_grpc_servicer.sglang.plugin`; ``SMG_SGLANG_SERVICER_IMPL=rust`` is
+the fallback the flag overrides) the same entrypoint hands the process to
+:func:`serve_rust` before any of that exists:
 the contract is served by the Rust :class:`smg.servicer.SglangGrpcServer` on a
 Rust-owned thread, and the scheduler runs headless in a spawned child (this
 package's :mod:`headless` launcher, with its SGLang plugin dialing the
@@ -25,9 +28,11 @@ import json
 import logging
 import multiprocessing
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
+from smg_grpc_servicer.hostport import host_port
+from smg_grpc_servicer.mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
@@ -46,17 +51,55 @@ SERVICER_IMPL_ENV = "SMG_SGLANG_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_SGLANG_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_SGLANG_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS"
+# Set to 0/false/no/off to keep SGLang's KV event publisher off when the
+# launcher was given no --kv-events-config (see `default_kv_events_config`).
+KV_EVENTS_ENV = "SMG_SGLANG_SERVICER_KV_EVENTS"
+_OFF_VALUES = ("0", "false", "no", "off")
+# What a launcher without --kv-events-config gets under the Rust servicer:
+# the ZMQ publisher, with SGLang's own defaults for the rest (the endpoint,
+# the topic; no replay socket).
+DEFAULT_KV_EVENTS_CONFIG = '{"publisher": "zmq"}'
 IMPLS = ("python", "rust")
+# Where the implementation choice came from, for the startup log line.
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
 
 
-def resolve_servicer_impl(environ: Mapping[str, str] | None = None) -> str:
-    """Which implementation serves this process: ``$SMG_SGLANG_SERVICER_IMPL``,
-    else python."""
+def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
+    """Which implementation serves this process: the launcher's
+    ``--servicer-impl`` when it carried one (``args.servicer_impl``, or the
+    value this package's SGLang plugin parsed in this process), else
+    ``$SMG_SGLANG_SERVICER_IMPL``, else python."""
+    return servicer_impl_source(args, environ)[0]
+
+
+def servicer_impl_source(
+    args: Any = None, environ: Mapping[str, str] | None = None
+) -> tuple[str, str]:
+    """:func:`resolve_servicer_impl`'s answer with where it came from:
+    ``flag``, ``env`` or ``default``.
+
+    A decision made with the launcher's flag in hand is written back to the
+    environment, so the headless scheduler child and anything that reads only
+    the variable agree with it when ``--servicer-impl python`` overrides an
+    exported ``rust``."""
     source = os.environ if environ is None else environ
-    value = str(source.get(SERVICER_IMPL_ENV) or "python").strip().lower()
+    value = getattr(args, "servicer_impl", None) if args is not None else None
+    if not value:
+        from smg_grpc_servicer.sglang import plugin
+
+        value = plugin.parsed_flag()
+    origin = SOURCE_FLAG
+    if not value:
+        value = source.get(SERVICER_IMPL_ENV)
+        origin = SOURCE_ENV if value else SOURCE_DEFAULT
+    value = str(value or "python").strip().lower()
     if value not in IMPLS:
         raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    return value
+    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
+        source[SERVICER_IMPL_ENV] = value
+    return value, origin
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +211,11 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol
+    # The engine's own per-request media limits, flat, as the Python servicer
+    # adds them: the Router's media pipeline holds requests to them.
+    item_limits = sglang_item_limits(server_args)
+    if item_limits:
+        args_dict[MM_ITEM_LIMITS_KEY] = item_limits
     try:
         from sglang.version import __version__ as sglang_version
     except ImportError:  # the launcher's unit tests run without SGLang
@@ -211,6 +259,38 @@ def kv_events_publisher(server_args: Any) -> tuple[str, str, str]:
         str(config.get("replay_endpoint") or ""),
         str(config.get("topic") or ""),
     )
+
+
+def default_kv_events_config(
+    server_args: Any, environ: Mapping[str, str] | None = None
+) -> str | None:
+    """Turn SGLang's KV event publisher on when the launcher was given no
+    ``--kv-events-config``; returns the configuration applied, or None.
+
+    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
+    SGLang publishes none unless started with ``--kv-events-config
+    '{"publisher": "zmq"}'``: a launcher without it got a router that routed
+    blind, with one WARN per worker as the only trace. Under the Rust
+    servicer the server args that lack the option get exactly that
+    configuration before the facts and the headless scheduler are built from
+    them, so publisher and relay agree. An explicit ``--kv-events-config`` is
+    kept as given, off included; ``SMG_SGLANG_SERVICER_KV_EVENTS=0`` keeps
+    the publisher off without one.
+    """
+    source = os.environ if environ is None else environ
+    if getattr(server_args, "kv_events_config", None):
+        return None
+    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
+        return None
+    try:
+        server_args.kv_events_config = DEFAULT_KV_EVENTS_CONFIG
+    except AttributeError:  # frozen server args: left as they are
+        logger.warning(
+            "kv_events_config cannot be set on %s; KV event publishing stays as configured",
+            type(server_args).__name__,
+        )
+        return None
+    return DEFAULT_KV_EVENTS_CONFIG
 
 
 # ---------------------------------------------------------------------------
@@ -277,12 +357,28 @@ async def serve_rust(server_args: Any) -> int:
     from smg.servicer import SglangGrpcServer, init_servicer_tracing
 
     init_servicer_tracing(None)
+    if default_kv_events_config(server_args) is not None:
+        logger.info(
+            "KV event publishing enabled: no --kv-events-config was given, so SGLang's ZMQ "
+            "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+            "--kv-events-config to configure it, or set %s=0 to leave it off",
+            KV_EVENTS_ENV,
+        )
     handshake_port = int(os.environ.get(HANDSHAKE_PORT_ENV) or 0) or free_port()
     socket_dir = default_socket_dir()
     os.makedirs(socket_dir, mode=0o700, exist_ok=True)
     host = getattr(server_args, "host", None) or "0.0.0.0"
     port = int(getattr(server_args, "port", 0) or 0)
     facts = {**model_facts(server_args), **server_facts(server_args)}
+    if facts.get("kv_events_endpoint"):
+        logger.info(
+            "SubscribeKvEvents relays SGLang's KV events from %s", facts["kv_events_endpoint"]
+        )
+    else:
+        logger.warning(
+            "SubscribeKvEvents is off (no ZMQ KV event publisher configured): a cache-aware "
+            "router sees nothing of this engine's cache"
+        )
     engine_count = facts["data_parallel_size"]
     if engine_count > 1:
         logger.info(
@@ -297,7 +393,7 @@ async def serve_rust(server_args: Any) -> int:
             getattr(server_args, "model_path", ""),
         )
     server = SglangGrpcServer(
-        bind_address=f"{host}:{port}",
+        bind_address=host_port(host, port),
         ipc_base_url=f"ipc://{socket_dir}/sglang-servicer-{os.getpid()}",
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=engine_count,

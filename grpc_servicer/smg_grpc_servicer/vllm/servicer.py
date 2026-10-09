@@ -58,6 +58,7 @@ from smg_grpc_servicer.vllm.mm_processor import (
     MmProcessorUnavailable,
     MmSettings,
     build_mm_processor,
+    launcher_settings,
 )
 from smg_grpc_servicer.vllm.mm_salt import (
     engine_accepts_mm_inputs,
@@ -67,9 +68,12 @@ from smg_grpc_servicer.vllm.mm_salt import (
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
     mm_device_do_normalize,
+    mm_item_limits,
     model_facts,
+    running_window,
     server_facts,
 )
+from smg_grpc_servicer.vllm.trace_context import trace_headers
 
 from .mm_keys import (
     batches_missing_pixels,
@@ -111,9 +115,7 @@ def _kv_capacity_tokens(engine) -> int:
 
 def _max_running_requests(engine) -> int:
     """The scheduler's running window (``max_num_seqs``), when exposed."""
-    scheduler = getattr(getattr(engine, "vllm_config", None), "scheduler_config", None)
-    window = getattr(scheduler, "max_num_seqs", None)
-    return window if isinstance(window, int) and window > 0 else 0
+    return running_window(getattr(engine, "vllm_config", None))
 
 
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
@@ -177,8 +179,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Args:
             async_llm: The EngineClient instance (e.g. AsyncLLM)
             start_time: The server start time, in seconds since epoch
-            mm_settings: The launcher's `--mm-*` flags; None (an older
-                launcher) resolves everything from the environment
+            mm_settings: The launcher's `--mm-*` flags; None takes the
+                settings the plugin kept from this process's launcher parse
+                (upstream's launcher builds the servicer without its
+                namespace), else an older launcher resolves everything from
+                the environment
         """
         # The Rust path takes the process before this class exists; reaching
         # here with the flag set means the launcher never consulted it.
@@ -196,7 +201,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # from the requests this servicer forwards (vLLM's stats carry none).
         self._loads = LoadTracker()
         # Flag > env > default, resolved once so each value names its source.
-        self._mm_settings = (mm_settings or MmSettings()).resolve()
+        self._mm_settings = (mm_settings or launcher_settings() or MmSettings()).resolve()
         # Worker-side media processing (media_refs); None keeps refs rejected.
         self._mm_processor = build_mm_processor(async_llm, settings=self._mm_settings)
         # One cap over all the multimodal work this servicer runs off the event
@@ -436,6 +441,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 sampling_params=sampling_params,
                 request_id=request_id,
                 tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers(context.invocation_metadata()),
                 data_parallel_rank=(
                     request.data_parallel_rank if request.HasField("data_parallel_rank") else None
                 ),
@@ -699,6 +705,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             GetServerInfoResponse protobuf
         """
         facts = server_facts(self.engine.vllm_config)
+        # The running window is the newest field; a proto package predating
+        # it takes the rest and leaves the Router's admission gate off.
+        max_num_seqs = facts.pop("max_num_seqs", 0)
         mm_processor = ""
         mm_media_ref_schemes = ""
         # A --language-model-only engine accepts no multimodal inputs, so it
@@ -725,6 +734,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # engine raw pixels; likewise absent from an older proto package.
         if "mm_device_do_normalize" in info.DESCRIPTOR.fields_by_name:
             info.mm_device_do_normalize = mm_device_do_normalize(self.engine.vllm_config)
+        if max_num_seqs and "max_num_seqs" in info.DESCRIPTOR.fields_by_name:
+            info.max_num_seqs = max_num_seqs
+        # The engine's own per-prompt media limits, for the Router's media
+        # pipeline to hold requests to; likewise absent from an older package.
+        if "mm_item_limits" in info.DESCRIPTOR.fields_by_name:
+            info.mm_item_limits = mm_item_limits(self.engine.vllm_config)
         return info
 
     async def GetLoads(

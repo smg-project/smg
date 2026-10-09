@@ -3,9 +3,11 @@
 Run with: pytest grpc_servicer/tests/test_vllm_mm_processor.py
 """
 
+import argparse
 import asyncio
 import importlib.util
 import logging
+import os
 import sys
 import types
 from dataclasses import dataclass
@@ -250,15 +252,26 @@ class TestMmSettings:
         assert set(resolved.sources.values()) == {"default"}
         assert resolved.resolved
 
+    @staticmethod
+    def _launcher_with_the_flags(**values):
+        """A namespace as a launcher that defines every `--mm-*` flag parses it."""
+        return types.SimpleNamespace(
+            **{f"mm_{name}": values.get(name) for name in mm_processor._MM_SETTING_SPECS},
+            model="m",
+        )
+
     def test_env_fills_what_the_flags_left_unset(self, caplog):
+        """The launcher defines the flags, the operator set the variables: the
+        values apply, each with a line pointing at the flag it stands in for."""
         env = {
             "SMG_VLLM_MM_PROCESSOR": " Redis ",
             "SMG_VLLM_MM_MAX_ITEM_BYTES": "4096",
             "SMG_VLLM_MM_SIDECAR_TIMEOUT_MS": "1000",
             "SMG_VLLM_MM_MAX_ITEMS": "3",
         }
+        settings = mm_processor.MmSettings.from_args(self._launcher_with_the_flags())
         with caplog.at_level("WARNING", logger=self.LOGGER):
-            resolved = mm_processor.MmSettings().resolve(env=env)
+            resolved = settings.resolve(env=env)
         assert resolved.processor == "redis"
         assert resolved.max_item_bytes == 4096
         assert resolved.sidecar_timeout_ms == 1000
@@ -274,6 +287,39 @@ class TestMmSettings:
         ) in messages
         assert sum("SMG_VLLM_MM_PROCESSOR is deprecated" in m for m in messages) == 1
         assert sum("is deprecated in favour of" in m for m in messages) == 4
+
+    def test_env_alone_on_a_launcher_without_the_flags_logs_no_deprecation(self, caplog):
+        """A launcher that defines no `--mm-*` flag (upstream's stock gRPC
+        launcher without this package's plugin, a servicer built without a
+        namespace): the variables are its one way to set the values, and are
+        read as such, without a deprecation line pointing at a flag it lacks."""
+        env = {"SMG_VLLM_MM_PROCESSOR": "smg", "SMG_VLLM_MM_MAX_ITEM_BYTES": "4096"}
+        older_launcher = types.SimpleNamespace(model="m")
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            bare = mm_processor.MmSettings().resolve(env=env)
+            older = mm_processor.MmSettings.from_args(older_launcher).resolve(env=env)
+        assert not [r for r in caplog.records if "deprecated" in r.getMessage()]
+        for resolved in (bare, older):
+            assert (resolved.processor, resolved.max_item_bytes) == ("smg", 4096)
+            assert resolved.source == "env" and resolved.sources["max_item_bytes"] == "env"
+            assert resolved.flags_defined == frozenset()
+
+    def test_the_deprecation_line_follows_the_flags_the_launcher_defines(self, caplog):
+        """A launcher with some of the flags: the variable behind a flag it
+        defines logs the line, the variable behind one it lacks does not."""
+        settings = mm_processor.MmSettings.from_args(
+            types.SimpleNamespace(mm_processor=None, model="m")
+        )
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_INFLIGHT": "7"}
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = settings.resolve(env=env)
+        assert [r.getMessage() for r in caplog.records] == [
+            "SMG_VLLM_MM_PROCESSOR is deprecated in favour of --mm-processor; env support ends"
+            " in the next minor release"
+        ]
+        assert (resolved.processor, resolved.max_inflight) == ("inprocess", 7)
+        assert resolved.sources["processor"] == resolved.sources["max_inflight"] == "env"
+        assert settings.flags_defined == resolved.flags_defined == frozenset({"processor"})
 
     def test_flags_win_over_env_and_log_no_deprecation(self, caplog):
         requested = mm_processor.MmSettings(
@@ -310,10 +356,12 @@ class TestMmSettings:
         assert settings == mm_processor.MmSettings(
             processor="redis", redis_url="redis://cache:6379/1", sidecar_namespace="ns"
         )
-        # An older launcher namespace without the flags asks for nothing.
-        assert mm_processor.MmSettings.from_args(types.SimpleNamespace(model="m")) == (
-            mm_processor.MmSettings()
-        )
+        assert settings.flags_defined == frozenset(mm_processor._MM_SETTING_SPECS)
+        # An older launcher namespace without the flags asks for nothing, and
+        # is remembered as a launcher without them.
+        older = mm_processor.MmSettings.from_args(types.SimpleNamespace(model="m"))
+        assert older == mm_processor.MmSettings()
+        assert older.flags_defined == frozenset()
 
     def test_flag_values_are_validated_like_env_values(self):
         with pytest.raises(ValueError, match="--mm-processor='sidecar' is not one of"):
@@ -363,11 +411,99 @@ class TestMmSettings:
 
     def test_resolving_twice_is_stable_and_quiet(self, caplog):
         env = {"SMG_VLLM_MM_PROCESSOR": "redis"}
+        settings = mm_processor.MmSettings.from_args(self._launcher_with_the_flags())
         with caplog.at_level("WARNING", logger=self.LOGGER):
-            once = mm_processor.MmSettings().resolve(env=env)
+            once = settings.resolve(env=env)
             again = once.resolve(env={})
         assert again == once
+        assert again.flags_defined == settings.flags_defined
         assert sum("deprecated" in r.getMessage() for r in caplog.records) == 1
+
+
+class TestLauncherFlags:
+    """The `--mm-*` flags on a launcher parser that lacks them, and their
+    carry-over to a servicer built without the namespace."""
+
+    LOGGER = "mm_processor"
+
+    def test_add_mm_arguments_defines_what_from_args_reads(self, caplog):
+        parser = argparse.ArgumentParser(prog="grpc_server")
+        parser.add_argument("--port", type=int, default=50051)
+        added = mm_processor.add_mm_arguments(parser)
+        assert added == [flag for flag, _env, _default in mm_processor._MM_SETTING_SPECS.values()]
+        args = parser.parse_args(
+            ["--mm-processor", "smg", "--mm-max-item-bytes", "4096", "--mm-sidecar-namespace", "ns"]
+        )
+        settings = mm_processor.MmSettings.from_args(args)
+        assert settings == mm_processor.MmSettings(
+            processor="smg", max_item_bytes=4096, sidecar_namespace="ns"
+        )
+        assert settings.flags_defined == frozenset(mm_processor._MM_SETTING_SPECS)
+        # The flag wins over the variable, quietly; a flag left out takes the
+        # variable, with the line that points at the flag.
+        env = {"SMG_VLLM_MM_PROCESSOR": "redis", "SMG_VLLM_MM_MAX_INFLIGHT": "9"}
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = settings.resolve(env=env)
+        assert (resolved.processor, resolved.max_inflight) == ("smg", 9)
+        assert (resolved.sources["processor"], resolved.sources["max_inflight"]) == ("flag", "env")
+        assert [r.getMessage() for r in caplog.records] == [
+            "SMG_VLLM_MM_MAX_INFLIGHT is deprecated in favour of --mm-max-inflight; env support"
+            " ends in the next minor release"
+        ]
+        # A parser that has the flags already (a `vllm serve` with its own) gets none twice.
+        assert mm_processor.add_mm_arguments(parser) == []
+        assert "--mm-processor" in parser.format_help()
+        # Bad values are the parser's errors, as for any flag.
+        for argv in (["--mm-processor", "sidecar"], ["--mm-max-inflight", "many"]):
+            with pytest.raises(SystemExit):
+                parser.parse_args(argv)
+
+    def test_carry_mm_flags_keeps_the_settings_for_a_servicer_built_without_them(
+        self, monkeypatch, caplog
+    ):
+        """Upstream's launcher builds the servicer without its namespace: the
+        settings the plugin kept from the parse are what the servicer resolves
+        when given none, so a flag's value stays `source=flag` and a variable
+        behind a flag the launcher has still gets its deprecation line; the
+        set values reach the environment as well."""
+        monkeypatch.setattr(mm_processor, "_launcher_settings", None)
+        monkeypatch.setattr(mm_processor, "_environ_before_carry", None)
+        monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "off")
+        assert mm_processor.launcher_settings() is None
+        parser = argparse.ArgumentParser(prog="grpc_server")
+        mm_processor.add_mm_arguments(parser)
+        kept = mm_processor.carry_mm_flags(parser.parse_args(["--mm-processor", "inprocess"]))
+        assert mm_processor.launcher_settings() is kept
+        assert kept.flags_defined == frozenset(mm_processor._MM_SETTING_SPECS)
+        assert os.environ["SMG_VLLM_MM_PROCESSOR"] == "inprocess"
+        # The servicer's own expression, given no settings.
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_INFLIGHT": "7"}
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = (
+                None or mm_processor.launcher_settings() or mm_processor.MmSettings()
+            ).resolve(env=env)
+        assert (resolved.processor, resolved.source) == ("inprocess", "flag")
+        assert (resolved.max_inflight, resolved.sources["max_inflight"]) == (7, "env")
+        assert [r.getMessage() for r in caplog.records] == [
+            "SMG_VLLM_MM_MAX_INFLIGHT is deprecated in favour of --mm-max-inflight; env support"
+            " ends in the next minor release"
+        ]
+
+    def test_export_mm_flags_carries_the_values_to_a_servicer_without_the_namespace(self):
+        parser = argparse.ArgumentParser(prog="grpc_server")
+        mm_processor.add_mm_arguments(parser)
+        args = parser.parse_args(["--mm-processor", "inprocess", "--mm-max-items", "2"])
+        environ = {"SMG_VLLM_MM_PROCESSOR": "redis"}
+        exported = mm_processor.export_mm_flags(args, environ)
+        assert exported == {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEMS": "2"}
+        assert environ == exported
+        # A servicer built without the namespace resolves the same values, quietly.
+        resolved = mm_processor.MmSettings().resolve(env=environ)
+        assert (resolved.processor, resolved.max_items, resolved.source) == ("inprocess", 2, "env")
+        # Flags left out export nothing: the environment keeps its own values.
+        untouched = {"SMG_VLLM_MM_MAX_INFLIGHT": "5"}
+        assert mm_processor.export_mm_flags(parser.parse_args([]), untouched) == {}
+        assert untouched == {"SMG_VLLM_MM_MAX_INFLIGHT": "5"}
 
 
 class TestInProcessConstruction:
@@ -662,6 +798,41 @@ class TestServicerWiring:
         servicer = VllmEngineServicer(_Engine(), start_time=0.0)
         assert servicer._mm_processor is None
         assert servicer._mm_settings.source == "default"
+
+    def test_a_servicer_built_without_settings_takes_the_launchers(self, monkeypatch, caplog):
+        """Upstream's launcher builds the servicer without its namespace: it
+        resolves the settings the plugin kept from the parse, so a flag's value
+        is reported as such and a variable behind a flag the launcher has still
+        gets its deprecation line."""
+        pytest.importorskip("vllm")
+        # The servicer reads the slot of the installed module, not of the copy
+        # this file loads from its path.
+        from smg_grpc_servicer.vllm import mm_processor as installed
+        from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+
+        parsed = types.SimpleNamespace(
+            **{f"mm_{name}": None for name in installed._MM_SETTING_SPECS}, model="m"
+        )
+        parsed.mm_processor = "off"
+        monkeypatch.setattr(installed, "_launcher_settings", installed.MmSettings.from_args(parsed))
+        monkeypatch.delenv("SMG_VLLM_MM_PROCESSOR", raising=False)
+        monkeypatch.setenv("SMG_VLLM_MM_MAX_INFLIGHT", "3")
+
+        class _Engine:
+            vllm_config = type("VC", (), {"kv_events_config": None})()
+            model_config = type("MC", (), {"is_multimodal_model": False})()
+
+        with caplog.at_level("WARNING", logger="mm_processor"):
+            servicer = VllmEngineServicer(_Engine(), start_time=0.0)
+        assert servicer._mm_processor is None
+        assert servicer._mm_settings.source == "flag"
+        assert servicer._mm_limit == 3
+        assert servicer._mm_settings.sources["max_inflight"] == "env"
+        assert any(
+            "SMG_VLLM_MM_MAX_INFLIGHT is deprecated in favour of --mm-max-inflight"
+            in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_launcher_settings_take_precedence_and_name_their_source(self, monkeypatch, caplog):
         pytest.importorskip("vllm")

@@ -198,7 +198,9 @@ async def test_generate_aborts_with_invalid_argument_for_vllm_validation_error()
     class Aborted(Exception):
         pass
 
-    context = SimpleNamespace(abort=AsyncMock(side_effect=Aborted()))
+    context = SimpleNamespace(
+        abort=AsyncMock(side_effect=Aborted()), invocation_metadata=lambda: ()
+    )
     with pytest.raises(Aborted):
         async for _ in servicer.Generate(request, context):
             pass

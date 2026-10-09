@@ -1,0 +1,1182 @@
+{
+  "cases": [
+    {
+      "fnv1a_bf16": "0d484b497590a9c8",
+      "fnv1a_f32": "baff3ba7ab4e73cc",
+      "fnv1a_positions_i64": "3e8fe93a6018f3a5",
+      "height": 64,
+      "max_soft_tokens": 280,
+      "name": "synthetic_64x64_280",
+      "num_soft_tokens": 256,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 0
+      },
+      "target_hw": [
+        768,
+        768
+      ],
+      "width": 64
+    },
+    {
+      "fnv1a_bf16": "ff3cc3217ffa24d7",
+      "fnv1a_f32": "3d5e4c493d750c1c",
+      "fnv1a_positions_i64": "f10a208209df5745",
+      "height": 64,
+      "max_soft_tokens": 70,
+      "name": "synthetic_64x64_70",
+      "num_soft_tokens": 64,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 0
+      },
+      "target_hw": [
+        384,
+        384
+      ],
+      "width": 64
+    },
+    {
+      "fnv1a_bf16": "838cb66b80a09378",
+      "fnv1a_f32": "f98eb2b414b49d56",
+      "fnv1a_positions_i64": "50b65ebce9ac2944",
+      "height": 128,
+      "max_soft_tokens": 280,
+      "name": "synthetic_96x128_280",
+      "num_soft_tokens": 266,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 1
+      },
+      "target_hw": [
+        912,
+        672
+      ],
+      "width": 96
+    },
+    {
+      "fnv1a_bf16": "e836d404f01e059e",
+      "fnv1a_f32": "4356dbf1fd27a5d3",
+      "fnv1a_positions_i64": "cb8f968e82d86cda",
+      "height": 128,
+      "max_soft_tokens": 70,
+      "name": "synthetic_96x128_70",
+      "num_soft_tokens": 63,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 1
+      },
+      "target_hw": [
+        432,
+        336
+      ],
+      "width": 96
+    },
+    {
+      "fnv1a_bf16": "a8d617cb0cde9b04",
+      "fnv1a_f32": "618a0ffcf2d8bd3b",
+      "fnv1a_positions_i64": "596051a6e943ab24",
+      "height": 150,
+      "max_soft_tokens": 280,
+      "name": "synthetic_200x150_280",
+      "num_soft_tokens": 266,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 2
+      },
+      "target_hw": [
+        672,
+        912
+      ],
+      "width": 200
+    },
+    {
+      "fnv1a_bf16": "84449451995994fc",
+      "fnv1a_f32": "828ce75c91022edd",
+      "fnv1a_positions_i64": "0033773e172a9d7a",
+      "height": 150,
+      "max_soft_tokens": 70,
+      "name": "synthetic_200x150_70",
+      "num_soft_tokens": 63,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 2
+      },
+      "target_hw": [
+        336,
+        432
+      ],
+      "width": 200
+    },
+    {
+      "fnv1a_bf16": "bf0331be15b5e48d",
+      "fnv1a_f32": "7e60246e40ef9457",
+      "fnv1a_positions_i64": "596051a6e943ab24",
+      "height": 240,
+      "max_soft_tokens": 280,
+      "name": "synthetic_320x240_280",
+      "num_soft_tokens": 266,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 3
+      },
+      "target_hw": [
+        672,
+        912
+      ],
+      "width": 320
+    },
+    {
+      "fnv1a_bf16": "0a19db1164507b3c",
+      "fnv1a_f32": "c5786922893ef9dc",
+      "fnv1a_positions_i64": "0033773e172a9d7a",
+      "height": 240,
+      "max_soft_tokens": 70,
+      "name": "synthetic_320x240_70",
+      "num_soft_tokens": 63,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 3
+      },
+      "target_hw": [
+        336,
+        432
+      ],
+      "width": 320
+    },
+    {
+      "fnv1a_bf16": "4ab5c1e3554b0279",
+      "fnv1a_f32": "9e567413f4bd773b",
+      "fnv1a_positions_i64": "3e8fe93a6018f3a5",
+      "height": 512,
+      "max_soft_tokens": 280,
+      "name": "synthetic_512x512_280",
+      "num_soft_tokens": 256,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 4
+      },
+      "target_hw": [
+        768,
+        768
+      ],
+      "width": 512
+    },
+    {
+      "fnv1a_bf16": "c6ab9ba38cd9549f",
+      "fnv1a_f32": "43c8138ab499b6cc",
+      "fnv1a_positions_i64": "f10a208209df5745",
+      "height": 512,
+      "max_soft_tokens": 70,
+      "name": "synthetic_512x512_70",
+      "num_soft_tokens": 64,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 4
+      },
+      "target_hw": [
+        384,
+        384
+      ],
+      "width": 512
+    },
+    {
+      "fnv1a_bf16": "4fd956fd93fbcd67",
+      "fnv1a_f32": "5c93f7c9be42e3f7",
+      "fnv1a_positions_i64": "596051a6e943ab24",
+      "height": 480,
+      "max_soft_tokens": 280,
+      "name": "synthetic_640x480_280",
+      "num_soft_tokens": 266,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 5
+      },
+      "target_hw": [
+        672,
+        912
+      ],
+      "width": 640
+    },
+    {
+      "fnv1a_bf16": "c31b67d2402124e9",
+      "fnv1a_f32": "eccfdb6b1ab1826f",
+      "fnv1a_positions_i64": "0033773e172a9d7a",
+      "height": 480,
+      "max_soft_tokens": 70,
+      "name": "synthetic_640x480_70",
+      "num_soft_tokens": 63,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 5
+      },
+      "target_hw": [
+        336,
+        432
+      ],
+      "width": 640
+    },
+    {
+      "fnv1a_bf16": "40c28681b4ddf634",
+      "fnv1a_f32": "734315ccdc279ec0",
+      "fnv1a_positions_i64": "3e8fe93a6018f3a5",
+      "height": 1024,
+      "max_soft_tokens": 280,
+      "name": "synthetic_1024x1024_280",
+      "num_soft_tokens": 256,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 6
+      },
+      "target_hw": [
+        768,
+        768
+      ],
+      "width": 1024
+    },
+    {
+      "fnv1a_bf16": "4e5cac85fce89839",
+      "fnv1a_f32": "b1eb0c091bc92cb4",
+      "fnv1a_positions_i64": "f10a208209df5745",
+      "height": 1024,
+      "max_soft_tokens": 70,
+      "name": "synthetic_1024x1024_70",
+      "num_soft_tokens": 64,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 6
+      },
+      "target_hw": [
+        384,
+        384
+      ],
+      "width": 1024
+    },
+    {
+      "fnv1a_bf16": "a7a785bd80744875",
+      "fnv1a_f32": "f0c9681442ff69e2",
+      "fnv1a_positions_i64": "80a71be41b37ad25",
+      "height": 300,
+      "max_soft_tokens": 280,
+      "name": "synthetic_1200x300_280",
+      "num_soft_tokens": 264,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 7
+      },
+      "target_hw": [
+        384,
+        1584
+      ],
+      "width": 1200
+    },
+    {
+      "fnv1a_bf16": "4f3393262e856f7d",
+      "fnv1a_f32": "a97e2b2d46e14fc3",
+      "fnv1a_positions_i64": "f45aa67efca02345",
+      "height": 300,
+      "max_soft_tokens": 70,
+      "name": "synthetic_1200x300_70",
+      "num_soft_tokens": 64,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 7
+      },
+      "target_hw": [
+        192,
+        768
+      ],
+      "width": 1200
+    },
+    {
+      "fnv1a_bf16": "4d362fb995bf21b4",
+      "fnv1a_f32": "041f9696e3d20d85",
+      "fnv1a_positions_i64": "1b2fdafe432ec925",
+      "height": 1200,
+      "max_soft_tokens": 280,
+      "name": "synthetic_300x1200_280",
+      "num_soft_tokens": 264,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 8
+      },
+      "target_hw": [
+        1584,
+        384
+      ],
+      "width": 300
+    },
+    {
+      "fnv1a_bf16": "587ec369f59e0fc0",
+      "fnv1a_f32": "c2933f09a1c24d69",
+      "fnv1a_positions_i64": "e0790977f0912f45",
+      "height": 1200,
+      "max_soft_tokens": 70,
+      "name": "synthetic_300x1200_70",
+      "num_soft_tokens": 64,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 8
+      },
+      "target_hw": [
+        768,
+        192
+      ],
+      "width": 300
+    },
+    {
+      "fnv1a_bf16": "e8714ed42486a65a",
+      "fnv1a_f32": "99404cc3bcaddb54",
+      "fnv1a_positions_i64": "1943848cd7c06325",
+      "height": 720,
+      "max_soft_tokens": 280,
+      "name": "synthetic_1280x720_280",
+      "num_soft_tokens": 264,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 9
+      },
+      "target_hw": [
+        576,
+        1056
+      ],
+      "width": 1280
+    },
+    {
+      "fnv1a_bf16": "3f1c069b57bd260d",
+      "fnv1a_f32": "23f745dc6e921fac",
+      "fnv1a_positions_i64": "03b3fe31c0a6c544",
+      "height": 720,
+      "max_soft_tokens": 70,
+      "name": "synthetic_1280x720_70",
+      "num_soft_tokens": 66,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 9
+      },
+      "target_hw": [
+        288,
+        528
+      ],
+      "width": 1280
+    },
+    {
+      "fnv1a_bf16": "3e69b288b59036f1",
+      "fnv1a_f32": "1925f587902f23aa",
+      "fnv1a_positions_i64": "1943848cd7c06325",
+      "height": 1080,
+      "max_soft_tokens": 280,
+      "name": "synthetic_1920x1080_280",
+      "num_soft_tokens": 264,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 10
+      },
+      "target_hw": [
+        576,
+        1056
+      ],
+      "width": 1920
+    },
+    {
+      "fnv1a_bf16": "c467830e98ff2d71",
+      "fnv1a_f32": "e259a8bf8095aeca",
+      "fnv1a_positions_i64": "03b3fe31c0a6c544",
+      "height": 1080,
+      "max_soft_tokens": 70,
+      "name": "synthetic_1920x1080_70",
+      "num_soft_tokens": 66,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 10
+      },
+      "target_hw": [
+        288,
+        528
+      ],
+      "width": 1920
+    },
+    {
+      "fnv1a_bf16": "899b927fe001e75d",
+      "fnv1a_f32": "932ccae1b9ff957e",
+      "fnv1a_positions_i64": "646d34ec0de52865",
+      "height": 2000,
+      "max_soft_tokens": 280,
+      "name": "synthetic_3000x2000_280",
+      "num_soft_tokens": 260,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 11
+      },
+      "target_hw": [
+        624,
+        960
+      ],
+      "width": 3000
+    },
+    {
+      "fnv1a_bf16": "4faebbf809f1d2b8",
+      "fnv1a_f32": "041af1c362431529",
+      "fnv1a_positions_i64": "28f371e720a24e85",
+      "height": 2000,
+      "max_soft_tokens": 70,
+      "name": "synthetic_3000x2000_70",
+      "num_soft_tokens": 60,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 11
+      },
+      "target_hw": [
+        288,
+        480
+      ],
+      "width": 3000
+    },
+    {
+      "fnv1a_bf16": "0e01a3f3d678cd8e",
+      "fnv1a_f32": "5cceabdf34fef3ab",
+      "fnv1a_positions_i64": "50b65ebce9ac2944",
+      "height": 56,
+      "max_soft_tokens": 280,
+      "name": "synthetic_41x56_280",
+      "num_soft_tokens": 266,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 12
+      },
+      "target_hw": [
+        912,
+        672
+      ],
+      "width": 41
+    },
+    {
+      "fnv1a_bf16": "53b663738b54ca84",
+      "fnv1a_f32": "abce0068004d3e26",
+      "fnv1a_positions_i64": "cb8f968e82d86cda",
+      "height": 56,
+      "max_soft_tokens": 70,
+      "name": "synthetic_41x56_70",
+      "num_soft_tokens": 63,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 12
+      },
+      "target_hw": [
+        432,
+        336
+      ],
+      "width": 41
+    },
+    {
+      "fnv1a_bf16": "c396fe7c5933bebb",
+      "fnv1a_f32": "3a736d03dcada41d",
+      "fnv1a_positions_i64": "6a1a0895a430ee65",
+      "height": 351,
+      "max_soft_tokens": 280,
+      "name": "synthetic_28x351_280",
+      "num_soft_tokens": 236,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 13
+      },
+      "target_hw": [
+        2832,
+        192
+      ],
+      "width": 28
+    },
+    {
+      "fnv1a_bf16": "6d845e1e18ea0822",
+      "fnv1a_f32": "ab9e387f2e06ba46",
+      "fnv1a_positions_i64": "00652cb730714ba4",
+      "height": 351,
+      "max_soft_tokens": 70,
+      "name": "synthetic_28x351_70",
+      "num_soft_tokens": 58,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 13
+      },
+      "target_hw": [
+        1392,
+        96
+      ],
+      "width": 28
+    },
+    {
+      "fnv1a_bf16": "bb026c58796d6325",
+      "fnv1a_f32": "38e69e04ef6aa325",
+      "fnv1a_positions_i64": "3e8fe93a6018f3a5",
+      "height": 1,
+      "max_soft_tokens": 280,
+      "name": "synthetic_1x1_280",
+      "num_soft_tokens": 256,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 14
+      },
+      "target_hw": [
+        768,
+        768
+      ],
+      "width": 1
+    },
+    {
+      "fnv1a_bf16": "95bd9ca531f4f325",
+      "fnv1a_f32": "a693c33eb0f44325",
+      "fnv1a_positions_i64": "f10a208209df5745",
+      "height": 1,
+      "max_soft_tokens": 70,
+      "name": "synthetic_1x1_70",
+      "num_soft_tokens": 64,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 14
+      },
+      "target_hw": [
+        384,
+        384
+      ],
+      "width": 1
+    },
+    {
+      "fnv1a_bf16": "4f97c8f6b74abcb1",
+      "fnv1a_f32": "4a7169970ff7870a",
+      "fnv1a_positions_i64": "c1e05bb0619de465",
+      "height": 3,
+      "max_soft_tokens": 280,
+      "name": "synthetic_2x3_280",
+      "num_soft_tokens": 260,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 15
+      },
+      "target_hw": [
+        960,
+        624
+      ],
+      "width": 2
+    },
+    {
+      "fnv1a_bf16": "aa6b3065da4b0235",
+      "fnv1a_f32": "0bc2caa21b98cbcd",
+      "fnv1a_positions_i64": "5612ab1eeadf4685",
+      "height": 3,
+      "max_soft_tokens": 70,
+      "name": "synthetic_2x3_70",
+      "num_soft_tokens": 60,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 15
+      },
+      "target_hw": [
+        480,
+        288
+      ],
+      "width": 2
+    },
+    {
+      "fnv1a_bf16": "6915034bfddf5e0b",
+      "fnv1a_f32": "6fbc8efa7221b65a",
+      "fnv1a_positions_i64": "3e8fe93a6018f3a5",
+      "height": 47,
+      "max_soft_tokens": 280,
+      "name": "synthetic_47x47_280",
+      "num_soft_tokens": 256,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 16
+      },
+      "target_hw": [
+        768,
+        768
+      ],
+      "width": 47
+    },
+    {
+      "fnv1a_bf16": "5a7e6883675c6f89",
+      "fnv1a_f32": "57fc894e8d87f1fa",
+      "fnv1a_positions_i64": "f10a208209df5745",
+      "height": 47,
+      "max_soft_tokens": 70,
+      "name": "synthetic_47x47_70",
+      "num_soft_tokens": 64,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 16
+      },
+      "target_hw": [
+        384,
+        384
+      ],
+      "width": 47
+    },
+    {
+      "fnv1a_bf16": "e43c9112992db1f2",
+      "fnv1a_f32": "6df3582ea24ed006",
+      "fnv1a_positions_i64": "fa4d482407ca9ba5",
+      "height": 10,
+      "max_soft_tokens": 280,
+      "name": "synthetic_3000x10_280",
+      "num_soft_tokens": 280,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "seed": 17
+      },
+      "target_hw": [
+        48,
+        13440
+      ],
+      "width": 3000
+    },
+    {
+      "fnv1a_bf16": "3d948c3da31a27dc",
+      "fnv1a_f32": "c3745b894ce903b1",
+      "fnv1a_positions_i64": "23afe4f6a74ac464",
+      "height": 10,
+      "max_soft_tokens": 70,
+      "name": "synthetic_3000x10_70",
+      "num_soft_tokens": 70,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "seed": 17
+      },
+      "target_hw": [
+        48,
+        3360
+      ],
+      "width": 3000
+    },
+    {
+      "fnv1a_bf16": "32e4beb6da6f6aae",
+      "fnv1a_f32": "a56a460e471f0bc0",
+      "fnv1a_positions_i64": "646d34ec0de52865",
+      "height": 701,
+      "max_soft_tokens": 280,
+      "name": "carrots_280",
+      "num_soft_tokens": 260,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "file": "deepseek_v41_carrots.png"
+      },
+      "target_hw": [
+        624,
+        960
+      ],
+      "width": 1024
+    },
+    {
+      "fnv1a_bf16": "ee3e1173d63f3472",
+      "fnv1a_f32": "30b04bd728d9746d",
+      "fnv1a_positions_i64": "28f371e720a24e85",
+      "height": 701,
+      "max_soft_tokens": 70,
+      "name": "carrots_70",
+      "num_soft_tokens": 60,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "file": "deepseek_v41_carrots.png"
+      },
+      "target_hw": [
+        288,
+        480
+      ],
+      "width": 1024
+    },
+    {
+      "fnv1a_bf16": "de70b61b647a84e5",
+      "fnv1a_f32": "148502aae99c9734",
+      "fnv1a_positions_i64": "646d34ec0de52865",
+      "height": 308,
+      "max_soft_tokens": 280,
+      "name": "corn_280",
+      "num_soft_tokens": 260,
+      "positions_shape": [
+        1,
+        2520,
+        2
+      ],
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "source": {
+        "file": "deepseek_v41_corn.png"
+      },
+      "target_hw": [
+        624,
+        960
+      ],
+      "width": 450
+    },
+    {
+      "fnv1a_bf16": "7f1f323567ae180f",
+      "fnv1a_f32": "8cc0c6546b6c88c7",
+      "fnv1a_positions_i64": "28f371e720a24e85",
+      "height": 308,
+      "max_soft_tokens": 70,
+      "name": "corn_70",
+      "num_soft_tokens": 60,
+      "positions_shape": [
+        1,
+        630,
+        2
+      ],
+      "shape": [
+        1,
+        630,
+        768
+      ],
+      "source": {
+        "file": "deepseek_v41_corn.png"
+      },
+      "target_hw": [
+        288,
+        480
+      ],
+      "width": 450
+    }
+  ],
+  "generator": "generate_gemma4_preprocess_fingerprints.py",
+  "numpy": "2.2.6",
+  "processor": {
+    "image_max_soft_tokens": 280,
+    "patch_size": 16,
+    "pooling_kernel_size": 3,
+    "video_max_soft_tokens": 70
+  },
+  "reference": "transformers/models/gemma4/image_processing_gemma4.py (torchvision backend)",
+  "reference_sha256": "5d280d5448b1c219183a27e95b6aa7178b350275772d07881c91c65f13fa815e",
+  "torch": "2.13.0+cu130",
+  "transformers": "5.17.0",
+  "video_cases": [
+    {
+      "fnv1a_bf16": "0c6249e10b476574",
+      "fnv1a_f32": "a10691cb30bf72ce",
+      "fnv1a_positions_i64": "8b823f369bd6181a",
+      "height": 240,
+      "max_soft_tokens": 70,
+      "name": "frames_320x240",
+      "num_soft_tokens": [
+        63,
+        63,
+        63
+      ],
+      "positions_shape": [
+        3,
+        630,
+        2
+      ],
+      "shape": [
+        3,
+        630,
+        768
+      ],
+      "source": {
+        "seeds": [
+          20,
+          21,
+          22
+        ]
+      },
+      "target_hw": [
+        [
+          336,
+          432
+        ],
+        [
+          336,
+          432
+        ],
+        [
+          336,
+          432
+        ]
+      ],
+      "width": 320
+    },
+    {
+      "fnv1a_bf16": "d8f5d1638acb8ab6",
+      "fnv1a_f32": "07d5ce7829047973",
+      "fnv1a_positions_i64": "d4af386fa8a2b625",
+      "height": 360,
+      "max_soft_tokens": 70,
+      "name": "frames_640x360",
+      "num_soft_tokens": [
+        66,
+        66
+      ],
+      "positions_shape": [
+        2,
+        630,
+        2
+      ],
+      "shape": [
+        2,
+        630,
+        768
+      ],
+      "source": {
+        "seeds": [
+          23,
+          24
+        ]
+      },
+      "target_hw": [
+        [
+          288,
+          528
+        ],
+        [
+          288,
+          528
+        ]
+      ],
+      "width": 640
+    }
+  ]
+}

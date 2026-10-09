@@ -86,10 +86,18 @@ pub fn hash_video_with_sampling(
     hasher.update(&sample_fps.to_le_bytes());
     // `0` marks "no cap" so it cannot alias a real cap value.
     hasher.update(&max_long_side_pixel.unwrap_or(0).to_le_bytes());
-    hasher.update(&[match sampling {
-        FrameSampling::Even => 0,
-        FrameSampling::Interval => 1,
-    }]);
+    match sampling {
+        FrameSampling::Even => {
+            hasher.update(&[0]);
+        }
+        FrameSampling::Interval => {
+            hasher.update(&[1]);
+        }
+        FrameSampling::UpTo { max_frames } => {
+            hasher.update(&[2]);
+            hasher.update(&(max_frames as u64).to_le_bytes());
+        }
+    }
     hasher.finalize().to_hex().to_string()
 }
 
@@ -172,6 +180,20 @@ mod video_sampling_hash_tests {
             hash_video_with_sampling(CLIP, 1.0, None, FrameSampling::Even),
             hash_video_with_sampling(CLIP, 5.0, None, FrameSampling::Even)
         );
+    }
+
+    #[test]
+    fn frame_budgets_hash_apart_from_each_other_and_from_rate_sampling() {
+        let up_to = |max_frames| {
+            hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::UpTo { max_frames })
+        };
+        assert_ne!(up_to(32), up_to(16));
+        assert_ne!(up_to(32), hash_video(CLIP));
+        assert_ne!(
+            up_to(32),
+            hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::Interval)
+        );
+        assert_eq!(up_to(32), up_to(32));
     }
 
     #[test]

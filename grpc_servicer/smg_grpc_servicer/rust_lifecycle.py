@@ -22,10 +22,19 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DRAIN_SECS = 5.0
 ENGINE_TERMINATE_SECS = 30.0
-# Bound on the engine's ZMQ handshake. An engine's start includes model load,
-# kernel JIT and graph capture; a cold kernel cache has taken over ten minutes.
-# A dead engine never waits this long: ``supervise`` polls the engine process.
+# Bound on silence during the engine's ZMQ handshake. An engine's start
+# includes model load, kernel JIT and graph capture, and nothing crosses the
+# wire between its first handshake message and its last; a server that takes
+# ``note_engine_alive`` reports hears from ``supervise`` that the engine
+# process is alive on every poll, so a healthy start that outlasts this bound
+# still completes. A dead engine never waits this long: ``supervise`` polls
+# the engine process.
 DEFAULT_STARTUP_TIMEOUT_SECS = 1800.0
+# Bound on the whole start however alive the engine is: an engine that stays
+# alive without ever completing its handshake. Large checkpoints have taken
+# over half an hour to load on a cold start; four hours leaves room for the
+# storage path. 0 lifts the ceiling.
+DEFAULT_STARTUP_CEILING_SECS = 4 * 3600.0
 _POLL_SECS = 0.5
 TRACK_INTERVAL_SECS = 2.0  # how often the supervisor's poll refreshes the engine's descendants
 
@@ -303,12 +312,18 @@ async def supervise(
 ) -> int:
     """Run until a shutdown signal, an engine exit, or a server failure.
 
+    While the engine's handshake runs, every poll that finds the engine
+    process alive is reported to a server that takes such reports
+    (``note_engine_alive``), so the server's startup bound counts silence
+    from a living engine rather than time since the last handshake message.
+
     Signals drain: health flips to NOT_SERVING at once (the Router stops
     routing here), in-flight streams get ``drain_secs`` to finish with the
     engine still up, then the server stops and the engine is terminated.
     Returns the process exit code.
     """
     loop = asyncio.get_running_loop()
+    note_engine_alive = getattr(server, "note_engine_alive", None)
     if stop_event is None:
         stop_event = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -330,6 +345,8 @@ async def supervise(
                 logger.error("Headless engine exited with code %s", rc)
                 exit_code = 1
                 break
+            if not announced_ready and note_engine_alive is not None:
+                note_engine_alive()
             try:
                 await asyncio.wait_for(stop_event.wait(), poll_secs)
             except asyncio.TimeoutError:  # noqa: UP041 -- distinct from the builtin before 3.11

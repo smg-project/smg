@@ -16,7 +16,8 @@ pub use audit::{AuditEvent, AuditLogger, AuditOutcome};
 pub use config::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 pub use jwt::{JwtValidator, JwtValidatorError};
 pub use middleware::{
-    control_plane_auth_middleware, AuthMethod, ControlPlaneAuthState, Principal, PrincipalExt,
+    bearer_token, control_plane_auth_middleware, AuthMethod, ControlPlaneAuthState, Principal,
+    PrincipalExt,
 };
 
 /// Request ID for correlation in audit logs.

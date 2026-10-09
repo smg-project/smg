@@ -17,6 +17,7 @@ use super::{
     pixel_cache::{pixel_cache_with_budget, PixelCache},
     settings::MultimodalSettings,
 };
+use crate::worker::http_client::build_client;
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug, Clone)]
@@ -264,10 +265,12 @@ impl MultimodalComponents {
         max_inflight_bytes: Option<usize>,
         settings: &MultimodalSettings,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to create reqwest client")?;
+        let client = build_client(
+            || reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
+            false,
+            "media HTTP client",
+        )
+        .map_err(anyhow::Error::msg)?;
         let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
             .context("Failed to create MediaConnector")?;
 

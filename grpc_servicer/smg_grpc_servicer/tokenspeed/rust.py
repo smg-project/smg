@@ -2,9 +2,11 @@
 
 ``python -m smg_grpc_servicer.tokenspeed`` (what ``ts serve`` spawns) serves
 ``tokenspeed.grpc.scheduler.TokenSpeedScheduler`` from Python over TokenSpeed's
-in-process ``AsyncLLM``. With ``SMG_TOKENSPEED_SERVICER_IMPL=rust`` the same
-entrypoint hands the process to :func:`serve_rust` before an ``AsyncLLM`` or a
-Python gRPC server exists: the contract is served by the Rust
+in-process ``AsyncLLM``. With ``--servicer-impl rust`` (this package's flag on
+that launcher, see :func:`add_servicer_impl_argument`;
+``SMG_TOKENSPEED_SERVICER_IMPL=rust`` is the fallback the flag overrides) the
+same entrypoint hands the process to :func:`serve_rust` before an ``AsyncLLM``
+or a Python gRPC server exists: the contract is served by the Rust
 :class:`smg.servicer.TokenSpeedGrpcServer` on a Rust-owned thread, and the
 scheduler(s) run headless in a spawned child through TokenSpeed's own
 ``launch_scheduler_headless`` (what ``ts serve --headless`` runs), dialing the
@@ -19,15 +21,17 @@ emulates: ``FlushCache`` and profiling answer UNIMPLEMENTED, ranked
 
 from __future__ import annotations
 
+import argparse
 import copy
 import dataclasses
 import json
 import logging
 import multiprocessing
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
+from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
@@ -49,17 +53,71 @@ SERVICER_IMPL_ENV = "SMG_TOKENSPEED_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS"
+# Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
+# launcher was given no --kv-events-config (see `default_kv_events_config`).
+KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
+_OFF_VALUES = ("0", "false", "no", "off")
+# What a launcher without --kv-events-config gets under the Rust servicer:
+# the ZMQ publisher, with TokenSpeed's own defaults for the rest (the
+# endpoint, the topic).
+DEFAULT_KV_EVENTS_CONFIG = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
 IMPLS = ("python", "rust")
+SERVICER_IMPL_FLAG = "--servicer-impl"
+# Where the implementation choice came from, for the startup log line.
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
 
 
-def resolve_servicer_impl(environ: Mapping[str, str] | None = None) -> str:
-    """Which implementation serves this process: ``$SMG_TOKENSPEED_SERVICER_IMPL``,
-    else python."""
+def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
+    """Add ``--servicer-impl`` to a launcher's parser that lacks it; returns
+    whether it was added."""
+    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
+    if SERVICER_IMPL_FLAG in actions:
+        return False
+    parser.add_argument(
+        SERVICER_IMPL_FLAG,
+        dest="servicer_impl",
+        choices=list(IMPLS),
+        default=None,
+        help=(
+            "Which implementation serves the gRPC contract: the Python servicer (default) "
+            "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
+            f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
+        ),
+    )
+    return True
+
+
+def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
+    """Which implementation serves this process: ``args.servicer_impl`` when
+    the launcher carried the flag, else ``$SMG_TOKENSPEED_SERVICER_IMPL``, else
+    python."""
+    return servicer_impl_source(args, environ)[0]
+
+
+def servicer_impl_source(
+    args: Any = None, environ: Mapping[str, str] | None = None
+) -> tuple[str, str]:
+    """:func:`resolve_servicer_impl`'s answer with where it came from:
+    ``flag``, ``env`` or ``default``.
+
+    A decision made with the launcher's flag in hand is written back to the
+    environment, so the headless scheduler child and anything that reads only
+    the variable agree with it when ``--servicer-impl python`` overrides an
+    exported ``rust``."""
     source = os.environ if environ is None else environ
-    value = str(source.get(SERVICER_IMPL_ENV) or "python").strip().lower()
+    value = getattr(args, "servicer_impl", None) if args is not None else None
+    origin = SOURCE_FLAG
+    if not value:
+        value = source.get(SERVICER_IMPL_ENV)
+        origin = SOURCE_ENV if value else SOURCE_DEFAULT
+    value = str(value or "python").strip().lower()
     if value not in IMPLS:
         raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    return value
+    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
+        source[SERVICER_IMPL_ENV] = value
+    return value, origin
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +229,39 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     }
 
 
+def default_kv_events_config(
+    server_args: Any, environ: Mapping[str, str] | None = None
+) -> str | None:
+    """Turn TokenSpeed's KV event publisher on when the launcher was given no
+    ``--kv-events-config``; returns the configuration applied, or None.
+
+    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
+    TokenSpeed publishes none unless started with ``--kv-events-config
+    '{"enable_kv_cache_events": true, "publisher": "zmq"}'``: a launcher
+    without it got a router that routed blind, with one WARN per worker as
+    the only trace. Under the Rust servicer the server args that lack the
+    option get exactly that configuration before the facts and the headless
+    scheduler are built from them, so publisher and relay agree. An explicit
+    ``--kv-events-config`` is kept as given, off included;
+    ``SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`` keeps the publisher off without
+    one.
+    """
+    source = os.environ if environ is None else environ
+    if getattr(server_args, "kv_events_config", None):
+        return None
+    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
+        return None
+    try:
+        server_args.kv_events_config = DEFAULT_KV_EVENTS_CONFIG
+    except AttributeError:  # frozen server args: left as they are
+        logger.warning(
+            "kv_events_config cannot be set on %s; KV event publishing stays as configured",
+            type(server_args).__name__,
+        )
+        return None
+    return DEFAULT_KV_EVENTS_CONFIG
+
+
 # ---------------------------------------------------------------------------
 # Headless scheduler: TokenSpeed's own launch, dialing this servicer
 # ---------------------------------------------------------------------------
@@ -224,12 +315,28 @@ async def serve_rust(server_args: Any) -> int:
     from smg.servicer import TokenSpeedGrpcServer, init_servicer_tracing
 
     init_servicer_tracing(os.environ.get("RUST_LOG") and None)
+    if default_kv_events_config(server_args) is not None:
+        logger.info(
+            "KV event publishing enabled: no --kv-events-config was given, so TokenSpeed's ZMQ "
+            "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+            "--kv-events-config to configure it, or set %s=0 to leave it off",
+            KV_EVENTS_ENV,
+        )
     handshake_port = int(os.environ.get(HANDSHAKE_PORT_ENV) or 0) or free_port()
     socket_dir = default_socket_dir()
     os.makedirs(socket_dir, mode=0o700, exist_ok=True)
     host = getattr(server_args, "host", None) or "0.0.0.0"
     port = int(getattr(server_args, "port", 0) or 0)
     facts = {**model_facts(server_args), **server_facts(server_args)}
+    if facts.get("kv_events_endpoint"):
+        logger.info(
+            "SubscribeKvEvents relays TokenSpeed's KV events from %s", facts["kv_events_endpoint"]
+        )
+    else:
+        logger.warning(
+            "SubscribeKvEvents is off (KV cache events disabled, or a publisher other than "
+            "zmq): a cache-aware router sees nothing of this engine's cache"
+        )
     engine_count = facts["data_parallel_size"]
     tokenizer_dir = tokenizer_dir_for(server_args)
     if tokenizer_dir is None:
@@ -238,7 +345,7 @@ async def serve_rust(server_args: Any) -> int:
             getattr(server_args, "model", ""),
         )
     server = TokenSpeedGrpcServer(
-        bind_address=f"{host}:{port}",
+        bind_address=host_port(host, port),
         ipc_base_url=f"ipc://{socket_dir}/tokenspeed-servicer-{os.getpid()}",
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=engine_count,

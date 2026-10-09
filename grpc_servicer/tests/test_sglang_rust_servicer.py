@@ -8,14 +8,34 @@ class and a fake scheduler launch.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import os
 import sys
 import types
 from types import SimpleNamespace
 
 import pytest
-from smg_grpc_servicer.sglang import rust
+from smg_grpc_servicer.sglang import plugin, rust
+
+
+def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    monkeypatch.setitem(sys.modules, name, module)
+    parent, _, child = name.rpartition(".")
+    if parent:
+        parent_module = sys.modules.get(parent) or _install(monkeypatch, parent)
+        setattr(parent_module, child, module)
+    return module
+
+
+@pytest.fixture
+def no_parsed_flag(monkeypatch):
+    """No ``--servicer-impl`` parsed in this process, whatever ran before."""
+    monkeypatch.setattr(plugin._state, "parsed", None)
 
 
 def _server_args(**overrides):
@@ -57,15 +77,143 @@ def _model_config(**overrides):
 
 
 def test_package_exposes_the_flag_and_the_rust_entry_points():
-    assert rust.SERVICER_IMPL_ENV == "SMG_SGLANG_SERVICER_IMPL"
-    assert callable(rust.serve_rust) and callable(rust.resolve_servicer_impl)
+    import smg_grpc_servicer.sglang as pkg
+
+    assert pkg.SERVICER_IMPL_ENV == rust.SERVICER_IMPL_ENV == "SMG_SGLANG_SERVICER_IMPL"
+    assert pkg.resolve_servicer_impl is rust.resolve_servicer_impl
+    assert pkg.serve_rust is rust.serve_rust
+    assert set(plugin.SERVICER_IMPL_CHOICES) == set(rust.IMPLS)
 
 
-def test_resolve_servicer_impl_reads_the_env():
-    assert rust.resolve_servicer_impl({}) == "python"
-    assert rust.resolve_servicer_impl({rust.SERVICER_IMPL_ENV: " Rust "}) == "rust"
-    with pytest.raises(ValueError, match="SMG_SGLANG_SERVICER_IMPL"):
-        rust.resolve_servicer_impl({rust.SERVICER_IMPL_ENV: "go"})
+def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env(no_parsed_flag):
+    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={"SMG_SGLANG_SERVICER_IMPL": " Rust "}) == "rust"
+    args = argparse.Namespace(servicer_impl="rust")
+    assert rust.resolve_servicer_impl(args, environ={}) == "rust"
+    # The flag wins over the environment, in both directions.
+    assert (
+        rust.resolve_servicer_impl(args, environ={"SMG_SGLANG_SERVICER_IMPL": "python"}) == "rust"
+    )
+    args = argparse.Namespace(servicer_impl="python")
+    assert (
+        rust.resolve_servicer_impl(args, environ={"SMG_SGLANG_SERVICER_IMPL": "rust"}) == "python"
+    )
+    # An unset launcher flag falls through to the env.
+    args = argparse.Namespace(servicer_impl=None)
+    assert rust.resolve_servicer_impl(args, environ={"SMG_SGLANG_SERVICER_IMPL": "rust"}) == "rust"
+    with pytest.raises(ValueError, match="SMG_SGLANG_SERVICER_IMPL must be one of"):
+        rust.resolve_servicer_impl(environ={"SMG_SGLANG_SERVICER_IMPL": "go"})
+    with pytest.raises(ValueError, match="SMG_SGLANG_SERVICER_IMPL must be one of"):
+        rust.resolve_servicer_impl(argparse.Namespace(servicer_impl="go"), environ={})
+
+
+def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back(no_parsed_flag):
+    assert rust.servicer_impl_source(environ={}) == ("python", "default")
+    assert rust.servicer_impl_source(environ={"SMG_SGLANG_SERVICER_IMPL": "rust"}) == (
+        "rust",
+        "env",
+    )
+    # `--servicer-impl python` with `rust` still exported: the flag decides,
+    # and the environment the headless child inherits says the same.
+    environ = {"SMG_SGLANG_SERVICER_IMPL": "rust"}
+    args = argparse.Namespace(servicer_impl="python")
+    assert rust.servicer_impl_source(args, environ=environ) == ("python", "flag")
+    assert environ == {"SMG_SGLANG_SERVICER_IMPL": "python"}
+    # Without a flag in hand nothing is written.
+    environ = {}
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("python", "default")
+    assert environ == {}
+    # The flag the plugin parsed in this process counts as the launcher's:
+    # SGLang's ServerArgs does not carry it.
+    plugin._state.parsed = "rust"
+    environ = {"SMG_SGLANG_SERVICER_IMPL": "python"}
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("rust", "flag")
+    assert environ == {"SMG_SGLANG_SERVICER_IMPL": "rust"}
+
+
+def test_plugin_adds_the_servicer_impl_flag_to_sglangs_parser(monkeypatch, no_parsed_flag):
+    """The flag joins a parser once, is listed by --help, keeps argparse's
+    validation, and a parsed value is carried as this process's launcher
+    flag and into the environment (SGLang's ServerArgs would drop it)."""
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
+    parser = argparse.ArgumentParser(prog="sglang serve")
+    parser.add_argument("--grpc-mode", action="store_true")
+    assert plugin.add_servicer_impl_argument(parser) is True
+    assert plugin.add_servicer_impl_argument(parser) is False
+    assert "--servicer-impl {python,rust}" in parser.format_help()
+    assert "SMG_SGLANG_SERVICER_IMPL" in parser.format_help()
+    assert parser.parse_args(["--grpc-mode"]).servicer_impl is None
+    assert plugin.parsed_flag() is None and os.environ[rust.SERVICER_IMPL_ENV] == "python"
+    args = parser.parse_args(["--grpc-mode", "--servicer-impl", "rust"])
+    assert (args.grpc_mode, args.servicer_impl) == (True, "rust")
+    assert plugin.parsed_flag() == "rust" and os.environ[rust.SERVICER_IMPL_ENV] == "rust"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--grpc-mode", "--servicer-impl", "go"])
+    # The parsed flag decides ahead of the environment, with or without the namespace.
+    assert rust.servicer_impl_source(args, environ={"SMG_SGLANG_SERVICER_IMPL": "python"}) == (
+        "rust",
+        "flag",
+    )
+    assert rust.servicer_impl_source(SimpleNamespace(), environ={}) == ("rust", "flag")
+
+
+def test_the_flag_is_a_store_action_and_a_new_parser_forgets_the_last_choice(
+    monkeypatch, no_parsed_flag
+):
+    """SGLang's --config merger takes only store and store_true options from
+    the YAML file, so `servicer-impl: rust` there must find a store action;
+    and a new parser is a new parse, which drops the choice an earlier parser
+    in this process made."""
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
+    parser = argparse.ArgumentParser(prog="sglang serve")
+    plugin.add_servicer_impl_argument(parser)
+    action = parser._option_string_actions[plugin.SERVICER_IMPL_FLAG]  # noqa: SLF001
+    assert isinstance(action, argparse._StoreAction)  # noqa: SLF001
+    assert parser.parse_args(["--servicer-impl", "rust"]).servicer_impl == "rust"
+    assert plugin.parsed_flag() == "rust"
+    # The next parser SGLang builds in this process starts without it: a parse
+    # without the flag falls through to the environment.
+    fresh = argparse.ArgumentParser(prog="sglang serve")
+    assert plugin.add_servicer_impl_argument(fresh) is True
+    assert plugin.parsed_flag() is None
+    assert fresh.parse_args([]).servicer_impl is None
+    assert rust.servicer_impl_source(
+        SimpleNamespace(), environ={"SMG_SGLANG_SERVICER_IMPL": "python"}
+    ) == ("python", "env")
+
+
+def test_plugin_hooks_sglangs_parser_builder(monkeypatch, no_parsed_flag):
+    """SGLang runs the plugin before it parses: the hook on
+    ``ServerArgs.add_cli_args`` adds the flag to the parser it filled,
+    whether the method is called as a staticmethod or with a class."""
+    registered = []
+
+    class HookType:
+        BEFORE, AFTER, AROUND, REPLACE = "before", "after", "around", "replace"
+
+    class HookRegistry:
+        @classmethod
+        def register(cls, target, hook, hook_type=HookType.AFTER):
+            registered.append((target, hook, hook_type))
+
+    _install(
+        monkeypatch,
+        "sglang.srt.plugins.hook_registry",
+        HookRegistry=HookRegistry,
+        HookType=HookType,
+    )
+    plugin.register()
+    assert registered == [
+        ("sglang.srt.server_args.ServerArgs.add_cli_args", plugin.after_add_cli_args, "after")
+    ]
+    parser = argparse.ArgumentParser(prog="sglang serve")
+    assert plugin.after_add_cli_args(None, parser) is None
+    assert "--servicer-impl" in parser.format_help()
+    with_class = argparse.ArgumentParser(prog="sglang serve")
+    plugin.after_add_cli_args(None, object, with_class)
+    assert "--servicer-impl" in with_class.format_help()
+    plugin.after_add_cli_args(None, parser=with_class)  # once per parser
+    assert with_class.format_help().count("--servicer-impl") == 2  # usage + option
 
 
 def test_model_facts_mirror_the_python_servicer():
@@ -119,6 +267,19 @@ def test_server_facts_carry_the_router_labels_and_the_window(monkeypatch):
     assert facts["max_running_requests"] == 32
     assert facts["data_parallel_size"] == 2
     assert facts["scheduler_info_json"] == "{}"
+    # Without --limit-mm-data-per-request the engine has no per-request media
+    # limit to advertise: the Router keeps its own caps.
+    assert "mm_item_limits" not in args
+
+
+def test_server_facts_carry_the_engines_media_limits_flat(monkeypatch):
+    # SGLang's --limit-mm-data-per-request is a JSON object per modality; the
+    # Router's label readers take flat values only, so it rides along flat.
+    monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
+    facts = rust.server_facts(_server_args(limit_mm_data_per_request={"image": 1, "video": 1}))
+    args = json.loads(facts["server_args_json"])
+    assert args["mm_item_limits"] == "image=1,video=1"
+    assert args["limit_mm_data_per_request"] == {"image": 1, "video": 1}
 
 
 def test_server_facts_carry_the_kv_events_publisher(monkeypatch):
@@ -166,6 +327,41 @@ def test_server_facts_refuse_non_finite_floats():
         rust.server_facts(_server_args(mem_fraction_static=float("nan")))
 
 
+def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer():
+    """A launcher without --kv-events-config left SGLang publishing nothing and
+    the router's cache-aware routing blind (smg-lab #1): the Rust path turns
+    the ZMQ publisher on itself unless told otherwise."""
+    expected = '{"publisher": "zmq"}'
+    # Nothing given: SGLang's own defaults behind the ZMQ publisher.
+    args = _server_args()
+    assert rust.default_kv_events_config(args, environ={}) == expected
+    assert args.kv_events_config == expected
+    assert rust.kv_events_publisher(args) == ("tcp://*:5557", "", "")
+    args = _server_args(kv_events_config=None)
+    assert rust.default_kv_events_config(args, environ={}) == expected
+    args = _server_args(kv_events_config="")
+    assert rust.default_kv_events_config(args, environ={}) == expected
+    # The opt-out.
+    for value in ("0", "false", "No", " off "):
+        args = _server_args(kv_events_config=None)
+        assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: value}) is None
+        assert args.kv_events_config is None
+    args = _server_args()
+    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}) == expected
+    # An explicit configuration is kept as given, off included.
+    for given in ('{"publisher": "null"}', '{"publisher": "zmq", "endpoint": "tcp://*:6100"}'):
+        args = _server_args(kv_events_config=given)
+        assert rust.default_kv_events_config(args, environ={}) is None
+        assert args.kv_events_config == given
+    # Server args that cannot be written are left alone.
+
+    class Frozen:
+        __slots__ = ()
+        kv_events_config = None
+
+    assert rust.default_kv_events_config(Frozen(), environ={}) is None
+
+
 def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatch, tmp_path):
     created = {}
 
@@ -210,9 +406,13 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert created["engine_count"] == 1 and created["tokenizer_dir"] == "/tok"
     assert created["model_path"] == "org/model" and created["sglang_version"] == "x"
     assert launched == {"args": args, "port": 24321}
+    # No --kv-events-config was given: the headless scheduler publishes.
+    assert args.kv_events_config == '{"publisher": "zmq"}'
 
 
-def test_serve_grpc_hands_the_process_to_rust_when_the_flag_says_so(monkeypatch):
+def test_serve_grpc_hands_the_process_to_rust_when_the_flag_says_so(
+    monkeypatch, caplog, no_parsed_flag
+):
     pytest.importorskip("sglang")
     from smg_grpc_servicer.sglang import server
 
@@ -222,6 +422,8 @@ def test_serve_grpc_hands_the_process_to_rust_when_the_flag_says_so(monkeypatch)
         return 3
 
     monkeypatch.setattr(server, "serve_rust", fake_serve_rust)
-    with pytest.raises(SystemExit) as raised:
-        asyncio.run(server.serve_grpc(SimpleNamespace()))
+    with caplog.at_level("INFO", logger=server.logger.name):
+        with pytest.raises(SystemExit) as raised:
+            asyncio.run(server.serve_grpc(SimpleNamespace()))
     assert raised.value.code == 3
+    assert "Servicer implementation: rust (source=env)" in caplog.text

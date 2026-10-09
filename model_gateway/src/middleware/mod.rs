@@ -5,6 +5,7 @@
 //! reference, so this split is invisible to downstream callers.
 
 pub mod auth;
+pub mod body_timeout;
 pub mod concurrency;
 pub mod logging;
 pub mod metrics;
@@ -16,10 +17,11 @@ pub mod token_bucket;
 pub mod wasm;
 
 pub use auth::{auth_middleware, deny_all_middleware, AuthConfig};
+pub use body_timeout::{request_body_timeout_middleware, RequestBodyTimeouts};
 pub use concurrency::{concurrency_limit_middleware, AdmissionQueue, TokenGuardBody};
 pub use logging::{
-    create_logging_layer, ProbeResponse, RequestLogger, RequestSpan, ResponseLogger,
-    StreamFailureLogger,
+    create_logging_layer, trace_context_response, ProbeResponse, RequestLogger, RequestSpan,
+    ResponseLogger, StreamFailureLogger,
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};

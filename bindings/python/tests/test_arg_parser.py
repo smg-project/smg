@@ -717,6 +717,8 @@ class TestParseRouterArgs:
                 "5",
                 "--worker-wedge-secs",
                 "7",
+                "--worker-stale-secs",
+                "9",
                 "--worker-warmup-secs",
                 "30",
                 "--worker-warmup-share",
@@ -737,6 +739,7 @@ class TestParseRouterArgs:
         assert router_args.kv_index == "chain"
         assert router_args.worker_stall_secs == 5
         assert router_args.worker_wedge_secs == 7
+        assert router_args.worker_stale_secs == 9
         assert router_args.worker_warmup_secs == 30
         assert router_args.worker_warmup_share == pytest.approx(0.5)
         assert router_args.worker_warmup_blocks == 256
@@ -750,6 +753,7 @@ class TestParseRouterArgs:
         assert defaults.kv_index == "positional"
         assert defaults.worker_stall_secs == 2
         assert defaults.worker_wedge_secs == 3
+        assert defaults.worker_stale_secs == 15
         assert defaults.worker_warmup_secs == 60
         assert defaults.worker_warmup_share == pytest.approx(0.25)
         assert defaults.worker_warmup_blocks == 1024
@@ -1639,6 +1643,7 @@ class TestRouterArgsFieldOrder:
         "disable_tokenizer_autoload",
         "tokenizer_cache_enable_l0",
         "tokenizer_cache_l0_max_entries",
+        "tokenizer_cache_l0_max_memory",
         "tokenizer_cache_enable_l1",
         "tokenizer_cache_l1_max_memory",
         "reasoning_parser",
@@ -1727,6 +1732,7 @@ class TestRouterArgsFieldOrder:
         "kv_index",
         "worker_stall_secs",
         "worker_wedge_secs",
+        "worker_stale_secs",
         "worker_warmup_secs",
         "worker_warmup_share",
         "worker_warmup_blocks",
@@ -1785,6 +1791,7 @@ class TestRouterArgsFieldOrder:
             "kv_index",
             "worker_stall_secs",
             "worker_wedge_secs",
+            "worker_stale_secs",
             "worker_warmup_secs",
             "worker_warmup_share",
             "worker_warmup_blocks",
@@ -1806,3 +1813,31 @@ class TestRouterArgsFieldOrder:
                 f"{appended} must be appended after worker_startup_delay to "
                 "preserve positional callers"
             )
+
+
+class TestPrometheusHostDefault:
+    """--prometheus-host is unset by default: the router derives the metrics
+    bind address from --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)
+    instead of the launcher pinning an IPv4-only 0.0.0.0."""
+
+    def _parse(self, argv):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        return RouterArgs.from_cli_args(parser.parse_args(argv))
+
+    def test_unset_by_default(self):
+        assert self._parse([]).prometheus_host is None
+        assert self._parse(["--host", "[::]"]).prometheus_host is None
+        assert self._parse(["--host", "127.0.0.1"]).prometheus_host is None
+
+    def test_explicit_value_is_kept(self):
+        assert self._parse(["--prometheus-host", "::"]).prometheus_host == "::"
+        assert self._parse(["--prometheus-host", "[::]"]).prometheus_host == "[::]"
+        assert self._parse(["--prometheus-host", "127.0.0.1"]).prometheus_host == "127.0.0.1"
+        assert self._parse(["--prometheus-host", "0.0.0.0"]).prometheus_host == "0.0.0.0"
+
+    def test_router_prefix_unset_by_default(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = RouterArgs.from_cli_args(parser.parse_args([]), use_router_prefix=True)
+        assert args.prometheus_host is None

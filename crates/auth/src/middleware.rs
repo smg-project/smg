@@ -148,9 +148,15 @@ impl ControlPlaneAuthState {
     }
 }
 
-/// Check admin role and log denial if not admin.
+/// Whether `role` may perform `method` on a control plane route: `admin`
+/// every method, `user` the read-only ones (GET and HEAD).
+fn role_allows(role: Role, method: &str) -> bool {
+    role.is_admin() || matches!(method, "GET" | "HEAD")
+}
+
+/// Check the role against the request method and log a denial.
 /// Returns Some(Response) if denied, None if allowed.
-fn check_admin_role(
+fn check_role(
     principal_id: &str,
     auth_method: &str,
     role: Role,
@@ -159,21 +165,21 @@ fn check_admin_role(
     request_id: Option<&str>,
     audit_logger: &AuditLogger,
 ) -> Option<Response> {
-    if role.is_admin() {
+    if role_allows(role, method) {
         return None;
     }
 
     warn!(
-        "{} {} has role {:?} but admin is required for control plane access",
-        auth_method, principal_id, role
+        "{} {} has role {:?} but admin is required for {} {}",
+        auth_method, principal_id, role, method, path
     );
     let ctx = AuditContext::new(principal_id, auth_method, role, method, path, request_id);
-    audit_logger.log_denied(&ctx, "Admin role required for control plane access");
+    audit_logger.log_denied(&ctx, "Admin role required for this control plane operation");
 
     Some(
         (
             StatusCode::FORBIDDEN,
-            "Admin role required for control plane access",
+            "Admin role required for this control plane operation",
         )
             .into_response(),
     )
@@ -203,17 +209,32 @@ fn log_auth_success(
     audit_logger.log_success(&ctx, None);
 }
 
+/// The token of a `Bearer` credential in an `Authorization` header value.
+///
+/// The scheme is matched case-insensitively (RFC 7235: authentication scheme
+/// names are case-insensitive), followed by one or more spaces and a
+/// non-empty token. Returns `None` for any other scheme or an empty token.
+pub fn bearer_token(header_value: &str) -> Option<&str> {
+    let (scheme, rest) = header_value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim_start_matches(' ');
+    (!token.is_empty()).then_some(token)
+}
+
 /// Control plane authentication middleware.
 ///
 /// This middleware:
 /// 1. Extracts the Bearer token from the Authorization header
 /// 2. Attempts JWT validation first (if configured)
 /// 3. Falls back to API key validation (if configured)
-/// 4. Checks if the authenticated principal has admin role
+/// 4. Checks the principal's role against the request: `admin` for every
+///    method, `user` for the read-only ones (GET, HEAD)
 /// 5. Logs audit events for control plane access
 ///
 /// Returns 401 Unauthorized if authentication fails.
-/// Returns 403 Forbidden if the user doesn't have admin role.
+/// Returns 403 Forbidden if the principal's role does not allow the method.
 pub async fn control_plane_auth_middleware(
     State(auth_state): State<ControlPlaneAuthState>,
     mut request: Request<Body>,
@@ -233,7 +254,7 @@ pub async fn control_plane_auth_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
+        .and_then(bearer_token);
 
     let Some(token) = token else {
         debug!("Missing or invalid Authorization header for control plane API");
@@ -255,7 +276,7 @@ pub async fn control_plane_auth_middleware(
     if let Some(jwt_validator) = &auth_state.jwt_validator {
         match jwt_validator.validate(token).await {
             Ok(validated_token) => {
-                if let Some(resp) = check_admin_role(
+                if let Some(resp) = check_role(
                     &validated_token.subject,
                     "jwt",
                     validated_token.role,
@@ -311,7 +332,7 @@ pub async fn control_plane_auth_middleware(
 
     // Try API key validation
     if let Some(api_key_entry) = auth_state.config.find_api_key(token) {
-        if let Some(resp) = check_admin_role(
+        if let Some(resp) = check_role(
             &api_key_entry.id,
             "api_key",
             api_key_entry.role,
@@ -437,6 +458,39 @@ mod tests {
             key_id: "key-123".to_string(),
         };
         assert_eq!(api_key.to_string(), "api_key:key-123");
+    }
+
+    #[test]
+    fn bearer_token_matches_the_scheme_case_insensitively() {
+        assert_eq!(bearer_token("Bearer k1"), Some("k1"));
+        assert_eq!(bearer_token("bearer k1"), Some("k1"));
+        assert_eq!(bearer_token("BEARER k1"), Some("k1"));
+        assert_eq!(bearer_token("Bearer   k1"), Some("k1"));
+    }
+
+    #[test]
+    fn bearer_token_rejects_other_schemes_and_empty_tokens() {
+        assert_eq!(bearer_token("Basic k1"), None);
+        assert_eq!(bearer_token("Bearerk1"), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Bearer "), None);
+        assert_eq!(bearer_token("k1"), None);
+    }
+
+    #[test]
+    fn admin_may_use_every_method() {
+        for method in ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] {
+            assert!(role_allows(Role::Admin, method), "{method}");
+        }
+    }
+
+    #[test]
+    fn user_may_only_read() {
+        assert!(role_allows(Role::User, "GET"));
+        assert!(role_allows(Role::User, "HEAD"));
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert!(!role_allows(Role::User, method), "{method}");
+        }
     }
 
     #[test]

@@ -13,8 +13,11 @@ use axum::{
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
+use serde_json::json;
 use sha2::{Digest, Sha256};
+use smg_auth::bearer_token;
 
 use crate::{
     config::TenantApiKeyEntry,
@@ -89,7 +92,7 @@ pub async fn auth_middleware(
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "))
+            .and_then(bearer_token)
             .map(hash_key);
 
         let tenant_key = token_hash
@@ -97,7 +100,7 @@ pub async fn auth_middleware(
             .and_then(|hash| auth_config.keys.get(hash));
 
         let Some(tenant_key) = tenant_key else {
-            return StatusCode::UNAUTHORIZED.into_response();
+            return unauthorized(token_hash.is_some());
         };
 
         request
@@ -110,8 +113,45 @@ pub async fn auth_middleware(
 
 /// Unconditionally rejects with 401 — for route groups that must never fall
 /// back to open just because their auth config happens to be empty.
-pub async fn deny_all_middleware(_request: Request<Body>, _next: Next) -> Response {
-    StatusCode::UNAUTHORIZED.into_response()
+pub async fn deny_all_middleware(request: Request<Body>, _next: Next) -> Response {
+    let token_presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(bearer_token)
+        .is_some();
+    unauthorized(token_presented)
+}
+
+/// The serving plane's 401: the `WWW-Authenticate` challenge RFC 6750
+/// requires (`error="invalid_token"` when a token was presented but is not a
+/// configured key) and an OpenAI-style error body, so SDK clients surface a
+/// message instead of a blank error.
+fn unauthorized(token_presented: bool) -> Response {
+    let (challenge, message) = if token_presented {
+        (
+            "Bearer realm=\"data-plane\", error=\"invalid_token\"",
+            "Invalid API key",
+        )
+    } else {
+        (
+            "Bearer realm=\"data-plane\"",
+            "Missing API key: send it as `Authorization: Bearer <key>`",
+        )
+    };
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, challenge)],
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_api_key",
+            }
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -273,6 +313,87 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_matched_case_insensitively() {
+        let auth_config = AuthConfig::new(Some("shared-secret".to_string()));
+
+        for scheme in ["bearer", "BEARER"] {
+            let response = app(auth_config.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(header::AUTHORIZATION, format!("{scheme} shared-secret"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "scheme {scheme}");
+        }
+    }
+
+    fn challenge(response: &Response) -> String {
+        response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn missing_key_gets_a_bearer_challenge_and_a_message() {
+        let response = app(AuthConfig::new(Some("shared-secret".to_string())))
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(challenge(&response), "Bearer realm=\"data-plane\"");
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_key_gets_an_invalid_token_challenge() {
+        let response = app(AuthConfig::new(Some("shared-secret".to_string())))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::AUTHORIZATION, "Bearer not-a-configured-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            challenge(&response),
+            "Bearer realm=\"data-plane\", error=\"invalid_token\""
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_all_carries_the_challenge() {
+        let response = Router::new()
+            .route("/", get(handler))
+            .route_layer(axum::middleware::from_fn(deny_all_middleware))
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(challenge(&response), "Bearer realm=\"data-plane\"");
     }
 
     #[test]

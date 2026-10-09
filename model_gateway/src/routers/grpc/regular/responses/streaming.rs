@@ -152,6 +152,19 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     build_sse_response(rx)
 }
 
+/// The SSE events of one frame of the chat stream's body.
+///
+/// The chat pipeline writes whole events to the body, but not one per frame:
+/// a frame carries every chunk the engine had ready when the stream loop ran,
+/// and a re-sliced stream every slice cut from one chunk. Read as one event,
+/// such a frame parses as nothing and everything after its first event is lost.
+fn sse_events(frame: &str) -> impl Iterator<Item = &str> {
+    frame
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|event| !event.is_empty())
+}
+
 /// Process chat SSE stream and transform to responses format
 async fn process_and_transform_sse_stream(
     body: Body,
@@ -189,8 +202,8 @@ async fn process_and_transform_sse_stream(
     let mut stream = body.into_data_stream();
 
     let mut terminal_error = None;
-    // Process stream chunks (each chunk is a complete SSE event)
-    while let Some(chunk_result) = stream.next().await {
+    // Process the stream frame by frame; a frame holds one or more SSE events.
+    'frames: while let Some(chunk_result) = stream.next().await {
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
             Err(error) => {
@@ -201,17 +214,17 @@ async fn process_and_transform_sse_stream(
             }
         };
 
-        // Convert chunk to string
-        let event_str = String::from_utf8_lossy(&chunk);
-        let event = event_str.trim();
+        let frame = String::from_utf8_lossy(&chunk);
+        for event in sse_events(&frame) {
+            // Check for end of stream
+            if event == "data: [DONE]" {
+                break 'frames;
+            }
 
-        // Check for end of stream
-        if event == "data: [DONE]" {
-            break;
-        }
-
-        // Parse SSE event (format: "data: {...}\n\n" or "data: {...}")
-        if let Some(json_str) = event.strip_prefix("data: ") {
+            // Parse SSE event (format: "data: {...}")
+            let Some(json_str) = event.strip_prefix("data: ") else {
+                continue;
+            };
             let json_str = json_str.trim();
 
             // Try to parse as ChatCompletionStreamResponse
@@ -230,7 +243,7 @@ async fn process_and_transform_sse_stream(
                                 "code": error.get("code").and_then(Value::as_str).or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
                                 "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
                             }));
-                            break;
+                            break 'frames;
                         }
                     }
                     // Pass through unrecognized non-error events.
@@ -970,18 +983,21 @@ async fn convert_and_accumulate_stream(
     let mut mcp_indices: HashMap<u32, bool> = HashMap::new();
     let mut pending: HashMap<u32, Vec<ToolCallDelta>> = HashMap::new();
 
-    while let Some(chunk_result) = stream.next().await {
+    // A frame holds one or more SSE events; every one of them counts.
+    'frames: while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|error| {
             json!({
                 "code": "stream_error", "message": format!("Stream read error: {error}"),
             })
         })?;
-        let event_str = String::from_utf8_lossy(&chunk);
-        let event = event_str.trim();
-        if event == "data: [DONE]" {
-            break;
-        }
-        if let Some(json_str) = event.strip_prefix("data: ") {
+        let frame = String::from_utf8_lossy(&chunk);
+        for event in sse_events(&frame) {
+            if event == "data: [DONE]" {
+                break 'frames;
+            }
+            let Some(json_str) = event.strip_prefix("data: ") else {
+                continue;
+            };
             let json_str = json_str.trim();
             if let Ok(mut chat_chunk) =
                 serde_json::from_str::<ChatCompletionStreamResponse>(json_str)
@@ -1600,5 +1616,139 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("connection reset"));
+    }
+
+    /// One chat chunk as the SSE event the chat stream writes for it.
+    fn chat_event(delta: Value, finish_reason: Option<&str>) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]
+            })
+        )
+    }
+
+    /// The chat stream hands the body every chunk the engine had ready as one
+    /// frame. Each event of such a frame is converted, and a `[DONE]` that
+    /// shares its frame with the finish chunk still ends the stream.
+    #[tokio::test]
+    async fn drained_frame_feeds_every_chat_chunk_to_the_responses_stream() {
+        let frames = vec![
+            [
+                chat_event(json!({"role":"assistant","content":""}), None),
+                chat_event(json!({"content":"Hel"}), None),
+                chat_event(json!({"content":"lo"}), None),
+            ]
+            .concat(),
+            [
+                chat_event(json!({}), Some("stop")),
+                "data: [DONE]\n\n".to_string(),
+            ]
+            .concat(),
+        ];
+        let body = Body::from_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+        ));
+        let (tx, mut rx) = mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(false),
+                ..Default::default()
+            },
+            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        let mut events: Vec<Value> = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                // Only the chat stream's `[DONE]` is not JSON; keep it visible.
+                events.push(serde_json::from_str(data).unwrap_or(Value::String(data.to_string())));
+            }
+        }
+        assert!(
+            events.iter().all(|e| e["sequence_number"].is_u64()),
+            "a chat frame reached the client unconverted: {events:?}"
+        );
+        let text: String = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_text.delta")
+            .map(|e| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "Hello");
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+        assert_eq!(
+            terminal["response"]["output"][0]["content"][0]["text"],
+            "Hello"
+        );
+    }
+
+    /// The MCP converter reads every event of a frame as well: a server call
+    /// whose name, arguments and finish arrive in one frame is accumulated
+    /// for execution.
+    #[tokio::test]
+    async fn drained_frame_feeds_every_chat_chunk_to_the_mcp_converter() {
+        let frame = [
+            chat_event(
+                json!({"tool_calls":[{"index":0,"id":"call_server","type":"function",
+                    "function":{"name":"server_tool","arguments":""}}]}),
+                None,
+            ),
+            chat_event(
+                json!({"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":1}"}}]}),
+                None,
+            ),
+            chat_event(json!({}), Some("tool_calls")),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, _rx) = mpsc::channel(64);
+        let response =
+            convert_and_accumulate_stream(Body::from(frame), &mut emitter, &tx, |name| {
+                name == "server_tool"
+            })
+            .await
+            .unwrap();
+        let choice = &response.choices[0];
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        let calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("the server call of the frame is accumulated");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_server");
+        assert_eq!(calls[0].function.name, "server_tool");
+        assert_eq!(calls[0].function.arguments.as_deref(), Some("{\"q\":1}"));
+    }
+
+    /// An upstream error that shares a frame with the chunks before it fails
+    /// the response instead of completing it.
+    #[tokio::test]
+    async fn drained_frame_error_fails_the_mcp_stream() {
+        let frame = [
+            chat_event(json!({"role":"assistant","content":"Part"}), None),
+            "data: {\"error\":{\"message\":\"engine unavailable\",\"type\":\"internal_error\"}}\n\n"
+                .to_string(),
+        ]
+        .concat();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, _rx) = mpsc::channel(64);
+        let error = convert_and_accumulate_stream(Body::from(frame), &mut emitter, &tx, |_| false)
+            .await
+            .unwrap_err();
+        assert_eq!(error["code"], "internal_error");
+        assert_eq!(error["message"], "engine unavailable");
     }
 }

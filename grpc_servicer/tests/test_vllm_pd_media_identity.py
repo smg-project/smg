@@ -114,7 +114,7 @@ def _request(*, refs=False, kv=False, identity=None):
 
 
 async def _complete(servicer, request):
-    context = SimpleNamespace(abort=AsyncMock())
+    context = SimpleNamespace(abort=AsyncMock(), invocation_metadata=lambda: ())
     responses = [r async for r in servicer.Generate(request, context)]
     context.abort.assert_not_awaited()
     (final,) = [r for r in responses if r.HasField("complete")]

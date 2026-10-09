@@ -50,6 +50,7 @@ mod capability;
 mod config;
 mod detect;
 mod inflight;
+mod item_limits;
 mod pixel_cache;
 mod plan;
 mod process;
@@ -72,6 +73,7 @@ pub(crate) use config::{
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
 pub(crate) use inflight::{reserve_multimodal_inflight, InflightPermit};
+pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
     prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
     MediaPlan, PlaceholderTokens,

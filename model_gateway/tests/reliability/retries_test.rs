@@ -111,7 +111,10 @@ mod retry_tests {
         ctx.shutdown().await;
     }
 
-    /// Test max retries limit
+    /// A worker that answers every request with its own 500 is not asked
+    /// again for the same request: with one worker there is nothing to retry
+    /// on, so the answer comes back after one attempt (the retry budget on
+    /// transient failures is covered by the router's unit tests).
     #[tokio::test]
     async fn test_max_retries_limit() {
         let retry_config = RetryConfig {
@@ -136,7 +139,6 @@ mod retry_tests {
             "stream": false
         });
 
-        let start = std::time::Instant::now();
         let req = Request::builder()
             .method("POST")
             .uri("/generate")
@@ -145,23 +147,13 @@ mod retry_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        let elapsed = start.elapsed();
 
-        // Should eventually fail after retries
-        assert!(
-            resp.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
-            "Should fail after exhausting retries, got {}",
+        // The worker's own answer is what the client gets.
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the failing worker's own 500 is returned, got {}",
             resp.status()
-        );
-
-        // Should take some time due to backoff (at least initial_backoff_ms)
-        // With 2 retries and 10ms initial backoff, should take at least 10ms
-        // But don't make this too strict as timing can vary
-        assert!(
-            elapsed.as_millis() >= 5,
-            "Should have some backoff delay, got {}ms",
-            elapsed.as_millis()
         );
 
         ctx.shutdown().await;

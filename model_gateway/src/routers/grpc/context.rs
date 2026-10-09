@@ -44,7 +44,10 @@ use crate::{
     middleware::TenantRequestMeta,
     observability::cache_trace,
     policies::CacheNamespace,
-    routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
+    routers::{
+        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
+        error::internal_error,
+    },
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
     },
@@ -284,6 +287,9 @@ pub(crate) struct DispatchContext {
     pub root_request_id: Option<String>,
     pub cache_trace: Option<String>,
     pub attempt: u32,
+    /// The request's bookkeeping across attempts: circuit-breaker charges
+    /// and the workers whose answer was definitive.
+    pub ledger: AttemptLedger,
     /// Canonical model ID (routing, registries).
     pub model_id: String,
     /// Model the response reports, captured from the request at the build
@@ -695,6 +701,24 @@ pub(crate) enum LoadGuards {
         _admission: PdAdmissionGuard,
         _guards: Box<LoadGuards>,
     },
+    /// The dispatch's upstream span rides with the guards, so it ends when
+    /// they are released: at the response stream's last frame, the client's
+    /// disconnect, an upstream error or a retry, not at dispatch.
+    Traced {
+        _span: StreamSpan,
+        _guards: Box<LoadGuards>,
+    },
+}
+
+/// A span held open across a response stream. Released, it is entered once
+/// more: the OpenTelemetry layer stamps a span's end at its last exit, not
+/// at its close, so a span merely held would still end at dispatch.
+pub(crate) struct StreamSpan(tracing::Span);
+
+impl Drop for StreamSpan {
+    fn drop(&mut self) {
+        let _last_exit = self.0.enter();
+    }
 }
 
 impl LoadGuards {
@@ -719,6 +743,14 @@ impl LoadGuards {
                 _guards: Box::new(guards),
             },
             None => guards,
+        }
+    }
+
+    /// Keep `span` open for as long as the guards are held.
+    pub fn traced(span: tracing::Span, guards: Self) -> Self {
+        Self::Traced {
+            _span: StreamSpan(span),
+            _guards: Box::new(guards),
         }
     }
 
@@ -890,6 +922,7 @@ impl RequestContext {
             },
             cache_trace: None,
             attempt: 0,
+            ledger: AttemptLedger::default(),
             model_id,
             dispatch_model,
             streaming,
@@ -1144,37 +1177,55 @@ impl WorkerSelection {
         }
     }
 
-    /// Record circuit breaker outcome for all workers based on HTTP status code.
-    pub fn record_outcome(&self, status_code: u16) {
+    /// The workers this selection dispatches to: the one worker, or the
+    /// prefill and decode legs.
+    pub fn workers(&self) -> impl Iterator<Item = &Arc<dyn Worker>> {
+        let (first, second) = match self {
+            Self::Single { worker } => (worker, None),
+            Self::Disaggregated {
+                prefill, decode, ..
+            } => (prefill, Some(decode)),
+        };
+        std::iter::once(first).chain(second)
+    }
+
+    /// Record an attempt's circuit-breaker outcome on every worker, through
+    /// the request's ledger (one failure charge per request per worker).
+    pub fn record_outcome(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
-            Self::Single { worker } => worker.record_outcome(status_code),
+            Self::Single { worker } => ledger.record_outcome(worker.as_ref(), status_code),
             Self::Disaggregated {
                 prefill, decode, ..
             } => {
                 // EPD encode dispatch is asynchronous and supervised by
                 // RequestExecution; this records only the prefill/decode leg.
-                prefill.record_outcome(status_code);
-                decode.record_outcome(status_code);
+                ledger.record_outcome(prefill.as_ref(), status_code);
+                ledger.record_outcome(decode.as_ref(), status_code);
             }
         }
     }
 
     /// Record circuit breaker outcomes for disaggregated dispatch (individual tracking)
-    pub fn record_prefill_decode_outcomes(&self, prefill_status: u16, decode_status: u16) {
+    pub fn record_prefill_decode_outcomes(
+        &self,
+        ledger: &AttemptLedger,
+        prefill_status: u16,
+        decode_status: u16,
+    ) {
         if let Self::Disaggregated {
             prefill, decode, ..
         } = self
         {
-            prefill.record_outcome(prefill_status);
-            decode.record_outcome(decode_status);
+            ledger.record_outcome(prefill.as_ref(), prefill_status);
+            ledger.record_outcome(decode.as_ref(), decode_status);
         }
     }
 
     /// Record circuit breaker outcome for prefill worker only (sequential PD)
-    pub fn record_outcome_prefill(&self, status_code: u16) {
+    pub fn record_outcome_prefill(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
             Self::Disaggregated { prefill, .. } => {
-                prefill.record_outcome(status_code);
+                ledger.record_outcome(prefill.as_ref(), status_code);
             }
             Self::Single { .. } => {
                 debug!("record_outcome_prefill called on Single worker selection, ignoring");
@@ -1183,10 +1234,10 @@ impl WorkerSelection {
     }
 
     /// Record circuit breaker outcome for decode worker only (sequential PD)
-    pub fn record_outcome_decode(&self, status_code: u16) {
+    pub fn record_outcome_decode(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
             Self::Disaggregated { decode, .. } => {
-                decode.record_outcome(status_code);
+                ledger.record_outcome(decode.as_ref(), status_code);
             }
             Self::Single { .. } => {
                 debug!("record_outcome_decode called on Single worker selection, ignoring");

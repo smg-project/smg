@@ -112,6 +112,12 @@ pub struct RouterConfig {
     /// new requests stop being routed to it until it makes progress.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
+    /// Seconds without any contact from a worker whose KV-event stream pushes
+    /// load records, after which it is excluded from routing as unreachable
+    /// until it is heard from again; workers that never pushed a record are
+    /// not judged by it. 0 disables the rule.
+    #[serde(default = "default_worker_stale_secs")]
+    pub worker_stale_secs: u64,
     /// Warm-up slice for cache-aware routing: for this many seconds after a
     /// worker becomes routable, until its index has grown by
     /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
@@ -271,8 +277,9 @@ pub struct RouterConfig {
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
-    /// Standing-concurrency cap; -1 disables. Each admission permit is
-    /// held for the full response, including streaming bodies.
+    /// Standing-concurrency cap. -1 (default) derives it from the host (1024
+    /// per available core, at least 4096); 0 disables it. Each admission
+    /// permit is held for the full response, including streaming bodies.
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
@@ -288,8 +295,9 @@ pub struct RouterConfig {
     /// `None` applies the built-in default when admission is enabled.
     #[serde(default)]
     pub prefill_queue_timeout_secs: Option<u64>,
-    /// Unset or 0 = no refill: `max_concurrent_requests` bounds standing
-    /// concurrency alone.
+    /// Sustained admission rate (requests per second), bursting up to
+    /// `max_concurrent_requests`, which keeps bounding standing concurrency.
+    /// Unset or 0 = no rate limit.
     pub rate_limit_tokens_per_second: Option<i32>,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior
@@ -439,6 +447,9 @@ pub struct TokenizerCacheConfig {
     pub enable_l0: bool,
     #[serde(default = "default_l0_max_entries")]
     pub l0_max_entries: usize,
+    /// Byte budget of the L0 cache (texts, ids and per-entry overhead)
+    #[serde(default = "default_l0_max_memory")]
+    pub l0_max_memory: usize,
     /// Prefix matching at fixed boundaries
     #[serde(default = "default_enable_l1")]
     pub enable_l1: bool,
@@ -477,6 +488,10 @@ fn default_worker_stall_secs() -> u64 {
 
 fn default_worker_wedge_secs() -> u64 {
     3
+}
+
+fn default_worker_stale_secs() -> u64 {
+    15
 }
 
 fn default_worker_warmup_secs() -> u64 {
@@ -526,6 +541,10 @@ fn default_l0_max_entries() -> usize {
     10_000
 }
 
+fn default_l0_max_memory() -> usize {
+    256 * 1024 * 1024 // 256MB
+}
+
 fn default_enable_l1() -> bool {
     false
 }
@@ -551,6 +570,7 @@ impl Default for TokenizerCacheConfig {
         Self {
             enable_l0: default_enable_l0(),
             l0_max_entries: default_l0_max_entries(),
+            l0_max_memory: default_l0_max_memory(),
             enable_l1: default_enable_l1(),
             l1_max_memory: default_l1_max_memory(),
         }
@@ -1377,6 +1397,26 @@ impl Default for MetricsConfig {
     }
 }
 
+impl MetricsConfig {
+    /// The metrics host when none is configured: the unspecified address of
+    /// the serving listener's family. A gateway bound to an IPv6 address
+    /// (`[::]`, `::`, `[fd00::1]`) then exposes its metrics over IPv6 too,
+    /// instead of on an IPv4-only `0.0.0.0` that nothing on an IPv6-only
+    /// network can reach; `::` is dual-stack on Linux, so IPv4 scrapers keep
+    /// working. IPv4 hosts (and anything that is not an IP literal) keep the
+    /// IPv4 wildcard they always had.
+    pub fn default_host_for(server_host: &str) -> String {
+        let bare = server_host
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(server_host);
+        match bare.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => "::".to_string(),
+            _ => "0.0.0.0".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceConfig {
     pub enable_trace: bool,
@@ -1419,6 +1459,7 @@ impl Default for RouterConfig {
             load_monitor_interval_secs: 10,
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
+            worker_stale_secs: default_worker_stale_secs(),
             worker_warmup_secs: default_worker_warmup_secs(),
             worker_warmup_share: default_worker_warmup_share(),
             worker_warmup_blocks: default_worker_warmup_blocks(),
@@ -2515,6 +2556,28 @@ discovery:
 
         assert_eq!(config.port, 29000);
         assert_eq!(config.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn metrics_host_defaults_to_the_serving_listeners_family() {
+        for (server_host, expected) in [
+            ("[::]", "::"),
+            ("::", "::"),
+            ("[::1]", "::"),
+            ("fd00::1", "::"),
+            ("[fd00::1]", "::"),
+            ("0.0.0.0", "0.0.0.0"),
+            ("127.0.0.1", "0.0.0.0"),
+            ("10.0.0.7", "0.0.0.0"),
+            ("localhost", "0.0.0.0"),
+            ("", "0.0.0.0"),
+        ] {
+            assert_eq!(
+                MetricsConfig::default_host_for(server_host),
+                expected,
+                "server host {server_host:?}"
+            );
+        }
     }
 
     #[test]

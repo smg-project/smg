@@ -12,9 +12,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use llm_multimodal::{
-    configure_parallelism, vision::PreProcessorConfig, MediaConnector, MediaConnectorConfig,
-    MediaConnectorError, MediaContentPart, Modality, ModelMetadata, ModelRegistry, MultiModalError,
-    Parallelism, VisionProcessorRegistry, POOL_THREADS_ENV,
+    configure_parallelism, registry::modality_limit_override, vision::PreProcessorConfig,
+    MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart, Modality,
+    ModelMetadata, ModelRegistry, MultiModalError, Parallelism, VisionProcessorRegistry,
+    POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -30,7 +31,7 @@ use super::{
     process::process_multimodal_plan,
     RegistryTokenizer,
 };
-use crate::routers::grpc::proto_wrapper::vllm_mm_identity;
+use crate::{routers::grpc::proto_wrapper::vllm_mm_identity, worker::http_client::build_client};
 
 /// A worker serves one model: the config registry's one key.
 const CONFIG_KEY: &str = "worker";
@@ -58,6 +59,9 @@ pub struct WorkerMediaSettings {
     pub model_dir: String,
     /// The id the model specs match on: the served model path or Hub id.
     pub model_id: String,
+    /// The name the model is served under, for messages an operator reads;
+    /// `model_id` is often a loader's cache directory.
+    pub served_model_name: Option<String>,
     pub pixel_format: PixelFormat,
     /// The engine's dtype (`bfloat16`, `float16`, `float32`); normalized
     /// pixels are written in it directly, so nothing downstream casts them.
@@ -69,11 +73,122 @@ pub struct WorkerMediaSettings {
     /// Media items a request may carry per modality; `None` keeps the model
     /// spec's limits.
     pub max_items: Option<usize>,
+    /// The engine's own per-prompt media limits (vLLM's
+    /// `--limit-mm-per-prompt`) by modality: the ceiling the pipeline's own
+    /// limits tighten but never loosen. Empty when they are not known.
+    pub engine_item_limits: HashMap<Modality, usize>,
     /// Cap on an inline (`data:`) item's decoded size; fetched items are
     /// capped by the connector's own limits.
     pub max_item_bytes: Option<usize>,
     pub allowed_domains: Option<Vec<String>>,
     pub fetch_timeout: Duration,
+}
+
+/// What set a modality's effective per-request item limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemLimitSource {
+    /// The engine's `--limit-mm-per-prompt`.
+    Engine,
+    /// The servicer's `--mm-max-items`.
+    Flag,
+    /// `SMG_<MODALITY>_MAX_COUNT` in the environment.
+    Env,
+    /// The model spec's declared limit.
+    Spec,
+}
+
+impl ItemLimitSource {
+    fn describe(self, modality: Modality) -> String {
+        match self {
+            Self::Engine => "the engine's --limit-mm-per-prompt".to_string(),
+            Self::Flag => "--mm-max-items".to_string(),
+            Self::Env => format!(
+                "SMG_{}_MAX_COUNT",
+                modality.to_string().to_ascii_uppercase()
+            ),
+            Self::Spec => "the model spec".to_string(),
+        }
+    }
+}
+
+/// A modality's effective per-request item limit and what set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ItemLimit {
+    limit: usize,
+    source: ItemLimitSource,
+}
+
+/// The per-request item limit of every modality the spec declares: the
+/// pipeline's own limit (`--mm-max-items`, else the `SMG_*_MAX_COUNT`
+/// environment override, else the spec's), never above the engine's
+/// `--limit-mm-per-prompt` where that is known. The engine sizes its encoder
+/// budget by its limit and its own server refuses above it, so this worker
+/// must not accept more on its behalf.
+fn effective_item_limits(
+    spec_limits: &HashMap<Modality, usize>,
+    engine_limits: &HashMap<Modality, usize>,
+    max_items: Option<usize>,
+    env_override: impl Fn(Modality) -> Option<usize>,
+) -> HashMap<Modality, ItemLimit> {
+    spec_limits
+        .iter()
+        .map(|(&modality, &spec_limit)| {
+            let own = match (max_items, env_override(modality)) {
+                (Some(limit), _) => ItemLimit {
+                    limit,
+                    source: ItemLimitSource::Flag,
+                },
+                (None, Some(limit)) => ItemLimit {
+                    limit,
+                    source: ItemLimitSource::Env,
+                },
+                (None, None) => ItemLimit {
+                    limit: spec_limit,
+                    source: ItemLimitSource::Spec,
+                },
+            };
+            let effective = match engine_limits.get(&modality) {
+                Some(&limit) if limit <= own.limit => ItemLimit {
+                    limit,
+                    source: ItemLimitSource::Engine,
+                },
+                _ => own,
+            };
+            (modality, effective)
+        })
+        .collect()
+}
+
+/// Refuse a request carrying more items of a modality than this worker
+/// takes, before any fetch, naming the limit and what set it. A modality
+/// without a limit here is left to the spec's own validation.
+fn check_item_counts(
+    items: &[WorkerMediaItem],
+    limits: &HashMap<Modality, ItemLimit>,
+) -> Result<(), WorkerMediaError> {
+    let mut counts: Vec<(Modality, usize)> = Vec::new();
+    for item in items {
+        match counts
+            .iter_mut()
+            .find(|(modality, _)| *modality == item.modality)
+        {
+            Some((_, count)) => *count += 1,
+            None => counts.push((item.modality, 1)),
+        }
+    }
+    for (modality, count) in counts {
+        let Some(limit) = limits.get(&modality) else {
+            continue;
+        };
+        if count > limit.limit {
+            return Err(WorkerMediaError::Invalid(format!(
+                "media_refs carries {count} {modality} items, above this worker's limit of {} ({})",
+                limit.limit,
+                limit.source.describe(modality)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One `media_refs` item.
@@ -110,6 +225,52 @@ pub enum WorkerMediaError {
     Internal(String),
 }
 
+/// Why the pipeline refuses a model it has no spec for, in the terms an
+/// operator acts on: the model type and architectures from its config and
+/// the served name first, then the families the pipeline supports and the
+/// modes that would start the deployment; the loader's path (often a cache
+/// directory under a streaming loader) last.
+fn unsupported_model_message(
+    settings: &WorkerMediaSettings,
+    config: &serde_json::Value,
+    supported: &[&str],
+) -> String {
+    let model_type = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let architectures: Vec<&str> = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+        .unwrap_or_default();
+    let mut facts = Vec::new();
+    if !architectures.is_empty() {
+        facts.push(format!("architectures [{}]", architectures.join(", ")));
+    }
+    if let Some(served) = settings
+        .served_model_name
+        .as_deref()
+        .filter(|served| *served != settings.model_id)
+    {
+        facts.push(format!("served as {served:?}"));
+    }
+    let facts = if facts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", facts.join(", "))
+    };
+    let mut supported: Vec<&str> = supported.to_vec();
+    supported.sort_unstable();
+    format!(
+        "multimodal processing is not supported for model_type {model_type:?}{facts}; the smg \
+         pipeline supports: {}; use --mm-processor inprocess or redis to process media with \
+         the engine's own processors, or off (model path: {})",
+        supported.join(", "),
+        settings.model_id
+    )
+}
+
 /// The pipeline for one served model.
 pub struct WorkerMediaPipeline {
     components: MultimodalComponents,
@@ -120,6 +281,7 @@ pub struct WorkerMediaPipeline {
     spec_name: &'static str,
     pixel_format: PixelFormat,
     max_item_bytes: Option<usize>,
+    item_limits: HashMap<Modality, ItemLimit>,
 }
 
 impl WorkerMediaPipeline {
@@ -160,23 +322,31 @@ impl WorkerMediaPipeline {
             None => loaded,
         };
         let model_registry = Arc::new(ModelRegistry::default());
-        let spec_name = {
+        let (spec_name, spec_limits) = {
             let adapter = RegistryTokenizer(tokenizer.as_ref());
             let metadata = ModelMetadata {
                 model_id: &settings.model_id,
                 tokenizer: &adapter,
                 config: &loaded.config,
             };
-            model_registry
-                .lookup(&metadata)
-                .map(|spec| spec.name())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "multimodal processing is not supported for model {}",
-                        settings.model_id
-                    )
-                })?
+            let spec = model_registry.lookup(&metadata).ok_or_else(|| {
+                anyhow::anyhow!(unsupported_model_message(
+                    &settings,
+                    &loaded.config,
+                    &model_registry.spec_names()
+                ))
+            })?;
+            let limits = spec.modality_limits(&metadata).map_err(|error| {
+                anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
+            })?;
+            (spec.name(), limits)
         };
+        let item_limits = effective_item_limits(
+            &spec_limits,
+            &settings.engine_item_limits,
+            settings.max_items,
+            modality_limit_override,
+        );
         let vision_processor_registry = Arc::new(VisionProcessorRegistry::with_defaults());
         if settings.pixel_format == PixelFormat::RawU8 {
             let model_type = loaded.config.get("model_type").and_then(|v| v.as_str());
@@ -190,10 +360,12 @@ impl WorkerMediaPipeline {
                  --mm-device-do-normalize=false or use --mm-processor inprocess"
             );
         }
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("building the media HTTP client")?;
+        let client = build_client(
+            || reqwest::Client::builder().timeout(Duration::from_secs(30)),
+            false,
+            "media HTTP client",
+        )
+        .map_err(anyhow::Error::msg)?;
         let connector = MediaConnector::new(
             client,
             MediaConnectorConfig {
@@ -209,10 +381,12 @@ impl WorkerMediaPipeline {
             model_registry,
             config_registry,
             pixel_cache: pixel_cache_with_budget(mm_settings().pixel_cache_mb.value),
-            modality_limit_overrides: settings
-                .max_items
-                .map(|limit| HashMap::from([(Modality::Image, limit), (Modality::Video, limit)]))
-                .unwrap_or_default(),
+            // The same numbers for the spec's validation of the plan, so
+            // nothing downstream loosens what the engine takes.
+            modality_limit_overrides: item_limits
+                .iter()
+                .map(|(&modality, limit)| (modality, limit.limit))
+                .collect(),
             processing: MmProcessingMode::Worker,
             inflight: None,
         };
@@ -231,6 +405,7 @@ impl WorkerMediaPipeline {
             spec_name,
             pixel_format: settings.pixel_format,
             max_item_bytes: settings.max_item_bytes,
+            item_limits,
         })
     }
 
@@ -241,6 +416,24 @@ impl WorkerMediaPipeline {
 
     pub fn pixel_format(&self) -> PixelFormat {
         self.pixel_format
+    }
+
+    /// The per-request item limits in force and what set each, for the
+    /// startup log: `image=8 (the engine's --limit-mm-per-prompt), ...`.
+    pub fn item_limits_summary(&self) -> String {
+        let mut limits: Vec<String> = self
+            .item_limits
+            .iter()
+            .map(|(modality, limit)| {
+                format!(
+                    "{modality}={} ({})",
+                    limit.limit,
+                    limit.source.describe(*modality)
+                )
+            })
+            .collect();
+        limits.sort();
+        limits.join(", ")
     }
 
     /// Process one request's references against its prompt, which carries
@@ -256,6 +449,7 @@ impl WorkerMediaPipeline {
                 "media_refs is set but carries no items".to_string(),
             ));
         }
+        check_item_counts(items, &self.item_limits)?;
         let parts = items
             .iter()
             .enumerate()
@@ -263,6 +457,8 @@ impl WorkerMediaPipeline {
             .collect::<Result<Vec<_>, _>>()?;
         let plan = MediaPlan::new(parts);
         let tokenizer = self.tokenizer.as_ref();
+        // This worker holds requests to its own engine's limits through the
+        // components' limit overrides; there is no fleet to consult here.
         let placeholders = prepare_placeholder_tokens(
             &plan,
             &self.model_id,
@@ -270,6 +466,7 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
+            &HashMap::new(),
         )
         .await
         .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
@@ -446,7 +643,147 @@ fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaEr
 
 #[cfg(test)]
 mod tests {
+    use llm_tokenizer::MockTokenizer;
+
     use super::*;
+
+    fn limits(pairs: &[(Modality, usize)]) -> HashMap<Modality, usize> {
+        pairs.iter().copied().collect()
+    }
+
+    fn image_items(count: usize) -> Vec<WorkerMediaItem> {
+        vec![
+            WorkerMediaItem {
+                modality: Modality::Image,
+                url: "data:image/png;base64,AAAA".to_string(),
+            };
+            count
+        ]
+    }
+
+    /// The engine's `--limit-mm-per-prompt` caps the pipeline's own limits
+    /// (`--mm-max-items`, the environment override, the spec's), which keep
+    /// their precedence below it; without an engine limit nothing changes.
+    #[test]
+    fn engine_limits_cap_the_pipelines_own_limits() {
+        use ItemLimitSource::{Engine, Env, Flag, Spec};
+        let spec = limits(&[(Modality::Image, 128), (Modality::Video, 8)]);
+        let at = |limit, source| ItemLimit { limit, source };
+
+        let engine = limits(&[(Modality::Image, 1), (Modality::Video, 2)]);
+        let effective = effective_item_limits(&spec, &engine, None, |_| None);
+        assert_eq!(effective[&Modality::Image], at(1, Engine));
+        assert_eq!(effective[&Modality::Video], at(2, Engine));
+
+        let engine = limits(&[(Modality::Image, 8)]);
+        let effective = effective_item_limits(&spec, &engine, Some(3), |_| None);
+        assert_eq!(effective[&Modality::Image], at(3, Flag));
+        assert_eq!(effective[&Modality::Video], at(3, Flag));
+        let effective = effective_item_limits(&spec, &engine, Some(16), |_| None);
+        assert_eq!(effective[&Modality::Image], at(8, Engine));
+        assert_eq!(effective[&Modality::Video], at(16, Flag));
+
+        let env = |modality| (modality == Modality::Image).then_some(5);
+        let effective = effective_item_limits(&spec, &engine, None, env);
+        assert_eq!(effective[&Modality::Image], at(5, Env));
+        assert_eq!(effective[&Modality::Video], at(8, Spec));
+        let effective = effective_item_limits(&spec, &limits(&[(Modality::Image, 4)]), None, env);
+        assert_eq!(effective[&Modality::Image], at(4, Engine));
+
+        let effective = effective_item_limits(&spec, &HashMap::new(), None, |_| None);
+        assert_eq!(effective[&Modality::Image], at(128, Spec));
+        assert_eq!(effective[&Modality::Video], at(8, Spec));
+    }
+
+    #[test]
+    fn over_limit_requests_are_refused_naming_the_limit() {
+        let limits = HashMap::from([(
+            Modality::Image,
+            ItemLimit {
+                limit: 1,
+                source: ItemLimitSource::Engine,
+            },
+        )]);
+        let error = check_item_counts(&image_items(9), &limits).unwrap_err();
+        assert!(matches!(error, WorkerMediaError::Invalid(_)));
+        let message = error.to_string();
+        assert!(
+            message.contains("9 image items")
+                && message.contains("limit of 1")
+                && message.contains("--limit-mm-per-prompt"),
+            "{message}"
+        );
+        assert!(check_item_counts(&image_items(1), &limits).is_ok());
+        // A modality without a limit here is the spec's to validate.
+        let videos = vec![
+            WorkerMediaItem {
+                modality: Modality::Video,
+                url: "data:video/mp4;base64,AAAA".to_string(),
+            };
+            3
+        ];
+        assert!(check_item_counts(&videos, &limits).is_ok());
+    }
+
+    /// End to end on a pipeline: nine images against an engine limit of one
+    /// are refused before any fetch, with the limit in the message; one image
+    /// goes on into the pipeline.
+    #[tokio::test]
+    async fn pipeline_refuses_more_images_than_the_engine_takes() {
+        let dir = std::env::temp_dir().join(format!(
+            "smg-worker-media-engine-limits-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"model_type": "llava", "image_token_index": 32000}"#,
+        )
+        .unwrap();
+        let settings = WorkerMediaSettings {
+            model_dir: dir.display().to_string(),
+            served_model_name: None,
+            model_id: dir.display().to_string(),
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "float32".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::from([(Modality::Image, 1)]),
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+        };
+        let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            pipeline.item_limits_summary(),
+            "image=1 (the engine's --limit-mm-per-prompt)"
+        );
+
+        let error = pipeline
+            .process(vec![1, 2, 3], &image_items(9), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                WorkerMediaError::Invalid(message)
+                    if message.contains("9 image items") && message.contains("limit of 1")
+            ),
+            "{error}"
+        );
+        // Within the limit the request reaches the pipeline proper (which the
+        // mock tokenizer, lacking the placeholder token, then refuses).
+        let error = pipeline
+            .process(vec![1, 2, 3], &image_items(1), false)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("limit of"), "{error}");
+        std::fs::remove_file(config).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn data_url_payload_size_is_estimated_like_the_python_servicer() {
@@ -535,5 +872,88 @@ mod processor_kwargs_tests {
         let message = error.to_string();
         assert!(message.contains(r#"["fps", "num_frames"]"#), "{message}");
         assert!(message.contains("--mm-processor inprocess"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod unsupported_model_tests {
+    use llm_tokenizer::MockTokenizer;
+
+    use super::*;
+
+    /// A family without a spec is refused in the terms an operator acts on:
+    /// the model type and architectures, the served name, the families the
+    /// pipeline supports and the modes that would start the deployment; the
+    /// loader's directory (a cache path under a streaming loader) comes last.
+    #[tokio::test]
+    async fn a_family_without_a_spec_is_refused_by_model_type_with_the_supported_families() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "quux", "architectures": ["QuuxForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let settings = WorkerMediaSettings {
+            model_dir: path.clone(),
+            model_id: path.clone(),
+            served_model_name: Some("m6".to_string()),
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "bfloat16".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+        };
+        let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
+            .await
+            .err()
+            .expect("no spec for this family");
+        let message = format!("{error:#}");
+        assert!(message.contains(r#"model_type "quux""#), "{message}");
+        assert!(
+            message.contains("QuuxForConditionalGeneration"),
+            "{message}"
+        );
+        assert!(message.contains(r#"served as "m6""#), "{message}");
+        for family in ["qwen3_vl", "kimi_k3", "llama4"] {
+            assert!(message.contains(family), "{family} missing: {message}");
+        }
+        assert!(message.contains("--mm-processor inprocess"), "{message}");
+        assert!(
+            message.find("model_type").unwrap() < message.find(&path).unwrap(),
+            "the path is the last detail: {message}"
+        );
+    }
+
+    /// A served name that is the path itself is not repeated.
+    #[test]
+    fn the_served_name_is_omitted_when_it_is_the_path() {
+        let settings = WorkerMediaSettings {
+            model_dir: "/models/x".to_string(),
+            model_id: "/models/x".to_string(),
+            served_model_name: Some("/models/x".to_string()),
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "bfloat16".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+        };
+        let message = unsupported_model_message(
+            &settings,
+            &serde_json::json!({"model_type": "gemma4"}),
+            &["qwen_vl", "llava"],
+        );
+        assert_eq!(
+            message,
+            "multimodal processing is not supported for model_type \"gemma4\"; the smg pipeline \
+             supports: llava, qwen_vl; use --mm-processor inprocess or redis to process media \
+             with the engine's own processors, or off (model path: /models/x)"
+        );
     }
 }

@@ -8,6 +8,7 @@ imported lazily inside the backends.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import dataclasses
 import inspect
@@ -16,7 +17,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Iterable, Mapping, MutableMapping, Sequence
 from typing import Any
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
@@ -684,11 +685,17 @@ class MmSettings:
     sidecar_max_queue: int | None = None
     sidecar_namespace: str | None = None
     sources: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False)
+    # The settings whose flag the launcher defines (`from_args`), set or not.
+    # For the rest the environment variable is the documented way to set them,
+    # so `resolve` reads it without a deprecation line.
+    flags_defined: frozenset[str] = dataclasses.field(default_factory=frozenset, compare=False)
 
     @classmethod
     def from_args(cls, args) -> MmSettings:
-        """The `--mm-*` values of a launcher namespace; absent flags ask for nothing."""
-        return cls(**{name: getattr(args, f"mm_{name}", None) for name in _MM_SETTING_SPECS})
+        """The `--mm-*` values of a launcher namespace; absent flags ask for
+        nothing, and are remembered as absent (see `flags_defined`)."""
+        defined = frozenset(name for name in _MM_SETTING_SPECS if hasattr(args, f"mm_{name}"))
+        return cls(**{name: getattr(args, f"mm_{name}") for name in defined}, flags_defined=defined)
 
     @property
     def resolved(self) -> bool:
@@ -713,6 +720,11 @@ class MmSettings:
         `only` limits resolution to the named settings (the rest stay unset
         and unvalidated), for a process that uses a subset; `flags` renames
         the flag a deprecation line points at, for a parser with its own.
+
+        An environment variable logs a deprecation line only when the launcher
+        offers the flag it stands in for (`flags_defined`, or a name in
+        `flags`): on a launcher without the flag the variable is the one way to
+        set the value, and is read as such.
         """
         if self.resolved:
             return self
@@ -732,17 +744,119 @@ class MmSettings:
                 continue
             from_env = _read_env(name, env, env_name)
             if from_env is not None:
-                logger.warning(
-                    "%s is deprecated in favour of %s; env support ends in the next minor release",
-                    env_name,
-                    flag,
-                )
+                if name in self.flags_defined or name in (flags or {}):
+                    logger.warning(
+                        "%s is deprecated in favour of %s; env support ends in the next minor release",
+                        env_name,
+                        flag,
+                    )
                 values[name] = from_env
                 sources[name] = SOURCE_ENV
                 continue
             values[name] = default
             sources[name] = SOURCE_DEFAULT
-        return MmSettings(**values, sources=sources)
+        return MmSettings(**values, sources=sources, flags_defined=self.flags_defined)
+
+
+_MM_FLAG_HELP: dict[str, str] = {
+    "processor": (
+        "Worker-side media processing: off (the router preprocesses media), inprocess or "
+        "redis (vLLM's own processors on this worker), smg (smg's pipeline; Rust servicer only)."
+    ),
+    "max_inflight": "Media requests this worker processes at once.",
+    "max_item_bytes": "Cap on an inline (data:) media item's decoded size, in bytes.",
+    "max_items": "Media items a request may carry per modality.",
+    "redis_url": "The media sidecar's Redis URL (--mm-processor redis).",
+    "sidecar_timeout_ms": "How long to wait for the sidecar's result, in milliseconds.",
+    "sidecar_max_queue": "Jobs the sidecar queue holds before this worker refuses more.",
+    "sidecar_namespace": "The Redis key namespace shared with the sidecar.",
+}
+
+
+def add_mm_arguments(parser: argparse.ArgumentParser) -> list[str]:
+    """Define the `--mm-*` flags `MmSettings.from_args` reads on a launcher
+    parser that lacks them; a flag the parser already has (a `vllm serve` that
+    defines its own) is left as it is. Returns the flags added."""
+    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
+    added: list[str] = []
+    for name, (flag, env_name, _default) in _MM_SETTING_SPECS.items():
+        if flag in actions:
+            continue
+        kwargs: dict[str, Any] = {
+            "dest": f"mm_{name}",
+            "default": None,
+            "help": f"{_MM_FLAG_HELP[name]} Unset falls back to ${env_name}.",
+        }
+        if name == "processor":
+            kwargs["choices"] = list(VALID_MODES)
+        elif name in _MM_INT_SETTINGS:
+            kwargs["type"] = int
+        parser.add_argument(flag, **kwargs)
+        added.append(flag)
+    return added
+
+
+# The `--mm-*` settings the launcher parsed in this process, kept for a
+# servicer the launcher builds without its namespace (upstream's gRPC launcher
+# constructs `VllmEngineServicer(async_llm, start_time)`): read when the
+# servicer is given none, so a flag's value keeps `source=flag` and
+# `flags_defined` keeps the deprecation line for a variable behind a flag.
+_launcher_settings: MmSettings | None = None
+
+
+def remember_launcher_settings(settings: MmSettings | None) -> None:
+    """Keep the launcher's parsed `--mm-*` settings for `launcher_settings`."""
+    global _launcher_settings  # noqa: PLW0603 — one launcher per process
+    _launcher_settings = settings
+
+
+def launcher_settings() -> MmSettings | None:
+    """The `--mm-*` settings the launcher parsed in this process, if any."""
+    return _launcher_settings
+
+
+# What the environment held for the `SMG_VLLM_MM_*` variables before the
+# first carry of this process, put back before every later carry: each carry
+# leaves the operator's environment plus this parse's flags, so a flag one
+# parse set and the next dropped does not live on as a variable the operator
+# never set.
+_environ_before_carry: dict[str, str | None] | None = None
+
+
+def carry_mm_flags(args: Any, environ: MutableMapping[str, str] = os.environ) -> MmSettings:
+    """What the plugin does with a gRPC launcher's parsed `--mm-*` flags: keep
+    them for the servicer this process builds (`launcher_settings`), and
+    carry the set values into the environment for anything that reads only
+    that; a later parse replaces both. Returns the settings kept."""
+    global _environ_before_carry  # noqa: PLW0603 — one launcher per process
+    names = [env_name for _flag, env_name, _default in _MM_SETTING_SPECS.values()]
+    if _environ_before_carry is None:
+        _environ_before_carry = {name: environ.get(name) for name in names}
+    else:
+        for name, before in _environ_before_carry.items():
+            if before is None:
+                environ.pop(name, None)
+            else:
+                environ[name] = before
+    settings = MmSettings.from_args(args)
+    remember_launcher_settings(settings)
+    export_mm_flags(args, environ)
+    return settings
+
+
+def export_mm_flags(args: Any, environ: MutableMapping[str, str] = os.environ) -> dict[str, str]:
+    """Carry a parsed namespace's `--mm-*` values into the environment, for a
+    servicer the launcher builds without its namespace (upstream's gRPC
+    launcher constructs `VllmEngineServicer(async_llm, start_time)`): that
+    servicer resolves from the environment and finds the flags' values there.
+    Returns what was exported."""
+    exported: dict[str, str] = {}
+    for name, (_flag, env_name, _default) in _MM_SETTING_SPECS.items():
+        value = getattr(args, f"mm_{name}", None)
+        if value is not None:
+            environ[env_name] = str(value)
+            exported[env_name] = str(value)
+    return exported
 
 
 def _validate_flag(name: str, flag: str, value: Any) -> Any:

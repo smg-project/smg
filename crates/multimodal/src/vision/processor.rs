@@ -216,6 +216,7 @@ impl VisionProcessorRegistry {
     ///
     /// Currently registers:
     /// - `deepseek_v41` / `deepseek-v4.1` -> DeepseekV41Processor (gray-padded contain fit)
+    /// - `gemma4` / `gemma-4` -> Gemma4Processor (block-aligned resize, padded patches)
     /// - `glm-5.3-flash` / `glm5_next` -> Glm53FlashProcessor
     /// - `llava-next` -> LlavaNextProcessor
     /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
@@ -236,6 +237,11 @@ impl VisionProcessorRegistry {
                 pattern,
                 Box::new(super::processors::DeepseekV41Processor::new()),
             );
+        }
+
+        // Gemma 4 (the HF model_type and the released ids' spelling).
+        for pattern in ["gemma4", "gemma-4"] {
+            registry.register(pattern, Box::new(super::processors::Gemma4Processor::new()));
         }
 
         for pattern in [
@@ -476,6 +482,23 @@ mod tests {
                 .expect("GLM-5.3-Flash processor");
             assert_eq!(processor.model_name(), "glm-5.3-flash");
         }
+    }
+
+    #[test]
+    fn test_registry_finds_gemma4_by_id_and_model_type() {
+        let registry = VisionProcessorRegistry::with_defaults();
+        for (model_id, model_type) in [
+            ("google/gemma-4-26B-A4B-it", None),
+            ("/models/local-checkpoint", Some("gemma4")),
+        ] {
+            let processor = registry
+                .find(model_id, model_type)
+                .expect("Gemma 4 vision processor");
+            assert_eq!(processor.model_name(), "gemma4", "{model_id}");
+        }
+        assert!(registry
+            .find("/models/local-checkpoint", Some("gemma3"))
+            .is_none());
     }
 
     #[test]

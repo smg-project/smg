@@ -1,3 +1,5 @@
+use std::net::{IpAddr, SocketAddr};
+
 use axum::http::HeaderName;
 use sha2::{Digest, Sha256};
 
@@ -85,6 +87,32 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         }
     }
     Ok(())
+}
+
+/// Parse a listener host as operators write it: an IP literal, with or
+/// without the brackets an IPv6 address carries inside a `host:port` string
+/// (`0.0.0.0`, `::`, `[::]`, `::1`, `[fd00::1]`). Every bind flag goes
+/// through this one rule, so `--host`, `--prometheus-host`, the probe
+/// listener and the mesh listener accept the same spellings. A hostname is
+/// not a bind address and is rejected, like anything else that is not an IP
+/// address.
+pub fn parse_bind_host(host: &str) -> Result<IpAddr, String> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<IpAddr>().map_err(|_| {
+        format!(
+            "invalid bind host '{host}': expected an IP address such as \
+             0.0.0.0, ::, [::] or [fd00::1]"
+        )
+    })
+}
+
+/// The socket address a listener binds for `host` (any spelling
+/// [`parse_bind_host`] accepts) and `port`.
+pub fn bind_socket_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    parse_bind_host(host).map(|ip| SocketAddr::new(ip, port))
 }
 
 /// Configuration validator
@@ -761,6 +789,14 @@ impl ConfigValidator {
     }
 
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
+        if let Err(reason) = parse_bind_host(&config.host) {
+            return Err(ConfigError::InvalidValue {
+                field: "host".to_string(),
+                value: config.host.clone(),
+                reason,
+            });
+        }
+
         if config.port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "port".to_string(),
@@ -1021,6 +1057,14 @@ impl ConfigValidator {
             });
         }
 
+        if let Err(reason) = parse_bind_host(&metrics.host) {
+            return Err(ConfigError::InvalidValue {
+                field: "metrics.host".to_string(),
+                value: metrics.host.clone(),
+                reason,
+            });
+        }
+
         Ok(())
     }
 
@@ -1030,36 +1074,62 @@ impl ConfigValidator {
         }
 
         let endpoint = &trace_config.otlp_traces_endpoint;
-
-        let Some((host, port_str)) = endpoint.rsplit_once(':') else {
-            return Err(ConfigError::InvalidValue {
-                field: "trace_config.otlp_traces_endpoint".to_string(),
-                value: endpoint.clone(),
-                reason:
-                    "expected format <host>:<port>, e.g., otel-collector:4317 or 127.0.0.1:4317"
-                        .to_string(),
-            });
+        let invalid = |reason: String| ConfigError::InvalidValue {
+            field: "trace_config.otlp_traces_endpoint".to_string(),
+            value: endpoint.clone(),
+            reason,
         };
+        const EXPECTED: &str = "expected <host>:<port> or http(s)://<host>:<port>, with an \
+                                IPv6 literal in brackets, e.g. otel-collector:4317, \
+                                127.0.0.1:4317 or [::1]:4317";
 
-        if host.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field: "trace_config.otlp_traces_endpoint".to_string(),
-                value: endpoint.clone(),
-                reason: "host part cannot be empty".to_string(),
-            });
+        // Parse exactly what the exporter dials (it prefixes `http://` to a
+        // scheme-less endpoint), so a value that validates also builds a URI.
+        // A last-colon split used to let an unbracketed IPv6 literal
+        // (`::1:4317`) or a port-less one (`fd00::1`, host `fd00:` port `1`)
+        // through, and startup then aborted in the exporter with an opaque
+        // "invalid URI".
+        let with_scheme = if endpoint.contains("://") {
+            endpoint.clone()
+        } else {
+            format!("http://{endpoint}")
+        };
+        let url =
+            ::url::Url::parse(&with_scheme).map_err(|e| invalid(format!("{EXPECTED}: {e}")))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(invalid(format!(
+                "{EXPECTED}: unsupported scheme '{}'",
+                url.scheme()
+            )));
         }
-
-        // check port: must be 1~65535
-        match port_str.parse::<u16>() {
-            Ok(p) if p > 0 => (), // valid port
-            _ => {
-                return Err(ConfigError::InvalidValue {
-                    field: "trace_config.otlp_traces_endpoint".to_string(),
-                    value: endpoint.clone(),
-                    reason: "port must be a number between 1 and 65535".to_string(),
-                });
+        if url.host_str().is_none_or(str::is_empty) {
+            return Err(invalid(format!("{EXPECTED}: host part cannot be empty")));
+        }
+        // `Url` drops a scheme-default port (`:80`, `:443`) from `port()`;
+        // accept one that was written, reject a missing port and port 0.
+        let authority = with_scheme
+            .split_once("://")
+            .map_or("", |(_, rest)| rest)
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("");
+        let written_default_port = url
+            .port_or_known_default()
+            .is_some_and(|default| authority.ends_with(&format!(":{default}")));
+        match url.port() {
+            Some(0) => {
+                return Err(invalid(format!(
+                    "{EXPECTED}: port must be a number between 1 and 65535"
+                )))
             }
-        };
+            Some(_) => {}
+            None if written_default_port => {}
+            None => {
+                return Err(invalid(format!(
+                    "{EXPECTED}: port must be a number between 1 and 65535"
+                )))
+            }
+        }
 
         Ok(())
     }
@@ -1140,6 +1210,14 @@ impl ConfigValidator {
             return Err(ConfigError::InvalidValue {
                 field: "tokenizer_cache.l0_max_entries".to_string(),
                 value: cache.l0_max_entries.to_string(),
+                reason: "Must be > 0 when L0 cache is enabled".to_string(),
+            });
+        }
+
+        if cache.enable_l0 && cache.l0_max_memory == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l0_max_memory".to_string(),
+                value: cache.l0_max_memory.to_string(),
                 reason: "Must be > 0 when L0 cache is enabled".to_string(),
             });
         }
@@ -1286,6 +1364,115 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::worker::ConnectionMode;
+
+    /// The OTLP endpoint is validated as the URL the exporter dials, so an
+    /// unbracketed IPv6 literal is a configuration error with the bracketed
+    /// form in the message instead of an "invalid URI" abort at startup.
+    #[test]
+    fn otlp_endpoint_must_be_a_url_the_exporter_can_dial() {
+        let trace = |endpoint: &str| TraceConfig {
+            enable_trace: true,
+            otlp_traces_endpoint: endpoint.to_string(),
+        };
+        for ok in [
+            "otel-collector:4317",
+            "localhost:4317",
+            "127.0.0.1:4317",
+            "[::1]:4317",
+            "[fd00::1]:4317",
+            "http://[::1]:4317",
+            "http://127.0.0.1:4317",
+            "https://otel-collector.example:4317",
+            "http://otel-collector:80",
+        ] {
+            ConfigValidator::validate_trace(&trace(ok))
+                .unwrap_or_else(|e| panic!("{ok} should validate: {e}"));
+        }
+        for bad in [
+            "::1:4317",
+            "fd00::1",
+            "http://::1:4317",
+            "[::1]",
+            "otel-collector",
+            "otel-collector:0",
+            "otel-collector:70000",
+            "grpc://otel-collector:4317",
+            ":4317",
+            "",
+        ] {
+            let err = ConfigValidator::validate_trace(&trace(bad)).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { field, .. }
+                    if field == "trace_config.otlp_traces_endpoint"),
+                "{bad:?}: {err}"
+            );
+            assert!(err.to_string().contains("[::1]:4317"), "{bad:?}: {err}");
+        }
+        // Tracing off: the endpoint is not looked at.
+        ConfigValidator::validate_trace(&TraceConfig {
+            enable_trace: false,
+            otlp_traces_endpoint: "::1:4317".to_string(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn bind_hosts_accept_ipv6_with_or_without_brackets() {
+        for (host, expected) in [
+            ("::", "[::]:30000"),
+            ("[::]", "[::]:30000"),
+            ("::1", "[::1]:30000"),
+            ("[fd00::1]", "[fd00::1]:30000"),
+            ("0.0.0.0", "0.0.0.0:30000"),
+            ("127.0.0.1", "127.0.0.1:30000"),
+        ] {
+            assert_eq!(
+                bind_socket_addr(host, 30000).unwrap().to_string(),
+                expected,
+                "host {host:?}"
+            );
+        }
+        for bad in [
+            "",
+            "localhost",
+            "[::",
+            "::]",
+            "[]",
+            "0.0.0.0:30000",
+            "[::1]:30000",
+        ] {
+            let err = parse_bind_host(bad).unwrap_err();
+            assert!(err.contains("invalid bind host"), "host {bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn server_and_metrics_hosts_are_validated_as_bind_hosts() {
+        let config = |host: &str, metrics_host: &str| RouterConfig {
+            host: host.to_string(),
+            metrics: Some(MetricsConfig {
+                port: 29000,
+                host: metrics_host.to_string(),
+            }),
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for (host, metrics_host) in [("[::]", "::"), ("::", "[::]"), ("0.0.0.0", "0.0.0.0")] {
+            config(host, metrics_host)
+                .validate()
+                .unwrap_or_else(|e| panic!("host {host:?} metrics {metrics_host:?}: {e}"));
+        }
+        match config("localhost", "::").validate() {
+            Err(ConfigError::InvalidValue { field, .. }) => assert_eq!(field, "host"),
+            other => panic!("expected an invalid host, got {other:?}"),
+        }
+        match config("[::]", "metrics").validate() {
+            Err(ConfigError::InvalidValue { field, .. }) => assert_eq!(field, "metrics.host"),
+            other => panic!("expected an invalid metrics host, got {other:?}"),
+        }
+    }
 
     #[test]
     fn igw_disaggregated_modes_reject_bucket_decode_policy() {

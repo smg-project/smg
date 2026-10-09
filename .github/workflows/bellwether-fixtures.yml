@@ -91,6 +91,33 @@ jobs:
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
+      # `bellwether unpack` fetches the compressed sets through `git lfs`, and
+      # the CPU runner image carries no git-lfs, so the job brings its own: the
+      # release binary for the runner's architecture, checked against the
+      # checksum pinned here, on PATH for the rest of the job. No root needed.
+      - name: Install git-lfs
+        env:
+          GIT_LFS_VERSION: "3.8.0"
+          GIT_LFS_SHA256_AMD64: e455e00f15d9b95661b8d53498ffb0c3367962cf1ec73c31ab7369516cd6ab8d
+          GIT_LFS_SHA256_ARM64: ac9c8efac980bb0505ead384d087e2acb6486fd8498691a2165fa174ec6118c2
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)  arch=amd64; sha="$GIT_LFS_SHA256_AMD64" ;;
+            aarch64) arch=arm64; sha="$GIT_LFS_SHA256_ARM64" ;;
+            *) echo "::error::no git-lfs build pinned for $(uname -m)"; exit 1 ;;
+          esac
+          dir="$RUNNER_TEMP/git-lfs"
+          mkdir -p "$dir"
+          tarball="git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz"
+          curl -fsSL --retry 3 -o "$dir/$tarball" \
+            "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/${tarball}"
+          echo "${sha}  $dir/$tarball" | sha256sum -c -
+          tar -xzf "$dir/$tarball" -C "$dir"
+          install -m 0755 "$dir/git-lfs-${GIT_LFS_VERSION}/git-lfs" "$dir/git-lfs"
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/git-lfs" version
+
       - name: Check out bellwether
         uses: actions/checkout@v7
         with:

@@ -9,6 +9,19 @@ use pyo3::prelude::*;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// The gateway's jemalloc options (`SERVER_MALLOC_CONF`). The extension is a
+// final artifact of its own, so it exports them as jemalloc's
+// application-provided `malloc_conf` like the `smg` executable does;
+// without this the router launched from Python ran jemalloc's stock decay
+// and kept a traffic burst's freed pages resident.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 61] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
 
@@ -471,6 +484,7 @@ struct Router {
     disable_tokenizer_autoload: bool,
     tokenizer_cache_enable_l0: bool,
     tokenizer_cache_l0_max_entries: usize,
+    tokenizer_cache_l0_max_memory: usize,
     tokenizer_cache_enable_l1: bool,
     tokenizer_cache_l1_max_memory: usize,
     reasoning_parser: Option<String>,
@@ -553,6 +567,7 @@ struct Router {
     kv_index: String,
     worker_stall_secs: u64,
     worker_wedge_secs: u64,
+    worker_stale_secs: u64,
     worker_warmup_secs: u64,
     worker_warmup_share: f32,
     worker_warmup_blocks: usize,
@@ -602,15 +617,22 @@ impl Router {
             .unwrap_or(ConnectionMode::Http)
     }
 
+    /// The metrics bind host: `prometheus_host`, or the unspecified address
+    /// of `host`'s family when it is not given.
+    fn metrics_host(&self) -> String {
+        self.prometheus_host
+            .clone()
+            .unwrap_or_else(|| config::MetricsConfig::default_host_for(&self.host))
+    }
+
     fn parse_mesh_socket_addr(
         host: &str,
         port: u16,
         field: &str,
     ) -> PyResult<std::net::SocketAddr> {
-        let addr = format!("{host}:{port}");
-        addr.parse::<std::net::SocketAddr>().map_err(|e| {
+        config::bind_socket_addr(host, port).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "Invalid value for {field}='{host}': invalid mesh socket address '{addr}': {e}"
+                "Invalid value for {field}='{host}': invalid mesh socket address: {e}"
             ))
         })
     }
@@ -825,13 +847,10 @@ impl Router {
         };
         let has_discovery = discovery.is_some();
 
-        let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
-            (Some(port), Some(host)) => Some(MetricsConfig {
-                port,
-                host: host.clone(),
-            }),
-            _ => None,
-        };
+        let metrics = self.prometheus_port.map(|port| MetricsConfig {
+            port,
+            host: self.metrics_host(),
+        });
 
         let trace_config = Some(config::TraceConfig {
             enable_trace: self.enable_trace,
@@ -933,6 +952,7 @@ impl Router {
             .worker_overload_shed(self.worker_overload_shed)
             .worker_stall_secs(self.worker_stall_secs)
             .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_stale_secs(self.worker_stale_secs)
             .worker_warmup(
                 self.worker_warmup_secs,
                 self.worker_warmup_share,
@@ -988,6 +1008,7 @@ impl Router {
             .tokenizer_cache(config::TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
                 l0_max_entries: self.tokenizer_cache_l0_max_entries,
+                l0_max_memory: self.tokenizer_cache_l0_max_memory,
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
@@ -1157,6 +1178,7 @@ impl Router {
         chat_template = None,
         tokenizer_cache_enable_l0 = false,
         tokenizer_cache_l0_max_entries = 10000,
+        tokenizer_cache_l0_max_memory = 268435456,
         tokenizer_cache_enable_l1 = false,
         tokenizer_cache_l1_max_memory = 52428800,
         reasoning_parser = None,
@@ -1245,6 +1267,7 @@ impl Router {
         kv_index = String::from("positional"),
         worker_stall_secs = 2,
         worker_wedge_secs = 3,
+        worker_stale_secs = 15,
         worker_warmup_secs = 60,
         worker_warmup_share = 0.25,
         worker_warmup_blocks = 1024,
@@ -1345,6 +1368,7 @@ impl Router {
         chat_template: Option<String>,
         tokenizer_cache_enable_l0: bool,
         tokenizer_cache_l0_max_entries: usize,
+        tokenizer_cache_l0_max_memory: usize,
         tokenizer_cache_enable_l1: bool,
         tokenizer_cache_l1_max_memory: usize,
         reasoning_parser: Option<String>,
@@ -1431,6 +1455,7 @@ impl Router {
         kv_index: String,
         worker_stall_secs: u64,
         worker_wedge_secs: u64,
+        worker_stale_secs: u64,
         worker_warmup_secs: u64,
         worker_warmup_share: f32,
         worker_warmup_blocks: usize,
@@ -1568,6 +1593,7 @@ impl Router {
             disable_tokenizer_autoload,
             tokenizer_cache_enable_l0,
             tokenizer_cache_l0_max_entries,
+            tokenizer_cache_l0_max_memory,
             tokenizer_cache_enable_l1,
             tokenizer_cache_l1_max_memory,
             reasoning_parser,
@@ -1643,6 +1669,7 @@ impl Router {
             kv_index,
             worker_stall_secs,
             worker_wedge_secs,
+            worker_stale_secs,
             worker_warmup_secs,
             worker_warmup_share,
             worker_warmup_blocks,
@@ -1692,10 +1719,7 @@ impl Router {
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),
-            host: self
-                .prometheus_host
-                .clone()
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            host: self.metrics_host(),
             duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 

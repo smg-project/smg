@@ -24,7 +24,10 @@ use crate::{
         policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
         SelectWorkerInfo, WorkerLeg,
     },
-    routers::common::{header_utils, overload},
+    routers::{
+        common::{header_utils, overload, retry::mark_non_retryable},
+        error,
+    },
     worker::{
         overload::{BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION},
         ConnectionMode, ConnectionModeExt, PdPairIndex, PrefillCandidateError,
@@ -58,6 +61,9 @@ pub(crate) fn admission_prefilters(
         || header_utils::extract_target_worker(headers).is_none()
 }
 
+/// A per-request candidate predicate: a worker it rejects is never selected.
+pub(crate) type CandidateFilter<'a> = &'a (dyn Fn(&dyn Worker) -> bool + Sync);
+
 /// Everything a single-worker placement reads from the request.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PlacementInputs<'a> {
@@ -72,8 +78,9 @@ pub(crate) struct PlacementInputs<'a> {
     /// The request's cache partition, when set.
     pub cache_namespace: Option<CacheNamespace>,
     /// Extra per-request candidate predicate; a worker it rejects is never
-    /// selected (e.g. only workers that process media references themselves).
-    pub candidate_filter: Option<fn(&dyn Worker) -> bool>,
+    /// selected (e.g. only workers that process media references themselves,
+    /// or none that already answered this request definitively).
+    pub candidate_filter: Option<CandidateFilter<'a>>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -327,6 +334,17 @@ pub(crate) fn failure_from(
         return PlacementFailure::AllOverloaded(shed);
     }
     PlacementFailure::Unavailable
+}
+
+/// The 503 for a pool whose every worker is unavailable (unhealthy or its
+/// circuit breaker open). Terminal for the retry layer: the verdict clears at
+/// the health interval or the breaker timeout, never inside a backoff window,
+/// so retrying it in-process only adds the backoffs to every client's latency
+/// while the pool is down. The client retries on its own schedule.
+pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
+    let mut response = error::service_unavailable("no_available_workers", message);
+    mark_non_retryable(&mut response);
+    response
 }
 
 /// The steering default for a disaggregated placement whose failed leg is

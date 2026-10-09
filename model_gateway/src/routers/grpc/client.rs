@@ -1,24 +1,28 @@
 //! Unified gRPC client wrapper for SGLang, vLLM, and TensorRT-LLM backends
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
 };
 use smg_grpc_client::{
-    common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, MlxEngineClient,
-    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
-    TrtllmServiceClient, VllmEngineClient,
+    common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, BoxedTraceInjector,
+    MlxEngineClient, SglangGenerateRequestOptions, SglangSchedulerClient,
+    TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
 };
 
-use crate::routers::grpc::{
-    proto_wrapper::{
-        cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
-        collect_vllm_generate_request_shm_handles, finish_tokenspeed_request, finish_vllm_request,
-        ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest, ProtoStream,
+use crate::{
+    observability::otel_trace::OtelTraceInjector,
+    routers::grpc::{
+        proto_wrapper::{
+            cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
+            collect_vllm_generate_request_shm_handles, finish_tokenspeed_request,
+            finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
+            ProtoStream,
+        },
+        MultimodalData,
     },
-    MultimodalData,
 };
 
 /// Health check response (common across backends)
@@ -201,13 +205,25 @@ impl GrpcClient {
         url: &str,
         runtime_type: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Every RPC carries the current span's W3C trace context in its
+        // metadata, so the engine side can continue the gateway's trace (a
+        // no-op while tracing is off).
+        let trace_injector: BoxedTraceInjector = Arc::new(OtelTraceInjector);
         match runtime_type {
-            "sglang" => Ok(Self::Sglang(SglangSchedulerClient::connect(url).await?)),
-            "vllm" => Ok(Self::Vllm(VllmEngineClient::connect(url).await?)),
-            "trtllm" | "tensorrt-llm" => Ok(Self::Trtllm(TrtllmServiceClient::connect(url).await?)),
-            "mlx" => Ok(Self::Mlx(MlxEngineClient::connect(url).await?)),
+            "sglang" => Ok(Self::Sglang(
+                SglangSchedulerClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "vllm" => Ok(Self::Vllm(
+                VllmEngineClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "trtllm" | "tensorrt-llm" => Ok(Self::Trtllm(
+                TrtllmServiceClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "mlx" => Ok(Self::Mlx(
+                MlxEngineClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
             "tokenspeed" => Ok(Self::TokenSpeed(
-                TokenSpeedSchedulerClient::connect(url).await?,
+                TokenSpeedSchedulerClient::connect_with_trace_injector(url, trace_injector).await?,
             )),
             _ => Err(format!("Unknown runtime type: {runtime_type}").into()),
         }
@@ -863,6 +879,10 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // The operator's explicit protocol, which the servicer reads from the
     // engine's SMG_PAIRING_PROTOCOL environment.
     "pairing_protocol",
+    // The engine's own per-request media limits (`--limit-mm-data-per-request`),
+    // flattened by the servicer to `image=1,video=1`: the gateway's own media
+    // pipeline holds requests to them, as the engine's front end would.
+    "mm_item_limits",
 ];
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
@@ -898,6 +918,9 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "kv_cache_dtype",
     "attention_backend",
     "pairing_protocol",
+    // The engine's own per-request media limits, flattened by the servicer as
+    // for SGLang (`image=4`); TokenSpeed's engine has none to advertise today.
+    "mm_item_limits",
     // RL control plane (crates/rl): where the engine's SGLang-compatible
     // control app listens and what it implements. The engine advertises
     // these; SMG's discovery turns them into the labels the RL crate reads.
@@ -980,9 +1003,28 @@ fn pick_prost_fields(labels: &mut HashMap<String, String>, s: &prost_types::Stru
 mod tests {
     use std::collections::BTreeMap;
 
-    use smg_grpc_client::{sglang_proto, tokenspeed_proto};
+    use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto};
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo};
+
+    /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
+    /// are: the engine's per-prompt media limits arrive as `mm_item_limits`,
+    /// and an engine without them (a text model) sets no such label.
+    #[test]
+    fn server_info_to_labels_vllm_carries_the_engines_item_limits() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            server_type: "vllm-grpc".to_string(),
+            mm_item_limits: "image=8,video=2".to_string(),
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(
+            labels.get("mm_item_limits").map(String::as_str),
+            Some("image=8,video=2")
+        );
+        let text_only = ServerInfo::Vllm(Box::default());
+        assert!(!text_only.to_labels().contains_key("mm_item_limits"));
+    }
 
     #[test]
     fn trtllm_status_healthy_matches_ok_exactly() {
@@ -1006,6 +1048,27 @@ mod tests {
         prost_types::Value {
             kind: Some(prost_types::value::Kind::NumberValue(n)),
         }
+    }
+
+    /// The vLLM servicer's running window flattens into the `max_num_seqs`
+    /// label the PD admission gate and the capacity tracker read; an engine
+    /// that reports none (the proto default) leaves no label, as before.
+    #[test]
+    fn server_info_to_labels_vllm_carries_the_running_window() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            kv_connector: "NixlConnector".to_string(),
+            max_num_seqs: 64,
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(labels.get("max_num_seqs").map(String::as_str), Some("64"));
+        assert_eq!(
+            labels.get("kv_connector").map(String::as_str),
+            Some("NixlConnector")
+        );
+
+        let unknown = ServerInfo::Vllm(Box::default());
+        assert!(!unknown.to_labels().contains_key("max_num_seqs"));
     }
 
     /// The `/workers` metadata path for TokenSpeed: curated `server_args` keys
@@ -1044,6 +1107,7 @@ mod tests {
                         "rl.reports_weight_version".to_string(),
                         string_value("true"),
                     ),
+                    ("mm_item_limits".to_string(), string_value("image=4")),
                     // Not in TOKENSPEED_GRPC_KEYS — must not become a label.
                     ("host".to_string(), string_value("127.0.0.1")),
                 ]),
@@ -1118,6 +1182,11 @@ mod tests {
             labels.get("rl.reports_weight_version").map(String::as_str),
             Some("true")
         );
+        // The engine's per-request media limits, for the media pipeline.
+        assert_eq!(
+            labels.get("mm_item_limits").map(String::as_str),
+            Some("image=4")
+        );
         // scheduler_info and transient runtime state never become labels.
         assert!(!labels.contains_key("status"));
         assert!(!labels.contains_key("active_requests"));
@@ -1149,6 +1218,10 @@ mod tests {
                     ("page_size".to_string(), number_value(64.0)),
                     ("attention_backend".to_string(), string_value("fa3")),
                     ("pairing_protocol".to_string(), string_value("kv-v1")),
+                    (
+                        "mm_item_limits".to_string(),
+                        string_value("image=1,video=1"),
+                    ),
                     // Not in SGLANG_GRPC_KEYS — must not become a label.
                     ("api_key".to_string(), string_value("secret")),
                 ]),
@@ -1197,6 +1270,11 @@ mod tests {
         assert_eq!(
             labels.get("pairing_protocol").map(String::as_str),
             Some("kv-v1")
+        );
+        // The engine's per-request media limits, for the media pipeline.
+        assert_eq!(
+            labels.get("mm_item_limits").map(String::as_str),
+            Some("image=1,video=1")
         );
     }
 

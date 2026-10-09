@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Cursor,
     sync::{
@@ -13,7 +13,7 @@ use bytes::Bytes;
 use engine_zmq_client::{
     codec::{decode_msgpack, tensor::WireTensor, OpaqueValue},
     mock_engine::{
-        connect_to_frontend, default_ready_response, EngineInbound, MockEngineInput,
+        connect_to_frontend, default_ready_response, hello, EngineInbound, MockEngineInput,
         MockEngineOutput, MOCK_DEADLINE,
     },
     protocol::vllm::{
@@ -73,6 +73,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmS
         model,
         media_processor: None,
         engine_startup_timeout: Duration::from_secs(10),
+        engine_startup_ceiling: None,
     }
 }
 
@@ -288,11 +289,22 @@ fn start_rejects_malformed_config() {
         engine_startup_timeout: Duration::ZERO,
         ..good.clone()
     };
+    let zero_ceiling = VllmServicerConfig {
+        engine_startup_ceiling: Some(Duration::ZERO),
+        ..good.clone()
+    };
     let no_model = VllmServicerConfig {
         model: VllmModelInfo::default(),
         ..good
     };
-    for config in [bad_ipc, bad_handshake, no_engines, zero_timeout, no_model] {
+    for config in [
+        bad_ipc,
+        bad_handshake,
+        no_engines,
+        zero_timeout,
+        zero_ceiling,
+        no_model,
+    ] {
         assert!(matches!(
             VllmServicerServer::start(config),
             Err(ServicerError::InvalidConfig(_))
@@ -709,6 +721,70 @@ async fn kv_transfer_params_pass_through_both_ways() {
     let legacy = finished.kv_transfer_params.expect("legacy mirror");
     assert_eq!(legacy.remote_host, "10.0.0.1");
     assert_eq!(legacy.remote_port, 5600);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The Router's W3C trace context (gRPC metadata) reaches the engine request
+/// as `trace_headers`, the field vLLM's own frontend fills for its tracer; a
+/// call without the context sets none.
+#[tokio::test]
+async fn trace_context_metadata_reaches_the_engine_request() {
+    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let mut h = harness(model_info(), None).await;
+    let mut request = tonic::Request::new(generate_request("tr1", false, Vec::new()));
+    request
+        .metadata_mut()
+        .insert("traceparent", TRACEPARENT.parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("tracestate", "vendor=a".parse().unwrap());
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        engine_request.trace_headers,
+        Some(BTreeMap::from([
+            ("traceparent".to_string(), TRACEPARENT.to_string()),
+            ("tracestate".to_string(), "vendor=a".to_string()),
+        ]))
+    );
+    h.engine_out
+        .send_outputs(&batch(
+            "tr1",
+            vec![7],
+            Some(EngineCoreFinishReason::Length),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "length"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut stream = h
+        .client
+        .generate(generate_request("tr2", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    assert_eq!(recv_add(&mut h.engine_in).await.trace_headers, None);
+    h.engine_out
+        .send_outputs(&batch(
+            "tr2",
+            vec![7],
+            Some(EngineCoreFinishReason::Length),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert!(stream.message().bounded().await.unwrap().is_some());
     assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -1144,6 +1220,12 @@ async fn info_rpcs_report_config_and_handshake_facts() {
     assert_eq!(server.kv_engine_id, "eng-a");
     assert_eq!(server.kv_cache_dtype, "auto");
     assert_eq!(server.shm_namespace_id, "boot:42");
+    // The running window the Router's PD admission gate bounds dispatch by:
+    // the handshake's, for a launcher that reported none.
+    assert_eq!(
+        server.max_num_seqs,
+        i32::try_from(ready.max_num_seqs).unwrap()
+    );
 
     // Before any output batch, loads are zero-filled per rank (the Router
     // reads an empty list as no report), stamped with the engine's version.
@@ -1171,6 +1253,30 @@ async fn info_rpcs_report_config_and_handshake_facts() {
         .map(|_| ())
         .unwrap_err();
     assert_eq!(status.code(), Code::Unimplemented);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The launcher's `--max-num-seqs` is the window `GetServerInfo` advertises
+/// and `GetLoads` reports, over the handshake's figure.
+#[tokio::test]
+async fn the_launchers_running_window_wins_over_the_handshakes() {
+    let mut model = model_info();
+    model.max_num_seqs = 64;
+    let mut h = harness(model, None).await;
+    let server = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(server.max_num_seqs, 64);
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.loads[0].max_running_requests, 64);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -2533,6 +2639,34 @@ async fn server_info_advertises_device_side_normalization() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The engine's per-prompt media limits are a fact of its config, advertised
+/// whatever processes media so the Router's own pipeline holds requests to
+/// them; an engine without them (a text model) advertises none.
+#[tokio::test]
+async fn server_info_advertises_the_engines_item_limits() {
+    let mut model = model_info();
+    model.mm_item_limits = "image=8,video=2".to_string();
+    let mut h = harness_with(model, None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_item_limits, "image=8,video=2");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let mut h = harness_with(model_info(), None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_item_limits, "");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `GetServerInfo` advertises the processor only while it answers its probe
 /// and the engine takes multimodal input, as the Python servicer does.
 #[tokio::test]
@@ -2771,4 +2905,194 @@ async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
 
     server.stop(Duration::from_secs(5)).unwrap();
     assert_handshake_released(&handshake).await;
+}
+
+/// Between HELLO and READY a real engine loads its model, and nothing crosses
+/// the wire meanwhile. The lifecycle owner's reports that the engine process
+/// is alive keep the link waiting well past the silence bound, and the start
+/// then completes.
+#[tokio::test]
+async fn a_slow_engine_stays_linked_while_the_launcher_reports_it_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let server = VllmServicerServer::start(VllmServicerConfig {
+        engine_startup_timeout: silence,
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    // The engine dials in at once, then "loads" for four silences.
+    let loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let load_time = Instant::now() + 4 * silence;
+    while Instant::now() < load_time {
+        server.note_engine_alive();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        server.last_error().unwrap(),
+        None,
+        "the link gave up on a living engine"
+    );
+    assert!(!server.engine_ready());
+
+    let engine = loading
+        .ready(default_ready_response())
+        .bounded()
+        .await
+        .expect("READY and registration accepted");
+    wait_until(|| server.engine_ready()).await;
+    let (mut engine_in, _engine_out) = engine.split();
+    assert_engine_idle(&mut engine_in).await;
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// An engine that dials in and then falls silent, with nobody reporting it
+/// alive, fails the link at the silence bound as before.
+#[tokio::test]
+async fn an_engine_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let server = VllmServicerServer::start(VllmServicerConfig {
+        engine_startup_timeout: silence,
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let since_hello = Instant::now();
+    let deadline = since_hello + Duration::from_secs(10);
+    let error = loop {
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(since_hello.elapsed() >= silence);
+    assert!(
+        error.contains("timed out while waiting for READY"),
+        "{error}"
+    );
+    assert!(error.contains("without a sign of life"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// The ceiling bounds a start however alive the engine is reported.
+#[tokio::test]
+async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let ceiling = Duration::from_millis(900);
+    let server = VllmServicerServer::start(VllmServicerConfig {
+        engine_startup_timeout: silence,
+        engine_startup_ceiling: Some(ceiling),
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let started = Instant::now();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let deadline = started + Duration::from_secs(10);
+    let error = loop {
+        server.note_engine_alive();
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(started.elapsed() >= ceiling);
+    assert!(error.contains("reached its ceiling"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// Many streams on one connection keep their own chunk sequences: every
+/// engine step carries one token for each of them, and each stream sees
+/// exactly its tokens, in order, then its own `Complete` with the full output
+/// and finish reason.
+#[tokio::test]
+async fn concurrent_streams_keep_their_own_chunk_sequences() {
+    const STREAMS: usize = 48;
+    const STEPS: u32 = 6;
+    fn token(stream: usize, step: u32) -> u32 {
+        1000 + u32::try_from(stream).unwrap() * 16 + step
+    }
+    let mut h = harness(model_info(), None).await;
+    let mut streams = Vec::with_capacity(STREAMS);
+    for i in 0..STREAMS {
+        let mut request = generate_request(&format!("c{i}"), true, Vec::new());
+        request.sampling_params.as_mut().unwrap().max_tokens = Some(STEPS);
+        streams.push(
+            h.client
+                .generate(request)
+                .await
+                .expect("generate")
+                .into_inner(),
+        );
+    }
+    let mut ids = BTreeSet::new();
+    for _ in 0..STREAMS {
+        ids.insert(recv_add(&mut h.engine_in).await.request_id);
+    }
+    assert_eq!(ids.len(), STREAMS);
+    for step in 0..STEPS {
+        let last = step + 1 == STEPS;
+        let outputs = (0..STREAMS)
+            .map(|i| EngineCoreOutput {
+                request_id: format!("c{i}"),
+                new_token_ids: vec![token(i, step)],
+                finish_reason: last.then_some(EngineCoreFinishReason::Length),
+                ..Default::default()
+            })
+            .collect();
+        h.engine_out
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 0,
+                outputs,
+                finished_requests: last.then(|| ids.clone()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+    }
+    for (i, stream) in streams.iter_mut().enumerate() {
+        let expected: Vec<u32> = (0..STEPS).map(|step| token(i, step)).collect();
+        let mut got = Vec::new();
+        loop {
+            let message = stream
+                .message()
+                .bounded()
+                .await
+                .unwrap()
+                .expect("a stream ends with its Complete");
+            match message.response {
+                Some(vllm::generate_response::Response::Chunk(chunk)) => {
+                    got.extend(chunk.token_ids);
+                }
+                Some(vllm::generate_response::Response::Complete(done)) => {
+                    assert_eq!(done.output_ids, expected, "stream {i}");
+                    assert_eq!(done.finish_reason, "length", "stream {i}");
+                    assert_eq!(done.completion_tokens, STEPS, "stream {i}");
+                    break;
+                }
+                other => panic!("stream {i}: unexpected response {other:?}"),
+            }
+        }
+        assert_eq!(
+            got, expected,
+            "stream {i}: the chunks are its tokens, in order"
+        );
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
 }

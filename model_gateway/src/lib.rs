@@ -8,6 +8,7 @@ pub mod middleware;
 mod model_profile;
 pub mod observability;
 pub mod policies;
+pub mod posture;
 pub mod rate_limit;
 pub mod rl_adapter;
 pub mod routers;

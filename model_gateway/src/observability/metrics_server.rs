@@ -1,10 +1,7 @@
 //! HTTP server for the Prometheus metrics endpoint (default port 29000).
 //! Serves `GET /metrics` (Prometheus).
 
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -43,11 +40,11 @@ pub async fn start_metrics_server(
     host: String,
     port: u16,
 ) -> Result<(SocketAddr, JoinHandle<()>), String> {
-    let ip_addr: IpAddr = host.parse().unwrap_or_else(|e| {
-        error!("Failed to parse metrics host '{host}': {e}, falling back to 0.0.0.0");
-        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
-    });
-    let addr = SocketAddr::new(ip_addr, port);
+    // The same spellings as `--host` (`::` and `[::]` both bind IPv6), and a
+    // bad host is a startup error: a silent fallback to 0.0.0.0 would hide a
+    // typo and leave an IPv6-only network without metrics.
+    let addr =
+        crate::config::bind_socket_addr(&host, port).map_err(|e| format!("metrics server: {e}"))?;
 
     let listener = bind_metrics_listener(addr).await?;
     let bound_addr = listener
@@ -88,7 +85,44 @@ pub async fn start_metrics_server(
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
+
+    #[tokio::test]
+    async fn ipv6_host_binds_ipv6_with_or_without_brackets() {
+        // Nothing to assert on a host without an IPv6 loopback.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        for host in ["[::1]", "::1"] {
+            let (addr, _server) = start_metrics_server(handle.clone(), host.to_string(), 0)
+                .await
+                .unwrap();
+            assert!(addr.ip().is_ipv6(), "host {host} bound {addr}");
+            let resp = reqwest::get(format!("http://{addr}/metrics"))
+                .await
+                .unwrap();
+            assert!(resp.status().is_success(), "host {host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unparsable_host_is_an_error_not_an_ipv4_fallback() {
+        let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let err = start_metrics_server(handle, "metrics-host".to_string(), 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("invalid bind host 'metrics-host'"),
+            "got: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn bind_metrics_listener_error_includes_addr() {

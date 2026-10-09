@@ -71,12 +71,14 @@ impl BuildStage for GenerateRequestBuildingStage {
             disaggregated,
         );
 
-        // Build proto request using centralized dispatch
+        // Build proto request using centralized dispatch. A generate request
+        // carries no media: the ids are the prompt and the text stays off the
+        // wire (see `helpers::wire_prompt_text`).
         let mut proto_request = builder_client
             .build_generate_request(
                 request_id,
                 &generate_request,
-                prep.routing_text().map(String::from),
+                None,
                 prep.token_ids().to_vec(),
             )
             .map_err(|e| {

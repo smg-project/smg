@@ -444,7 +444,7 @@ async fn effective_discovered_cards_select_the_contract() {
     smg::worker::Worker::set_models(&replacement, vec![k3_card("vllm-model", "public-alias")]);
     assert!(registry.replace(&id, Arc::new(replacement)));
     let app = ctx.create_app();
-    for padding in ["".to_string(), "x".repeat(2048)] {
+    for padding in [String::new(), "x".repeat(2048)] {
         let response = app
             .clone()
             .oneshot(request(

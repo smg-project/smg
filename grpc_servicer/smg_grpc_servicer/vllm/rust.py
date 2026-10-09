@@ -49,8 +49,10 @@ import os
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
+from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
+    DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
     EngineProcessGroup,
@@ -60,9 +62,11 @@ from smg_grpc_servicer.rust_lifecycle import (
     supervise,
 )
 from smg_grpc_servicer.rust_lifecycle import env_float as _env_float
+from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
     eos_token_ids_with_generation_config,
     mm_device_do_normalize,
+    mm_item_limits,
     model_facts,
     server_facts,
 )
@@ -73,6 +77,11 @@ SERVICER_IMPL_ENV = "SMG_VLLM_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_VLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS"
+STARTUP_CEILING_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_CEILING_SECS"
+# Set to 0/false/no/off to keep vLLM's KV event publisher off when the
+# launcher was given no --kv-events-config (see `default_kv_events_config`).
+KV_EVENTS_ENV = "SMG_VLLM_SERVICER_KV_EVENTS"
+_OFF_VALUES = ("0", "false", "no", "off")
 # vLLM's own knob for how it starts its processes; the engine cores launched
 # from this process are spawned unless the deployment chose otherwise.
 MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
@@ -128,7 +137,40 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         ),
         "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
         "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
+        "mm_item_limits": mm_item_limits(vllm_config),
     }
+
+
+def default_kv_events_config(
+    args: argparse.Namespace, environ: Mapping[str, str] | None = None
+) -> Any | None:
+    """Turn vLLM's KV event publisher on when the launcher was given no
+    ``--kv-events-config``; returns the configuration applied, or None.
+
+    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
+    vLLM publishes none unless started with ``--kv-events-config
+    '{"enable_kv_cache_events": true, "publisher": "zmq"}'``: a launcher
+    without it got a router that routed blind, with one WARN per worker as
+    the only trace. Under the Rust servicer the namespace that lacks the
+    option gets exactly that configuration (vLLM's own defaults for the rest:
+    the ZMQ endpoint and its port, the topic), before the engine args and the
+    engine cores are built from it, so publisher and relay agree. An explicit
+    ``--kv-events-config`` is kept as given, off included;
+    ``SMG_VLLM_SERVICER_KV_EVENTS=0`` keeps the publisher off without one.
+    """
+    source = os.environ if environ is None else environ
+    if getattr(args, "kv_events_config", None) is not None:
+        return None
+    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
+        return None
+    try:
+        from vllm.config import KVEventsConfig
+
+        config: Any = KVEventsConfig(enable_kv_cache_events=True, publisher="zmq")
+    except ImportError:  # the launcher's parser hands the config over as JSON too
+        config = {"enable_kv_cache_events": True, "publisher": "zmq"}
+    args.kv_events_config = config
+    return config
 
 
 def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[str, Any] | None:
@@ -144,7 +186,9 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     The engine's ``mm_processor_kwargs`` go along as overrides of the
     preprocessor config (less ``device``, which only says where vLLM's own
     processor would run); a knob the pipeline has no field for is refused
-    at launch rather than silently ignored.
+    at launch rather than silently ignored. The engine's own per-prompt media
+    limits (``--limit-mm-per-prompt``) go along too: the pipeline refuses
+    above them as the engine's own server does, whatever its own caps say.
     """
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
@@ -174,9 +218,22 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         ),
         "max_inflight": settings.max_inflight,
         "max_items": settings.max_items,
+        "engine_item_limits": engine_item_limits(model_config),
         "max_item_bytes": settings.max_item_bytes,
         "source": settings.source,
     }
+
+
+def engine_item_limits(model_config) -> dict[str, int] | None:
+    """The engine's per-prompt media limits for the modalities the pipeline
+    fetches, as vLLM resolved ``--limit-mm-per-prompt`` (its own server refuses
+    a prompt above them); ``None`` on a config that does not carry them, which
+    leaves the pipeline to its own caps."""
+    mm_config = getattr(model_config, "multimodal_config", None)
+    get_limit = getattr(mm_config, "get_limit_per_prompt", None)
+    if not callable(get_limit):
+        return None
+    return {modality: int(get_limit(modality)) for modality in FETCHABLE_MODALITIES}
 
 
 # ---------------------------------------------------------------------------
@@ -339,9 +396,23 @@ async def serve_rust(args: argparse.Namespace) -> int:
     from vllm.usage.usage_lib import UsageContext
 
     configure_logging()
+    if default_kv_events_config(args) is not None:
+        logger.info(
+            "KV event publishing enabled: no --kv-events-config was given, so vLLM's ZMQ "
+            "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+            "--kv-events-config to configure it, or set %s=0 to leave it off",
+            KV_EVENTS_ENV,
+        )
     engine_args = AsyncEngineArgs.from_cli_args(args)
     vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
     info = model_info_from_config(vllm_config)
+    if info["kv_events_endpoint"]:
+        logger.info("SubscribeKvEvents relays vLLM's KV events from %s", info["kv_events_endpoint"])
+    else:
+        logger.warning(
+            "SubscribeKvEvents is off (KV cache events disabled, or a publisher other than "
+            "zmq): a cache-aware router sees nothing of this engine's cache"
+        )
     model_config = vllm_config.model_config
     tokenizer_dir = resolve_tokenizer_dir(
         str(getattr(model_config, "tokenizer", None) or model_config.model),
@@ -371,18 +442,19 @@ async def serve_rust(args: argparse.Namespace) -> int:
     )
 
     init_servicer_tracing()
+    startup_timeout_secs = _env_float(STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS)
+    startup_ceiling_secs = _env_float(STARTUP_CEILING_SECS_ENV, DEFAULT_STARTUP_CEILING_SECS)
     server = VllmGrpcServer(
         # `vllm serve` leaves host unset and upstream binds all interfaces then.
-        bind_address=f"{getattr(args, 'host', None) or '0.0.0.0'}:{args.port}",
+        bind_address=host_port(getattr(args, "host", None) or "0.0.0.0", args.port),
         # Per process, not per requested port: `--port 0` launchers would
         # otherwise share one path and unlink each other's sockets.
         ipc_base_url=f"ipc://{socket_dir}/servicer-{os.getpid()}",
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=data_parallel_size,
         tokenizer_dir=tokenizer_dir,
-        engine_startup_timeout_secs=_env_float(
-            STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS
-        ),
+        engine_startup_timeout_secs=startup_timeout_secs,
+        engine_startup_ceiling_secs=startup_ceiling_secs,
         media_processor=media,
         smg_media_processor=smg_media,
         **info,
@@ -392,6 +464,14 @@ async def serve_rust(args: argparse.Namespace) -> int:
         server.address,
         handshake_port,
         data_parallel_size,
+    )
+    logger.info(
+        "Engine startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+        "the handshake waits while the engine process is alive",
+        startup_timeout_secs,
+        STARTUP_TIMEOUT_SECS_ENV,
+        f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
+        STARTUP_CEILING_SECS_ENV,
     )
     try:
         engine = launch_engine_cores(

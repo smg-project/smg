@@ -16,13 +16,15 @@ use subtle::ConstantTimeEq;
 pub enum Role {
     /// Full access to all control plane APIs (workers, wasm, tokenizers, etc.)
     Admin,
-    /// Access to inference/data plane APIs only (default for backward compatibility)
+    /// Read-only access to the control plane APIs: the GET and HEAD requests
+    /// (listing workers, loads, tokenizers, modules). Every mutating request
+    /// requires `Admin`. The default for tokens without a mapped role.
     #[default]
     User,
 }
 
 impl Role {
-    /// Check if this role has admin privileges for control plane APIs.
+    /// Check if this role has admin privileges (every control plane method).
     pub fn is_admin(self) -> bool {
         matches!(self, Role::Admin)
     }

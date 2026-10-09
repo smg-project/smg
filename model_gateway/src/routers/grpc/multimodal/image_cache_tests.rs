@@ -240,3 +240,48 @@ async fn large_batches_unconfirmed_processors_and_disabled_cache_use_batch_path(
         }
     }
 }
+
+/// Hits and misses per model, as `(hits, misses)`; `None` until both series
+/// are rendered.
+fn lookups(
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+    model: &str,
+) -> Option<(f64, f64)> {
+    let body = handle.render();
+    let sample = |family: &str| -> Option<f64> {
+        let prefix = format!("{family}{{model=\"{model}\"}} ");
+        body.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|value| value.trim().parse().ok())
+    };
+    Some((
+        sample("smg_mm_pixel_cache_hits_total")?,
+        sample("smg_mm_pixel_cache_misses_total")?,
+    ))
+}
+
+/// Every lookup is a hit or a miss on `/metrics`, by model, with both series
+/// present from the first lookup. An image repeated within one request is
+/// deduplicated before the cache and is neither.
+#[test]
+fn lookups_are_counted_as_hits_and_misses_by_model() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (components, _calls, config) = setup(true, false);
+            run(&components, &config, &[1, 2], "tok").await;
+            assert_eq!(lookups(&handle, "qwen2-vl"), Some((0.0, 2.0)));
+
+            run(&components, &config, &[1, 2, 1], "tok").await;
+            assert_eq!(lookups(&handle, "qwen2-vl"), Some((2.0, 2.0)));
+
+            run(&components, &config, &[3], "tok").await;
+            assert_eq!(lookups(&handle, "qwen2-vl"), Some((2.0, 3.0)));
+        });
+    });
+}

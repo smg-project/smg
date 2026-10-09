@@ -9,28 +9,25 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Jemalloc's run-time options for a long-running server. With the stock
-// settings a thread's freed pages decay back to the OS only when that thread
-// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
-// resident over ~270 MB of live objects (soak s2, ten hours). A background
-// thread purges on schedule instead; dirty pages are returned after 10 s and
-// muzzy pages at once. This is jemalloc's application-provided `malloc_conf`
-// string under the vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF`
-// environment variable is read after it and overrides it entry by entry.
+// Jemalloc's run-time options for a long-running server (see
+// `SERVER_MALLOC_CONF`): the executable exports them as jemalloc's
+// application-provided `malloc_conf`, as the Python extension does for the
+// router launched from Python.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+use smg::observability::metrics::SERVER_MALLOC_CONF;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[expect(
     unsafe_code,
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 61] =
-    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0\0";
+pub static MALLOC_CONF: &[u8; 61] = SERVER_MALLOC_CONF;
 
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
+        bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, ManualAssignmentMode,
         MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
@@ -244,7 +241,8 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
-    /// Host address to bind the router server
+    /// Host address to bind the router server: an IP literal, IPv6 with or
+    /// without brackets (`0.0.0.0`, `::`, `[::]`, `[fd00::1]`)
     #[arg(long, default_value = "0.0.0.0", help_heading = "Worker Configuration")]
     host: String,
 
@@ -634,6 +632,17 @@ struct CliArgs {
     #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
     worker_wedge_secs: u64,
 
+    /// Seconds without any contact (a load record, a poll answer, a probe, a
+    /// token) from a worker whose KV-event stream pushes load records, after
+    /// which it is excluded from routing as unreachable until it is heard
+    /// from again. A reachable servicer pushes a record at least every few
+    /// seconds, so a longer silence is a dead or one-way link the transport
+    /// has not reported yet. Workers that never pushed a record (HTTP
+    /// workers, older servicers) are not judged by it. Keep it above the
+    /// load-monitor interval. 0 disables the rule.
+    #[arg(long, default_value_t = 15, help_heading = "Load Monitoring")]
+    worker_stale_secs: u64,
+
     /// Warm-up slice for cache-aware routing: for this many seconds after a
     /// worker becomes routable, until its index has grown by
     /// --worker-warmup-blocks blocks, one cache miss in 1/--worker-warmup-share
@@ -733,7 +742,9 @@ struct CliArgs {
     multimodal_max_inflight_bytes: Option<usize>,
 
     /// Per-request image-count limit applied to every model, replacing each
-    /// spec's built-in limit (e.g. to match the engine's `--limit-mm-per-prompt`).
+    /// spec's built-in limit. It tightens, never loosens, the limit a model's
+    /// workers advertise for their engine (`mm_item_limits`, e.g. vLLM's
+    /// `--limit-mm-per-prompt`), which the router holds requests to by itself.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
     mm_per_request_image_limit: Option<u64>,
 
@@ -871,9 +882,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
     prometheus_port: u16,
 
-    /// Host address to bind the Prometheus metrics server
-    #[arg(long, default_value = "0.0.0.0", help_heading = "Prometheus Metrics")]
-    prometheus_host: String,
+    /// Host address to bind the Prometheus metrics server. Defaults to the
+    /// unspecified address of `--host`'s family: `::` for an IPv6 host,
+    /// `0.0.0.0` otherwise.
+    #[arg(long, help_heading = "Prometheus Metrics")]
+    prometheus_host: Option<String>,
 
     /// Custom buckets for Prometheus duration metrics
     #[arg(long, num_args = 0.., help_heading = "Prometheus Metrics")]
@@ -944,8 +957,11 @@ struct CliArgs {
     cors_allowed_origins: Vec<String>,
 
     // ==================== Rate Limiting ====================
-    /// Maximum standing concurrent requests (-1 to disable). Each admission
-    /// permit is held for the full response, including streaming bodies.
+    /// Maximum standing concurrent requests. Each admission permit is held
+    /// for the full response, including streaming bodies. -1 (default)
+    /// derives the bound from the host (1024 per available core, at least
+    /// 4096) so an overloaded router sheds with 429/503 instead of queueing
+    /// without bound; 0 disables the bound.
     #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
     max_concurrent_requests: i32,
 
@@ -987,8 +1003,10 @@ struct CliArgs {
     #[arg(long, help_heading = "Tenant Rate Limit")]
     tenant_rate_limit_config: Option<String>,
 
-    /// Token bucket refill rate (tokens per second). Unset or 0 = no refill:
-    /// --max-concurrent-requests bounds standing concurrency alone.
+    /// Sustained admission rate in requests per second, bursting up to
+    /// --max-concurrent-requests, which keeps bounding standing concurrency
+    /// (a completed request frees its slot, not rate budget). Unset or 0 =
+    /// no rate limit: --max-concurrent-requests bounds concurrency alone.
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 
@@ -1018,7 +1036,8 @@ struct CliArgs {
     disable_retries: bool,
 
     // ==================== Circuit Breaker ====================
-    /// Number of failures before circuit opens
+    /// Number of failed requests before the circuit opens (a request's retries
+    /// on a worker count once)
     #[arg(long, default_value_t = 10, help_heading = "Circuit Breaker")]
     cb_failure_threshold: u32,
 
@@ -1114,6 +1133,10 @@ struct CliArgs {
     /// Maximum entries in L0 tokenizer cache
     #[arg(long, default_value_t = 10000, help_heading = "Tokenizer")]
     tokenizer_cache_l0_max_entries: usize,
+
+    /// Maximum memory for L0 tokenizer cache in bytes (texts, ids and per-entry overhead)
+    #[arg(long, default_value_t = 268435456, help_heading = "Tokenizer")]
+    tokenizer_cache_l0_max_memory: usize,
 
     /// Enable L1 (prefix matching) tokenizer cache
     #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
@@ -1294,7 +1317,8 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append, help_heading = "Control Plane Authentication")]
     jwt_role_mapping: Vec<String>,
 
-    /// API keys for control plane access (format: id:name:role:key)
+    /// API keys for control plane access (format: id:name:role:key; role `admin` reaches every
+    /// control plane route, `user` the read-only GET/HEAD routes)
     #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
@@ -1313,7 +1337,8 @@ struct CliArgs {
     #[arg(long)]
     mesh_server_name: Option<String>,
 
-    /// Bind address for the mesh listener.
+    /// Bind address for the mesh listener: an IP literal, IPv6 with or
+    /// without brackets (`::`, `[::]`).
     #[arg(long, default_value = "0.0.0.0")]
     mesh_host: String,
 
@@ -1557,18 +1582,24 @@ impl CliArgs {
         map
     }
 
+    /// The metrics bind host: `--prometheus-host`, or the unspecified address
+    /// of `--host`'s family when it is not given.
+    fn metrics_host(&self) -> String {
+        self.prometheus_host
+            .clone()
+            .unwrap_or_else(|| MetricsConfig::default_host_for(&self.host))
+    }
+
     fn parse_mesh_socket_addr(
         host: &str,
         port: u16,
         field: &str,
     ) -> ConfigResult<std::net::SocketAddr> {
-        let addr = format!("{host}:{port}");
-        addr.parse::<std::net::SocketAddr>()
-            .map_err(|e| ConfigError::InvalidValue {
-                field: field.to_string(),
-                value: host.to_string(),
-                reason: format!("invalid mesh socket address '{addr}': {e}"),
-            })
+        bind_socket_addr(host, port).map_err(|e| ConfigError::InvalidValue {
+            field: field.to_string(),
+            value: host.to_string(),
+            reason: format!("invalid mesh socket address: {e}"),
+        })
     }
 
     fn build_mesh_server_config(&self) -> ConfigResult<Option<MeshServerConfig>> {
@@ -1941,7 +1972,7 @@ impl CliArgs {
 
         let metrics = Some(MetricsConfig {
             port: self.prometheus_port,
-            host: self.prometheus_host.clone(),
+            host: self.metrics_host(),
         });
 
         let trace_config = Some(TraceConfig {
@@ -2072,6 +2103,7 @@ impl CliArgs {
             .load_monitor_interval_secs(self.load_monitor_interval)
             .worker_stall_secs(self.worker_stall_secs)
             .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_stale_secs(self.worker_stale_secs)
             .worker_warmup(
                 self.worker_warmup_secs,
                 self.worker_warmup_share,
@@ -2143,6 +2175,7 @@ impl CliArgs {
             .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
                 l0_max_entries: self.tokenizer_cache_l0_max_entries,
+                l0_max_memory: self.tokenizer_cache_l0_max_memory,
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
@@ -2217,7 +2250,7 @@ impl CliArgs {
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
-            host: self.prometheus_host.clone(),
+            host: self.metrics_host(),
             duration_buckets: if self.prometheus_duration_buckets.is_empty() {
                 None
             } else {
@@ -2398,6 +2431,70 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// Mesh bind and advertise hosts go through the shared bind-host rule, so
+    /// IPv6 works with or without brackets, as it does for `--host`.
+    #[test]
+    fn mesh_hosts_accept_both_ipv6_spellings() {
+        for (host, advertise, expected_bind, expected_advertise) in [
+            ("::", "::1", "[::]:39527", "[::1]:39527"),
+            ("[::]", "[::1]", "[::]:39527", "[::1]:39527"),
+            ("0.0.0.0", "127.0.0.1", "0.0.0.0:39527", "127.0.0.1:39527"),
+        ] {
+            let mesh = cli_args_from(&[
+                "--enable-mesh",
+                "--mesh-host",
+                host,
+                "--mesh-advertise-host",
+                advertise,
+            ])
+            .build_mesh_server_config()
+            .unwrap()
+            .unwrap();
+            assert_eq!(mesh.bind_addr.to_string(), expected_bind, "host {host}");
+            assert_eq!(
+                mesh.advertise_addr.to_string(),
+                expected_advertise,
+                "advertise {advertise}"
+            );
+        }
+        let err = cli_args_from(&["--enable-mesh", "--mesh-host", "mesh-host"])
+            .build_mesh_server_config()
+            .err()
+            .expect("a mesh host that is not an IP literal must be rejected");
+        assert!(
+            err.to_string().contains("invalid bind host 'mesh-host'"),
+            "got: {err}"
+        );
+    }
+
+    /// With no `--prometheus-host`, the metrics listener follows the serving
+    /// listener's address family, so an IPv6-bound gateway is scraped over
+    /// IPv6 too; an explicit value is kept as written.
+    #[test]
+    fn metrics_host_defaults_to_the_serving_family() {
+        for (args, expected) in [
+            (vec!["--host", "[::]"], "::"),
+            (vec!["--host", "::"], "::"),
+            (vec!["--host", "[fd00::1]"], "::"),
+            (vec![], "0.0.0.0"),
+            (vec!["--host", "127.0.0.1"], "0.0.0.0"),
+            (
+                vec!["--host", "[::]", "--prometheus-host", "127.0.0.1"],
+                "127.0.0.1",
+            ),
+            (vec!["--host", "0.0.0.0", "--prometheus-host", "::"], "::"),
+        ] {
+            let cli = cli_args_from(&args);
+            assert_eq!(cli.metrics_host(), expected, "args {args:?}");
+            let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+            assert_eq!(
+                router_config.metrics.unwrap().host,
+                expected,
+                "args {args:?}"
+            );
+        }
     }
 
     /// A grouped ZMQ handshake needs at least one engine, so `0` (and any

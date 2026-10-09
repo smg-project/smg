@@ -13,7 +13,10 @@ pub trait Normalizable {
 
 #[cfg(feature = "axum")]
 use axum::{
-    extract::{rejection::JsonRejection, FromRequest, Request},
+    extract::{
+        rejection::{BytesRejection, FailedToBufferBody, JsonRejection},
+        FromRequest, Request,
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -43,6 +46,22 @@ use validator::Validate;
 /// ```
 #[cfg(feature = "axum")]
 pub struct ValidatedJson<T>(pub T);
+
+/// The gateway's JSON error envelope for a rejected request body.
+#[cfg(feature = "axum")]
+fn rejection(status: StatusCode, code: &str, message: String) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": code
+            }
+        })),
+    )
+        .into_response()
+}
 
 #[cfg(feature = "axum")]
 impl<S, T> FromRequest<S> for ValidatedJson<T>
@@ -78,6 +97,23 @@ where
             Json::<T>::from_request(req, state)
                 .await
                 .map_err(|err: JsonRejection| {
+                    // A body that crosses the payload limit is a size error,
+                    // not a client JSON error: a declared Content-Length over
+                    // the limit is already refused with 413 before the body,
+                    // and a chunked upload must get the same answer the moment
+                    // it crosses the limit (reading stops there; the frames
+                    // after it are never pulled in).
+                    if let JsonRejection::BytesRejection(BytesRejection::FailedToBufferBody(
+                        FailedToBufferBody::LengthLimitError(_),
+                    )) = &err
+                    {
+                        return rejection(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request_body_too_large",
+                            "Request body exceeded the payload limit (max_payload_size)"
+                                .to_string(),
+                        );
+                    }
                     let error_message = match err {
                         JsonRejection::JsonDataError(e) => {
                             format!("Invalid JSON data: {e}")
@@ -90,18 +126,7 @@ where
                         }
                         _ => format!("Failed to parse JSON: {err}"),
                     };
-
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "error": {
-                                "message": error_message,
-                                "type": "invalid_request_error",
-                                "code": "json_parse_error"
-                            }
-                        })),
-                    )
-                        .into_response()
+                    rejection(StatusCode::BAD_REQUEST, "json_parse_error", error_message)
                 })?;
 
         prepare(&mut data)?;

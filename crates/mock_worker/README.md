@@ -192,7 +192,9 @@ engines do not expose:
   serving worker, prompt/cached tokens, queue wait and the **arrival-time
   oracle**: the most cached tokens any worker of the process held when the
   request arrived (the best a router could have obtained). Join on the
-  gateway's response `id`;
+  gateway's response `id`. `injected_failures` beside the records counts, per
+  worker, the requests the `fail` hook answered before admission (they left no
+  record) and the streams it cut;
 - `GET /admin/cache/{worker}` — the worker's cached block keys;
 - `POST /admin/reset[/{worker}]` — clear caches and publish `AllBlocksCleared`
   (an engine restart, to the index).
@@ -206,19 +208,26 @@ but cannot drive event-driven `cache_aware`, which requires token ids.)
 ### Fault hooks
 
 All under the admin API; `{worker}` is a worker name (`grpc:<port>`,
-`zmq:<index>`) or `all`. A hook applies to every KV-event transport of the
-worker (gRPC `SubscribeKvEvents` and the ZMQ publisher alike) and answers with
-the worker's hook state (`drop_pending`, `dropped_total`, `delay_ms`,
-`paused`, `generation`, `restarts`).
+`http:<port>`, `zmq:<index>`) or `all`. A hook applies to every KV-event
+transport of the worker (gRPC `SubscribeKvEvents` and the ZMQ publisher alike)
+and answers with the worker's hook state (`drop_pending`, `dropped_total`,
+`delay_ms`, `admit_delay_ms`, `admit_per_sec`, `paused`, `generation`,
+`restarts`, and the request fault's `fail_status`, `fail_pending`,
+`fail_secs_left`, `fail_after_tokens`, `fail_stall_ms`, `failed_total`,
+`cut_total`, `stalled_total`). The hooks need `--engine realistic`: the canned
+path has no engine to hook.
 
 | Hook | Effect |
 |------|--------|
 | `POST /admin/fault/{worker}/drop?batches=N` | the next N event batches are not published (lost on the wire; they stay in the replay buffer, so a gap replay recovers them) |
 | `POST /admin/fault/{worker}/delay?ms=D` | every batch is published D ms after its pass ends (0 clears) |
+| `POST /admin/fault/{worker}/admit-delay?ms=D` | every new gRPC request is held D ms before the engine sees it (0 clears): the gateway has dispatched it, the load record does not count it yet, as a backlog in transit between the two would behave |
+| `POST /admin/fault/{worker}/admit-rate?per_sec=R` | at most R new gRPC requests per second enter the engine (0 clears); the rest wait their turn, unseen by the load record: a throttled input path whose backlog grows while the gateway keeps sending |
 | `POST /admin/fault/{worker}/restart-publisher` | the publisher restarts: gRPC sequence numbers start over at 1 and the ZMQ sequence at 0, the replay buffers are emptied, the cache is kept (no `AllBlocksCleared`); `generation` increments |
 | `POST /admin/fault/{worker}/pause` | the engine freezes after its current pass: no passes, no tokens, no events; requests queue (and count as waiting); health and `GetLoads` keep answering |
 | `POST /admin/fault/{worker}/resume` | the engine runs again |
-| `GET /admin/fault/{worker}` | the hooks' current state (pending drops, delay, restarts, paused, generation) |
+| `POST /admin/fault/{worker}/fail?status=S[&count=N\|&secs=T][&after_tokens=K][&stall_ms=M]` | the worker answers status S (400-599) instead of serving: the next N requests, every request for T seconds, or every request until cleared; an HTTP worker answers the status with `{"error": {"message": "injected", "type": "fault"}}`, a gRPC worker the status code the gateway maps back to it (429 `resource_exhausted`, 500 `internal`, 502/503 `unavailable`, 504 `deadline_exceeded`). Before admission, so the request never counts as served and leaves no record. With `after_tokens=K` the request is admitted and served for K tokens, then the stream is cut with S (the gRPC trailer; an HTTP body that ends without its finish frame): the non-retryable case, for a duplication check (a non-streaming HTTP request is answered with S after K tokens instead, which the gateway may retry: the duplicated-work case). On the gRPC worker 408 reads back at the gateway as 504 and 502 as 503 (both retryable), any other 4xx as 400. `stall_ms=M` holds the request M ms first; `status=0&stall_ms=M` stalls and then serves. `status=0` alone clears |
+| `GET /admin/fault/{worker}` | the hooks' current state (pending drops, delay, restarts, paused, generation, the request fault and its counts) |
 | `POST /admin/reset/{worker}` | (already there) clear the cache and publish `AllBlocksCleared` |
 
 ### Truth endpoints
@@ -226,7 +235,29 @@ the worker's hook state (`drop_pending`, `dropped_total`, `delay_ms`,
 | Endpoint | Answer |
 |----------|--------|
 | `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `block_size` (the engine's own prefix match, last-block rule included) |
-| `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, so a gateway's hit-rate claim can be checked against what the engines actually served |
+| `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
+
+A circuit-breaker or retry drill arms `fail` on one worker (`status=503&count=N`
+for exactly N failures inside the breaker's window, `secs=T` for a worker that
+stays up but failing), sends requests through the gateway and reads
+`failed_total` against the gateway's retry and breaker metrics; a retried
+request that reached a worker shows in `/admin/requests` once per admission,
+so `requests` there against `injected_failures` tells retried attempts from
+duplicated work.
+
+## Long prompts
+
+A gRPC worker decodes and encodes messages of any size by default, as the
+engine servicers do. `--grpc-max-message-bytes <n>` sets a limit; tonic's own
+default, 4 MiB, refused the `Generate` of a million-token prompt (its ids
+alone are about 2 MB as varints, and a gateway that sends the prompt text
+alongside adds the text's bytes on top). What bounds a long prompt end to end
+on the gateway's gRPC path: the gateway's HTTP body limit
+(`--max-payload-size`, 512 MiB by default), the context length the worker
+advertises (`--context-length`), and the worker's decode limit. The gateway
+sends `Generate` with no size limit of its own and decodes each response
+message up to tonic's 4 MiB default, which a streamed chunk never approaches.
+
 ## Capturing requests
 
 `--capture PATH` appends every gRPC `Generate` request a worker receives to
@@ -298,12 +329,23 @@ scores routing quality end to end.
 
 - Every `hash_id` becomes a deterministic text block (`--words-per-block`, 480
   words, about one token each), so rows that share ids share prompt prefixes
-  after the gateway tokenizes them.
+  after the gateway tokenizes them. Calibrate the knob against the real
+  tokenizer once per model: replay a few hundred rows, fit
+  `prompt_tokens = a + b * blocks` over the successful rows of `requests.csv`
+  (`blocks = ceil(trace_input_length / 512)`; `a` is the chat template's
+  overhead, `b` the tokens one block really produced), then set
+  `--words-per-block` to `480 * 512 / b` so a block is 512 tokens again (a
+  tokenizer with a ~150k vocabulary gives `b` near 481, i.e. 511 words).
 - Requests are sent open-loop at `timestamp / --speedup` as streaming chat
   completions with `stream_options.include_usage`, recording TTFT, inter-token
-  latencies, end-to-end latency, the serving worker (`system_fingerprint`, which
-  the gateway sets from the worker's `weight_version` label), and the
-  engine-reported `cached_tokens`.
+  latencies (a thinking model's streamed `reasoning_content` counts as output
+  for both, and separately as `reasoning_tokens` in the CSV), end-to-end
+  latency, the serving worker (`system_fingerprint`, which the gateway sets
+  from the worker's `weight_version` label), and the engine-reported
+  `cached_tokens`.
+- `--chat-template-kwargs '{"enable_thinking":false}'` sends the object as
+  `chat_template_kwargs` in every request, the way to turn a model's default
+  reasoning off without touching the trace.
 - With `--admin <mock admin url>` each request is joined with the mock fleet's
   record of it (`GET /admin/requests`), adding the arrival-time oracle (the most
   cached tokens any worker held when it arrived) and the queue wait.

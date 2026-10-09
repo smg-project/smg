@@ -1360,6 +1360,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
     let l0_only_config = CacheConfig {
         enable_l0: true,
         l0_max_entries: 10_000,
+        l0_max_memory: usize::MAX,
         enable_l1: false,
         l1_max_memory: 0,
     };
@@ -1410,6 +1411,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
     let l0_l1_config = CacheConfig {
         enable_l0: true,
         l0_max_entries: 10_000,
+        l0_max_memory: usize::MAX,
         enable_l1: true,
         l1_max_memory: 50 * 1024 * 1024,
     };
@@ -1499,6 +1501,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
     let l1_only_config = CacheConfig {
         enable_l0: false,
         l0_max_entries: 0,
+        l0_max_memory: usize::MAX,
         enable_l1: true,
         l1_max_memory: 50 * 1024 * 1024,
     };

@@ -276,6 +276,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_stale_secs(mut self, secs: u64) -> Self {
+        self.config.worker_stale_secs = secs;
+        self
+    }
+
     pub fn worker_warmup(
         mut self,
         secs: u64,
@@ -409,8 +414,9 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Remove the in-flight bound entirely (`max_concurrent_requests = 0`).
     pub fn disable_rate_limiting(mut self) -> Self {
-        self.config.max_concurrent_requests = -1;
+        self.config.max_concurrent_requests = 0;
         self
     }
 
@@ -727,6 +733,11 @@ impl RouterConfigBuilder {
     pub fn enable_l0_cache(mut self, max_entries: usize) -> Self {
         self.config.tokenizer_cache.enable_l0 = true;
         self.config.tokenizer_cache.l0_max_entries = max_entries;
+        self
+    }
+
+    pub fn l0_cache_max_memory(mut self, max_memory: usize) -> Self {
+        self.config.tokenizer_cache.l0_max_memory = max_memory;
         self
     }
 
