@@ -987,8 +987,10 @@ struct CliArgs {
     #[arg(long, help_heading = "Tenant Rate Limit")]
     tenant_rate_limit_config: Option<String>,
 
-    /// Token bucket refill rate (tokens per second). Unset or 0 = no refill:
-    /// --max-concurrent-requests bounds standing concurrency alone.
+    /// Sustained admission rate in requests per second, bursting up to
+    /// --max-concurrent-requests, which keeps bounding standing concurrency
+    /// (a completed request frees its slot, not rate budget). Unset or 0 =
+    /// no rate limit: --max-concurrent-requests bounds concurrency alone.
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 

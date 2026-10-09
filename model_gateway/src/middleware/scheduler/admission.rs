@@ -112,12 +112,13 @@ pub async fn priority_admission_middleware(
         sched_metrics::record_clamp(resolved.requested, class, tenant.as_str());
     }
 
-    // RPS sibling check (only set when an explicit per-second limit is
-    // configured). Checked before admission so a rejected request never
-    // consumes a slot. Tokens are not returned — refill is time-based.
-    // Tracked by smg_http_rate_limit_total, so not double-counted here.
+    // Per-second check (only set when an explicit rate is configured),
+    // run before admission so a rejected request never consumes a slot.
+    // `try_take` spends rate budget without a concurrency slot: the
+    // scheduler owns concurrency. Tracked by smg_http_rate_limit_total, so
+    // not double-counted here.
     if let Some(bucket) = &state.rate_limiter {
-        if bucket.try_acquire(1.0).is_err() {
+        if bucket.try_take(1.0).is_err() {
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             return SchedulerError::QueueFull.into_response();
         }

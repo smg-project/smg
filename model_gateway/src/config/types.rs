@@ -288,8 +288,9 @@ pub struct RouterConfig {
     /// `None` applies the built-in default when admission is enabled.
     #[serde(default)]
     pub prefill_queue_timeout_secs: Option<u64>,
-    /// Unset or 0 = no refill: `max_concurrent_requests` bounds standing
-    /// concurrency alone.
+    /// Sustained admission rate (requests per second), bursting up to
+    /// `max_concurrent_requests`, which keeps bounding standing concurrency.
+    /// Unset or 0 = no rate limit.
     pub rate_limit_tokens_per_second: Option<i32>,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior

@@ -129,7 +129,8 @@ class RouterArgs:
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). Unset or 0 = no refill
+    # Sustained admission rate (requests per second), bursting up to
+    # max_concurrent_requests. Unset or 0 = no rate limit
     rate_limit_tokens_per_second: int | None = None
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
@@ -1441,9 +1442,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
             help=(
-                "Token bucket refill rate (tokens per second). Unset or 0 ="
-                " no refill: --max-concurrent-requests bounds standing"
-                " concurrency alone."
+                "Sustained admission rate in requests per second, bursting up"
+                " to --max-concurrent-requests, which keeps bounding standing"
+                " concurrency. Unset or 0 = no rate limit."
             ),
         )
 
