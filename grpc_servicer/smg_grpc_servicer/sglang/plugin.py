@@ -45,11 +45,13 @@ def parsed_flag() -> str | None:
     return _state.parsed
 
 
-class _ServicerImplAction(argparse.Action):
-    """Stores the choice on the namespace, as this process's launcher flag
-    and in the environment: SGLang's ``ServerArgs`` keeps only its own
+class _ServicerImplAction(argparse._StoreAction):  # noqa: SLF001 — SGLang's --config merger admits store actions only
+    """A store action that also keeps the choice as this process's launcher
+    flag and in the environment: SGLang's ``ServerArgs`` keeps only its own
     fields, so the namespace value does not survive the parse, and the
-    environment is what the headless scheduler child inherits."""
+    environment is what the headless scheduler child inherits. It derives
+    from argparse's store action because SGLang's ``--config`` merger takes
+    only store and store_true options from the YAML file."""
 
     def __call__(
         self,
@@ -58,17 +60,21 @@ class _ServicerImplAction(argparse.Action):
         values: Any,
         option_string: str | None = None,
     ) -> None:
-        setattr(namespace, self.dest, values)
+        super().__call__(parser, namespace, values, option_string)
         _state.parsed = values
         os.environ[SERVICER_IMPL_ENV] = values
 
 
 def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     """Add ``--servicer-impl`` to a parser that lacks it; returns whether it
-    was added."""
+    was added. A new parser is a new parse (SGLang builds one per
+    ``prepare_server_args``): the choice an earlier parser in this process
+    remembered is dropped, so a parse without the flag falls through to the
+    environment."""
     actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
     if SERVICER_IMPL_FLAG in actions:
         return False
+    _state.parsed = None
     parser.add_argument(
         SERVICER_IMPL_FLAG,
         dest="servicer_impl",

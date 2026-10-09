@@ -157,6 +157,31 @@ def test_plugin_adds_the_servicer_impl_flag_to_sglangs_parser(monkeypatch, no_pa
     assert rust.servicer_impl_source(SimpleNamespace(), environ={}) == ("rust", "flag")
 
 
+def test_the_flag_is_a_store_action_and_a_new_parser_forgets_the_last_choice(
+    monkeypatch, no_parsed_flag
+):
+    """SGLang's --config merger takes only store and store_true options from
+    the YAML file, so `servicer-impl: rust` there must find a store action;
+    and a new parser is a new parse, which drops the choice an earlier parser
+    in this process made."""
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
+    parser = argparse.ArgumentParser(prog="sglang serve")
+    plugin.add_servicer_impl_argument(parser)
+    action = parser._option_string_actions[plugin.SERVICER_IMPL_FLAG]  # noqa: SLF001
+    assert isinstance(action, argparse._StoreAction)  # noqa: SLF001
+    assert parser.parse_args(["--servicer-impl", "rust"]).servicer_impl == "rust"
+    assert plugin.parsed_flag() == "rust"
+    # The next parser SGLang builds in this process starts without it: a parse
+    # without the flag falls through to the environment.
+    fresh = argparse.ArgumentParser(prog="sglang serve")
+    assert plugin.add_servicer_impl_argument(fresh) is True
+    assert plugin.parsed_flag() is None
+    assert fresh.parse_args([]).servicer_impl is None
+    assert rust.servicer_impl_source(
+        SimpleNamespace(), environ={"SMG_SGLANG_SERVICER_IMPL": "python"}
+    ) == ("python", "env")
+
+
 def test_plugin_hooks_sglangs_parser_builder(monkeypatch, no_parsed_flag):
     """SGLang runs the plugin before it parses: the hook on
     ``ServerArgs.add_cli_args`` adds the flag to the parser it filled,
