@@ -3,9 +3,13 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{borrow::Cow, collections::HashMap, fs, io};
+use std::{borrow::Cow, collections::HashMap, fs, io, sync::OnceLock};
 
 use anyhow::{anyhow, Result};
+use chrono::{
+    format::{strftime::StrftimeItems, Item},
+    DateTime, FixedOffset, Local, TimeZone,
+};
 use minijinja::{
     context,
     machinery::{
@@ -520,6 +524,10 @@ pub struct ChatTemplateParams<'a> {
     /// this value as a default. An explicit `template_kwargs` entry for that
     /// key still wins.
     pub thinking: Option<bool>,
+    /// The instant the template's `strftime_now` writes, for a render that
+    /// must come out the same each time; `None` is the clock (see
+    /// [`render_instant`]).
+    pub now: Option<DateTime<FixedOffset>>,
 }
 
 /// JSON separator pair passed through HuggingFace's `tojson` filter.
@@ -981,6 +989,44 @@ fn special_token_value(token: Option<&str>) -> Value {
     token.map_or(Value::UNDEFINED, Value::from)
 }
 
+/// transformers' `strftime_now(format)`: `now` written with the strftime
+/// `format`, as `datetime.now().strftime(format)` writes the local time.
+fn strftime(
+    now: &DateTime<FixedOffset>,
+    format: &str,
+) -> std::result::Result<String, MinijinjaError> {
+    let items: Vec<Item<'_>> = StrftimeItems::new(format).collect();
+    if items.contains(&Item::Error) {
+        return Err(MinijinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("strftime_now: {format:?} is not a valid strftime format"),
+        ));
+    }
+    Ok(now.format_with_items(items.iter()).to_string())
+}
+
+/// The instant `strftime_now` writes when the render names none: the local
+/// time now, as transformers' `datetime.now()`; or, when the environment sets
+/// `SOURCE_DATE_EPOCH` (seconds since the Unix epoch, the reproducible-builds
+/// convention), that instant in local time, read once, so a prompt that writes
+/// the date can be reproduced on another day.
+fn render_instant() -> DateTime<FixedOffset> {
+    static SOURCE_DATE_EPOCH: OnceLock<Option<DateTime<FixedOffset>>> = OnceLock::new();
+    SOURCE_DATE_EPOCH
+        .get_or_init(|| {
+            let seconds = std::env::var("SOURCE_DATE_EPOCH")
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            Local
+                .timestamp_opt(seconds, 0)
+                .single()
+                .map(|instant| instant.fixed_offset())
+        })
+        .unwrap_or_else(|| Local::now().fixed_offset())
+}
+
 fn render_chat_template(
     env: &Environment<'_>,
     messages: &[serde_json::Value],
@@ -989,6 +1035,11 @@ fn render_chat_template(
     let tmpl = env
         .get_template("chat")
         .map_err(|e| anyhow!("Failed to get template: {e}"))?;
+
+    // transformers adds `strftime_now` to the template environment; here it is
+    // a callable of the render context, bound to the render's instant.
+    let now = params.now.unwrap_or_else(render_instant);
+    let strftime_now = Value::from_function(move |format: String| strftime(&now, &format));
 
     // Convert messages to minijinja::Value (messages already processed by router)
     let minijinja_messages: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
@@ -1017,6 +1068,7 @@ fn render_chat_template(
     let base_context = context! {
         messages => &minijinja_messages,
         add_generation_prompt => params.add_generation_prompt,
+        strftime_now => strftime_now,
         tools => tools_value,
         documents => documents_value,
         bos_token => bos_value,
@@ -1326,6 +1378,40 @@ mod tests {
             plain_generation_blocks("{% if add_generation_prompt %}a{% endif %}"),
             Cow::Borrowed(_)
         ));
+    }
+
+    /// transformers' `strftime_now(format)`: the render's instant written with
+    /// the format; a template may guard it with `is defined`; a render that
+    /// names no instant writes today; an invalid format is an error.
+    #[test]
+    fn strftime_now_writes_the_render_instant() {
+        let template = "{%- if strftime_now is defined -%}Current date: \
+                        {{ strftime_now('%Y-%m-%d') }}. {{ strftime_now('%H:%M') }}{%- endif -%}";
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages: [serde_json::Value; 0] = [];
+        let now = DateTime::parse_from_rfc3339("2026-10-07T09:30:00+02:00").unwrap();
+        let params = ChatTemplateParams {
+            now: Some(now),
+            ..Default::default()
+        };
+        let rendered = processor.apply_chat_template(&messages, params).unwrap();
+        assert_eq!(rendered, "Current date: 2026-10-07. 09:30");
+
+        let today = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            today.len(),
+            "Current date: 2026-10-07. 09:30".len(),
+            "{today}"
+        );
+
+        let invalid = ChatTemplateProcessor::new("{{ strftime_now('%Q') }}".to_string()).unwrap();
+        let error = invalid
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("strftime_now"), "{error}");
     }
 
     #[test]
