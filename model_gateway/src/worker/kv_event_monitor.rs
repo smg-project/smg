@@ -224,6 +224,19 @@ impl KvEventMonitor {
         }
     }
 
+    /// Zero a model's index-shape gauges once its index is dropped. The
+    /// periodic publication only sees the indexes that exist, and a series
+    /// keeps its last value, so without this the gauges would report the
+    /// last worker's blocks for as long as no worker of the model joins
+    /// again (an engine replaced behind a one-engine gateway, a model scaled
+    /// to zero).
+    fn publish_dropped_index(model_id: &str, kind: KvIndexKind) {
+        Metrics::set_kv_index_size(model_id, 0, 0);
+        if kind == KvIndexKind::Chain {
+            Metrics::set_kv_index_chain_stats(model_id, &kv_index::ChainIndexStats::default());
+        }
+    }
+
     /// Start the periodic index-shape publication. Like the prune task, it
     /// shares only the indexer map, never the monitor, and stops when the
     /// monitor drops.
@@ -343,6 +356,7 @@ impl KvEventMonitor {
         let slots = Arc::clone(&self.worker_handles);
         let indexers = Arc::clone(&self.indexers);
         let model_block_sizes = Arc::clone(&self.block_sizes);
+        let kind = self.kind;
 
         #[expect(
             clippy::disallowed_methods,
@@ -383,6 +397,7 @@ impl KvEventMonitor {
                 &slots,
                 &indexers,
                 &model_block_sizes,
+                kind,
                 &task_url,
                 id,
                 &task_model_id,
@@ -407,14 +422,16 @@ impl KvEventMonitor {
     /// The end of a removal, run by the subscription task once its blocks
     /// are out of the index: lift the URL's reservation if it is this task's
     /// (a later subscription under the URL has its own), and drop the
-    /// model's index with the model's last subscription. The task does this
-    /// rather than `on_worker_removed`, whose future a caller may drop
-    /// before the task has ended; a slot that is `Active` (the task ended on
-    /// its own, or `stop` took the subscription) is left as it is.
+    /// model's index with the model's last subscription, zeroing the gauges
+    /// that index fed. The task does this rather than `on_worker_removed`,
+    /// whose future a caller may drop before the task has ended; a slot that
+    /// is `Active` (the task ended on its own, or `stop` took the
+    /// subscription) is left as it is.
     async fn complete_removal(
         slots: &Mutex<HashMap<String, Slot>>,
         indexers: &DashMap<String, Arc<KvIndex>>,
         block_sizes: &DashMap<String, usize>,
+        kind: KvIndexKind,
         worker_url: &str,
         id: u64,
         model_id: &str,
@@ -434,6 +451,7 @@ impl KvEventMonitor {
         if last_of_model {
             indexers.remove(model_id);
             block_sizes.remove(model_id);
+            Self::publish_dropped_index(model_id, kind);
         }
     }
 
@@ -994,6 +1012,84 @@ mod tests {
             assert!(gauge(&handle, "smg_kv_index_arena_bytes", "chain").is_some_and(|b| b > 0.0));
             assert!(gauge(&handle, "smg_kv_index_slab_bytes", "chain").is_some_and(|b| b > 0.0));
             assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "pos"), None);
+        });
+    }
+
+    /// A model's index goes with its last subscription, and nothing publishes
+    /// the model's gauges after that: the removal itself zeroes them, or they
+    /// keep the removed worker's count until a worker of the model joins
+    /// again (an engine replaced behind a one-engine gateway).
+    #[test]
+    fn the_models_last_removal_zeroes_its_index_gauges() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn gauge(handle: &PrometheusHandle, name: &str, model: &str) -> Option<f64> {
+            let prefix = format!("{name}{{model=\"{model}\"}}");
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // The removal task publishes from the runtime's thread, which must
+        // be the one holding the local recorder.
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let monitor = Arc::new(KvEventMonitor::with_kind(KvIndexKind::Chain, None));
+                let worker = refusing_grpc_worker();
+                let url = worker.url().to_string();
+                monitor.on_worker_added(&worker).await;
+                let index = monitor
+                    .get_indexer(UNKNOWN_MODEL_ID)
+                    .expect("the model's index");
+                wait_until("the subscription interns its worker", || {
+                    index.worker_id(&url).is_some()
+                })
+                .await;
+                let worker_id = index.worker_id(&url).unwrap();
+                let blocks: Vec<StoredBlock> = (1..=3u64)
+                    .map(|i| StoredBlock {
+                        seq_hash: SequenceHash(i),
+                        content_hash: ContentHash(100 + i),
+                    })
+                    .collect();
+                index
+                    .apply_stored(worker_id, &blocks, None, &mut WorkerBlocks::default())
+                    .unwrap();
+                KvEventMonitor::publish_stats(&monitor.indexers);
+                assert_eq!(
+                    gauge(&handle, "smg_kv_index_memberships", UNKNOWN_MODEL_ID),
+                    Some(3.0)
+                );
+                assert_eq!(
+                    gauge(&handle, "smg_kv_index_blocks_live", UNKNOWN_MODEL_ID),
+                    Some(3.0)
+                );
+
+                monitor.on_worker_removed(&url).await;
+                assert!(
+                    monitor.get_indexer(UNKNOWN_MODEL_ID).is_none(),
+                    "the model's last worker takes its index with it"
+                );
+                for name in [
+                    "smg_kv_index_memberships",
+                    "smg_kv_index_entries",
+                    "smg_kv_index_blocks_live",
+                    "smg_kv_index_runs_live",
+                    "smg_kv_index_arena_bytes",
+                    "smg_kv_index_slab_bytes",
+                ] {
+                    assert_eq!(gauge(&handle, name, UNKNOWN_MODEL_ID), Some(0.0), "{name}");
+                }
+            });
         });
     }
 
