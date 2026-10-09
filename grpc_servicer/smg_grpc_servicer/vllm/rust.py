@@ -239,19 +239,41 @@ def engine_item_limits(model_config) -> dict[str, int] | None:
     return {modality: int(get_limit(modality)) for modality in FETCHABLE_MODALITIES}
 
 
-def video_frame_budget(model_config) -> int | None:
+def video_frame_budget(model_config, environ: Mapping[str, str] | None = None) -> int | None:
     """The number of frames the engine's own loader samples a video to: its
     ``--media-io-kwargs`` ``video.num_frames`` when set (``0`` for a non-positive
-    count, which vLLM reads as every frame), else the loader's default; ``None``
-    when neither is known, which leaves the pipeline's spec to its own constant."""
-    from smg_grpc_servicer.vllm.mm_processor import vllm_default_video_frames
+    count, which vLLM reads as every frame), else the loader's default, under
+    the same ``SMG_VLLM_MM_MAX_VIDEO_FRAMES`` cap the other processors apply
+    (``clamp_video_frames``); ``None`` when neither is known, which leaves the
+    pipeline's spec to its own constant. A ``video_backend`` in the kwargs
+    selects a loader with its own sampling rule, which the pipeline cannot
+    follow: refused, like any other knob the pipeline has no field for."""
+    from smg_grpc_servicer.vllm.mm_processor import (
+        DEFAULT_MAX_VIDEO_FRAMES,
+        ENV_MAX_VIDEO_FRAMES,
+        clamp_video_frames,
+        env_int,
+        vllm_default_video_frames,
+    )
 
+    source = os.environ if environ is None else environ
     mm_config = getattr(model_config, "multimodal_config", None)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
-    video = kwargs.get("video") if isinstance(kwargs, Mapping) else None
+    if not isinstance(kwargs, Mapping):
+        kwargs = {}
+    video = kwargs.get("video")
+    if isinstance(video, Mapping) and video.get("video_backend") is not None:
+        raise ValueError(
+            "--media-io-kwargs video.video_backend selects a loader whose sampling the smg "
+            "media pipeline cannot follow; drop it or use --mm-processor inprocess or redis"
+        )
+    default = vllm_default_video_frames()
+    max_frames = env_int(source, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0)
+    capped = clamp_video_frames(kwargs, max_frames, default) or {}
+    video = capped.get("video") if isinstance(capped, Mapping) else None
     num_frames = video.get("num_frames") if isinstance(video, Mapping) else None
     if num_frames is None:
-        num_frames = vllm_default_video_frames()
+        num_frames = default
     if num_frames is None:
         return None
     return max(int(num_frames), 0)

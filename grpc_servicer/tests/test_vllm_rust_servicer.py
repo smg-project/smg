@@ -449,14 +449,30 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
         "video": 2,
     }
     # The engine's video frame budget rides along: its media kwargs when set
-    # (a non-positive count meaning every frame), else the loader's default.
+    # (a non-positive count meaning every frame), else the loader's default,
+    # under the same SMG_VLLM_MM_MAX_VIDEO_FRAMES cap as the other processors.
     monkeypatch.setattr(mm_processor, "vllm_default_video_frames", lambda: 32)
+    monkeypatch.setenv(mm_processor.ENV_MAX_VIDEO_FRAMES, "0")  # no cap
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 32
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"num_frames": 16}}
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 16
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"num_frames": -1}}
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 0
+    # The cap bounds a set count, the loader's default and an unbounded count alike.
+    monkeypatch.setenv(mm_processor.ENV_MAX_VIDEO_FRAMES, "8")
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"num_frames": 16}}
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"num_frames": 4}}
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 4
     config.model_config.multimodal_config.media_io_kwargs = {}
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    # A loader of its own (video_backend) samples by rules the pipeline cannot follow: refused.
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "x"}}
+    with pytest.raises(ValueError, match="video_backend"):
+        rust.smg_media_options(config, settings, str(tmp_path))
+    config.model_config.multimodal_config.media_io_kwargs = {}
+    monkeypatch.delenv(mm_processor.ENV_MAX_VIDEO_FRAMES, raising=False)
     # A local model directory with its config is the pipeline's config source.
     (tmp_path / "config.json").write_text("{}")
     config.model_config.model = str(tmp_path)
