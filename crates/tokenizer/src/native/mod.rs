@@ -33,10 +33,13 @@ use std::{
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 use tokenizers::{models::ModelWrapper, Model, Tokenizer as HfTokenizer};
-use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+use unicode_normalization::{
+    char::canonical_combining_class, is_nfc_quick, IsNormalized, UnicodeNormalization,
+};
 
 mod pattern;
 mod unicode;
@@ -53,6 +56,11 @@ const BYTE_LEVEL_PATTERN: &str =
 const CACHED_PIECE_MAX_BYTES: usize = 64;
 /// Entries per encoder in a thread's piece cache before it is cleared.
 const PIECE_CACHE_CAPACITY: usize = 16_384;
+/// Texts at least this long (between added tokens) are encoded across the
+/// thread pool; shorter ones are not worth the hand-off.
+const PARALLEL_MIN_BYTES: usize = 128 * 1024;
+/// The least a parallel chunk gets, so threads do not fight over scraps.
+const PARALLEL_CHUNK_MIN_BYTES: usize = 64 * 1024;
 
 static NEXT_ENCODER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -134,7 +142,7 @@ impl AddedTokens {
 
     /// Calls `f` with each segment in order: an added token's id, or a text
     /// span between added tokens.
-    fn split<'t>(&self, text: &'t str, mut f: impl FnMut(Segment<'t>)) {
+    fn split<'t>(&self, text: &'t str, f: &mut dyn FnMut(Segment<'t>)) {
         let mut cursor = 0;
         for found in self.automaton.find_iter(text) {
             if cursor < found.start() {
@@ -151,6 +159,14 @@ impl AddedTokens {
 
 enum Segment<'t> {
     Text(&'t str),
+    Added(u32),
+}
+
+/// One unit of the parallel path's tokenization: a first-stage piece of the
+/// text, by byte range, or an added token's id.
+#[derive(Clone, Copy)]
+enum Item {
+    Piece(usize, usize),
     Added(u32),
 }
 
@@ -294,34 +310,229 @@ impl NativeEncoder {
     /// normalizer, or a piece the model would not tokenize (so that the
     /// error surfaces from there).
     pub(crate) fn encode(&self, model: &ModelWrapper, text: &str) -> Option<Vec<u32>> {
-        if self.normalizer == Normalizer::Nfc && is_nfc_quick(text.chars()) != IsNormalized::Yes {
+        if self.normalizer == Normalizer::Nfc && !is_nfc(text) {
             return None;
         }
+        let threads = rayon::current_num_threads();
+        if text.len() >= PARALLEL_MIN_BYTES && !self.stages.is_empty() && threads > 1 {
+            let chunk = (text.len() / threads).max(PARALLEL_CHUNK_MIN_BYTES);
+            return self.encode_parallel(model, text, chunk);
+        }
         let mut ids = Vec::with_capacity(text.len() / 3 + 8);
-        let mut mapped = String::new();
-        let mut failed = false;
-        let mut tokenize = |segment: &str, ids: &mut Vec<u32>| {
-            self.pieces(0, segment, &mut |piece| {
-                if !self.tokenize_piece(model, piece, &mut mapped, ids) {
-                    failed = true;
-                }
-            });
-        };
-        let mut after_raw = |segment: Segment<'_>, ids: &mut Vec<u32>| match segment {
+        let mut scratch = String::new();
+        let mut ok = true;
+        self.split_added(text, &mut |segment| match segment {
             Segment::Added(id) => ids.push(id),
-            Segment::Text(text) => match &self.normalized_added {
-                Some(added) => added.split(text, |inner| match inner {
-                    Segment::Added(id) => ids.push(id),
-                    Segment::Text(text) => tokenize(text, ids),
-                }),
-                None => tokenize(text, ids),
-            },
+            Segment::Text(segment) => {
+                if ok && !self.encode_text(model, segment, &mut scratch, &mut ids) {
+                    ok = false;
+                }
+            }
+        });
+        ok.then_some(ids)
+    }
+
+    /// [`Self::encode`] through the parallel path in chunks of about `chunk`
+    /// bytes, whatever the text's length.
+    #[cfg(test)]
+    fn encode_with_chunk(
+        &self,
+        model: &ModelWrapper,
+        text: &str,
+        chunk: usize,
+    ) -> Option<Vec<u32>> {
+        if self.normalizer == Normalizer::Nfc && !is_nfc_chunked(text, chunk) {
+            return None;
+        }
+        if self.stages.is_empty() {
+            return self.encode(model, text);
+        }
+        self.encode_parallel(model, text, chunk)
+    }
+
+    /// Calls `f` with each added-token id and each text span between them,
+    /// in order: the non-normalized set is matched on the raw text, the
+    /// normalized set on what is left.
+    fn split_added<'t>(&self, text: &'t str, f: &mut dyn FnMut(Segment<'t>)) {
+        let mut after_raw = |segment: Segment<'t>| match (&segment, &self.normalized_added) {
+            (Segment::Text(text), Some(added)) => added.split(text, &mut *f),
+            _ => f(segment),
         };
         match &self.raw_added {
-            Some(added) => added.split(text, |segment| after_raw(segment, &mut ids)),
-            None => after_raw(Segment::Text(text), &mut ids),
+            Some(added) => added.split(text, &mut after_raw),
+            None => after_raw(Segment::Text(text)),
         }
-        (!failed).then_some(ids)
+    }
+
+    /// Appends the ids of one text span (no added tokens inside); `false`
+    /// when the model declined a piece.
+    fn encode_text(
+        &self,
+        model: &ModelWrapper,
+        text: &str,
+        scratch: &mut String,
+        ids: &mut Vec<u32>,
+    ) -> bool {
+        let mut ok = true;
+        self.pieces(0, text, &mut |piece| {
+            if ok && !self.tokenize_piece(model, piece, scratch, ids) {
+                ok = false;
+            }
+        });
+        ok
+    }
+
+    /// The long-prompt path. The text spans between added tokens are scanned
+    /// by the first `Split` in parallel, a span longer than `chunk` in chunks
+    /// of about that size: a chunk's pieces are exact except where its scan
+    /// touched the chunk's end, so at every seam the span is rescanned
+    /// serially from the start of the left chunk's last piece until that scan
+    /// lands on a piece end the right chunk's scan also produced, from where
+    /// the two agree (a scan is a function of the text from a piece end on).
+    /// The pieces, now exactly the serial ones, and the added tokens between
+    /// them are then tokenized in parallel batches, each through its thread's
+    /// piece cache.
+    fn encode_parallel(&self, model: &ModelWrapper, text: &str, chunk: usize) -> Option<Vec<u32>> {
+        let mut segments = Vec::new();
+        self.split_added(text, &mut |segment| segments.push(segment));
+        let base = text.as_ptr() as usize;
+        let per_segment: Vec<Vec<(usize, usize)>> = segments
+            .par_iter()
+            .map(|segment| match *segment {
+                Segment::Added(_) => Vec::new(),
+                Segment::Text(span) => {
+                    let start = span.as_ptr() as usize - base;
+                    let end = start + span.len();
+                    if span.len() > chunk {
+                        let bounds: Vec<usize> = chunk_bounds(span, chunk)
+                            .into_iter()
+                            .map(|offset| start + offset)
+                            .collect();
+                        let per_chunk: Vec<Vec<(usize, usize)>> = bounds
+                            .par_windows(2)
+                            .map(|window| {
+                                self.first_stage_pieces(text, window[0], window[1])
+                                    .collect()
+                            })
+                            .collect();
+                        self.splice(text, &bounds, per_chunk)
+                    } else {
+                        self.first_stage_pieces(text, start, end).collect()
+                    }
+                }
+            })
+            .collect();
+        let mut items: Vec<Item> = Vec::with_capacity(per_segment.iter().map(Vec::len).sum());
+        for (segment, pieces) in segments.iter().zip(per_segment) {
+            match *segment {
+                Segment::Added(id) => items.push(Item::Added(id)),
+                Segment::Text(_) => {
+                    items.extend(pieces.into_iter().map(|(s, e)| Item::Piece(s, e)));
+                }
+            }
+        }
+        let batch = (items.len() / (rayon::current_num_threads() * 4)).max(256);
+        let batches: Option<Vec<Vec<u32>>> = items
+            .par_chunks(batch)
+            .map(|batch| {
+                let mut out = Vec::with_capacity(batch.len() * 2);
+                let mut scratch = String::new();
+                let mut ok = true;
+                for item in batch {
+                    match *item {
+                        Item::Added(id) => out.push(id),
+                        Item::Piece(start, end) => {
+                            self.pieces(1, &text[start..end], &mut |piece| {
+                                if ok && !self.tokenize_piece(model, piece, &mut scratch, &mut out)
+                                {
+                                    ok = false;
+                                }
+                            });
+                            if !ok {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                Some(out)
+            })
+            .collect();
+        let batches = batches?;
+        let mut ids = Vec::with_capacity(batches.iter().map(Vec::len).sum());
+        for batch in batches {
+            ids.extend_from_slice(&batch);
+        }
+        Some(ids)
+    }
+
+    /// The first stage's pieces of `text[start..end]`, as absolute ranges,
+    /// produced one at a time.
+    fn first_stage_pieces<'t>(
+        &self,
+        text: &'t str,
+        start: usize,
+        end: usize,
+    ) -> FirstStagePieces<'_, 't> {
+        let stage = &self.stages[0];
+        FirstStagePieces {
+            matches: stage.pattern.find_iter(&text[start..end]),
+            keep_gaps: stage.keep_gaps,
+            base: start,
+            end,
+            cursor: start,
+            pending: None,
+            done: false,
+        }
+    }
+
+    /// Joins the chunks' first-stage pieces of one span into the serial
+    /// scan's pieces, rescanning across each seam as described on
+    /// [`Self::encode_parallel`]. `bounds` holds the chunk starts and the
+    /// span's end.
+    fn splice(
+        &self,
+        text: &str,
+        bounds: &[usize],
+        chunks: Vec<Vec<(usize, usize)>>,
+    ) -> Vec<(usize, usize)> {
+        let span_end = bounds[bounds.len() - 1];
+        let mut result: Vec<(usize, usize)> = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+        let mut chunks = chunks.into_iter().enumerate();
+        if let Some((_, first)) = chunks.next() {
+            result.extend(first);
+        }
+        'seams: while let Some((index, chunk)) = chunks.next() {
+            let seam = bounds[index];
+            // Everything before the start of the last piece so far is exact
+            // (the span's start always is): rescan from there.
+            let rescan_from = result.last().map_or(bounds[0], |&(start, _)| start);
+            result.truncate(result.partition_point(|&(_, end)| end <= rescan_from));
+            let mut current = chunk;
+            let mut current_end = bounds[index + 1];
+            for (s, e) in self.first_stage_pieces(text, rescan_from, span_end) {
+                result.push((s, e));
+                if e < seam {
+                    continue;
+                }
+                // The rescan may run past whole chunks; those are dropped.
+                while e > current_end {
+                    match chunks.next() {
+                        Some((next_index, next_chunk)) => {
+                            current = next_chunk;
+                            current_end = bounds[next_index + 1];
+                        }
+                        None => break 'seams,
+                    }
+                }
+                if let Ok(at) = current.binary_search_by_key(&e, |&(_, end)| end) {
+                    result.extend_from_slice(&current[at + 1..]);
+                    continue 'seams;
+                }
+            }
+            // The rescan reached the end of the span.
+            break;
+        }
+        result
     }
 
     /// Applies the stages from `depth` on to `text`, calling `f` with each
@@ -390,6 +601,102 @@ impl NativeEncoder {
         }
         true
     }
+}
+
+/// The pieces of one first-stage scan over a text span: its matches and,
+/// when the stage keeps them, the gaps between them.
+struct FirstStagePieces<'p, 't> {
+    matches: pattern::Matches<'p, 't>,
+    keep_gaps: bool,
+    base: usize,
+    end: usize,
+    cursor: usize,
+    pending: Option<(usize, usize)>,
+    done: bool,
+}
+
+impl Iterator for FirstStagePieces<'_, '_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        if let Some(piece) = self.pending.take() {
+            return Some(piece);
+        }
+        if self.done {
+            return None;
+        }
+        match self.matches.next() {
+            Some((s, e)) => {
+                let (s, e) = (self.base + s, self.base + e);
+                let gap = (self.keep_gaps && self.cursor < s).then_some((self.cursor, s));
+                self.cursor = e;
+                match gap {
+                    Some(gap) => {
+                        self.pending = Some((s, e));
+                        Some(gap)
+                    }
+                    None => Some((s, e)),
+                }
+            }
+            None => {
+                self.done = true;
+                let gap =
+                    (self.keep_gaps && self.cursor < self.end).then_some((self.cursor, self.end));
+                self.cursor = self.end;
+                gap
+            }
+        }
+    }
+}
+
+/// Chunk starts and the text end for a text split into pieces of about
+/// `chunk` bytes at character boundaries.
+fn chunk_bounds(text: &str, chunk: usize) -> Vec<usize> {
+    let mut bounds = vec![0usize];
+    let mut next = chunk;
+    while next < text.len() {
+        while !text.is_char_boundary(next) {
+            next += 1;
+        }
+        if next >= text.len() {
+            break;
+        }
+        bounds.push(next);
+        next += chunk;
+    }
+    bounds.push(text.len());
+    bounds
+}
+
+/// NFC quick check, over the thread pool for long texts.
+fn is_nfc(text: &str) -> bool {
+    if text.len() < PARALLEL_MIN_BYTES || rayon::current_num_threads() < 2 {
+        return is_nfc_quick(text.chars()) == IsNormalized::Yes;
+    }
+    let chunk = (text.len() / rayon::current_num_threads()).max(PARALLEL_CHUNK_MIN_BYTES);
+    is_nfc_chunked(text, chunk)
+}
+
+/// The quick check in chunks: every chunk must pass, and at each seam the
+/// canonical ordering must hold across it (a non-starter may not follow a
+/// character of higher combining class).
+fn is_nfc_chunked(text: &str, chunk: usize) -> bool {
+    let bounds = chunk_bounds(text, chunk);
+    let chunks_ok = bounds
+        .par_windows(2)
+        .all(|window| is_nfc_quick(text[window[0]..window[1]].chars()) == IsNormalized::Yes);
+    chunks_ok
+        && bounds[1..bounds.len() - 1].iter().all(|&seam| {
+            let before = text[..seam]
+                .chars()
+                .next_back()
+                .map_or(0, canonical_combining_class);
+            let after = text[seam..]
+                .chars()
+                .next()
+                .map_or(0, canonical_combining_class);
+            after == 0 || before <= after
+        })
 }
 
 impl Drop for NativeEncoder {
@@ -910,5 +1217,114 @@ mod tests {
             first,
             tokenizer.encode(text, false).expect("encode").get_ids()
         );
+    }
+
+    /// Long text with the shapes that stress chunk seams: runs of one
+    /// character class far longer than a chunk, whitespace runs with and
+    /// without newlines, CJK, marks, clitics, and added tokens.
+    fn long_text(state: &mut u64, added: &[&str]) -> String {
+        let mut text = random_text(state, 3000, added);
+        text.push_str(&"a".repeat(700));
+        text.push_str(&" ".repeat(500));
+        text.push('x');
+        text.push_str(&"\n".repeat(300));
+        text.push_str(&" \n".repeat(200));
+        text.push_str(&"中".repeat(400));
+        text.push_str(&"7".repeat(350));
+        text.push_str(&"ก\u{E31}".repeat(200));
+        text.push_str(&random_text(state, 3000, added));
+        text.push_str(&"-".repeat(300));
+        text.push('\n');
+        text.push_str(&random_text(state, 2000, added));
+        text
+    }
+
+    #[test]
+    fn the_parallel_path_gives_the_serial_ids_for_every_chunk_size() {
+        let mut state = 0x1357_9BDF_2468_ACE0u64;
+        for shape in shapes() {
+            let tokenizer = tokenizer_of(&shape, &mut state);
+            let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+            let added: Vec<&str> = shape
+                .special
+                .iter()
+                .copied()
+                .chain(shape.added.iter().map(|(s, _)| *s))
+                .collect();
+            for round in 0..3 {
+                let text = long_text(&mut state, &added);
+                let Some(serial) = native.encode(tokenizer.get_model(), &text) else {
+                    continue;
+                };
+                let reference = tokenizer
+                    .encode(text.as_str(), false)
+                    .expect("encode")
+                    .get_ids()
+                    .to_vec();
+                assert_eq!(serial, reference, "{} round {round}: serial", shape.name);
+                for chunk in [5usize, 17, 64, 333, 1000, 4096, 1 << 20] {
+                    let parallel = native
+                        .encode_with_chunk(tokenizer.get_model(), &text, chunk)
+                        .expect("same NFC verdict");
+                    assert_eq!(
+                        parallel, serial,
+                        "{} round {round}: chunk {chunk}",
+                        shape.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_prompt_takes_the_parallel_path_and_matches_tokenizers() {
+        let mut state = 0xFEDC_BA98_7654_3210u64;
+        let shape = &shapes()[0];
+        let tokenizer = tokenizer_of(shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let mut text = String::new();
+        while text.len() < 3 * PARALLEL_MIN_BYTES {
+            // Without the two pool characters that compose with a preceding
+            // base, so the text is in NFC and takes the native path.
+            text.extend(
+                long_text(&mut state, &["<|im_start|>", "<|im_end|>"])
+                    .chars()
+                    .filter(|c| !matches!(c, '\u{301}' | '\u{9BE}')),
+            );
+        }
+        assert_eq!(is_nfc_quick(text.chars()), IsNormalized::Yes);
+        let Some(ids) = native.encode(tokenizer.get_model(), &text) else {
+            panic!("the long prompt was declined");
+        };
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(ids, reference);
+    }
+
+    #[test]
+    fn the_chunked_nfc_check_agrees_with_the_whole_check() {
+        const MARKS: &[char] = &[
+            'a', 'e', 'o', '\u{301}', '\u{300}', '\u{323}', '\u{31B}', '\u{E9}', '\u{1EA1}', 'ก',
+            '\u{E31}', 'क', '\u{93E}', '\u{93C}', '\u{1100}', '\u{1161}', '\u{11A8}', ' ', '\n',
+            'x', '\u{FFFD}', '中',
+        ];
+        let mut state = 0x0BAD_CAFE_F00D_1234u64;
+        for _ in 0..3000 {
+            let len = 1 + (pseudo_random(&mut state) % 24) as usize;
+            let text: String = (0..len)
+                .map(|_| MARKS[(pseudo_random(&mut state) % MARKS.len() as u64) as usize])
+                .collect();
+            let whole = is_nfc_quick(text.chars()) == IsNormalized::Yes;
+            for chunk in [1usize, 2, 3, 5, 8, 64] {
+                assert_eq!(
+                    is_nfc_chunked(&text, chunk),
+                    whole,
+                    "{text:?} chunk {chunk}"
+                );
+            }
+        }
     }
 }
