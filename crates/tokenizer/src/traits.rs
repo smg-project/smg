@@ -87,7 +87,7 @@ pub trait Encoder: Send + Sync {
 /// Implementations own whatever they need (pending bytes, a decode window)
 /// and must produce, over a whole stream, the text [`Decoder::decode`] gives
 /// for all of its ids.
-pub trait IncrementalDecoder: Send {
+pub trait IncrementalDecoder: Send + Sync {
     /// Feed one token; returns the text that became final with it (empty when
     /// the token only extends a multi-byte character or is skipped).
     fn step(&mut self, token_id: TokenIdType) -> Result<String>;
