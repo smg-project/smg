@@ -453,6 +453,13 @@ message GetServerInfoResponse {
   // bound the router's PD admission gate claims decode rooms against and its
   // fleet capacity accounting sums; 0 when unknown leaves both as they were.
   int32 max_num_seqs = 20;
+
+  // The engine's own per-prompt media limits (vLLM's resolved
+  // `--limit-mm-per-prompt`) for the modalities a router request can carry,
+  // as sorted `<modality>=<count>` pairs: "image=8,video=2". Empty when the
+  // engine has none (a text model). Flattened into the `mm_item_limits`
+  // worker label, which the router's own media pipeline holds requests to.
+  string mm_item_limits = 21;
 }
 
 // =====================

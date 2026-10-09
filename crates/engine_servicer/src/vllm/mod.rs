@@ -125,6 +125,10 @@ pub struct VllmModelInfo {
     /// `mm_device_do_normalize`, where the model supports it): advertised so
     /// the Router sends such an engine the pixels' own bytes.
     pub mm_device_do_normalize: bool,
+    /// The engine's per-prompt media limits (vLLM's `--limit-mm-per-prompt`)
+    /// as the `mm_item_limits` label the Router's media pipeline holds
+    /// requests to (`image=8,video=2`); empty when the engine has none.
+    pub mm_item_limits: String,
     /// The scheduler's running window (`--max-num-seqs`) as the launcher read
     /// it: how many requests the engine runs at once, which `GetServerInfo`
     /// advertises as the bound the Router's PD admission gate claims decode

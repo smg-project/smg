@@ -2639,6 +2639,34 @@ async fn server_info_advertises_device_side_normalization() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The engine's per-prompt media limits are a fact of its config, advertised
+/// whatever processes media so the Router's own pipeline holds requests to
+/// them; an engine without them (a text model) advertises none.
+#[tokio::test]
+async fn server_info_advertises_the_engines_item_limits() {
+    let mut model = model_info();
+    model.mm_item_limits = "image=8,video=2".to_string();
+    let mut h = harness_with(model, None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_item_limits, "image=8,video=2");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let mut h = harness_with(model_info(), None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_item_limits, "");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `GetServerInfo` advertises the processor only while it answers its probe
 /// and the engine takes multimodal input, as the Python servicer does.
 #[tokio::test]

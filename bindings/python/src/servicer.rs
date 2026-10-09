@@ -600,6 +600,7 @@ impl PyVllmGrpcServer {
         pooler_use_activation = None,
         pooler_dimensions = None,
         mm_device_do_normalize = false,
+        mm_item_limits = String::new(),
         max_num_seqs = 0,
         media_processor = None,
         smg_media_processor = None,
@@ -644,6 +645,7 @@ impl PyVllmGrpcServer {
         pooler_use_activation: Option<bool>,
         pooler_dimensions: Option<u32>,
         mm_device_do_normalize: bool,
+        mm_item_limits: String,
         max_num_seqs: i32,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
@@ -695,6 +697,7 @@ impl PyVllmGrpcServer {
             pooler_use_activation,
             pooler_dimensions,
             mm_device_do_normalize,
+            mm_item_limits,
             max_num_seqs,
         };
         let mut config = VllmServicerConfig {

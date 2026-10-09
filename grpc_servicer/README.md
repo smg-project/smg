@@ -63,7 +63,10 @@ the `mm_processor_source` label name where the value came from.
 The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards
 `media_refs` only to workers that advertise, and a router without it ignores the
-labels and keeps sending preprocessed tensors. vLLM's `--allowed-media-domains`,
+labels and keeps sending preprocessed tensors. Whatever the processor mode, a
+multimodal engine also advertises its resolved `--limit-mm-per-prompt` as
+`mm_item_limits` (`image=8,video=2`), so a router that preprocesses media
+itself holds requests to the engine's limits. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
 `--allowed-media-domains` the worker fetches from any host the router forwards.

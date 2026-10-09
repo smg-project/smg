@@ -38,6 +38,26 @@ def _model_config(**overrides):
     return config
 
 
+def test_mm_item_limits_follow_the_engines_per_prompt_limits():
+    # A text model, and a multimodal config without vLLM's accessor, advertise
+    # nothing: the Router keeps its own caps.
+    assert model_info.mm_item_limits(SimpleNamespace(model_config=_model_config())) == ""
+    bare = _model_config(is_multimodal_model=True, multimodal_config=SimpleNamespace())
+    assert model_info.mm_item_limits(SimpleNamespace(model_config=bare)) == ""
+    # The resolved --limit-mm-per-prompt of the modalities a vLLM worker takes,
+    # as sorted pairs the Router parses.
+    limits = {"image": 8, "video": 2, "audio": 1}
+    config = _model_config(
+        is_multimodal_model=True,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=limits.__getitem__),
+    )
+    label = model_info.mm_item_limits(SimpleNamespace(model_config=config))
+    assert label == "image=8,video=2"
+    info = vllm_engine_pb2.GetServerInfoResponse(mm_item_limits=label)
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
+    assert parsed.mm_item_limits == "image=8,video=2"
+
+
 def test_model_facts_build_the_proto_as_they_are(caplog):
     with caplog.at_level(logging.WARNING, logger=model_info.__name__):
         facts = model_info.model_facts(_model_config())

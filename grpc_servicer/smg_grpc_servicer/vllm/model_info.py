@@ -131,6 +131,35 @@ def mm_device_do_normalize(vllm_config: Any) -> bool:
     return bool(getattr(mm_config, "mm_device_do_normalize", False))
 
 
+# The modalities a router request can carry to a vLLM worker, whose per-prompt
+# limits the engine resolves from `--limit-mm-per-prompt`.
+MM_ITEM_LIMIT_MODALITIES = ("image", "video")
+
+
+def mm_item_limits(vllm_config: Any) -> str:
+    """The engine's per-prompt media limits as the ``mm_item_limits`` label the
+    Router reads: sorted ``<modality>=<count>`` pairs (``image=8,video=2``), from
+    vLLM's resolved ``--limit-mm-per-prompt``, whose own server refuses a prompt
+    above them. Empty on a text model or a config that does not carry them,
+    which leaves the Router to its own caps."""
+    model_config = vllm_config.model_config
+    if not getattr(model_config, "is_multimodal_model", False):
+        return ""
+    mm_config = getattr(model_config, "multimodal_config", None)
+    get_limit = getattr(mm_config, "get_limit_per_prompt", None)
+    if not callable(get_limit):
+        return ""
+    pairs = []
+    for modality in sorted(MM_ITEM_LIMIT_MODALITIES):
+        try:
+            limit = int(get_limit(modality))
+        except (TypeError, ValueError):
+            continue
+        if limit > 0:
+            pairs.append(f"{modality}={limit}")
+    return ",".join(pairs)
+
+
 def running_window(vllm_config: Any) -> int:
     """The scheduler's running window (``--max-num-seqs``): how many requests
     the engine runs at once, which ``GetServerInfo`` advertises as

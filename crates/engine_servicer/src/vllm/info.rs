@@ -171,6 +171,7 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         model_dtype,
         shm_namespace_id: model.shm_namespace_id.clone(),
         mm_device_do_normalize: model.mm_device_do_normalize,
+        mm_item_limits: model.mm_item_limits.clone(),
         max_num_seqs: max_num_seqs(state),
         ..Default::default()
     }

@@ -471,6 +471,19 @@ def test_model_info_advertises_device_side_normalization():
     assert rust.model_info_from_config(config)["mm_device_do_normalize"] is True
 
 
+def test_model_info_advertises_the_engines_item_limits():
+    # A text model has none: the Router keeps its own caps.
+    assert rust.model_info_from_config(_config())["mm_item_limits"] == ""
+    config = _config(
+        is_multimodal_model=True,
+        multimodal_config=SimpleNamespace(
+            mm_device_do_normalize=False,
+            get_limit_per_prompt=lambda modality: {"image": 8, "video": 2, "audio": 1}[modality],
+        ),
+    )
+    assert rust.model_info_from_config(config)["mm_item_limits"] == "image=8,video=2"
+
+
 def test_model_info_carries_the_running_window():
     # The Rust servicer advertises the launcher's `--max-num-seqs` as the
     # Python servicer does; a config without one leaves the handshake's.

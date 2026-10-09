@@ -1000,6 +1000,25 @@ mod tests {
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo};
 
+    /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
+    /// are: the engine's per-prompt media limits arrive as `mm_item_limits`,
+    /// and an engine without them (a text model) sets no such label.
+    #[test]
+    fn server_info_to_labels_vllm_carries_the_engines_item_limits() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            server_type: "vllm-grpc".to_string(),
+            mm_item_limits: "image=8,video=2".to_string(),
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(
+            labels.get("mm_item_limits").map(String::as_str),
+            Some("image=8,video=2")
+        );
+        let text_only = ServerInfo::Vllm(Box::default());
+        assert!(!text_only.to_labels().contains_key("mm_item_limits"));
+    }
+
     #[test]
     fn trtllm_status_healthy_matches_ok_exactly() {
         assert!(trtllm_status_healthy("ok"));

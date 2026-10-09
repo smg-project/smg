@@ -68,6 +68,7 @@ from smg_grpc_servicer.vllm.mm_salt import (
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
     mm_device_do_normalize,
+    mm_item_limits,
     model_facts,
     running_window,
     server_facts,
@@ -735,6 +736,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             info.mm_device_do_normalize = mm_device_do_normalize(self.engine.vllm_config)
         if max_num_seqs and "max_num_seqs" in info.DESCRIPTOR.fields_by_name:
             info.max_num_seqs = max_num_seqs
+        # The engine's own per-prompt media limits, for the Router's media
+        # pipeline to hold requests to; likewise absent from an older package.
+        if "mm_item_limits" in info.DESCRIPTOR.fields_by_name:
+            info.mm_item_limits = mm_item_limits(self.engine.vllm_config)
         return info
 
     async def GetLoads(
