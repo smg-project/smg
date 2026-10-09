@@ -7,6 +7,7 @@ pub mod mesh_discovery;
 pub mod middleware;
 pub mod observability;
 pub mod policies;
+pub mod posture;
 pub mod rate_limit;
 pub mod rl_adapter;
 pub mod routers;

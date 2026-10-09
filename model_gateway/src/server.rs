@@ -1602,6 +1602,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
+    // Name what this start leaves open, once, before the listener opens:
+    // an unauthenticated gateway is a decision, not an omission.
+    crate::posture::log_open_posture(
+        &serving_auth_config,
+        &admin_auth_config,
+        control_plane_auth_state.is_some(),
+        config.prometheus_config.as_ref(),
+    );
+
     let app = build_app(
         app_state,
         serving_auth_config,
