@@ -224,7 +224,9 @@ mod tests {
     }
 
     /// A tokenizer with a Jinja template declares native continuation and
-    /// continues through its template when asked to.
+    /// continues through its template when asked to, and says whether it did:
+    /// where the template cannot continue the message, the text follows the
+    /// generation prompt instead.
     #[test]
     fn a_jinja_tokenizer_continues_through_its_template() {
         let dir = TempDir::new().unwrap();
@@ -236,7 +238,7 @@ mod tests {
         )
         .unwrap();
         fs::write(&template_path, HEADER).unwrap();
-        let tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
+        let mut tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
             tokenizer_path.to_str().unwrap(),
             template_path.to_str(),
         )
@@ -247,19 +249,33 @@ mod tests {
                 .renderer_capabilities()
                 .native_assistant_continuation
         );
-        let rendered = tokenizer
-            .apply_chat_template_with_encoding(
-                &chat(json!({"content": "The weather"})),
-                ChatTemplateParams {
-                    continue_final_message: true,
-                    ..Default::default()
-                },
-                None,
-            )
-            .unwrap();
+        let continue_final = |tokenizer: &HuggingFaceTokenizer| {
+            tokenizer
+                .apply_chat_template_with_encoding(
+                    &chat(json!({"content": "The weather"})),
+                    ChatTemplateParams {
+                        continue_final_message: true,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap()
+        };
+        let rendered = continue_final(&tokenizer);
         assert_eq!(
             rendered.text,
             "<|turn|>user<|body|>Hi<|end|><|turn|>assistant<|to|>user<|body|>The weather"
         );
+        assert!(rendered.continued_final_message);
+
+        tokenizer
+            .set_chat_template(NO_ASSISTANT_TURNS.to_string())
+            .unwrap();
+        let rendered = continue_final(&tokenizer);
+        assert_eq!(
+            rendered.text,
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nThe weather"
+        );
+        assert!(!rendered.continued_final_message);
     }
 }

@@ -59,12 +59,13 @@ pub fn encode_tools_to_typescript(tools: &[Value]) -> Option<String> {
 }
 
 /// Renderer for `Renderer::KimiK25Tools`. Computes `tools_ts_str` and merges
-/// it into `template_kwargs`, then delegates to the standard minijinja path.
+/// it into `template_kwargs`, then delegates to the standard minijinja path,
+/// which also says whether the prompt continues the final message.
 pub(crate) fn apply_kimi_k25_tools(
     chat_template: &ChatTemplateState,
     messages: &[Value],
     params: ChatTemplateParams,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let ts_str = params.tools.and_then(encode_tools_to_typescript);
 
     let owned: Option<HashMap<String, Value>> = match (params.template_kwargs, ts_str.as_ref()) {
@@ -85,7 +86,7 @@ pub(crate) fn apply_kimi_k25_tools(
         template_kwargs: owned.as_ref().or(params.template_kwargs),
         ..params
     };
-    chat_template.apply(messages, new_params)
+    chat_template.apply_with_continuation(messages, new_params)
 }
 
 // ---------------------------------------------------------------------------

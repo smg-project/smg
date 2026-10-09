@@ -57,6 +57,12 @@ pub struct ProcessedMessages {
     pub stop_sequences: Option<StringOrArray>,
     /// Rendered prompt tokens the provider does not bill.
     pub unbilled_prompt_tokens: u32,
+    /// The prompt continues the trailing assistant message instead of
+    /// following a generation prompt (see
+    /// `ChatTemplateOutput::continued_final_message`): what the reasoning
+    /// decisions follow, since a template that cannot continue the message
+    /// appends its text after the generation prompt.
+    pub continued_final_message: bool,
 }
 
 #[cfg(test)]

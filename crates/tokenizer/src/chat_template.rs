@@ -824,7 +824,9 @@ pub struct ChatTemplateParams<'a> {
     /// Leave the final message open for the model to continue, as
     /// transformers' `continue_final_message` does: the conversation is
     /// rendered with that message and cut right after its text. Not
-    /// compatible with `add_generation_prompt`.
+    /// compatible with `add_generation_prompt`. Where the template cannot
+    /// continue the message, its text follows the generation prompt instead
+    /// (`ChatTemplateOutput::continued_final_message` says which happened).
     pub continue_final_message: bool,
 }
 
@@ -1573,12 +1575,13 @@ fn cut_at_final_message(rendered: &str, text: &str) -> Result<String> {
 /// its text appended after the generation prompt, which is how every
 /// continued message rendered before. Speech-recognition prompts rely on
 /// this: their forced-language prefill follows a generation prompt the
-/// template opens but whose turn it never renders.
+/// template opens but whose turn it never renders. The flag says which
+/// happened: true when the message was continued.
 fn render_continuing_final_message(
     env: &Environment<'_>,
     messages: &[JsonValue],
     params: ChatTemplateParams,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     if params.add_generation_prompt {
         return Err(anyhow!(
             "continue_final_message and add_generation_prompt are not compatible"
@@ -1590,17 +1593,18 @@ fn render_continuing_final_message(
             continue_final_message: false,
             ..params
         };
-        cut_at_final_message(&render_chat_template(env, &tagged, params)?, &text)
+        let (rendered, _) = render_chat_template(env, &tagged, params)?;
+        cut_at_final_message(&rendered, &text)
     });
     let reason = match continued {
-        Ok(prompt) => return Ok(prompt),
+        Ok(prompt) => return Ok((prompt, true)),
         Err(reason) => reason,
     };
     let Some((last, head)) = messages.split_last() else {
         return Err(reason);
     };
     tracing::debug!(%reason, "appending the continued message after the generation prompt");
-    let mut prompt = render_chat_template(
+    let (mut prompt, _) = render_chat_template(
         env,
         head,
         ChatTemplateParams {
@@ -1617,14 +1621,16 @@ fn render_continuing_final_message(
             .for_each(|text| prompt.push_str(text)),
         _ => {}
     }
-    Ok(prompt)
+    Ok((prompt, false))
 }
 
+/// Render the chat, and say whether the prompt continues the final message
+/// (see [`render_continuing_final_message`]).
 fn render_chat_template(
     env: &Environment<'_>,
     messages: &[serde_json::Value],
     params: ChatTemplateParams,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     if params.continue_final_message {
         return render_continuing_final_message(env, messages, params);
     }
@@ -1692,7 +1698,7 @@ fn render_chat_template(
         .render(&ctx)
         .map_err(|e| anyhow!("Failed to render template: {e}"))?;
 
-    Ok(rendered)
+    Ok((rendered, false))
 }
 
 /// The messages with every string `content` of a non-tool message replaced by
@@ -1748,7 +1754,7 @@ impl ChatTemplateProcessor {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
-        render_chat_template(&self.env, messages, params)
+        render_chat_template(&self.env, messages, params).map(|(prompt, _)| prompt)
     }
 }
 
@@ -1891,6 +1897,20 @@ impl ChatTemplateState {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
+        self.apply_with_continuation(messages, params)
+            .map(|(prompt, _)| prompt)
+    }
+
+    /// [`Self::apply`], also saying whether the prompt continues the final
+    /// message: false unless `continue_final_message` was asked for and the
+    /// template could continue the message instead of appending its text
+    /// after the generation prompt (see
+    /// [`ChatTemplateParams::continue_final_message`]).
+    pub fn apply_with_continuation(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
         let env = self.env.as_ref().ok_or_else(|| {
             anyhow!(
                 "Cannot use chat template functions because tokenizer.chat_template is not set \

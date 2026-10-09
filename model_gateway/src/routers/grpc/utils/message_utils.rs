@@ -237,6 +237,7 @@ pub(crate) fn process_messages_prompt(
             text,
             stop_sequences,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
+            continued_final_message: rendered.continued_final_message,
         },
         rendered.encoding,
     ))

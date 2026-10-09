@@ -287,7 +287,11 @@ fn resolve_thinking_pref(
 /// that continues a trailing assistant message natively
 /// (`continue_final_message`, see `RendererCapabilities`) renders that
 /// message past its `</think>`, so the completion starts in content mode and
-/// the parser must not be armed.
+/// the parser must not be armed. `continues_final_assistant` says whether
+/// the prompt does that. Once the prompt is rendered it is the prompt's
+/// `continued_final_message`, not the request's ask: a template that cannot
+/// continue the message appends its text after the generation prompt, and
+/// the completion then starts wherever that prompt leaves it.
 pub fn reasoning_starts_in_prefill(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -316,16 +320,33 @@ pub fn continues_final_assistant(request: &ChatCompletionRequest) -> bool {
         && matches!(request.messages.last(), Some(ChatMessage::Assistant { .. }))
 }
 
-/// [`reasoning_starts_in_prefill`] for a chat request.
+/// [`reasoning_starts_in_prefill`] for a chat request, without its rendered
+/// prompt (the Go binding): a trailing assistant message is taken to be
+/// continued whenever the request asks for it. The gateway decides from the
+/// rendered prompt with [`chat_reasoning_starts_in_rendered_prefill`].
 pub fn chat_reasoning_starts_in_prefill(
     request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
+    chat_reasoning_starts_in_rendered_prefill(
+        request,
+        continues_final_assistant(request),
+        tokenizer,
+    )
+}
+
+/// [`reasoning_starts_in_prefill`] for a chat request whose prompt is
+/// rendered: `continued_final_message` is the rendered prompt's.
+pub fn chat_reasoning_starts_in_rendered_prefill(
+    request: &ChatCompletionRequest,
+    continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
     reasoning_starts_in_prefill(
         request.chat_template_kwargs.as_ref(),
         request.effective_reasoning_effort(),
         request.effective_thinking_toggle(),
-        continues_final_assistant(request),
+        continued_final_message,
         tokenizer,
         ProviderProfile::for_model(&request.model),
     )
@@ -333,10 +354,12 @@ pub fn chat_reasoning_starts_in_prefill(
 
 /// [`reasoning_starts_in_prefill`] for a Messages API request: the
 /// `thinking` block is the user's preference (`enabled`/`adaptive` on,
-/// `disabled` off, absent → the template's default), and a trailing
-/// assistant message with text and no tool call is continued.
+/// `disabled` off, absent → the template's default), and
+/// `continued_final_message` is the rendered prompt's (a trailing assistant
+/// message with text and no tool call is continued where the template can).
 pub fn messages_reasoning_starts_in_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
+    continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
     use openai_protocol::messages::ThinkingConfig;
@@ -349,8 +372,9 @@ pub fn messages_reasoning_starts_in_prefill(
         None,
         None,
         user_thinking,
-        super::message_utils::continues_final_assistant(&request.messages),
+        continued_final_message,
         tokenizer,
+        ProviderProfile::for_model(&request.model),
     )
 }
 
@@ -600,11 +624,15 @@ pub(crate) fn create_tool_parser(
 mod tests {
     use std::sync::Arc;
 
+    use llm_multimodal::MediaPartOrder;
     use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
     use tool_parser::ToolConstraint;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::{
+        routers::grpc::utils::{chat_utils, message_utils},
+        worker::{BasicWorkerBuilder, WorkerType},
+    };
 
     fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
         let mut builder =
@@ -1068,17 +1096,139 @@ mod tests {
                 native_assistant_continuation: true,
                 ..Default::default()
             });
+        // Armed from the rendered prompt, as request building arms it.
+        let armed = |request: &openai_protocol::messages::CreateMessageRequest,
+                     tokenizer: &dyn Tokenizer| {
+            let (processed, _) = message_utils::process_messages(
+                request,
+                tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+            )
+            .expect("rendered");
+            messages_reasoning_starts_in_prefill(
+                request,
+                processed.continued_final_message,
+                tokenizer,
+            )
+        };
 
-        assert!(!messages_reasoning_starts_in_prefill(&prefill, &native));
-        assert!(messages_reasoning_starts_in_prefill(&tool_use, &native));
-        assert!(messages_reasoning_starts_in_prefill(
-            &text_and_tool_use,
-            &native
-        ));
-        assert!(messages_reasoning_starts_in_prefill(
-            &prefill,
-            &thinking_on()
-        ));
+        assert!(!armed(&prefill, &native));
+        assert!(armed(&tool_use, &native));
+        assert!(armed(&text_and_tool_use, &native));
+        assert!(armed(&prefill, &thinking_on()));
+    }
+
+    /// A generation prompt that opens `<think>` (thinking on by default) and
+    /// no rendered assistant turn: a continued final message cannot be cut
+    /// from the template's own rendering, so its text follows that prompt.
+    const THINKING_PROMPT_NO_ASSISTANT_TURNS: &str = r"
+{%- for m in messages -%}
+{%- if m.role != 'assistant' -%}{{- '<|im_start|>' + m.role + '\n' + m.content + '<|im_end|>\n' -}}{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}
+{%- if enable_thinking is not defined or enable_thinking -%}{{- '<think>\n' -}}{%- endif -%}
+{%- endif -%}";
+
+    /// The prompt both APIs render for a `Let me` prefill on that template.
+    const PREFILL_AFTER_THINKING_PROMPT: &str =
+        "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\nLet me";
+
+    fn thinking_prompt_tokenizer() -> llm_tokenizer::TiktokenTokenizer {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .expect("tokenizer");
+        tokenizer
+            .set_chat_template(THINKING_PROMPT_NO_ASSISTANT_TURNS.to_string())
+            .expect("template");
+        tokenizer
+    }
+
+    /// The reasoning and the answer a fresh qwen3 parser, armed or not, finds
+    /// in a completion that closes its reasoning and then answers.
+    fn reasoning_and_answer(armed: bool) -> (String, String) {
+        let factory = ReasoningParserFactory::new();
+        let mut parser =
+            create_reasoning_parser(&factory, Some("qwen3"), "m").expect("qwen3 parser");
+        if armed {
+            parser.mark_reasoning_started();
+        }
+        let parsed = parser
+            .detect_and_parse_reasoning(" check.</think>Done")
+            .expect("parsed");
+        (parsed.reasoning_text, parsed.normal_text)
+    }
+
+    /// Where the template cannot continue a Messages prefill, the prompt ends
+    /// inside the `<think>` its generation prompt opens. The parser is armed
+    /// from the rendered prompt, not from the request asking to continue, so
+    /// the completion's reasoning is parsed as reasoning.
+    #[test]
+    fn messages_continuation_after_a_thinking_generation_prompt_arms() {
+        let tokenizer = thinking_prompt_tokenizer();
+        let request: openai_protocol::messages::CreateMessageRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "Let me"}
+                ]
+            }))
+            .expect("messages request");
+        let (processed, _) = message_utils::process_messages(
+            &request,
+            &tokenizer,
+            None,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .expect("rendered");
+        assert_eq!(processed.text, PREFILL_AFTER_THINKING_PROMPT);
+        assert!(!processed.continued_final_message);
+        let armed = messages_reasoning_starts_in_prefill(
+            &request,
+            processed.continued_final_message,
+            &tokenizer,
+        );
+        assert_eq!(
+            reasoning_and_answer(armed),
+            (" check.".to_string(), "Done".to_string())
+        );
+    }
+
+    /// The same for a chat `continue_final_message`.
+    #[test]
+    fn chat_continuation_after_a_thinking_generation_prompt_arms() {
+        let tokenizer = thinking_prompt_tokenizer();
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "Let me"}
+            ],
+            "continue_final_message": true
+        }))
+        .expect("chat request");
+        let (processed, _) = chat_utils::process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .expect("rendered");
+        assert_eq!(processed.text, PREFILL_AFTER_THINKING_PROMPT);
+        assert!(!processed.continued_final_message);
+        let armed = chat_reasoning_starts_in_rendered_prefill(
+            &request,
+            processed.continued_final_message,
+            &tokenizer,
+        );
+        assert_eq!(
+            reasoning_and_answer(armed),
+            (" check.".to_string(), "Done".to_string())
+        );
     }
 
     /// Typed toggle: below an explicit kwargs toggle and a native effort, above the OpenAI mapping.

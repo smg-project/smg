@@ -29,8 +29,8 @@ use crate::{
     encoders::{deepseek_v32, deepseek_v4, deepseek_v41, RendererProfile},
     native::NativeEncoder,
     traits::{
-        DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens, TokenIdType,
-        Tokenizer as TokenizerTrait,
+        ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder,
+        PromptEncoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
 };
 
@@ -752,6 +752,21 @@ impl HuggingFaceTokenizer {
         })()
         .unwrap_or_default()
     }
+
+    /// The Jinja renderer, with this tokenizer's special tokens unless the
+    /// caller passed its own. The flag says whether the prompt continues the
+    /// final message (see `ChatTemplateState::apply_with_continuation`).
+    fn apply_jinja(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
+        let params = ChatTemplateParams {
+            special_tokens: params.special_tokens.or(Some(&self.special_tokens)),
+            ..params
+        };
+        self.chat_template.apply_with_continuation(messages, params)
+    }
 }
 
 /// Special token strings read from tokenizer_config.json.
@@ -1334,21 +1349,39 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         params: ChatTemplateParams,
     ) -> Result<String> {
         match self.renderer {
-            Renderer::Jinja => {
-                // Inject special tokens if the caller didn't provide them.
-                if params.special_tokens.is_some() {
-                    return self.chat_template.apply(messages, params);
-                }
-                let params = ChatTemplateParams {
-                    special_tokens: Some(&self.special_tokens),
-                    ..params
-                };
-                self.chat_template.apply(messages, params)
-            }
+            Renderer::Jinja => self.apply_jinja(messages, params).map(|(text, _)| text),
             Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
             Renderer::DeepseekV4(encoding) => apply_deepseek_v4(messages, &params, encoding),
             Renderer::DeepseekV41 => apply_deepseek_v41(messages, &params),
         }
+    }
+
+    fn apply_chat_template_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        // The Jinja template says whether it continued the final message or
+        // appended its text after the generation prompt; the native encoders
+        // continue it whenever they are asked to (V4.1) or are never asked.
+        let continue_final_message = params.continue_final_message;
+        let (mut text, continued_final_message) = match self.renderer {
+            Renderer::Jinja => self.apply_jinja(messages, params)?,
+            _ => (
+                self.apply_chat_template(messages, params)?,
+                continue_final_message,
+            ),
+        };
+        if let Some(prefix) = assistant_prefix {
+            text.push_str(prefix);
+        }
+        Ok(ChatTemplateOutput {
+            text,
+            encoding: PromptEncoding::FromText,
+            unbilled_prompt_tokens: 0,
+            continued_final_message,
+        })
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {

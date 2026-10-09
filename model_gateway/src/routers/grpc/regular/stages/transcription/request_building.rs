@@ -61,6 +61,7 @@ impl BuildStage for TranscriptionRequestBuildingStage {
             ctx,
             &chat_request,
             processed_messages.text,
+            processed_messages.continued_final_message,
             token_ids,
             None,
             "transcription-",

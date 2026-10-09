@@ -848,6 +848,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
                         text: String::new(),
                         stop_sequences: request.stop.clone(),
                         unbilled_prompt_tokens: 0,
+                        continued_final_message: false,
                     },
                     PromptEncoding::FromText,
                 ));
@@ -875,6 +876,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             text,
             stop_sequences: request.stop.clone(),
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
+            continued_final_message: rendered.continued_final_message,
         },
         rendered.encoding,
     ))
@@ -2334,6 +2336,7 @@ mod tests {
             processed.text,
             "<|turn|>user<|body|>Hello<|end|><|turn|>assistant<|to|>user<|body|>Sure"
         );
+        assert!(processed.continued_final_message);
     }
 
     /// Under the OpenAI content format the popped assistant message keeps its

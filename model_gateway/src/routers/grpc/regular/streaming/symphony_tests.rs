@@ -5,6 +5,7 @@ use llm_tokenizer::StopSequenceConfig;
 use openai_protocol::{
     chat::ChatChoice,
     common::{ChatLogProbs, StringOrArray},
+    profile::ProviderProfile,
 };
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
@@ -341,6 +342,7 @@ fn lookup_tools() -> Vec<Tool> {
 /// A Messages spec with Symphony assigned `format`, replaying `prompt`, with the `lookup` tool.
 fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        provider: ProviderProfile::Generic,
         continues_final_assistant: false,
         thinking: thinking.then_some(messages::ThinkingConfig::Enabled {
             budget_tokens: 1024,

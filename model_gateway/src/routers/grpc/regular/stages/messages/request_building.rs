@@ -134,6 +134,7 @@ impl BuildStage for MessageRequestBuildingStage {
             .await?;
         }
 
+        let continued_final_message = processed_messages.continued_final_message;
         // Native Gemma4 channels follow the rendered prompt; other parsers keep
         // their tokenizer-driven preference for the engine's reasoning gate.
         let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
@@ -147,7 +148,11 @@ impl BuildStage for MessageRequestBuildingStage {
         );
         let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
             ctx.tokenizer_arc().is_some_and(|tokenizer| {
-                utils::messages_reasoning_starts_in_prefill(&messages_request, tokenizer.as_ref())
+                utils::messages_reasoning_starts_in_prefill(
+                    &messages_request,
+                    continued_final_message,
+                    tokenizer.as_ref(),
+                )
             })
         });
 
@@ -272,6 +277,7 @@ impl BuildStage for MessageRequestBuildingStage {
         let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.symphony = assignment;
+        spec.continues_final_assistant = continued_final_message;
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
             spec: ResponseSpec::Messages(Box::new(spec)),

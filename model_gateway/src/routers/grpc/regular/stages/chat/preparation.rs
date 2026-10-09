@@ -353,7 +353,11 @@ pub(crate) async fn prepare_chat_like(
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools();
-        let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
+        let reasoning = utils::chat_reasoning_starts_in_rendered_prefill(
+            request,
+            processed_messages.continued_final_message,
+            tokenizer.as_ref(),
+        );
         // When Symphony reads the response, its table gives a forced call, or a
         // JSON response_format, its tag, so the output comes back in the syntax
         // the table parses (see `regular::symphony`, which decides both with one

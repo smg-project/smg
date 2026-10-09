@@ -49,11 +49,14 @@ impl ChatRequestBuildingStage {
 /// data, applies sampling defaults (from the chat request), finalizes stops,
 /// and injects PD/EPD metadata — returning the plan, attempt stamp and rendered
 /// reasoning state. The caller supplies the `ResponseSpec`.
+/// `continued_final_message` is the rendered prompt's
+/// (`ProcessedMessages::continued_final_message`).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: String,
+    continued_final_message: bool,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
     id_prefix: &'static str,
@@ -133,7 +136,11 @@ pub(crate) async fn build_chat_backed_plan(
     );
     let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
         ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
+            utils::chat_reasoning_starts_in_rendered_prefill(
+                chat_request,
+                continued_final_message,
+                tokenizer.as_ref(),
+            )
         })
     });
 
@@ -310,10 +317,12 @@ impl BuildStage for ChatRequestBuildingStage {
             Some(request) => request,
             None => chat_request.as_ref(),
         };
+        let continued_final_message = processed_messages.continued_final_message;
         let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             ctx,
             engine_request,
             processed_messages.text,
+            continued_final_message,
             token_ids,
             tool_constraints,
             "chatcmpl-",
@@ -328,6 +337,7 @@ impl BuildStage for ChatRequestBuildingStage {
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.symphony = assignment;
+        spec.continues_final_assistant = continued_final_message;
 
         Ok(BuildOutput {
             plan,

@@ -89,7 +89,9 @@ pub(crate) struct ChatResponseSpec {
     /// The typed `thinking.type` toggle as the provider profile reads it
     /// (`ChatCompletionRequest::effective_thinking_toggle`).
     pub thinking: Option<bool>,
-    /// `continue_final_message` on a trailing assistant message.
+    /// `continue_final_message` on a trailing assistant message. Request
+    /// building replaces the request's ask with what the rendered prompt did
+    /// (`ProcessedMessages::continued_final_message`).
     pub continues_final_assistant: bool,
     /// `n`, normalized.
     pub expected_choices: u32,
@@ -190,6 +192,9 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
 
 #[derive(Clone)]
 pub(crate) struct MessagesResponseSpec {
+    /// The provider profile the requested model selects; it reads the
+    /// request's thinking the way the chat spec's does.
+    pub provider: ProviderProfile,
     pub thinking: Option<messages::ThinkingConfig>,
     /// Native channel formats can derive the initial state from the rendered prompt.
     pub reasoning_in_prefill: Option<bool>,
@@ -202,13 +207,15 @@ pub(crate) struct MessagesResponseSpec {
     /// Symphony's assignment when a table reads the message (see `regular::symphony`).
     pub symphony: Option<Assignment>,
     /// A trailing assistant message with text and no tool call, continued as
-    /// a prefill.
+    /// a prefill. Request building replaces the request's ask with what the
+    /// rendered prompt did (`ProcessedMessages::continued_final_message`).
     pub continues_final_assistant: bool,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
         Self {
+            provider: ProviderProfile::for_model(&request.model),
             thinking: request.thinking.clone(),
             reasoning_in_prefill: None,
             tool_choice: request.tool_choice.clone(),
@@ -249,6 +256,7 @@ impl MessagesResponseSpec {
             user_thinking,
             self.continues_final_assistant,
             tokenizer,
+            self.provider,
         )
     }
 }
