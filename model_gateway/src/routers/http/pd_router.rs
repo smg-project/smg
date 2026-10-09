@@ -300,10 +300,7 @@ impl PDRouter {
                 // for a leg that is merely down, so a client can key its
                 // retry on one code whatever the transport; the message
                 // still names the leg.
-                error::service_unavailable(
-                    "no_available_workers",
-                    format!("No available servers: {error}"),
-                )
+                placement::no_available_workers(format!("No available servers: {error}"))
             }
         }
     }

@@ -710,18 +710,31 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// pass the status code returned to the client (e.g., 502 for a send
     /// error, 504 for a timeout).
     fn record_outcome(&self, status_code: u16) {
-        let resilience = self.resilience();
         // Capacity pushback (429 by default) is a routing signal, not a
         // worker fault: the request is retried elsewhere, but no
         // circuit-breaker sample is recorded in either direction — opening
         // the breaker on backpressure would amplify a load spike into
         // unavailability, and crediting a success would close a half-open
         // breaker on a request the worker refused.
-        if resilience.capacity_status_codes.contains(&status_code) {
+        if self
+            .resilience()
+            .capacity_status_codes
+            .contains(&status_code)
+        {
             return;
         }
-        let is_failure = resilience.retryable_status_codes.contains(&status_code);
-        self.record_circuit_breaker_outcome(!is_failure);
+        self.record_circuit_breaker_outcome(!self.is_breaker_failure(status_code));
+    }
+
+    /// Whether `status_code` counts as a circuit-breaker failure for this
+    /// worker: a status in its `retryable_status_codes` that is not capacity
+    /// pushback. The per-request accounting in
+    /// `routers::common::attempt_ledger` asks this before charging, so a
+    /// request's retries charge a worker once.
+    fn is_breaker_failure(&self, status_code: u16) -> bool {
+        let resilience = self.resilience();
+        !resilience.capacity_status_codes.contains(&status_code)
+            && resilience.retryable_status_codes.contains(&status_code)
     }
 
     /// Get the resolved resilience config for this worker.

@@ -54,6 +54,7 @@ use crate::{
     routers::{
         common::{
             attach_sized_body,
+            attempt_ledger::{mark_upstream_answer, AttemptLedger},
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
@@ -61,7 +62,7 @@ use crate::{
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
-            placement::{self, PlacementFailure, PlacementInputs},
+            placement::{self, CandidateFilter, PlacementFailure, PlacementInputs},
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
@@ -254,6 +255,10 @@ impl Router {
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes"
+    )]
     fn select_worker_for_model(
         &self,
         model_id: &str,
@@ -262,6 +267,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
+        candidate_filter: Option<CandidateFilter<'_>>,
     ) -> Option<Arc<dyn Worker>> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -277,7 +283,7 @@ impl Router {
                 headers,
                 rid_key,
                 cache_namespace,
-                candidate_filter: None,
+                candidate_filter,
             },
         )
     }
@@ -407,6 +413,11 @@ impl Router {
             ReleasePoint::from_retry_config(retry_config),
         );
 
+        // The request's bookkeeping across attempts: each worker is charged
+        // one breaker failure at most, and a worker whose answer was
+        // definitive takes no further attempt.
+        let ledger = AttemptLedger::default();
+
         let response = if lease.release_point() == ReleasePoint::AfterDispatch {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request the moment the upstream bytes are serialized.
@@ -418,6 +429,7 @@ impl Router {
                     model_id,
                     canonical_model.as_deref(),
                     is_stream,
+                    &ledger,
                 )
                 .await;
             Metrics::record_router_upstream_response(
@@ -446,6 +458,7 @@ impl Router {
                             model_id,
                             canonical_model.as_deref(),
                             is_stream,
+                            &ledger,
                         )
                         .await;
 
@@ -501,6 +514,10 @@ impl Router {
         response
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one dispatch attempt takes the request's lease, its route and its attempt ledger"
+    )]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -509,7 +526,10 @@ impl Router {
         model_id: &str,
         canonical_model: Option<&str>,
         is_stream: bool,
+        ledger: &AttemptLedger,
     ) -> Response {
+        // A retry never goes back to a worker whose answer was definitive.
+        let admits = |worker: &dyn Worker| ledger.admits(worker);
         let worker = match lease.with_view(|view| {
             self.select_worker_for_model(
                 model_id,
@@ -518,6 +538,7 @@ impl Router {
                 headers,
                 view.rid_key,
                 view.cache_namespace,
+                Some(&admits),
             )
         }) {
             Some(w) => w,
@@ -537,8 +558,7 @@ impl Router {
                     PlacementFailure::Unavailable
                     | PlacementFailure::PolicyDeclined(_)
                     | PlacementFailure::NoCompatiblePair { .. }
-                    | PlacementFailure::PrefillAtCapacity => error::service_unavailable(
-                        "no_available_workers",
+                    | PlacementFailure::PrefillAtCapacity => placement::no_available_workers(
                         "All workers are unavailable (circuit breaker open or unhealthy)",
                     ),
                 };
@@ -659,7 +679,7 @@ impl Router {
 
         // Judge the converted result so malformed successes become backend
         // failures and follow the same outcome accounting and retry policy.
-        let response = if let Some(adapter) = decision_adapter {
+        let mut response = if let Some(adapter) = decision_adapter {
             adapter
                 .convert_response(response, self.max_payload_size)
                 .await
@@ -670,7 +690,16 @@ impl Router {
         events::RequestReceivedEvent {}.emit();
 
         let status = response.status();
-        worker.record_outcome(status.as_u16());
+        ledger.record_outcome(worker.as_ref(), status.as_u16());
+        // A definitive answer closes the retry window on this worker: the next
+        // attempt goes to another available worker, or the answer stands.
+        ledger.settle(
+            &mut response,
+            [&worker],
+            self.worker_registry
+                .get_routing_pool(model_id, RoutingPool::HttpRegular)
+                .iter(),
+        );
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -927,7 +956,7 @@ impl Router {
                     } else {
                         "All workers are unavailable (circuit breaker open or unhealthy)"
                     };
-                    error::service_unavailable("no_available_workers", message)
+                    placement::no_available_workers(message)
                 }
             };
             record_pre_send_error(&resp);
@@ -1397,6 +1426,7 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+            mark_upstream_answer(&mut response);
 
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
@@ -1418,6 +1448,7 @@ impl Router {
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
+                    mark_upstream_answer(&mut response);
                     response
                 }
                 Err(error_response) => error_response,
@@ -1825,6 +1856,7 @@ impl Router {
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
+            None,
             None,
             None,
         ) else {
@@ -2345,7 +2377,7 @@ mod tests {
             },
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         },
-        worker::BasicWorkerBuilder,
+        worker::{circuit_breaker::CircuitState, BasicWorkerBuilder},
     };
 
     /// Accepts `kill_first` connections and closes them before any response
@@ -2537,6 +2569,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(selected.is_available());
@@ -2551,7 +2584,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
             )
             .is_none());
     }
@@ -2584,6 +2618,186 @@ mod tests {
             "no_available_workers"
         );
         assert!(response.headers().get(RETRY_AFTER).is_none());
+    }
+
+    /// Loopback POST /generate stub answering `status` with a JSON body on
+    /// every request, counting the requests it saw.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn fixed_status_upstream(status: StatusCode) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, AtomicOrdering::SeqCst);
+                    (
+                        status,
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"error":{"message":"upstream failed","type":"InternalServerError"}}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn fast_retries(max_retries: u32) -> RetryConfig {
+        RetryConfig {
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        }
+    }
+
+    /// A round-robin router over `worker_urls`, each worker's breaker opening
+    /// at `failure_threshold` failures.
+    fn breaker_router(worker_urls: &[&str], retry: RetryConfig, failure_threshold: u32) -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for url in worker_urls {
+            let worker = BasicWorkerBuilder::new(*url)
+                .worker_type(WorkerType::Regular)
+                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    failure_threshold,
+                    success_threshold: 1,
+                    timeout_duration: Duration::from_secs(60),
+                    window_duration: Duration::from_secs(60),
+                })
+                .health_config(no_health_check())
+                .build();
+            worker_registry.register_or_replace(Arc::new(worker));
+        }
+        Router {
+            worker_registry,
+            policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            retry_config: retry,
+            max_payload_size: 536_870_912,
+            stream_stall_timeout: Some(Duration::from_secs(60)),
+            max_buffered_request_bytes: 0,
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+        }
+    }
+
+    async fn generate(router: &Router, text: &str) -> Response {
+        router
+            .route_typed_request(
+                None,
+                DropProbeRequest {
+                    text: text.to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await
+    }
+
+    /// Three attempts of one request on a worker that cannot serve it now are
+    /// one failure for its breaker: the threshold counts failed requests, not
+    /// attempts.
+    #[tokio::test]
+    async fn transient_upstream_failures_charge_the_breaker_once_per_request() {
+        let (url, hits) = fixed_status_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+        let router = breaker_router(&[&url], fast_retries(3), 2);
+        let worker = router.worker_registry.get_all().remove(0);
+
+        let response = generate(&router, "busy").await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            3,
+            "a 503 is replayed up to the retry limit"
+        );
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "one failed request is one failure, under the threshold of two"
+        );
+
+        generate(&router, "busy again").await;
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "the second failed request reaches the threshold"
+        );
+    }
+
+    /// A 500 the worker itself answered is its verdict on the payload: it is
+    /// returned at once rather than replayed, and the worker is charged once.
+    #[tokio::test]
+    async fn a_workers_own_500_is_not_replayed_on_it() {
+        let (url, hits) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let router = breaker_router(&[&url], fast_retries(5), 2);
+        let worker = router.worker_registry.get_all().remove(0);
+
+        let response = generate(&router, "bad payload").await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            1,
+            "the worker's answer is definitive for this payload"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            body.windows(15).any(|w| w == b"upstream failed"),
+            "the client gets the worker's own body"
+        );
+    }
+
+    /// With two workers the request moves to the other one once; a second
+    /// definitive answer stands.
+    #[tokio::test]
+    async fn a_workers_own_500_moves_the_request_to_another_worker_once() {
+        let (url_a, hits_a) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (url_b, hits_b) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let router = breaker_router(&[&url_a, &url_b], fast_retries(5), 5);
+
+        let response = generate(&router, "bad payload").await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(hits_a.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(hits_b.load(AtomicOrdering::SeqCst), 1);
+        for worker in router.worker_registry.get_all() {
+            assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        }
+    }
+
+    /// Once every breaker is open the verdict clears at the breaker timeout,
+    /// not inside a backoff: the 503 is terminal for the retry loop.
+    #[tokio::test]
+    async fn no_retry_runs_against_a_pool_of_open_breakers() {
+        let (url, hits) = fixed_status_upstream(StatusCode::OK).await;
+        let router = breaker_router(&[&url], fast_retries(5), 1);
+        let worker = router.worker_registry.get_all().remove(0);
+        worker.record_outcome(500);
+        assert!(!worker.is_available());
+
+        let response = generate(&router, "anything").await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
     }
 
     fn rerank_request() -> RerankRequest {

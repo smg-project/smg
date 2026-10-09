@@ -76,10 +76,13 @@ use crate::{
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
-        common::retry::{is_retryable_response, BackoffCalculator},
+        common::{
+            placement::{self, Candidates, WireConstraint},
+            retry::{is_retryable_response, BackoffCalculator},
+        },
         error,
     },
-    worker::{PrefillAdmission, WorkerRegistry},
+    worker::{PrefillAdmission, RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
@@ -671,7 +674,7 @@ impl RequestPipeline {
             }
 
             let last_attempt = attempt + 1 >= max_attempts;
-            let failure = match self
+            let mut failure = match self
                 .run_attempt(&mut dctx, &mut plan, &spec, &stamp, attempt, last_attempt)
                 .await
             {
@@ -704,6 +707,17 @@ impl RequestPipeline {
             // queued behind its own predecessor's bootstrap rooms.
             dctx.load_guards = None;
             dctx.pd_prefill_guard = None;
+            // A worker's definitive answer closes the retry window on that
+            // worker: the next attempt goes to another available worker, or
+            // the answer stands as the client's response.
+            if let Some(workers) = dctx.workers.as_ref() {
+                let pools = self.retry_pools(&dctx.model_id, dctx.wire);
+                dctx.ledger.settle(
+                    &mut failure,
+                    workers.workers(),
+                    pools.iter().flat_map(|pool| pool.as_slice().iter()),
+                );
+            }
 
             let Some(config) = retry_config else {
                 return Err(failure);
@@ -727,6 +741,21 @@ impl RequestPipeline {
             tokio::time::sleep(delay).await;
             attempt = next_attempt;
         }
+    }
+
+    /// The pools a retry of `model_id` re-selects from, narrowed to the
+    /// retained wire as the re-selection itself is.
+    fn retry_pools(&self, model_id: &str, wire: WireConstraint) -> Vec<Candidates> {
+        let pools: &[RoutingPool] = match self.mode {
+            Mode::Regular => &[RoutingPool::GrpcPipelineRegular],
+            Mode::PrefillDecode | Mode::EncodePrefillDecode => {
+                &[RoutingPool::GrpcPrefill, RoutingPool::GrpcDecode]
+            }
+        };
+        pools
+            .iter()
+            .map(|pool| placement::candidates(&self.worker_registry, model_id, *pool, Some(wire)))
+            .collect()
     }
 
     /// Attribute a response to the worker from the successful dispatch attempt.
@@ -1646,6 +1675,7 @@ mod request_release_tests {
             MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
         },
         worker::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
             BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker,
             WorkerType,
         },
@@ -1666,11 +1696,13 @@ mod request_release_tests {
     /// the outcome in `released`. An ungated stub (no probe) answers
     /// immediately -- used for the PD prefill leg. `fail_first` makes the
     /// first generate call return UNAVAILABLE, for retry-replay tests;
-    /// `fail_always` fails every call, and `answer_after` stalls the generate
-    /// RPC, standing in for an engine that answers only at its own deadline;
-    /// `frame_gap` paces the response frames, for a stream that outlasts its
-    /// dispatch. Every call's input token ids, prompt text and engine request
-    /// id are recorded, as is every aborted request id.
+    /// `fail_always` fails every call, `fail_internal` answers every call with
+    /// INTERNAL (an engine that took the request and failed on it), and
+    /// `answer_after` stalls the generate RPC, standing in for an engine that
+    /// answers only at its own deadline; `frame_gap` paces the response frames,
+    /// for a stream that outlasts its dispatch. Every call's input token ids,
+    /// prompt text and engine request id are recorded, as is every aborted
+    /// request id.
     #[derive(Clone, Default)]
     struct GatedScheduler {
         probe: Option<Weak<CompletionRequest>>,
@@ -1678,6 +1710,7 @@ mod request_release_tests {
         released: Arc<AtomicBool>,
         fail_first: bool,
         fail_always: bool,
+        fail_internal: bool,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
@@ -1784,6 +1817,9 @@ mod request_release_tests {
                 || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0)
             {
                 return Err(Status::unavailable("release-test induced failure"));
+            }
+            if self.fail_internal {
+                return Err(Status::internal("release-test induced engine failure"));
             }
             if let Some(delay) = self.answer_after {
                 tokio::time::sleep(delay).await;
@@ -1952,6 +1988,36 @@ mod request_release_tests {
                 .connection_mode(ConnectionMode::Grpc)
                 .runtime_type(RuntimeType::TokenSpeed)
                 .model(ModelCard::new(MODEL))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry
+            .register(Arc::clone(&worker))
+            .expect("register release-test worker");
+        worker
+    }
+
+    /// [`register_worker`] with a circuit breaker opening at `failure_threshold`.
+    fn register_worker_with_breaker(
+        registry: &WorkerRegistry,
+        port: u16,
+        failure_threshold: u32,
+    ) -> Arc<dyn Worker> {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .model(ModelCard::new(MODEL))
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold,
+                    success_threshold: 1,
+                    timeout_duration: Duration::from_secs(60),
+                    window_duration: Duration::from_secs(60),
+                })
                 .health_config(HealthCheckConfig {
                     disable_health_check: true,
                     ..Default::default()
@@ -2437,6 +2503,155 @@ mod request_release_tests {
                 assert!(trace_header.is_none());
             }
         }
+    }
+
+    async fn run_completion(
+        pipeline: RequestPipeline,
+        components: Arc<SharedComponents>,
+        retry: &RetryConfig,
+    ) -> Response {
+        pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                Some(retry),
+            )
+            .await
+    }
+
+    fn calls_seen(ids: &Mutex<Vec<String>>) -> usize {
+        ids.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
+    /// Three attempts of one request on a worker that cannot serve it now are
+    /// one failure for its breaker: the threshold counts failed requests, not
+    /// attempts.
+    #[tokio::test]
+    async fn transient_start_failures_charge_the_breaker_once_per_request() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_always: true,
+            seen_request_ids: Arc::clone(&seen),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker_with_breaker(&worker_registry, port, 2);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(3)).await;
+
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            calls_seen(&seen),
+            3,
+            "an UNAVAILABLE start is replayed up to the retry limit"
+        );
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "one failed request is one failure, under the threshold of two"
+        );
+    }
+
+    /// INTERNAL is the engine's own answer for this payload: it is returned
+    /// at once rather than replayed on the worker, and the worker is charged
+    /// once.
+    #[tokio::test]
+    async fn an_internal_engine_error_is_not_replayed_on_its_worker() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&seen),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker_with_breaker(&worker_registry, port, 2);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            calls_seen(&seen),
+            1,
+            "the answer is definitive for this payload"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// With two workers the request moves to the other one once; a second
+    /// INTERNAL answer stands.
+    #[tokio::test]
+    async fn an_internal_engine_error_moves_the_request_to_another_worker_once() {
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let port_a = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&seen_a),
+            ..Default::default()
+        })
+        .await;
+        let port_b = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&seen_b),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker_a = register_worker_with_breaker(&worker_registry, port_a, 5);
+        let worker_b = register_worker_with_breaker(&worker_registry, port_b, 5);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(calls_seen(&seen_a), 1);
+        assert_eq!(calls_seen(&seen_b), 1);
+        assert!(!is_retryable_response(&response));
+        assert_eq!(worker_a.circuit_breaker_state(), CircuitState::Closed);
+        assert_eq!(worker_b.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// Once the only worker's breaker opens, the verdict clears at the
+    /// breaker timeout, not inside a backoff: the 503 ends the retry window.
+    #[tokio::test]
+    async fn a_pool_of_open_breakers_ends_the_retry_window_at_once() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_always: true,
+            seen_request_ids: Arc::clone(&seen),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker_with_breaker(&worker_registry, port, 1);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert_eq!(calls_seen(&seen), 1, "the open breaker takes no attempt");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert!(!is_retryable_response(&response));
     }
 
     /// A prefill leg that cannot start must answer the client immediately

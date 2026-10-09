@@ -18,6 +18,7 @@ use crate::{
     },
     routers::{
         common::{
+            attempt_ledger::{mark_upstream_answer, AttemptLedger},
             kv_transfer::{
                 connector_mode_for_worker, is_moriio_worker, mooncake_decode_params,
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
@@ -339,6 +340,10 @@ pub(crate) async fn execute_plan(
             "Worker selection not completed",
         )
     })?;
+    // Every breaker sample of this attempt goes through the request's
+    // ledger, which charges a worker once per request however often the
+    // request retried on it.
+    let ledger = &ctx.ledger;
 
     ctx.load_guards = Some(LoadGuards::admitted(
         admission,
@@ -386,12 +391,14 @@ pub(crate) async fn execute_plan(
     let result = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => execute_single(req, clients, workers).await,
-                ProtoRequest::Embed(req) => execute_single_embed(req, clients, workers).await,
+                ProtoRequest::Generate(req) => execute_single(req, clients, workers, ledger).await,
+                ProtoRequest::Embed(req) => {
+                    execute_single_embed(req, clients, workers, ledger).await
+                }
             },
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(req, clients, workers, model, prefill_guard).await
+                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 // Bootstrap info was injected into the prefill request during
@@ -405,11 +412,21 @@ pub(crate) async fn execute_plan(
                     model,
                     encode_dispatch,
                     prefill_guard,
+                    ledger,
                 )
                 .await
             }
             ExecutionPlan::Batch { kind, requests, .. } => {
-                execute_batch_dispatch(kind, requests, clients, workers, model, prefill_guard).await
+                execute_batch_dispatch(
+                    kind,
+                    requests,
+                    clients,
+                    workers,
+                    model,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
             }
         }
     }
@@ -458,6 +475,7 @@ async fn execute_pd_dispatch(
     workers: &WorkerSelection,
     model: &str,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -486,14 +504,39 @@ async fn execute_pd_dispatch(
     // carried in the request.
     match protocol.dispatch {
         PdDispatch::Sequential => {
-            execute_sequential_pd(proto_request, clients, workers, model, prefill_guard).await
+            execute_sequential_pd(
+                proto_request,
+                clients,
+                workers,
+                model,
+                prefill_guard,
+                ledger,
+            )
+            .await
         }
         PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
             Some(n) => {
-                execute_fanout_pd(proto_request, n, clients, workers, protocol, prefill_guard).await
+                execute_fanout_pd(
+                    proto_request,
+                    n,
+                    clients,
+                    workers,
+                    protocol,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
             }
             None => {
-                execute_parallel_pd(proto_request, clients, workers, protocol, prefill_guard).await
+                execute_parallel_pd(
+                    proto_request,
+                    clients,
+                    workers,
+                    protocol,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
             }
         },
     }
@@ -510,6 +553,7 @@ async fn execute_fanout_pd(
     workers: &WorkerSelection,
     protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let subs = fan_out_pd_request(&proto_request, n, |sub| {
         maybe_inject_pd_metadata(sub, workers);
@@ -525,7 +569,9 @@ async fn execute_fanout_pd(
     let guards = prefill_guard.replicate_to(subs.len());
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
-        async move { execute_parallel_pd(sub, &mut clients, workers, protocol, guard).await }
+        async move {
+            execute_parallel_pd(sub, &mut clients, workers, protocol, guard, ledger).await
+        }
     });
     let results = try_join_all(dispatches).await?;
 
@@ -584,12 +630,21 @@ async fn execute_epd_dispatch(
     model: &str,
     encode_dispatch: Option<EncodeDispatchPlan>,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
     proto_request.clear_mm_pixel_values();
-    execute_pd_dispatch(proto_request, clients, workers, model, prefill_guard).await
+    execute_pd_dispatch(
+        proto_request,
+        clients,
+        workers,
+        model,
+        prefill_guard,
+        ledger,
+    )
+    .await
 }
 
 #[expect(
@@ -646,6 +701,7 @@ async fn execute_batch_dispatch(
     workers: &WorkerSelection,
     model: &str,
     prefill_guard: Option<PrefillLoadGuard>,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -666,13 +722,20 @@ async fn execute_batch_dispatch(
             async move {
                 match kind {
                     ExecutionPlanKind::Single => {
-                        execute_single(request, &mut clients, workers).await
+                        execute_single(request, &mut clients, workers, ledger).await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
                         let prefill_guard = require_prefill_guard(prefill_guard)?;
-                        execute_pd_dispatch(request, &mut clients, workers, model, prefill_guard)
-                            .await
+                        execute_pd_dispatch(
+                            request,
+                            &mut clients,
+                            workers,
+                            model,
+                            prefill_guard,
+                            ledger,
+                        )
+                        .await
                     }
                 }
             }
@@ -686,6 +749,7 @@ async fn execute_single(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_mut().ok_or_else(|| {
         error!(
@@ -708,7 +772,7 @@ async fn execute_single(
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
     let result = client.generate(proto_request).await;
-    workers.record_outcome(result.cb_status_code());
+    workers.record_outcome(ledger, result.cb_status_code());
 
     let stream = result.map_err(|e| {
         start_failure_response(
@@ -746,6 +810,12 @@ fn start_failure_response(
         error!(function = function, error = %e, "{}", description);
     }
     let mut response = e.to_http_error(code, format!("{description}: {}", e.message()));
+    // INTERNAL is the servicers' code for a request the engine took and failed
+    // on: the worker's own answer for this payload, which the retry layer does
+    // not replay on it (see `routers::common::attempt_ledger`).
+    if e.code() == tonic::Code::Internal {
+        mark_upstream_answer(&mut response);
+    }
     // The worker already spent its whole media-sidecar budget on this input;
     // another attempt costs the same again. Other sidecar failures fail fast.
     if e.code() == tonic::Code::Unavailable && e.message().starts_with("sidecar_timeout") {
@@ -758,6 +828,7 @@ async fn execute_single_embed(
     proto_request: ProtoEmbedRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_mut().ok_or_else(|| {
         error!(
@@ -774,7 +845,7 @@ async fn execute_single_embed(
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
     let result = client.embed(proto_request).await;
-    workers.record_outcome(result.cb_status_code());
+    workers.record_outcome(ledger, result.cb_status_code());
 
     let complete = result.map_err(|e| {
         start_failure_response(
@@ -794,6 +865,7 @@ async fn execute_parallel_pd(
     workers: &WorkerSelection,
     protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -856,6 +928,7 @@ async fn execute_parallel_pd(
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
             // Record circuit breaker outcomes (client errors don't count as failures)
             workers.record_prefill_decode_outcomes(
+                ledger,
                 prefill_result.cb_status_code(),
                 decode_result.cb_status_code(),
             );
@@ -906,11 +979,11 @@ async fn execute_parallel_pd(
             // it when it finally does.
             let (label, partner_label, partner_worker) = match leg {
                 PdLeg::Prefill => {
-                    workers.record_outcome_prefill(status);
+                    workers.record_outcome_prefill(ledger, status);
                     (prefill_label, decode_label, workers.decode_worker())
                 }
                 PdLeg::Decode => {
-                    workers.record_outcome_decode(status);
+                    workers.record_outcome_decode(ledger, status);
                     (decode_label, prefill_label, workers.prefill_worker())
                 }
             };
@@ -1131,6 +1204,7 @@ async fn execute_sequential_pd(
     workers: &WorkerSelection,
     model: &str,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -1285,7 +1359,7 @@ async fn execute_sequential_pd(
         .generate(prefill_request)
         .await
         .map_err(|e| {
-            workers.record_outcome_prefill(e.http_status().as_u16());
+            workers.record_outcome_prefill(ledger, e.http_status().as_u16());
             Metrics::record_worker_error(
                 metrics_labels::WORKER_PREFILL,
                 prefill_label,
@@ -1320,7 +1394,7 @@ async fn execute_sequential_pd(
                 }
             }
             Err(e) => {
-                workers.record_outcome_prefill(e.http_status().as_u16());
+                workers.record_outcome_prefill(ledger, e.http_status().as_u16());
                 Metrics::record_worker_error(
                     metrics_labels::WORKER_PREFILL,
                     prefill_label,
@@ -1337,7 +1411,7 @@ async fn execute_sequential_pd(
     prefill_stream.mark_completed();
     // Prefill is drained: its admission slot is free while decode runs.
     drop(prefill_guard);
-    workers.record_outcome_prefill(200);
+    workers.record_outcome_prefill(ledger, 200);
     // Captured at drain; recorded below only once decode is established.
     let prefill_duration = prefill_start.elapsed();
 
@@ -1443,7 +1517,7 @@ async fn execute_sequential_pd(
         Metrics::record_worker_request(decode.url(), decode.model_id());
     }
     let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
-        workers.record_outcome_decode(e.http_status().as_u16());
+        workers.record_outcome_decode(ledger, e.http_status().as_u16());
         Metrics::record_worker_error(
             metrics_labels::WORKER_DECODE,
             decode_label,
@@ -1457,7 +1531,7 @@ async fn execute_sequential_pd(
         )
     })?;
 
-    workers.record_outcome_decode(200);
+    workers.record_outcome_decode(ledger, 200);
     // Decode established: record the success-only PD metrics here.
     Metrics::record_pd_kv_connector_mode(kv_connector_label);
     Metrics::record_pd_prefill_duration(
