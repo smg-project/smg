@@ -10,7 +10,10 @@ use std::{
 
 use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
 use ts::{
@@ -91,7 +94,7 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
                     .max_decoding_message_size(max_message_bytes)
                     .max_encoding_message_size(max_message_bytes),
             )
-            .serve_with_incoming(TcpListenerStream::new(listener))
+            .serve_with_incoming(connections(listener))
             .await
         {
             tracing::error!("grpc worker {addr:?} stopped: {e}");
@@ -103,6 +106,23 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
         }
         None => server.await,
     }
+}
+
+/// The listener's connections with `TCP_NODELAY` set, as the engine
+/// servicers serve theirs. tonic ignores its own `tcp_nodelay` setting for a
+/// caller-provided incoming stream, and with Nagle on the response HEADERS
+/// frame goes out alone while the first DATA frame (the first token) waits
+/// for its acknowledgement, which the gateway's delayed ACK holds for ~40 ms
+/// on every other request.
+fn connections(listener: TcpListener) -> impl Stream<Item = std::io::Result<TcpStream>> {
+    TcpListenerStream::new(listener).map(|conn| {
+        if let Ok(stream) = &conn {
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!("grpc worker: set_nodelay failed: {e}");
+            }
+        }
+        conn
+    })
 }
 
 #[derive(Clone)]
@@ -605,5 +625,30 @@ fn snapshot_to_scheduler_load(s: &engine::LoadSnapshot) -> ts::SchedulerLoad {
         utilization: s.token_usage,
         memory: None,
         queues: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sockets the gRPC worker serves carry `TCP_NODELAY`, so a token
+    /// frame is never held back for the acknowledgement of the frame before.
+    #[tokio::test]
+    async fn served_connections_have_nodelay_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let mut incoming = std::pin::pin!(connections(listener));
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let accepted = incoming
+            .next()
+            .await
+            .expect("a connection")
+            .expect("accepted");
+        assert!(
+            accepted.nodelay().expect("nodelay"),
+            "the accepted socket runs with Nagle on"
+        );
+        drop(client);
     }
 }
