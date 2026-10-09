@@ -50,6 +50,7 @@ mod admission;
 mod apply;
 mod subscription;
 
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) use apply::WorkerIndexState;
 
 /// Default jump size for new positional indexers.
