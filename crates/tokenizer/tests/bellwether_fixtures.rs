@@ -53,9 +53,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{BufRead, BufReader, Read},
+    num::NonZeroUsize,
     ops::Bound,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
 };
 
 use llm_tokenizer::{create_tokenizer, traits::Tokenizer, MockTokenizer, Sequence};
@@ -268,12 +272,8 @@ struct Report {
 }
 
 impl Report {
-    /// Count one compared case into `tally`, and keep and print its
-    /// difference if it has one.
-    #[expect(
-        clippy::print_stdout,
-        reason = "a difference is test diagnostic output, printed as it is found"
-    )]
+    /// Count one compared case into `tally`, and keep its difference if it
+    /// has one, written to `lines` as it is found.
     fn record(
         &mut self,
         id: String,
@@ -281,6 +281,7 @@ impl Report {
         ids: usize,
         tally: &mut Tally,
         known: &BTreeMap<&str, &str>,
+        lines: &mut String,
     ) {
         assert!(
             self.seen.insert(id.clone()),
@@ -293,9 +294,23 @@ impl Report {
             let listed = known_reason(known, &id).map_or(String::new(), |reason| {
                 format!("\n          known: {reason}")
             });
-            println!("  differs {id}: {why}{listed}");
+            lines.push_str(&format!("  differs {id}: {why}{listed}\n"));
             self.differences.insert(id, why);
         }
+    }
+
+    /// Take in what one model's comparison reported.
+    fn merge(&mut self, other: Report) {
+        self.loaded_dirs.extend(other.loaded_dirs);
+        for id in other.seen {
+            assert!(
+                self.seen.insert(id.clone()),
+                "{id}: recorded more than once"
+            );
+        }
+        self.differences.extend(other.differences);
+        self.unloaded.extend(other.unloaded);
+        self.mismatches.extend(other.mismatches);
     }
 
     /// What fails the run; empty when it passes.
@@ -472,9 +487,12 @@ fn encode_and_incremental_decode_match_the_reference() {
 
 /// Compare each model's render and parse sets under `root` with the tokenizer
 /// `load` gives for the model, each case as its line is read, and the cases
-/// read from each set with the model's `sets.toml`. A model whose tokenizer
-/// does not load is kept in the report and the run goes on. Prints each set
-/// read, each difference, and a tally per model.
+/// read from each set with the model's `sets.toml`. The models are compared
+/// on as many threads as the run has CPUs; what each printed is written in
+/// the manifests' order, each model as soon as it and the ones before it are
+/// done, so the output reads as a serial run's. A model whose tokenizer does
+/// not load is kept in the report and the run goes on. Prints each set read,
+/// each difference, and a tally per model.
 #[expect(
     clippy::print_stdout,
     reason = "the per-set and per-model report is test diagnostic output"
@@ -483,90 +501,19 @@ fn compare(
     root: &Path,
     manifests: &[(String, Manifest)],
     known: &BTreeMap<&str, &str>,
-    load: impl Fn(&str, &Manifest) -> Result<(Arc<dyn Tokenizer>, String), String>,
+    load: impl Fn(&str, &Manifest) -> Result<(Arc<dyn Tokenizer>, String), String> + Sync,
 ) -> Result<Report, String> {
     let mut report = Report::default();
-    let mut summaries = Vec::new();
-    for (slug, manifest) in manifests {
-        let model_dir = root.join(slug);
-        let sets = set_files(&model_dir)?;
-        let listed = read_set_table(&model_dir)?;
-        if sets.is_empty() {
-            // Nothing to compare; a set the table lists is missing.
-            let listed = listed.unwrap_or_default();
-            let mismatches = set_mismatches(slug, &BTreeMap::new(), &listed);
-            report.mismatches.extend(mismatches);
-            summaries.push(format!("{slug}: no render or parse sets"));
-            continue;
-        }
-        let Some(listed) = listed else {
-            return Err(format!(
-                "{slug}: no sets.toml beside its manifest.toml to check its sets against; \
-                 {FIXTURES_ENV} must point at the tree `bellwether unpack` writes, which carries \
-                 each model's sets.toml"
-            ));
-        };
-        let (tok, from) = match load(slug, manifest) {
-            Ok(loaded) => loaded,
-            Err(why) => {
-                summaries.push(format!("{slug}: not compared, its tokenizer did not load"));
-                report.unloaded.push((slug.clone(), why));
-                continue;
-            }
-        };
-        println!(
-            "{slug}: {} at {} from {from}",
-            manifest.model, manifest.revision
-        );
-        let mut encode = Tally::default();
-        let mut decode = Tally::default();
-        let mut read = BTreeMap::new();
-        for (kind, set, path) in &sets {
-            report.loaded_dirs.insert(format!("{slug}/{kind}"));
-            let mut tokenizers = None;
-            let cases = if *kind == "render" {
-                encode.loaded = true;
-                for_each_case(path, |case: RenderCase| {
-                    assert_eq!(case.kind, "render", "{}: not a render case", case.id);
-                    assert_eq!(
-                        case.model, manifest.model,
-                        "{}: model differs from the manifest",
-                        case.id
-                    );
-                    tokenizers.get_or_insert_with(|| recorded_with(&case.reference.provenance));
-                    let outcome = check_encode(tok.as_ref(), &case.reference);
-                    let ids = case.reference.input_ids.len();
-                    report.record(case.id, outcome, ids, &mut encode, known);
-                })?
-            } else {
-                decode.loaded = true;
-                for_each_case(path, |case: ParseCase| {
-                    assert_eq!(case.kind, "parse", "{}: not a parse case", case.id);
-                    assert_eq!(
-                        case.model, manifest.model,
-                        "{}: model differs from the manifest",
-                        case.id
-                    );
-                    tokenizers.get_or_insert_with(|| recorded_with(&case.reference.provenance));
-                    let outcome = check_decode(&tok, &case);
-                    let ids = case.output_ids.len();
-                    report.record(case.id, outcome, ids, &mut decode, known);
-                })?
-            };
-            let tokenizers = tokenizers.map_or(String::new(), |version| {
-                format!("; recorded with tokenizers {version}")
-            });
-            let counted = counts(Some(cases), listed.get(set).copied());
-            println!("  {set}: {counted}{tokenizers}");
-            read.insert(set.clone(), cases);
-        }
-        report
-            .mismatches
-            .extend(set_mismatches(slug, &read, &listed));
-        summaries.push(format!(
-            "{slug}: encode: {encode}; incremental decode: {decode}"
-        ));
-    }
+    let mut summaries = Vec::with_capacity(manifests.len());
+    in_order(
+        manifests,
+        |slug, manifest| compare_model(root, slug, manifest, known, &load),
+        |compared| {
+            print!("{}", compared.lines);
+            report.merge(compared.report);
+            summaries.push(compared.summary);
+        },
+    )?;
     println!("summary:");
     for summary in &summaries {
         println!("  {summary}");
@@ -578,6 +525,158 @@ fn compare(
         report.differences.len()
     );
     Ok(report)
+}
+
+/// What comparing one model gave: the lines a serial run would have printed
+/// for it, its line of the summary, and its part of the report.
+struct Compared {
+    lines: String,
+    summary: String,
+    report: Report,
+}
+
+/// Compare one model's sets, as [`compare`] describes.
+fn compare_model<F>(
+    root: &Path,
+    slug: &str,
+    manifest: &Manifest,
+    known: &BTreeMap<&str, &str>,
+    load: &F,
+) -> Result<Compared, String>
+where
+    F: Fn(&str, &Manifest) -> Result<(Arc<dyn Tokenizer>, String), String>,
+{
+    let mut report = Report::default();
+    let mut lines = String::new();
+    let model_dir = root.join(slug);
+    let sets = set_files(&model_dir)?;
+    let listed = read_set_table(&model_dir)?;
+    if sets.is_empty() {
+        // Nothing to compare; a set the table lists is missing.
+        let listed = listed.unwrap_or_default();
+        let mismatches = set_mismatches(slug, &BTreeMap::new(), &listed);
+        report.mismatches.extend(mismatches);
+        return Ok(Compared {
+            lines,
+            summary: format!("{slug}: no render or parse sets"),
+            report,
+        });
+    }
+    let Some(listed) = listed else {
+        return Err(format!(
+            "{slug}: no sets.toml beside its manifest.toml to check its sets against; \
+             {FIXTURES_ENV} must point at the tree `bellwether unpack` writes, which carries \
+             each model's sets.toml"
+        ));
+    };
+    let (tok, from) = match load(slug, manifest) {
+        Ok(loaded) => loaded,
+        Err(why) => {
+            report.unloaded.push((slug.to_string(), why));
+            return Ok(Compared {
+                lines,
+                summary: format!("{slug}: not compared, its tokenizer did not load"),
+                report,
+            });
+        }
+    };
+    lines.push_str(&format!(
+        "{slug}: {} at {} from {from}\n",
+        manifest.model, manifest.revision
+    ));
+    let mut encode = Tally::default();
+    let mut decode = Tally::default();
+    let mut read = BTreeMap::new();
+    for (kind, set, path) in &sets {
+        report.loaded_dirs.insert(format!("{slug}/{kind}"));
+        let mut tokenizers = None;
+        let cases = if *kind == "render" {
+            encode.loaded = true;
+            for_each_case(path, |case: RenderCase| {
+                assert_eq!(case.kind, "render", "{}: not a render case", case.id);
+                assert_eq!(
+                    case.model, manifest.model,
+                    "{}: model differs from the manifest",
+                    case.id
+                );
+                tokenizers.get_or_insert_with(|| recorded_with(&case.reference.provenance));
+                let outcome = check_encode(tok.as_ref(), &case.reference);
+                let ids = case.reference.input_ids.len();
+                report.record(case.id, outcome, ids, &mut encode, known, &mut lines);
+            })?
+        } else {
+            decode.loaded = true;
+            for_each_case(path, |case: ParseCase| {
+                assert_eq!(case.kind, "parse", "{}: not a parse case", case.id);
+                assert_eq!(
+                    case.model, manifest.model,
+                    "{}: model differs from the manifest",
+                    case.id
+                );
+                tokenizers.get_or_insert_with(|| recorded_with(&case.reference.provenance));
+                let outcome = check_decode(&tok, &case);
+                let ids = case.output_ids.len();
+                report.record(case.id, outcome, ids, &mut decode, known, &mut lines);
+            })?
+        };
+        let tokenizers = tokenizers.map_or(String::new(), |version| {
+            format!("; recorded with tokenizers {version}")
+        });
+        let counted = counts(Some(cases), listed.get(set).copied());
+        lines.push_str(&format!("  {set}: {counted}{tokenizers}\n"));
+        read.insert(set.clone(), cases);
+    }
+    report
+        .mismatches
+        .extend(set_mismatches(slug, &read, &listed));
+    Ok(Compared {
+        lines,
+        summary: format!("{slug}: encode: {encode}; incremental decode: {decode}"),
+        report,
+    })
+}
+
+/// Run `each` on every model, on as many threads as the run has CPUs, and
+/// hand what it gives to `then` in the models' order, each as soon as it and
+/// the ones before it are done. An error from `each` ends the run once the
+/// models in flight are done.
+fn in_order<T: Send>(
+    manifests: &[(String, Manifest)],
+    each: impl Fn(&str, &Manifest) -> Result<T, String> + Sync,
+    mut then: impl FnMut(T),
+) -> Result<(), String> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(manifests.len())
+        .max(1);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let (next, each) = (&next, &each);
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((slug, manifest)) = manifests.get(index) else {
+                    break;
+                };
+                if tx.send((index, each(slug, manifest))).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(tx);
+        let mut pending = BTreeMap::new();
+        let mut done = 0;
+        for (index, outcome) in rx {
+            pending.insert(index, outcome);
+            while let Some(outcome) = pending.remove(&done) {
+                then(outcome?);
+                done += 1;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Encode the reference text as the gateway encodes a rendered prompt, without

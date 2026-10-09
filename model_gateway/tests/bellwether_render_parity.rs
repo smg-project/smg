@@ -50,9 +50,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{BufRead, BufReader, Read},
+    num::NonZeroUsize,
     ops::Bound,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
 };
 
 use llm_tokenizer::{create_tokenizer, traits::Tokenizer, MockTokenizer};
@@ -1572,18 +1576,15 @@ struct Report {
 }
 
 impl Report {
-    /// Count one compared case into `tally`, and keep and print its
-    /// difference if it has one.
-    #[expect(
-        clippy::print_stdout,
-        reason = "a difference is test diagnostic output, printed as it is found"
-    )]
+    /// Count one compared case into `tally`, and keep its difference if it
+    /// has one, written to `lines` as it is found.
     fn record(
         &mut self,
         fixture: &Fixture,
         outcome: Result<(), String>,
         tally: &mut Tally,
         known: &BTreeMap<&str, &str>,
+        lines: &mut String,
     ) {
         self.seen.insert(fixture.id.clone());
         tally.cases += 1;
@@ -1596,12 +1597,22 @@ impl Report {
             let listed = known_reason(known, &fixture.id).map_or(String::new(), |reason| {
                 format!("\n          known: {reason}")
             });
-            println!(
-                "  differs {} (reference {}): {why}{listed}",
+            lines.push_str(&format!(
+                "  differs {} (reference {}): {why}{listed}\n",
                 fixture.id, fixture.reference.source
-            );
+            ));
             self.differences.insert(fixture.id.clone(), why);
         }
+    }
+
+    /// Take in what one model's comparison reported.
+    fn merge(&mut self, other: Report) {
+        self.loaded_slugs.extend(other.loaded_slugs);
+        self.seen.extend(other.seen);
+        self.differences.extend(other.differences);
+        self.witnessed += other.witnessed;
+        self.unloaded.extend(other.unloaded);
+        self.mismatches.extend(other.mismatches);
     }
 
     /// What fails the run; empty when it passes.
@@ -1758,7 +1769,10 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
 /// Render each model's render sets under `root` through the chat request path
 /// with the tokenizer `load` gives for the model, each case as its line is
 /// read, and compare the cases read from each set with the model's
-/// `sets.toml`. A model whose tokenizer does not load is kept in the report
+/// `sets.toml`. The models are compared on as many threads as the run has
+/// CPUs; what each printed is written in the manifests' order, each model as
+/// soon as it and the ones before it are done, so the output reads as a
+/// serial run's. A model whose tokenizer does not load is kept in the report
 /// and the run goes on. Prints each set read, each difference, and a tally
 /// per model.
 #[expect(
@@ -1769,78 +1783,19 @@ fn compare(
     root: &Path,
     manifests: &[(String, Manifest)],
     known: &BTreeMap<&str, &str>,
-    load: impl Fn(&str, &Manifest) -> Result<(Arc<dyn Tokenizer>, String), String>,
+    load: impl Fn(&str, &Manifest) -> Result<(Arc<dyn Tokenizer>, String), String> + Sync,
 ) -> Result<Report, String> {
     let mut report = Report::default();
-    let mut summaries = Vec::new();
-    for (slug, manifest) in manifests {
-        let model_dir = root.join(slug);
-        let sets = set_files(&model_dir)?;
-        let listed = read_set_table(&model_dir)?;
-        if sets.is_empty() {
-            // Nothing to compare; a set the table lists is missing.
-            let listed = listed.unwrap_or_default();
-            let mismatches = set_mismatches(slug, &BTreeMap::new(), &listed);
-            report.mismatches.extend(mismatches);
-            summaries.push(format!("{slug}: no render sets"));
-            continue;
-        }
-        let Some(listed) = listed else {
-            return Err(format!(
-                "{slug}: no sets.toml beside its manifest.toml to check its sets against; \
-                 {FIXTURES_ENV} must point at the tree `bellwether unpack` writes, which carries \
-                 each model's sets.toml"
-            ));
-        };
-        let (tok, from) = match load(slug, manifest) {
-            Ok(loaded) => loaded,
-            Err(why) => {
-                summaries.push(format!("{slug}: not compared, its tokenizer did not load"));
-                report.unloaded.push((slug.clone(), why));
-                continue;
-            }
-        };
-        report.loaded_slugs.insert(slug.clone());
-        println!(
-            "{slug}: {} at {} from {from}",
-            manifest.model, manifest.revision
-        );
-        let mut tally = Tally::default();
-        let mut read = BTreeMap::new();
-        for (_, set, path) in &sets {
-            let mut transformers = None;
-            let cases = for_each_case(path, |fixture: Fixture| {
-                assert_eq!(fixture.kind, "render", "{}: not a render case", fixture.id);
-                assert_eq!(
-                    fixture.model, manifest.model,
-                    "{}: model differs from the manifest",
-                    fixture.id
-                );
-                transformers.get_or_insert_with(|| recorded_with(&fixture.reference.provenance));
-                let outcome = match render(tok.as_ref(), &manifest.model, &fixture.request) {
-                    Err(e) => Err(e),
-                    Ok(got)
-                        if got.text == fixture.reference.text
-                            && got.ids == fixture.reference.input_ids =>
-                    {
-                        Ok(())
-                    }
-                    Ok(got) => Err(describe(&got, &fixture.reference)),
-                };
-                report.record(&fixture, outcome, &mut tally, known);
-            })?;
-            let transformers = transformers.map_or(String::new(), |version| {
-                format!("; recorded with transformers {version}")
-            });
-            let counted = counts(Some(cases), listed.get(set).copied());
-            println!("  {set}: {counted}{transformers}");
-            read.insert(set.clone(), cases);
-        }
-        report
-            .mismatches
-            .extend(set_mismatches(slug, &read, &listed));
-        summaries.push(format!("{slug}: {tally}"));
-    }
+    let mut summaries = Vec::with_capacity(manifests.len());
+    in_order(
+        manifests,
+        |slug, manifest| compare_model(root, slug, manifest, known, &load),
+        |compared| {
+            print!("{}", compared.lines);
+            report.merge(compared.report);
+            summaries.push(compared.summary);
+        },
+    )?;
     println!("summary:");
     for summary in &summaries {
         println!("  {summary}");
@@ -1852,6 +1807,148 @@ fn compare(
         report.witnessed
     );
     Ok(report)
+}
+
+/// What comparing one model gave: the lines a serial run would have printed
+/// for it, its line of the summary, and its part of the report.
+struct Compared {
+    lines: String,
+    summary: String,
+    report: Report,
+}
+
+/// Compare one model's render sets, as [`compare`] describes.
+fn compare_model<F>(
+    root: &Path,
+    slug: &str,
+    manifest: &Manifest,
+    known: &BTreeMap<&str, &str>,
+    load: &F,
+) -> Result<Compared, String>
+where
+    F: Fn(&str, &Manifest) -> Result<(Arc<dyn Tokenizer>, String), String>,
+{
+    let mut report = Report::default();
+    let mut lines = String::new();
+    let model_dir = root.join(slug);
+    let sets = set_files(&model_dir)?;
+    let listed = read_set_table(&model_dir)?;
+    if sets.is_empty() {
+        // Nothing to compare; a set the table lists is missing.
+        let listed = listed.unwrap_or_default();
+        let mismatches = set_mismatches(slug, &BTreeMap::new(), &listed);
+        report.mismatches.extend(mismatches);
+        return Ok(Compared {
+            lines,
+            summary: format!("{slug}: no render sets"),
+            report,
+        });
+    }
+    let Some(listed) = listed else {
+        return Err(format!(
+            "{slug}: no sets.toml beside its manifest.toml to check its sets against; \
+             {FIXTURES_ENV} must point at the tree `bellwether unpack` writes, which carries \
+             each model's sets.toml"
+        ));
+    };
+    let (tok, from) = match load(slug, manifest) {
+        Ok(loaded) => loaded,
+        Err(why) => {
+            report.unloaded.push((slug.to_string(), why));
+            return Ok(Compared {
+                lines,
+                summary: format!("{slug}: not compared, its tokenizer did not load"),
+                report,
+            });
+        }
+    };
+    report.loaded_slugs.insert(slug.to_string());
+    lines.push_str(&format!(
+        "{slug}: {} at {} from {from}\n",
+        manifest.model, manifest.revision
+    ));
+    let mut tally = Tally::default();
+    let mut read = BTreeMap::new();
+    for (_, set, path) in &sets {
+        let mut transformers = None;
+        let cases = for_each_case(path, |fixture: Fixture| {
+            assert_eq!(fixture.kind, "render", "{}: not a render case", fixture.id);
+            assert_eq!(
+                fixture.model, manifest.model,
+                "{}: model differs from the manifest",
+                fixture.id
+            );
+            transformers.get_or_insert_with(|| recorded_with(&fixture.reference.provenance));
+            let outcome = match render(tok.as_ref(), &manifest.model, &fixture.request) {
+                Err(e) => Err(e),
+                Ok(got)
+                    if got.text == fixture.reference.text
+                        && got.ids == fixture.reference.input_ids =>
+                {
+                    Ok(())
+                }
+                Ok(got) => Err(describe(&got, &fixture.reference)),
+            };
+            report.record(&fixture, outcome, &mut tally, known, &mut lines);
+        })?;
+        let transformers = transformers.map_or(String::new(), |version| {
+            format!("; recorded with transformers {version}")
+        });
+        let counted = counts(Some(cases), listed.get(set).copied());
+        lines.push_str(&format!("  {set}: {counted}{transformers}\n"));
+        read.insert(set.clone(), cases);
+    }
+    report
+        .mismatches
+        .extend(set_mismatches(slug, &read, &listed));
+    Ok(Compared {
+        lines,
+        summary: format!("{slug}: {tally}"),
+        report,
+    })
+}
+
+/// Run `each` on every model, on as many threads as the run has CPUs, and
+/// hand what it gives to `then` in the models' order, each as soon as it and
+/// the ones before it are done. An error from `each` ends the run once the
+/// models in flight are done.
+fn in_order<T: Send>(
+    manifests: &[(String, Manifest)],
+    each: impl Fn(&str, &Manifest) -> Result<T, String> + Sync,
+    mut then: impl FnMut(T),
+) -> Result<(), String> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(manifests.len())
+        .max(1);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let (next, each) = (&next, &each);
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((slug, manifest)) = manifests.get(index) else {
+                    break;
+                };
+                if tx.send((index, each(slug, manifest))).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(tx);
+        let mut pending = BTreeMap::new();
+        let mut done = 0;
+        for (index, outcome) in rx {
+            pending.insert(index, outcome);
+            while let Some(outcome) = pending.remove(&done) {
+                then(outcome?);
+                done += 1;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Hand a corpus request to the gateway's own request processing. The request
