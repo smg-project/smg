@@ -57,12 +57,14 @@ on:
 permissions:
   contents: read
 
-# One group per pull request and one per branch: a newer push cancels the
-# superseded run. Keep the pull request form in sync with
-# cancel-pr-workflows.yml.
+# One group per pull request and one per branch. A newer push to a pull
+# request cancels the superseded run; a push to a branch lets the running run
+# complete and queues behind it (one pending run per group), so main keeps a
+# completed run through a burst of merges. Keep the pull request form in sync
+# with cancel-pr-workflows.yml.
 concurrency:
   group: bellwether-fixtures-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   RUSTC_WRAPPER: sccache
