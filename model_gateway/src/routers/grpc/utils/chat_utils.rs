@@ -174,6 +174,11 @@ pub(crate) async fn encode_prompt_blocking(
     encoding: PromptEncoding,
 ) -> anyhow::Result<Encoding> {
     match encoding {
+        // Only the offloaded encode needs its own copy of the prompt, to move
+        // onto the blocking thread; inline encodes borrow it.
+        PromptEncoding::FromText if text.len() < ENCODE_OFFLOAD_MIN_BYTES => {
+            tokenizer.encode(text, false)
+        }
         PromptEncoding::FromText => encode_blocking(tokenizer, text.to_string(), false).await,
         PromptEncoding::Deferred(job) => offload(text.len(), move || job.run()).await,
     }

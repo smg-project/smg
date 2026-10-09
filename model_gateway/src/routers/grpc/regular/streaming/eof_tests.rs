@@ -7,7 +7,7 @@ use bytes::BufMut;
 use http_body::Frame;
 use http_body_util::StreamBody;
 use llm_tokenizer::{traits::Encoding, SpecialTokens};
-use openai_protocol::chat::ChatCompletionRequest;
+use openai_protocol::{chat::ChatCompletionRequest, completion::CompletionRequest};
 use prost::Message as ProstMessage;
 use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
@@ -250,6 +250,7 @@ async fn chat_events(
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             (None, None, false, false, false),
+            None,
             chat_spec(with_tools),
             &tx,
             None,
@@ -412,6 +413,7 @@ async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
                 dispatch(),
                 Arc::new(CharacterTokenizer::default()),
                 (None, None, false, false, false),
+                None,
                 spec,
                 &tx,
                 None,
@@ -484,6 +486,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
                 dispatch(),
                 Arc::new(CharacterTokenizer::default()),
                 (None, None, false, false, false),
+                None,
                 spec,
                 &tx,
                 None,
@@ -564,6 +567,7 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
                 dispatch(),
                 tokenizer,
                 (None, None, false, false, false),
+                None,
                 spec,
                 &tx,
                 None,
@@ -662,6 +666,7 @@ async fn deepseek_usage_rides_on_the_last_finish_chunk() {
                     dispatch(),
                     Arc::new(CharacterTokenizer::default()),
                     (None, None, false, false, false),
+                    None,
                     spec,
                     &tx,
                     None,
@@ -724,6 +729,7 @@ async fn deepseek_does_not_emit_aggregate_usage_without_complete_frames() {
                 dispatch(),
                 Arc::new(CharacterTokenizer::default()),
                 (None, None, false, false, false),
+                None,
                 ChatResponseSpec::from(&req),
                 &tx,
                 None,
@@ -878,6 +884,7 @@ async fn messages_blocks_and_inputs(
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             (None, None, false, false, false),
+            None,
             spec,
             &tx,
             None,
@@ -1177,5 +1184,120 @@ async fn messages_tool_arguments_need_an_open_block() {
             ]
         );
         assert_eq!(inputs, [input]);
+    }
+}
+
+/// The stop decoder preparation built is handed to the stream for choice 0;
+/// the other choices of an n>1 request build theirs from the stream's stop
+/// parameters. Only the prepared decoder knows "END" and only a decoder built
+/// from the parameters knows "FIN", so each choice's stop tells which one ran.
+#[tokio::test]
+async fn chat_prepared_stop_decoder_serves_choice_zero_and_others_build_their_own() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let prepared_stop = StringOrArray::String("END".to_string());
+    let prepared =
+        utils::create_stop_decoder(&tokenizer, Some(&prepared_stop), None, false, false, false);
+    let stream_stop = StringOrArray::String("FIN".to_string());
+    let (stream, server) = scripted_stream(
+        vec![
+            chunk(0, "one END tail"),
+            chunk(1, "two FIN tail"),
+            complete(0, "length"),
+            complete(1, "length"),
+        ],
+        "0",
+    )
+    .await;
+    let (tx, rx) = sse_channel();
+    let result = processor(false)
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            tokenizer,
+            (Some(stream_stop), None, false, false, false),
+            Some(prepared),
+            chat_spec(false),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "content"), "one ");
+    assert_eq!(chat_text(&events, 1, "content"), "two ");
+    for (index, matched) in [(0, "END"), (1, "FIN")] {
+        let finish = events
+            .iter()
+            .map(|event| &event["choices"][0])
+            .find(|choice| choice["index"] == index && !choice["finish_reason"].is_null())
+            .unwrap_or_else(|| panic!("no finish chunk for choice {index}: {events:?}"));
+        assert_eq!(finish["finish_reason"], "stop");
+        assert_eq!(finish["matched_stop"], matched);
+    }
+}
+
+/// Completions seed the prepared decoder at the prompt's first choice index
+/// (`index_offset`), so a later prompt's first choice gets it and its second
+/// choice builds its own from the stop parameters.
+#[tokio::test]
+async fn completion_prepared_stop_decoder_is_seeded_at_the_index_offset() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let prepared_stop = StringOrArray::String("END".to_string());
+    let prepared =
+        utils::create_stop_decoder(&tokenizer, Some(&prepared_stop), None, false, false, false);
+    let stream_stop = StringOrArray::String("FIN".to_string());
+    let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "eof-test", "prompt": ["first", "second"], "n": 2, "stream": true, "stop": "FIN"
+    }))
+    .expect("completion request");
+    let spec = CompletionResponseSpec::from(&request);
+    let (stream, server) = scripted_stream(
+        vec![
+            chunk(0, "one END tail"),
+            chunk(1, "two FIN tail"),
+            complete(0, "length"),
+            complete(1, "length"),
+        ],
+        "0",
+    )
+    .await;
+    let (tx, rx) = sse_channel();
+    let outcome = processor(false)
+        .process_completion_streaming_chunks(
+            stream,
+            dispatch(),
+            tokenizer,
+            (Some(stream_stop), None, false, false, false),
+            Some(prepared),
+            &spec,
+            "",
+            2,
+            &tx,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+    let text = |index: u32| -> String {
+        events
+            .iter()
+            .map(|event| &event["choices"][0])
+            .filter(|choice| choice["index"] == index)
+            .filter_map(|choice| choice["text"].as_str())
+            .collect()
+    };
+    assert_eq!(text(2), "one ");
+    assert_eq!(text(3), "two ");
+    for index in [2, 3] {
+        assert!(
+            events
+                .iter()
+                .map(|event| &event["choices"][0])
+                .any(|choice| choice["index"] == index && choice["finish_reason"] == "stop"),
+            "choice {index} did not stop on its decoder: {events:?}"
+        );
     }
 }

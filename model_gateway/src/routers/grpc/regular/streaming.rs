@@ -199,6 +199,7 @@ impl StreamingProcessor {
     ///
     /// Note: Caller should attach load guards to the returned response using
     /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -206,6 +207,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         use bytes::Bytes;
@@ -243,6 +245,7 @@ impl StreamingProcessor {
                             dispatch_clone,
                             tokenizer_clone,
                             stop_params,
+                            prepared_stop_decoder,
                             chat_request,
                             &tx,
                             reservation,
@@ -278,6 +281,7 @@ impl StreamingProcessor {
                             dispatch,
                             tokenizer_clone,
                             stop_params,
+                            prepared_stop_decoder,
                             chat_request,
                             &tx,
                             pd_timing,
@@ -330,6 +334,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         original_request: ChatResponseSpec,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
@@ -339,6 +344,7 @@ impl StreamingProcessor {
             dispatch,
             tokenizer,
             stop_params,
+            prepared_stop_decoder,
             original_request,
             tx,
             None,
@@ -357,6 +363,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         original_request: ChatResponseSpec,
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
@@ -390,7 +397,6 @@ impl StreamingProcessor {
 
         // Phase 1: Initialize state tracking (per-index for n>1 support)
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
-        let mut stream_buffers: HashMap<u32, String> = HashMap::new();
         let mut finish_reasons: HashMap<u32, String> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<Value>> = HashMap::new();
         // Indices whose local stop decoder fired: their finish reason is pinned
@@ -411,8 +417,13 @@ impl StreamingProcessor {
         let mut tool_parsers: HashMap<u32, PooledToolParser> = HashMap::new();
         let mut has_tool_calls: HashMap<u32, bool> = HashMap::new();
 
-        // Per-index stop decoders (each index needs its own state for n>1 support)
+        // Per-index stop decoders (each index needs its own state for n>1 support).
+        // Preparation already built the first choice's decoder; the other
+        // choices of an n>1 request build theirs on first use.
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
+        if let Some(decoder) = prepared_stop_decoder {
+            stop_decoders.insert(0, decoder);
+        }
 
         // Reusable SSE encoder for the post-loop flush / tool / finish / usage
         // chunks, which previously each did `to_string` + `format!`.
@@ -650,9 +661,6 @@ impl StreamingProcessor {
                 continue;
             };
 
-            // Initialize stream buffer if first time
-            let stream_buffer = stream_buffers.entry(index).or_default();
-
             // Send first chunk with role
             if is_firsts.get(&index).copied().unwrap_or(true) {
                 let first_choice = assistant_choice(index, None, None, None);
@@ -671,7 +679,6 @@ impl StreamingProcessor {
 
             // Calculate delta
             let mut delta = text;
-            stream_buffer.push_str(&delta);
 
             // Reasoning content handling
             let in_reasoning = if separate_reasoning && reasoning_parser_available {
@@ -967,6 +974,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         original_request: ChatResponseSpec,
         tx: &SseSender,
         pd_timing: context::PdTiming,
@@ -988,6 +996,7 @@ impl StreamingProcessor {
                 dispatch,
                 tokenizer,
                 stop_params,
+                prepared_stop_decoder,
                 original_request,
                 tx,
                 Some(pd_timing),
@@ -1968,6 +1977,7 @@ impl StreamingProcessor {
     ///
     /// Parallel to [`Self::process_streaming_response`] for chat, but emits
     /// Anthropic SSE format (`event: {type}\ndata: {json}\n\n`).
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -1975,6 +1985,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         let stop_params = (
@@ -2006,6 +2017,7 @@ impl StreamingProcessor {
                             dispatch_clone,
                             tokenizer_clone,
                             stop_params,
+                            prepared_stop_decoder,
                             messages_request,
                             &tx,
                             reservation,
@@ -2046,6 +2058,7 @@ impl StreamingProcessor {
                             dispatch,
                             tokenizer_clone,
                             stop_params,
+                            prepared_stop_decoder,
                             messages_request,
                             &tx,
                             prefill_guards,
@@ -2102,6 +2115,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         original_request: MessagesResponseSpec,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
@@ -2127,8 +2141,8 @@ impl StreamingProcessor {
         // Parser state (simple variables — Messages is always n=1)
         let mut reasoning_parser: Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>> = None;
 
-        // Stop decoder
-        let mut stop_decoder = {
+        // Stop decoder: the one preparation built, when it was handed over.
+        let mut stop_decoder = prepared_stop_decoder.unwrap_or_else(|| {
             let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) =
                 stop_params;
             utils::create_stop_decoder(
@@ -2139,7 +2153,7 @@ impl StreamingProcessor {
                 no_stop_trim,
                 ignore_eos,
             )
-        };
+        });
 
         // Token tracking
         let mut completion_tokens = CompletionTokenTracker::new();
@@ -2852,6 +2866,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         original_request: MessagesResponseSpec,
         tx: &SseSender,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
@@ -2868,6 +2883,7 @@ impl StreamingProcessor {
                 dispatch,
                 tokenizer,
                 stop_params,
+                prepared_stop_decoder,
                 original_request,
                 tx,
                 reservation,
@@ -2897,6 +2913,7 @@ impl StreamingProcessor {
         completion_request: CompletionResponseSpec,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         let (tx, rx) = sse_channel();
@@ -2924,6 +2941,9 @@ impl StreamingProcessor {
             // Fail-fast: the first stream error cancels the remaining units
             // (their streams abort on drop) and fails the whole request.
             let completion_request = &completion_request;
+            // Preparation's decoder serves the first prompt's first choice;
+            // every other (prompt, choice) builds its own on first use.
+            let mut prepared_stop_decoder = prepared_stop_decoder;
             let outcomes =
                 try_join_all(units.into_iter().enumerate().map(|(prompt_index, unit)| {
                     let stop_params = (
@@ -2951,6 +2971,11 @@ impl StreamingProcessor {
                         ""
                     };
                     let index_offset = prompt_index as u32 * choices_per_prompt;
+                    let prepared_stop_decoder = if prompt_index == 0 {
+                        prepared_stop_decoder.take()
+                    } else {
+                        None
+                    };
                     let processor = &processor;
                     let tx = &tx;
                     async move {
@@ -2962,6 +2987,7 @@ impl StreamingProcessor {
                                         dispatch,
                                         tokenizer,
                                         stop_params,
+                                        prepared_stop_decoder,
                                         completion_request,
                                         prompt_text,
                                         index_offset,
@@ -2981,6 +3007,7 @@ impl StreamingProcessor {
                                         dispatch,
                                         tokenizer,
                                         stop_params,
+                                        prepared_stop_decoder,
                                         completion_request,
                                         prompt_text,
                                         index_offset,
@@ -3138,6 +3165,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         completion_request: &CompletionResponseSpec,
         prompt_text: &str,
         index_offset: u32,
@@ -3154,6 +3182,9 @@ impl StreamingProcessor {
         let suffix = completion_request.suffix.as_deref();
 
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
+        if let Some(decoder) = prepared_stop_decoder {
+            stop_decoders.insert(index_offset, decoder);
+        }
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
         let mut stopped_indices: HashSet<u32> = HashSet::new();
         let mut sse_buffer = Vec::with_capacity(512);
@@ -3456,6 +3487,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        prepared_stop_decoder: Option<StopSequenceDecoder>,
         original_request: &CompletionResponseSpec,
         prompt_text: &str,
         index_offset: u32,
@@ -3472,6 +3504,7 @@ impl StreamingProcessor {
                 dispatch,
                 tokenizer,
                 stop_params,
+                prepared_stop_decoder,
                 original_request,
                 prompt_text,
                 index_offset,

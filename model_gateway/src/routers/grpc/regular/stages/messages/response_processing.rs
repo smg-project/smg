@@ -115,6 +115,7 @@ impl ProcessStage for MessageResponseProcessingStage {
                     dispatch,
                     tokenizer,
                     skip_special_tokens,
+                    ctx.response.stop_decoder.take(),
                     reservation.clone(),
                 )
                 .await;

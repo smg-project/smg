@@ -109,6 +109,7 @@ impl ProcessStage for CompletionResponseProcessingStage {
                     completion_request,
                     dispatch,
                     tokenizer,
+                    ctx.response.stop_decoder.take(),
                     reservation.clone(),
                 )
                 .await;
