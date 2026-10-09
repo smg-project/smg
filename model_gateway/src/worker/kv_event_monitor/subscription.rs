@@ -37,6 +37,19 @@ async fn woken(wake: Option<&Arc<tokio::sync::Notify>>) {
     }
 }
 
+/// Take a contact noted before now (`notify_one` keeps one until it is
+/// awaited), so that only a contact after this point ends a wait: the
+/// connect of a stream that then failed was a contact, and says nothing
+/// about the worker now.
+fn drain_contact(wake: Option<&Arc<tokio::sync::Notify>>) {
+    if let Some(notify) = wake {
+        let mut notified = std::pin::pin!(notify.notified());
+        // Consumes a stored permit without waiting; a waiter it registered
+        // instead goes away with the future.
+        let _ = notified.as_mut().enable();
+    }
+}
+
 /// How long a subscription call may take to answer with headers. A port that
 /// accepts but does not serve yet (an engine still starting) hangs the call.
 const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(2);
@@ -72,6 +85,29 @@ enum StreamResult {
     Error(tonic::Status),
     /// Detected a gap in sequence numbers.
     GapDetected { expected: u64, received: u64 },
+}
+
+/// The label a stream error is counted under: its gRPC status code.
+fn error_class(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::Unknown => "unknown",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Internal => "internal",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::Unauthenticated => "unauthenticated",
+    }
 }
 
 impl KvEventMonitor {
@@ -183,10 +219,12 @@ impl KvEventMonitor {
 
         /// Sleep with shutdown check. Returns `true` if shutdown was signaled.
         /// A contact with the worker ends the sleep early, but never before
-        /// `RECONNECT_FLOOR`.
+        /// `RECONNECT_FLOOR`, and only one made after the sleep began: the
+        /// connect of a stream that then failed does not count.
         macro_rules! sleep_or_shutdown {
             ($delay:expr, $rx:expr) => {{
                 let delay: Duration = $delay;
+                drain_contact(wake.as_ref());
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => false,
                     () = async {
@@ -292,7 +330,10 @@ impl KvEventMonitor {
                         "KV event stream connected"
                     );
                     Metrics::record_kv_event_subscription(&worker_url);
-                    reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
+                    // The backoff is not reset here: a connect is no proof of
+                    // a working stream (one that fails on its first message
+                    // would be retried at the initial delay forever); it is
+                    // reset once the stream has delivered a batch.
                     state.reconnected();
                     liveness::on_contact(&worker);
                     stream
@@ -358,7 +399,9 @@ impl KvEventMonitor {
                 }
             };
 
+            let mut applied = false;
             let on_batch = |batch: &KvEventBatch| {
+                applied = true;
                 liveness::on_contact(&worker);
                 Self::learn_block_size(&block_sizes, &model_id, &mut block_size_learned, batch);
             };
@@ -390,6 +433,10 @@ impl KvEventMonitor {
                 }
             };
 
+            if applied {
+                // The stream worked: its failure starts the backoff over.
+                reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
+            }
             if state.abandon_snapshot() {
                 warn!(
                     worker_url = %worker_url,
@@ -423,6 +470,7 @@ impl KvEventMonitor {
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
                 StreamResult::Error(e) => {
+                    Metrics::record_kv_event_stream_error(&worker_url, error_class(e.code()));
                     if e.code() == tonic::Code::DataLoss {
                         warn!(
                             worker_url = %worker_url,
@@ -523,7 +571,7 @@ impl KvEventMonitor {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, pin::Pin};
+    use std::{net::SocketAddr, pin::Pin, sync::Mutex};
 
     use futures::Stream;
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
@@ -540,17 +588,26 @@ mod tests {
     use super::*;
     use crate::worker::BasicWorkerBuilder;
 
-    /// A scheduler whose `SubscribeKvEvents` accepts the call and never
-    /// answers it, as an engine still starting behind an open port does.
-    struct HangingScheduler;
+    /// What the test scheduler's `SubscribeKvEvents` does.
+    enum Subscribe {
+        /// Accepts the call and never answers it, as an engine still
+        /// starting behind an open port does.
+        Hang,
+        /// Answers at once with a stream that fails on its first message,
+        /// as a server does whose first message the client cannot decode;
+        /// each call's arrival is noted.
+        FailFirstMessage(Arc<Mutex<Vec<Instant>>>),
+    }
 
-    type Never<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+    struct TestScheduler(Subscribe);
+
+    type ServerStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
     #[tonic::async_trait]
-    impl TokenSpeedScheduler for HangingScheduler {
-        type GenerateStream = Never<ts::GenerateResponse>;
-        type SubscribeKvEventsStream = Never<KvEventBatch>;
-        type GetTokenizerStream = Never<common::GetTokenizerChunk>;
+    impl TokenSpeedScheduler for TestScheduler {
+        type GenerateStream = ServerStream<ts::GenerateResponse>;
+        type SubscribeKvEventsStream = ServerStream<KvEventBatch>;
+        type GetTokenizerStream = ServerStream<common::GetTokenizerChunk>;
 
         async fn generate(
             &self,
@@ -598,7 +655,17 @@ mod tests {
             &self,
             _: Request<common::SubscribeKvEventsRequest>,
         ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-            std::future::pending().await
+            match &self.0 {
+                Subscribe::Hang => std::future::pending().await,
+                Subscribe::FailFirstMessage(calls) => {
+                    calls.lock().unwrap().push(Instant::now());
+                    Ok(Response::new(Box::pin(futures::stream::once(async {
+                        Err(Status::out_of_range(
+                            "the first message is larger than the decode limit",
+                        ))
+                    }))))
+                }
+            }
         }
 
         async fn flush_cache(
@@ -667,7 +734,9 @@ mod tests {
         )]
         let server = tokio::spawn(
             Server::builder()
-                .add_service(TokenSpeedSchedulerServer::new(HangingScheduler))
+                .add_service(TokenSpeedSchedulerServer::new(TestScheduler(
+                    Subscribe::Hang,
+                )))
                 .serve(addr),
         );
         wait_until_listening(addr).await;
@@ -702,6 +771,85 @@ mod tests {
 
         pinger.abort();
         server.abort();
+    }
+
+    /// A stream that fails on its first message is a failed subscription,
+    /// not a working one: the delay before the next attempt doubles from
+    /// attempt to attempt instead of restarting at the initial delay on
+    /// every connect, the worker's own answer to the subscribe call does
+    /// not end the wait early, and the failure is counted by its code.
+    #[test]
+    fn a_stream_that_fails_on_its_first_message_backs_off_and_is_counted() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let port = portpicker::pick_unused_port().expect("a free port");
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        // One thread, so the subscription task's metrics land on this
+        // thread's recorder.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the test scheduler lives as long as the test"
+                )]
+                let server = tokio::spawn(
+                    Server::builder()
+                        .add_service(TokenSpeedSchedulerServer::new(TestScheduler(
+                            Subscribe::FailFirstMessage(Arc::clone(&calls)),
+                        )))
+                        .serve(addr),
+                );
+                wait_until_listening(addr).await;
+                let worker = grpc_worker(addr);
+                let monitor = KvEventMonitor::new(None);
+                monitor.on_worker_added(&worker).await;
+                tokio::time::sleep(Duration::from_millis(1_900)).await;
+                monitor.on_worker_removed(worker.url()).await;
+                server.abort();
+            });
+        });
+
+        // Attempts at about 0, 100, 300, 700 and 1,500 ms: five in 1.9 s,
+        // where a backoff reset on every connect made nineteen.
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            (3..=6).contains(&calls.len()),
+            "{} subscribe calls in 1.9 s",
+            calls.len()
+        );
+        let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(
+            gaps.windows(2).all(|pair| pair[1] > pair[0]),
+            "the gaps do not grow: {gaps:?}"
+        );
+        assert!(
+            gaps.last().unwrap() >= &Duration::from_millis(600),
+            "{gaps:?}"
+        );
+
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with("smg_kv_event_stream_errors_total{"))
+            .unwrap_or_else(|| panic!("no stream error counted:\n{rendered}"));
+        assert!(
+            line.contains(&format!("worker=\"grpc://{addr}\"")),
+            "{line}"
+        );
+        assert!(line.contains("error=\"out_of_range\""), "{line}");
+        let errors: f64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!(
+            errors >= 3.0 && errors as usize <= calls.len(),
+            "{errors} errors for {} calls",
+            calls.len()
+        );
     }
 
     #[tokio::test]

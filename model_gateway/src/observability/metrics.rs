@@ -362,6 +362,11 @@ pub(crate) fn init_metrics() {
         "KV event streams connected, by worker; a reconnect counts again"
     );
     describe_counter!(
+        "smg_kv_event_stream_errors_total",
+        "KV event streams that failed after connecting, by worker and error (the gRPC \
+         status code: out_of_range, unavailable, data_loss, ...)"
+    );
+    describe_counter!(
         "smg_kv_event_batches_total",
         "KV event batches by worker and disposition (applied, stale, tail_overflow, snapshot)"
     );
@@ -1728,6 +1733,19 @@ impl Metrics {
         counter!(
             "smg_kv_event_subscriptions_total",
             "worker" => intern_string(worker_url)
+        )
+        .increment(1);
+    }
+
+    /// Count a KV event stream that failed after it connected, by the
+    /// error's gRPC status code: a stream that dies on its first message at
+    /// every reconnect shows here, where the connect counter alone reads as
+    /// a healthy subscription.
+    pub fn record_kv_event_stream_error(worker_url: &str, error: &'static str) {
+        counter!(
+            "smg_kv_event_stream_errors_total",
+            "worker" => intern_string(worker_url),
+            "error" => error
         )
         .increment(1);
     }
