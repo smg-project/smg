@@ -252,8 +252,9 @@ capture on, and they are independent of each other. A request header asks for it
   `matched_units` of `input_units` with the `credited_units` the chosen worker is expected to have
   cached.
 - A request that carries the header `x-smg-cache-trace: 1` gets the same response header whatever
-  the two switches say, and no log line: one request's evidence on a running gateway, without a
-  restart. The switches keep their meaning for every other request.
+  the two switches say: one request's evidence on a running gateway, without a restart. The header
+  alone writes no log line; `SMG_CACHE_TRACE=1` keeps logging every dispatch, the opted-in ones
+  included, and both switches keep their meaning for every other request.
 
 ## Testing without engines
 

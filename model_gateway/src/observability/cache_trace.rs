@@ -338,7 +338,13 @@ pub(crate) fn dispatch(
         let header_wanted = header_enabled() || capture.header_requested;
         let (header, line) = emit(value, log_enabled(), header_wanted, sampler(), max_bytes());
         if header_wanted && header.is_none() {
-            tracing::info!(target: "smg::cache_trace", "Cache trace header omitted: size or encoding limit");
+            // The process switch asked: say so at INFO. Only the request asked: the
+            // request's own header stays its only trace, so the omission is at DEBUG.
+            if header_enabled() {
+                tracing::info!(target: "smg::cache_trace", "Cache trace header omitted: size or encoding limit");
+            } else {
+                tracing::debug!(target: "smg::cache_trace", "Cache trace header omitted: size or encoding limit");
+            }
         }
         if let Some(encoded) = line {
             tracing::info!(target: "smg::cache_trace", evidence = %encoded, "Cache routing dispatch");
