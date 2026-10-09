@@ -738,14 +738,21 @@ mod tests {
         addr
     }
 
+    /// The process-level crypto provider rustls needs before any TLS
+    /// configuration is built: the gateway installs it at start-up, the test
+    /// binary does it itself, and before the peer's server is built, since a
+    /// build with both rustls backends enabled (the workspace's test build)
+    /// cannot pick one on its own.
+    fn install_crypto_provider() {
+        let _ = ring::default_provider().install_default();
+    }
+
     /// `try_ping` with mTLS on, the way the gossip loop dials a peer.
     async fn mtls_ping(
         peer: SocketAddr,
         certs: &MtlsTestCerts,
     ) -> Result<NodeUpdate, tonic::Status> {
-        // The gateway installs the process-level crypto provider at start-up;
-        // the test binary has to do it itself.
-        let _ = ring::default_provider().install_default();
+        install_crypto_provider();
         let mtls = MTLSManager::new(MTLSConfig {
             ca_cert_path: certs.ca_cert_path.clone(),
             server_cert_path: certs.node_cert_path.clone(),
@@ -772,6 +779,7 @@ mod tests {
     #[tokio::test]
     async fn mtls_ping_reaches_an_ipv6_peer_by_its_ip_san() {
         init();
+        install_crypto_provider();
         // Nothing to assert on a host without an IPv6 loopback.
         if std::net::TcpListener::bind("[::1]:0").is_err() {
             return;
@@ -789,6 +797,7 @@ mod tests {
     #[tokio::test]
     async fn mtls_ping_reaches_an_ipv4_peer_by_its_ip_san() {
         init();
+        install_crypto_provider();
         let certs = MtlsTestCerts::generate();
         let peer = gossip_peer_over_tls(Ipv4Addr::LOCALHOST.into(), &certs).await;
 
