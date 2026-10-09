@@ -171,6 +171,22 @@ fn native_encode_matches_tokenizers_on_real_vocabularies() {
     let mut state = 0x6A09_E667_F3BC_C908u64;
     for dir in dirs.split(',').map(str::trim).filter(|d| !d.is_empty()) {
         let ours = create_tokenizer(dir).expect("the crate loads the tokenizer");
+        if !std::path::Path::new(&format!("{dir}/tokenizer.json")).exists() {
+            // A tiktoken vocabulary: the crate has no `tokenizers` pipeline
+            // for it, so there is nothing to compare and no native path.
+            for text in TEXTS {
+                let encoding = ours.encode(text, false).expect("encode");
+                assert!(
+                    !matches!(encoding, Encoding::Plain(_)),
+                    "{dir}: {text:?} took the native path"
+                );
+            }
+            println!(
+                "{dir}: no tokenizer.json, the native path does not apply ({} texts checked)",
+                TEXTS.len()
+            );
+            continue;
+        }
         let reference =
             HfTokenizer::from_file(format!("{dir}/tokenizer.json")).expect("tokenizers loads it");
         let specials: Vec<String> = reference
