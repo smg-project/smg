@@ -45,6 +45,8 @@ struct Counting;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Heap size when the measured encode started; the peak is reported against it.
+static BASELINE: AtomicUsize = AtomicUsize::new(0);
 
 fn note_alloc(size: usize) {
     ALLOCS.fetch_add(1, Ordering::Relaxed);
@@ -83,16 +85,18 @@ static GLOBAL: Counting = Counting;
 
 fn reset_counters() {
     ALLOCS.store(0, Ordering::Relaxed);
-    PEAK.store(CURRENT.load(Ordering::Relaxed), Ordering::Relaxed);
+    let current = CURRENT.load(Ordering::Relaxed);
+    BASELINE.store(current, Ordering::Relaxed);
+    PEAK.store(current, Ordering::Relaxed);
 }
 
+/// Allocations since the reset, and the peak heap growth over the heap size
+/// at the reset (so the result buffer and anything the encode kept count).
 fn counters() -> (usize, usize) {
     (
         ALLOCS.load(Ordering::Relaxed),
         PEAK.load(Ordering::Relaxed)
-            - CURRENT
-                .load(Ordering::Relaxed)
-                .min(PEAK.load(Ordering::Relaxed)),
+            .saturating_sub(BASELINE.load(Ordering::Relaxed)),
     )
 }
 
