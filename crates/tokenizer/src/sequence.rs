@@ -160,8 +160,8 @@ impl Sequence {
     ///
     /// When the tokenizer provides an [`IncrementalDecoder`] (HuggingFace
     /// tokenizers with a plain `ByteLevel` decoder: Qwen, Llama 3, GPT-2 style
-    /// vocabularies), the token goes through it and `token_ids()` / `text()`
-    /// do not track a decode window. Otherwise this delegates to
+    /// vocabularies; every tiktoken vocabulary), the token goes through it and
+    /// `token_ids()` / `text()` do not track a decode window. Otherwise this delegates to
     /// `Decoder::decode_step`: HuggingFace's native `step_decode_stream` for
     /// its other decoders, the default double-decode algorithm for the rest;
     /// both drain the retained ids and cache the prefix internally.

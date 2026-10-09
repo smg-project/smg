@@ -18,7 +18,7 @@ use tokenizers::{
 use tracing::debug;
 
 use crate::{
-    byte_level::{ByteLevelIncremental, ByteLevelTable},
+    byte_level::{ByteLevelIncremental, ByteLevelTable, UnknownId},
     chat_template::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
@@ -552,6 +552,7 @@ impl Decoder for HuggingFaceTokenizer {
         Some(Box::new(ByteLevelIncremental::new(
             Arc::clone(table),
             skip_special_tokens,
+            UnknownId::Drop,
         )))
     }
 }

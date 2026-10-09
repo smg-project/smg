@@ -2,12 +2,13 @@
 //!
 //! The `tokenizers` `ByteLevel` decoder maps every token string back to the
 //! bytes it stands for, concatenates them, and runs `String::from_utf8_lossy`
-//! over the result. That makes decoding compositional: a token's bytes never
-//! depend on its neighbours. So instead of the generic incremental algorithm,
-//! which decodes the retained window twice per generated token and diffs the
-//! two strings, we precompute each id's bytes once per tokenizer and, per
-//! token, append them to a small pending buffer and emit its lossy decode
-//! once that decode no longer ends in U+FFFD.
+//! over the result; a tiktoken rank is such a byte string to begin with. That
+//! makes decoding compositional: a token's bytes never depend on its
+//! neighbours. So instead of the generic incremental algorithm, which decodes
+//! the retained window twice per generated token and diffs the two strings,
+//! we precompute each id's bytes once per tokenizer and, per token, append
+//! them to a small pending buffer and emit its lossy decode once that decode
+//! no longer ends in U+FFFD.
 //!
 //! That is the rule `tokenizers`' `DecodeStream` applies to its window, and
 //! the window's already-emitted prefix always consists of complete
@@ -16,9 +17,12 @@
 //! whole stream exactly `decode(all_ids)`. The pending buffer holds at most
 //! the bytes since the last emission, normally one partial character.
 
-use std::sync::{Arc, LazyLock};
+use std::{
+    borrow::Cow,
+    sync::{Arc, LazyLock},
+};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokenizers::{decoders::DecoderWrapper, Tokenizer as HfTokenizer};
 
 use crate::traits::{IncrementalDecoder, TokenIdType};
@@ -47,16 +51,74 @@ static CHAR_BYTES: LazyLock<[Option<u8>; ALPHABET_END]> = LazyLock::new(|| {
     table
 });
 
+/// What the table knows about an id.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Not in the vocabulary.
+    Absent,
+    /// A token kept in decoded text.
+    Ordinary,
+    /// A token `skip_special_tokens` strips.
+    Special,
+}
+
 /// Per-tokenizer table of the bytes each id decodes to.
 ///
-/// Built once at load time for tokenizers whose decoder is exactly
-/// `ByteLevel`; roughly 4 bytes per id plus the token bytes themselves.
+/// Built once at load time: by [`ByteLevelTable::build`] for a `tokenizers`
+/// vocabulary whose decoder is exactly `ByteLevel`, through
+/// [`ByteLevelTableBuilder`] for a tiktoken vocabulary, whose ranks are byte
+/// strings already. About 9 bytes per id plus the token bytes themselves.
 pub(crate) struct ByteLevelTable {
     /// `offsets[id]..offsets[id + 1]` indexes `bytes` for token `id`.
-    offsets: Vec<u32>,
+    offsets: Vec<usize>,
     bytes: Vec<u8>,
-    /// Ids the tokenizer treats as special tokens.
-    special: Vec<bool>,
+    kind: Vec<Kind>,
+}
+
+/// Builds a [`ByteLevelTable`] one id at a time, from 0 up.
+pub(crate) struct ByteLevelTableBuilder {
+    offsets: Vec<usize>,
+    bytes: Vec<u8>,
+    kind: Vec<Kind>,
+}
+
+impl ByteLevelTableBuilder {
+    pub(crate) fn with_capacity(ids: usize) -> Self {
+        let mut offsets = Vec::with_capacity(ids + 1);
+        offsets.push(0);
+        Self {
+            offsets,
+            bytes: Vec::with_capacity(ids * 4),
+            kind: Vec::with_capacity(ids),
+        }
+    }
+
+    /// The next id decodes to `bytes`; `special` marks a token that
+    /// `skip_special_tokens` strips.
+    pub(crate) fn push(&mut self, bytes: &[u8], special: bool) {
+        self.bytes.extend_from_slice(bytes);
+        self.offsets.push(self.bytes.len());
+        self.kind.push(if special {
+            Kind::Special
+        } else {
+            Kind::Ordinary
+        });
+    }
+
+    /// The next id is not in the vocabulary.
+    pub(crate) fn push_absent(&mut self) {
+        self.offsets.push(self.bytes.len());
+        self.kind.push(Kind::Absent);
+    }
+
+    pub(crate) fn finish(mut self) -> Arc<ByteLevelTable> {
+        self.bytes.shrink_to_fit();
+        Arc::new(ByteLevelTable {
+            offsets: self.offsets,
+            bytes: self.bytes,
+            kind: self.kind,
+        })
+    }
 }
 
 impl ByteLevelTable {
@@ -68,36 +130,32 @@ impl ByteLevelTable {
         let max_id = tokenizer.get_vocab(true).values().copied().max()?;
         let count = max_id as usize + 1;
         let added = tokenizer.get_added_vocabulary();
-        let mut offsets = Vec::with_capacity(count + 1);
-        let mut bytes = Vec::with_capacity(count * 4);
-        let mut special = vec![false; count];
-        offsets.push(0u32);
-        for (id, is_special) in special.iter_mut().enumerate() {
-            if let Some(token) = tokenizer.id_to_token(id as u32) {
-                *is_special = added.is_special_token(&token);
-                push_token_bytes(&token, &mut bytes);
+        let mut table = ByteLevelTableBuilder::with_capacity(count);
+        let mut bytes = Vec::new();
+        for id in 0..count {
+            match tokenizer.id_to_token(id as u32) {
+                Some(token) => {
+                    bytes.clear();
+                    push_token_bytes(&token, &mut bytes);
+                    table.push(&bytes, added.is_special_token(&token));
+                }
+                None => table.push_absent(),
             }
-            offsets.push(u32::try_from(bytes.len()).ok()?);
         }
-        bytes.shrink_to_fit();
-        Some(Arc::new(Self {
-            offsets,
-            bytes,
-            special,
-        }))
+        Some(table.finish())
     }
 
+    /// The bytes of `id` and whether it is special; `None` for an id the
+    /// vocabulary lacks.
     #[inline]
-    fn bytes_of(&self, id: TokenIdType) -> Option<&[u8]> {
+    fn entry(&self, id: TokenIdType) -> Option<(&[u8], bool)> {
         let id = id as usize;
-        let end = *self.offsets.get(id + 1)? as usize;
-        let start = self.offsets[id] as usize;
-        Some(&self.bytes[start..end])
-    }
-
-    #[inline]
-    fn is_special(&self, id: TokenIdType) -> bool {
-        self.special.get(id as usize).copied().unwrap_or(false)
+        let kind = *self.kind.get(id)?;
+        if kind == Kind::Absent {
+            return None;
+        }
+        let bytes = &self.bytes[self.offsets[id]..self.offsets[id + 1]];
+        Some((bytes, kind == Kind::Special))
     }
 }
 
@@ -122,19 +180,41 @@ fn push_token_bytes(token: &str, out: &mut Vec<u8>) {
     }
 }
 
+/// What to do with an id the vocabulary lacks: what the backend's `decode`
+/// does with it.
+#[derive(Clone, Copy)]
+pub(crate) enum UnknownId {
+    /// Decode nothing for it (`tokenizers`).
+    Drop,
+    /// Fail the stream (tiktoken).
+    Reject,
+}
+
 /// One stream's state: the bytes of a character that is still incomplete.
 pub(crate) struct ByteLevelIncremental {
     table: Arc<ByteLevelTable>,
     pending: Vec<u8>,
     skip_special_tokens: bool,
+    unknown: UnknownId,
+    /// Tokens fed so far, to place the once-per-stream report.
+    fed: usize,
+    /// Whether this stream's invalid bytes were reported already.
+    reported: bool,
 }
 
 impl ByteLevelIncremental {
-    pub(crate) fn new(table: Arc<ByteLevelTable>, skip_special_tokens: bool) -> Self {
+    pub(crate) fn new(
+        table: Arc<ByteLevelTable>,
+        skip_special_tokens: bool,
+        unknown: UnknownId,
+    ) -> Self {
         Self {
             table,
             pending: Vec::new(),
             skip_special_tokens,
+            unknown,
+            fed: 0,
+            reported: false,
         }
     }
 
@@ -158,11 +238,14 @@ fn settled(text: &str) -> bool {
 
 impl IncrementalDecoder for ByteLevelIncremental {
     fn step(&mut self, token_id: TokenIdType) -> Result<String> {
-        // Ids outside the vocabulary are dropped, as `decode` drops them.
-        let Some(bytes) = self.table.bytes_of(token_id) else {
-            return Ok(String::new());
+        self.fed += 1;
+        let Some((bytes, special)) = self.table.entry(token_id) else {
+            return match self.unknown {
+                UnknownId::Drop => Ok(String::new()),
+                UnknownId::Reject => Err(anyhow!("unknown token id {token_id}")),
+            };
         };
-        if self.skip_special_tokens && self.table.is_special(token_id) {
+        if self.skip_special_tokens && special {
             return Ok(String::new());
         }
         if self.pending.is_empty() {
@@ -174,17 +257,30 @@ impl IncrementalDecoder for ByteLevelIncremental {
             }
         }
         self.pending.extend_from_slice(bytes);
-        let text = String::from_utf8_lossy(&self.pending);
-        if !settled(&text) {
-            return Ok(String::new());
-        }
-        let text = text.into_owned();
+        let text = match String::from_utf8_lossy(&self.pending) {
+            Cow::Borrowed(text) if settled(text) => text.to_owned(),
+            // A replacement inside settled text stands for bytes no later
+            // token can complete: say so once per stream, not once per token.
+            Cow::Owned(text) if settled(&text) => {
+                if !self.reported {
+                    self.reported = true;
+                    tracing::warn!(
+                        token_index = self.fed - 1,
+                        "invalid UTF-8 bytes in the token stream decoded to U+FFFD"
+                    );
+                }
+                text
+            }
+            _ => return Ok(String::new()),
+        };
         self.pending.clear();
         Ok(text)
     }
 
     fn reset(&mut self) {
         self.pending.clear();
+        self.fed = 0;
+        self.reported = false;
     }
 }
 
@@ -266,7 +362,7 @@ mod tests {
     }
 
     fn stream(table: &Arc<ByteLevelTable>, ids: &[u32], skip: bool) -> (Vec<String>, Vec<u8>) {
-        let mut dec = ByteLevelIncremental::new(Arc::clone(table), skip);
+        let mut dec = ByteLevelIncremental::new(Arc::clone(table), skip, UnknownId::Drop);
         let steps = ids.iter().map(|&id| dec.step(id).expect("step")).collect();
         (steps, dec.pending().to_vec())
     }
@@ -403,7 +499,7 @@ mod tests {
         // 'é' is C3 A9; its byte tokens are 'Ã' and '©'.
         let c3 = tokenizer.token_to_id("Ã").expect("C3");
         let a9 = tokenizer.token_to_id("©").expect("A9");
-        let mut dec = ByteLevelIncremental::new(table, false);
+        let mut dec = ByteLevelIncremental::new(table, false, UnknownId::Drop);
         assert_eq!(dec.step(c3).expect("step"), "");
         assert_eq!(dec.pending(), [0xC3]);
         assert_eq!(dec.step(a9).expect("step"), "é");
@@ -460,15 +556,30 @@ mod tests {
     }
 
     #[test]
+    fn unknown_ids_are_dropped_or_rejected_as_asked() {
+        let tokenizer = byte_level_tokenizer();
+        let table = ByteLevelTable::build(&tokenizer).expect("table");
+        let beyond = tokenizer.get_vocab_size(true) as u32 + 3;
+        let h = tokenizer.token_to_id("h").expect("h");
+        let mut drop = ByteLevelIncremental::new(Arc::clone(&table), false, UnknownId::Drop);
+        assert_eq!(drop.step(beyond).expect("dropped"), "");
+        assert_eq!(drop.step(h).expect("step"), "h");
+        let mut reject = ByteLevelIncremental::new(table, false, UnknownId::Reject);
+        assert_eq!(reject.step(h).expect("step"), "h");
+        let err = reject.step(beyond).expect_err("rejected");
+        assert!(err.to_string().contains("unknown token id"), "{err}");
+    }
+
+    #[test]
     fn special_tokens_follow_the_skip_flag() {
         let tokenizer = byte_level_tokenizer();
         let table = ByteLevelTable::build(&tokenizer).expect("table");
         let special = tokenizer.token_to_id(SPECIAL).expect("special id");
         let added = tokenizer.token_to_id(ADDED).expect("added id");
-        let mut keep = ByteLevelIncremental::new(Arc::clone(&table), false);
+        let mut keep = ByteLevelIncremental::new(Arc::clone(&table), false, UnknownId::Drop);
         assert_eq!(keep.step(special).expect("step"), SPECIAL);
         assert_eq!(keep.step(added).expect("step"), ADDED);
-        let mut skip = ByteLevelIncremental::new(table, true);
+        let mut skip = ByteLevelIncremental::new(table, true, UnknownId::Drop);
         assert_eq!(skip.step(special).expect("step"), "");
         assert_eq!(skip.step(added).expect("step"), ADDED);
     }
