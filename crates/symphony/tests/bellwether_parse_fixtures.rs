@@ -83,18 +83,7 @@ const SLUG: &str = "qwen3-8b";
 /// reference on whole sets, which no per-case list could carry. The slug stays
 /// in the table so its family and prompt tail are kept; the issue brings it
 /// back.
-const SKIPPED: &[(&str, &str)] = &[
-    (
-        "mimo-v2.5",
-        "the parser drops the trailing newline of a tool-call string argument \
-         (smg-project/smg-lab#110)",
-    ),
-    (
-        "seed-oss-36b-instruct",
-        "the parser drops the trailing newline of a tool-call string argument \
-         (smg-project/smg-lab#110)",
-    ),
-];
+const SKIPPED: &[(&str, &str)] = &[];
 /// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
 /// the table that reads it and how its template ends the generation prompt. The fixtures carry
 /// the request and the output, not the rendered prompt, so the prompt's tail is stated here until

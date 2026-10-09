@@ -81,6 +81,93 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// when no loaded case is under it at all.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
+        "iquest-q1/render/bfcl-multi-turn-*",
+        "the typed tool definitions drop the fields outside the function schema, here the \
+         `response` field of the BFCL multi-turn tools, and this template renders the tool \
+         object verbatim (smg-project/smg-lab#105)",
+    ),
+    (
+        "iquest-q1/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "iquest-q1/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "iquest-q1/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "k2-horizon-36b/render/bfcl-multi-turn-*",
+        "the typed tool definitions drop the fields outside the function schema, here the \
+         `response` field of the BFCL multi-turn tools, and this template renders the tool \
+         object verbatim (smg-project/smg-lab#105)",
+    ),
+    (
+        "k2-horizon-36b/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "k2-horizon-36b/render/tools-schema-with-defs",
+        "the template merges a tool's `$defs` into its parameters with `dict()` over a list of \
+         (key, value) pairs, which the gateway's template engine does not accept, so the \
+         render fails (smg-project/smg-lab#119)",
+    ),
+    (
+        "laguna-xs.2/render/bfcl-multi-turn-*",
+        "the typed tool definitions drop the fields outside the function schema, here the \
+         `response` field of the BFCL multi-turn tools, and this template renders the tool \
+         object verbatim (smg-project/smg-lab#105)",
+    ),
+    (
+        "laguna-xs.2/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "laguna-xs.2/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "laguna-xs.2/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "lfm2.5-1.2b-instruct/render/bfcl-multi-turn-*",
+        "the typed tool definitions drop the fields outside the function schema, here the \
+         `response` field of the BFCL multi-turn tools, and this template renders the tool \
+         object verbatim (smg-project/smg-lab#105)",
+    ),
+    (
+        "lfm2.5-1.2b-instruct/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "lfm2.5-1.2b-instruct/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "llava-1.5-7b-hf/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "llava-1.5-7b-hf/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
         "qwen3-8b/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and appending its \
          text after the generation header, which drops the empty think block the template writes \
@@ -1325,6 +1412,28 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          render differences are listed again once the pin moves",
     ),
     (
+        "trinity-mini/render/bfcl-multi-turn-*",
+        "the typed tool definitions drop the fields outside the function schema, here the \
+         `response` field of the BFCL multi-turn tools, and this template renders the tool \
+         object verbatim (smg-project/smg-lab#105)",
+    ),
+    (
+        "trinity-mini/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "trinity-mini/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "trinity-mini/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
         "webworld-32b/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -1346,44 +1455,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
 /// is tracked, so the run compares the others: an unlisted model that does
 /// not load fails the run, and so does a listed one whose tokenizer loads
 /// now, so the list cannot rot.
-const KNOWN_UNLOADED: &[(&str, &str)] = &[
-    (
-        "iquest-q1",
-        "the template uses the `generation` statement, which the template engine does not know \
-         (smg-project/smg-lab#108)",
-    ),
-    (
-        "k2-horizon-36b",
-        "the template uses the `generation` statement, which the template engine does not know \
-         (smg-project/smg-lab#108)",
-    ),
-    (
-        "laguna-xs.2",
-        "the template uses the `generation` statement, which the template engine does not know \
-         (smg-project/smg-lab#108)",
-    ),
-    (
-        "lfm2.5-1.2b-instruct",
-        "the template uses the `generation` statement, which the template engine does not know \
-         (smg-project/smg-lab#108)",
-    ),
-    (
-        "llava-1.5-7b-hf",
-        "the template uses the `generation` statement, which the template engine does not know \
-         (smg-project/smg-lab#108)",
-    ),
-    (
-        "trinity-mini",
-        "the template uses the `generation` statement, which the template engine does not know \
-         (smg-project/smg-lab#108)",
-    ),
-    (
-        "kimi-k3",
-        "the checkpoint ships tiktoken.model and no tokenizer.json; this harness fetches \
+const KNOWN_UNLOADED: &[(&str, &str)] = &[(
+    "kimi-k3",
+    "the checkpoint ships tiktoken.model and no tokenizer.json; this harness fetches \
          tokenizer.json only (the tokenizer harness reads the tiktoken file since \
          smg-project/smg#2923)",
-    ),
-];
+)];
 
 /// The reason `known` lists for `id`: the entry that is the id itself, else
 /// the first prefix entry the id begins with; none when the id is not listed.
