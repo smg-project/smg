@@ -45,6 +45,9 @@ pub struct CacheConfig {
     pub enable_l0: bool,
     /// Maximum number of entries in L0 cache
     pub l0_max_entries: usize,
+    /// Byte budget of the L0 cache (texts, ids and per-entry overhead); an
+    /// input whose entry would exceed a quarter of it is not cached
+    pub l0_max_memory: usize,
     /// Enable L1 (prefix) cache
     pub enable_l1: bool,
     /// Maximum memory for L1 cache in bytes
@@ -55,8 +58,9 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enable_l0: true,
-            l0_max_entries: 10_000, // ~22MB memory for typical prompts
-            enable_l1: false,       // Opt-in for now
+            l0_max_entries: 10_000,
+            l0_max_memory: l0::DEFAULT_MAX_BYTES,
+            enable_l1: false,                // Opt-in for now
             l1_max_memory: 50 * 1024 * 1024, // 50MB
         }
     }
@@ -82,7 +86,10 @@ impl CachedTokenizer {
         let fingerprint = TokenizerFingerprint::from_tokenizer(inner.as_ref());
 
         let l0 = if config.enable_l0 {
-            Some(L0Cache::new(config.l0_max_entries))
+            Some(L0Cache::with_limits(
+                config.l0_max_entries,
+                config.l0_max_memory,
+            ))
         } else {
             None
         };
@@ -501,6 +508,7 @@ mod tests {
         CacheConfig {
             enable_l0: false,
             l0_max_entries: 0,
+            l0_max_memory: usize::MAX,
             enable_l1: true,
             l1_max_memory: 1024 * 1024,
         }
@@ -620,6 +628,7 @@ mod tests {
         let config = CacheConfig {
             enable_l0: false,
             l0_max_entries: 0,
+            l0_max_memory: usize::MAX,
             enable_l1: true,
             l1_max_memory: 1024 * 1024,
         };
@@ -639,6 +648,7 @@ mod tests {
             CacheConfig {
                 enable_l0: false,
                 l0_max_entries: 0,
+                l0_max_memory: usize::MAX,
                 enable_l1: false,
                 l1_max_memory: 0,
             },
@@ -684,6 +694,7 @@ mod tests {
         let config = CacheConfig {
             enable_l0: false,
             l0_max_entries: 0,
+            l0_max_memory: usize::MAX,
             enable_l1: false,
             l1_max_memory: 0,
         };

@@ -1561,6 +1561,7 @@ class TestRouterArgsFieldOrder:
         "disable_tokenizer_autoload",
         "tokenizer_cache_enable_l0",
         "tokenizer_cache_l0_max_entries",
+        "tokenizer_cache_l0_max_memory",
         "tokenizer_cache_enable_l1",
         "tokenizer_cache_l1_max_memory",
         "reasoning_parser",

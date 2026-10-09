@@ -210,6 +210,7 @@ fn with_optional_cache(
             let cache_config = CacheConfig {
                 enable_l0: cfg.enable_l0,
                 l0_max_entries: cfg.l0_max_entries,
+                l0_max_memory: cfg.l0_max_memory,
                 enable_l1: cfg.enable_l1,
                 l1_max_memory: cfg.l1_max_memory,
             };
@@ -493,6 +494,7 @@ mod tests {
             cache_config: Some(TokenizerCacheConfig {
                 enable_l0: true,
                 l0_max_entries: 1000,
+                l0_max_memory: 256 * 1024 * 1024,
                 enable_l1: false,
                 l1_max_memory: 0,
             }),

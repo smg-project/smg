@@ -439,6 +439,9 @@ pub struct TokenizerCacheConfig {
     pub enable_l0: bool,
     #[serde(default = "default_l0_max_entries")]
     pub l0_max_entries: usize,
+    /// Byte budget of the L0 cache (texts, ids and per-entry overhead)
+    #[serde(default = "default_l0_max_memory")]
+    pub l0_max_memory: usize,
     /// Prefix matching at fixed boundaries
     #[serde(default = "default_enable_l1")]
     pub enable_l1: bool,
@@ -526,6 +529,10 @@ fn default_l0_max_entries() -> usize {
     10_000
 }
 
+fn default_l0_max_memory() -> usize {
+    256 * 1024 * 1024 // 256MB
+}
+
 fn default_enable_l1() -> bool {
     false
 }
@@ -551,6 +558,7 @@ impl Default for TokenizerCacheConfig {
         Self {
             enable_l0: default_enable_l0(),
             l0_max_entries: default_l0_max_entries(),
+            l0_max_memory: default_l0_max_memory(),
             enable_l1: default_enable_l1(),
             l1_max_memory: default_l1_max_memory(),
         }

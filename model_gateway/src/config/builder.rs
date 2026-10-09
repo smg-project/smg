@@ -730,6 +730,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn l0_cache_max_memory(mut self, max_memory: usize) -> Self {
+        self.config.tokenizer_cache.l0_max_memory = max_memory;
+        self
+    }
+
     pub fn enable_l1_cache(mut self, max_memory: usize) -> Self {
         self.config.tokenizer_cache.enable_l1 = true;
         self.config.tokenizer_cache.l1_max_memory = max_memory;

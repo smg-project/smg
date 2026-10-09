@@ -1144,6 +1144,14 @@ impl ConfigValidator {
             });
         }
 
+        if cache.enable_l0 && cache.l0_max_memory == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l0_max_memory".to_string(),
+                value: cache.l0_max_memory.to_string(),
+                reason: "Must be > 0 when L0 cache is enabled".to_string(),
+            });
+        }
+
         if cache.enable_l1 && cache.l1_max_memory == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "tokenizer_cache.l1_max_memory".to_string(),
