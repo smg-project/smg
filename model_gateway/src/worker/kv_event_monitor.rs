@@ -298,9 +298,14 @@ impl KvEventMonitor {
             // The previous subscription for this URL is still being taken
             // out of the index: intern it again only once its task has ended.
             if done.has_changed().is_err() {
-                // The task is gone without lifting its reservation (aborted,
-                // or a panic past its guard): nothing is left to wait for.
+                // The task is gone without lifting its reservation (it ended
+                // before the removal began, was aborted, or panicked past its
+                // guard): nothing is left to wait for. Whatever it raised on
+                // the gauge is lowered before its successor starts, whose
+                // answer owns the gauge from here (the removal's own reset
+                // skips a slot that is no longer its reservation).
                 handles.remove(&url);
+                Metrics::set_kv_events_unavailable(&url, false);
                 break handles;
             }
             drop(handles);
@@ -423,6 +428,13 @@ impl KvEventMonitor {
         if !matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
             return;
         }
+        // A backend without KV events is no longer a blind spot once its
+        // worker has left: lowered here, by the task that owned the
+        // subscription and under the slot lock, so a re-add of the URL that
+        // follows the removal cannot see its fresh gauge reset by a stale
+        // caller, and a caller that dropped `on_worker_removed` early does
+        // not leave it raised.
+        Metrics::set_kv_events_unavailable(worker_url, false);
         handles.remove(worker_url);
         // Under the slot lock, which `on_worker_added` holds from its lookup
         // of the model's index to its insert: an add of the model racing
@@ -478,6 +490,7 @@ impl KvEventMonitor {
         // future here loses nothing but the join error below.
         // Panics are caught inside the task; a JoinError here (abort or a
         // panic that escaped the guard) must still be surfaced, not discarded.
+        let id = sub.id;
         if let Err(e) = sub.handle.await {
             error!(
                 worker_url = %worker_url,
@@ -486,9 +499,17 @@ impl KvEventMonitor {
             );
             Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
         }
-        // A backend without KV events is no longer a blind spot once its
-        // worker has left.
-        Metrics::set_kv_events_unavailable(worker_url, false);
+        // A task that ends on the shutdown signal lowers the gauge in its own
+        // cleanup (`complete_removal`). One that had ended before this removal
+        // began (the answer that raises the gauge ends the subscription), or
+        // that did not reach its cleanup, left the reservation in place and
+        // the gauge with it: lowered here, under the slot lock and only while
+        // the reservation is still this subscription's. A successor under the
+        // URL owns the gauge from its add on.
+        let handles = self.worker_handles.lock().await;
+        if matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
+            Metrics::set_kv_events_unavailable(worker_url, false);
+        }
     }
 
     /// Stop all subscriptions and clean up.
