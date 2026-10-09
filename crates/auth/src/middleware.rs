@@ -203,6 +203,20 @@ fn log_auth_success(
     audit_logger.log_success(&ctx, None);
 }
 
+/// The token of a `Bearer` credential in an `Authorization` header value.
+///
+/// The scheme is matched case-insensitively (RFC 7235: authentication scheme
+/// names are case-insensitive), followed by one or more spaces and a
+/// non-empty token. Returns `None` for any other scheme or an empty token.
+pub fn bearer_token(header_value: &str) -> Option<&str> {
+    let (scheme, rest) = header_value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim_start_matches(' ');
+    (!token.is_empty()).then_some(token)
+}
+
 /// Control plane authentication middleware.
 ///
 /// This middleware:
@@ -233,7 +247,7 @@ pub async fn control_plane_auth_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
+        .and_then(bearer_token);
 
     let Some(token) = token else {
         debug!("Missing or invalid Authorization header for control plane API");
@@ -437,6 +451,23 @@ mod tests {
             key_id: "key-123".to_string(),
         };
         assert_eq!(api_key.to_string(), "api_key:key-123");
+    }
+
+    #[test]
+    fn bearer_token_matches_the_scheme_case_insensitively() {
+        assert_eq!(bearer_token("Bearer k1"), Some("k1"));
+        assert_eq!(bearer_token("bearer k1"), Some("k1"));
+        assert_eq!(bearer_token("BEARER k1"), Some("k1"));
+        assert_eq!(bearer_token("Bearer   k1"), Some("k1"));
+    }
+
+    #[test]
+    fn bearer_token_rejects_other_schemes_and_empty_tokens() {
+        assert_eq!(bearer_token("Basic k1"), None);
+        assert_eq!(bearer_token("Bearerk1"), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Bearer "), None);
+        assert_eq!(bearer_token("k1"), None);
     }
 
     #[test]
