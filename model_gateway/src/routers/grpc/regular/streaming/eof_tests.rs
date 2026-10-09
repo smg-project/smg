@@ -24,7 +24,7 @@ use crate::{
 };
 
 #[derive(Default)]
-struct CharacterTokenizer {
+pub(super) struct CharacterTokenizer {
     special_tokens: SpecialTokens,
 }
 
@@ -75,7 +75,7 @@ impl Tokenizer for CharacterTokenizer {
     }
 }
 
-fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
+pub(super) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
     let token_ids: Vec<_> = text.chars().map(u32::from).collect();
     proto::GenerateResponse {
         response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
@@ -88,7 +88,7 @@ fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
 }
 
 /// A chunk that also reports one logprob per token.
-fn chunk_with_logprobs(index: u32, text: &str) -> proto::GenerateResponse {
+pub(super) fn chunk_with_logprobs(index: u32, text: &str) -> proto::GenerateResponse {
     let mut response = chunk(index, text);
     if let Some(GenerationEvent::Chunk(chunk)) = &mut response.response {
         chunk.output_logprobs = Some(proto::OutputLogProbs {
@@ -100,11 +100,15 @@ fn chunk_with_logprobs(index: u32, text: &str) -> proto::GenerateResponse {
     response
 }
 
-fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
+pub(super) fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
     complete_with_prompt(index, reason, 1)
 }
 
-fn complete_with_prompt(index: u32, reason: &str, prompt_tokens: u32) -> proto::GenerateResponse {
+pub(super) fn complete_with_prompt(
+    index: u32,
+    reason: &str,
+    prompt_tokens: u32,
+) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenerationEvent::Complete(proto::GenerateComplete {
             index,
@@ -122,7 +126,7 @@ fn complete_with_prompt(index: u32, reason: &str, prompt_tokens: u32) -> proto::
     clippy::disallowed_methods,
     reason = "bounded test fixture; server task is explicitly aborted"
 )]
-async fn scripted_stream(
+pub(super) async fn scripted_stream(
     responses: Vec<proto::GenerateResponse>,
     grpc_status: &'static str,
 ) -> (ProtoStream, JoinHandle<()>) {
@@ -180,7 +184,7 @@ async fn scripted_stream(
     (ProtoStream::Vllm(stream), server)
 }
 
-fn processor(with_tools: bool) -> StreamingProcessor {
+pub(super) fn processor(with_tools: bool) -> StreamingProcessor {
     StreamingProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),

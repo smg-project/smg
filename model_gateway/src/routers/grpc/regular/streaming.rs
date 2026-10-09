@@ -3589,6 +3589,9 @@ impl<'a> ChatChunkWithUsage<'a> {
 mod eof_tests;
 
 #[cfg(test)]
+mod sse_bytes_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
