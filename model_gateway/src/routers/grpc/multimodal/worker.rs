@@ -143,6 +143,18 @@ impl ItemLimitSource {
     }
 }
 
+/// Whether this pipeline can be handed a video at all: the spec declares the
+/// modality (a text-and-image derivative does not) and the effective limit
+/// leaves room for one (`--limit-mm-per-prompt '{"video": 0}'`, image-only
+/// serving, does not). Such a pipeline never samples a clip, so its engine's
+/// loader rule cannot matter and a fleet-wide loader setting must not keep it
+/// from starting.
+fn serves_video(item_limits: &HashMap<Modality, ItemLimit>) -> bool {
+    item_limits
+        .get(&Modality::Video)
+        .is_some_and(|limit| limit.limit > 0)
+}
+
 /// A modality's effective per-request item limit and what set it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ItemLimit {
@@ -379,13 +391,7 @@ impl WorkerMediaPipeline {
             settings.max_items,
             modality_limit_override,
         );
-        // An engine that takes no video (`--limit-mm-per-prompt '{"video": 0}'`,
-        // image-only serving) never samples one, so its loader's rule cannot
-        // matter and a fleet-wide loader setting must not keep it from starting.
-        let serves_video = item_limits
-            .get(&Modality::Video)
-            .is_none_or(|limit| limit.limit > 0);
-        if serves_video {
+        if serves_video(&item_limits) {
             if let Some(message) = loader_rule_conflict(
                 settings.video_loader_rule.as_deref(),
                 spec_name,
@@ -1041,5 +1047,23 @@ mod unsupported_model_tests {
             );
         }
         assert_eq!(loader_rule_conflict(None, "gemma4", loader), None);
+    }
+
+    /// The loader rule matters only to a pipeline that can be handed a video:
+    /// a spec without the modality or an engine limit of 0 never samples one.
+    #[test]
+    fn the_loader_rule_is_moot_without_video() {
+        let at = |limit| {
+            HashMap::from([(
+                Modality::Video,
+                ItemLimit {
+                    limit,
+                    source: ItemLimitSource::Spec,
+                },
+            )])
+        };
+        assert!(!serves_video(&HashMap::new()), "no video in the spec");
+        assert!(!serves_video(&at(0)), "an engine limit of 0");
+        assert!(serves_video(&at(1)));
     }
 }
