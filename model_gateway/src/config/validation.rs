@@ -100,15 +100,6 @@ impl ConfigValidator {
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_model_aliases(config)?;
-        for model in config.model_profiles.keys() {
-            if model.trim().is_empty() {
-                return Err(ConfigError::InvalidValue {
-                    field: "model_profiles".to_string(),
-                    value: model.clone(),
-                    reason: "Model ID must be non-empty".to_string(),
-                });
-            }
-        }
         Self::validate_rl(config)?;
         Self::validate_prefill_admission(config)?;
         if let Some(discovery) = &config.discovery {

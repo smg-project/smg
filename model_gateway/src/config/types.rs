@@ -346,9 +346,6 @@ pub struct RouterConfig {
     /// Lookup stays case-sensitive; entries name exact client-sent strings.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_aliases: HashMap<String, String>,
-    /// Canonical model ID -> explicit Chat Completions contract. Aliases inherit the canonical profile.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub model_profiles: HashMap<String, openai_protocol::profile::ModelProfile>,
     /// Disable automatic tokenizer loading at startup and worker registration
     #[serde(default)]
     pub disable_tokenizer_autoload: bool,
@@ -1489,7 +1486,6 @@ impl Default for RouterConfig {
             chat_template: None,
             disable_tokenizer_autoload: false,
             model_aliases: HashMap::new(),
-            model_profiles: HashMap::new(),
             history_backend: default_history_backend(),
             oracle: None,
             postgres: None,

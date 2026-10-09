@@ -853,10 +853,6 @@ struct CliArgs {
     #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Service Discovery (Kubernetes)")]
     model_alias: Vec<String>,
 
-    /// Pin a Chat Completions contract for a canonical model (model=profile, repeatable).
-    #[arg(long = "model-profile", action = ArgAction::Append, value_parser = parse_model_profile, help_heading = "Service Discovery (Kubernetes)")]
-    model_profile: Vec<String>,
-
     // ==================== Logging ====================
     /// Directory to store log files
     #[arg(long, help_heading = "Logging")]
@@ -1371,18 +1367,6 @@ fn parse_routing_key_header(s: &str) -> Result<String, String> {
     http::header::HeaderName::try_from(s)
         .map(|name| name.as_str().to_string())
         .map_err(|e| format!("Invalid header name '{s}': {e}"))
-}
-
-/// Validate an explicit model contract at CLI parse time.
-fn parse_model_profile(s: &str) -> Result<String, String> {
-    let Some((model, profile)) = s.split_once('=') else {
-        return Err("Expected: <canonical-model>=<profile>".to_string());
-    };
-    if model.trim().is_empty() {
-        return Err("Model ID must be non-empty".to_string());
-    }
-    profile.parse::<openai_protocol::profile::ModelProfile>()?;
-    Ok(s.to_string())
 }
 
 /// Validate `--model-alias` value at CLI parse time (format: alias=canonical).
@@ -2064,34 +2048,6 @@ impl CliArgs {
             }
         }
 
-        let mut model_profiles = HashMap::new();
-        for entry in &self.model_profile {
-            let (model, value) =
-                entry
-                    .split_once('=')
-                    .ok_or_else(|| ConfigError::InvalidValue {
-                        field: "model_profile".to_string(),
-                        value: entry.clone(),
-                        reason: "Expected: <canonical-model>=<profile>".to_string(),
-                    })?;
-            let profile = value
-                .parse::<openai_protocol::profile::ModelProfile>()
-                .map_err(|reason| ConfigError::InvalidValue {
-                    field: "model_profile".to_string(),
-                    value: entry.clone(),
-                    reason,
-                })?;
-            if let Some(previous) = model_profiles.insert(model.to_string(), profile) {
-                if previous != profile {
-                    return Err(ConfigError::InvalidValue {
-                        field: "model_profile".to_string(),
-                        value: model.to_string(),
-                        reason: "A model cannot have conflicting profiles".to_string(),
-                    });
-                }
-            }
-        }
-
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -2213,7 +2169,6 @@ impl CliArgs {
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
             .model_aliases(model_aliases)
-            .model_profiles(model_profiles)
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
             .maybe_redis(redis)
@@ -3493,41 +3448,5 @@ mod tests {
             Err(ConfigError::InvalidValue { field, reason, .. })
                 if field == "model_alias" && reason == "Alias maps to both 'a' and 'b'"
         ));
-    }
-    #[test]
-    fn explicit_model_profiles_flow_into_configuration() {
-        let cli = cli_args_from(&[
-            "--model-profile",
-            "vllm-model=kimi_k3",
-            "--model-profile",
-            "other=deepseek_v4_1",
-        ]);
-        let config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(
-            config.model_profiles["vllm-model"],
-            openai_protocol::profile::ModelProfile::KimiK3
-        );
-        assert_eq!(
-            config.model_profiles["other"],
-            openai_protocol::profile::ModelProfile::DeepSeekV41
-        );
-        let json = serde_json::to_value(config).unwrap();
-        assert_eq!(json["model_profiles"]["vllm-model"], "kimi_k3");
-    }
-
-    #[test]
-    fn invalid_and_conflicting_model_profiles_are_rejected() {
-        for invalid in ["missing-equals", "=kimi_k3", "model=unknown", "model="] {
-            assert!(Cli::try_parse_from(["smg", "--model-profile", invalid]).is_err());
-        }
-        let cli = cli_args_from(&[
-            "--model-profile",
-            "model=kimi",
-            "--model-profile",
-            "model=kimi_k3",
-        ]);
-        assert!(
-            matches!(cli.to_router_config(vec![],vec![]),Err(ConfigError::InvalidValue {ref field,..}) if field=="model_profile")
-        );
     }
 }

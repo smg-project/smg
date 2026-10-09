@@ -1035,7 +1035,7 @@ mod responses_finish_reason_tests {
     }
 
     #[tokio::test]
-    async fn explicit_k3_profile_controls_nonstream_tool_ids_on_generic_names() {
+    async fn resolved_k3_profile_controls_nonstream_tool_ids_on_generic_names() {
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
             "<tool_call>\n{\"name\":\"user_tool\",\"arguments\":{}}\n</tool_call>",
         ));

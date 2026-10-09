@@ -70,10 +70,15 @@ pub(super) fn is_glm53(model: &str) -> bool {
     model_matches(model, &GLM53_MARKERS)
 }
 
+pub(super) fn uses_sampling_defaults(model: &str) -> bool {
+    model_matches(model, &DEFAULTS_MARKERS)
+}
+
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
-    if req.model_profile() == ModelProfile::ZaiGlm53
-        || model_matches(req.profile_model_id(), &DEFAULTS_MARKERS)
-    {
+    if matches!(
+        req.model_profile(),
+        ModelProfile::ZaiGlm53 | ModelProfile::ZaiWithSamplingDefaults
+    ) {
         req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
         req.top_p.get_or_insert(DEFAULT_TOP_P);
     }

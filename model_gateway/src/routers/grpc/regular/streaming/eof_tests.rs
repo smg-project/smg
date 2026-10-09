@@ -1126,7 +1126,7 @@ async fn messages_tool_arguments_need_an_open_block() {
 }
 
 #[tokio::test]
-async fn explicit_k3_profile_controls_streaming_tool_ids_on_generic_names() {
+async fn resolved_k3_profile_controls_streaming_tool_ids_on_generic_names() {
     for forced in [false, true] {
         let text = if forced {
             r#"{"city":"Tokyo"}"#

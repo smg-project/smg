@@ -182,11 +182,6 @@ pub struct ChatCompletionRequest {
     #[schemars(skip)]
     pub resolved_model_profile: Option<ModelProfile>,
 
-    /// Canonical identity for model-specific defaults, independent of the public serving name.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub resolved_model_id: Option<String>,
-
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
     #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
@@ -444,10 +439,6 @@ impl ChatCompletionRequest {
     pub fn model_profile(&self) -> ModelProfile {
         self.resolved_model_profile
             .unwrap_or_else(|| ModelProfile::for_model(&self.model))
-    }
-
-    pub fn profile_model_id(&self) -> &str {
-        self.resolved_model_id.as_deref().unwrap_or(&self.model)
     }
 
     pub fn provider_profile(&self) -> ProviderProfile {

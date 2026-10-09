@@ -53,7 +53,7 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        Self::from_request_with(req, state, |_| {}).await
+        Self::from_request_with(req, state, |_| Ok(())).await
     }
 }
 
@@ -63,7 +63,7 @@ where
     T: DeserializeOwned + Validate + Normalizable + Send,
 {
     /// Apply trusted request metadata after deserialization and before any normalization.
-    /// The protocol crate remains independent of the gateway's registry and configuration.
+    /// The protocol crate remains independent of the gateway's worker registry.
     pub async fn from_request_with<S, F>(
         req: Request,
         state: &S,
@@ -71,7 +71,7 @@ where
     ) -> Result<Self, Response>
     where
         S: Send + Sync,
-        F: FnOnce(&mut T) + Send,
+        F: FnOnce(&mut T) -> Result<(), Response> + Send,
     {
         // First, extract and deserialize the JSON
         let Json(mut data) =
@@ -104,7 +104,7 @@ where
                         .into_response()
                 })?;
 
-        prepare(&mut data);
+        prepare(&mut data)?;
 
         // Normalize the request (apply defaults based on other fields)
         data.normalize();

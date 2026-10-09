@@ -666,14 +666,6 @@ impl RouterConfigBuilder {
     }
 
     /// Alias → canonical model ID map applied to locally created workers.
-    pub fn model_profiles(
-        mut self,
-        profiles: HashMap<String, openai_protocol::profile::ModelProfile>,
-    ) -> Self {
-        self.config.model_profiles = profiles;
-        self
-    }
-
     pub fn model_aliases(mut self, aliases: HashMap<String, String>) -> Self {
         self.config.model_aliases = aliases;
         self

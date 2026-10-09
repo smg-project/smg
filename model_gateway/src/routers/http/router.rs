@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     error::Error as _,
     sync::Arc,
     time::{Duration, Instant},
@@ -27,7 +26,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
-    profile::{ModelProfile, ProviderProfile},
+    profile::ProviderProfile,
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
@@ -124,7 +123,6 @@ pub struct Router {
     /// requests stream and forfeit router retries. `0` never buffers for
     /// retries.
     max_buffered_request_bytes: u64,
-    model_profiles: HashMap<String, ModelProfile>,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -192,7 +190,6 @@ impl Router {
                 secs => Some(Duration::from_secs(secs)),
             },
             max_buffered_request_bytes: ctx.router_config.max_buffered_request_bytes,
-            model_profiles: ctx.router_config.model_profiles.clone(),
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
@@ -1829,8 +1826,14 @@ impl Router {
         // A model contract needs the typed path, even when a large body
         // would otherwise stream past gateway normalization and validation.
         if route == "/v1/chat/completions"
-            && (!self.model_profiles.is_empty()
-                || ModelProfile::for_model(worker.model_id()) != ModelProfile::OpenAi)
+            && (crate::model_profile::worker_requires_chat_profile(worker.as_ref())
+                || self
+                    .worker_registry
+                    .get_routing_pool(crate::worker::UNKNOWN_MODEL_ID, RoutingPool::HttpRegular)
+                    .iter()
+                    .any(|candidate| {
+                        crate::model_profile::worker_requires_chat_profile(candidate.as_ref())
+                    }))
         {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, "model_profile");
             return Err(req);
@@ -2454,7 +2457,6 @@ mod tests {
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
             max_buffered_request_bytes: 0,
-            model_profiles: HashMap::new(),
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -2781,7 +2783,6 @@ mod tests {
             // Streaming tests exercise the streamed path; 0 never buffers
             // for retries.
             max_buffered_request_bytes: 0,
-            model_profiles: HashMap::new(),
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
