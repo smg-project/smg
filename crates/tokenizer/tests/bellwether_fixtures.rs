@@ -151,18 +151,7 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
 /// is tracked, so the run compares the others: an unlisted model that does
 /// not load fails the run, and so does a listed one whose tokenizer loads
 /// now, so the list cannot rot.
-const KNOWN_UNLOADED: &[(&str, &str)] = &[
-    (
-        "qwen3-omni-30b-a3b-instruct",
-        "the checkpoint ships vocab.json and merges.txt and neither tokenizer.json nor \
-         tiktoken.model, the files the tokenizer reads (smg-project/smg-lab#111)",
-    ),
-    (
-        "qwen3-omni-30b-a3b-thinking",
-        "the checkpoint ships vocab.json and merges.txt and neither tokenizer.json nor \
-         tiktoken.model, the files the tokenizer reads (smg-project/smg-lab#111)",
-    ),
-];
+const KNOWN_UNLOADED: &[(&str, &str)] = &[];
 
 /// The reason `known` lists for `id`: the entry that is the id itself, else
 /// the first prefix entry the id begins with; none when the id is not listed.

@@ -126,6 +126,42 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "SMG's request schema types tool-call arguments as a string, as the API and the engines do; \
          the Qwen3 template accepts an object (smg-project/bellwether#12, needs:simo)",
     ),
+    // The two Qwen3-Omni models load since smg-project/smg#3006: the same classes as
+    // their siblings, nothing from tokenization.
+    (
+        "qwen3-omni-30b-a3b-instruct/render/bfcl-multi-turn-*",
+        "the typed tool definitions drop the fields outside the function schema, here the \
+         `response` field of the BFCL multi-turn tools, and this template renders the tool \
+         object verbatim (smg-project/smg-lab#105)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-instruct/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-instruct/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking/render/bfcl-multi-turn-*",
+        "the typed tool definitions drop the fields outside the function schema, here the \
+         `response` field of the BFCL multi-turn tools, and this template renders the tool \
+         object verbatim (smg-project/smg-lab#105)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
     (
         "glm-5.3-flash/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
@@ -406,22 +442,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "glm-5.3-flash/render/continue-final-message",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779)",
-    ),
-    (
-        "glm-5.3-flash/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "glm-5.3-flash/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
         "granite-4.1-3b/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -484,22 +504,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "hermes-4-14b/render/tools-history-single-call",
         "the gateway parses tool-call arguments into objects before rendering, which this \
          template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "hy4-preview/render/continue-final-message",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779)",
-    ),
-    (
-        "hy4-preview/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "hy4-preview/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "inkling/render/continue-final-message",
@@ -649,22 +653,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "minimax-m2.7/render/continue-final-message",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779)",
-    ),
-    (
-        "minimax-m2.7/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "minimax-m2.7/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
         "minimax-m2/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -683,22 +671,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "minimax-m2/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "minimax-m3/render/continue-final-message",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779)",
-    ),
-    (
-        "minimax-m3/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "minimax-m3/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
@@ -1410,16 +1382,6 @@ const KNOWN_UNLOADED: &[(&str, &str)] = &[
         "the checkpoint ships tiktoken.model and no tokenizer.json; this harness fetches \
          tokenizer.json only (the tokenizer harness reads the tiktoken file since \
          smg-project/smg#2923)",
-    ),
-    (
-        "qwen3-omni-30b-a3b-instruct",
-        "the checkpoint ships vocab.json and merges.txt and neither tokenizer.json nor \
-         tiktoken.model, the files the tokenizer reads (smg-project/smg-lab#111)",
-    ),
-    (
-        "qwen3-omni-30b-a3b-thinking",
-        "the checkpoint ships vocab.json and merges.txt and neither tokenizer.json nor \
-         tiktoken.model, the files the tokenizer reads (smg-project/smg-lab#111)",
     ),
 ];
 
