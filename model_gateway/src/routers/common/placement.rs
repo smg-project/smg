@@ -81,6 +81,14 @@ pub(crate) struct PlacementInputs<'a> {
     /// selected (e.g. only workers that process media references themselves,
     /// or none that already answered this request definitively).
     pub candidate_filter: Option<CandidateFilter<'a>>,
+    /// Engines (by base URL) a failed attempt of this request already
+    /// dispatched to. A retry skips them while another available candidate
+    /// is left to take the request, so a policy that would re-select the
+    /// same worker deterministically (a routing key, a cached prefix) moves
+    /// on instead of replaying on the worker that just failed. A pool with
+    /// nothing else left is used whole, so a single worker is retried as
+    /// before.
+    pub tried: &'a [String],
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -236,6 +244,29 @@ pub(crate) fn select_from(
             .cloned()
             .collect::<Vec<_>>();
         &filtered
+    };
+    // The engines this request already tried step aside for its retry while
+    // another available candidate remains; otherwise the pool is used whole.
+    let untried;
+    let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() {
+        available
+    } else {
+        untried = available
+            .iter()
+            .filter(|worker| {
+                worker.is_available()
+                    && !inputs
+                        .tried
+                        .iter()
+                        .any(|engine| engine == worker.base_url())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if untried.is_empty() {
+            available
+        } else {
+            &untried
+        }
     };
     if available.is_empty() {
         return overload_fallback(registry, policy.name(), model_id, candidates);
@@ -1285,5 +1316,199 @@ mod tests {
             single_failure(&registry, MODEL, RoutingPool::GrpcPipelineRegular, None),
             PlacementFailure::NoCandidates
         ));
+    }
+
+    fn cache_aware_policy() -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
+        }
+    }
+
+    fn http_registry(urls: &[&str]) -> WorkerRegistry {
+        let typed: Vec<_> = urls
+            .iter()
+            .map(|url| (*url, ConnectionMode::Http, RuntimeType::Sglang))
+            .collect();
+        registry_with(&typed)
+    }
+
+    fn pick(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        inputs: PlacementInputs<'_>,
+    ) -> Arc<dyn Worker> {
+        select_single(
+            registry,
+            policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            inputs,
+        )
+        .expect("a worker is selectable")
+    }
+
+    /// A routing key pins consistent hashing to one worker; once that worker
+    /// was tried, the retry falls through to the next node on the ring, and
+    /// a pool with nothing untried left is used whole.
+    #[test]
+    fn a_retry_under_consistent_hashing_falls_through_to_the_next_ring_node() {
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "session-7".parse().unwrap());
+        let inputs = PlacementInputs {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let owner = pick(&registry, &policies, inputs);
+        assert_eq!(
+            pick(&registry, &policies, inputs).url(),
+            owner.url(),
+            "the key re-selects its owner deterministically"
+        );
+
+        let tried = vec![owner.base_url().to_string()];
+        let moved = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..inputs
+            },
+        );
+        assert_ne!(
+            moved.url(),
+            owner.url(),
+            "the retry leaves the tried worker"
+        );
+        assert_eq!(
+            pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..inputs
+                },
+            )
+            .url(),
+            moved.url(),
+            "the fall-through is deterministic too"
+        );
+
+        let all: Vec<String> = ["http://h:1", "http://h:2", "http://h:3"]
+            .iter()
+            .map(|url| (*url).to_string())
+            .collect();
+        assert_eq!(
+            pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &all,
+                    ..inputs
+                },
+            )
+            .url(),
+            owner.url(),
+            "with every worker tried the pool is used whole again"
+        );
+    }
+
+    /// Cache-aware routing pins a prompt to the worker holding its prefix;
+    /// a retry moves to the next-best worker and comes back only when no
+    /// other worker is left.
+    #[test]
+    fn a_retry_under_cache_aware_routing_moves_to_the_next_best_worker() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(cache_aware_policy());
+        let text = "the one prompt whose prefix lives on a single worker after the first request";
+        let inputs = PlacementInputs {
+            text: Some(text),
+            ..Default::default()
+        };
+
+        let holder = pick(&registry, &policies, inputs);
+        assert_eq!(
+            pick(&registry, &policies, inputs).url(),
+            holder.url(),
+            "the prefix pins the prompt to its holder"
+        );
+
+        let tried = vec![holder.base_url().to_string()];
+        let moved = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..inputs
+            },
+        );
+        assert_ne!(moved.url(), holder.url(), "the retry leaves the holder");
+
+        let both = vec![holder.base_url().to_string(), moved.base_url().to_string()];
+        assert!(select_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                tried: &both,
+                ..inputs
+            },
+        )
+        .is_some());
+    }
+
+    /// Round robin never re-selects a tried worker while another is left,
+    /// and a single-worker pool keeps retrying its one worker.
+    #[test]
+    fn a_retry_under_round_robin_skips_the_tried_worker_and_a_lone_worker_is_kept() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let tried = vec!["http://h:1".to_string()];
+        for _ in 0..4 {
+            let selected = pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(selected.url(), "http://h:2");
+        }
+
+        let lone = http_registry(&["http://h:9"]);
+        let tried = vec!["http://h:9".to_string()];
+        let selected = pick(
+            &lone,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            selected.url(),
+            "http://h:9",
+            "nothing else is left: the one worker takes the retry"
+        );
     }
 }

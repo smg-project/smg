@@ -170,6 +170,7 @@ impl PipelineStage for WorkerSelectionStage {
             rid_key,
             cache_namespace,
             candidate_filter: media_refs.then_some(ACCEPTS_MEDIA_REFS),
+            tried: &[],
         };
         let sticky_key = ctx.state.sticky_key.as_deref();
 
@@ -321,7 +322,7 @@ impl WorkerSelectionStage {
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(
+                match self.select_single_worker_for_attempt(
                     model_id,
                     text,
                     tokens,
@@ -330,6 +331,7 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     wire,
                     Some(&admits),
+                    &ctx.tried,
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
@@ -353,6 +355,7 @@ impl WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     candidate_filter: Some(&pinned),
+                    tried: &[],
                 };
                 let (pair, guard) = self
                     .admit_pd_pair(
@@ -719,6 +722,38 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         candidate_filter: Option<CandidateFilter<'_>>,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_single_worker_for_attempt(
+            model_id,
+            text,
+            tokens,
+            headers,
+            rid_key,
+            cache_namespace,
+            wire,
+            candidate_filter,
+            &[],
+        )
+    }
+
+    /// [`Self::select_single_worker`] for a retry attempt: `tried` are the
+    /// engines the request's failed attempts dispatched to, skipped while
+    /// another available candidate is left (see `PlacementInputs::tried`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes"
+    )]
+    fn select_single_worker_for_attempt(
+        &self,
+        model_id: &str,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
+        wire: Option<WireConstraint>,
+        candidate_filter: Option<CandidateFilter<'_>>,
+        tried: &[String],
+    ) -> Option<Arc<dyn Worker>> {
         // A retry pins the retained wire, and with it the media pin, on top of
         // whatever the caller excludes.
         let pinned = |worker: &dyn Worker| {
@@ -745,6 +780,7 @@ impl WorkerSelectionStage {
                 rid_key,
                 cache_namespace,
                 candidate_filter,
+                tried,
             },
         )
     }
@@ -1877,6 +1913,7 @@ mod tests {
             cache_trace: None,
             attempt: 0,
             ledger: AttemptLedger::default(),
+            tried: Vec::new(),
             model_id: model_id.to_string(),
             dispatch_model: model_id.to_string(),
             streaming: false,
@@ -1966,6 +2003,87 @@ mod tests {
                 WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
             }
         }
+    }
+
+    /// A keyed request's retry re-selects away from the engine its failed
+    /// attempt used while another worker on the retained wire is left; with
+    /// every engine tried the pool is used whole again.
+    #[tokio::test]
+    async fn reselect_skips_the_engines_the_failed_attempts_used() {
+        let model_id = "tried-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for url in [
+            "grpc://127.0.0.1:9310",
+            "grpc://127.0.0.1:9311",
+            "grpc://127.0.0.1:9312",
+        ] {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing)),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        let mut ctx = dispatch_ctx(
+            model_id,
+            WireConstraint {
+                runtime: RuntimeType::Vllm,
+                connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "session-42".parse().unwrap());
+        ctx.headers = Some(headers);
+        let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
+            WorkerSelection::Single { worker } => Arc::clone(worker),
+            WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
+        };
+
+        stage.reselect(&mut ctx).await.unwrap();
+        let owner = selected(&ctx);
+        stage.reselect(&mut ctx).await.unwrap();
+        assert_eq!(
+            selected(&ctx).url(),
+            owner.url(),
+            "without a failed attempt the key re-selects its owner"
+        );
+
+        ctx.tried.push(owner.base_url().to_string());
+        stage.reselect(&mut ctx).await.unwrap();
+        let second = selected(&ctx);
+        assert_ne!(
+            second.url(),
+            owner.url(),
+            "the retry leaves the tried engine"
+        );
+
+        ctx.tried.push(second.base_url().to_string());
+        stage.reselect(&mut ctx).await.unwrap();
+        let third = selected(&ctx);
+        assert!(
+            third.url() != owner.url() && third.url() != second.url(),
+            "the second retry leaves both tried engines"
+        );
+
+        ctx.tried.push(third.base_url().to_string());
+        stage.reselect(&mut ctx).await.unwrap();
+        assert_eq!(
+            selected(&ctx).url(),
+            owner.url(),
+            "with every engine tried the pool is used whole again"
+        );
     }
 
     #[tokio::test]

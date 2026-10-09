@@ -549,6 +549,7 @@ impl PDRouter {
                     rid_key: rid_key.as_deref(),
                     cache_namespace,
                     candidate_filter: None,
+                    tried: &[],
                 },
                 sticky_key,
             )
@@ -2699,6 +2700,7 @@ impl RouterTrait for PDRouter {
                 rid_key: None,
                 cache_namespace: None,
                 candidate_filter: None,
+                tried: &[],
             },
         ) else {
             return error::service_unavailable(
