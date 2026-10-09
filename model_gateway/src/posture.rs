@@ -7,6 +7,9 @@
 //! so from its first log lines, not from an audit. One WARN record names
 //! every open surface and the flag that closes it.
 
+use std::net::SocketAddr;
+
+use smg_mesh::MeshServerConfig;
 use tracing::warn;
 
 use crate::{middleware::AuthConfig, observability::metrics::PrometheusConfig};
@@ -21,16 +24,21 @@ pub(crate) struct OpenSurfaces {
     pub control_plane: bool,
     /// The serving routes answer without a credential.
     pub data_plane: bool,
+    /// The mesh listener, when the mesh runs without TLS: it gossips
+    /// membership and state with any peer that connects.
+    pub mesh_without_tls: Option<SocketAddr>,
 }
 
 impl OpenSurfaces {
     /// `control_plane_auth` says whether control-plane auth (API keys or
     /// JWT) initialised; `serving_auth` and `admin_auth` are the serving
-    /// check and the admin routes' shared-key fallback.
+    /// check and the admin routes' shared-key fallback; `mesh` is the mesh
+    /// configuration of this start, if any.
     pub(crate) fn judge(
         serving_auth: &AuthConfig,
         admin_auth: &AuthConfig,
         control_plane_auth: bool,
+        mesh: Option<&MeshServerConfig>,
     ) -> Self {
         // Mirrors `build_app`: control-plane auth guards the admin routes;
         // without it, tenant keys without a shared key deny every request;
@@ -41,11 +49,14 @@ impl OpenSurfaces {
         Self {
             control_plane,
             data_plane: !serving_auth.is_enabled(),
+            mesh_without_tls: mesh
+                .filter(|mesh| mesh.mtls_config.is_none())
+                .map(|mesh| mesh.bind_addr),
         }
     }
 
     pub(crate) fn any(self) -> bool {
-        self.control_plane || self.data_plane
+        self.control_plane || self.data_plane || self.mesh_without_tls.is_some()
     }
 }
 
@@ -71,15 +82,27 @@ pub(crate) fn open_posture_warning(
     if !open.any() {
         return None;
     }
-    let control_plane = open.control_plane.then(|| {
-        "OPEN: POST /workers and PUT/PATCH/DELETE /workers/{id} (register or remove backends by \
-         URL), GET /workers and GET /get_loads (the backends' addresses), POST /flush_cache (drops \
-         the engines' prefix caches), POST /start_profile and POST /stop_profile (the engines' \
-         profilers), POST /heap_profile (writes this gateway's heap profile to disk), /parse/*, \
-         /wasm and /v1/tokenizers; protect them with --control-plane-api-keys \
-         id:name:admin:<key> or --jwt-issuer/--jwt-audience (the shared --api-key gates them too)"
-            .to_string()
-    });
+    let mut control_plane_parts = Vec::new();
+    if open.control_plane {
+        control_plane_parts.push(
+            "OPEN: POST /workers and PUT/PATCH/DELETE /workers/{id} (register or remove backends by \
+             URL), GET /workers and GET /get_loads (the backends' addresses), POST /flush_cache \
+             (drops the engines' prefix caches), POST /start_profile and POST /stop_profile (the \
+             engines' profilers), POST /heap_profile (writes this gateway's heap profile to \
+             disk), /parse/*, /wasm and /v1/tokenizers; protect them with \
+             --control-plane-api-keys id:name:admin:<key> or --jwt-issuer/--jwt-audience (the \
+             shared --api-key gates them too)"
+                .to_string(),
+        );
+    }
+    if let Some(addr) = open.mesh_without_tls {
+        control_plane_parts.push(format!(
+            "OPEN: the mesh listener on {addr} gossips membership and state with any peer that \
+             connects, in clear text; give it --mesh-tls-ca-cert, --mesh-tls-cert and \
+             --mesh-tls-key (peers then need a certificate from that CA)"
+        ));
+    }
+    let control_plane = (!control_plane_parts.is_empty()).then(|| control_plane_parts.join(" "));
     let data_plane = open.data_plane.then(|| {
         "OPEN: /v1/chat/completions, /v1/completions, /v1/responses, /v1/embeddings, /v1/messages \
          and the other serving routes need no credential; protect them with --api-key <key> or \
@@ -113,8 +136,9 @@ pub(crate) fn log_open_posture(
     admin_auth: &AuthConfig,
     control_plane_auth: bool,
     metrics: Option<&PrometheusConfig>,
+    mesh: Option<&MeshServerConfig>,
 ) {
-    let open = OpenSurfaces::judge(serving_auth, admin_auth, control_plane_auth);
+    let open = OpenSurfaces::judge(serving_auth, admin_auth, control_plane_auth, mesh);
     if let Some(warning) = open_posture_warning(open, metrics) {
         warn!(
             control_plane = warning.control_plane.as_deref(),
@@ -146,12 +170,13 @@ mod tests {
 
     #[test]
     fn an_unkeyed_start_names_every_open_surface_and_its_flag() {
-        let open = OpenSurfaces::judge(&unkeyed(), &unkeyed(), false);
+        let open = OpenSurfaces::judge(&unkeyed(), &unkeyed(), false, None);
         assert_eq!(
             open,
             OpenSurfaces {
                 control_plane: true,
                 data_plane: true,
+                mesh_without_tls: None,
             }
         );
 
@@ -188,12 +213,13 @@ mod tests {
 
     #[test]
     fn control_plane_keys_alone_leave_only_the_data_plane_open() {
-        let open = OpenSurfaces::judge(&unkeyed(), &unkeyed(), true);
+        let open = OpenSurfaces::judge(&unkeyed(), &unkeyed(), true, None);
         assert_eq!(
             open,
             OpenSurfaces {
                 control_plane: false,
                 data_plane: true,
+                mesh_without_tls: None,
             }
         );
 
@@ -206,7 +232,7 @@ mod tests {
 
     #[test]
     fn an_ipv6_listener_is_bracketed() {
-        let open = OpenSurfaces::judge(&unkeyed(), &unkeyed(), false);
+        let open = OpenSurfaces::judge(&unkeyed(), &unkeyed(), false, None);
         let listener = PrometheusConfig {
             host: "::".to_string(),
             ..PrometheusConfig::default()
@@ -222,7 +248,7 @@ mod tests {
 
     #[test]
     fn a_shared_key_closes_both_planes() {
-        let open = OpenSurfaces::judge(&keyed(), &keyed(), false);
+        let open = OpenSurfaces::judge(&keyed(), &keyed(), false, None);
 
         assert!(!open.any());
         assert_eq!(open_posture_warning(open, Some(&listener())), None);
@@ -240,7 +266,7 @@ mod tests {
             }],
         );
 
-        let open = OpenSurfaces::judge(&serving, &unkeyed(), false);
+        let open = OpenSurfaces::judge(&serving, &unkeyed(), false, None);
 
         assert!(!open.any());
     }
@@ -248,7 +274,7 @@ mod tests {
     #[traced_test]
     #[test]
     fn an_open_start_logs_the_warning() {
-        log_open_posture(&unkeyed(), &unkeyed(), false, Some(&listener()));
+        log_open_posture(&unkeyed(), &unkeyed(), false, Some(&listener()), None);
 
         assert!(logs_contain("SECURITY POSTURE"));
         assert!(logs_contain("control_plane=\"OPEN: POST /workers"));
@@ -256,10 +282,77 @@ mod tests {
         assert!(logs_contain("metrics_listener=\"0.0.0.0:29000"));
     }
 
+    fn mesh(mtls: Option<smg_mesh::MTLSConfig>) -> MeshServerConfig {
+        let addr: SocketAddr = "10.0.0.7:39527".parse().unwrap();
+        MeshServerConfig {
+            self_name: "node-a".to_string(),
+            bind_addr: addr,
+            advertise_addr: addr,
+            init_peer: None,
+            mtls_config: mtls,
+        }
+    }
+
+    /// A mesh without TLS is an open control-plane surface even on a keyed
+    /// start; with mTLS configured it is not named.
+    #[test]
+    fn a_mesh_listener_without_tls_is_named_in_the_control_plane() {
+        let open = OpenSurfaces::judge(&keyed(), &keyed(), true, Some(&mesh(None)));
+        assert_eq!(
+            open.mesh_without_tls,
+            Some("10.0.0.7:39527".parse().unwrap())
+        );
+        assert!(open.any());
+
+        let warning = open_posture_warning(open, None).expect("a plaintext mesh warns");
+        let control_plane = warning
+            .control_plane
+            .expect("the mesh is a control-plane surface");
+        for needle in [
+            "mesh listener on 10.0.0.7:39527",
+            "--mesh-tls-ca-cert",
+            "--mesh-tls-key",
+        ] {
+            assert!(
+                control_plane.contains(needle),
+                "{needle} missing from:\n{control_plane}"
+            );
+        }
+        assert!(
+            !control_plane.contains("POST /workers"),
+            "the keyed routes are not named"
+        );
+        assert_eq!(warning.data_plane, None);
+
+        let secured = OpenSurfaces::judge(
+            &keyed(),
+            &keyed(),
+            true,
+            Some(&mesh(Some(smg_mesh::MTLSConfig::default()))),
+        );
+        assert_eq!(secured.mesh_without_tls, None);
+        assert!(!secured.any());
+    }
+
+    #[traced_test]
+    #[test]
+    fn a_plaintext_mesh_logs_the_warning_on_a_keyed_start() {
+        log_open_posture(
+            &keyed(),
+            &keyed(),
+            true,
+            Some(&listener()),
+            Some(&mesh(None)),
+        );
+
+        assert!(logs_contain("SECURITY POSTURE"));
+        assert!(logs_contain("mesh listener on 10.0.0.7:39527"));
+    }
+
     #[traced_test]
     #[test]
     fn a_keyed_start_logs_nothing() {
-        log_open_posture(&keyed(), &keyed(), true, Some(&listener()));
+        log_open_posture(&keyed(), &keyed(), true, Some(&listener()), None);
 
         assert!(!logs_contain("SECURITY POSTURE"));
     }

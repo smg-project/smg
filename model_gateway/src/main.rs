@@ -47,7 +47,7 @@ use smg::{
     worker::{ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
-use smg_mesh::MeshServerConfig;
+use smg_mesh::{MTLSConfig, MeshServerConfig};
 use tracing::info;
 
 /// Parse repeated `<flag> <url> [bootstrap_port|none]` occurrences into
@@ -1361,6 +1361,20 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     mesh_peer_urls: Vec<String>,
 
+    /// The CA certificate (PEM) the mesh peers' certificates chain to. With
+    /// `--mesh-tls-cert` and `--mesh-tls-key` the mesh listener serves TLS
+    /// and requires peer certificates, and every dial presents this node's.
+    #[arg(long, requires_all = ["mesh_tls_cert", "mesh_tls_key"])]
+    mesh_tls_ca_cert: Option<String>,
+
+    /// This mesh node's certificate (PEM), with the node's IP as a SAN.
+    #[arg(long, requires_all = ["mesh_tls_ca_cert", "mesh_tls_key"])]
+    mesh_tls_cert: Option<String>,
+
+    /// This mesh node's private key (PKCS#8 PEM).
+    #[arg(long, requires_all = ["mesh_tls_ca_cert", "mesh_tls_cert"])]
+    mesh_tls_key: Option<String>,
+
     // ==================== WebRTC ====================
     /// Bind address for WebRTC UDP sockets (client-facing ICE candidate IP).
     /// Default: the unspecified address of `--host`'s family (`::`, dual-stack
@@ -1678,7 +1692,37 @@ impl CliArgs {
             bind_addr,
             advertise_addr,
             init_peer: peer,
-            mtls_config: None,
+            mtls_config: self.mesh_mtls_config()?,
+        }))
+    }
+
+    /// The mesh mTLS configuration from `--mesh-tls-ca-cert`, `--mesh-tls-cert`
+    /// and `--mesh-tls-key` (all three or none, which the parser enforces);
+    /// each file has to be readable at start-up, not at the first dial.
+    fn mesh_mtls_config(&self) -> ConfigResult<Option<MTLSConfig>> {
+        let (Some(ca), Some(cert), Some(key)) = (
+            &self.mesh_tls_ca_cert,
+            &self.mesh_tls_cert,
+            &self.mesh_tls_key,
+        ) else {
+            return Ok(None);
+        };
+        for (field, path) in [
+            ("mesh_tls_ca_cert", ca),
+            ("mesh_tls_cert", cert),
+            ("mesh_tls_key", key),
+        ] {
+            std::fs::metadata(path).map_err(|e| ConfigError::InvalidValue {
+                field: field.to_string(),
+                value: path.clone(),
+                reason: format!("cannot read the file: {e}"),
+            })?;
+        }
+        Ok(Some(MTLSConfig {
+            ca_cert_path: ca.into(),
+            server_cert_path: cert.into(),
+            server_key_path: key.into(),
+            ..MTLSConfig::default()
         }))
     }
 
@@ -2477,6 +2521,95 @@ mod tests {
         assert!(
             err.to_string().contains("invalid bind host 'mesh-host'"),
             "got: {err}"
+        );
+    }
+
+    /// Three files for the mesh TLS flags (their content is not read here).
+    fn mesh_tls_files(tag: &str) -> [String; 3] {
+        let dir = std::env::temp_dir().join(format!("smg-mesh-tls-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ["ca.pem", "node.pem", "node-key.pem"].map(|name| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"test").unwrap();
+            path.to_string_lossy().into_owned()
+        })
+    }
+
+    #[test]
+    fn mesh_tls_flags_configure_mtls_with_client_certificates_required() {
+        let [ca, cert, key] = mesh_tls_files("all");
+        let mesh = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-tls-ca-cert",
+            &ca,
+            "--mesh-tls-cert",
+            &cert,
+            "--mesh-tls-key",
+            &key,
+        ])
+        .build_mesh_server_config()
+        .unwrap()
+        .unwrap();
+
+        let mtls = mesh.mtls_config.expect("the three flags configure mTLS");
+        assert_eq!(mtls.ca_cert_path.to_string_lossy(), ca);
+        assert_eq!(mtls.server_cert_path.to_string_lossy(), cert);
+        assert_eq!(mtls.server_key_path.to_string_lossy(), key);
+        assert!(mtls.require_client_cert, "peers must present a certificate");
+
+        let plain = cli_args_from(&["--enable-mesh", "--mesh-host", "127.0.0.1"])
+            .build_mesh_server_config()
+            .unwrap()
+            .unwrap();
+        assert!(plain.mtls_config.is_none(), "no flags, no mTLS");
+    }
+
+    #[test]
+    fn the_mesh_tls_flags_come_together() {
+        let [ca, cert, _key] = mesh_tls_files("partial");
+        for partial in [
+            vec!["--mesh-tls-cert", cert.as_str()],
+            vec![
+                "--mesh-tls-ca-cert",
+                ca.as_str(),
+                "--mesh-tls-cert",
+                cert.as_str(),
+            ],
+        ] {
+            let argv: Vec<&str> = ["smg", "--enable-mesh", "--mesh-host", "127.0.0.1"]
+                .into_iter()
+                .chain(partial.iter().copied())
+                .collect();
+            let err = Cli::try_parse_from(argv).expect_err("a partial set is rejected");
+            assert!(
+                err.to_string().contains("--mesh-tls-"),
+                "the error names the missing flag: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_mesh_tls_file_is_a_configuration_error() {
+        let [ca, cert, _key] = mesh_tls_files("missing");
+        let err = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-tls-ca-cert",
+            &ca,
+            "--mesh-tls-cert",
+            &cert,
+            "--mesh-tls-key",
+            "/nonexistent/node-key.pem",
+        ])
+        .build_mesh_server_config()
+        .err()
+        .expect("an unreadable key file is rejected at start-up");
+        assert!(
+            err.to_string().contains("mesh_tls_key"),
+            "the error names the flag: {err}"
         );
     }
 

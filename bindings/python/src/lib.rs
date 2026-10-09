@@ -588,6 +588,11 @@ struct Router {
     /// The keyword-only `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
+    /// Keyword-only: the mesh CA, this node's certificate and key (PEM
+    /// paths); all three or none.
+    mesh_tls_ca_cert: Option<String>,
+    mesh_tls_cert: Option<String>,
+    mesh_tls_key: Option<String>,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -624,6 +629,42 @@ impl Router {
         self.prometheus_host
             .clone()
             .unwrap_or_else(|| config::MetricsConfig::default_host_for(&self.host))
+    }
+
+    /// The mesh mTLS configuration from `mesh_tls_ca_cert`, `mesh_tls_cert`
+    /// and `mesh_tls_key`: all three or none, each a readable file.
+    fn mesh_mtls_config(&self) -> PyResult<Option<smg_mesh::MTLSConfig>> {
+        let (ca, cert, key) = match (
+            &self.mesh_tls_ca_cert,
+            &self.mesh_tls_cert,
+            &self.mesh_tls_key,
+        ) {
+            (None, None, None) => return Ok(None),
+            (Some(ca), Some(cert), Some(key)) => (ca, cert, key),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "mesh_tls_ca_cert, mesh_tls_cert and mesh_tls_key come together: give all \
+                     three or none",
+                ))
+            }
+        };
+        for (field, path) in [
+            ("mesh_tls_ca_cert", ca),
+            ("mesh_tls_cert", cert),
+            ("mesh_tls_key", key),
+        ] {
+            std::fs::metadata(path).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid value for {field}='{path}': cannot read the file: {e}"
+                ))
+            })?;
+        }
+        Ok(Some(smg_mesh::MTLSConfig {
+            ca_cert_path: ca.into(),
+            server_cert_path: cert.into(),
+            server_key_path: key.into(),
+            ..smg_mesh::MTLSConfig::default()
+        }))
     }
 
     fn parse_mesh_socket_addr(
@@ -1287,6 +1328,9 @@ impl Router {
         jemalloc_prof_dir = None,
         // Keyword-only, so it never takes a positional slot.
         *,
+        mesh_tls_ca_cert = None,
+        mesh_tls_cert = None,
+        mesh_tls_key = None,
         discovery = None,
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -1474,6 +1518,9 @@ impl Router {
         tenant_rate_limit_enabled: bool,
         tenant_rate_limit_config: Option<String>,
         jemalloc_prof_dir: Option<String>,
+        mesh_tls_ca_cert: Option<String>,
+        mesh_tls_cert: Option<String>,
+        mesh_tls_key: Option<String>,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
@@ -1690,6 +1737,9 @@ impl Router {
             tenant_rate_limit_enabled,
             tenant_rate_limit_config,
             discovery,
+            mesh_tls_ca_cert,
+            mesh_tls_cert,
+            mesh_tls_key,
         })
     }
 
@@ -1806,7 +1856,7 @@ impl Router {
                         bind_addr,
                         advertise_addr,
                         init_peer: peer,
-                        mtls_config: None,
+                        mtls_config: self.mesh_mtls_config()?,
                     })
                 } else {
                     None

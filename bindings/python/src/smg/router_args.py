@@ -333,6 +333,10 @@ class RouterArgs:
     # Heap profiles of the router process (a jemalloc-profiling build); appended
     # last: positional callers bind the fields by position
     jemalloc_prof_dir: str | None = None
+    # Mesh mTLS: the CA, this node's certificate and key (PEM paths); all three or none.
+    mesh_tls_ca_cert: str | None = None
+    mesh_tls_cert: str | None = None
+    mesh_tls_key: str | None = None
 
     @staticmethod
     def add_cli_args(
@@ -2088,6 +2092,28 @@ class RouterArgs:
             action="extend",
             default=[],
             help="Peer mesh server addresses to join (format: host:port)",
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-ca-cert",
+            type=str,
+            default=None,
+            help=(
+                "CA certificate (PEM) the mesh peers' certificates chain to. With"
+                " --mesh-tls-cert and --mesh-tls-key the mesh listener serves TLS and requires"
+                " peer certificates, and every dial presents this node's."
+            ),
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-cert",
+            type=str,
+            default=None,
+            help="This mesh node's certificate (PEM), with the node's IP as a SAN",
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-key",
+            type=str,
+            default=None,
+            help="This mesh node's private key (PKCS#8 PEM)",
         )
 
     @classmethod
