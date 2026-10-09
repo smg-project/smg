@@ -1,17 +1,22 @@
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
 use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{
+    DistributionBuilder, Matcher, PrometheusBuilder, PrometheusHandle,
+};
+use metrics_util::parse_quantiles;
 use once_cell::sync::Lazy;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
     bool_to_static_str, intern_model_label, intern_tool_label, metrics_labels, STREAMING_FALSE,
     STREAMING_TRUE,
 };
+
+use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -891,8 +896,56 @@ fn record_tokenizer_cache_activity_snapshot(stats: CacheActivityStats) {
     reason = "startup initialization — metrics exporter must be installed or the process cannot serve metrics"
 )]
 pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
+    let bucket_overrides = histogram_bucket_overrides(config.duration_buckets);
+    let mut builder =
+        PrometheusBuilder::new().upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS));
+    for (matcher, buckets) in &bucket_overrides {
+        builder = builder
+            .set_buckets_for_metric(matcher.clone(), buckets)
+            .expect("histogram bucket overrides are not empty");
+    }
+    let recorder = builder.build_recorder();
+    let handle = recorder.handle();
+
+    // Series labelled `worker` live in a store of their own so they can be
+    // dropped with their worker (see `worker_metrics`); it renders histograms
+    // with the exporter's buckets and quantiles.
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        Some(bucket_overrides),
+        None,
+    )));
+    worker_metrics::install(Arc::clone(&workers));
+    metrics::set_global_recorder(WorkerSeriesRecorder::new(recorder, workers))
+        .expect("failed to install Prometheus recorder");
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    allocator_stats::start_reporting();
+
+    // Descriptions are kept by whichever recorder is current when they are
+    // registered. Before `set_global_recorder()` that is the no-op recorder, so
+    // the `describe_*!` calls must run after it or `/metrics` has `# TYPE`
+    // lines but no `# HELP` text.
+    init_metrics();
+
+    handle
+}
+
+/// The exporter's default summary quantiles, for the summaries of the
+/// per-worker store (`PrometheusBuilder` keeps its own copy private).
+const DEFAULT_SUMMARY_QUANTILES: &[f64] = &[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0];
+
+/// Histogram buckets by metric name. The exporter renders a histogram with
+/// these buckets for a matching name and a summary for any other name.
+fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Matcher, Vec<f64>> {
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
-    let duration_bucket: Vec<f64> = config.duration_buckets.unwrap_or_else(|| {
+    let duration_bucket: Vec<f64> = duration_buckets.unwrap_or_else(|| {
         vec![
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
             60.0, 90.0, 120.0, 180.0, 240.0, 300.0, 480.0, 900.0, 1200.0, 1800.0, 2700.0, 3600.0,
@@ -933,47 +986,23 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     // (seconds): its own buckets, or the recorder renders it as a summary.
     let retry_backoff_matcher = Matcher::Full(String::from("smg_worker_retry_backoff_seconds"));
 
-    let handle = PrometheusBuilder::new()
-        .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
-        .set_buckets_for_metric(duration_matcher, &duration_bucket)
-        .expect("failed to set duration bucket")
-        .set_buckets_for_metric(ttft_matcher, &duration_bucket)
-        .expect("failed to set ttft bucket")
-        .set_buckets_for_metric(tpot_matcher, &duration_bucket)
-        .expect("failed to set tpot bucket")
-        .set_buckets_for_metric(
+    HashMap::from([
+        (duration_matcher, duration_bucket.clone()),
+        (ttft_matcher, duration_bucket.clone()),
+        (tpot_matcher, duration_bucket),
+        (
             canary_matcher,
-            super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
-        )
-        .expect("failed to set event loop delay buckets")
-        .set_buckets_for_metric(match_ratio_matcher, CACHE_AWARE_MATCH_RATIO_BUCKETS)
-        .expect("failed to set cache-aware match ratio buckets")
-        .set_buckets_for_metric(kv_lookup_matcher, KV_INDEX_MICRO_BUCKETS)
-        .expect("failed to set KV index lookup buckets")
-        .set_buckets_for_metric(kv_apply_matcher, KV_INDEX_MICRO_BUCKETS)
-        .expect("failed to set KV event apply buckets")
-        .set_buckets_for_metric(kv_lag_matcher, KV_EVENT_LAG_BUCKETS)
-        .expect("failed to set KV event lag buckets")
-        .set_buckets_for_metric(retry_backoff_matcher, WORKER_RETRY_BACKOFF_BUCKETS)
-        .expect("failed to set worker retry backoff buckets")
-        .install_recorder()
-        .inspect(|_| {
-            #[cfg(all(
-                feature = "jemalloc-stats",
-                not(target_env = "msvc"),
-                not(target_env = "musl")
-            ))]
-            allocator_stats::start_reporting();
-        })
-        .expect("failed to install Prometheus recorder");
-
-    // Descriptions are kept by whichever recorder is current when they are
-    // registered. Before `install_recorder()` that is the no-op recorder, so
-    // the `describe_*!` calls must run after it or `/metrics` has `# TYPE`
-    // lines but no `# HELP` text.
-    init_metrics();
-
-    handle
+            super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS.to_vec(),
+        ),
+        (
+            match_ratio_matcher,
+            CACHE_AWARE_MATCH_RATIO_BUCKETS.to_vec(),
+        ),
+        (kv_lookup_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
+        (kv_apply_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
+        (kv_lag_matcher, KV_EVENT_LAG_BUCKETS.to_vec()),
+        (retry_backoff_matcher, WORKER_RETRY_BACKOFF_BUCKETS.to_vec()),
+    ])
 }
 
 #[cfg(all(
@@ -2414,20 +2443,24 @@ impl Metrics {
     // Worker cleanup
     // ========================================================================
 
+    /// A worker registered at `worker_url`: its series record again if the
+    /// address was retired by an earlier removal.
+    pub fn worker_registered(worker_url: &str) {
+        if let Some(series) = worker_metrics::installed() {
+            series.activate(worker_url);
+        }
+    }
+
+    /// The registration at `worker_url` was removed: drop the address's
+    /// series (every family labelled `worker`, see `worker_metrics`), so the
+    /// scrape and the time-series database stop growing with pod churn, and
+    /// drop the writes that arrive after the removal until the address
+    /// registers again. The interned label goes with them.
     pub fn remove_worker_metrics(worker_url: &str) {
-        // Intern once, clone (cheap) for each metric
-        let worker = intern_string(worker_url);
-
-        gauge!("smg_worker_cb_consecutive_failures", "worker" => Arc::clone(&worker)).set(0.0);
-        gauge!("smg_worker_cb_consecutive_successes", "worker" => Arc::clone(&worker)).set(0.0);
-        gauge!("smg_worker_requests_active", "worker" => Arc::clone(&worker)).set(0.0);
-        gauge!("smg_pd_prefill_admission_inflight", "worker" => Arc::clone(&worker)).set(0.0);
-
-        // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
-        // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
-        gauge!("smg_pd_admission_window", "worker" => Arc::clone(&worker)).set(-1.0);
-        gauge!("smg_worker_cb_state", "worker" => Arc::clone(&worker)).set(-1.0);
-        gauge!("smg_worker_health", "worker" => worker).set(-1.0);
+        if let Some(series) = worker_metrics::installed() {
+            series.retire(worker_url);
+        }
+        STRING_INTERNER.remove(worker_url);
     }
 
     /// Sentinel-out `smg_engine_*` series for a removed worker.
@@ -2578,16 +2611,37 @@ mod tests {
     }
 
     #[test]
-    fn prefill_worker_removal_resets_admission_gauge() {
-        let rendered = render_with_recorder(|| {
+    fn prefill_worker_removal_releases_its_admission_series() {
+        let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+            parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )));
+        let recorder = WorkerSeriesRecorder::new(
+            PrometheusBuilder::new().build_recorder(),
+            Arc::clone(&workers),
+        );
+        metrics::with_local_recorder(&recorder, || {
             Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 7);
-            Metrics::remove_worker_metrics("http://removed-prefill");
+            Metrics::set_pd_prefill_admission_inflight("http://kept-prefill", 3);
+            workers.retire("http://removed-prefill");
+            // A release racing the removal must not bring the series back.
+            Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 6);
         });
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        assert!(
+            !rendered.contains("http://removed-prefill"),
+            "removed worker still rendered:\n{rendered}"
+        );
         assert_metric(
             &rendered,
             "smg_pd_prefill_admission_inflight",
-            &[r#"worker="http://removed-prefill""#],
-            "0",
+            &[r#"worker="http://kept-prefill""#],
+            "3",
         );
     }
 

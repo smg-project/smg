@@ -1922,6 +1922,16 @@ impl WorkerRegistry {
             self.bump_global_routing_epoch();
         }
 
+        // The worker's series are kept for the time its address is
+        // registered (see `observability::worker_metrics`). The builder's
+        // writes for health, HTTP/2 and breaker state preceded this
+        // registration and were dropped if the address was retired by an
+        // earlier removal, so they are repeated here.
+        Metrics::worker_registered(worker.url());
+        Metrics::set_worker_health(worker.url(), worker.is_healthy());
+        Metrics::set_worker_http2(worker.url(), worker.http2());
+        Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
+
         // The worker's request counter starts at zero with its registration,
         // so a worker that gets no traffic shows as such.
         Metrics::init_worker_requests(worker.url(), worker.model_id());
