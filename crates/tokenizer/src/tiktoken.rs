@@ -192,8 +192,10 @@ pub struct TiktokenTokenizer {
     eos_token_ids: Vec<TokenIdType>,
     skip_token_ids: HashSet<TokenIdType>,
     renderer: Renderer,
-    /// Bytes per id, for the per-stream decoder (see `byte_level`).
-    byte_level: Arc<ByteLevelTable>,
+    /// Bytes per id, for the per-stream decoder (see `byte_level`); `None`
+    /// for a vocabulary whose ids lie too far apart for a dense table, which
+    /// streams through the generic decoder.
+    byte_level: Option<Arc<ByteLevelTable>>,
 }
 
 /// Supported Tiktoken models
@@ -477,21 +479,37 @@ fn build_vocab_maps(
     (vocab, reverse_vocab)
 }
 
+/// The largest id range a dense per-id byte table is built for. Every real
+/// vocabulary ends far below it (o200k at 200,019, Kimi K3 at its 163,840
+/// ranks plus the specials); a `tokenizer_config.json` whose added-token ids
+/// lie far beyond the ranks would otherwise cost about nine bytes and one
+/// BPE lookup per id up to the largest one, so such a vocabulary keeps the
+/// generic per-stream decoder instead.
+const MAX_BYTE_LEVEL_TABLE_IDS: usize = 1 << 22;
+
 /// The bytes every id decodes to, read back from the BPE: a rank's byte
 /// string, a special token's text. Every id up to the largest rank or special
 /// id gets an entry; `skip_token_ids` marks the ones `skip_special_tokens`
-/// strips, as `decode` strips them.
+/// strips, as `decode` strips them. `None` when the ids reach past
+/// [`MAX_BYTE_LEVEL_TABLE_IDS`].
 fn byte_level_table(
     bpe: &CoreBPE,
     vocab_size: usize,
     skip_token_ids: &HashSet<TokenIdType>,
-) -> Arc<ByteLevelTable> {
+) -> Option<Arc<ByteLevelTable>> {
     let ids_end = skip_token_ids
         .iter()
         .map(|&id| id as usize + 1)
         .max()
         .unwrap_or(0)
         .max(vocab_size);
+    if ids_end > MAX_BYTE_LEVEL_TABLE_IDS {
+        tracing::debug!(
+            ids_end,
+            "tiktoken ids too sparse for a per-id byte table; streams use the generic decoder"
+        );
+        return None;
+    }
     let mut table = ByteLevelTableBuilder::with_capacity(ids_end);
     for id in 0..ids_end {
         let Ok(id) = TokenIdType::try_from(id) else {
@@ -502,7 +520,7 @@ fn byte_level_table(
             Err(_) => table.push_absent(),
         }
     }
-    table.finish()
+    Some(table.finish())
 }
 
 /// Find a tiktoken model file in the given directory.
@@ -631,13 +649,16 @@ impl Decoder for TiktokenTokenizer {
     /// Every id stands for fixed bytes, so one stream needs only a
     /// pending-bytes buffer: no window re-decoded per token, and a character
     /// that merely spans tokens is held back, not a decode failure. An id the
-    /// vocabulary lacks fails the stream, as `decode` fails on it.
+    /// vocabulary lacks fails the stream, as `decode` fails on it. A
+    /// vocabulary without the table (see [`MAX_BYTE_LEVEL_TABLE_IDS`]) streams
+    /// through the generic decoder.
     fn incremental_decoder(
         &self,
         skip_special_tokens: bool,
     ) -> Option<Box<dyn IncrementalDecoder>> {
+        let table = self.byte_level.as_ref()?;
         Some(Box::new(ByteLevelIncremental::new(
-            Arc::clone(&self.byte_level),
+            Arc::clone(table),
             skip_special_tokens,
             UnknownId::Reject,
         )))
@@ -1286,6 +1307,24 @@ mod tests {
         assert_eq!(sequence.append_token(2).unwrap(), "[BOS]");
         let err = sequence.append_token(4).unwrap_err();
         assert!(err.to_string().contains("unknown token id"), "{err}");
+    }
+
+    #[test]
+    fn test_incremental_decode_keeps_the_generic_path_for_distant_ids() {
+        // An added token far beyond the ranks: no per-id table is built for
+        // it, the stream goes through the generic decoder and is still right.
+        let dir = write_minimal_tiktoken_dir(
+            r#"{"added_tokens_decoder": {"100000000": {"content": "[FAR]", "special": true}}}"#,
+            None,
+        );
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(dir.path()).unwrap());
+        assert!(tokenizer.incremental_decoder(false).is_none());
+        assert_eq!(stream(&tokenizer, &[0, 1, 0], false), ["a", "b", "a"]);
+        assert_eq!(
+            stream(&tokenizer, &[0, 100_000_000, 1], false).concat(),
+            tokenizer.decode(&[0, 100_000_000, 1], false).unwrap()
+        );
     }
 
     #[test]
