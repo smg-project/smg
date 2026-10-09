@@ -127,7 +127,7 @@ class _TestStructuredOutputBase:
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
-@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
+@pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestStructuredOutputRegular(_TestStructuredOutputBase):
@@ -142,7 +142,7 @@ class TestStructuredOutputRegular(_TestStructuredOutputBase):
 @pytest.mark.engine("sglang", "vllm", "trtllm")
 @pytest.mark.gpu(1)
 @pytest.mark.model("openai/gpt-oss-20b")
-@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
+@pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestStructuredOutputGptOss(_TestStructuredOutputBase):
@@ -152,7 +152,7 @@ class TestStructuredOutputGptOss(_TestStructuredOutputBase):
 @pytest.mark.engine("sglang", "vllm", "trtllm")
 @pytest.mark.gpu(4)
 @pytest.mark.model("openai/gpt-oss-120b")
-@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
+@pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestStructuredOutputGptOss120B(_TestStructuredOutputBase):

@@ -6,6 +6,10 @@ needs the same backend. The pool keys reuse on
 ``(engine, model_id, mode, worker_type, count)`` and gates reuse on
 worker liveness.
 
+Reviewed functional classes can opt into ``gateway(reuse=True)`` to keep a
+ZMQ gateway and its bound engines together across identical configurations.
+Unmarked classes keep a fresh gateway and fresh ZMQ engines.
+
 PD-disaggregation paths run through the pool too (so it can evict a
 stale cached worker holding their GPUs) but the caller owns teardown of
 the prefill/decode workers via ``stop_workers``. The function-scoped
@@ -52,6 +56,7 @@ _GW_DEFAULTS = {
     "extra_args": None,
     "log_level": None,
     "log_dir": None,
+    "reuse": False,
 }
 
 _WORKER_DEFAULTS = {
@@ -333,6 +338,24 @@ def setup_backend(request: pytest.FixtureRequest):
             returncode=1,
         )
 
+    if (
+        not is_pd
+        and not is_epd
+        and connection_mode == ConnectionMode.ZMQ
+        and gateway_config["reuse"]
+    ):
+        yield from _setup_pooled_zmq(
+            request.session,
+            model_id,
+            model_path,
+            engine,
+            workers_config,
+            gateway_config,
+            backend_name,
+            log_dir,
+        )
+        return
+
     gateway = Gateway()
     try:
         if is_epd:
@@ -377,6 +400,50 @@ def setup_backend(request: pytest.FixtureRequest):
 # ---------------------------------------------------------------------------
 # Local (non-PD) backend
 # ---------------------------------------------------------------------------
+
+
+def _setup_pooled_zmq(
+    session,
+    model_id,
+    model_path,
+    engine,
+    workers_config,
+    gateway_config,
+    backend_name,
+    log_dir,
+):
+    """Reuse only explicitly compatible classes; failed classes evict the pair."""
+    failures_before = session.testsfailed
+    pool = get_pool()
+    try:
+        gateway = pool.acquire_zmq(
+            model_id=model_id,
+            model_path=model_path,
+            engine=engine,
+            count=workers_config.get("count") or 1,
+            gpus=workers_config.get("gpus"),
+            extra_engine_args=workers_config.get("extra_engine_args"),
+            gateway_config={
+                **gateway_config,
+                "timeout": _gateway_readiness_timeout(
+                    ConnectionMode.ZMQ, model_id, gateway_config["timeout"]
+                ),
+            },
+            log_dir=log_dir,
+        )
+    except (TimeoutError, RuntimeError):
+        _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
+        raise
+    try:
+        yield backend_name, model_path, _make_openai_client(gateway), gateway
+    except BaseException:
+        pool.discard_zmq(gateway)
+        raise
+    finally:
+        # Keep the service for the remaining methods of a failed class, then
+        # start the next class fresh rather than carrying potentially bad state.
+        if session.testsfailed > failures_before:
+            pool.discard_zmq(gateway)
 
 
 def _setup_local(

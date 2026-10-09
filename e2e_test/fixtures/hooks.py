@@ -66,7 +66,8 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
-        "gateway(policy=..., timeout=..., extra_args=...): gateway/router configuration",
+        "gateway(policy=..., timeout=..., extra_args=..., reuse=False): gateway/router "
+        "configuration; opt reviewed functional classes into identical ZMQ serving reuse",
     )
     config.addinivalue_line(
         "markers",
@@ -534,7 +535,21 @@ def _pool_sort_key(item: pytest.Item) -> tuple:
     model_marker = resolve_class_marker(item, "model")
     model = str(model_id_for_engine(model_marker, get_runtime(), default=""))
 
-    return (backend, model, item.nodeid)
+    gateway = resolve_class_marker(item, "gateway")
+    serving_config = ("", "")
+    if (
+        get_connection_mode_override() == ConnectionMode.ZMQ
+        and gateway is not None
+        and gateway.kwargs.get("reuse")
+    ):
+        workers = resolve_class_marker(item, "workers")
+        # Literal marker configuration only: do not fold defaults or reorder
+        # CLI arguments to declare two serving instances compatible.
+        serving_config = (
+            repr(sorted(workers.kwargs.items())) if workers is not None else "",
+            repr(sorted(gateway.kwargs.items())),
+        )
+    return (backend, model, *serving_config, item.nodeid)
 
 
 # ---------------------------------------------------------------------------
