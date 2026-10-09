@@ -1105,7 +1105,7 @@ mod tests {
             "<|close|>mes",
             "<|close|>response",
             "<|open|>",
-            "<|open|>respons",
+            "<|open|>respo",
         ] {
             let text = format!("Pong.{tail}");
             let expected = ParserResult::normal("Pong.".to_owned());
