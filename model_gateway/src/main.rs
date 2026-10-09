@@ -9,22 +9,19 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Jemalloc's run-time options for a long-running server. With the stock
-// settings a thread's freed pages decay back to the OS only when that thread
-// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
-// resident over ~270 MB of live objects (soak s2, ten hours). A background
-// thread purges on schedule instead; dirty pages are returned after 10 s and
-// muzzy pages at once. This is jemalloc's application-provided `malloc_conf`
-// string under the vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF`
-// environment variable is read after it and overrides it entry by entry.
+// Jemalloc's run-time options for a long-running server (see
+// `SERVER_MALLOC_CONF`): the executable exports them as jemalloc's
+// application-provided `malloc_conf`, as the Python extension does for the
+// router launched from Python.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+use smg::observability::metrics::SERVER_MALLOC_CONF;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[expect(
     unsafe_code,
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 61] =
-    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0\0";
+pub static MALLOC_CONF: &[u8; 61] = SERVER_MALLOC_CONF;
 
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};

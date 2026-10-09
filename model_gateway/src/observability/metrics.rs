@@ -171,6 +171,19 @@ pub(crate) const KV_EVENT_LAG_BUCKETS: &[f64] = &[
     5.0, 10.0, 30.0, 60.0,
 ];
 
+/// Jemalloc's run-time options for a long-running gateway, for every final
+/// artifact (the `smg` executable, the Python extension) to export as
+/// `_rjem_malloc_conf` next to its `#[global_allocator]`. With the stock
+/// settings a thread's freed pages decay back to the OS only when that thread
+/// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
+/// resident over ~270 MB of live objects (soak s2, ten hours). A background
+/// thread purges on schedule instead; dirty pages are returned after 10 s and
+/// muzzy pages at once. This is jemalloc's application-provided `malloc_conf`
+/// string under the vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF`
+/// environment variable is read after it and overrides it entry by entry.
+pub const SERVER_MALLOC_CONF: &[u8; 61] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0\0";
+
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
 /// Call this before [`start_prometheus`] only from a binary or extension that

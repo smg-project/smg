@@ -9,6 +9,19 @@ use pyo3::prelude::*;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// The gateway's jemalloc options (`SERVER_MALLOC_CONF`). The extension is a
+// final artifact of its own, so it exports them as jemalloc's
+// application-provided `malloc_conf` like the `smg` executable does;
+// without this the router launched from Python ran jemalloc's stock decay
+// and kept a traffic burst's freed pages resident.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 61] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
 
