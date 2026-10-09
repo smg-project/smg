@@ -322,7 +322,7 @@ impl TokenSpeedSchedulerClient {
             frequency_penalty: Some(request.frequency_penalty.unwrap_or(0.0)),
             presence_penalty: Some(request.presence_penalty.unwrap_or(0.0)),
             repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
-            max_new_tokens: request.max_completion_tokens,
+            max_new_tokens: request.output_token_cap(),
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens: true,

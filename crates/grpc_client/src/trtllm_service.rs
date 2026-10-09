@@ -133,7 +133,7 @@ impl TrtllmServiceClient {
 
         let stop = Self::extract_stop_strings(body.stop.as_ref());
 
-        let max_tokens = body.max_completion_tokens.unwrap_or(2048);
+        let max_tokens = body.output_token_cap().unwrap_or(2048);
 
         let grpc_request = proto::GenerateRequest {
             request_id,

@@ -3470,6 +3470,92 @@ mod tests {
         assert_eq!(bodies[0], bodies[1], "the retry must replay the same body");
     }
 
+    /// The relayed chat body carries the client's sampling fields as the
+    /// client wrote them, on the streamed and the unary path alike. The
+    /// request goes through `normalize` as the extractor runs it: that is
+    /// where `max_tokens` used to be rewritten into `max_completion_tokens`,
+    /// a name an upstream reading only `max_tokens` ignores, answering with
+    /// its default length instead of the requested one.
+    #[tokio::test]
+    async fn relayed_chat_body_keeps_the_clients_sampling_fields() {
+        use openai_protocol::validated::Normalizable;
+        use tokio::sync::Mutex;
+
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bodies);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let stream = body["stream"].as_bool().unwrap_or(false);
+                    sink.lock().await.push(body);
+                    if stream {
+                        ([(CONTENT_TYPE, "text/event-stream")], "data: [DONE]\n\n").into_response()
+                    } else {
+                        ([(CONTENT_TYPE, "application/json")], "{}").into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for stream in [true, false] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4096,
+                "min_tokens": 16,
+                "ignore_eos": true,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "seed": 7,
+                "stream": stream,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2, "one streamed and one unary dispatch");
+        for (body, stream) in bodies.iter().zip([true, false]) {
+            assert_eq!(body["stream"], json!(stream));
+            assert_eq!(
+                body["max_tokens"],
+                json!(4096),
+                "the cap reaches the upstream under the name the client wrote"
+            );
+            assert!(
+                body.get("max_completion_tokens").is_none(),
+                "no field the client did not send"
+            );
+            assert_eq!(body["min_tokens"], json!(16));
+            assert_eq!(body["ignore_eos"], json!(true));
+            assert_eq!(body["temperature"], json!(0.7));
+            assert_eq!(body["top_p"], json!(0.9));
+            assert_eq!(body["seed"], json!(7));
+        }
+    }
+
     #[tokio::test]
     async fn mutating_worker_falls_back_to_buffered() {
         let worker = BasicWorkerBuilder::new("http://worker1:8080")

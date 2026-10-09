@@ -430,6 +430,16 @@ impl ThinkingParam {
 }
 
 impl ChatCompletionRequest {
+    /// The cap the client put on the completion: `max_completion_tokens`,
+    /// else the deprecated `max_tokens`. The request keeps whichever field
+    /// the client wrote, so a proxied body reaches its upstream unchanged;
+    /// everything that needs the number reads it here.
+    pub fn output_token_cap(&self) -> Option<u32> {
+        #[expect(deprecated, reason = "the one place the deprecated field is read")]
+        let max_tokens = self.max_tokens;
+        self.max_completion_tokens.or(max_tokens)
+    }
+
     /// The thinking preference stated by `thinking.type`, if any.
     pub fn thinking_toggle(&self) -> Option<bool> {
         self.thinking.as_ref().and_then(ThinkingParam::toggle)
@@ -510,7 +520,7 @@ fn validate_chat_cross_parameters(
     }
 
     // 3. Validate token limits - min <= max
-    if let (Some(min), Some(max)) = (req.min_tokens, req.max_completion_tokens) {
+    if let (Some(min), Some(max)) = (req.min_tokens, req.output_token_cap()) {
         if min > max {
             let mut e = validator::ValidationError::new("min_tokens_exceeds_max");
             e.message = Some("min_tokens cannot exceed max_tokens/max_completion_tokens".into());
@@ -706,15 +716,12 @@ impl Normalizable for ChatCompletionRequest {
     /// 2. Migrate deprecated fields to their replacements
     /// 3. Clear deprecated fields and log warnings
     /// 4. Apply OpenAI defaults for tool_choice
+    ///
+    /// The deprecated `max_tokens` is not migrated: a proxied request reaches
+    /// its upstream with the cap under the name the client wrote, and the
+    /// router reads the number through [`Self::output_token_cap`].
     fn normalize(&mut self) {
         ProviderProfile::for_model(&self.model).normalize_chat(self);
-
-        // Migrate deprecated max_tokens → max_completion_tokens
-        #[expect(deprecated)]
-        if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
-            self.max_completion_tokens = self.max_tokens;
-            self.max_tokens = None; // Clear deprecated field
-        }
 
         // Migrate deprecated functions → tools
         #[expect(deprecated)]

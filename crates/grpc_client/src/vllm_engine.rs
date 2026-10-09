@@ -226,7 +226,7 @@ impl VllmEngineClient {
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = Self::extract_stop_strings(request);
 
-        let max_tokens = request.max_completion_tokens;
+        let max_tokens = request.output_token_cap();
 
         // Hardcode to true: gRPC backends return raw token IDs, not decoded text.
         // Detokenization happens on the SMG Rust side (StopDecoder/Sequence).
