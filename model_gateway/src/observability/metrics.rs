@@ -394,6 +394,12 @@ pub(crate) fn init_metrics() {
         "KV event streams that failed after connecting, by worker and error (the gRPC \
          status code: out_of_range, unavailable, data_loss, ...)"
     );
+    describe_gauge!(
+        "smg_kv_events_unavailable",
+        "1 while a worker's backend serves no KV events (SubscribeKvEvents answered \
+         UNIMPLEMENTED: the engine's publisher is off), 0 once the worker leaves, by \
+         worker. Cache-aware routing is blind to such a worker's cache"
+    );
     describe_counter!(
         "smg_kv_event_batches_total",
         "KV event batches by worker and disposition (applied, stale, tail_overflow, snapshot)"
@@ -1895,6 +1901,15 @@ impl Metrics {
             "error" => error
         )
         .increment(1);
+    }
+
+    /// Whether a worker's backend serves no KV events: its subscription ended
+    /// on `UNIMPLEMENTED`, and until the worker leaves cache-aware routing is
+    /// blind to its cache. A gauge per worker, so a dashboard or an alert sees
+    /// a blind cache-aware router where the log had one WARN line.
+    pub fn set_kv_events_unavailable(worker_url: &str, unavailable: bool) {
+        gauge!("smg_kv_events_unavailable", "worker" => intern_string(worker_url))
+            .set(if unavailable { 1.0 } else { 0.0 });
     }
 
     /// Count a KV event batch by what the subscriber did with it.

@@ -345,7 +345,8 @@ impl KvEventMonitor {
                         warn!(
                             worker_url = %worker_url,
                             "Backend does not implement SubscribeKvEvents, \
-                             disabling KV event subscription for this worker"
+                             disabling KV event subscription for this worker; \
+                             cache-aware routing sees nothing of its cache"
                         );
                         Self::remove_indexer_worker(
                             Arc::clone(&indexer),
@@ -354,6 +355,7 @@ impl KvEventMonitor {
                             state.index,
                         )
                         .await;
+                        Metrics::set_kv_events_unavailable(&worker_url, true);
                         return;
                     }
                     if e.code() == tonic::Code::OutOfRange {
@@ -597,6 +599,9 @@ mod tests {
         /// as a server does whose first message the client cannot decode;
         /// each call's arrival is noted.
         FailFirstMessage(Arc<Mutex<Vec<Instant>>>),
+        /// Answers `UNIMPLEMENTED`, as a backend whose KV event publisher is
+        /// off does.
+        Unimplemented,
     }
 
     struct TestScheduler(Subscribe);
@@ -657,6 +662,9 @@ mod tests {
         ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
             match &self.0 {
                 Subscribe::Hang => std::future::pending().await,
+                Subscribe::Unimplemented => {
+                    Err(Status::unimplemented("KV cache events not enabled"))
+                }
                 Subscribe::FailFirstMessage(calls) => {
                     calls.lock().unwrap().push(Instant::now());
                     Ok(Response::new(Box::pin(futures::stream::once(async {
@@ -850,6 +858,74 @@ mod tests {
             "{errors} errors for {} calls",
             calls.len()
         );
+    }
+
+    /// A backend that serves no KV events (an engine whose publisher is off)
+    /// left one WARN line as the only trace of a cache-aware router routing
+    /// blind: the worker carries a gauge from the answer until it leaves.
+    #[test]
+    fn a_backend_without_kv_events_is_a_gauge_until_the_worker_leaves() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn gauge(handle: &PrometheusHandle, worker_url: &str) -> Option<f64> {
+            let prefix = format!("smg_kv_events_unavailable{{worker=\"{worker_url}\"}}");
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // The subscription task publishes from the runtime's thread, which
+        // must be the one holding the local recorder.
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let port = portpicker::pick_unused_port().expect("a free port");
+                let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the test scheduler lives as long as the test"
+                )]
+                let server = tokio::spawn(
+                    Server::builder()
+                        .add_service(TokenSpeedSchedulerServer::new(TestScheduler(
+                            Subscribe::Unimplemented,
+                        )))
+                        .serve(addr),
+                );
+                wait_until_listening(addr).await;
+
+                let worker = grpc_worker(addr);
+                let monitor = KvEventMonitor::new(None);
+                monitor.on_worker_added(&worker).await;
+                for _ in 0..500 {
+                    if gauge(&handle, worker.url()) == Some(1.0) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(
+                    gauge(&handle, worker.url()),
+                    Some(1.0),
+                    "the answer raises the gauge"
+                );
+
+                monitor.on_worker_removed(worker.url()).await;
+                assert_eq!(
+                    gauge(&handle, worker.url()),
+                    Some(0.0),
+                    "the worker's removal lowers it"
+                );
+                server.abort();
+            });
+        });
     }
 
     #[tokio::test]

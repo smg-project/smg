@@ -486,6 +486,9 @@ impl KvEventMonitor {
             );
             Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
         }
+        // A backend without KV events is no longer a blind spot once its
+        // worker has left.
+        Metrics::set_kv_events_unavailable(worker_url, false);
     }
 
     /// Stop all subscriptions and clean up.
