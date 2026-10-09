@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Error, Result};
 use serde::Deserialize;
@@ -18,12 +18,16 @@ use tokenizers::{
 use tracing::debug;
 
 use crate::{
+    byte_level::{ByteLevelIncremental, ByteLevelTable},
     chat_template::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
     encoders::{deepseek_v32, deepseek_v4, deepseek_v41},
-    traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait},
+    traits::{
+        Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens, TokenIdType,
+        Tokenizer as TokenizerTrait,
+    },
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +49,8 @@ pub struct HuggingFaceTokenizer {
     eos_token_ids: Vec<TokenIdType>,
     /// Which renderer applies chat templates for this model.
     renderer: Renderer,
+    /// Bytes per id, when the decoder is a plain `ByteLevel` (see `byte_level`).
+    byte_level: Option<Arc<ByteLevelTable>>,
 }
 
 const QWEN2_PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -282,6 +288,7 @@ impl HuggingFaceTokenizer {
             .unwrap_or(Renderer::Jinja);
 
         Ok(HuggingFaceTokenizer {
+            byte_level: ByteLevelTable::build(&tokenizer),
             tokenizer,
             special_tokens,
             vocab,
@@ -350,6 +357,7 @@ impl HuggingFaceTokenizer {
             .collect();
 
         HuggingFaceTokenizer {
+            byte_level: ByteLevelTable::build(&tokenizer),
             tokenizer,
             special_tokens,
             vocab,
@@ -532,6 +540,19 @@ impl Decoder for HuggingFaceTokenizer {
             prefix_index,
         )
         .map_err(|e| Error::msg(format!("Decode stream error: {e}")))
+    }
+
+    /// Byte-level vocabularies decode each id to fixed bytes, so one stream
+    /// needs only a pending-bytes buffer instead of two decodes per token.
+    fn incremental_decoder(
+        &self,
+        skip_special_tokens: bool,
+    ) -> Option<Box<dyn IncrementalDecoder>> {
+        let table = self.byte_level.as_ref()?;
+        Some(Box::new(ByteLevelIncremental::new(
+            Arc::clone(table),
+            skip_special_tokens,
+        )))
     }
 }
 

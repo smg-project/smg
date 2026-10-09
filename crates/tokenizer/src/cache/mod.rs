@@ -34,7 +34,8 @@ use crate::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
     },
     traits::{
-        ChatTemplateOutput, Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer,
+        ChatTemplateOutput, Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens,
+        TokenIdType, Tokenizer,
     },
 };
 
@@ -272,6 +273,27 @@ impl Decoder for CachedTokenizer {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         // Decoding is not cached (it's fast enough and rarely repeated)
         self.inner.decode(token_ids, skip_special_tokens)
+    }
+
+    // Incremental decoding is the inner tokenizer's business too; without these
+    // forwards a cached tokenizer would fall back to the generic double decode.
+    fn decode_step(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.inner
+            .decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn incremental_decoder(
+        &self,
+        skip_special_tokens: bool,
+    ) -> Option<Box<dyn IncrementalDecoder>> {
+        self.inner.incremental_decoder(skip_special_tokens)
     }
 }
 

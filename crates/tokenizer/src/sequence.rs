@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::traits::{TokenIdType, Tokenizer as TokenizerTrait};
+use crate::traits::{IncrementalDecoder, TokenIdType, Tokenizer as TokenizerTrait};
 
 /// Maintains state for an ongoing sequence of tokens and their decoded text.
 ///
@@ -37,6 +37,9 @@ pub struct Sequence {
 
     /// Whether to skip special tokens when decoding
     skip_special_tokens: bool,
+    /// The backend's own per-stream decoder, when it has one. Then
+    /// `token_ids`, `prefix_index` and `cached_prefix` stay unused.
+    incremental: Option<Box<dyn IncrementalDecoder>>,
 }
 
 impl std::fmt::Debug for Sequence {
@@ -72,6 +75,7 @@ impl Sequence {
     /// Create a new empty sequence with skip_special_tokens option
     pub fn new_with_options(tokenizer: Arc<dyn TokenizerTrait>, skip_special_tokens: bool) -> Self {
         Self {
+            incremental: tokenizer.incremental_decoder(skip_special_tokens),
             tokenizer,
             token_ids: Vec::new(),
             total_tokens: 0,
@@ -93,7 +97,16 @@ impl Sequence {
         skip_special_tokens: bool,
     ) -> Self {
         let len = token_ids.len();
+        let mut incremental = tokenizer.incremental_decoder(skip_special_tokens);
+        if let Some(decoder) = incremental.as_mut() {
+            // Position the decoder after the seed tokens; their text is not
+            // emitted. Fall back to the generic path if the backend objects.
+            if token_ids.iter().any(|&id| decoder.step(id).is_err()) {
+                incremental = None;
+            }
+        }
         Self {
+            incremental,
             tokenizer,
             token_ids,
             total_tokens: len,
@@ -121,6 +134,9 @@ impl Sequence {
         self.total_tokens = 0;
         self.prefix_index = 0;
         self.cached_prefix.clear();
+        if let Some(decoder) = self.incremental.as_mut() {
+            decoder.reset();
+        }
     }
 
     /// Append text to the sequence by encoding it.
@@ -142,12 +158,20 @@ impl Sequence {
 
     /// Append a single token to the sequence and return newly decoded text.
     ///
-    /// Delegates to `Decoder::decode_step` on the tokenizer trait. For HuggingFace
-    /// tokenizers this uses the native `step_decode_stream`; other backends use the
-    /// default double-decode fallback. Both paths handle token draining and prefix
-    /// caching internally.
+    /// When the tokenizer provides an [`IncrementalDecoder`] (HuggingFace
+    /// tokenizers with a plain `ByteLevel` decoder: Qwen, Llama 3, GPT-2 style
+    /// vocabularies), the token goes through it and `token_ids()` / `text()`
+    /// do not track a decode window. Otherwise this delegates to
+    /// `Decoder::decode_step`: HuggingFace's native `step_decode_stream` for
+    /// its other decoders, the default double-decode algorithm for the rest;
+    /// both drain the retained ids and cache the prefix internally.
     #[inline]
     pub fn append_token(&mut self, token_id: TokenIdType) -> Result<String> {
+        if let Some(decoder) = self.incremental.as_mut() {
+            let text = decoder.step(token_id)?;
+            self.total_tokens += 1;
+            return Ok(text);
+        }
         let result = self.tokenizer.decode_step(
             token_id,
             &mut self.token_ids,
@@ -168,7 +192,9 @@ impl Sequence {
         &self.tokenizer
     }
 
-    /// Get the current token ids in the buffer (sliding window, not full history)
+    /// Get the current token ids in the buffer (sliding window, not full history).
+    /// Empty, apart from any seed tokens, when the tokenizer provides its own
+    /// incremental decoder (see [`append_token`](Self::append_token)).
     #[inline]
     pub fn token_ids(&self) -> &[TokenIdType] {
         &self.token_ids
@@ -177,7 +203,8 @@ impl Sequence {
     /// Decode the current buffer to text.
     ///
     /// WARNING: after `append_token()` calls, this only decodes the sliding
-    /// window (retained tokens), not the full sequence history. Use the
+    /// window (retained tokens), not the full sequence history, and nothing
+    /// at all when the tokenizer provides its own incremental decoder. Use the
     /// incremental return values from `append_token()` to build the full text.
     pub fn text(&self) -> Result<String> {
         self.tokenizer
