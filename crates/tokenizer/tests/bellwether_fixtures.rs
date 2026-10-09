@@ -710,17 +710,22 @@ fn load_tokenizer(slug: &str, manifest: &Manifest) -> Result<(Arc<dyn Tokenizer>
 }
 
 /// The vocabulary files a checkpoint may ship, in the order they are tried:
-/// a `tokenizers` file, or a tiktoken file for the models that have no
-/// `tokenizer.json` (Kimi).
-const VOCABULARY_FILES: [&str; 2] = ["tokenizer.json", "tiktoken.model"];
+/// a `tokenizers` file; a tiktoken file for the models that have no
+/// `tokenizer.json` (Kimi); the `vocab.json` + `merges.txt` pair of the
+/// models that ship neither (Qwen3-Omni), which counts only whole.
+const VOCABULARIES: [&[&str]; 3] = [
+    &["tokenizer.json"],
+    &["tiktoken.model"],
+    &["vocab.json", "merges.txt"],
+];
 
 /// The checkpoint's tokenizer files at the manifest's revision: the Hugging
 /// Face cache snapshot when it is there, else a one-time download of the
 /// files the tokenizer loads: `tokenizer_config.json`, the first of
-/// [`VOCABULARY_FILES`] the checkpoint serves, and `config.json` when it has
-/// one (the renderer detection reads it). A download is written beside its
-/// name and renamed into place, so an interrupted write never leaves a short
-/// file the next run would trust.
+/// [`VOCABULARIES`] the checkpoint serves whole, and `config.json` when it
+/// has one (the renderer detection reads it). A download is written beside
+/// its name and renamed into place, so an interrupted write never leaves a
+/// short file the next run would trust.
 fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, String> {
     if let Some(snapshot) = hf_cache_snapshot(model, revision) {
         return Ok(snapshot);
@@ -732,19 +737,27 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
         .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
     download(&client, model, revision, &dir, "config.json", 2)?;
     let mut vocabulary = None;
-    for file in VOCABULARY_FILES {
-        if download(&client, model, revision, &dir, file, 100_000)?.is_some() {
-            vocabulary = Some(file);
+    for files in VOCABULARIES {
+        let mut whole = true;
+        for file in files {
+            whole &= download(&client, model, revision, &dir, file, 100_000)?.is_some();
+        }
+        if whole {
+            vocabulary = Some(files);
             break;
         }
     }
-    vocabulary.ok_or_else(|| {
-        format!(
-            "{model} at {revision} serves none of {}",
-            VOCABULARY_FILES.join(", ")
-        )
-    })?;
+    vocabulary.ok_or_else(|| format!("{model} at {revision} serves none of {}", vocabularies()))?;
     Ok(dir)
+}
+
+/// [`VOCABULARIES`] for a message: `tokenizer.json, tiktoken.model, vocab.json + merges.txt`.
+fn vocabularies() -> String {
+    VOCABULARIES
+        .iter()
+        .map(|files| files.join(" + "))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Fetches `file` into `dir` unless it is there already; `Ok(None)` when the
@@ -797,12 +810,20 @@ fn hf_cache_snapshot(model: &str, revision: &str) -> Option<PathBuf> {
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/huggingface/hub"))
         })?;
+    snapshot_under(&hub, model, revision)
+}
+
+/// The snapshot of `model` at `revision` under the hub cache `hub`, when it
+/// holds `tokenizer_config.json` and one of [`VOCABULARIES`] whole.
+fn snapshot_under(hub: &Path, model: &str, revision: &str) -> Option<PathBuf> {
     let dir = hub
         .join(format!("models--{}", model.replace('/', "--")))
         .join("snapshots")
         .join(revision);
     (dir.join("tokenizer_config.json").is_file()
-        && VOCABULARY_FILES.iter().any(|file| dir.join(file).is_file()))
+        && VOCABULARIES
+            .iter()
+            .any(|files| files.iter().all(|file| dir.join(file).is_file())))
     .then_some(dir)
 }
 
@@ -941,6 +962,52 @@ fn sets_without_a_sets_toml_stop_the_run() {
         .err()
         .expect("sets with no sets.toml to check them against should stop the run");
     assert!(error.contains("sets.toml"), "{error}");
+}
+
+#[test]
+fn a_cache_snapshot_with_any_whole_vocabulary_is_the_tokenizer_dir() {
+    let revision = "0123456789abcdef0123456789abcdef01234567";
+    let snapshot = |model: &str, files: &[&str]| -> Vec<(String, String)> {
+        files
+            .iter()
+            .map(|file| {
+                (
+                    format!(
+                        "models--{}/snapshots/{revision}/{file}",
+                        model.replace('/', "--")
+                    ),
+                    String::from("{}"),
+                )
+            })
+            .collect()
+    };
+    let files = [
+        snapshot("org/json", &["tokenizer_config.json", "tokenizer.json"]),
+        snapshot("org/tiktoken", &["tokenizer_config.json", "tiktoken.model"]),
+        snapshot(
+            "org/pair",
+            &["tokenizer_config.json", "vocab.json", "merges.txt"],
+        ),
+        snapshot("org/half-pair", &["tokenizer_config.json", "vocab.json"]),
+        snapshot("org/no-config", &["vocab.json", "merges.txt"]),
+    ]
+    .concat();
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect();
+    let hub = tree(&files).unwrap();
+    for (model, found) in [
+        ("org/json", true),
+        ("org/tiktoken", true),
+        ("org/pair", true),
+        ("org/half-pair", false),
+        ("org/no-config", false),
+        ("org/absent", false),
+    ] {
+        let snapshot = snapshot_under(hub.path(), model, revision);
+        assert_eq!(snapshot.is_some(), found, "{model}: {snapshot:?}");
+    }
 }
 
 #[test]
