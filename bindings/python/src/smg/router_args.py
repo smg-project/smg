@@ -305,6 +305,9 @@ class RouterArgs:
     # worker is vetoed; seconds without progress before a loaded one is wedged
     worker_stall_secs: int = 2
     worker_wedge_secs: int = 3
+    # Liveness: seconds without any contact from a worker whose KV-event
+    # stream pushes load records before it is vetoed as unreachable (0 = off)
+    worker_stale_secs: int = 15
     # Warm-up slice for cache-aware routing (see the --worker-warmup-* flags)
     worker_warmup_secs: int = 60
     worker_warmup_share: float = 0.25
@@ -744,6 +747,19 @@ class RouterArgs:
                 " until it makes progress; the bound stretches to the time its"
                 " in-flight prompts may still need in prefill, up to 120 seconds."
                 " Defaults to 3."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-stale-secs",
+            type=int,
+            default=RouterArgs.worker_stale_secs,
+            help=(
+                "Seconds without any contact (a load record, a poll answer, a probe,"
+                " a token) from a worker whose KV-event stream pushes load records,"
+                " after which it is excluded from routing as unreachable until it is"
+                " heard from again; workers that never pushed a record are not"
+                " judged by it. Keep it above the load-monitor interval. 0 disables."
+                " Defaults to 15."
             ),
         )
         routing_group.add_argument(

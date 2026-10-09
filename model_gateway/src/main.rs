@@ -632,6 +632,17 @@ struct CliArgs {
     #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
     worker_wedge_secs: u64,
 
+    /// Seconds without any contact (a load record, a poll answer, a probe, a
+    /// token) from a worker whose KV-event stream pushes load records, after
+    /// which it is excluded from routing as unreachable until it is heard
+    /// from again. A reachable servicer pushes a record at least every few
+    /// seconds, so a longer silence is a dead or one-way link the transport
+    /// has not reported yet. Workers that never pushed a record (HTTP
+    /// workers, older servicers) are not judged by it. Keep it above the
+    /// load-monitor interval. 0 disables the rule.
+    #[arg(long, default_value_t = 15, help_heading = "Load Monitoring")]
+    worker_stale_secs: u64,
+
     /// Warm-up slice for cache-aware routing: for this many seconds after a
     /// worker becomes routable, until its index has grown by
     /// --worker-warmup-blocks blocks, one cache miss in 1/--worker-warmup-share
@@ -2089,6 +2100,7 @@ impl CliArgs {
             .load_monitor_interval_secs(self.load_monitor_interval)
             .worker_stall_secs(self.worker_stall_secs)
             .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_stale_secs(self.worker_stale_secs)
             .worker_warmup(
                 self.worker_warmup_secs,
                 self.worker_warmup_share,

@@ -784,6 +784,7 @@ impl AppContextBuilder {
         liveness::configure(
             Duration::from_secs(config.worker_stall_secs),
             Duration::from_secs(config.worker_wedge_secs),
+            Duration::from_secs(config.worker_stale_secs),
         );
         liveness::configure_warmup(liveness::Warmup {
             secs: Duration::from_secs(config.worker_warmup_secs),

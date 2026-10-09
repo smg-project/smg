@@ -567,6 +567,7 @@ struct Router {
     kv_index: String,
     worker_stall_secs: u64,
     worker_wedge_secs: u64,
+    worker_stale_secs: u64,
     worker_warmup_secs: u64,
     worker_warmup_share: f32,
     worker_warmup_blocks: usize,
@@ -951,6 +952,7 @@ impl Router {
             .worker_overload_shed(self.worker_overload_shed)
             .worker_stall_secs(self.worker_stall_secs)
             .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_stale_secs(self.worker_stale_secs)
             .worker_warmup(
                 self.worker_warmup_secs,
                 self.worker_warmup_share,
@@ -1265,6 +1267,7 @@ impl Router {
         kv_index = String::from("positional"),
         worker_stall_secs = 2,
         worker_wedge_secs = 3,
+        worker_stale_secs = 15,
         worker_warmup_secs = 60,
         worker_warmup_share = 0.25,
         worker_warmup_blocks = 1024,
@@ -1452,6 +1455,7 @@ impl Router {
         kv_index: String,
         worker_stall_secs: u64,
         worker_wedge_secs: u64,
+        worker_stale_secs: u64,
         worker_warmup_secs: u64,
         worker_warmup_share: f32,
         worker_warmup_blocks: usize,
@@ -1665,6 +1669,7 @@ impl Router {
             kv_index,
             worker_stall_secs,
             worker_wedge_secs,
+            worker_stale_secs,
             worker_warmup_secs,
             worker_warmup_share,
             worker_warmup_blocks,

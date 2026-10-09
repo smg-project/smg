@@ -8,7 +8,8 @@
 //! This module turns those failures into a routing veto and clears it on the
 //! first successful contact.
 //!
-//! Two vetoes, both read by routing through [`Worker::stall_reason`]:
+//! Two vetoes, both read by routing through [`Worker::stall_reason`]
+//! (the second reached by two rules):
 //!
 //! - **unreachable**: a connection failure (load poll, KV event stream) while
 //!   nothing has been heard from the worker for the stall threshold. Any
@@ -38,7 +39,22 @@
 //!   is all in prefill streams nothing and is not wedged. A zero threshold
 //!   turns the rule off.
 //!
-//! Neither veto touches the worker's health status: the health checker keeps
+//! - **stale records** (an unreachable veto by another rule): a worker whose
+//!   KV-event stream has pushed load records is heard from every few
+//!   seconds while it is reachable (a record rides every event batch and a
+//!   heartbeat fills every silence), so no contact at all for the stale
+//!   threshold is a dead or one-way link that the transport has not
+//!   reported yet: a one-way cut leaves the connection open until the
+//!   keepalive verdict, tens of seconds later, and a failed poll deadline
+//!   is deliberately not a transport failure. The veto is `unreachable`,
+//!   cleared by the first contact like any other. Workers that never pushed
+//!   a record (HTTP workers, older servicers, a stream still connecting)
+//!   are not judged by their silence: a poll every ten seconds and a probe
+//!   every minute is all that is expected of them. Tokens are contact too,
+//!   so a worker that still streams is never stale. A zero threshold turns
+//!   the rule off.
+//!
+//! No veto touches the worker's health status: the health checker keeps
 //! its own state machine, and the veto is simply gone once the worker talks.
 
 use std::{
@@ -54,6 +70,11 @@ use crate::observability::metrics::Metrics;
 
 const DEFAULT_STALL: Duration = Duration::from_secs(2);
 const DEFAULT_WEDGE: Duration = Duration::from_secs(3);
+/// Three idle heartbeats of a servicer's stream (one every five seconds once
+/// its record stops changing), and past the ten-second load-poll interval, so
+/// a stream that stopped while the poll still answers is never judged by its
+/// silence alone.
+const DEFAULT_STALE: Duration = Duration::from_secs(15);
 
 /// How often the sweep runs.
 pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
@@ -77,7 +98,7 @@ fn wedge_bound(worker: &Arc<dyn Worker>, wedge: Duration) -> Duration {
         .min(wedge.max(WEDGE_BOUND_CAP))
 }
 
-static THRESHOLDS: OnceLock<(Duration, Duration)> = OnceLock::new();
+static THRESHOLDS: OnceLock<(Duration, Duration, Duration)> = OnceLock::new();
 static WARMUP: OnceLock<Warmup> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
@@ -163,17 +184,17 @@ pub(crate) fn warmup() -> Warmup {
     WARMUP.get().copied().unwrap_or(DEFAULT_WARMUP)
 }
 
-/// Set the stall and wedge thresholds from the gateway configuration. The
-/// first call wins; the defaults are two and three seconds.
-pub(crate) fn configure(stall: Duration, wedge: Duration) {
-    let _ = THRESHOLDS.set((stall, wedge));
+/// Set the stall, wedge and stale thresholds from the gateway configuration.
+/// The first call wins; the defaults are two, three and fifteen seconds.
+pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
+    let _ = THRESHOLDS.set((stall, wedge, stale));
 }
 
-fn thresholds() -> (Duration, Duration) {
+fn thresholds() -> (Duration, Duration, Duration) {
     THRESHOLDS
         .get()
         .copied()
-        .unwrap_or((DEFAULT_STALL, DEFAULT_WEDGE))
+        .unwrap_or((DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE))
 }
 
 /// Milliseconds since the gateway started: the clock behind the workers'
@@ -261,16 +282,19 @@ fn on_contact_failed_with(worker: &Arc<dyn Worker>, what: &'static str, stall: D
 /// silent for the stall threshold is vetoed now, not at its next failed poll,
 /// so the exclusion lands at the threshold itself.
 pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
-    let (stall, wedge) = thresholds();
-    sweep_with(worker, stall, wedge);
+    let (stall, wedge, stale) = thresholds();
+    sweep_with(worker, stall, wedge, stale);
 }
 
 /// [`sweep`] at the given thresholds.
-fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration) {
+fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale: Duration) {
     let load = worker.tracked_load();
     let previous_load = worker.swap_load_sample(load);
-    let silent_after_failure =
-        worker.transport_failure_pending() && stalled(worker.contact_age(), stall);
+    let contact_age = worker.contact_age();
+    let silent_after_failure = worker.transport_failure_pending() && stalled(contact_age, stall);
+    // The stream that pushed this worker's load records has gone quiet, and
+    // so has everything else: unreachability the transport has not reported.
+    let records_stopped = records_stopped(worker.pushes_load_records(), contact_age, stale);
     match worker.stall_reason() {
         Some(StallReason::Unreachable) => return,
         Some(StallReason::Wedged) => {
@@ -287,6 +311,12 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration) {
                     Some(StallReason::Unreachable),
                     "silent since a transport failure",
                 );
+            } else if records_stopped {
+                set(
+                    worker,
+                    Some(StallReason::Unreachable),
+                    "load records stopped",
+                );
             } else if load == 0 {
                 set(worker, None, "drained");
             }
@@ -299,6 +329,14 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration) {
             worker,
             Some(StallReason::Unreachable),
             "silent since a transport failure",
+        );
+        return;
+    }
+    if records_stopped {
+        set(
+            worker,
+            Some(StallReason::Unreachable),
+            "load records stopped",
         );
         return;
     }
@@ -334,7 +372,7 @@ pub(crate) fn on_token_progress(worker: &Arc<dyn Worker>) {
 /// grew since the previous report) and no token or completion arrived within
 /// the wedge threshold.
 pub(crate) fn on_load_report(worker: &Arc<dyn Worker>, waiting: i64) {
-    let (_, wedge) = thresholds();
+    let (_, wedge, _) = thresholds();
     on_load_report_with(worker, waiting, wedge);
 }
 
@@ -371,6 +409,13 @@ fn on_load_report_with(worker: &Arc<dyn Worker>, waiting: i64, wedge: Duration) 
 /// The unreachable rule on its inputs.
 fn stalled(contact_age: Duration, stall: Duration) -> bool {
     contact_age >= stall
+}
+
+/// The stale-records rule on its inputs: a worker whose stream has pushed
+/// load records, heard from on no channel for the stale threshold. Off at a
+/// zero threshold.
+fn records_stopped(pushes_load_records: bool, contact_age: Duration, stale: Duration) -> bool {
+    pushes_load_records && !stale.is_zero() && contact_age >= stale
 }
 
 /// The wedged rule from an engine's load report: work in flight, a waiting
@@ -586,6 +631,77 @@ mod tests {
     }
 
     #[test]
+    fn records_stopped_needs_a_pushing_worker_silent_for_the_threshold() {
+        let stale = DEFAULT_STALE;
+        assert!(records_stopped(true, Duration::from_secs(15), stale));
+        assert!(
+            !records_stopped(true, Duration::from_secs(14), stale),
+            "inside the threshold"
+        );
+        assert!(
+            !records_stopped(false, Duration::from_secs(60), stale),
+            "a worker that never pushed a record is polled and probed, not judged by silence"
+        );
+        assert!(
+            !records_stopped(true, Duration::from_secs(60), Duration::ZERO),
+            "zero turns the rule off"
+        );
+    }
+
+    #[test]
+    fn a_pushing_worker_whose_records_stop_is_vetoed_and_the_next_contact_restores_it() {
+        let stale = Duration::from_millis(20);
+        let w = worker();
+        // Nothing pushed yet: the silence of a polled worker is not a verdict.
+        thread::sleep(Duration::from_millis(30));
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
+        assert!(w.stall_reason().is_none(), "never pushed");
+        // The stream delivers a record: from here on silence counts.
+        w.note_load_record();
+        on_contact(&w);
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
+        assert!(w.stall_reason().is_none(), "just heard from");
+        thread::sleep(Duration::from_millis(30));
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
+        assert_eq!(w.stall_reason(), Some(StallReason::Unreachable));
+        assert!(!w.routing_state().eligible());
+        // The next record, poll answer or probe is a contact: re-admitted.
+        on_contact(&w);
+        assert!(w.stall_reason().is_none());
+        assert!(!w.routing_state().stalled);
+        // A worker that still streams tokens is heard from: never stale.
+        thread::sleep(Duration::from_millis(30));
+        on_token_progress(&w);
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
+        assert!(w.stall_reason().is_none(), "tokens are contact");
+        // Off at zero.
+        thread::sleep(Duration::from_millis(30));
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, Duration::ZERO);
+        assert!(w.stall_reason().is_none(), "rule off");
+    }
+
+    #[test]
+    fn a_wedged_worker_whose_records_stop_becomes_unreachable() {
+        let stale = Duration::from_millis(20);
+        let w = worker();
+        w.note_load_record();
+        w.increment_load();
+        w.note_tracked_started();
+        set(&w, Some(StallReason::Wedged), "test");
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "still heard from"
+        );
+        thread::sleep(Duration::from_millis(30));
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
+        assert_eq!(w.stall_reason(), Some(StallReason::Unreachable));
+        on_contact(&w);
+        assert!(w.stall_reason().is_none());
+    }
+
+    #[test]
     fn a_veto_removes_the_worker_from_routing_and_contact_restores_it() {
         let w = worker();
         assert!(w.stall_reason().is_none());
@@ -642,7 +758,7 @@ mod tests {
             w.increment_load();
         }
         thread::sleep(Duration::from_millis(5));
-        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(1));
+        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(1), DEFAULT_STALE);
         assert!(w.stall_reason().is_none(), "no signal, no pile, no veto");
         on_load_report_with(&w, 8, Duration::from_millis(1));
         assert!(
@@ -657,7 +773,7 @@ mod tests {
         let w = worker();
         tracked_pile(&w, 4);
         thread::sleep(Duration::from_millis(5));
-        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(1));
+        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(1), DEFAULT_STALE);
         assert_eq!(
             w.stall_reason(),
             Some(StallReason::Wedged),
@@ -683,13 +799,13 @@ mod tests {
         tracked_pile(&w, 4);
         thread::sleep(Duration::from_millis(5));
         on_token_progress(&w);
-        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50));
+        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50), DEFAULT_STALE);
         assert!(
             w.stall_reason().is_none(),
             "finishing work is progress, whatever the request's shape"
         );
         thread::sleep(Duration::from_millis(55));
-        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50));
+        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50), DEFAULT_STALE);
         assert_eq!(
             w.stall_reason(),
             Some(StallReason::Wedged),
@@ -701,6 +817,14 @@ mod tests {
     fn the_wedged_clock_starts_with_the_first_tracked_request() {
         // An untracked request has been in flight for a while when the first
         // stream is dispatched: the stream's run starts now.
+        //
+        // The clock's first millisecond is `busy_since`'s idle marker (a zero
+        // stamp reads as "never busy"), so a worker built while the clock
+        // still reads zero starts its run a millisecond late and the first
+        // assertion fails whenever this test is the first to read the clock:
+        // let it tick first.
+        let _ = now_ms();
+        thread::sleep(Duration::from_millis(2));
         let w = worker();
         w.increment_load();
         thread::sleep(Duration::from_millis(15));
@@ -718,7 +842,7 @@ mod tests {
         let w = worker();
         tracked_pile(&w, 4);
         thread::sleep(Duration::from_millis(5));
-        sweep_with(&w, DEFAULT_STALL, Duration::ZERO);
+        sweep_with(&w, DEFAULT_STALL, Duration::ZERO, DEFAULT_STALE);
         assert!(w.stall_reason().is_none(), "--worker-wedge-secs 0");
         on_load_report_with(&w, 8, Duration::ZERO);
         assert!(w.stall_reason().is_none());
@@ -764,14 +888,14 @@ mod tests {
         tracked_pile(&w, 4);
         set(&w, Some(StallReason::Wedged), "test");
         on_contact_failed_with(&w, "load poll", Duration::from_secs(600));
-        sweep_with(&w, Duration::from_secs(600), DEFAULT_WEDGE);
+        sweep_with(&w, Duration::from_secs(600), DEFAULT_WEDGE, DEFAULT_STALE);
         assert_eq!(
             w.stall_reason(),
             Some(StallReason::Wedged),
             "not silent for the threshold yet"
         );
         thread::sleep(Duration::from_millis(5));
-        sweep_with(&w, Duration::from_millis(1), DEFAULT_WEDGE);
+        sweep_with(&w, Duration::from_millis(1), DEFAULT_WEDGE, DEFAULT_STALE);
         assert_eq!(w.stall_reason(), Some(StallReason::Unreachable));
         on_contact(&w);
         assert!(w.stall_reason().is_none());
@@ -800,7 +924,7 @@ mod tests {
         // the veto within the bound.
         tracked_pile(&w, 4);
         thread::sleep(Duration::from_millis(5));
-        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(1));
+        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(1), DEFAULT_STALE);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "re-armed");
     }
 

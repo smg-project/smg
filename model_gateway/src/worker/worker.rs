@@ -593,6 +593,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn token_progress_age(&self) -> Duration {
         Duration::ZERO
     }
+
+    /// Record a load record pushed on the worker's own KV-event stream: from
+    /// here on the worker is expected to be heard from at the stream's
+    /// cadence (see [`super::liveness`]).
+    fn note_load_record(&self) {}
+
+    /// Whether the worker's stream has ever pushed a load record.
+    fn pushes_load_records(&self) -> bool {
+        false
+    }
     /// Record the start of a request whose responses the gateway sees one by
     /// one (a streaming generation to this worker over gRPC): the pile the
     /// wedged rule counts, and the start of its clock when a run begins.
@@ -1361,6 +1371,9 @@ pub struct WorkerRuntime {
     last_waiting_reqs: AtomicI64,
     /// A transport failure happened since the last contact.
     transport_failed: AtomicBool,
+    /// The worker's KV-event stream has pushed a load record: silence is
+    /// then judged by the stream's cadence (see [`super::liveness`]).
+    pushed_loads: AtomicBool,
     /// In-flight count at the previous liveness sweep.
     last_load_sample: AtomicUsize,
     /// Woken on every contact, so a loop backing off from this worker (the
@@ -1422,6 +1435,7 @@ impl WorkerRuntime {
             last_token_ms: AtomicU64::new(super::liveness::now_ms()),
             last_waiting_reqs: AtomicI64::new(0),
             transport_failed: AtomicBool::new(false),
+            pushed_loads: AtomicBool::new(false),
             last_load_sample: AtomicUsize::new(0),
             contact_wake: Arc::new(Notify::new()),
             admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
@@ -1522,6 +1536,14 @@ impl WorkerRuntime {
 
     pub fn contact_age(&self) -> Duration {
         Self::age_of(self.last_contact_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn note_load_record(&self) {
+        self.pushed_loads.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pushes_load_records(&self) -> bool {
+        self.pushed_loads.load(Ordering::Relaxed)
     }
 
     /// Time without a token or completion, counted from the later of the last
@@ -2252,6 +2274,14 @@ impl Worker for BasicWorker {
 
     fn token_progress_age(&self) -> Duration {
         self.runtime.load().token_progress_age()
+    }
+
+    fn note_load_record(&self) {
+        self.runtime.load().note_load_record();
+    }
+
+    fn pushes_load_records(&self) -> bool {
+        self.runtime.load().pushes_load_records()
     }
 
     fn swap_waiting_reqs(&self, waiting: i64) -> i64 {

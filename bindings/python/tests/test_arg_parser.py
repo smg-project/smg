@@ -717,6 +717,8 @@ class TestParseRouterArgs:
                 "5",
                 "--worker-wedge-secs",
                 "7",
+                "--worker-stale-secs",
+                "9",
                 "--worker-warmup-secs",
                 "30",
                 "--worker-warmup-share",
@@ -737,6 +739,7 @@ class TestParseRouterArgs:
         assert router_args.kv_index == "chain"
         assert router_args.worker_stall_secs == 5
         assert router_args.worker_wedge_secs == 7
+        assert router_args.worker_stale_secs == 9
         assert router_args.worker_warmup_secs == 30
         assert router_args.worker_warmup_share == pytest.approx(0.5)
         assert router_args.worker_warmup_blocks == 256
@@ -750,6 +753,7 @@ class TestParseRouterArgs:
         assert defaults.kv_index == "positional"
         assert defaults.worker_stall_secs == 2
         assert defaults.worker_wedge_secs == 3
+        assert defaults.worker_stale_secs == 15
         assert defaults.worker_warmup_secs == 60
         assert defaults.worker_warmup_share == pytest.approx(0.25)
         assert defaults.worker_warmup_blocks == 1024
@@ -1728,6 +1732,7 @@ class TestRouterArgsFieldOrder:
         "kv_index",
         "worker_stall_secs",
         "worker_wedge_secs",
+        "worker_stale_secs",
         "worker_warmup_secs",
         "worker_warmup_share",
         "worker_warmup_blocks",
@@ -1786,6 +1791,7 @@ class TestRouterArgsFieldOrder:
             "kv_index",
             "worker_stall_secs",
             "worker_wedge_secs",
+            "worker_stale_secs",
             "worker_warmup_secs",
             "worker_warmup_share",
             "worker_warmup_blocks",

@@ -276,6 +276,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_stale_secs(mut self, secs: u64) -> Self {
+        self.config.worker_stale_secs = secs;
+        self
+    }
+
     pub fn worker_warmup(
         mut self,
         secs: u64,

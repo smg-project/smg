@@ -112,6 +112,12 @@ pub struct RouterConfig {
     /// new requests stop being routed to it until it makes progress.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
+    /// Seconds without any contact from a worker whose KV-event stream pushes
+    /// load records, after which it is excluded from routing as unreachable
+    /// until it is heard from again; workers that never pushed a record are
+    /// not judged by it. 0 disables the rule.
+    #[serde(default = "default_worker_stale_secs")]
+    pub worker_stale_secs: u64,
     /// Warm-up slice for cache-aware routing: for this many seconds after a
     /// worker becomes routable, until its index has grown by
     /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
@@ -482,6 +488,10 @@ fn default_worker_stall_secs() -> u64 {
 
 fn default_worker_wedge_secs() -> u64 {
     3
+}
+
+fn default_worker_stale_secs() -> u64 {
+    15
 }
 
 fn default_worker_warmup_secs() -> u64 {
@@ -1449,6 +1459,7 @@ impl Default for RouterConfig {
             load_monitor_interval_secs: 10,
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
+            worker_stale_secs: default_worker_stale_secs(),
             worker_warmup_secs: default_worker_warmup_secs(),
             worker_warmup_share: default_worker_warmup_share(),
             worker_warmup_blocks: default_worker_warmup_blocks(),

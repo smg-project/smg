@@ -494,6 +494,9 @@ impl WorkerMonitor {
         let age = Duration::from_millis(u64::from(record.age_ms)) + PUSHED_ONE_WAY_MARGIN;
         let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
         let url = worker.url().to_string();
+        // The stream pushes: silence from this worker is judged by the
+        // stream's cadence from now on (`liveness`, the stale rule).
+        worker.note_load_record();
         // The poll decision reads the receipt, not the sample's age: a record
         // that arrives is a stream that works, whatever the engine's clock.
         self.pushed_at
