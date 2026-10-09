@@ -63,6 +63,9 @@ pub(crate) enum MmRefsError {
     EncodeNotSupported,
     /// A selected leg does not advertise worker-side processing.
     WorkerNotCapable,
+    /// The model has no registry spec, so the router cannot process its media
+    /// itself, and the placement did not give it a worker that does.
+    RouterSpecMissing,
 }
 
 impl MmRefsError {
@@ -74,7 +77,9 @@ impl MmRefsError {
             Self::ModalityUnsupported(_) | Self::UnsupportedPart(_) => "multimodal_not_supported",
             Self::RefTooLarge { .. } => "media_ref_too_large",
             Self::SchemeNotAccepted { .. } => "media_ref_scheme_not_accepted",
-            Self::EncodeNotSupported | Self::WorkerNotCapable => "multimodal_not_supported",
+            Self::EncodeNotSupported | Self::WorkerNotCapable | Self::RouterSpecMissing => {
+                "multimodal_not_supported"
+            }
         }
     }
 }
@@ -113,6 +118,11 @@ impl std::fmt::Display for MmRefsError {
             }
             Self::WorkerNotCapable => f.write_str(
                 "the selected worker does not advertise worker-side multimodal processing",
+            ),
+            Self::RouterSpecMissing => f.write_str(
+                "the router has no media spec for this model's family and cannot process its \
+                 media itself; a vLLM worker with --mm-processor inprocess|redis processes it \
+                 under --mm-processing worker (or auto, when every worker of the model does)",
             ),
         }
     }
@@ -201,6 +211,11 @@ pub(crate) fn resolve_mm_processing(
             }
         }
     };
+
+    if resolved == MmProcessing::Router && placeholders.is_worker_only() {
+        // No spec: the router has nothing to process the media with.
+        return Err(MmRefsError::RouterSpecMissing);
+    }
 
     // Where a model's media is processed is worker configuration, reported in
     // the worker's labels and countable on this metric. It is not a per-request
@@ -506,6 +521,54 @@ mod tests {
         let schemes = worker_media_ref_schemes(w.as_ref());
         assert_eq!(schemes.len(), 3);
         assert!(schemes.contains("http") && schemes.contains("https") && schemes.contains("data"));
+    }
+
+    /// A model without a registry spec: worker placement forwards it, auto
+    /// forwards it when every worker of the model processes media itself and
+    /// refuses it otherwise, router placement refuses it; the refusal names
+    /// the router's missing spec, not the model.
+    #[test]
+    fn a_model_without_a_spec_goes_to_a_capable_worker_or_is_refused() {
+        let worker_only = PlaceholderTokens::worker_only();
+        let plan_ok = plan(vec![image_url("https://a/1.png")]);
+        assert!(worker_only.worker_expandable(Modality::Image));
+
+        assert_eq!(
+            resolve_mm_processing(
+                &components(MmProcessingMode::Worker),
+                &registry_with(vec![]),
+                MODEL,
+                &plan_ok,
+                &worker_only
+            )
+            .expect("worker placement forwards"),
+            MmProcessing::Worker
+        );
+        let auto = components(MmProcessingMode::Auto);
+        assert_eq!(
+            resolve_mm_processing(
+                &auto,
+                &registry_with(vec![capable("grpc://127.0.0.1:9450")]),
+                MODEL,
+                &plan_ok,
+                &worker_only
+            )
+            .expect("a uniform capable fleet forwards"),
+            MmProcessing::Worker
+        );
+        for (registry, placement) in [
+            (registry_with(vec![]), &auto),
+            (
+                registry_with(vec![capable("grpc://127.0.0.1:9451")]),
+                &components(MmProcessingMode::Router),
+            ),
+        ] {
+            let err = resolve_mm_processing(placement, &registry, MODEL, &plan_ok, &worker_only)
+                .expect_err("nothing processes the media");
+            assert_eq!(err, MmRefsError::RouterSpecMissing);
+            assert_eq!(err.code(), "multimodal_not_supported");
+            assert!(err.to_string().contains("no media spec"), "{err}");
+        }
     }
 
     #[test]
