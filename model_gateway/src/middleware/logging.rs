@@ -6,7 +6,8 @@
 
 use std::time::Duration;
 
-use axum::{extract::Request, response::Response};
+use axum::{extract::Request, middleware::Next, response::Response};
+use opentelemetry::trace::TraceContextExt;
 use tower_http::{
     classify::ServerErrorsFailureClass,
     trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer},
@@ -17,7 +18,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use super::{metrics::matched_path_label, request_id::RequestId};
 use crate::observability::{
     metrics::{method_to_static_str, Metrics},
-    otel_trace::extract_trace_context_http,
+    otel_trace::{extract_trace_context_http, inject_trace_context_http, is_otel_enabled},
 };
 
 /// Response-extension marker for orchestrator probe responses (`/health`,
@@ -55,6 +56,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             uri = %request.uri(),
             version = ?request.version(),
             request_id = Empty,  // Will be set later
+            trace_id = Empty,
             status_code = Empty,
             latency = Empty,
             error = Empty,
@@ -63,8 +65,45 @@ impl<B> MakeSpan<B> for RequestSpan {
 
         // 0.33 returns a Result; a missing/empty parent context is not actionable here.
         let _ = span.set_parent(parent_cx);
+        record_trace_id(&span);
         span
     }
+}
+
+/// Record the span's W3C trace id as a span field, so every log line written
+/// under the request span (`started/finished processing request` included)
+/// carries the id the trace backend indexes. The id is the caller's when the
+/// request came with a `traceparent`, else the one minted for this request.
+/// Nothing is recorded while tracing is off: the span has no trace then.
+fn record_trace_id(span: &Span) {
+    if !is_otel_enabled() {
+        return;
+    }
+    let context = span.context();
+    let span_ref = context.span();
+    let span_context = span_ref.span_context();
+    if span_context.is_valid() {
+        span.record("trace_id", tracing::field::display(span_context.trace_id()));
+    }
+}
+
+/// Echo the request's trace context on the response (`traceparent`, plus
+/// `tracestate` when the caller sent one), so a client holding a reply can
+/// look its trace up without an attribute search. Runs under the request
+/// span (inside [`create_logging_layer`]'s trace layer); a no-op while
+/// tracing is off.
+pub async fn trace_context_response(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    inject_trace_context_http(headers);
+    // The propagator writes `tracestate` even when there is none to carry.
+    if headers
+        .get("tracestate")
+        .is_some_and(|state| state.is_empty())
+    {
+        headers.remove("tracestate");
+    }
+    response
 }
 
 /// Custom on_request handler

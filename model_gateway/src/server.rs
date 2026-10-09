@@ -1095,8 +1095,8 @@ pub fn build_app(
     .with_state(app_state))
 }
 
-/// The middleware every request crosses, matched or not: body limits, access
-/// logging, HTTP metrics, request ids and CORS.
+/// The middleware every request crosses, matched or not: body limits, the
+/// trace-context echo, access logging, HTTP metrics, request ids and CORS.
 ///
 /// `Router::layer` wraps only what the router holds when it is called, so the
 /// not-found fallback goes in first. Registered after the layers, unknown
@@ -1116,6 +1116,9 @@ where
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::trace_context_response,
         ))
         .layer(middleware::create_logging_layer())
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
@@ -1777,8 +1780,16 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
                 http::header::AUTHORIZATION,
                 http::header::HeaderName::from_static("anthropic-version"),
                 http::header::HeaderName::from_static("anthropic-beta"),
+                http::header::HeaderName::from_static("traceparent"),
+                http::header::HeaderName::from_static("tracestate"),
             ])
-            .expose_headers([http::header::HeaderName::from_static("x-request-id")])
+            // The request id and the echoed trace context, readable by
+            // browser clients.
+            .expose_headers([
+                http::header::HeaderName::from_static("x-request-id"),
+                http::header::HeaderName::from_static("traceparent"),
+                http::header::HeaderName::from_static("tracestate"),
+            ])
     };
 
     cors.max_age(Duration::from_secs(3600))
