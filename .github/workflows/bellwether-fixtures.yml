@@ -182,6 +182,17 @@ jobs:
         env:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
           SYMPHONY_SAMPLE_EVERY: "200"
+          # Two of the recorded templates (Apertus, Muse Glimmer) write the day
+          # of the render into the prompt with strftime_now, so their references
+          # carry the day they were recorded: 2026-10-07, in every case of both.
+          # The gateway's strftime_now takes its instant from SOURCE_DATE_EPOCH
+          # when it is set, so the harness renders that day too; noon UTC of it,
+          # so the day is the same in whichever zone the runner formats it. The
+          # value belongs with the pin: when .github/versions/bellwether.ref
+          # moves to a commit that re-recorded those sets, set it to the day
+          # their references carry (neither the pin's commit date nor the sets'
+          # commit date is that day).
+          SOURCE_DATE_EPOCH: "1791374400"
         run: |
           source "$HOME/.cargo/env"
           cargo test -p llm-tokenizer -p smg -p smg-symphony --test 'bellwether_*' -- --nocapture
