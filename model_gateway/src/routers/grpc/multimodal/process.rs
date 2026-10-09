@@ -26,6 +26,7 @@ use super::{
     MediaBatch, MultimodalIntermediate, MultimodalOutput, PrecomputedMultimodalIntermediate,
     PromptBinding, RegistryTokenizer,
 };
+use crate::observability::metrics::Metrics;
 
 struct PreparedMultimodalPart {
     preprocessed: PreprocessedEncoderInputs,
@@ -624,8 +625,10 @@ async fn preprocess_image_cached(
         config_fingerprint: fingerprint,
     };
     if let Some(cached) = cache.get(&key) {
+        Metrics::record_mm_pixel_cache_lookup(&model_id, true);
         return Ok(cached.preprocessed.clone());
     }
+    Metrics::record_mm_pixel_cache_lookup(&model_id, false);
 
     let preprocessed = preprocess_image_batch(
         registry,

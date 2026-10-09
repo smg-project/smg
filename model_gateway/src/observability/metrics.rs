@@ -768,6 +768,25 @@ pub(crate) fn init_metrics() {
         "smg_mm_turbojpeg_available",
         "1 when JPEGs decode through libjpeg-turbo (PIL's pixels), 0 through the pure-Rust fallback"
     );
+    // The router-side pixel cache (--mm-pixel-cache-mb): one per process,
+    // shared by every model, keyed by image and model configuration.
+    describe_counter!(
+        "smg_mm_pixel_cache_hits_total",
+        "Pixel cache lookups that found the image's preprocessed encoder input, by model"
+    );
+    describe_counter!(
+        "smg_mm_pixel_cache_misses_total",
+        "Pixel cache lookups that had to preprocess the image, by model"
+    );
+    describe_counter!(
+        "smg_mm_pixel_cache_evictions_total",
+        "Entries the pixel cache dropped to stay within its byte budget"
+    );
+    describe_gauge!(
+        "smg_mm_pixel_cache_bytes",
+        "Bytes of preprocessed encoder inputs the pixel cache holds"
+    );
+    describe_gauge!("smg_mm_pixel_cache_entries", "Images the pixel cache holds");
     describe_counter!(
         "smg_responses_stream_failures_total",
         "Responses streams that ended with a response.failed terminal, by model and reason"
@@ -1258,6 +1277,32 @@ impl Metrics {
 
     pub fn set_mm_turbojpeg_available(available: bool) {
         gauge!("smg_mm_turbojpeg_available").set(if available { 1.0 } else { 0.0 });
+    }
+
+    /// The pixel cache's occupancy and eviction series, at zero: called when
+    /// the cache is built, so they are on the first scrape.
+    pub fn init_mm_pixel_cache_series() {
+        counter!("smg_mm_pixel_cache_evictions_total").absolute(0);
+        gauge!("smg_mm_pixel_cache_bytes").set(0.0);
+        gauge!("smg_mm_pixel_cache_entries").set(0.0);
+    }
+
+    /// One pixel cache lookup for `model_id`: a hit served the image's
+    /// preprocessed encoder input, a miss preprocessed it. Both series exist
+    /// from the model's first lookup, so a hit rate reads from the start.
+    pub fn record_mm_pixel_cache_lookup(model_id: &str, hit: bool) {
+        let model = intern_model_label(model_id);
+        counter!("smg_mm_pixel_cache_hits_total", "model" => model.clone())
+            .increment(u64::from(hit));
+        counter!("smg_mm_pixel_cache_misses_total", "model" => model).increment(u64::from(!hit));
+    }
+
+    /// The pixel cache after an insert: the entries it dropped to stay within
+    /// its budget, and what it holds now.
+    pub fn record_mm_pixel_cache_insert(evicted: u64, bytes: usize, entries: usize) {
+        counter!("smg_mm_pixel_cache_evictions_total").increment(evicted);
+        gauge!("smg_mm_pixel_cache_bytes").set(bytes as f64);
+        gauge!("smg_mm_pixel_cache_entries").set(entries as f64);
     }
 
     /// Record where a multimodal request's media is processed and why.
