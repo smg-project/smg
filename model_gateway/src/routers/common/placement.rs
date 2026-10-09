@@ -247,8 +247,13 @@ pub(crate) fn select_from(
     };
     // The engines this request already tried step aside for its retry while
     // another available candidate remains; otherwise the pool is used whole.
+    // An explicit target under consistent hashing indexes this slice and
+    // stays strict (as `admission_prefilters` keeps it), so it is never
+    // narrowed: the retry goes back to the targeted worker.
+    let strict_target = policy.name() == "consistent_hashing"
+        && header_utils::extract_target_worker(inputs.headers).is_some();
     let untried;
-    let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() {
+    let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() || strict_target {
         available
     } else {
         untried = available
@@ -1474,6 +1479,40 @@ mod tests {
             },
         )
         .is_some());
+    }
+
+    /// An explicit target under consistent hashing indexes the unfiltered
+    /// set and stays strict: its retry goes back to the targeted worker
+    /// (never to whichever worker a narrowed slice puts at that index), even
+    /// though that worker was tried.
+    #[test]
+    fn an_explicit_target_under_consistent_hashing_keeps_its_worker_on_retry() {
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        for index in 0..3 {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", index.to_string().parse().unwrap());
+            let inputs = PlacementInputs {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+
+            let target = pick(&registry, &policies, inputs);
+            let tried = vec![target.base_url().to_string()];
+            let retried = pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..inputs
+                },
+            );
+            assert_eq!(
+                retried.url(),
+                target.url(),
+                "target {index}: the retry stays on the targeted worker"
+            );
+        }
     }
 
     /// Round robin never re-selects a tried worker while another is left,
