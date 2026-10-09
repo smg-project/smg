@@ -11,9 +11,10 @@
 //! 1. added tokens are cut out of the text the way `AddedVocabulary` does it
 //!    (leftmost-longest, the non-normalized set on the raw text first, the
 //!    normalized set after normalization);
-//! 2. normalization is NFC or nothing; NFC is applied only as a check, the
-//!    text must already be in NFC (the quick check says so for practically
-//!    every prompt) and anything else goes back to `tokenizers`;
+//! 2. normalization is NFC or nothing; NFC is applied only as a check: the
+//!    text must already be in NFC (the quick check says so for most prompts
+//!    and normalizing settles the rest, so marks-heavy scripts stay on this
+//!    path when they are in NFC) and anything else goes back to `tokenizers`;
 //! 3. each `Split` pre-tokenizer runs as a [`pattern::Pattern`] over `&str`,
 //!    with the same leftmost-first semantics and Unicode tables as the regex
 //!    engine `tokenizers` uses, producing byte ranges instead of strings;
@@ -76,6 +77,19 @@ fn escape_literal(literal: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Whether `text` is already in NFC. The quick check answers for most text;
+/// where it cannot (marks that might compose or reorder: Indic vowel signs
+/// and nuktas, an acute after a letter, Hangul jamo, ...) the text is
+/// normalized and compared, which costs far less than the encode it keeps on
+/// the native path.
+fn is_nfc(text: &str) -> bool {
+    match is_nfc_quick(text.chars()) {
+        IsNormalized::Yes => true,
+        IsNormalized::No => false,
+        IsNormalized::Maybe => text.nfc().eq(text.chars()),
+    }
 }
 
 /// GPT-2's `bytes_to_unicode`: the alphabet character for each byte.
@@ -301,7 +315,7 @@ impl NativeEncoder {
     /// normalizer, or a piece the model would not tokenize (so that the
     /// error surfaces from there).
     pub(crate) fn encode(&self, model: &ModelWrapper, text: &str) -> Option<Vec<u32>> {
-        if self.normalizer == Normalizer::Nfc && is_nfc_quick(text.chars()) != IsNormalized::Yes {
+        if self.normalizer == Normalizer::Nfc && !is_nfc(text) {
             return None;
         }
         let mut ids = Vec::with_capacity(text.len() / 3 + 8);
@@ -824,7 +838,7 @@ mod tests {
                         assert_eq!(ids, reference, "{}: {text:?}", shape.name);
                     }
                     None => assert!(
-                        shape.nfc && is_nfc_quick(text.chars()) != IsNormalized::Yes,
+                        shape.nfc && text.nfc().ne(text.chars()),
                         "{}: declined {text:?} for no reason",
                         shape.name
                     ),
@@ -1013,5 +1027,52 @@ mod tests {
             caches.iter().sum::<usize>() <= PIECE_CACHE_TOTAL_CAPACITY,
             "{caches:?}"
         );
+    }
+
+    #[test]
+    fn text_in_nfc_takes_the_native_path_when_the_quick_check_is_unsure() {
+        let mut state = 0x6666_7777_8888_9999u64;
+        let shape = &shapes()[0];
+        let tokenizer = tokenizer_of(shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        // Marks the quick check cannot vouch for, on text that is already in
+        // NFC: a Bengali vowel sign, a Devanagari nukta (its composition is
+        // excluded), an acute on a letter with no precomposed form, a lone
+        // Hangul trailing consonant, a prompt in Thai and Hindi.
+        for text in [
+            "কা",
+            "क़ पढ़ें",
+            "x\u{301}",
+            "\u{11A8}",
+            "<|im_start|>user\nครับ ผม ชื่อ นาย คำ ไทย, कृपया यह पढ़ें<|im_end|>\n",
+        ] {
+            assert_ne!(
+                is_nfc_quick(text.chars()),
+                IsNormalized::Yes,
+                "{text:?}: the quick check should be unsure here"
+            );
+            let ids = native
+                .encode(tokenizer.get_model(), text)
+                .unwrap_or_else(|| panic!("{text:?} is in NFC and must take the native path"));
+            assert_eq!(
+                ids,
+                tokenizer.encode(text, false).expect("encode").get_ids(),
+                "{text:?}"
+            );
+        }
+        // Not in NFC: composition or reordering would change the text, so
+        // these stay with `tokenizers`.
+        for text in [
+            "Cafe\u{301}",
+            "a\u{323}\u{301}",
+            "\u{1100}\u{1161}",
+            "\u{AC00}\u{11A8}",
+            "ก\u{E48}\u{E38}",
+        ] {
+            assert!(
+                native.encode(tokenizer.get_model(), text).is_none(),
+                "{text:?}"
+            );
+        }
     }
 }
