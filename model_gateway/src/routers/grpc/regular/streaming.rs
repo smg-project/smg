@@ -551,6 +551,30 @@ impl StreamingProcessor {
                         usage.record_chunk(&chunk);
                     }
 
+                    // The engine's first output opens the choice with the
+                    // role chunk, as the engine's own server does, whether or
+                    // not that output decodes to visible text (a special
+                    // token the decoder skips, a partial UTF-8 sequence): a
+                    // client timing its first chunk otherwise waits for the
+                    // next step's text.
+                    if is_firsts.get(&index).copied().unwrap_or(true) {
+                        let usage = continuous_usage.as_ref().map(|tracker| {
+                            tracker.snapshot().with_unbilled_prompt_tokens(
+                                original_request.unbilled_prompt_tokens,
+                            )
+                        });
+                        Self::send_role_chunk(
+                            tx,
+                            &mut sse_buffer,
+                            &chunk_frame,
+                            index,
+                            usage.as_ref(),
+                            emit_usage_null,
+                        )
+                        .await?;
+                        is_firsts.insert(index, false);
+                    }
+
                     // Get or create stop decoder for this index
                     let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
                         let (
@@ -665,19 +689,18 @@ impl StreamingProcessor {
             // Initialize stream buffer if first time
             let stream_buffer = stream_buffers.entry(index).or_default();
 
-            // Send first chunk with role
+            // Text that reaches here without an engine chunk before it (a
+            // decoder flush on the terminal frame) still opens its choice.
             if is_firsts.get(&index).copied().unwrap_or(true) {
-                let first_choice = assistant_choice(index, None, None, None);
-                Self::push_chunk(
+                Self::send_role_chunk(
                     tx,
                     &mut sse_buffer,
                     &chunk_frame,
-                    &first_choice,
+                    index,
                     usage.as_ref(),
                     emit_usage_null,
                 )
-                .await
-                .map_err(|()| "Failed to send first chunk".to_string())?;
+                .await?;
                 is_firsts.insert(index, false);
             }
 
@@ -1839,6 +1862,21 @@ impl StreamingProcessor {
         tx.send(Ok(buffer.split().freeze()))
             .await
             .map_err(|_| "Failed to send chunks".to_string())
+    }
+
+    /// The chunk that opens a choice: the assistant role and no content.
+    async fn send_role_chunk(
+        tx: &SseSender,
+        buffer: &mut BytesMut,
+        frame: &ChatChunkFrame,
+        index: u32,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) -> Result<(), String> {
+        let role_choice = assistant_choice(index, None, None, None);
+        Self::push_chunk(tx, buffer, frame, &role_choice, usage, emit_usage_null)
+            .await
+            .map_err(|()| "Failed to send first chunk".to_string())
     }
 
     // =========================================================================
