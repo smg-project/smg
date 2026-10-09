@@ -244,6 +244,54 @@ grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
 explicitly when that matters; the engine keeps the backend of its first
 structured request either way, as it does behind vLLM's own frontend.
 
+#### Multi-node engines: the worker pod's liveness
+
+An engine whose tensor-parallel ranks span pods runs its EngineCore and the
+gRPC servicer on a leader pod (`--nnodes N --node-rank 0 --master-addr <its
+own address> --master-port <port>`) and the other ranks on worker pods
+(`vllm serve <model> --headless --nnodes N --node-rank <k> --master-addr
+<the leader>`, the same engine flags). Every rank joins the process group
+through the leader's TCP store at `--master-port` and keeps that connection
+for its lifetime. When the leader's engine goes away (the pod restarts, or
+the servicer gives up on a start), the ranks on the worker pods are not
+told: their store connection is dead and they wait on it, the next leader
+waits for ranks that never join, and a worker probe that only asks whether
+the engine process exists (`grep vllm /proc/1/cmdline`) keeps those orphans
+running until someone deletes the pod. A leader restart must restart its
+workers: ranks cannot re-join a store they were not started against.
+
+`python -m smg_grpc_servicer.vllm.worker_probe` is the worker pod's probe.
+It passes while at least one TCP connection from the pod to the leader's
+store port is established and fails otherwise, so the kubelet restarts the
+worker and its fresh ranks join the new leader within `periodSeconds x
+failureThreshold`. Without arguments it reads `--master-addr` and
+`--master-port` off the worker's own command line (`/proc/1/cmdline`);
+`--leader <name>` names the leader by its stable DNS name instead,
+re-resolved on every run, so that a recreated leader pod at a new address
+fails the probe even while the stale connections to the old one linger, and
+`--port` names the store port. The ranks connect to the store early in
+their start, before the model loads, so the same command serves as the
+startup probe, with a budget that covers waiting for the leader. Run it
+with `python3 -I`: the probe itself needs only the standard library, but
+the engine's `PYTHONPATH` may carry site customizations that import the
+engine, and an interpreter start on a node saturated by the weight stream
+takes seconds; `-I` leaves both out, and `timeoutSeconds` of 30 or more
+keeps a slow start from counting as a failure:
+
+```yaml
+# the worker pod's container; LEADER_HOST is the leader's stable DNS name
+startupProbe:
+  exec: {command: [/bin/sh, -c, 'python3 -I -m smg_grpc_servicer.vllm.worker_probe --leader "$LEADER_HOST"']}
+  periodSeconds: 30
+  timeoutSeconds: 30
+  failureThreshold: 480
+livenessProbe:
+  exec: {command: [/bin/sh, -c, 'python3 -I -m smg_grpc_servicer.vllm.worker_probe --leader "$LEADER_HOST"']}
+  periodSeconds: 30
+  timeoutSeconds: 30
+  failureThreshold: 3
+```
+
 ### MLX
 
 ```bash
