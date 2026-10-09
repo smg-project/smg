@@ -1,18 +1,29 @@
 //! Tracing/logging integration for the HTTP layer.
 //!
-//! Wires `tower_http::trace::TraceLayer` with custom span/request/response
-//! handlers that propagate W3C trace context, attach the request ID into
-//! the span, and record HTTP-level metrics via the observability layer.
+//! [`RequestTraceLayer`] opens one `http_request` span per request with the
+//! `tower_http::trace` handlers below (W3C trace context in, the request ID
+//! and trace ID on the span, HTTP-level metrics), runs the handler under it
+//! and logs the response. The span is entered for the request, the handler
+//! and the response log, and once more if the response stream fails; it is
+//! not entered per body frame, so a long SSE stream costs no span bookkeeping
+//! per chunk. The span stays open until the body ends, so an exported trace
+//! still covers the whole stream.
 
-use std::time::Duration;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
 
-use axum::{extract::Request, middleware::Next, response::Response};
+use axum::{body::Body, extract::Request, middleware::Next, response::Response};
 use opentelemetry::trace::TraceContextExt;
+use tower::{Layer, Service};
 use tower_http::{
     classify::ServerErrorsFailureClass,
-    trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer},
+    trace::{MakeSpan, OnFailure, OnRequest, OnResponse},
 };
-use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
+use tracing::{debug, error, field::Empty, info, info_span, warn, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{metrics::matched_path_label, request_id::RequestId};
@@ -219,20 +230,167 @@ impl OnFailure<ServerErrorsFailureClass> for StreamFailureLogger {
     }
 }
 
-/// Create a configured TraceLayer for HTTP logging
+/// Create the request-span layer for HTTP logging.
 /// Note: Actual request/response logging with request IDs is done in RequestIdService
-pub fn create_logging_layer() -> TraceLayer<
-    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
-    RequestSpan,
-    RequestLogger,
-    ResponseLogger,
-    tower_http::trace::DefaultOnBodyChunk,
-    tower_http::trace::DefaultOnEos,
-    StreamFailureLogger,
-> {
-    TraceLayer::new_for_http()
-        .make_span_with(RequestSpan)
-        .on_request(RequestLogger)
-        .on_response(ResponseLogger)
-        .on_failure(StreamFailureLogger)
+pub fn create_logging_layer() -> RequestTraceLayer {
+    RequestTraceLayer
+}
+
+/// Tower layer that runs every request under its `http_request` span: the
+/// [`RequestSpan`] handlers above, applied by [`RequestTraceService`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestTraceLayer;
+
+impl<S> Layer<S> for RequestTraceLayer {
+    type Service = RequestTraceService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestTraceService { inner }
+    }
+}
+
+/// Tower service of [`RequestTraceLayer`].
+#[derive(Clone, Debug)]
+pub struct RequestTraceService<S> {
+    inner: S,
+}
+
+impl<S> Service<Request> for RequestTraceService<S>
+where
+    S: Service<Request, Response = Response> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let span = RequestSpan.make_span(&request);
+        let start = Instant::now();
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            RequestLogger.on_request(&request, &span);
+            // The handler's future is created and polled under the span, as
+            // the trace layer did, so everything it logs carries the span.
+            let future = {
+                let _enter = span.enter();
+                inner.call(request)
+            };
+            let response = future.instrument(span.clone()).await?;
+            ResponseLogger.on_response(&response, start.elapsed(), &span);
+            Ok(response.map(|body| Body::new(SpannedBody { inner: body, span })))
+        })
+    }
+}
+
+/// A response body that keeps its request span alive until the body ends,
+/// without entering it per frame; a failure of the stream is logged under the
+/// span once.
+struct SpannedBody {
+    inner: Body,
+    span: Span,
+}
+
+impl http_body::Body for SpannedBody {
+    type Data = <Body as http_body::Body>::Data;
+    type Error = <Body as http_body::Body>::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Err(error))) = &poll {
+            StreamFailureLogger.on_failure(
+                ServerErrorsFailureClass::Error(error.to_string()),
+                Duration::ZERO,
+                &this.span,
+            );
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        http_body::Body::is_end_stream(&self.inner)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::Body::size_hint(&self.inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{body::Bytes, http::Request, routing::get, Router};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
+
+    use super::*;
+
+    /// Counts how often any span is entered on this thread's subscriber.
+    struct EnterCounter(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for EnterCounter {
+        fn on_enter(
+            &self,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_does_not_enter_the_request_span_per_frame() {
+        let enters = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(EnterCounter(enters.clone())),
+        );
+        let frames = 64usize;
+        let app = Router::new()
+            .route(
+                "/stream",
+                get(move || async move {
+                    Body::from_stream(futures::stream::iter(
+                        (0..frames)
+                            .map(|_| Ok::<_, std::io::Error>(Bytes::from_static(b"data: x\n\n"))),
+                    ))
+                }),
+            )
+            .layer(create_logging_layer());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stream")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let before_body = enters.load(Ordering::Relaxed);
+        assert!(before_body >= 1, "the request itself runs under the span");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(body.len(), frames * b"data: x\n\n".len());
+        let during_body = enters.load(Ordering::Relaxed) - before_body;
+        assert!(
+            during_body < frames,
+            "the request span was entered {during_body} times while {frames} frames streamed"
+        );
+    }
 }
