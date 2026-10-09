@@ -2634,7 +2634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_workers_keep_generic_503_without_retry_after() {
+    async fn unavailable_workers_answer_503_with_retry_after() {
         let router = create_test_regular_router();
         for worker in router.worker_registry.get_all() {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
@@ -2660,7 +2660,13 @@ mod tests {
                 .expect("gateway error code header"),
             "no_available_workers"
         );
-        assert!(response.headers().get(RETRY_AFTER).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
     }
 
     /// Loopback POST /generate stub answering `status` with a JSON body on

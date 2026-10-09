@@ -14,7 +14,10 @@
 
 use std::sync::Arc;
 
-use axum::{http::HeaderMap, response::Response};
+use axum::{
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
+    response::Response,
+};
 use rand::RngExt;
 use tracing::{debug, warn};
 
@@ -372,14 +375,26 @@ pub(crate) fn failure_from(
     PlacementFailure::Unavailable
 }
 
+/// Seconds a client is told to wait before retrying a request every worker
+/// refused. A pacing hint, not a recovery estimate: the breaker timeout and
+/// the health interval are far longer, and the fleet may be back sooner.
+pub(crate) const NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS: u32 = 1;
+
 /// The 503 for a pool whose every worker is unavailable (unhealthy or its
 /// circuit breaker open). Terminal for the retry layer: the verdict clears at
 /// the health interval or the breaker timeout, never inside a backoff window,
 /// so retrying it in-process only adds the backoffs to every client's latency
-/// while the pool is down. The client retries on its own schedule.
+/// while the pool is down. The client retries on its own schedule, paced by
+/// `Retry-After` like the gateway's other refusals (admission sheds, the
+/// overload shed, tenant limits): a client that honours the header does not
+/// hammer a fleet that is down and gets the same bounded hint on every path.
 pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
     let mut response = error::service_unavailable("no_available_workers", message);
     mark_non_retryable(&mut response);
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from(NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS),
+    );
     response
 }
 
@@ -747,6 +762,7 @@ pub(crate) fn select_pair(
 mod tests {
     use std::collections::BTreeMap;
 
+    use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
@@ -1548,6 +1564,26 @@ mod tests {
             selected.url(),
             "http://h:9",
             "nothing else is left: the one worker takes the retry"
+        );
+    }
+
+    /// The all-unavailable 503 tells the client when to come back, like the
+    /// gateway's other refusals.
+    #[test]
+    fn no_available_workers_answers_503_with_retry_after() {
+        let response = no_available_workers("every worker is down");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
         );
     }
 }

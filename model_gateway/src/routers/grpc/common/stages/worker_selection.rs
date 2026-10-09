@@ -1113,7 +1113,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use std::{collections::HashMap, time::Duration};
 
-    use axum::http::StatusCode;
+    use axum::http::{header::RETRY_AFTER, StatusCode};
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
@@ -1133,6 +1133,13 @@ mod tests {
             disable_health_check: true,
             ..Default::default()
         }
+    }
+
+    fn retry_after(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
     }
 
     fn register_pd_workers(
@@ -1844,6 +1851,7 @@ mod tests {
             extract_error_code_from_response(&response),
             "no_available_workers"
         );
+        assert_eq!(retry_after(&response), Some("1"));
         // A model nobody serves stays a 404.
         assert_eq!(
             stage
@@ -1896,6 +1904,7 @@ mod tests {
                 extract_error_code_from_response(&response),
                 "no_available_workers"
             );
+            assert_eq!(retry_after(&response), Some("1"));
         }
         let absent = stage.pair_failure(
             model_id,

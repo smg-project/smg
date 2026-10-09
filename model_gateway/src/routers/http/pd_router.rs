@@ -2895,6 +2895,7 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::header::RETRY_AFTER;
     use openai_protocol::model_card::ModelCard;
     use tokio::sync::oneshot;
 
@@ -2921,6 +2922,29 @@ mod tests {
             prefill_admission: None,
             moriio_dp_turn: AtomicUsize::new(0),
         }
+    }
+
+    /// A leg that is merely down answers the same 503 as the other routers,
+    /// Retry-After included, so a client keys its back-off on one answer
+    /// whatever the transport.
+    #[test]
+    fn an_unavailable_leg_answers_503_with_retry_after() {
+        let response = PDRouter::handle_server_selection_error(PdSelectionFailure::Unavailable(
+            "No prefill workers available".to_string(),
+        ));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {
