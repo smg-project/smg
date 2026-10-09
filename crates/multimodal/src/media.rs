@@ -2202,6 +2202,18 @@ impl FrameSelection {
     }
 }
 
+/// How the decoded frames become RGB, appended to every frame filter.
+///
+/// libswscale converts 4:2:0 video to 24-bit RGB with its generic table
+/// converter but to 32-bit RGB with its SIMD kernels, and the two round
+/// differently: up to three levels apart on most pixels of every frame. The
+/// engine's own video loader (OpenCV) gets the SIMD kernel, so the frames
+/// are converted to RGBA first and the padding byte is dropped afterwards,
+/// which is exact. Asking for rgb24 outright would hand the pipeline the
+/// other converter, and the model would see every clip slightly differently
+/// from the way the engine's loader shows it.
+const RGB_CONVERSION: &str = "format=rgba,format=rgb24";
+
 /// Output-side ffmpeg arguments choosing which decoded frames to emit.
 struct FfmpegFrameArgs {
     filter: String,
@@ -2239,7 +2251,8 @@ impl FfmpegFrameArgs {
     }
 
     fn apply(&self, command: &mut Command) {
-        command.args(["-vf", &self.filter, "-frames:v", &self.frames]);
+        let filter = format!("{},{RGB_CONVERSION}", self.filter);
+        command.args(["-vf", &filter, "-frames:v", &self.frames]);
         if let Some(sync) = self.sync {
             command.args(sync);
         }
@@ -3366,6 +3379,149 @@ mod video_sampling_tests {
             .await
             .expect_err("frame 60 does not exist");
         assert!(error.to_string().contains("expected 4"), "{error}");
+    }
+
+    /// Every frame of a generated clip as the engine's own loader hands it
+    /// over: libswscale's 32-bit RGB conversion, padding byte dropped.
+    async fn engine_loader_frames(path: &Path, width: usize, height: usize) -> Vec<Vec<u8>> {
+        let output = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+            .arg(path)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .expect("ffmpeg");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let frame_bytes = width * height * 4;
+        assert_eq!(output.stdout.len() % frame_bytes, 0);
+        output
+            .stdout
+            .chunks_exact(frame_bytes)
+            .map(|frame| {
+                frame
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|pixel| pixel[..3].iter().copied())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The RGB bytes of each decoded frame, whichever runner produced them.
+    fn decoded_rgb_frames(
+        decoded: DecodedVideoFrames,
+    ) -> (Vec<Vec<u8>>, Option<VideoSamplingInfo>) {
+        match decoded {
+            DecodedVideoFrames::Rgb {
+                video, sampling, ..
+            } => (
+                video
+                    .frame_refs()
+                    .expect("frame refs")
+                    .iter()
+                    .map(|frame| frame.data.to_vec())
+                    .collect(),
+                sampling,
+            ),
+            DecodedVideoFrames::Images {
+                frames, sampling, ..
+            } => (
+                frames
+                    .iter()
+                    .map(|frame| frame.to_rgb8().into_raw())
+                    .collect(),
+                sampling,
+            ),
+        }
+    }
+
+    /// The pipeline's frames are the engine loader's frames, pixel for pixel,
+    /// on every ffmpeg runner. Skipped when ffmpeg or ffprobe is not on PATH.
+    #[tokio::test]
+    async fn ffmpeg_path_converts_frames_like_the_engine_loader() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clip.mp4");
+        // Rows of 16 pixels and an even height: the sizes the SIMD converters take.
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30:duration=1",
+                "-c:v",
+                "mpeg4",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        let probed = Command::new("ffprobe")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        if !matches!((generated, probed), (Ok(generated), Ok(probed)) if generated.success() && probed.success())
+        {
+            return;
+        }
+
+        let reference = engine_loader_frames(&path, 64, 48).await;
+        assert_eq!(reference.len(), 30);
+        let metadata = probe_video_metadata(&path).await.expect("ffprobe metadata");
+        assert_eq!((metadata.width, metadata.height), (64, 48));
+        let selection =
+            FrameSelection::from_metadata(metadata, cfg()).expect("frame rate and count");
+        assert_eq!(selection.frame_indices, vec![0, 9, 19, 29]);
+
+        let input_bytes = fs::read(&path).await.expect("generated clip").len();
+        let decoded = decode_video_with_ffmpeg(&path, input_bytes, cfg())
+            .await
+            .expect("ffmpeg decode");
+        let (frames, sampling) = decoded_rgb_frames(decoded);
+        let sampling = sampling.expect("ffprobe reports the frame rate and count");
+        assert_eq!(sampling.frame_indices, selection.frame_indices);
+        let raw = decode_video_with_ffmpeg_raw(&path, cfg(), metadata, Some(&selection))
+            .await
+            .expect("rawvideo decode");
+        let raw: Vec<Vec<u8>> = raw
+            .frame_refs()
+            .expect("frame refs")
+            .iter()
+            .map(|frame| frame.data.to_vec())
+            .collect();
+        let (png, _) = decode_video_with_ffmpeg_png(&path, cfg(), Some(metadata), Some(&selection))
+            .await
+            .expect("png decode");
+        let png: Vec<Vec<u8>> = png.iter().map(|frame| frame.to_rgb8().into_raw()).collect();
+
+        for (runner, frames) in [("ppm", &frames), ("rawvideo", &raw), ("png", &png)] {
+            assert_eq!(frames.len(), selection.frame_indices.len(), "{runner}");
+            for (frame, &index) in frames.iter().zip(&selection.frame_indices) {
+                let expected = &reference[index];
+                assert_eq!(frame.len(), expected.len(), "{runner} frame {index}");
+                let differing = frame.iter().zip(expected).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differing, 0,
+                    "{runner} frame {index}: {differing} of {} bytes differ from the engine loader's conversion",
+                    frame.len()
+                );
+            }
+        }
     }
 
     #[cfg(feature = "opencv-video")]
