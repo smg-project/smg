@@ -333,6 +333,22 @@ scores routing quality end to end.
 - With `--admin <mock admin url>` each request is joined with the mock fleet's
   record of it (`GET /admin/requests`), adding the arrival-time oracle (the most
   cached tokens any worker held when it arrived) and the queue wait.
+- `--connections fresh` (the default) gives every request a connection of its
+  own, closed by the server after the response (`Connection: close`, so the
+  TIME_WAIT sits on the server's side and the replayer's ephemeral ports stay
+  free at rate). `--connections pooled` reuses HTTP/1.1 keep-alive connections
+  instead: fewer handshakes, but the client's pool can hand a request a
+  connection whose previous response is still streaming, and that request
+  then waits inside the client for the whole stream before the gateway reads
+  it, which a TTFT column shows as one rare request per few tens of thousands
+  taking a full stream's time on an otherwise idle gateway. A connection per
+  request has its own cost, the handshake and the gateway's accept path under
+  load: measured on one deployment at 40 streaming requests per second, TTFT
+  p50 +3 ms and p99 +75 ms against the pool, so compare absolute percentiles
+  within one mode, and use `pooled` for throughput ladders (thousands of
+  connections per second are not what a gateway should spend its time on).
+  Either way the gateway's (and the admin API's) host name is resolved once
+  at start and pinned, so no connection waits on a name lookup.
 
 Output: `summary.json` (mean/p50/p90/p99 TTFT, per-request mean ITL (TPOT)
 distribution, e2e latency, goodput at the SLO `--slo-ttft-ms` / `--slo-itl-ms`
