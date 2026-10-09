@@ -1470,6 +1470,40 @@ mod tests {
     }
 
     #[test]
+    fn developer_message_renders_as_system_when_the_template_has_no_developer_branch() {
+        // The template names system/user/assistant only: a developer message
+        // would render nothing. vLLM's renderer turns it into a system message.
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}\
+                        {% if messages[0].tools is defined %}TOOLS{% endif %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "developer", "content": "Be terse.", "tools": [{"name": "t"}]}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<sys>Be terse.</sys><usr>hi</usr>");
+    }
+
+    #[test]
+    fn developer_message_reaches_a_template_that_handles_the_role() {
+        let template = "{% for m in messages %}{% if m.role == 'developer' %}<dev>{{ m.content }}</dev>\
+                        {% elif m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "developer", "content": "Be terse."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<dev>Be terse.</dev><usr>hi</usr>");
+    }
+
+    #[test]
     fn test_chat_template_state_invalid_template() {
         let result = ChatTemplateState::new(Some("{% invalid".to_string()));
         assert!(result.is_err());
