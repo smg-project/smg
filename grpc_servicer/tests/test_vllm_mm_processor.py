@@ -467,6 +467,7 @@ class TestLauncherFlags:
         behind a flag the launcher has still gets its deprecation line; the
         set values reach the environment as well."""
         monkeypatch.setattr(mm_processor, "_launcher_settings", None)
+        monkeypatch.setattr(mm_processor, "_environ_before_carry", None)
         monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "off")
         assert mm_processor.launcher_settings() is None
         parser = argparse.ArgumentParser(prog="grpc_server")

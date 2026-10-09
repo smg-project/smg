@@ -240,7 +240,9 @@ def test_plugin_hands_the_mm_flags_over_on_every_grpc_parse(monkeypatch):
     from smg_grpc_servicer.vllm import mm_processor, plugin
 
     monkeypatch.setattr(mm_processor, "_launcher_settings", None)
+    monkeypatch.setattr(mm_processor, "_environ_before_carry", None)
     monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "off")
+    monkeypatch.delenv("SMG_VLLM_MM_MAX_ITEMS", raising=False)
     monkeypatch.setitem(
         sys.modules,
         "__main__",
@@ -250,12 +252,22 @@ def test_plugin_hands_the_mm_flags_over_on_every_grpc_parse(monkeypatch):
     parser.add_argument("--port", type=int, default=50051)
     assert plugin.add_mm_arguments_to_grpc_parser(parser)  # the flags are on it now
     assert plugin.add_mm_arguments_to_grpc_parser(parser) == []  # a second parse adds none...
-    kept = plugin.handoff_mm_flags(parser, parser.parse_args(["--mm-processor", "inprocess"]))
+    kept = plugin.handoff_mm_flags(
+        parser, parser.parse_args(["--mm-processor", "inprocess", "--mm-max-items", "4"])
+    )
     assert kept is mm_processor.launcher_settings()  # ...and still hands the values over
     assert kept.processor == "inprocess" and kept.resolve(env={}).source == "flag"
     assert os.environ["SMG_VLLM_MM_PROCESSOR"] == "inprocess"
+    assert os.environ["SMG_VLLM_MM_MAX_ITEMS"] == "4"
+    # The latest parse wins in the slot and in the environment: a flag the
+    # first parse set and the second dropped is gone from both.
     again = plugin.handoff_mm_flags(parser, parser.parse_args(["--mm-processor", "redis"]))
     assert mm_processor.launcher_settings() is again and again.processor == "redis"
+    assert "SMG_VLLM_MM_MAX_ITEMS" not in os.environ
+    assert (
+        again.resolve(env=os.environ).max_items
+        == mm_processor.MmSettings().resolve(env={}).max_items
+    )
     # A parser of another command: nothing kept, the slot untouched.
     other = argparse.ArgumentParser(prog="bench")
     other.add_argument("--model")

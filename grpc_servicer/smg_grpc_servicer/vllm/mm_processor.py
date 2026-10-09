@@ -815,14 +815,32 @@ def launcher_settings() -> MmSettings | None:
     return _launcher_settings
 
 
-def carry_mm_flags(args: Any) -> MmSettings:
+# What the environment held for the `SMG_VLLM_MM_*` variables before the
+# first carry of this process, put back before every later carry: each carry
+# leaves the operator's environment plus this parse's flags, so a flag one
+# parse set and the next dropped does not live on as a variable the operator
+# never set.
+_environ_before_carry: dict[str, str | None] | None = None
+
+
+def carry_mm_flags(args: Any, environ: MutableMapping[str, str] = os.environ) -> MmSettings:
     """What the plugin does with a gRPC launcher's parsed `--mm-*` flags: keep
     them for the servicer this process builds (`launcher_settings`), and
     carry the set values into the environment for anything that reads only
-    that. Returns the settings kept."""
+    that; a later parse replaces both. Returns the settings kept."""
+    global _environ_before_carry  # noqa: PLW0603 — one launcher per process
+    names = [env_name for _flag, env_name, _default in _MM_SETTING_SPECS.values()]
+    if _environ_before_carry is None:
+        _environ_before_carry = {name: environ.get(name) for name in names}
+    else:
+        for name, before in _environ_before_carry.items():
+            if before is None:
+                environ.pop(name, None)
+            else:
+                environ[name] = before
     settings = MmSettings.from_args(args)
     remember_launcher_settings(settings)
-    export_mm_flags(args)
+    export_mm_flags(args, environ)
     return settings
 
 
