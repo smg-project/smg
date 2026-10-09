@@ -316,23 +316,6 @@ pub fn messages_reasoning_starts_in_prefill(
     should_mark_reasoning_started(user_thinking, tokenizer)
 }
 
-/// Whether a tool constraint already carries the model's reasoning block: a
-/// structural tag the registry wrapped in the parser's reasoning prefix
-/// (`ParserRegistry::register_reasoning_prefix`) because the prompt ends
-/// inside the thinking block. Such a grammar runs from the first generated
-/// token; the engine must not defer it past `</think>` on top (SGLang's
-/// `require_reasoning`), or the model would owe a second `</think>`.
-pub fn constraint_covers_reasoning(
-    tool_parser_factory: &ToolParserFactory,
-    configured_parser: Option<&str>,
-    tool_constraints: Option<&(String, String)>,
-) -> bool {
-    tool_constraints.is_some_and(|(kind, _)| kind == "structural_tag")
-        && tool_parser_factory
-            .registry()
-            .has_reasoning_prefix(configured_parser)
-}
-
 /// Resolve the user's effective thinking preference: the answer of a
 /// renderer that resolves the mode by its own rule, else the generic
 /// precedence of [`resolve_thinking_pref`].

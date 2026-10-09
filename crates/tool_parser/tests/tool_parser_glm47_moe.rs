@@ -220,10 +220,10 @@ fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
 }
 
 /// On a thinking prompt (GLM-4.7 with `enable_thinking` on, GLM-5 always) the
-/// forced call must follow the model's reasoning, as xgrammar's built-in
-/// `glm_4_7` tag lays it out with `reasoning=True`:
-/// `sequence[<free text></think>, <calls>]`. Without a forced choice there is
-/// still no constraint, thinking or not.
+/// forced call follows free text, `sequence[<free text>, <calls>]`: the
+/// thought and its close where the engine applies the grammar from the first
+/// token, nothing where it defers the grammar past the model's `</think>`.
+/// Without a forced choice there is still no constraint, thinking or not.
 #[test]
 fn test_glm47_forced_choice_on_a_thinking_prompt_reasons_first() {
     let factory = ParserFactory::new();
@@ -249,10 +249,8 @@ fn test_glm47_forced_choice_on_a_thinking_prompt_reasons_first() {
     assert_eq!(thinking["format"]["type"], "sequence");
     let elements = thinking["format"]["elements"].as_array().unwrap();
     assert_eq!(elements.len(), 2);
-    assert_eq!(elements[0]["type"], "tag");
-    assert_eq!(elements[0]["begin"], "");
-    assert_eq!(elements[0]["end"], "</think>");
-    assert_eq!(elements[0]["content"]["type"], "any_text");
+    assert_eq!(elements[0], Glm4MoeParser::reasoning_prefix());
+    assert_eq!(elements[0]["type"], "any_text");
     assert_eq!(
         elements[1], plain["format"],
         "the calls part is the non-thinking tag"
@@ -319,7 +317,10 @@ fn test_glm47_forced_call_grammar_owes_nothing_before_the_calls_on_a_thinking_pr
     }))
     .unwrap();
     for (choice, selected) in [
-        (ToolChoice::Value(ToolChoiceValue::Required), tools.as_slice()),
+        (
+            ToolChoice::Value(ToolChoiceValue::Required),
+            tools.as_slice(),
+        ),
         (named, &tools[..1]),
     ] {
         let Some(ToolConstraint::StructuralTag(tag)) = registry
