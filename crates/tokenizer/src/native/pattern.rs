@@ -1028,4 +1028,35 @@ mod tests {
             assert!(Pattern::parse(pattern).is_some(), "{pattern}");
         }
     }
+
+    #[test]
+    fn group_repeats_and_long_runs_on_a_small_stack() {
+        // A group under `+`, `*` or `{n,}` would recurse once per repetition
+        // and overflow the stack on a long run, which aborts the process; such
+        // patterns are declined, the optional form recurses at most once and
+        // class runs iterate, so long inputs match on a 256 KiB stack.
+        let worker = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                for pattern in [
+                    r"(?:\r?\n)+",
+                    r"(?: ?\p{L})+",
+                    r"(?:ab)*",
+                    r"(?:a|b){2,}",
+                    r"(?:'s){1,3}",
+                ] {
+                    assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+                }
+                let text = "\r\n".repeat(50_000) + &" x".repeat(50_000) + &"'s".repeat(5_000);
+                for pattern in [GPT2, QWEN35, CASED] {
+                    let parsed = Pattern::parse(pattern).expect("parses");
+                    let ours: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
+                    assert_eq!(ours, oracle_matches(pattern, &text), "{pattern}");
+                }
+            })
+            .expect("spawn");
+        worker
+            .join()
+            .expect("the matcher must not overflow a small stack");
+    }
 }
