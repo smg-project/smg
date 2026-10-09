@@ -284,7 +284,7 @@ impl Format {
                 let ways_in = self.ways_into(markers.block.as_ref()?.state);
                 return xtml::calls(&markers, &ways_in, &named, at_least_one);
             }
-            CallSyntax::Tagged(spelling) => {
+            CallSyntax::Tagged(spelling, _) => {
                 let ways_in = self.ways_into_block(&markers);
                 tagged::calls(&markers, &ways_in, *spelling, &named, at_least_one)
             }
@@ -308,7 +308,7 @@ impl Format {
                 tags.value_close,
             ],
             Some(CallSyntax::Dsml) => &[dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
-            Some(CallSyntax::Tagged(_)) => &TAGGED_TAGS,
+            Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
             _ => &[],
         };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));

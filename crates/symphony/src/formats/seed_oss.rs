@@ -2,14 +2,15 @@
 //! `</seed:think>`, each call between `<seed:tool_call>` and `</seed:tool_call>` as
 //! `<function=NAME>` and `<parameter=KEY>` tags, typed by the request's tools (which reach the
 //! engine with the request), every value written with Python's `str` where Qwen writes an object
-//! or a list as JSON, everything else content. The same five rows as
+//! or a list as JSON and between the tags directly where Qwen 3.5 puts it on a line of its own,
+//! everything else content. The same five rows as
 //! [`qwen3()`](crate::formats::qwen3()), with the spellings ByteDance-Seed/Seed-OSS-36B-Instruct
 //! writes; a plain `<tool_call>` is text here. The template is not ChatML: a turn opens with
 //! `<seed:bos>assistant`, so the prompt's replay starts there.
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    tagged::Spelling,
+    tagged::{Placement, Spelling},
 };
 
 /// The Seed-OSS table.
@@ -27,7 +28,7 @@ pub fn seed_oss() -> Format {
         .transition("content", "call_open", "calls")
         .transition("calls", "call_close", "content")
         .transition("calls", "call_open", "calls")
-        .calls(CallSyntax::Tagged(Spelling::Python))
+        .calls(CallSyntax::Tagged(Spelling::Python, Placement::Direct))
         .opens_turn("<seed:bos>assistant")
 }
 
@@ -42,8 +43,9 @@ mod tests {
         tagged::Declared,
     };
 
+    /// A call as the template writes it: the value between the parameter tags directly.
     const CALL: &str = concat!(
-        "<seed:tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n",
+        "<seed:tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n",
         "</function>\n</seed:tool_call>"
     );
 
@@ -138,5 +140,88 @@ mod tests {
             })
             .collect();
         assert_eq!(content, "Sure.\n<tool_call>x</tool_call>");
+    }
+
+    /// A `submit_patch` tool whose `patch` is a declared string, as bellwether's swebench call
+    /// cases declare it.
+    fn submit_patch() -> Declared {
+        use openai_protocol::common::{Function, Tool};
+        use serde_json::json as value;
+        Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "submit_patch".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {"patch": {"type": "string"}}}),
+                strict: None,
+            },
+        }])
+    }
+
+    #[test]
+    fn a_value_keeps_the_newline_it_ends_with_since_the_template_writes_none_of_its_own() {
+        // Seed-OSS writes `<parameter=KEY>`, the value and `</parameter>` with no newline between
+        // them, so a newline the value ends with is the value's: bellwether's
+        // seed-oss-36b-instruct/parse/swebench-*-call-* cases, whose patch ends in one, came back
+        // a byte short (smg-lab #110). A value of spaces, of one newline and of nothing, the same,
+        // whole and at every cut.
+        for value in [
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n",
+            "  two spaces  ",
+            "\n",
+            "\n\n",
+            "",
+        ] {
+            let output = format!(
+                "<seed:tool_call>\n<function=submit_patch>\n<parameter=patch>{value}</parameter>\n\
+                 </function>\n</seed:tool_call>"
+            );
+            let expected = format!(
+                "{{\"patch\": {}}}",
+                serde_json::Value::String(value.to_string())
+            );
+            for cut in 0..output.len() {
+                let pieces: Vec<&str> = if cut == 0 {
+                    vec![&output]
+                } else {
+                    vec![&output[..cut], &output[cut..]]
+                };
+                let mut parser = Engine::new(seed_oss(), submit_patch());
+                let mut out = Events::new();
+                for piece in &pieces {
+                    parser
+                        .feed(
+                            Input::Delta {
+                                token_ids: &[],
+                                text: piece,
+                                spans: &[],
+                            },
+                            &mut out,
+                        )
+                        .expect("delta");
+                }
+                parser
+                    .feed(
+                        Input::End {
+                            finish: EngineFinish::Stop,
+                        },
+                        &mut out,
+                    )
+                    .expect("end");
+                let events = out.drain();
+                let arguments: String = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(arguments, expected, "{value:?} cut at {cut}");
+                assert!(
+                    matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                    "{value:?} cut at {cut}"
+                );
+            }
+        }
     }
 }

@@ -59,7 +59,7 @@ use symphony::{
         deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
         qwen3, seed_oss, xlam,
     },
-    tagged::Spelling,
+    tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -357,9 +357,10 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen3Tagged,
         GenerationPrompt::OpensTheThought,
     ),
+    // MiMo writes Qwen 3.5's tags with the value between them directly, and its own `<think>`.
     (
         "mimo-v2.5",
-        Family::Qwen3Tagged,
+        Family::MiMo,
         GenerationPrompt::ModelWritesTheThought,
     ),
     (
@@ -452,6 +453,8 @@ enum Family {
     Qwen3,
     /// [`qwen3`] with the tagged call syntax, typed by the case's request tools.
     Qwen3Tagged,
+    /// [`qwen3`] with the tagged call syntax and the value between the tags directly: MiMo.
+    MiMo,
     /// [`qwen2_5`].
     Qwen2_5,
     /// [`deepseek_v4_1`]: DSML, whose parameter tags type their own values.
@@ -502,7 +505,8 @@ impl Family {
     fn format(self) -> symphony::Format {
         match self {
             Self::Qwen3 => qwen3(CallSyntax::Json),
-            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json)),
+            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+            Self::MiMo => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
             Self::Qwen2_5 => qwen2_5(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::SeedOss => seed_oss(),
@@ -525,7 +529,7 @@ impl Family {
     fn known_differences(self, slug: &str, prompt: GenerationPrompt) -> Vec<KnownDifference> {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
-            Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
+            Self::Qwen3Tagged | Self::MiMo => KNOWN_TAGGED_DIFFERENCES,
             // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3 and the plain table read neither of the probes'
             // Qwen markers: `</think>` stays reasoning text and the fenced `<tool_call>` block
             // stays content, as the reference says.
@@ -563,7 +567,13 @@ impl Family {
         let mut allowed = Vec::new();
         if matches!(
             self,
-            Self::Qwen3Tagged | Self::SeedOss | Self::Hy4 | Self::Ling | Self::IQuest | Self::Glm
+            Self::Qwen3Tagged
+                | Self::MiMo
+                | Self::SeedOss
+                | Self::Hy4
+                | Self::Ling
+                | Self::IQuest
+                | Self::Glm
         ) {
             allowed.push(Allowance::DeclaredTypeConflict);
         }
@@ -580,7 +590,7 @@ impl Family {
             allowed.push(Allowance::DeclaredTypeConflict);
             allowed.push(Allowance::NullNotWritten);
         }
-        if self == Self::Qwen3Tagged {
+        if matches!(self, Self::Qwen3Tagged | Self::MiMo) {
             allowed.push(Allowance::ContentTrimmed);
         }
         allowed

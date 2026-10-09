@@ -8,8 +8,9 @@
 //! it: `<parameter=KEY>`, the value, `</parameter>` and a newline; then `</function>`, a newline
 //! and the call's close. A newline may stand on either side of a pinned value: Qwen 3.5's template
 //! puts the value on a line of its own, Seed-OSS's and MiMo's write it between the tags directly,
-//! and the assembler takes one newline away on each side when it is there; a value written as text
-//! takes those newlines into the text, and the assembler takes them away all the same.
+//! and the grammar admits both; a value written as text takes those newlines into the text. Which
+//! newlines are the template's is the table's [`Placement`](crate::tagged::Placement), and the
+//! assembler takes them away by it, not the grammar.
 //!
 //! The value follows the property's type. A string is written as it is, any text up to the
 //! parameter's close or a terminal the table leaves the call on. A number is JSON. A boolean or
@@ -220,7 +221,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::{format::CallSyntax, formats};
+    use crate::{format::CallSyntax, formats, tagged::Placement};
 
     fn tool(name: &str, parameters: Value) -> Tool {
         Tool {
@@ -275,10 +276,10 @@ mod tests {
         // Qwen 3.5's template: `<tool_call>`, a newline, `<function=` and the name, `>` and a
         // newline; per argument `<parameter=` and the key, `>`, the value on a line of its own,
         // `</parameter>` and a newline; then `</function>`, a newline and `</tool_call>`. MiMo,
-        // on the same table, writes the value between the tags directly, so the newlines are
-        // allowed, not required. A string as it is; a boolean as JSON or Python's word; an object
-        // as the JSON Qwen's `tojson` writes.
-        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::Json))
+        // on the same table with the direct placement, writes the value between the tags
+        // directly, so the newlines are allowed, not required. A string as it is; a boolean as
+        // JSON or Python's word; an object as the JSON Qwen's `tojson` writes.
+        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine))
             .grammar(&weather_tools(), true, false)
             .expect("a grammar")
             .payload();
@@ -387,7 +388,7 @@ mod tests {
 
     #[test]
     fn null_takes_jsons_word_or_pythons() {
-        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::Json))
+        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine))
             .grammar(
                 &[tool(
                     "t",
@@ -410,7 +411,7 @@ mod tests {
 
     #[test]
     fn with_the_reasoning_open_the_prefix_excludes_the_four_tags_too() {
-        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::Json))
+        let payload = formats::qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine))
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .payload();
