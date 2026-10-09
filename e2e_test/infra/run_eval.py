@@ -56,12 +56,8 @@ def _get_eval(eval_name: str, num_examples: int, num_threads: int) -> Eval:
         from .simple_eval_mmlu import MMLUEval
 
         return MMLUEval(MMLU_DATASET_URL, num_examples, num_threads)
-    elif eval_name == "mmmu_art_and_design":
-        from .simple_eval_mmmu import MMMU_ART_AND_DESIGN, MMMUEval
-
-        return MMMUEval(MMMU_ART_AND_DESIGN, num_threads)
     else:
-        raise ValueError(f"Unknown eval: {eval_name}. Supported: mmlu, mmmu_art_and_design")
+        raise ValueError(f"Unknown eval: {eval_name}. Supported: mmlu")
 
 
 def run_eval(args: Any) -> dict:
