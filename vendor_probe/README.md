@@ -220,6 +220,33 @@ python -m vendor_probe.baseline \
     --probe-set-sha <sha> --run-id <run> --date <date>
 ```
 
+### The 2026-10-09 baselines
+
+Recorded by the `pull_request` run of the Vendor Probe workflow on the PR that
+revived this harness (curated tier only: 225 + 163 probes, run 38001344395;
+`gpt-5-nano-2025-08-07` / `gpt-4.1-nano-2025-04-14` and
+`claude-haiku-4-5-20251001`). Two properties of that recording to keep in mind
+when reading a diff against it:
+
+- The OpenAI organisation behind the CI key has Zero Data Retention: every
+  probe that stores a response or reads one back (`previous_response_id`,
+  `conversation`, `GET/DELETE /v1/responses/{id}`, input items) is recorded as
+  the vendor's `400 unsupported_parameter` / `404` instead of the public
+  behaviour. A gateway that stores (`--history-backend memory`) answers 200
+  there; those clusters are annotated in `known_divergences.jsonl`, not
+  divergences.
+- Both vendors refused the probes' image inputs (the 1x1 PNG, the wikimedia
+  URL), so the image probes carry the vendors' `400` rather than a 200.
+
+`known_divergences.jsonl` for this date was regenerated with
+`--write-allowlist` from a replay against a gateway in front of a real engine
+(gRPC worker path); each entry's `note` names the tracking issue or the
+recording artefact it comes from. Compared with the 2026-08-21 baselines the
+vendors changed field inventories only (OpenAI added `access_programs` and
+`billing`; Anthropic added `container`, `diagnostics`, `stop_details`,
+`usage.cache_creation`, `usage.inference_geo`, `usage.service_tier` and richer
+model cards); no status-class change.
+
 ### Baseline diff + regression gate
 
 `compat_diff --baseline` diffs an SMG replay against a baseline dir instead of
