@@ -438,36 +438,31 @@ async fn failed_jwt_initialization_keeps_admin_routes_protected() {
                     );
                 }
             }
-            for (token, status) in [
-                (
-                    "cp-admin-key",
-                    if with_keys {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::UNAUTHORIZED
-                    },
-                ),
-                (
-                    "cp-user-key",
-                    if with_keys {
-                        StatusCode::FORBIDDEN
-                    } else {
-                        StatusCode::UNAUTHORIZED
-                    },
-                ),
+            // With the keys the admin key passes, the user key reads but may
+            // not mutate; without them every key is rejected.
+            let denied = StatusCode::UNAUTHORIZED;
+            for (token, method, path, status) in [
+                ("cp-admin-key", "GET", "/workers", StatusCode::OK),
+                ("cp-user-key", "GET", "/workers", StatusCode::OK),
+                ("cp-user-key", "POST", "/flush_cache", StatusCode::FORBIDDEN),
             ] {
                 let response = app
                     .clone()
                     .oneshot(
                         Request::builder()
-                            .uri("/workers")
+                            .method(method)
+                            .uri(path)
                             .header(AUTH_HEADER, format!("Bearer {token}"))
                             .body(Body::empty())
                             .unwrap(),
                     )
                     .await
                     .unwrap();
-                assert_eq!(response.status(), status);
+                assert_eq!(
+                    response.status(),
+                    if with_keys { status } else { denied },
+                    "{method} {path}, shared_key={shared_key:?}, with_keys={with_keys}, token={token}"
+                );
             }
             let health = app
                 .clone()

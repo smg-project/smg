@@ -1303,7 +1303,8 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append, help_heading = "Control Plane Authentication")]
     jwt_role_mapping: Vec<String>,
 
-    /// API keys for control plane access (format: id:name:role:key)
+    /// API keys for control plane access (format: id:name:role:key; role `admin` reaches every
+    /// control plane route, `user` the read-only GET/HEAD routes)
     #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
