@@ -78,6 +78,19 @@ def add_mm_arguments_to_grpc_parser(parser: argparse.ArgumentParser) -> list[str
     return add_mm_arguments(parser)
 
 
+def handoff_mm_flags(parser: argparse.ArgumentParser, parsed: Any) -> Any | None:
+    """After a parse by a parser that serves gRPC: its `--mm-*` values go to
+    the servicer this process builds and into the environment, whether this
+    parse defined the flags or the parser had them already (a `vllm serve`
+    with its own; a second parse of the same parser). Returns the settings
+    kept, None for a parser of another command."""
+    if not serves_grpc(parser):
+        return None
+    from smg_grpc_servicer.vllm.mm_processor import carry_mm_flags
+
+    return carry_mm_flags(parsed)
+
+
 def register() -> None:
     """The ``vllm.general_plugins`` entry point. Idempotent, and loaded in
     every vLLM process: it wraps the parser class's parse step and installs
@@ -94,21 +107,18 @@ def register() -> None:
         # building the parser, so it is there for `--help` and for the
         # subcommand parse `vllm serve` dispatches to.
         add_servicer_impl_argument(self)
-        mm_flags = add_mm_arguments_to_grpc_parser(self)
+        add_mm_arguments_to_grpc_parser(self)
         parsed, extras = original(self, args, namespace)
         impl = getattr(parsed, "servicer_impl", None)
         if impl:
             # The Python servicer's guard reads only the environment: carry the
             # flag there, so a switch that never bound still fails loudly.
             os.environ[SERVICER_IMPL_ENV] = impl
-        if mm_flags:
-            # Upstream's launcher builds the Python servicer without its
-            # namespace: the parsed settings are kept for it in this process
-            # (so a flag stays `source=flag`), and the set values go into the
-            # environment too.
-            from smg_grpc_servicer.vllm.mm_processor import carry_mm_flags
-
-            carry_mm_flags(parsed)
+        # Upstream's launcher builds the Python servicer without its
+        # namespace: a gRPC parser's parsed settings are kept for it in this
+        # process (so a flag stays `source=flag`), and the set values go into
+        # the environment too; on every gRPC parse, the flags' origin aside.
+        handoff_mm_flags(self, parsed)
         return parsed, extras
 
     FlexibleArgumentParser.parse_known_args = parse_known_args  # type: ignore[method-assign]

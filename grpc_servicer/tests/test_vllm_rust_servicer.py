@@ -231,6 +231,38 @@ def test_plugin_defines_the_mm_flags_on_grpc_launcher_parsers(monkeypatch):
     assert plugin.add_mm_arguments_to_grpc_parser(launcher_parser()) == []
 
 
+def test_plugin_hands_the_mm_flags_over_on_every_grpc_parse(monkeypatch):
+    """The handoff to a servicer built without the namespace follows the
+    parser serving gRPC, not this parse having defined the flags: a parser
+    that has them already (a `vllm serve` with its own, a second parse of the
+    same parser) hands its values over too, and the latest parse wins; a
+    parser of another command hands nothing over."""
+    from smg_grpc_servicer.vllm import mm_processor, plugin
+
+    monkeypatch.setattr(mm_processor, "_launcher_settings", None)
+    monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "off")
+    monkeypatch.setitem(
+        sys.modules,
+        "__main__",
+        types.SimpleNamespace(__spec__=types.SimpleNamespace(name="vllm.entrypoints.grpc_server")),
+    )
+    parser = argparse.ArgumentParser(prog="grpc_server")
+    parser.add_argument("--port", type=int, default=50051)
+    assert plugin.add_mm_arguments_to_grpc_parser(parser)  # the flags are on it now
+    assert plugin.add_mm_arguments_to_grpc_parser(parser) == []  # a second parse adds none...
+    kept = plugin.handoff_mm_flags(parser, parser.parse_args(["--mm-processor", "inprocess"]))
+    assert kept is mm_processor.launcher_settings()  # ...and still hands the values over
+    assert kept.processor == "inprocess" and kept.resolve(env={}).source == "flag"
+    assert os.environ["SMG_VLLM_MM_PROCESSOR"] == "inprocess"
+    again = plugin.handoff_mm_flags(parser, parser.parse_args(["--mm-processor", "redis"]))
+    assert mm_processor.launcher_settings() is again and again.processor == "redis"
+    # A parser of another command: nothing kept, the slot untouched.
+    other = argparse.ArgumentParser(prog="bench")
+    other.add_argument("--model")
+    assert plugin.handoff_mm_flags(other, other.parse_args(["--model", "m"])) is None
+    assert mm_processor.launcher_settings() is again
+
+
 def test_plugin_parses_the_mm_flags_and_exports_them_for_the_python_servicer(monkeypatch):
     """With vLLM installed: the stock launcher's parse step grows the flags and
     carries their values into the environment, where a servicer built without
