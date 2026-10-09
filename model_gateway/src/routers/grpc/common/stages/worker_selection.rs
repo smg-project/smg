@@ -120,22 +120,32 @@ impl WorkerSelectionStage {
         self
     }
 
-    /// The 503 for a request held ahead of selection past the queue timeout,
+    /// The acceptance stamp this selection is bounded by, taken from the
+    /// request's meta once: the first selection of a request takes it, a later
+    /// pipeline run of the same request (a Responses tool loop iteration, with
+    /// the same meta) finds it spent and runs unbounded, as it did not wait
+    /// inside the gateway. `None` without a bound, a meta or a fresh stamp.
+    fn acceptance_for_selection(&self, ctx: &RequestContext) -> Option<Instant> {
+        self.queue_timeout?;
+        ctx.input
+            .tenant_request_meta
+            .as_ref()?
+            .extension::<AcceptedAt>()?
+            .take_for_selection()
+    }
+
+    /// The 503 for a request held past the queue timeout since `accepted`
+    /// (the admission grant where there is one, else the gateway's acceptance),
     /// before any worker is read: the admission bound caps how many requests
     /// the gateway holds, not for how long, and a gateway that falls behind
     /// its own ingress (tokenization, selection) would otherwise dispatch
     /// requests that waited minutes to workers that are not overloaded at all,
     /// so neither the overload shed nor the admission queue ever answers.
-    /// Terminal for the retry layer, like every shed, with the same back-off
-    /// hint as the admission queue's refusals.
-    fn refuse_if_waited_too_long(&self, ctx: &RequestContext) -> Option<Response> {
+    /// Checked again after the prefill admission wait of a PD or EPD request,
+    /// which can outlast the bound. Terminal for the retry layer, like every
+    /// shed, with the same back-off hint as the admission queue's refusals.
+    fn refuse_if_expired(&self, ctx: &RequestContext, accepted: Instant) -> Option<Response> {
         let timeout = self.queue_timeout?;
-        let accepted = ctx
-            .input
-            .tenant_request_meta
-            .as_ref()?
-            .extension::<AcceptedAt>()?
-            .0;
         let waited = waited_past_timeout(accepted, Instant::now(), timeout)?;
         Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_SELECTION_TIMEOUT);
         debug!(
@@ -184,7 +194,8 @@ fn disaggregated((prefill, decode, runtime_type): PdWorkerPair) -> WorkerSelecti
 #[async_trait]
 impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
-        if let Some(refused) = self.refuse_if_waited_too_long(ctx) {
+        let accepted = self.acceptance_for_selection(ctx);
+        if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
             return Err(refused);
         }
         let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
@@ -285,6 +296,14 @@ impl PipelineStage for WorkerSelectionStage {
                 let (pair, guard) = self
                     .admit_pd_pair(model_id, inputs, sticky_key, None, media_refs)
                     .await?;
+                // The prefill admission wait can outlast the bound; a request
+                // past it gives its claim back instead of taking a worker.
+                if let Some(refused) =
+                    accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted))
+                {
+                    drop(guard);
+                    return Err(refused);
+                }
                 ctx.state.pd_prefill_guard = Some(guard);
                 disaggregated(pair)
             }
@@ -317,6 +336,12 @@ impl PipelineStage for WorkerSelectionStage {
                         &encode_item_hashes,
                     )
                     .await?;
+                if let Some(refused) =
+                    accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted))
+                {
+                    drop(guard);
+                    return Err(refused);
+                }
                 ctx.state.pd_prefill_guard = Some(guard);
                 WorkerSelection::Disaggregated {
                     encode_assignments: if encode_assignments.is_empty() {
@@ -2820,7 +2845,7 @@ mod tests {
         });
         let meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         ctx.input.tenant_request_meta = Some(match accepted {
-            Some(accepted) => meta.with_extension(AcceptedAt(accepted)),
+            Some(accepted) => meta.with_extension(AcceptedAt::at(accepted)),
             None => meta,
         });
         ctx
@@ -2929,5 +2954,92 @@ mod tests {
             .await
             .expect("without an acceptance stamp the wait is unknown and never refused");
         assert!(ctx.state.workers.is_some());
+    }
+
+    /// A request's first selection takes the stamp; a later pipeline run of
+    /// the same request (a Responses tool loop iteration carries the same
+    /// meta) is not refused for the time the request spent generating and
+    /// running tools, however long, while a new request that waited is.
+    #[tokio::test]
+    async fn a_later_run_of_the_same_request_is_not_bounded() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(worker("grpc://127.0.0.1:30002", WorkerType::Regular))
+            .unwrap();
+        let stage =
+            regular_stage(Arc::clone(&registry)).with_queue_timeout(Duration::from_millis(1));
+        let mut first = prepared_ctx(Arc::clone(&registry), Some(Instant::now()));
+        stage
+            .execute(&mut first)
+            .await
+            .expect("the first selection");
+        let meta = first.input.tenant_request_meta.clone();
+
+        std::thread::sleep(Duration::from_millis(5));
+        let mut later = prepared_ctx(Arc::clone(&registry), None);
+        later.input.tenant_request_meta = meta;
+        stage
+            .execute(&mut later)
+            .await
+            .expect("a later run of the same request is not held to the bound");
+        assert!(later.state.workers.is_some());
+
+        let mut fresh = prepared_ctx(registry, Some(Instant::now()));
+        std::thread::sleep(Duration::from_millis(5));
+        let refused = stage
+            .execute(&mut fresh)
+            .await
+            .expect_err("a new request that waited past the bound is refused");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A PD request that passes the check and then waits for prefill
+    /// admission past the bound is refused once admitted, and its claim goes
+    /// back instead of a worker being taken.
+    #[tokio::test]
+    async fn the_bound_is_checked_again_after_the_prefill_admission_wait() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let prefill = worker("grpc://prefill-bound:30000", WorkerType::Prefill);
+        let decode = worker("grpc://decode-bound:30000", WorkerType::Decode);
+        for worker in [&prefill, &decode] {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        let admission = Arc::new(PrefillAdmission::new(1, 1, Duration::from_secs(5)));
+        let occupied = occupy(&admission, &prefill).await;
+        let stage = Arc::new(
+            pd_stage(
+                Arc::clone(&registry),
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                Arc::clone(&admission),
+            )
+            .with_queue_timeout(Duration::from_millis(50)),
+        );
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test waiter task is joined before the test ends"
+        )]
+        let queued = tokio::spawn({
+            let stage = Arc::clone(&stage);
+            let registry = Arc::clone(&registry);
+            async move {
+                let mut ctx = prepared_ctx(registry, Some(Instant::now()));
+                let result = stage.execute(&mut ctx).await;
+                (result, ctx.state.pd_prefill_guard.is_some())
+            }
+        });
+        wait_for_queued(&admission, 1).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(occupied);
+
+        let (result, holds_claim) = queued.await.expect("waiter should join");
+        let refused = result.expect_err("admitted past the bound, the request is refused");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            SELECTION_QUEUE_TIMEOUT_ERROR_CODE
+        );
+        assert!(!holds_claim, "the prefill claim went back");
+        assert_eq!(prefill.load(), 0, "no load left on the prefill worker");
     }
 }
