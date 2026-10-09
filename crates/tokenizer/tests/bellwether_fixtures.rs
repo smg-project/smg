@@ -33,12 +33,15 @@
 //!
 //! Tokenizer files come from the Hugging Face cache snapshot at the
 //! manifest's revision when it is there, else from a one-time download into
-//! `.tokenizer_cache/bellwether/<slug>/<revision>/`. That download needs the
-//! TLS backend a workspace build enables: under `cargo test -p llm-tokenizer`
-//! alone the crate's `reqwest` dev-dependency has none, so with a cold cache
-//! run it from the workspace or fill the Hugging Face cache first. A model
-//! whose tokenizer does not load is listed when the run fails at the end,
-//! after every other model has been compared.
+//! `.tokenizer_cache/bellwether/<slug>/<revision>/`: `tokenizer_config.json`
+//! and the vocabulary, `tokenizer.json` or, for checkpoints that ship a
+//! tiktoken vocabulary instead (Kimi), `tiktoken.model`, plus `config.json`
+//! when the checkpoint has one. That download needs the TLS backend a
+//! workspace build enables: under `cargo test -p llm-tokenizer` alone the
+//! crate's `reqwest` dev-dependency has none, so with a cold cache run it
+//! from the workspace or fill the Hugging Face cache first. A model whose
+//! tokenizer does not load is listed when the run fails at the end, after
+//! every other model has been compared.
 //!
 //! A difference is a finding, not something to hide: every known one is listed
 //! in [`KNOWN_DIFFERENCES`] with its reason and where it is tracked, the run
@@ -706,11 +709,18 @@ fn load_tokenizer(slug: &str, manifest: &Manifest) -> Result<(Arc<dyn Tokenizer>
     Ok((tok, dir))
 }
 
+/// The vocabulary files a checkpoint may ship, in the order they are tried:
+/// a `tokenizers` file, or a tiktoken file for the models that have no
+/// `tokenizer.json` (Kimi).
+const VOCABULARY_FILES: [&str; 2] = ["tokenizer.json", "tiktoken.model"];
+
 /// The checkpoint's tokenizer files at the manifest's revision: the Hugging
-/// Face cache snapshot when it is there, else a one-time download of the two
-/// files the tokenizer loads, `tokenizer.json` and `tokenizer_config.json`.
-/// A download is written beside its name and renamed into place, so an
-/// interrupted write never leaves a short file the next run would trust.
+/// Face cache snapshot when it is there, else a one-time download of the
+/// files the tokenizer loads: `tokenizer_config.json`, the first of
+/// [`VOCABULARY_FILES`] the checkpoint serves, and `config.json` when it has
+/// one (the renderer detection reads it). A download is written beside its
+/// name and renamed into place, so an interrupted write never leaves a short
+/// file the next run would trust.
 fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, String> {
     if let Some(snapshot) = hf_cache_snapshot(model, revision) {
         return Ok(snapshot);
@@ -718,35 +728,63 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let client = reqwest::blocking::Client::new();
-    for (file, min_bytes) in [
-        ("tokenizer.json", 100_000usize),
-        ("tokenizer_config.json", 100),
-    ] {
-        let path = dir.join(file);
-        if path.is_file() {
-            continue;
+    download(&client, model, revision, &dir, "tokenizer_config.json", 100)?
+        .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
+    download(&client, model, revision, &dir, "config.json", 2)?;
+    let mut vocabulary = None;
+    for file in VOCABULARY_FILES {
+        if download(&client, model, revision, &dir, file, 100_000)?.is_some() {
+            vocabulary = Some(file);
+            break;
         }
-        let url = format!("https://huggingface.co/{model}/resolve/{revision}/{file}");
-        let response = client
-            .get(&url)
-            .send()
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        if !response.status().is_success() {
-            return Err(format!("GET {url}: HTTP {}", response.status()));
-        }
-        let bytes = response.bytes().map_err(|e| format!("GET {url}: {e}"))?;
-        if bytes.len() < min_bytes {
-            return Err(format!(
-                "{url}: {} bytes, expected at least {min_bytes}",
-                bytes.len()
-            ));
-        }
-        let part = dir.join(format!("{file}.part"));
-        fs::write(&part, &bytes).map_err(|e| format!("cannot write {}: {e}", part.display()))?;
-        fs::rename(&part, &path)
-            .map_err(|e| format!("cannot rename {} into place: {e}", part.display()))?;
     }
+    vocabulary.ok_or_else(|| {
+        format!(
+            "{model} at {revision} serves none of {}",
+            VOCABULARY_FILES.join(", ")
+        )
+    })?;
     Ok(dir)
+}
+
+/// Fetches `file` into `dir` unless it is there already; `Ok(None)` when the
+/// checkpoint does not serve it (HTTP 404), an error for any other failure
+/// or a file shorter than `min_bytes`.
+fn download(
+    client: &reqwest::blocking::Client,
+    model: &str,
+    revision: &str,
+    dir: &Path,
+    file: &str,
+    min_bytes: usize,
+) -> Result<Option<PathBuf>, String> {
+    let path = dir.join(file);
+    if path.is_file() {
+        return Ok(Some(path));
+    }
+    let url = format!("https://huggingface.co/{model}/resolve/{revision}/{file}");
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(format!("GET {url}: HTTP {}", response.status()));
+    }
+    let bytes = response.bytes().map_err(|e| format!("GET {url}: {e}"))?;
+    if bytes.len() < min_bytes {
+        return Err(format!(
+            "{url}: {} bytes, expected at least {min_bytes}",
+            bytes.len()
+        ));
+    }
+    let part = dir.join(format!("{file}.part"));
+    fs::write(&part, &bytes).map_err(|e| format!("cannot write {}: {e}", part.display()))?;
+    fs::rename(&part, &path)
+        .map_err(|e| format!("cannot rename {} into place: {e}", part.display()))?;
+    Ok(Some(path))
 }
 
 /// `<hub cache>/models--<org>--<name>/snapshots/<revision>`, the layout
@@ -763,8 +801,9 @@ fn hf_cache_snapshot(model: &str, revision: &str) -> Option<PathBuf> {
         .join(format!("models--{}", model.replace('/', "--")))
         .join("snapshots")
         .join(revision);
-    (dir.join("tokenizer.json").is_file() && dir.join("tokenizer_config.json").is_file())
-        .then_some(dir)
+    (dir.join("tokenizer_config.json").is_file()
+        && VOCABULARY_FILES.iter().any(|file| dir.join(file).is_file()))
+    .then_some(dir)
 }
 
 // The run's own checks, on fixture trees the tests below write.
