@@ -179,7 +179,11 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
                 return injected_error(fault.status);
             }
         }
-        let cut = injected.and_then(|fault| fault.after_tokens.map(|after| (after, fault.status)));
+        let cut = injected.and_then(|fault| {
+            fault
+                .after_tokens
+                .map(|after| (after, fault.status, engine.cut_counter()))
+        });
         let parsed = parsed.unwrap_or(Value::Null);
         let prompt_ids = synth_token_ids(&extract_prompt_text(&parsed));
         let prompt_tokens = prompt_ids.len() as u32;
@@ -277,7 +281,7 @@ async fn realistic_completion(
     model: String,
     prompt_tokens: u32,
     endpoint: Endpoint,
-    cut: Option<(u32, u16)>,
+    cut: Option<(u32, u16, Arc<AtomicU64>)>,
 ) -> Response {
     let mut completion_tokens = 0u32;
     let mut cached_tokens = 0u32;
@@ -285,9 +289,10 @@ async fn realistic_completion(
         match ev {
             engine::GenEvent::Token { .. } => {
                 completion_tokens += 1;
-                if let Some((after, status)) = cut {
-                    if completion_tokens > after {
-                        return injected_error(status);
+                if let Some((after, status, cut_total)) = &cut {
+                    if completion_tokens > *after {
+                        cut_total.fetch_add(1, Ordering::Relaxed);
+                        return injected_error(*status);
                     }
                 }
             }
@@ -346,7 +351,7 @@ fn realistic_sse(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     model: String,
     endpoint: Endpoint,
-    cut: Option<(u32, u16)>,
+    cut: Option<(u32, u16, Arc<AtomicU64>)>,
 ) -> Sse<impl Stream<Item = Result<Event, io::Error>>> {
     Sse::new(realistic_frames(rx, model, endpoint, cut))
 }
@@ -356,7 +361,7 @@ fn realistic_frames(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     model: String,
     endpoint: Endpoint,
-    cut: Option<(u32, u16)>,
+    cut: Option<(u32, u16, Arc<AtomicU64>)>,
 ) -> impl Stream<Item = Result<Event, io::Error>> {
     enum St {
         Active {
@@ -364,6 +369,7 @@ fn realistic_frames(
             model: String,
             endpoint: Endpoint,
             served: u32,
+            cut: Option<(u32, u16, Arc<AtomicU64>)>,
         },
         Closing,
         Ended,
@@ -375,18 +381,21 @@ fn realistic_frames(
             model,
             endpoint,
             served: 0,
+            cut,
         },
-        move |st| async move {
+        |st| async move {
             match st {
                 St::Active {
                     mut rx,
                     model,
                     endpoint,
                     served,
+                    cut,
                 } => match rx.recv().await {
                     Some(engine::GenEvent::Token { .. }) => {
-                        if let Some((after, status)) = cut {
-                            if served >= after {
+                        if let Some((after, status, cut_total)) = &cut {
+                            if served >= *after {
+                                cut_total.fetch_add(1, Ordering::Relaxed);
                                 let cut = io::Error::other(format!("injected {status}"));
                                 return Some((Err(cut), St::Ended));
                             }
@@ -399,6 +408,7 @@ fn realistic_frames(
                                 model,
                                 endpoint,
                                 served: served + 1,
+                                cut,
                             },
                         ))
                     }
@@ -531,11 +541,17 @@ mod tests {
         }
         tx.send(done(3)).unwrap();
         drop(tx);
-        let frames: Vec<Result<Event, io::Error>> =
-            realistic_frames(rx, "m".to_string(), Endpoint::Chat, Some((1, 502)))
-                .collect()
-                .await;
+        let cuts = Arc::new(AtomicU64::new(0));
+        let frames: Vec<Result<Event, io::Error>> = realistic_frames(
+            rx,
+            "m".to_string(),
+            Endpoint::Chat,
+            Some((1, 502, Arc::clone(&cuts))),
+        )
+        .collect()
+        .await;
         assert_eq!(frames.len(), 2, "one token frame, then the cut");
+        assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
         assert!(frames[0].is_ok());
         assert!(
             matches!(&frames[1], Err(e) if e.to_string() == "injected 502"),
@@ -550,12 +566,39 @@ mod tests {
         tx.send(token()).unwrap();
         tx.send(done(1)).unwrap();
         drop(tx);
-        let frames: Vec<Result<Event, io::Error>> =
-            realistic_frames(rx, "m".to_string(), Endpoint::Chat, Some((5, 502)))
-                .collect()
-                .await;
+        let cuts = Arc::new(AtomicU64::new(0));
+        let frames: Vec<Result<Event, io::Error>> = realistic_frames(
+            rx,
+            "m".to_string(),
+            Endpoint::Chat,
+            Some((5, 502, Arc::clone(&cuts))),
+        )
+        .collect()
+        .await;
         assert_eq!(frames.len(), 3, "token, finish, [DONE]");
         assert!(frames.iter().all(Result::is_ok));
+        assert_eq!(cuts.load(Ordering::Relaxed), 0, "nothing was cut");
+    }
+
+    #[tokio::test]
+    async fn a_cut_completion_answers_the_status_and_counts_the_cut() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for _ in 0..3 {
+            tx.send(token()).unwrap();
+        }
+        tx.send(done(3)).unwrap();
+        drop(tx);
+        let cuts = Arc::new(AtomicU64::new(0));
+        let response = realistic_completion(
+            rx,
+            "m".to_string(),
+            3,
+            Endpoint::Chat,
+            Some((1, 502, Arc::clone(&cuts))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
     }
 
     #[tokio::test]

@@ -565,8 +565,9 @@ struct Faults {
     fail: Mutex<Option<RequestFault>>,
     /// Requests answered with the fault's status before admission.
     failed_total: AtomicU64,
-    /// Streams cut with the fault's status after their first tokens.
-    cut_total: AtomicU64,
+    /// Streams cut with the fault's status after their first tokens, counted
+    /// by the worker paths where they end the stream (`Engine::cut_counter`).
+    cut_total: Arc<AtomicU64>,
     /// Requests held back by the fault's stall.
     stalled_total: AtomicU64,
 }
@@ -881,9 +882,11 @@ impl Engine {
             .unwrap_or_else(|p| p.into_inner()) = fault;
     }
 
-    /// What the armed request fault does to the request arriving now, counted
-    /// in the totals; `None` when no fault applies. A `Requests(n)` scope is
-    /// spent by one, an elapsed `Until` disarms the fault.
+    /// What the armed request fault does to the request arriving now; `None`
+    /// when no fault applies. A `Requests(n)` scope is spent by one, an
+    /// elapsed `Until` disarms the fault. A status answered before admission
+    /// and a stall are counted here; a cut is counted where the stream is
+    /// actually cut (an output no longer than `after_tokens` is never cut).
     pub(crate) fn inject(&self) -> Option<Injected> {
         let faults = &self.shared.faults;
         let mut armed = faults.fail.lock().unwrap_or_else(|p| p.into_inner());
@@ -904,18 +907,20 @@ impl Engine {
         if !fault.stall.is_zero() {
             faults.stalled_total.fetch_add(1, Ordering::Relaxed);
         }
-        if fault.status != 0 {
-            if fault.after_tokens.is_some() {
-                faults.cut_total.fetch_add(1, Ordering::Relaxed);
-            } else {
-                faults.failed_total.fetch_add(1, Ordering::Relaxed);
-            }
+        if fault.status != 0 && fault.after_tokens.is_none() {
+            faults.failed_total.fetch_add(1, Ordering::Relaxed);
         }
         Some(Injected {
             status: fault.status,
             stall: fault.stall,
             after_tokens: fault.after_tokens,
         })
+    }
+
+    /// The count of streams the request fault actually cut; the worker paths
+    /// bump it at the point where they end a stream with the fault's status.
+    pub(crate) fn cut_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.faults.cut_total)
     }
 
     pub(crate) fn fault_status(&self) -> FaultStatus {
@@ -3218,8 +3223,11 @@ mod tests {
         assert_eq!(status.fail, None, "disarmed once elapsed");
         assert_eq!(
             (status.failed_total, status.cut_total, status.stalled_total),
-            (0, 1, 1)
+            (0, 0, 1),
+            "a cut is counted where the stream is cut, not when it is armed"
         );
+        engine.cut_counter().fetch_add(1, Ordering::Relaxed);
+        assert_eq!(engine.fault_status().cut_total, 1);
         // Open scope: every request until cleared.
         engine.fault_fail(Some(RequestFault {
             status: 429,

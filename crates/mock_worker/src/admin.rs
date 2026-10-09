@@ -189,9 +189,11 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
         (Some(_), Some(_)) => return Err("count and secs exclude each other".to_string()),
         (Some(0), None) => return Err("count must be at least 1".to_string()),
         (Some(n), None) => FaultScope::Requests(n),
-        (None, Some(t)) if t.is_finite() && t > 0.0 => {
-            FaultScope::Until(Instant::now() + Duration::from_secs_f64(t))
-        }
+        (None, Some(t)) if t.is_finite() && t > 0.0 => Duration::try_from_secs_f64(t)
+            .ok()
+            .and_then(|d| Instant::now().checked_add(d))
+            .map(FaultScope::Until)
+            .ok_or_else(|| format!("secs out of range, got {t}"))?,
         (None, Some(t)) => return Err(format!("secs must be positive, got {t}")),
         (None, None) => FaultScope::Open,
     };
@@ -537,6 +539,7 @@ mod tests {
             query(&[("status", "503"), ("count", "1"), ("secs", "1")]),
             query(&[("status", "503"), ("count", "0")]),
             query(&[("status", "503"), ("secs", "0")]),
+            query(&[("status", "503"), ("secs", "1e30")]),
             query(&[("after_tokens", "2")]),
             query(&[("status", "many")]),
         ] {

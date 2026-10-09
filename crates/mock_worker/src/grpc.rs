@@ -4,7 +4,10 @@
 use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -174,7 +177,7 @@ impl TokenSpeedScheduler for MockScheduler {
             let cut = injected.and_then(|fault| {
                 fault
                     .after_tokens
-                    .map(|after| (after, injected_status(fault.status)))
+                    .map(|after| (after, injected_status(fault.status), engine.cut_counter()))
             });
             let request_id = req.request_id;
             let prompt_token_ids = req.tokenized.map(|t| t.input_ids).unwrap_or_default();
@@ -393,9 +396,11 @@ impl TokenSpeedScheduler for MockScheduler {
     }
 }
 
-/// The gRPC status standing for the HTTP status a request fault answers:
-/// the inverse of the gateway's mapping of status codes to HTTP statuses, so
-/// a drill names the status it wants to see at the gateway.
+/// The gRPC status code closest to the HTTP status a request fault answers,
+/// chosen so the gateway's mapping of codes to HTTP statuses gives that status
+/// back where it can: 408 reads back as 504 and 502 as 503 (both still
+/// retryable), any other 4xx as 400 (not retryable, as on the HTTP worker),
+/// any other 5xx as 500.
 fn injected_status(status: u16) -> Status {
     const MESSAGE: &str = "injected";
     match status {
@@ -408,6 +413,7 @@ fn injected_status(status: u16) -> Status {
         429 => Status::resource_exhausted(MESSAGE),
         501 => Status::unimplemented(MESSAGE),
         502 | 503 => Status::unavailable(MESSAGE),
+        other if (400..=499).contains(&other) => Status::invalid_argument(MESSAGE),
         _ => Status::internal(MESSAGE),
     }
 }
@@ -419,8 +425,8 @@ struct Generating {
     stream_chunks: bool,
     request_id: String,
     /// The fault hook's cut: the stream ends with the status once the engine
-    /// has produced more than this many tokens.
-    cut: Option<(u32, Status)>,
+    /// has produced more than this many tokens; the counter records the cut.
+    cut: Option<(u32, Status, Arc<AtomicU64>)>,
     ended: bool,
 }
 
@@ -435,7 +441,7 @@ fn generate_stream(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     stream_chunks: bool,
     request_id: String,
-    cut: Option<(u32, Status)>,
+    cut: Option<(u32, Status, Arc<AtomicU64>)>,
 ) -> GenStream {
     let init = Generating {
         rx,
@@ -457,9 +463,10 @@ fn generate_stream(
                     cached_tokens,
                 }) => {
                     st.output_ids.push(token_id);
-                    if let Some((after, status)) = &st.cut {
+                    if let Some((after, status, cut_total)) = &st.cut {
                         if st.output_ids.len() > *after as usize {
                             let status = status.clone();
+                            cut_total.fetch_add(1, Ordering::Relaxed);
                             st.ended = true;
                             return Some((Err(status), st));
                         }
@@ -753,13 +760,15 @@ mod tests {
         }
         tx.send(done(4)).unwrap();
         drop(tx);
-        let cut = Some((2, Status::unavailable("injected")));
+        let cuts = Arc::new(AtomicU64::new(0));
+        let cut = Some((2, Status::unavailable("injected"), Arc::clone(&cuts)));
         let mut stream = generate_stream(rx, true, "r".to_string(), cut);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
         assert!(matches!(cut, Err(ref status) if status.code() == tonic::Code::Unavailable));
         assert!(stream.next().await.is_none(), "nothing after the cut");
+        assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
     }
 
     #[tokio::test]
@@ -768,21 +777,32 @@ mod tests {
         tx.send(token(1)).unwrap();
         tx.send(done(1)).unwrap();
         drop(tx);
-        let cut = Some((1, Status::internal("injected")));
+        let cuts = Arc::new(AtomicU64::new(0));
+        let cut = Some((1, Status::internal("injected"), Arc::clone(&cuts)));
         let mut stream = generate_stream(rx, true, "r".to_string(), cut);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         let complete = stream.next().await.expect("complete").expect("ok");
         assert!(matches!(complete.response, Some(GenResp::Complete(_))));
         assert!(stream.next().await.is_none());
+        assert_eq!(
+            cuts.load(Ordering::Relaxed),
+            0,
+            "an output no longer than the cut is not counted as cut"
+        );
     }
 
     #[test]
-    fn injected_statuses_read_back_at_the_gateway_as_the_status_asked_for() {
+    fn injected_statuses_map_to_the_closest_grpc_code() {
         assert_eq!(injected_status(503).code(), tonic::Code::Unavailable);
         assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
         assert_eq!(injected_status(500).code(), tonic::Code::Internal);
         assert_eq!(injected_status(429).code(), tonic::Code::ResourceExhausted);
         assert_eq!(injected_status(504).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(400).code(), tonic::Code::InvalidArgument);
+        // The two non-inverse cases (read back as 504 and 503) and a 4xx
+        // without its own code (read back as 400).
+        assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
+        assert_eq!(injected_status(422).code(), tonic::Code::InvalidArgument);
     }
 }
