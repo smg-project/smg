@@ -32,7 +32,8 @@ def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
     parent, _, child = name.rpartition(".")
     if parent:
         parent_module = sys.modules.get(parent) or _install(monkeypatch, parent)
-        setattr(parent_module, child, module)
+        # Undone with the test: the parent is the real package where an engine is installed.
+        monkeypatch.setattr(parent_module, child, module, raising=False)
     return module
 
 
@@ -975,40 +976,73 @@ def test_configure_logging_gives_the_package_a_handler(monkeypatch):
     assert root.handlers or pkg.handlers
 
 
+# vLLM's own default for its ZMQ publisher's endpoint. `default_kv_events_config`
+# leaves it to vLLM: absent from the JSON form, the dataclass default in the typed one.
+KV_EVENTS_ENDPOINT = "tcp://*:5557"
+# What vLLM sees of the configuration the Rust path applies: the publisher on.
+KV_EVENTS_ON = (True, "zmq", KV_EVENTS_ENDPOINT)
+
+
+def _kv_events(config):
+    """``(enable_kv_cache_events, publisher, endpoint)`` as vLLM ends up seeing
+    them, from either form ``default_kv_events_config`` returns: the JSON dict
+    the launcher's parser takes when ``vllm.config`` is not importable (the
+    unit-test job without an engine), or vLLM's own ``KVEventsConfig`` when it
+    is (the engine-gated job, where the engine args hold the typed form)."""
+    if isinstance(config, dict):
+        config = SimpleNamespace(**{"endpoint": KV_EVENTS_ENDPOINT, **config})
+    return config.enable_kv_cache_events, config.publisher, config.endpoint
+
+
 def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer(monkeypatch):
     """A launcher without --kv-events-config left vLLM publishing nothing and
     the router's cache-aware routing blind (smg-lab #1): the Rust path turns
     the ZMQ publisher on itself unless told otherwise."""
-    expected = {"enable_kv_cache_events": True, "publisher": "zmq"}
-    # Nothing given (no vLLM importable here: the JSON form the parser takes).
+    # Nothing given: the typed form when vllm.config is importable, else the
+    # JSON form the parser takes; what vLLM sees is the same.
     args = argparse.Namespace(model="org/m")
     applied = rust.default_kv_events_config(args, environ={})
-    assert applied == expected
+    assert _kv_events(applied) == KV_EVENTS_ON
     assert args.kv_events_config is applied
     args = argparse.Namespace(model="org/m", kv_events_config=None)
-    assert rust.default_kv_events_config(args, environ={}) == expected
+    assert _kv_events(rust.default_kv_events_config(args, environ={})) == KV_EVENTS_ON
     # The opt-out.
     for value in ("0", "false", "No", " off "):
         args = argparse.Namespace(model="org/m", kv_events_config=None)
         assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: value}) is None
         assert args.kv_events_config is None
     args = argparse.Namespace(model="org/m")
-    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}) == expected
+    applied = rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"})
+    assert _kv_events(applied) == KV_EVENTS_ON
     # An explicit configuration is kept as given, off included.
     given = SimpleNamespace(enable_kv_cache_events=False, publisher="null")
     args = argparse.Namespace(model="org/m", kv_events_config=given)
     assert rust.default_kv_events_config(args, environ={}) is None
     assert args.kv_events_config is given
-    # vLLM's own dataclass once it is importable.
 
+    # vLLM's own dataclass once vllm.config is importable, in vLLM 0.31's
+    # shape: the typed form carries the same two settings and leaves the rest
+    # (the endpoint among them) at vLLM's defaults.
+    @dataclasses.dataclass
     class KVEventsConfig:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
+        enable_kv_cache_events: bool = False
+        publisher: str | None = None
+        endpoint: str = KV_EVENTS_ENDPOINT
+        replay_endpoint: str | None = None
+        buffer_steps: int = 10_000
+        hwm: int = 100_000
+        max_queue_size: int = 100_000
+        topic: str = ""
+
+        def __post_init__(self):
+            if self.publisher is None:
+                self.publisher = "zmq" if self.enable_kv_cache_events else "null"
 
     _install(monkeypatch, "vllm.config", KVEventsConfig=KVEventsConfig)
     args = argparse.Namespace(model="org/m")
     applied = rust.default_kv_events_config(args, environ={})
-    assert isinstance(applied, KVEventsConfig) and applied.kwargs == expected
+    assert isinstance(applied, KVEventsConfig) and _kv_events(applied) == KV_EVENTS_ON
+    assert applied == KVEventsConfig(enable_kv_cache_events=True, publisher="zmq")
     assert args.kv_events_config is applied
 
 
@@ -1105,7 +1139,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert ns.data_parallel_rpc_port == 24321
     assert ns.data_parallel_size == 2 and ns.data_parallel_size_local == 2
     # No --kv-events-config was given: the engine args and the engine cores
-    # both see the publisher on.
-    kv_events = {"enable_kv_cache_events": True, "publisher": "zmq"}
-    assert recorded["engine_args_from"].kv_events_config == kv_events
-    assert ns.kv_events_config == kv_events
+    # both see the publisher on, in whichever form vllm.config's presence
+    # decides (the typed one in the engine-gated job).
+    assert _kv_events(recorded["engine_args_from"].kv_events_config) == KV_EVENTS_ON
+    assert _kv_events(ns.kv_events_config) == KV_EVENTS_ON
