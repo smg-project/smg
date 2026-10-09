@@ -10,6 +10,7 @@ use smg_data_connector::{
     create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     StorageFactoryConfig,
 };
+use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -551,7 +552,9 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
-            .webrtc_bind_addr(webrtc_bind_addr)
+            .webrtc_bind_addr(
+                webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
+            )
             .webrtc_stun_server(
                 webrtc_stun_server.or_else(|| Some("stun.l.google.com:19302".to_string())),
             )

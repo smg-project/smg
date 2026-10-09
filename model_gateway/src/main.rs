@@ -1355,8 +1355,10 @@ struct CliArgs {
 
     // ==================== WebRTC ====================
     /// Bind address for WebRTC UDP sockets (client-facing ICE candidate IP).
-    /// Default: 0.0.0.0 (auto-detect via routing table).
-    /// Set to 127.0.0.1 for local development on the same machine.
+    /// Default: the unspecified address of `--host`'s family (`::`, dual-stack
+    /// on Linux, for an IPv6 host; `0.0.0.0` otherwise), the candidate IP
+    /// auto-detected via the routing table.
+    /// Set to 127.0.0.1 (or ::1) for local development on the same machine.
     #[arg(long, help_heading = "WebRTC")]
     webrtc_bind_addr: Option<std::net::IpAddr>,
 
