@@ -911,4 +911,27 @@ mod tests {
             tokenizer.encode(text, false).expect("encode").get_ids()
         );
     }
+
+    #[test]
+    fn a_split_pattern_that_can_match_empty_declines_the_tokenizer() {
+        let mut state = 0x2222_3333_4444_5555u64;
+        let base = &shapes()[0];
+        let mut tokenizer = tokenizer_of(base, &mut state);
+        // `\p{N}*` matches empty between letters, and the engine splits there.
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+            split(r"\p{N}*|\s+", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ]))));
+        if let Some(native) = NativeEncoder::from_tokenizer(&tokenizer) {
+            for text in ["ab1", "the same words 12"] {
+                let reference = tokenizer.encode(text, false).expect("encode");
+                assert_eq!(
+                    native.encode(tokenizer.get_model(), text),
+                    Some(reference.get_ids().to_vec()),
+                    "{text:?}"
+                );
+            }
+        }
+        assert!(NativeEncoder::from_tokenizer(&tokenizer).is_none());
+    }
 }

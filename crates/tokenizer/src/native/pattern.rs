@@ -7,8 +7,10 @@
 //! the English clitics, and the lookahead `(?!\S)`. This module parses that
 //! subset and matches it the way the engine behind `tokenizers`' `Split`
 //! does: leftmost-first alternation, greedy quantifiers that back off one
-//! repetition at a time, no empty matches. A pattern that uses anything else
-//! does not parse, and the caller keeps the `tokenizers` pipeline for it.
+//! repetition at a time. The engine also yields empty matches, and `Split`
+//! cuts the text at them; this matcher does not reproduce that, so a pattern
+//! that can match the empty string is declined like everything else outside
+//! the subset, and the caller keeps the `tokenizers` pipeline for it.
 //!
 //! Character categories come from [`super::unicode`], generated from that
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
@@ -137,6 +139,9 @@ impl Pattern {
         };
         let root = parser.parse_alternation()?;
         if parser.chars.next().is_some() {
+            return None;
+        }
+        if can_match_empty(&root) {
             return None;
         }
         Some(Self {
@@ -271,14 +276,32 @@ impl Iterator for Matches<'_, '_> {
                     return Some((start, end));
                 }
                 _ => {
-                    // No match here (an empty one counts as none): move on by
-                    // one character.
+                    // No match starts here: move on by one character. (A
+                    // pattern that can match empty is declined at parse time,
+                    // so an empty match does not occur; it would count as no
+                    // match.)
                     let (_, len) = next_char(self.text, start)?;
                     self.pos = start + len;
                 }
             }
         }
         None
+    }
+}
+
+/// Whether `node` can match the empty string. The engine yields empty
+/// matches (all but one right after the previous match), and `Split` cuts the
+/// text at them: `\p{N}*` over "ab1" gives the pieces "a", "b", "1". This
+/// matcher does not reproduce that, so a pattern whose root can match empty is
+/// declined at parse time and no stage ever sees an empty match.
+fn can_match_empty(node: &Node) -> bool {
+    match node {
+        Node::Class(_) => false,
+        Node::ClassRepeat { min, .. } => *min == 0,
+        Node::Repeat { node, min, .. } => *min == 0 || can_match_empty(node),
+        Node::Concat(nodes) => nodes.iter().all(can_match_empty),
+        Node::Alt(alternatives) => alternatives.iter().any(can_match_empty),
+        Node::NotAhead(_) => true,
     }
 }
 
@@ -790,6 +813,13 @@ mod tests {
             r"(?i:[sdmt]|ll|ve|re)",
             r"(?i:\p{Ll})",
             r"(?i:é)",
+            r"\p{N}*",
+            r"a?",
+            r"(?!\S)",
+            r"\s*|\p{L}+",
+            r"(?:\p{L}+)?",
+            r"a|",
+            r"",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
@@ -855,5 +885,41 @@ mod tests {
         let mixed = "\n".repeat(100_000) + &" ".repeat(100_000) + "x";
         let ours: Vec<(usize, usize)> = parsed.find_iter(&mixed).collect();
         assert_eq!(ours, oracle_matches(QWEN35, &mixed));
+    }
+
+    #[test]
+    fn patterns_that_can_match_empty_are_declined() {
+        // The engine yields empty matches and `Split` cuts the text at them:
+        // `\p{N}*` over "ab1" matches at 0, at 1 and at 2..3, so the pieces
+        // are "a", "b" and "1". A matcher that skipped the empty matches
+        // would give "ab" and "1", and the ids could differ.
+        assert_eq!(
+            oracle_matches(r"\p{N}*", "ab1"),
+            vec![(0, 0), (1, 1), (2, 3)]
+        );
+        for (pattern, text) in [
+            (r"\p{N}*", "ab1"),
+            (r"a?", "ab1"),
+            (r"(?i:'s)?", "x's y"),
+            (r"\s*|\p{L}+", "ab 1"),
+            (r"\p{N}{0,3}", "ab12"),
+            (r"(?!\S)", "a b"),
+            (r"a*b*", "ab1"),
+            (r"(?:\p{L}+)?", "ab 1"),
+            (r"", "ab"),
+            (r"a|", "ab"),
+        ] {
+            if let Some(parsed) = Pattern::parse(pattern) {
+                assert_eq!(
+                    parsed.find_iter(text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, text),
+                    "{pattern:?} is accepted but matches {text:?} differently from the engine"
+                );
+            }
+            assert!(
+                Pattern::parse(pattern).is_none(),
+                "{pattern:?} can match empty and must be declined"
+            );
+        }
     }
 }
