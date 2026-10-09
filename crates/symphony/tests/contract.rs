@@ -30,9 +30,11 @@ use common::{bytes_of, chunkings, delta, prompt};
 use openai_protocol::common::{Function, Tool};
 use serde_json::json as value;
 use symphony::{
-    formats, json::PartialJson, tagged::Spelling, CallSyntax, Declared, DropReason, Engine,
-    EngineFinish, Event, Events, FinishReason, Input, MalformedReason, ParseError, Parser,
-    TokenSpan,
+    formats,
+    json::PartialJson,
+    tagged::{Placement, Spelling},
+    CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason, Input,
+    MalformedReason, ParseError, Parser, TokenSpan,
 };
 
 /// A subject under test: how to make its parser, and the outputs it is checked over.
@@ -51,7 +53,7 @@ fn qwen3() -> Box<dyn Parser> {
 
 fn qwen3_tagged() -> Box<dyn Parser> {
     Box::new(Engine::new(
-        formats::qwen3(CallSyntax::Tagged(Spelling::Json)),
+        formats::qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
         Declared::of(&[Tool {
             tool_type: "function".to_string(),
             function: Function {

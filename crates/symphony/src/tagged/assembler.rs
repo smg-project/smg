@@ -13,10 +13,14 @@
 //! Any other value is pushed whole at its close, because its text has to be read before it is
 //! written. A string that may also be null streams from the first byte that rules null out.
 //!
-//! The template writes one newline after `<parameter=KEY>` and one before `</parameter>`; neither
-//! is the value's, and the assembler takes exactly those two away, as vLLM's parsers do. The
-//! second cannot be told from a newline the value ends with until the closing tag follows it, so a
-//! newline at the end of a streamed piece is held back until the next piece says which it is.
+//! Where a template puts the value on a line of its own ([`Placement::OwnLine`]: Qwen 3.5,
+//! Qwen3-Coder) it writes one newline after `<parameter=KEY>` and one before `</parameter>`;
+//! neither is the value's, and the assembler takes exactly those two away, as vLLM's parsers do.
+//! The second cannot be told from a newline the value ends with until the closing tag follows it,
+//! so a newline at the end of a streamed piece is held back until the next piece says which it is.
+//! Where a template writes the value between the tags directly ([`Placement::Direct`]: Seed-OSS,
+//! MiMo) every byte between them is the value's, a newline it ends with included, and nothing is
+//! taken away: a patch keeps its final newline, and a value that is one newline is one newline.
 //!
 //! Every byte of the call lands in exactly one event. Whitespace between tags is the template's
 //! and goes into the source of the next event: the function tag's into `ToolCallStart`, a
@@ -68,6 +72,21 @@ pub enum Spelling {
     /// Every value as Python's text, an object or a list as its repr: Seed-OSS.
     Python,
 }
+
+/// Where a family's template puts a value between its parameter tags. Qwen 3.5, Qwen3-Coder and
+/// their kin write a newline after `<parameter=KEY>` and one before `</parameter>`, so the value
+/// stands on a line of its own; Seed-OSS and MiMo write it between the tags directly. The
+/// assembler takes the template's two newlines away only where the template writes them, so a
+/// value that ends in a newline, a patch or a file's body, reaches the client whole under either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// On a line of its own: a newline after the opening tag and one before the closing tag,
+    /// neither of them the value's. Qwen 3.5 and later, Qwen3-Coder.
+    OwnLine,
+    /// Between the tags directly, every byte between them the value's: Seed-OSS, MiMo.
+    Direct,
+}
+
 const WITHOUT_A_FUNCTION: &str = "a tool call without a function tag";
 const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
 const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";
@@ -90,6 +109,8 @@ pub struct Assembler {
     /// Members written to the arguments object so far.
     written: u32,
     done: bool,
+    /// Where the template puts a value: whether a newline on either side of it is the template's.
+    placement: Placement,
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +131,8 @@ enum Stage {
 struct ValueState {
     key: String,
     kind: Option<Kind>,
-    /// Whether the newline the template writes after the tag may still come: no value text yet.
+    /// Whether the newline the template writes after the tag may still come: no value text yet,
+    /// under a template that writes one.
     leading: bool,
     mode: Mode,
 }
@@ -128,8 +150,9 @@ enum Mode {
 }
 
 impl Assembler {
-    /// An assembler for the call at `index` with the id the format minted for it.
-    pub fn new(index: u32, id: impl Into<String>) -> Self {
+    /// An assembler for the call at `index` with the id the format minted for it, reading the
+    /// values where the family's template puts them.
+    pub fn new(index: u32, id: impl Into<String>, placement: Placement) -> Self {
         Self {
             index,
             id: id.into(),
@@ -139,6 +162,7 @@ impl Assembler {
             function: None,
             written: 0,
             done: false,
+            placement,
         }
     }
 
@@ -468,7 +492,7 @@ impl Assembler {
         self.stage = Stage::Value(ValueState {
             key,
             kind,
-            leading: true,
+            leading: self.placement == Placement::OwnLine,
             mode,
         });
     }
@@ -533,9 +557,12 @@ impl Assembler {
         self.stream(&arrived, out);
     }
 
-    /// A piece of a streamed string. A newline the piece ends with is held, since it may be the
-    /// template's; a newline held before it turns out to be the value's.
+    /// A piece of a streamed string. Under a template that writes a newline before the closing
+    /// tag, a newline the piece ends with is held, since it may be the template's, and a newline
+    /// held before it turns out to be the value's; under one that writes none, every byte is
+    /// the value's and goes out at once.
     fn stream(&mut self, text: &str, out: &mut Events) {
+        let own_line = self.placement == Placement::OwnLine;
         let Stage::Value(ValueState {
             mode: Mode::Streaming { held_newline },
             ..
@@ -545,8 +572,8 @@ impl Assembler {
         };
         let had_newline = *held_newline;
         let (body, ends_with_newline) = match text.strip_suffix('\n') {
-            Some(body) => (body, true),
-            None => (text, false),
+            Some(body) if own_line => (body, true),
+            _ => (text, false),
         };
         *held_newline = ends_with_newline;
         if body.is_empty() && !had_newline {
@@ -594,10 +621,13 @@ impl Assembler {
     }
 
     /// The text of a value written whole: what came after the tag and its newline, less the
-    /// newline the template writes before `</parameter>`.
+    /// newline the template writes before `</parameter>`, where the template writes one.
     fn whole_text(&self, start: usize) -> &str {
         let text = &self.carried[start..];
-        text.strip_suffix('\n').unwrap_or(text)
+        match self.placement {
+            Placement::OwnLine => text.strip_suffix('\n').unwrap_or(text),
+            Placement::Direct => text,
+        }
     }
 
     /// `, ` before every member but the first, which opens the object.
@@ -684,11 +714,15 @@ mod tests {
     );
     const CALL_ARGUMENTS: &str = r#"{"city": "Paris", "limit": 5, "note": "No rain"}"#;
 
-    /// Feeds the pieces, then the ending asked for, and returns the events with how many bytes
-    /// each feed took.
-    fn run(pieces: &[&str], ending: fn(Assembler, &mut Events)) -> (Vec<Event>, Vec<usize>) {
+    /// Feeds the pieces to an assembler reading values at `placement`, then the ending asked
+    /// for, and returns the events with how many bytes each feed took.
+    fn run(
+        pieces: &[&str],
+        placement: Placement,
+        ending: fn(Assembler, &mut Events),
+    ) -> (Vec<Event>, Vec<usize>) {
         let declared = declared();
-        let mut assembler = Assembler::new(0, "call_0");
+        let mut assembler = Assembler::new(0, "call_0", placement);
         let mut out = Events::new();
         let mut taken = Vec::new();
         for piece in pieces {
@@ -698,12 +732,18 @@ mod tests {
         (out.drain(), taken)
     }
 
+    /// The values on a line of their own, Qwen 3.5's way, and the stream cut at the end.
     fn finished(pieces: &[&str]) -> Vec<Event> {
-        run(pieces, Assembler::finish).0
+        run(pieces, Placement::OwnLine, Assembler::finish).0
+    }
+
+    /// The values between the tags directly, Seed-OSS's and MiMo's way, and the stream cut.
+    fn finished_direct(pieces: &[&str]) -> Vec<Event> {
+        run(pieces, Placement::Direct, Assembler::finish).0
     }
 
     fn closed(pieces: &[&str]) -> Vec<Event> {
-        run(pieces, Assembler::close).0
+        run(pieces, Placement::OwnLine, Assembler::close).0
     }
 
     /// The arguments as the client sees them: every fragment, concatenated.
@@ -794,7 +834,7 @@ mod tests {
 
     #[test]
     fn a_call_streams_its_strings_and_writes_its_integer_at_the_close() {
-        let (events, taken) = run(&[CALL], Assembler::finish);
+        let (events, taken) = run(&[CALL], Placement::OwnLine, Assembler::finish);
         assert_eq!(
             events,
             vec![
@@ -826,7 +866,11 @@ mod tests {
             if !CALL.is_char_boundary(cut) {
                 continue;
             }
-            let (events, taken) = run(&[&CALL[..cut], &CALL[cut..]], Assembler::finish);
+            let (events, taken) = run(
+                &[&CALL[..cut], &CALL[cut..]],
+                Placement::OwnLine,
+                Assembler::finish,
+            );
             assert_eq!(arguments(&events), CALL_ARGUMENTS, "cut at {cut}");
             assert_eq!(bytes(&events), CALL, "cut at {cut}");
             assert_eq!(name_of(&events), Some("f"), "cut at {cut}");
@@ -839,7 +883,7 @@ mod tests {
             .char_indices()
             .map(|(at, c)| &CALL[at..at + c.len_utf8()])
             .collect();
-        let (events, _) = run(&pieces, Assembler::finish);
+        let (events, _) = run(&pieces, Placement::OwnLine, Assembler::finish);
         assert_eq!(arguments(&events), CALL_ARGUMENTS);
         assert_eq!(bytes(&events), CALL);
         nothing_empty(&events);
@@ -901,7 +945,7 @@ mod tests {
             },
         }]);
         let call = "<function=f>\n<parameter=metrics>\n[]\n</parameter>\n</function>";
-        let mut assembler = Assembler::new(0, "call_0");
+        let mut assembler = Assembler::new(0, "call_0", Placement::OwnLine);
         let mut out = Events::new();
         assembler.feed(call, &declared, &mut out);
         assembler.finish(&mut out);
@@ -1029,7 +1073,7 @@ mod tests {
     #[test]
     fn bytes_after_the_function_close_are_not_taken() {
         let declared = declared();
-        let mut assembler = Assembler::new(3, "call_3");
+        let mut assembler = Assembler::new(3, "call_3", Placement::OwnLine);
         let mut out = Events::new();
         let piece = "<function=f>\n</function>\n</tool_call>more";
         let taken = assembler.feed(piece, &declared, &mut out);
@@ -1106,7 +1150,11 @@ mod tests {
     #[test]
     fn a_tag_inside_a_name_cuts_the_name_short() {
         // `</function>` inside the function's name ends the block, which named no function.
-        let (events, taken) = run(&["<function=f</function>rest"], Assembler::finish);
+        let (events, taken) = run(
+            &["<function=f</function>rest"],
+            Placement::OwnLine,
+            Assembler::finish,
+        );
         assert_eq!(name_of(&events), None);
         assert_eq!(
             malformed(&events),
@@ -1315,7 +1363,11 @@ mod tests {
         );
         assert_eq!(ends(&events), 0);
         // `</function>` with no function open ends the block as one that named none.
-        let (events, taken) = run(&["\nx</function>rest"], Assembler::finish);
+        let (events, taken) = run(
+            &["\nx</function>rest"],
+            Placement::OwnLine,
+            Assembler::finish,
+        );
         assert_eq!(
             malformed(&events),
             vec![
@@ -1418,5 +1470,63 @@ mod tests {
                 end("</function>"),
             ]
         );
+    }
+
+    #[test]
+    fn a_value_written_between_the_tags_directly_keeps_every_byte_newlines_included() {
+        // Seed-OSS's and MiMo's templates write `<parameter=KEY>`, the value and `</parameter>`
+        // with no newline of their own, so a newline the value ends with is the value's:
+        // bellwether's swebench call cases, whose patch ends in one, came back a byte short under
+        // the Qwen 3.5 reading (smg-lab #110).
+        let call = concat!(
+            "<function=f>\n<parameter=city>diff --git a/x b/x\n+line\n</parameter>\n",
+            "<parameter=note>  spaced  </parameter>\n<parameter=limit>5\n</parameter>\n",
+            "<parameter=extra>x\n</parameter>\n</function>"
+        );
+        let expected = concat!(
+            r#"{"city": "diff --git a/x b/x\n+line\n", "note": "  spaced  ", "limit": 5, "#,
+            r#""extra": "x\n"}"#
+        );
+        let events = finished_direct(&[call]);
+        assert_eq!(arguments(&events), expected);
+        assert_eq!(bytes(&events), call);
+        assert!(malformed(&events).is_empty());
+        // The same at every two-way cut: no newline is held back, since none is the template's.
+        for cut in 1..call.len() {
+            let (events, taken) = run(
+                &[&call[..cut], &call[cut..]],
+                Placement::Direct,
+                Assembler::finish,
+            );
+            assert_eq!(arguments(&events), expected, "cut at {cut}");
+            assert_eq!(bytes(&events), call, "cut at {cut}");
+            assert_eq!(taken.iter().sum::<usize>(), call.len(), "cut at {cut}");
+            nothing_empty(&events);
+        }
+        // A value of one newline is one newline, of two is two, of nothing is nothing, and a
+        // newline at the start is the value's too; under the own-line placement the same values
+        // stand between the template's two newlines.
+        for (value, json) in [
+            ("\n", r#""\n""#),
+            ("\n\n", r#""\n\n""#),
+            ("", r#""""#),
+            ("\nlead", r#""\nlead""#),
+            ("trail\n", r#""trail\n""#),
+            ("a  ", r#""a  ""#),
+        ] {
+            let direct = format!("<function=f>\n<parameter=city>{value}</parameter>\n</function>");
+            assert_eq!(
+                arguments(&finished_direct(&[&direct])),
+                format!("{{\"city\": {json}}}"),
+                "{value:?} between the tags directly"
+            );
+            let own_line =
+                format!("<function=f>\n<parameter=city>\n{value}\n</parameter>\n</function>");
+            assert_eq!(
+                arguments(&finished(&[&own_line])),
+                format!("{{\"city\": {json}}}"),
+                "{value:?} on a line of its own"
+            );
+        }
     }
 }

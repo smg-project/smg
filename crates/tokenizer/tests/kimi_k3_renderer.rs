@@ -229,13 +229,14 @@ fn tokenizer_loads_and_renders_k3_without_chat_template() {
 }
 
 /// The K3 encoder coerces tool-call `arguments` itself, so the gateway must
-/// forward them as written.
+/// forward them as written; the engine's own server rewrites `enable_thinking`
+/// into the encoder's `thinking`, so the alias is declared as well.
 #[test]
 fn k3_tokenizer_reports_raw_tool_call_arguments() {
     let (_dir, tok) = k3_tokenizer_without_chat_template();
     let caps = tok.renderer_capabilities();
     assert!(caps.raw_tool_call_arguments, "{caps:?}");
-    assert!(!caps.enable_thinking_alias, "{caps:?}");
+    assert!(caps.enable_thinking_alias, "{caps:?}");
     assert!(!caps.native_assistant_continuation, "{caps:?}");
 }
 

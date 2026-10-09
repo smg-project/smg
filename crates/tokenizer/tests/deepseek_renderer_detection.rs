@@ -101,9 +101,27 @@ mod tests {
             ..Default::default()
         };
         let out = tokenizer.apply_chat_template(&messages, params).unwrap();
-        // V4 emits BOS + <｜User｜>Hello<｜Assistant｜></think> in chat mode.
-        assert!(out.contains("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>"));
+        // V4 renders the engine's default: BOS, the `high` effort preamble,
+        // <｜User｜>Hello<｜Assistant｜><think> (thinking mode).
+        assert!(
+            out.starts_with("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>Reasoning Effort:")
+        );
         assert!(out.contains("<\u{FF5C}User\u{FF5C}>Hello<\u{FF5C}Assistant\u{FF5C}>"));
+        assert!(out.ends_with("<think>"));
+        // `thinking: false` is chat mode: no preamble, `</think>` closed.
+        let kwargs = HashMap::from([("thinking".to_string(), json!(false))]);
+        let out = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    template_kwargs: Some(&kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.starts_with(
+            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}User\u{FF5C}>Hello"
+        ));
         assert!(out.ends_with("</think>"));
     }
 
@@ -233,14 +251,18 @@ mod tests {
         // V3.2 / V4 inject `<think>` in the prefill when thinking is on, and
         // gate thinking on the `thinking` kwarg. The trait methods must
         // surface this so the gateway can call `mark_reasoning_started` on
-        // the conditional reasoning parser (deepseek_v31 etc).
-        for arch in &["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"] {
+        // the conditional reasoning parser (deepseek_v31 etc). V3.2 defaults
+        // thinking off; V4 defaults it on like the engine's own server.
+        for (arch, toggle) in &[
+            ("DeepseekV32ForCausalLM", ThinkingToggle::DefaultOff),
+            ("DeepseekV4ForCausalLM", ThinkingToggle::DefaultOn),
+        ] {
             let (_tmp, tok) = write_dir(Some(&[*arch]));
             let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
             assert_eq!(
                 tokenizer.thinking_toggle(),
-                ThinkingToggle::DefaultOff,
-                "{arch}: expected DefaultOff toggle"
+                *toggle,
+                "{arch}: unexpected thinking toggle"
             );
             assert_eq!(
                 tokenizer.thinking_key_name(),
@@ -255,48 +277,169 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_renderers_honor_thinking_kwarg_only() {
+    fn deepseek_v32_renderer_honors_thinking_kwarg_only() {
         // `thinking: true` → prompt ends with <think> (thinking mode).
         // `enable_thinking: true` alone → ignored (chat mode), matching
         // `thinking_key_name() == Some(Thinking)` and sglang's DeepSeek path.
-        for arch in &["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"] {
-            let (_tmp, tok) = write_dir(Some(&[*arch]));
-            let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-            let messages = vec![json!({ "role": "user", "content": "Hi" })];
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV32ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hi" })];
 
-            let mut thinking_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
-            thinking_kwargs.insert("thinking".to_string(), serde_json::Value::Bool(true));
-            let out_thinking = tokenizer
-                .apply_chat_template(
-                    &messages,
-                    ChatTemplateParams {
-                        template_kwargs: Some(&thinking_kwargs),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            assert!(
-                out_thinking.ends_with("<think>"),
-                "{arch}: thinking=true should enter thinking mode: {out_thinking}"
-            );
+        let mut thinking_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
+        thinking_kwargs.insert("thinking".to_string(), serde_json::Value::Bool(true));
+        let out_thinking = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    template_kwargs: Some(&thinking_kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            out_thinking.ends_with("<think>"),
+            "thinking=true should enter thinking mode: {out_thinking}"
+        );
 
-            let mut enable_thinking_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
-            enable_thinking_kwargs
-                .insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
-            let out_enable = tokenizer
-                .apply_chat_template(
-                    &messages,
-                    ChatTemplateParams {
-                        template_kwargs: Some(&enable_thinking_kwargs),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            assert!(
-                out_enable.ends_with("</think>"),
-                "{arch}: enable_thinking alone must NOT enter thinking mode: {out_enable}"
-            );
+        let mut enable_thinking_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
+        enable_thinking_kwargs.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+        let out_enable = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    template_kwargs: Some(&enable_thinking_kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            out_enable.ends_with("</think>"),
+            "enable_thinking alone must NOT enter thinking mode: {out_enable}"
+        );
+    }
+
+    /// Render a V4 request the way the gateway's chat path does: the top-level
+    /// `reasoning_effort` projected into the template kwargs under the
+    /// request's own `chat_template_kwargs`, and into the protocol thinking
+    /// preference (`none`/`minimal` off, a level no opinion).
+    fn render_v4(
+        tokenizer: &HuggingFaceTokenizer,
+        chat_template_kwargs: Option<&HashMap<String, serde_json::Value>>,
+        reasoning_effort: Option<&str>,
+    ) -> String {
+        let messages = vec![json!({ "role": "user", "content": "Hi" })];
+        let mut kwargs: HashMap<String, serde_json::Value> = HashMap::new();
+        if let Some(effort) = reasoning_effort {
+            kwargs.insert("reasoning_effort".to_string(), json!(effort));
         }
+        if let Some(explicit) = chat_template_kwargs {
+            kwargs.extend(explicit.clone());
+        }
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            template_kwargs: (!kwargs.is_empty()).then_some(&kwargs),
+            thinking: openai_protocol::chat::thinking_from_reasoning_effort(reasoning_effort),
+            ..Default::default()
+        };
+        tokenizer.apply_chat_template(&messages, params).unwrap()
+    }
+
+    const V4_HIGH_PREFIX: &str = "Reasoning Effort: Absolute maximum";
+    const V4_MAX_PREFIX: &str = "Reasoning Effort: Beyond maximum";
+
+    #[test]
+    fn deepseek_v4_defaults_to_thinking_with_the_engines_effort() {
+        // A plain request renders what the engine's own server renders:
+        // thinking mode with the `high` effort prompt.
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let out = render_v4(&tokenizer, None, None);
+        assert!(out.ends_with("<think>"), "{out}");
+        assert!(out.contains(V4_HIGH_PREFIX), "{out}");
+        assert_eq!(
+            tokenizer.native_reasoning_effort_off_values(),
+            &["none"],
+            "the gateway disarms the reasoning parser on the renderer's off word"
+        );
+        assert!(tokenizer.renderer_capabilities().enable_thinking_alias);
+    }
+
+    #[test]
+    fn deepseek_v4_thinking_switches_off_like_the_engine() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let chat = "<｜User｜>Hi<｜Assistant｜></think>";
+        // `thinking: false`, vLLM's `enable_thinking: false` alias and
+        // `reasoning_effort: "none"` (kwarg or top-level) render chat mode
+        // without any effort prefix.
+        for kwargs in [
+            HashMap::from([("thinking".to_string(), json!(false))]),
+            HashMap::from([("enable_thinking".to_string(), json!(false))]),
+            HashMap::from([("reasoning_effort".to_string(), json!("none"))]),
+            HashMap::from([
+                ("thinking".to_string(), json!(false)),
+                ("reasoning_effort".to_string(), json!("max")),
+            ]),
+        ] {
+            let out = render_v4(&tokenizer, Some(&kwargs), None);
+            assert!(out.ends_with(chat), "{kwargs:?}: {out}");
+            assert!(!out.contains("Reasoning Effort"), "{kwargs:?}: {out}");
+        }
+        let out = render_v4(&tokenizer, None, Some("none"));
+        assert!(out.ends_with(chat), "{out}");
+        assert!(!out.contains("Reasoning Effort"), "{out}");
+        // The typed `thinking.type: disabled` toggle arrives as `params.thinking`.
+        let messages = vec![json!({ "role": "user", "content": "Hi" })];
+        let out = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    add_generation_prompt: true,
+                    thinking: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.ends_with(chat), "{out}");
+        // The explicit toggle wins over the protocol preference, as it does
+        // when the gateway arms the parser.
+        let kwargs = HashMap::from([("thinking".to_string(), json!(true))]);
+        let out = render_v4(&tokenizer, Some(&kwargs), Some("minimal"));
+        assert!(out.ends_with("<think>"), "{out}");
+    }
+
+    #[test]
+    fn deepseek_v4_maps_reasoning_effort_like_the_engine() {
+        // vLLM's mapping of the kwarg: `max` the top level, `low`/`minimal`/
+        // `medium` the bottom one (no prefix), everything else `high`; the
+        // top-level field counts the same as the kwarg.
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        for (effort, prefix) in [
+            ("max", Some(V4_MAX_PREFIX)),
+            ("high", Some(V4_HIGH_PREFIX)),
+            ("xhigh", Some(V4_HIGH_PREFIX)),
+            ("medium", None),
+            ("minimal", None),
+            ("low", None),
+        ] {
+            let kwargs = HashMap::from([("reasoning_effort".to_string(), json!(effort))]);
+            for out in [
+                render_v4(&tokenizer, Some(&kwargs), None),
+                render_v4(&tokenizer, None, Some(effort)),
+            ] {
+                assert!(out.ends_with("<think>"), "{effort}: {out}");
+                match prefix {
+                    Some(prefix) => assert!(out.contains(prefix), "{effort}: {out}"),
+                    None => assert!(!out.contains("Reasoning Effort"), "{effort}: {out}"),
+                }
+            }
+        }
+        // An explicit kwarg wins over the top-level field, as everywhere else
+        // in the gateway.
+        let kwargs = HashMap::from([("reasoning_effort".to_string(), json!("low"))]);
+        let out = render_v4(&tokenizer, Some(&kwargs), Some("max"));
+        assert!(!out.contains("Reasoning Effort"), "{out}");
     }
 
     #[test]
@@ -316,8 +459,8 @@ mod tests {
         };
         let out = tokenizer.apply_chat_template(&messages, params).unwrap();
         assert!(
-            out.contains("Reasoning Effort: Absolute maximum"),
-            "expected reasoning-effort prefix in V4 output"
+            out.contains(V4_MAX_PREFIX),
+            "expected the engine's max effort prefix in V4 output: {out}"
         );
         assert!(
             out.ends_with("<think>"),
@@ -371,8 +514,8 @@ mod tests {
         let out = render_with_native_effort(&tokenizer, "max").unwrap();
         assert!(out.contains("Reasoning Effort: Beyond maximum"), "{out}");
 
-        // 0731 dir name + base encoder -> original encoding, where `low`
-        // doesn't exist and is ignored (no thinking, no prefix).
+        // 0731 dir name + base encoder -> original encoding, where `max` is
+        // the only level with a prompt; `low` is thinking mode without one.
         let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", Some(BASE_ENCODER_SNIPPET));
         let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
         let out = render_with_native_effort(&tokenizer, "max").unwrap();
@@ -380,32 +523,38 @@ mod tests {
         assert!(!out.contains("Beyond maximum"), "{out}");
         let out = render_with_native_effort(&tokenizer, "low").unwrap();
         assert!(!out.contains("Reasoning Effort:"), "{out}");
-        assert!(out.ends_with("</think>"), "{out}");
+        assert!(out.ends_with("<think>"), "{out}");
     }
 
     #[test]
-    fn missing_encoder_falls_back_to_dir_name() {
-        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", None);
-        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-        let out = render_with_native_effort(&tokenizer, "max").unwrap();
-        assert!(out.contains("Reasoning Effort: Beyond maximum"), "{out}");
-
-        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash", None);
-        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-        let out = render_with_native_effort(&tokenizer, "max").unwrap();
-        assert!(out.contains("Reasoning Effort: Absolute maximum"), "{out}");
-        assert!(!out.contains("Beyond maximum"), "{out}");
+    fn missing_encoder_renders_the_engines_effort_table() {
+        // Without the checkpoint's encoder (a tokenizer directory streamed from
+        // a worker has none), whatever the directory is called, the effort
+        // table is the one vLLM's port renders for every V4 checkpoint.
+        for name in ["DeepSeek-V4-Flash-0731", "DeepSeek-V4-Flash", "tmp8f2k1"] {
+            let (_tmp, tok) = write_v4_model_dir(name, None);
+            let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+            let out = render_with_native_effort(&tokenizer, "max").unwrap();
+            assert!(out.contains(V4_MAX_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "high").unwrap();
+            assert!(out.contains(V4_HIGH_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "low").unwrap();
+            assert!(!out.contains("Reasoning Effort:"), "{name}: {out}");
+            assert!(out.ends_with("<think>"), "{name}: {out}");
+        }
     }
 
     #[test]
-    fn unrecognized_native_effort_is_ignored() {
-        // The renderer owns interpretation; values outside the revision's set
-        // (including merged public efforts like "medium") render chat mode.
+    fn merged_public_effort_levels_render_thinking_without_a_prefix() {
+        // `medium` and `minimal` are the bottom level to the engine: thinking
+        // mode, no effort prompt.
         let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", None);
         let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-        let out = render_with_native_effort(&tokenizer, "medium").unwrap();
-        assert!(!out.contains("Reasoning Effort:"), "{out}");
-        assert!(out.ends_with("</think>"), "{out}");
+        for effort in ["medium", "minimal"] {
+            let out = render_with_native_effort(&tokenizer, effort).unwrap();
+            assert!(!out.contains("Reasoning Effort:"), "{effort}: {out}");
+            assert!(out.ends_with("<think>"), "{effort}: {out}");
+        }
     }
 
     #[test]

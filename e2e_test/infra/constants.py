@@ -369,10 +369,30 @@ ENV_SHOW_ROUTER_LOGS = "SHOW_ROUTER_LOGS"
 ENV_SHOW_WORKER_LOGS = "SHOW_WORKER_LOGS"
 
 # Network
-DEFAULT_HOST = "127.0.0.1"
+ENV_HOST = "E2E_HOST"  # The loopback the lane binds and dials — see default_host
+
+
+def default_host() -> str:
+    """The loopback the harness binds gateways and workers to and dials them at.
+
+    ``127.0.0.1`` unless ``E2E_HOST`` names another address; ``E2E_HOST=::1`` runs
+    a lane over IPv6 (bare literal, no brackets: it is passed to ``--host`` flags
+    as is, and every URL goes through :func:`host_port`).
+    """
+    return os.environ.get(ENV_HOST, "").strip() or "127.0.0.1"
+
+
+def host_port(host: str, port: int | str) -> str:
+    """``host:port`` for a URL or a dial string: an IPv6 literal goes in brackets."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+DEFAULT_HOST = default_host()
 BRAVE_MCP_PORT = int(os.environ.get("BRAVE_MCP_PORT") or 8080)
 BRAVE_MCP_HOST = os.environ.get("BRAVE_MCP_HOST") or DEFAULT_HOST
-BRAVE_MCP_URL = f"http://{BRAVE_MCP_HOST}:{BRAVE_MCP_PORT}/mcp"
+BRAVE_MCP_URL = f"http://{host_port(BRAVE_MCP_HOST, BRAVE_MCP_PORT)}/mcp"
 
 # In-process mock MCP server (see infra/mock_mcp_server.py). Bound to localhost
 # on an auto-allocated port; host is exposed as a constant so tests and

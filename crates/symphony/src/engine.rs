@@ -118,7 +118,9 @@ impl Call {
             // `None` is unreachable: `Format::validate`, run by `Engine::new`, refuses a table
             // with an arguments state and no call syntax. The arm keeps the match total.
             Some(CallSyntax::Json) | None => Self::Json(json::Assembler::new(index, id)),
-            Some(CallSyntax::Tagged(_)) => Self::Tagged(tagged::Assembler::new(index, id)),
+            Some(CallSyntax::Tagged(_, placement)) => {
+                Self::Tagged(tagged::Assembler::new(index, id, placement))
+            }
             Some(CallSyntax::Dsml) => Self::Dsml(tagged::dsml::Assembler::new(index, id)),
             Some(CallSyntax::Keyed(tags)) => {
                 Self::Keyed(tagged::keyed::Assembler::new(index, id, tags))

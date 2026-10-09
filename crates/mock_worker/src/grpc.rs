@@ -2,7 +2,6 @@
 //! tokenizes and sends token ids; this service streams back canned token ids.
 
 use std::{
-    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -32,17 +31,11 @@ use crate::{
 
 /// Serve the mock TokenSpeed gRPC service on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
-    let ip = match host.parse::<IpAddr>() {
-        Ok(ip) => ip,
-        Err(e) => {
-            tracing::error!("grpc worker host {host} invalid: {e}");
-            return;
-        }
-    };
-    let listener = match TcpListener::bind(SocketAddr::new(ip, port)).await {
+    // What the HTTP listener accepts: a bare IP of either family or a name.
+    let listener = match TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => {
-            tracing::error!("grpc worker {port} failed to bind: {e}");
+            tracing::error!("grpc worker bind {host}:{port} failed: {e}");
             return;
         }
     };

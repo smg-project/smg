@@ -39,8 +39,10 @@ hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "ru
 minijinja = { version = "=2.24.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
 rayon = "1.12"
+thread_local = "1.1"
 tiktoken-rs = "0.12"
 tokenizers = "0.23.1"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 criterion = "0.8"
@@ -64,3 +66,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "encode_cost"
+harness = false

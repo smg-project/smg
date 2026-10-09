@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::BufMut;
+use futures::{stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use llm_tokenizer::{traits::Encoding, SpecialTokens};
@@ -13,7 +14,7 @@ use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
     VllmEngineClient,
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
 use tool_parser::types::ToolCallItem;
 
@@ -122,14 +123,92 @@ pub(super) fn complete_with_prompt(
 
 /// The mock server accepts the client connection. This test supplies the
 /// response frames and controls EOF.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "bounded test fixture; server task is explicitly aborted"
-)]
 pub(super) async fn scripted_stream(
     responses: Vec<proto::GenerateResponse>,
     grpc_status: &'static str,
 ) -> (ProtoStream, JoinHandle<()>) {
+    let frames: Vec<Result<Frame<Bytes>, tonic::Status>> = responses
+        .iter()
+        .map(|response| Ok(data_frame(response)))
+        .chain(std::iter::once(Ok(trailers_frame(grpc_status))))
+        .collect();
+    let (client, server) = mock_client().await;
+    let stream = response_stream(stream::iter(frames), client);
+    (stream, server)
+}
+
+/// [`scripted_stream`] with the frames after `first` held back until `gate`
+/// fires: the processor sees the first engine output on its own.
+pub(super) async fn gated_stream(
+    first: Vec<proto::GenerateResponse>,
+    gate: oneshot::Receiver<()>,
+    rest: Vec<proto::GenerateResponse>,
+    grpc_status: &'static str,
+) -> (ProtoStream, JoinHandle<()>) {
+    let head: Vec<Result<Frame<Bytes>, tonic::Status>> = first
+        .iter()
+        .map(|response| Ok(data_frame(response)))
+        .collect();
+    let tail: Vec<Result<Frame<Bytes>, tonic::Status>> = rest
+        .iter()
+        .map(|response| Ok(data_frame(response)))
+        .chain(std::iter::once(Ok(trailers_frame(grpc_status))))
+        .collect();
+    let (client, server) = mock_client().await;
+    let gated = stream::once(async move {
+        let _ = gate.await;
+        stream::iter(tail)
+    })
+    .flatten();
+    let stream = response_stream(stream::iter(head).chain(gated), client);
+    (stream, server)
+}
+
+/// One length-prefixed gRPC data frame carrying `response`.
+fn data_frame(response: &proto::GenerateResponse) -> Frame<Bytes> {
+    let encoded = response.encode_to_vec();
+    let mut frame = Vec::with_capacity(encoded.len() + 5);
+    frame.put_u8(0);
+    frame.put_u32(encoded.len() as u32);
+    frame.extend_from_slice(&encoded);
+    Frame::data(Bytes::from(frame))
+}
+
+/// The trailers frame that ends a gRPC response with `grpc_status`.
+fn trailers_frame(grpc_status: &'static str) -> Frame<Bytes> {
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static(grpc_status));
+    Frame::trailers(trailers)
+}
+
+/// A decoded response stream over `body`, owned by `client` as a worker
+/// stream that was never dispatched (nothing to cancel on drop).
+fn response_stream<S>(body: S, client: VllmEngineClient) -> ProtoStream
+where
+    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+{
+    let mut codec =
+        tonic_prost::ProstCodec::<proto::GenerateResponse, proto::GenerateResponse>::default();
+    let stream = tonic::Streaming::new_response(
+        codec.decoder(),
+        StreamBody::new(body),
+        StatusCode::OK,
+        None,
+        None,
+    );
+    let stream = AbortOnDropStream::new(stream, "eof-test".to_string(), client);
+    // No generation was sent to the mock, so there is nothing to cancel.
+    stream.mark_completed();
+    ProtoStream::Vllm(stream)
+}
+
+/// The mock worker a test's client connects to. The test supplies the
+/// response frames itself; the server only accepts the connection.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded test fixture; server task is explicitly aborted"
+)]
+async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock worker");
@@ -157,31 +236,7 @@ pub(super) async fn scripted_stream(
     let client = VllmEngineClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
         .expect("connect mock worker");
-    let mut frames = Vec::new();
-    for response in responses {
-        let encoded = response.encode_to_vec();
-        let mut frame = Vec::with_capacity(encoded.len() + 5);
-        frame.put_u8(0);
-        frame.put_u32(encoded.len() as u32);
-        frame.extend_from_slice(&encoded);
-        frames.push(Ok::<_, tonic::Status>(Frame::data(Bytes::from(frame))));
-    }
-    let mut trailers = HeaderMap::new();
-    trailers.insert("grpc-status", HeaderValue::from_static(grpc_status));
-    frames.push(Ok(Frame::trailers(trailers)));
-    let mut codec =
-        tonic_prost::ProstCodec::<proto::GenerateResponse, proto::GenerateResponse>::default();
-    let stream = tonic::Streaming::new_response(
-        codec.decoder(),
-        StreamBody::new(futures::stream::iter(frames)),
-        StatusCode::OK,
-        None,
-        None,
-    );
-    let stream = AbortOnDropStream::new(stream, "eof-test".to_string(), client);
-    // No generation was sent to the mock, so there is nothing to cancel.
-    stream.mark_completed();
-    (ProtoStream::Vllm(stream), server)
+    (client, server)
 }
 
 pub(super) fn processor(with_tools: bool) -> StreamingProcessor {
@@ -273,6 +328,57 @@ fn chat_text(events: &[Value], index: u32, field: &str) -> String {
             }
         })
         .collect()
+}
+
+#[tokio::test]
+async fn chat_role_chunk_goes_out_on_the_first_engine_output() {
+    // The engine's first output carries nothing visible (as a special token the
+    // decoder skips does); the first visible text is held back behind the gate.
+    let (gate_tx, gate_rx) = oneshot::channel();
+    let (stream, server) = gated_stream(
+        vec![chunk(0, "")],
+        gate_rx,
+        vec![chunk(0, "hi"), complete(0, "stop")],
+        "0",
+    )
+    .await;
+    let (tx, mut rx) = sse_channel();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounded test fixture; the task ends with the stream"
+    )]
+    let task = tokio::spawn(async move {
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                chat_spec(false),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        result
+    });
+    // The role chunk opens the choice on the engine's first output, not on
+    // its first visible text one step later.
+    let first = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("the role chunk arrives before any visible text")
+        .expect("stream open")
+        .expect("successful SSE write");
+    let text = std::str::from_utf8(&first).expect("UTF-8 SSE");
+    let data = text.trim().strip_prefix("data: ").expect("SSE data line");
+    let event: Value = serde_json::from_str(data).expect("SSE JSON");
+    assert_eq!(event["choices"][0]["delta"]["role"], "assistant");
+    assert!(event["choices"][0]["delta"]["content"].is_null());
+    gate_tx.send(()).expect("open the gate");
+    let events = collect_events(rx).await;
+    task.await.expect("stream task").expect("stream processed");
+    assert_eq!(chat_text(&events, 0, "content"), "hi");
+    server.abort();
 }
 
 #[tokio::test]

@@ -4023,11 +4023,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "thread_local",
  "tiktoken-rs",
  "tokenizers",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 

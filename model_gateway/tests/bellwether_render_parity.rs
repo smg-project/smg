@@ -706,14 +706,19 @@ fn recorded_with(provenance: &Value) -> String {
         .to_string()
 }
 
+/// The vocabulary files a checkpoint may ship, in the order they are tried:
+/// a `tokenizers` file, or the `vocab.json` + `merges.txt` pair of the models
+/// that have no `tokenizer.json` (Qwen3-Omni), which counts only whole.
+const VOCABULARIES: [&[&str]; 2] = [&["tokenizer.json"], &["vocab.json", "merges.txt"]];
+
 /// The checkpoint's tokenizer files at the manifest's revision: the Hugging
 /// Face cache snapshot when it is there, else a one-time download of the files
-/// the tokenizer and the renderer read: `tokenizer.json`,
-/// `tokenizer_config.json`, the separate chat template files a checkpoint may
-/// ship instead of a template inside the config, and `config.json` for
-/// renderer detection. Only the first two must exist. A download is written
-/// beside its name and renamed into place, so an interrupted write never
-/// leaves a short file the next run would trust.
+/// the tokenizer and the renderer read: `tokenizer_config.json`, the separate
+/// chat template files a checkpoint may ship instead of a template inside the
+/// config, `config.json` for renderer detection, and the first of
+/// [`VOCABULARIES`] the checkpoint serves whole. A download is written beside
+/// its name and renamed into place, so an interrupted write never leaves a
+/// short file the next run would trust.
 fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, String> {
     if let Some(snapshot) = hf_cache_snapshot(model, revision) {
         return Ok(snapshot);
@@ -721,41 +726,77 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let client = reqwest::blocking::Client::new();
-    for (file, min_bytes, required) in [
-        ("tokenizer.json", 100_000usize, true),
-        ("tokenizer_config.json", 100, true),
-        ("chat_template.jinja", 1, false),
-        ("chat_template.json", 1, false),
-        ("config.json", 50, false),
+    download(&client, model, revision, &dir, "tokenizer_config.json", 100)?
+        .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
+    for (file, min_bytes) in [
+        ("chat_template.jinja", 1),
+        ("chat_template.json", 1),
+        ("config.json", 50),
     ] {
-        let path = dir.join(file);
-        if path.is_file() {
-            continue;
-        }
-        let url = format!("https://huggingface.co/{model}/resolve/{revision}/{file}");
-        let response = client
-            .get(&url)
-            .send()
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND && !required {
-            continue;
-        }
-        if !response.status().is_success() {
-            return Err(format!("GET {url}: HTTP {}", response.status()));
-        }
-        let bytes = response.bytes().map_err(|e| format!("GET {url}: {e}"))?;
-        if bytes.len() < min_bytes {
-            return Err(format!(
-                "{url}: {} bytes, expected at least {min_bytes}",
-                bytes.len()
-            ));
-        }
-        let part = dir.join(format!("{file}.part"));
-        fs::write(&part, &bytes).map_err(|e| format!("cannot write {}: {e}", part.display()))?;
-        fs::rename(&part, &path)
-            .map_err(|e| format!("cannot rename {} into place: {e}", part.display()))?;
+        download(&client, model, revision, &dir, file, min_bytes)?;
     }
+    let mut vocabulary = None;
+    for files in VOCABULARIES {
+        let mut whole = true;
+        for file in files {
+            whole &= download(&client, model, revision, &dir, file, 100_000)?.is_some();
+        }
+        if whole {
+            vocabulary = Some(files);
+            break;
+        }
+    }
+    vocabulary.ok_or_else(|| format!("{model} at {revision} serves none of {}", vocabularies()))?;
     Ok(dir)
+}
+
+/// [`VOCABULARIES`] for a message: `tokenizer.json, vocab.json + merges.txt`.
+fn vocabularies() -> String {
+    VOCABULARIES
+        .iter()
+        .map(|files| files.join(" + "))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Fetches `file` into `dir` unless it is there already; `Ok(None)` when the
+/// checkpoint does not serve it (HTTP 404), an error for any other failure
+/// or a file shorter than `min_bytes`.
+fn download(
+    client: &reqwest::blocking::Client,
+    model: &str,
+    revision: &str,
+    dir: &Path,
+    file: &str,
+    min_bytes: usize,
+) -> Result<Option<PathBuf>, String> {
+    let path = dir.join(file);
+    if path.is_file() {
+        return Ok(Some(path));
+    }
+    let url = format!("https://huggingface.co/{model}/resolve/{revision}/{file}");
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(format!("GET {url}: HTTP {}", response.status()));
+    }
+    let bytes = response.bytes().map_err(|e| format!("GET {url}: {e}"))?;
+    if bytes.len() < min_bytes {
+        return Err(format!(
+            "{url}: {} bytes, expected at least {min_bytes}",
+            bytes.len()
+        ));
+    }
+    let part = dir.join(format!("{file}.part"));
+    fs::write(&part, &bytes).map_err(|e| format!("cannot write {}: {e}", part.display()))?;
+    fs::rename(&part, &path)
+        .map_err(|e| format!("cannot rename {} into place: {e}", part.display()))?;
+    Ok(Some(path))
 }
 
 /// `<hub cache>/models--<org>--<name>/snapshots/<revision>`, the layout
@@ -769,12 +810,21 @@ fn hf_cache_snapshot(model: &str, revision: &str) -> Option<PathBuf> {
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/huggingface/hub"))
         })?;
+    snapshot_under(&hub, model, revision)
+}
+
+/// The snapshot of `model` at `revision` under the hub cache `hub`, when it
+/// holds `tokenizer_config.json` and one of [`VOCABULARIES`] whole.
+fn snapshot_under(hub: &Path, model: &str, revision: &str) -> Option<PathBuf> {
     let dir = hub
         .join(format!("models--{}", model.replace('/', "--")))
         .join("snapshots")
         .join(revision);
-    (dir.join("tokenizer.json").is_file() && dir.join("tokenizer_config.json").is_file())
-        .then_some(dir)
+    (dir.join("tokenizer_config.json").is_file()
+        && VOCABULARIES
+            .iter()
+            .any(|files| files.iter().all(|file| dir.join(file).is_file())))
+    .then_some(dir)
 }
 
 // The run's own checks, on fixture trees the tests below write.
@@ -905,6 +955,50 @@ fn sets_without_a_sets_toml_stop_the_run() {
         .err()
         .expect("sets with no sets.toml to check them against should stop the run");
     assert!(error.contains("sets.toml"), "{error}");
+}
+
+#[test]
+fn a_cache_snapshot_with_any_whole_vocabulary_is_the_tokenizer_dir() {
+    let revision = "0123456789abcdef0123456789abcdef01234567";
+    let snapshot = |model: &str, files: &[&str]| -> Vec<(String, String)> {
+        files
+            .iter()
+            .map(|file| {
+                (
+                    format!(
+                        "models--{}/snapshots/{revision}/{file}",
+                        model.replace('/', "--")
+                    ),
+                    String::from("{}"),
+                )
+            })
+            .collect()
+    };
+    let files = [
+        snapshot("org/json", &["tokenizer_config.json", "tokenizer.json"]),
+        snapshot(
+            "org/pair",
+            &["tokenizer_config.json", "vocab.json", "merges.txt"],
+        ),
+        snapshot("org/half-pair", &["tokenizer_config.json", "vocab.json"]),
+        snapshot("org/no-config", &["vocab.json", "merges.txt"]),
+    ]
+    .concat();
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect();
+    let hub = tree(&files).unwrap();
+    for (model, found) in [
+        ("org/json", true),
+        ("org/pair", true),
+        ("org/half-pair", false),
+        ("org/no-config", false),
+        ("org/absent", false),
+    ] {
+        let snapshot = snapshot_under(hub.path(), model, revision);
+        assert_eq!(snapshot.is_some(), found, "{model}: {snapshot:?}");
+    }
 }
 
 #[test]

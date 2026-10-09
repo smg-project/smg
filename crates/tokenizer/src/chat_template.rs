@@ -3,7 +3,7 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{collections::HashMap, fs, io};
+use std::{borrow::Cow, collections::HashMap, fs, io};
 
 use anyhow::{anyhow, Result};
 use minijinja::{
@@ -485,8 +485,9 @@ fn detect_all(
 
 /// AST detection of content format and think-in-prefill.
 fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool) {
+    let template = plain_generation_blocks(template);
     let ast = match parse(
-        template,
+        &template,
         "template",
         SyntaxConfig {},
         WhitespaceConfig::default(),
@@ -876,11 +877,78 @@ fn raise_exception(message: String) -> std::result::Result<String, MinijinjaErro
     Err(MinijinjaError::new(ErrorKind::InvalidOperation, message))
 }
 
+/// Transformers' `{% generation %}` ... `{% endgeneration %}` block marks the
+/// assistant tokens for a training mask and renders its body unchanged; the
+/// engine here has no such statement and would refuse the whole template. The
+/// block becomes `{% if true %}` ... `{% endif %}`: the same body, and the same
+/// whitespace handling, as both are block tags (`trim_blocks`, `lstrip_blocks`,
+/// and each tag's own `-` or `+` modifier, which is kept as written).
+fn plain_generation_blocks(template: &str) -> Cow<'_, str> {
+    if !template.contains("generation") {
+        return Cow::Borrowed(template);
+    }
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{%") {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        match generation_tag(rest) {
+            Some((len, replacement)) => {
+                out.push_str(&replacement);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push_str("{%");
+                rest = &rest[2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    if out == template {
+        Cow::Borrowed(template)
+    } else {
+        Cow::Owned(out)
+    }
+}
+
+/// When `tag`, which starts with `{%`, is a `generation` or `endgeneration`
+/// block tag: its length, and the `if true` or `endif` tag that stands in for
+/// it with the same whitespace modifiers.
+fn generation_tag(tag: &str) -> Option<(usize, String)> {
+    fn modifier(body: &str) -> (&str, &str) {
+        match body.as_bytes().first() {
+            Some(b'-') => ("-", &body[1..]),
+            Some(b'+') => ("+", &body[1..]),
+            _ => ("", body),
+        }
+    }
+    let (left, body) = modifier(tag.strip_prefix("{%")?);
+    let body = body.trim_start();
+    let (word, body) = ["endgeneration", "generation"]
+        .iter()
+        .find_map(|word| body.strip_prefix(word).map(|body| (*word, body)))?;
+    let (right, body) = modifier(body.trim_start());
+    let body = body.strip_prefix("%}")?;
+    let statement = if word == "generation" {
+        "if true"
+    } else {
+        "endif"
+    };
+    Some((
+        tag.len() - body.len(),
+        format!("{{%{left} {statement} {right}%}}"),
+    ))
+}
+
 /// Build a pre-configured `Environment<'static>` with the given template string,
 /// Python-compat method callback, and custom `tojson` filter already registered.
 /// The template is stored under the name `"chat"` using owned storage so the
 /// environment carries no borrows.
 fn build_environment(template: String) -> Result<Environment<'static>> {
+    let template = match plain_generation_blocks(&template) {
+        Cow::Borrowed(_) => template,
+        Cow::Owned(rewritten) => rewritten,
+    };
     let mut env = Environment::new();
 
     // Match HuggingFace's Jinja2 defaults: trim_blocks and lstrip_blocks are
@@ -1214,6 +1282,51 @@ impl ChatTemplateState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Transformers' `{% generation %}` block (the assistant-token mask marker)
+    /// renders its body; the engine here has no such statement, so the block
+    /// is rewritten to a plain `if` before parsing, and the content-format
+    /// detection parses such a template as well.
+    #[test]
+    fn generation_blocks_render_their_body() {
+        let template = "{%- for m in messages -%}\n{%- if m.role == 'assistant' -%}\n\
+                        {% generation %}\n<a>{{ m.content }}</a>\n{%- endgeneration -%}\n\
+                        {%- else -%}\n<u>{{ m.content }}</u>\n{%- endif -%}\n{%- endfor -%}";
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages = [
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "yo"}),
+        ];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<u>hi</u><a>yo</a>");
+
+        let parts_template = "{% for message in messages %}{% if message['role'] == 'user' %}USER: \
+                              {% for content in message['content'] | selectattr('type', 'equalto', 'text') %}\
+                              {% generation %}{{ content['text'] + ' ' }}{% endgeneration %}{% endfor %}\
+                              {% endif %}{% endfor %}";
+        assert_eq!(
+            detect_chat_template_content_format(parts_template),
+            ChatTemplateContentFormat::OpenAI
+        );
+    }
+
+    /// The rewrite keeps each tag's whitespace modifiers and leaves a template
+    /// without the block untouched.
+    #[test]
+    fn generation_tags_are_rewritten_with_their_modifiers() {
+        assert_eq!(
+            plain_generation_blocks(
+                "{%- generation -%}x{% endgeneration %}y{%+ generation %}z{%-endgeneration-%}"
+            ),
+            "{%- if true -%}x{% endif %}y{%+ if true %}z{%- endif -%}"
+        );
+        assert!(matches!(
+            plain_generation_blocks("{% if add_generation_prompt %}a{% endif %}"),
+            Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn test_chat_template_state_no_template() {

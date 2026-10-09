@@ -13,6 +13,11 @@
 //! A thinking model's streamed `reasoning_content` counts as output for TTFT
 //! and ITL (reported separately as `reasoning_tokens`), and
 //! `--chat-template-kwargs` reaches the chat template, e.g. to turn thinking off.
+//! Requests share HTTP/1.1 keep-alive connections by default (`--connections
+//! pooled`); `--connections fresh` gives every request a connection of its
+//! own, for tail-sensitive runs, so a request is never queued behind a stream
+//! in flight on a reused connection, which would show as one stream's worth
+//! of TTFT on an otherwise idle gateway.
 
 // A command-line tool: the summary goes to stdout, progress to stderr.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -103,6 +108,75 @@ struct Args {
     /// nothing is sent when absent.
     #[arg(long, value_parser = parse_json_object)]
     chat_template_kwargs: Option<Value>,
+    /// How requests use connections: `pooled` (the default) reuses HTTP/1.1
+    /// keep-alive connections, fewer handshakes, but a request can be handed
+    /// a connection whose previous response is still streaming and then
+    /// waits for that stream to end before the gateway reads it (rare: a
+    /// few per hundred thousand streamed requests); `fresh` opens a
+    /// connection per request and has it closed after the response, so a
+    /// request never shares a connection with a stream in flight, the
+    /// choice for tail-sensitive runs (max TTFT, stall hunting).
+    #[arg(long, value_enum, default_value_t = Connections::Pooled)]
+    connections: Connections,
+}
+
+/// The addresses a URL's host name resolves to now, for the client to pin:
+/// a connection then never waits on a name lookup, which is one per
+/// connection otherwise, one per request with `Connections::Fresh`, and a
+/// lost lookup costs a resolver timeout of seconds. A host that is already
+/// an address, or one that does not resolve here, is left to the client.
+async fn pinned_addresses(url: &str) -> Option<(String, Vec<std::net::SocketAddr>)> {
+    let url = reqwest::Url::parse(url).ok()?;
+    let host = url.host_str()?.trim_matches(['[', ']']).to_string();
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .ok()?
+        .collect();
+    (!addrs.is_empty()).then_some((host, addrs))
+}
+
+/// How the replayer's requests use connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Connections {
+    /// A connection per request, closed after the response.
+    Fresh,
+    /// HTTP/1.1 keep-alive connections reused from a pool.
+    Pooled,
+}
+
+/// The HTTP client for `connections`. With `Fresh` no idle connection is
+/// kept and every request asks the server to close after the response
+/// (`Connection: close`), so the server's side carries the TIME_WAIT and the
+/// client's ephemeral ports stay free at rate; with `Pooled` up to
+/// `max_inflight` keep-alive connections are kept and reused. The `pins`
+/// are host names resolved once, so that no connection waits on a lookup.
+fn http_client(
+    connections: Connections,
+    max_inflight: usize,
+    pins: &[(String, Vec<std::net::SocketAddr>)],
+) -> reqwest::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(600));
+    for (host, addrs) in pins {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    match connections {
+        Connections::Fresh => {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::CONNECTION,
+                reqwest::header::HeaderValue::from_static("close"),
+            );
+            builder
+                .pool_max_idle_per_host(0)
+                .default_headers(headers)
+                .build()
+        }
+        Connections::Pooled => builder.pool_max_idle_per_host(max_inflight).build(),
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1023,10 +1097,13 @@ async fn main() -> Result<()> {
         return Err(anyhow!("no rows selected"));
     }
     let t0 = rows[0].timestamp;
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(args.max_inflight)
-        .timeout(Duration::from_secs(600))
-        .build()?;
+    let mut pins = Vec::new();
+    for url in std::iter::once(&args.gateway).chain(args.admin.iter()) {
+        if let Some(pin) = pinned_addresses(url).await {
+            pins.push(pin);
+        }
+    }
+    let client = http_client(args.connections, args.max_inflight, &pins)?;
     let url = format!("{}/v1/chat/completions", args.gateway.trim_end_matches('/'));
     let inflight = Arc::new(Semaphore::new(args.max_inflight));
     let mut set: JoinSet<ReqResult> = JoinSet::new();
@@ -1599,6 +1676,102 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "hi");
         assert!(parse_json_object("[1]").is_err());
         assert!(parse_json_object("nope").is_err());
+    }
+
+    /// A one-route HTTP/1.1 server that records, per request, the client's
+    /// port and whether the request asked for the connection to close; it
+    /// keeps a connection open until the client closes it or asked it to.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test server tasks end with the test's runtime"
+    )]
+    async fn recording_server() -> (String, Arc<std::sync::Mutex<Vec<(u16, bool)>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/", listener.local_addr().expect("addr"));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, peer)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        // One request head at a time (the bodies are empty).
+                        buf.clear();
+                        while !buf.ends_with(b"\r\n\r\n") {
+                            match socket.read(&mut byte).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => buf.push(byte[0]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                        let close = head.contains("connection: close");
+                        log.lock().unwrap().push((peer.port(), close));
+                        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                        if socket.write_all(response.as_bytes()).await.is_err() || close {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    #[tokio::test]
+    async fn fresh_connections_are_never_shared_between_requests() {
+        let (url, seen) = recording_server().await;
+        let client = http_client(Connections::Fresh, 16, &[]).expect("client");
+        for _ in 0..3 {
+            let response = client.get(&url).send().await.expect("send");
+            assert_eq!(response.text().await.expect("body"), "ok");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter().all(|(_, close)| *close),
+            "every request asks the server to close: {seen:?}"
+        );
+        let ports: std::collections::BTreeSet<u16> = seen.iter().map(|(port, _)| *port).collect();
+        assert_eq!(ports.len(), 3, "a connection per request: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn host_names_are_pinned_once_and_addresses_left_alone() {
+        assert!(pinned_addresses("http://127.0.0.1:1/").await.is_none());
+        assert!(pinned_addresses("http://[::1]:1/").await.is_none());
+        assert!(pinned_addresses("not a url").await.is_none());
+        let (host, addrs) = pinned_addresses("http://localhost:1/")
+            .await
+            .expect("localhost resolves");
+        assert_eq!(host, "localhost");
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()), "{addrs:?}");
+    }
+
+    #[tokio::test]
+    async fn pooled_connections_are_reused_between_requests() {
+        let (url, seen) = recording_server().await;
+        let client = http_client(Connections::Pooled, 16, &[]).expect("client");
+        for _ in 0..3 {
+            let response = client.get(&url).send().await.expect("send");
+            assert_eq!(response.text().await.expect("body"), "ok");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter().all(|(_, close)| !*close),
+            "keep-alive requests: {seen:?}"
+        );
+        let ports: std::collections::BTreeSet<u16> = seen.iter().map(|(port, _)| *port).collect();
+        assert_eq!(ports.len(), 1, "one connection reused: {seen:?}");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use symphony::{
         deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
         qwen3, seed_oss, xlam,
     },
-    tagged::Spelling,
+    tagged::{Placement, Spelling},
     CallSyntax, Format,
 };
 
@@ -52,6 +52,8 @@ struct Group {
 enum Table {
     Qwen3,
     Qwen3Tagged,
+    /// [`qwen3`] with the tagged syntax and the value between the tags directly: MiMo.
+    Qwen3TaggedDirect,
     Qwen2_5,
     DeepSeekV4_1,
     SeedOss,
@@ -72,7 +74,8 @@ impl Table {
     fn format(self) -> Format {
         match self {
             Self::Qwen3 => qwen3(CallSyntax::Json),
-            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json)),
+            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+            Self::Qwen3TaggedDirect => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
             Self::Qwen2_5 => qwen2_5(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::SeedOss => seed_oss(),
@@ -93,6 +96,10 @@ impl Table {
     fn cell(self) -> String {
         match self {
             Self::Qwen3Tagged => format!("`{}`, tagged calls", self.format().name()),
+            Self::Qwen3TaggedDirect => format!(
+                "`{}`, tagged calls, the value between the tags",
+                self.format().name()
+            ),
             other => format!("`{}`", other.format().name()),
         }
     }
@@ -393,7 +400,7 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-04-27",
         smg: (None, None),
-        table: Some(Table::Qwen3Tagged),
+        table: Some(Table::Qwen3TaggedDirect),
         set: Some(54_181),
         status: Status::Replaying,
     },

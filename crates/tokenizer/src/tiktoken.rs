@@ -782,7 +782,11 @@ impl TokenizerTrait for TiktokenTokenizer {
 
     fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
         match self.renderer {
-            Renderer::KimiK3Xtml => &[],
+            // The levels the K3 encoder renders as a `thinking-effort`
+            // directive; `"none"` switches thinking off (the engine's own
+            // server maps the kwarg the same way before rendering), so the
+            // reasoning parser is armed from the kwarg like the prompt is.
+            Renderer::KimiK3Xtml => &["low", "high", "max"],
             _ => self.chat_template.native_reasoning_effort_values(),
         }
     }
@@ -809,8 +813,11 @@ impl TokenizerTrait for TiktokenTokenizer {
     fn renderer_capabilities(&self) -> RendererCapabilities {
         match self.renderer {
             // The K3 encoder parses `arguments` itself; the gateway forwards them as written.
+            // The engine's own server rewrites `enable_thinking` into the encoder's
+            // `thinking` before rendering, so the renderer and the parser read the alias.
             Renderer::KimiK3Xtml => RendererCapabilities {
                 raw_tool_call_arguments: true,
+                enable_thinking_alias: true,
                 ..RendererCapabilities::default()
             },
             Renderer::Jinja | Renderer::KimiK25Tools => RendererCapabilities::default(),
@@ -1508,10 +1515,14 @@ mod tests {
         let k3 = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
         let caps = k3.renderer_capabilities();
         assert!(caps.raw_tool_call_arguments, "{caps:?}");
+        // vLLM's K3 renderer honours `enable_thinking` as an alias of the
+        // encoder's `thinking`; the parser must be armed from it as well.
         assert!(
-            !caps.enable_thinking_alias && !caps.native_assistant_continuation,
+            caps.enable_thinking_alias && !caps.native_assistant_continuation,
             "{caps:?}"
         );
+        assert_eq!(k3.native_reasoning_effort_values(), &["low", "high", "max"]);
+        assert!(k3.native_reasoning_effort_off_values().is_empty());
 
         let jinja = write_minimal_tiktoken_dir("{}", None);
         let jinja = TiktokenTokenizer::from_dir(jinja.path()).unwrap();
