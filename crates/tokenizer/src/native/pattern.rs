@@ -40,6 +40,12 @@ const CAT_MODIFIER_LETTER: u16 = 1 << 8;
 const CAT_OTHER_LETTER: u16 = 1 << 9;
 const CAT_SPACE: u16 = 1 << 10;
 
+/// Pairs of ASCII letters that are the full case folding of one character
+/// (ß ẞ: ss; ﬀ: ff; ﬁ: fi; ﬂ: fl; ﬃ ﬄ: ffi, ffl; ﬅ ﬆ: st), which the engine
+/// matches under `(?i:)` and this matcher does not.
+const MULTI_CHARACTER_FOLDS: [[char; 2]; 5] =
+    [['s', 's'], ['s', 't'], ['f', 'f'], ['f', 'i'], ['f', 'l']];
+
 const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 11] = [
     (CAT_LETTER, unicode::LETTER),
     (CAT_MARK, unicode::MARK),
@@ -336,11 +342,26 @@ impl Parser<'_> {
 
     fn parse_concat(&mut self) -> Option<Node> {
         let mut nodes = Vec::new();
+        let mut previous_letter = None;
         while let Some(&c) = self.chars.peek() {
             if c == '|' || c == ')' {
                 break;
             }
             nodes.push(self.parse_quantified()?);
+            // Under `(?i:)` the engine also matches a run of letters against
+            // the one character whose full case folding is that run (ß and ẞ
+            // for "ss", ﬁ for "fi", ﬆ for "st", ...), which a matcher that
+            // folds letter by letter cannot do: such runs are declined.
+            let letter = (self.case_insensitive
+                && c.is_ascii_alphabetic()
+                && matches!(nodes.last(), Some(Node::Class(_))))
+            .then(|| c.to_ascii_lowercase());
+            if let (Some(first), Some(second)) = (previous_letter, letter) {
+                if MULTI_CHARACTER_FOLDS.contains(&[first, second]) {
+                    return None;
+                }
+            }
+            previous_letter = letter;
         }
         Some(if nodes.len() == 1 {
             nodes.pop()?
@@ -418,8 +439,10 @@ impl Parser<'_> {
     fn parse_atom(&mut self) -> Option<Node> {
         let c = self.chars.next()?;
         // Under `(?i:...)` only ASCII letters and plain ASCII literals are
-        // folded the way the engine folds them; a class, an escape or a
-        // non-ASCII literal there would match differently, so it is declined.
+        // folded the way the engine folds them, letter by letter; a class, an
+        // escape or a non-ASCII literal there would match differently, so it
+        // is declined (so are lookaheads and the letter runs the engine folds
+        // as one character; see `parse_group` and `parse_concat`).
         if self.case_insensitive && (c == '[' || c == '\\' || !c.is_ascii()) {
             return None;
         }
@@ -458,6 +481,11 @@ impl Parser<'_> {
                 (self.chars.next()? == ')').then_some(inner)
             }
             '!' => {
+                // The option would reach into the lookahead's class, which
+                // this matcher does not fold: declined under `(?i:)`.
+                if self.case_insensitive {
+                    return None;
+                }
                 let class = match self.chars.next()? {
                     '\\' => self.parse_escape_as_class()?,
                     '[' => self.parse_class_body()?,
@@ -820,6 +848,11 @@ mod tests {
             r"(?:\p{L}+)?",
             r"a|",
             r"",
+            r"(?i:'s(?![a-z]))",
+            r"(?i:'s(?!\S))",
+            r"(?i:ss)",
+            r"(?i:'st)",
+            r"(?i:fi|fl|ff)",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
@@ -953,6 +986,46 @@ mod tests {
                 Pattern::parse(pattern).is_none(),
                 "{pattern:?} must be declined"
             );
+        }
+    }
+
+    #[test]
+    fn case_insensitive_groups_decline_lookaheads_and_multi_character_folds() {
+        // The option reaches into a lookahead: `(?![a-z])` under `(?i:)`
+        // also rejects A-Z, ſ and K.
+        assert_eq!(
+            oracle_matches(r"(?i:'s(?![a-z]))", "'sA 'sb 's"),
+            vec![(8, 10)]
+        );
+        // A run of ASCII letters also matches the one character whose full
+        // case folding is that run: ß and ẞ for "ss", ﬁ for "fi", ﬆ for "st".
+        assert_eq!(oracle_matches(r"(?i:ss)", "ß"), vec![(0, 2)]);
+        assert_eq!(oracle_matches(r"(?i:'st)", "'ﬆ"), vec![(0, 4)]);
+        for (pattern, text) in [
+            (r"(?i:'s(?![a-z]))", "'sA 'sb 's"),
+            (r"(?i:'s(?!\p{Ll}))", "'sA"),
+            (r"(?i:'s(?!\S))", "'sA 's"),
+            (r"(?i:ss)", "ß ẞ ss"),
+            (r"(?i:'st|'ss)", "'ﬆ 'ß"),
+            (r"(?i:fi|fl|ff)", "ﬁ ﬂ ﬀ"),
+            (r"(?i:ffi)", "ﬃ"),
+            (r"(?i:'s|'t|'re|'ve|'m|'ll|'d|'st)", "'ﬅ"),
+        ] {
+            if let Some(parsed) = Pattern::parse(pattern) {
+                assert_eq!(
+                    parsed.find_iter(text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, text),
+                    "{pattern:?} is accepted but matches {text:?} differently from the engine"
+                );
+            }
+            assert!(
+                Pattern::parse(pattern).is_none(),
+                "{pattern:?} must be declined"
+            );
+        }
+        // The clitic groups in use fold letter by letter and stay accepted.
+        for pattern in [QWEN2, QWEN35, CL100K, CASED] {
+            assert!(Pattern::parse(pattern).is_some(), "{pattern}");
         }
     }
 }
