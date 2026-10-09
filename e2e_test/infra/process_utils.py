@@ -11,6 +11,8 @@ import time
 
 import requests
 
+from .constants import DEFAULT_HOST
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 _reserved_ports: set[int] = set()
 
 
-def get_open_port(max_attempts: int = 10) -> int:
+def get_open_port(max_attempts: int = 10, host: str = DEFAULT_HOST) -> int:
     """Get an available port with reservation tracking.
 
     Finds an available port from the kernel and reserves it in our tracking set
@@ -30,6 +32,9 @@ def get_open_port(max_attempts: int = 10) -> int:
 
     Args:
         max_attempts: Maximum attempts to find an unreserved port.
+        host: The address the port will be bound on; the probe uses its address
+            family (an IPv6 literal probes an IPv6 socket), so the port is free
+            where the gateway or worker binds it.
 
     Returns:
         An available port number that is reserved until release_port() is called.
@@ -37,10 +42,11 @@ def get_open_port(max_attempts: int = 10) -> int:
     Raises:
         RuntimeError: If unable to find an available port after max_attempts.
     """
+    family, unspecified = (socket.AF_INET6, "::") if ":" in host else (socket.AF_INET, "")
     for attempt in range(max_attempts):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        with socket.socket(family, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", 0))
+            s.bind((unspecified, 0))
             s.listen(1)
             port = s.getsockname()[1]
 

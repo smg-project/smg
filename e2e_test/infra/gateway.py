@@ -17,6 +17,7 @@ from .constants import (
     DEFAULT_ROUTER_TIMEOUT,
     ENV_SHOW_ROUTER_LOGS,
     get_zmq_engine_count,
+    host_port,
 )
 from .process_utils import (
     get_open_port,
@@ -93,10 +94,10 @@ class Gateway:
         self.host = host
         self._port_auto_allocated = port is None
         self._prometheus_port_auto_allocated = prometheus_port is None
-        self.port = port or get_open_port()
-        self.prometheus_port = prometheus_port or get_open_port()
-        self.base_url = f"http://{self.host}:{self.port}"
-        self.metrics_url = f"http://{self.host}:{self.prometheus_port}"
+        self.port = port or get_open_port(host=host)
+        self.prometheus_port = prometheus_port or get_open_port(host=host)
+        self.base_url = f"http://{host_port(self.host, self.port)}"
+        self.metrics_url = f"http://{host_port(self.host, self.prometheus_port)}"
 
         self.process: subprocess.Popen | None = None
         self.model_path: str | None = None
@@ -118,6 +119,11 @@ class Gateway:
     def is_running(self) -> bool:
         """Check if the gateway process is running."""
         return self.process is not None and self.process.poll() is None
+
+    @property
+    def ws_base_url(self) -> str:
+        """``ws://host:port`` of this gateway (an IPv6 host in brackets)."""
+        return f"ws://{host_port(self.host, self.port)}"
 
     def start(
         self,

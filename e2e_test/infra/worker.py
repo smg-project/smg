@@ -34,6 +34,7 @@ from .constants import (
     get_vllm_mm_processor,
     get_vllm_servicer_impl,
     get_zmq_engine_count,
+    host_port,
     sglang_transfer_backend,
     vllm_kv_backend,
 )
@@ -95,8 +96,8 @@ class Worker:
 
             return _zmq_ipc_url(self.port)
         if self.mode == ConnectionMode.GRPC:
-            return f"grpc://{DEFAULT_HOST}:{self.port}"
-        return f"http://{DEFAULT_HOST}:{self.port}"
+            return f"grpc://{host_port(DEFAULT_HOST, self.port)}"
+        return f"http://{host_port(DEFAULT_HOST, self.port)}"
 
     @property
     def worker_url(self) -> str:
@@ -106,7 +107,7 @@ class Worker:
     @property
     def http_url(self) -> str:
         """HTTP URL (used for health checks even on gRPC workers)."""
-        return f"http://{DEFAULT_HOST}:{self.port}"
+        return f"http://{host_port(DEFAULT_HOST, self.port)}"
 
     def start(
         self,
@@ -782,7 +783,7 @@ class Worker:
             )
 
         start = time.perf_counter()
-        channel = grpc.insecure_channel(f"{DEFAULT_HOST}:{self.port}")
+        channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
         try:
             while time.perf_counter() - start < timeout:
                 if not self.is_alive():
@@ -912,7 +913,7 @@ def start_workers(
                 WorkerType.DECODE,
             )
             dist_init_port = get_open_port() if is_ts_disagg else None
-            dist_init_addr = f"{DEFAULT_HOST}:{dist_init_port}" if dist_init_port else None
+            dist_init_addr = host_port(DEFAULT_HOST, dist_init_port) if dist_init_port else None
 
             worker = Worker(
                 model_id=model_id,

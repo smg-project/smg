@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .simple_eval_common import Eval
 
+from .constants import host_port
 from .simple_eval_common import ChatCompletionSampler, set_ulimit
 from .simple_eval_mmlu import MMLU_DATASET_URL
 
@@ -93,7 +94,7 @@ def run_eval(args: Any) -> dict:
     else:
         host = getattr(args, "host", "127.0.0.1")
         port = getattr(args, "port", 30000)
-        base_url = f"http://{host}:{port}/v1"
+        base_url = f"http://{host_port(host, port)}/v1"
 
     eval_name = getattr(args, "eval_name", "mmlu")
     num_examples = getattr(args, "num_examples", 64)

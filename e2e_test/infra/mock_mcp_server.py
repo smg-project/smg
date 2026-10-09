@@ -59,6 +59,8 @@ from typing import Any
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 
+from .constants import host_port
+
 logger = logging.getLogger(__name__)
 
 
@@ -171,7 +173,7 @@ class MockMcpServer:
         """Return the MCP streamable-HTTP URL. Requires ``start()`` first."""
         if self._bound_port is None:
             raise RuntimeError("MockMcpServer not started — call start() first")
-        return f"http://{self.host}:{self._bound_port}{self._mount_path}"
+        return f"http://{host_port(self.host, self._bound_port)}{self._mount_path}"
 
     @property
     def last_call_args(self) -> dict[str, Any] | None:

@@ -142,7 +142,7 @@ def gateway():
 @pytest.fixture()
 def ws_url(gateway):
     """Build the realtime WebSocket URL."""
-    return f"ws://{gateway.host}:{gateway.port}/v1/realtime?model={REALTIME_MODEL}"
+    return f"{gateway.ws_base_url}/v1/realtime?model={REALTIME_MODEL}"
 
 
 @pytest.fixture()
@@ -414,7 +414,7 @@ class TestRealtimeWebSocket:
         """Connecting without ?model= should fail with a reject status."""
 
         async def _run():
-            url = f"ws://{gateway.host}:{gateway.port}/v1/realtime"
+            url = f"{gateway.ws_base_url}/v1/realtime"
             with pytest.raises(websockets.exceptions.InvalidStatus):
                 async with websockets.connect(url, additional_headers=ws_headers):
                     pass
@@ -425,7 +425,7 @@ class TestRealtimeWebSocket:
         """Connecting without Authorization header should fail."""
 
         async def _run():
-            url = f"ws://{gateway.host}:{gateway.port}/v1/realtime?model={REALTIME_MODEL}"
+            url = f"{gateway.ws_base_url}/v1/realtime?model={REALTIME_MODEL}"
             try:
                 async with websockets.connect(url) as ws:
                     # Connection accepted — upstream must still send an error event
