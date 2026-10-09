@@ -1525,6 +1525,11 @@ impl WorkerLoadResponse {
             .sum()
     }
 
+    /// Total running requests summed across all DP ranks.
+    pub fn total_running_reqs(&self) -> i64 {
+        self.loads.iter().map(|l| l.num_running_reqs as i64).sum()
+    }
+
     /// Total waiting (queued) requests summed across all DP ranks.
     pub fn total_waiting_reqs(&self) -> i64 {
         self.loads.iter().map(|l| l.num_waiting_reqs as i64).sum()
