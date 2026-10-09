@@ -369,7 +369,10 @@ pub(crate) async fn execute_plan(
         );
     }
 
-    // Create OTEL span for gRPC request execution
+    // The upstream span: the dispatch, then the response stream (it closes
+    // with the load guards, which the response body holds to its last frame;
+    // see `LoadGuards::traced`). A failed dispatch sets its status to ERROR;
+    // success is left unset, as the RPC conventions have it.
     let span = info_span!(
         target: "smg::otel-trace",
         "grpc_execute",
@@ -377,6 +380,7 @@ pub(crate) async fn execute_plan(
         request_id = %request_id,
         model = %model,
         mode = %mode,
+        otel.status_code = tracing::field::Empty,
     );
 
     let result = async {
@@ -409,7 +413,7 @@ pub(crate) async fn execute_plan(
             }
         }
     }
-    .instrument(span)
+    .instrument(span.clone())
     .await;
     // The engines hold the request bodies now. An earlier attempt keeps its
     // share of the budget: the retained plan still owns the same media, and a
@@ -417,7 +421,16 @@ pub(crate) async fn execute_plan(
     if last_attempt {
         ctx.multimodal_inflight.take();
     }
-    let result = result?;
+    let result = match result {
+        Ok(result) => result,
+        Err(response) => {
+            span.record("otel.status_code", "ERROR");
+            return Err(response);
+        }
+    };
+    if let Some(guards) = ctx.load_guards.take() {
+        ctx.load_guards = Some(LoadGuards::traced(span, guards));
+    }
 
     // Store result in context for response processing
     ctx.response.execution_result = Some(result);

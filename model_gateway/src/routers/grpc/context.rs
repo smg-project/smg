@@ -695,6 +695,24 @@ pub(crate) enum LoadGuards {
         _admission: PdAdmissionGuard,
         _guards: Box<LoadGuards>,
     },
+    /// The dispatch's upstream span rides with the guards, so it ends when
+    /// they are released: at the response stream's last frame, the client's
+    /// disconnect, an upstream error or a retry, not at dispatch.
+    Traced {
+        _span: StreamSpan,
+        _guards: Box<LoadGuards>,
+    },
+}
+
+/// A span held open across a response stream. Released, it is entered once
+/// more: the OpenTelemetry layer stamps a span's end at its last exit, not
+/// at its close, so a span merely held would still end at dispatch.
+pub(crate) struct StreamSpan(tracing::Span);
+
+impl Drop for StreamSpan {
+    fn drop(&mut self) {
+        let _last_exit = self.0.enter();
+    }
 }
 
 impl LoadGuards {
@@ -719,6 +737,14 @@ impl LoadGuards {
                 _guards: Box::new(guards),
             },
             None => guards,
+        }
+    }
+
+    /// Keep `span` open for as long as the guards are held.
+    pub fn traced(span: tracing::Span, guards: Self) -> Self {
+        Self::Traced {
+            _span: StreamSpan(span),
+            _guards: Box::new(guards),
         }
     }
 

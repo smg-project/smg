@@ -1619,7 +1619,7 @@ mod request_release_tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Mutex, PoisonError, Weak,
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -1635,6 +1635,8 @@ mod request_release_tests {
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
     use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
     use super::*;
@@ -1665,9 +1667,10 @@ mod request_release_tests {
     /// immediately -- used for the PD prefill leg. `fail_first` makes the
     /// first generate call return UNAVAILABLE, for retry-replay tests;
     /// `fail_always` fails every call, and `answer_after` stalls the generate
-    /// RPC, standing in for an engine that answers only at its own deadline.
-    /// Every call's input token ids and engine request id are recorded, as is
-    /// every aborted request id.
+    /// RPC, standing in for an engine that answers only at its own deadline;
+    /// `frame_gap` paces the response frames, for a stream that outlasts its
+    /// dispatch. Every call's input token ids and engine request id are
+    /// recorded, as is every aborted request id.
     #[derive(Clone, Default)]
     struct GatedScheduler {
         probe: Option<Weak<CompletionRequest>>,
@@ -1676,6 +1679,7 @@ mod request_release_tests {
         fail_first: bool,
         fail_always: bool,
         answer_after: Option<Duration>,
+        frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
         seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
         seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
@@ -1782,11 +1786,15 @@ mod request_release_tests {
             let (tx, rx) = mpsc::channel(8);
             let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
             let released = Arc::clone(&self.released);
+            let frame_gap = self.frame_gap;
             tokio::spawn(async move {
                 if let Some(probe) = probe {
                     Self::await_probe(&probe, &released).await;
                 }
                 for frame in generate_frames(&request_id) {
+                    if let Some(gap) = frame_gap {
+                        tokio::time::sleep(gap).await;
+                    }
                     if tx.send(frame).await.is_err() {
                         return;
                     }
@@ -2028,6 +2036,122 @@ mod request_release_tests {
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("drain SSE body")
+    }
+
+    /// The spans the OpenTelemetry layer exported, as a trace backend sees
+    /// them: name, start and end.
+    #[derive(Clone, Debug, Default)]
+    struct ExportedSpans(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for ExportedSpans {
+        fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(batch);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// The exported upstream span covers the response stream, not the
+    /// dispatch alone: with the stub pacing its two frames 100 ms apart,
+    /// `grpc_execute` ends after the stream's end, not before its first frame.
+    #[tokio::test]
+    async fn upstream_span_closes_with_the_response_stream() {
+        use opentelemetry::trace::TracerProvider as _;
+        const FRAME_GAP: Duration = Duration::from_millis(100);
+        let request = completion_request(true);
+        let port = spawn_stub(GatedScheduler {
+            frame_gap: Some(FRAME_GAP),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+        // `tracing` rebuilds a callsite's cached interest from the current
+        // thread's default alone while it knows of a single dispatcher; a
+        // parallel test dispatching first, under no subscriber, would then
+        // cache "never" for `grpc_execute`. A second live dispatcher keeps
+        // every rebuild over all of them.
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+        let exported = ExportedSpans::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        // The gateway's exporter setup: the OpenTelemetry layer over the
+        // gateway's own spans alone (see `CustomOtelFilter`).
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")))
+            .with(tracing_subscriber::filter::Targets::new().with_target(
+                "smg::otel-trace",
+                tracing::level_filters::LevelFilter::TRACE,
+            ));
+
+        let (dispatched, drained) = async {
+            // A callsite's interest cached before this subscriber existed
+            // is rebuilt over the live dispatchers, this one included.
+            tracing::callsite::rebuild_interest_cache();
+            let response = pipeline
+                .execute_completion(
+                    request,
+                    None,
+                    MODEL.to_string(),
+                    components,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let dispatched = Instant::now();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("drain SSE body");
+            (dispatched, Instant::now())
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let upstream_spans = || -> Vec<Duration> {
+            exported
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|span| span.name == "grpc_execute")
+                .map(|span| {
+                    span.end_time
+                        .duration_since(span.start_time)
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        // The body's drop ends the span; give a slow thread a moment.
+        for _ in 0..50 {
+            if !upstream_spans().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let lasted = upstream_spans();
+        assert_eq!(lasted.len(), 1, "one upstream span per dispatch");
+        assert!(
+            drained >= dispatched + FRAME_GAP,
+            "the stub paced the stream over {:?}",
+            drained - dispatched
+        );
+        assert!(
+            lasted[0] >= FRAME_GAP,
+            "the exported upstream span lasted {:?}: it ended at dispatch, not with the stream ({:?} later)",
+            lasted[0],
+            drained - dispatched
+        );
     }
 
     /// The stream task must run off the response spec: the stub refuses to
