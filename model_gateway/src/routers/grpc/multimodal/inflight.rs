@@ -9,10 +9,10 @@ use std::{
 };
 
 use axum::response::Response;
-use http::StatusCode;
+use http::{header::RETRY_AFTER, HeaderValue, StatusCode};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::{observability::metrics::Metrics, routers::error};
+use crate::{middleware::SHED_RETRY_AFTER_SECS, observability::metrics::Metrics, routers::error};
 
 /// Granularity of the budget, so the permit count stays within the semaphore's range.
 const UNIT_BYTES: usize = 1024;
@@ -147,10 +147,17 @@ pub(crate) async fn reserve_multimodal_inflight(
         }
         Err(InflightRefusal::Busy) => {
             Metrics::record_admission_rejected("multimodal_inflight");
-            Err(error::too_many_requests(
+            let mut response = error::too_many_requests(
                 "multimodal_inflight_budget",
                 "the gateway is already holding its budget of preprocessed media in flight; retry shortly",
-            ))
+            );
+            // "Retry shortly" says how short, the way the gateway's other
+            // sheds do, so a client that honours the header paces itself
+            // instead of meeting the same full budget again at once.
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(SHED_RETRY_AFTER_SECS));
+            Err(response)
         }
     }
 }
@@ -235,6 +242,29 @@ mod tests {
 
         drop(held);
         assert!(queued.await.unwrap().is_ok());
+    }
+
+    /// The 429 names its back-off: `Retry-After`, as the gateway's other
+    /// sheds answer. The 413 is final for that payload and carries none.
+    #[tokio::test]
+    async fn the_busy_refusal_says_when_to_retry() {
+        let inflight = quick(4096);
+        let _held = inflight.reserve(4096).await.unwrap();
+
+        let busy = reserve_multimodal_inflight(Some(&inflight), 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            busy.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from(SHED_RETRY_AFTER_SECS))
+        );
+
+        let too_large = reserve_multimodal_inflight(Some(&inflight), 5000)
+            .await
+            .unwrap_err();
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(too_large.headers().get(RETRY_AFTER).is_none());
     }
 
     #[tokio::test]
