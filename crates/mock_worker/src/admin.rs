@@ -10,7 +10,8 @@
 //! - `POST /admin/reset/{worker}` and `POST /admin/reset`: clear one or every
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
 //! - `POST /admin/fault/{worker}/drop?batches=N`, `.../delay?ms=D`,
-//!   `.../restart-publisher`, `.../pause`, `.../resume` and
+//!   `.../restart-publisher`, `.../pause`, `.../resume`,
+//!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
 //! - `POST /admin/truth/{worker}` with `{"token_ids": [...]}`: what the
 //!   worker would serve from cache for that prompt right now;
@@ -23,6 +24,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -37,7 +39,7 @@ use tokio::net::TcpListener;
 
 use crate::{
     config::Config,
-    engine::{self, Engine},
+    engine::{self, Engine, FaultScope, RequestFault},
 };
 
 struct AdminState {
@@ -63,6 +65,7 @@ fn router(state: Arc<AdminState>) -> Router {
         )
         .route("/admin/fault/{worker}/pause", post(fault_pause))
         .route("/admin/fault/{worker}/resume", post(fault_resume))
+        .route("/admin/fault/{worker}/fail", post(fault_fail))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
         .with_state(state)
@@ -105,6 +108,15 @@ fn select(worker: &str) -> Result<Vec<Engine>, Response> {
 
 fn status_json(e: &Engine) -> Value {
     let s = e.fault_status();
+    let fail = s.fail;
+    let (fail_pending, fail_secs_left) = match fail.map(|f| f.scope) {
+        Some(FaultScope::Requests(n)) => (Some(n), None),
+        Some(FaultScope::Until(at)) => (
+            None,
+            Some(at.saturating_duration_since(Instant::now()).as_secs_f64()),
+        ),
+        Some(FaultScope::Open) | None => (None, None),
+    };
     json!({
         "worker": e.name(),
         "drop_pending": s.drop_pending,
@@ -115,6 +127,14 @@ fn status_json(e: &Engine) -> Value {
         "paused": s.paused,
         "generation": s.generation,
         "restarts": s.restarts,
+        "fail_status": fail.map_or(0, |f| f.status),
+        "fail_pending": fail_pending,
+        "fail_secs_left": fail_secs_left,
+        "fail_after_tokens": fail.and_then(|f| f.after_tokens),
+        "fail_stall_ms": fail.map_or(0, |f| f.stall.as_millis() as u64),
+        "failed_total": s.failed_total,
+        "cut_total": s.cut_total,
+        "stalled_total": s.stalled_total,
     })
 }
 
@@ -126,6 +146,61 @@ fn param<T: std::str::FromStr>(q: &HashMap<String, String>, name: &str) -> Resul
         )
             .into_response()
     })
+}
+
+/// A query parameter that may be absent; present, it must parse.
+fn optional<T: std::str::FromStr>(
+    q: &HashMap<String, String>,
+    name: &str,
+) -> Result<Option<T>, String> {
+    match q.get(name) {
+        None => Ok(None),
+        Some(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("invalid query parameter {name}: {v}")),
+    }
+}
+
+/// The request fault a `fail` query arms, or `None` to clear it:
+/// `status=S` (0, or 400 to 599) answered instead of serving, for the next
+/// `count=N` requests or every request for `secs=T` (neither: until cleared),
+/// after a `stall_ms=M` hold; `after_tokens=K` serves K tokens first and cuts
+/// the stream with S. `status=0` alone clears; with `stall_ms` it stalls and
+/// then serves.
+fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, String> {
+    let status: u16 = optional(q, "status")?.unwrap_or(0);
+    let count: Option<u32> = optional(q, "count")?;
+    let secs: Option<f64> = optional(q, "secs")?;
+    let after_tokens: Option<u32> = optional(q, "after_tokens")?;
+    let stall_ms: u64 = optional(q, "stall_ms")?.unwrap_or(0);
+    if status != 0 && !(400..=599).contains(&status) {
+        return Err(format!(
+            "status must be 0 or an error status (400-599), got {status}"
+        ));
+    }
+    if status == 0 && after_tokens.is_some() {
+        return Err("after_tokens needs a status to cut the stream with".to_string());
+    }
+    if status == 0 && stall_ms == 0 {
+        return Ok(None);
+    }
+    let scope = match (count, secs) {
+        (Some(_), Some(_)) => return Err("count and secs exclude each other".to_string()),
+        (Some(0), None) => return Err("count must be at least 1".to_string()),
+        (Some(n), None) => FaultScope::Requests(n),
+        (None, Some(t)) if t.is_finite() && t > 0.0 => {
+            FaultScope::Until(Instant::now() + Duration::from_secs_f64(t))
+        }
+        (None, Some(t)) => return Err(format!("secs must be positive, got {t}")),
+        (None, None) => FaultScope::Open,
+    };
+    Ok(Some(RequestFault {
+        status,
+        stall: Duration::from_millis(stall_ms),
+        after_tokens,
+        scope,
+    }))
 }
 
 async fn fleet(State(state): State<Arc<AdminState>>) -> Json<Value> {
@@ -176,7 +251,27 @@ async fn requests(Query(q): Query<HashMap<String, String>>) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({ "records": rows, "next": next }))
+    Json(json!({
+        "records": rows,
+        "next": next,
+        "injected_failures": injected_failures(),
+    }))
+}
+
+/// Per worker, the requests its fault hook answered with a status before
+/// admission (they left no record) and the streams it cut after output.
+fn injected_failures() -> Value {
+    let workers: serde_json::Map<String, Value> = engine::fleet_engines()
+        .iter()
+        .map(|e| {
+            let s = e.fault_status();
+            (
+                e.name().to_string(),
+                json!({ "failed": s.failed_total, "cut": s.cut_total }),
+            )
+        })
+        .collect();
+    Value::Object(workers)
 }
 
 async fn cache(Path(worker): Path<String>) -> Response {
@@ -288,6 +383,17 @@ async fn fault_pause(Path(worker): Path<String>) -> Response {
     apply(&worker, Engine::pause)
 }
 
+async fn fault_fail(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let fault = match fail_query(&q) {
+        Ok(fault) => fault,
+        Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
+    };
+    apply(&worker, |e| e.fault_fail(fault))
+}
+
 async fn fault_resume(Path(worker): Path<String>) -> Response {
     apply(&worker, Engine::resume)
 }
@@ -336,7 +442,8 @@ async fn truth_prompt(Path(worker): Path<String>, Json(body): Json<Value>) -> Re
     }
 }
 
-/// Per worker, what it actually served over every admitted request.
+/// Per worker, what it actually served over every admitted request, and
+/// what its fault hook refused or cut.
 async fn truth_served() -> Json<Value> {
     let mut totals: BTreeMap<String, (u64, u64, u64, u64)> = BTreeMap::new();
     for r in engine::records_since(0, usize::MAX) {
@@ -346,17 +453,94 @@ async fn truth_served() -> Json<Value> {
         t.2 += u64::from(r.cached_tokens);
         t.3 += u64::from(r.oracle_tokens);
     }
+    let injected: BTreeMap<String, (u64, u64)> = engine::fleet_engines()
+        .iter()
+        .map(|e| {
+            let s = e.fault_status();
+            (e.name().to_string(), (s.failed_total, s.cut_total))
+        })
+        .collect();
+    for worker in injected.keys() {
+        totals.entry(worker.clone()).or_insert((0, 0, 0, 0));
+    }
     let workers: Vec<Value> = totals
         .iter()
         .map(|(worker, (requests, prompt, cached, oracle))| {
+            let (failed, cut) = injected.get(worker).copied().unwrap_or((0, 0));
             json!({
                 "worker": worker,
                 "requests": requests,
                 "prompt_tokens": prompt,
                 "cached_tokens": cached,
                 "oracle_tokens": oracle,
+                "injected_failures": failed,
+                "cut_streams": cut,
             })
         })
         .collect();
     Json(json!({ "workers": workers }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn fail_query_arms_counts_and_clears() {
+        assert_eq!(fail_query(&query(&[("status", "0")])), Ok(None));
+        assert_eq!(fail_query(&query(&[])), Ok(None));
+        let next_two = fail_query(&query(&[("status", "503"), ("count", "2")]))
+            .unwrap()
+            .expect("armed");
+        assert_eq!(
+            (next_two.status, next_two.scope, next_two.after_tokens),
+            (503, FaultScope::Requests(2), None)
+        );
+        assert_eq!(next_two.stall, Duration::ZERO);
+        let open = fail_query(&query(&[("status", "500")]))
+            .unwrap()
+            .expect("armed");
+        assert_eq!(open.scope, FaultScope::Open);
+        let cut = fail_query(&query(&[
+            ("status", "502"),
+            ("after_tokens", "4"),
+            ("stall_ms", "250"),
+        ]))
+        .unwrap()
+        .expect("armed");
+        assert_eq!(cut.after_tokens, Some(4));
+        assert_eq!(cut.stall, Duration::from_millis(250));
+        let stall_only = fail_query(&query(&[("stall_ms", "3000"), ("count", "1")]))
+            .unwrap()
+            .expect("armed");
+        assert_eq!(
+            (stall_only.status, stall_only.scope),
+            (0, FaultScope::Requests(1))
+        );
+        let timed = fail_query(&query(&[("status", "429"), ("secs", "0.5")]))
+            .unwrap()
+            .expect("armed");
+        assert!(matches!(timed.scope, FaultScope::Until(at) if at > Instant::now()));
+    }
+
+    #[test]
+    fn fail_query_rejects_what_it_cannot_mean() {
+        for bad in [
+            query(&[("status", "200")]),
+            query(&[("status", "503"), ("count", "1"), ("secs", "1")]),
+            query(&[("status", "503"), ("count", "0")]),
+            query(&[("status", "503"), ("secs", "0")]),
+            query(&[("after_tokens", "2")]),
+            query(&[("status", "many")]),
+        ] {
+            assert!(fail_query(&bad).is_err(), "{bad:?}");
+        }
+    }
 }
