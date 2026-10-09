@@ -24,6 +24,7 @@ use crate::{
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
     encoders::{deepseek_v32, deepseek_v4, deepseek_v41},
+    native::NativeEncoder,
     traits::{
         Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens, TokenIdType,
         Tokenizer as TokenizerTrait,
@@ -51,6 +52,9 @@ pub struct HuggingFaceTokenizer {
     renderer: Renderer,
     /// Bytes per id, when the decoder is a plain `ByteLevel` (see `byte_level`).
     byte_level: Option<Arc<ByteLevelTable>>,
+    /// The direct encode path for byte-level BPE tokenizers of the common
+    /// shape (see `native`); `None` keeps every encode in `tokenizers`.
+    native: Option<NativeEncoder>,
 }
 
 const QWEN2_PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -289,6 +293,7 @@ impl HuggingFaceTokenizer {
 
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
+            native: NativeEncoder::from_tokenizer(&tokenizer),
             tokenizer,
             special_tokens,
             vocab,
@@ -358,6 +363,7 @@ impl HuggingFaceTokenizer {
 
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
+            native: NativeEncoder::from_tokenizer(&tokenizer),
             tokenizer,
             special_tokens,
             vocab,
@@ -492,6 +498,15 @@ struct TokenizerConfigResult {
 
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+        if !add_special_tokens {
+            if let Some(ids) = self
+                .native
+                .as_ref()
+                .and_then(|native| native.encode(self.tokenizer.get_model(), input))
+            {
+                return Ok(Encoding::Plain(ids));
+            }
+        }
         self.tokenizer
             .encode(input, add_special_tokens)
             .map_err(|e| Error::msg(format!("Encoding failed: {e}")))
