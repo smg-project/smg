@@ -638,8 +638,10 @@ mod tests {
 
     #[test]
     fn the_reasoning_prefix_wraps_the_tag_as_the_gateway_does() {
-        // `wrap_in_reasoning_prefix(tag, Glm4MoeParser::reasoning_prefix())`: a sequence of free
-        // text that writes none of the markers, closed by `</think>`, then the tag.
+        // `wrap_in_reasoning_prefix(tag, Glm4MoeParser::reasoning_prefix(..))`: a sequence of free
+        // text that writes none of the call markers, with nothing owed at its end (an engine that
+        // runs a reasoning parser applies the grammar only after the model's own `</think>`, so a
+        // prefix closed by `</think>` would be owed a second time), then the tag.
         let grammar = formats::glm()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar");
@@ -651,13 +653,11 @@ mod tests {
         assert_eq!(
             elements[0],
             value!({
-                "type": "tag",
-                "begin": "",
-                "content": {"type": "any_text", "excludes": [
-                    "<think>", "</think>", "<tool_call>", "</tool_call>",
+                "type": "any_text",
+                "excludes": [
+                    "<tool_call>", "</tool_call>",
                     "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
-                ]},
-                "end": "</think>",
+                ],
             })
         );
         assert_eq!(elements[1]["type"], "triggered_tags");
@@ -687,16 +687,16 @@ mod tests {
 
     #[test]
     fn the_prefix_excludes_each_tables_own_terminals_and_inner_tags() {
-        // No old builder wraps these two, so the derived shape is pinned here: the prefix's
-        // excludes are the table's terminals in order and the syntax's inner tags, its end the
-        // thought's close back to content, and the second element the tag as derived without it.
+        // No old builder wraps these two, so the derived shape is pinned here: the prefix is free
+        // text whose excludes are the table's terminals in order, the thought's own two left out
+        // so the model may close it where the engine runs the grammar from the first token, and
+        // the syntax's inner tags; nothing is owed at its end; the second element is the tag as
+        // derived without it.
         let tools = weather_tools();
         for (format, excludes) in [
             (
                 formats::deepseek_v4_1(),
                 value!([
-                    "<think>",
-                    "</think>",
                     "<｜DSML｜ calls>",
                     "</｜DSML｜ calls>",
                     "<｜DSML｜ invoke name=\"",
@@ -707,7 +707,7 @@ mod tests {
             ),
             (
                 formats::qwen3(CallSyntax::Json),
-                value!(["<think>", "</think>", "<tool_call>", "</tool_call>"]),
+                value!(["<tool_call>", "</tool_call>"]),
             ),
         ] {
             let wrapped = format
@@ -721,12 +721,7 @@ mod tests {
             assert_eq!(wrapped["type"], "sequence", "{}", format.name());
             assert_eq!(
                 wrapped["elements"][0],
-                value!({
-                    "type": "tag",
-                    "begin": "",
-                    "content": {"type": "any_text", "excludes": excludes},
-                    "end": "</think>",
-                }),
+                value!({"type": "any_text", "excludes": excludes}),
                 "{}",
                 format.name()
             );

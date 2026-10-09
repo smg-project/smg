@@ -273,21 +273,25 @@ mod tests {
 
     #[test]
     fn hy4_with_the_reasoning_open_takes_the_prefix_and_its_one_way_in() {
-        // Hy4's prompt opens the thought, so this is the path it takes most: the prefix closes the
-        // thought and can write none of the six terminals nor the four suffixed tags; the block
-        // behind it has its one way in, from content, with no close of its own before the opener.
+        // Hy4's prompt opens the thought, so this is the path it takes most: the prefix is free
+        // text that can write none of the four call terminals nor the four suffixed tags, the
+        // thought's own two allowed so the model may close it where the engine runs the grammar
+        // from the first token, and nothing owed at its end; the block behind it has its one way
+        // in, from content, with no close of its own before the opener.
         let payload = formats::hy4()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .payload();
         assert_eq!(payload["format"]["type"], "sequence");
         let prefix = &payload["format"]["elements"][0];
-        assert_eq!(prefix["end"], "</think:opensource>");
+        assert_eq!(prefix["type"], "any_text");
+        assert!(
+            prefix.get("end").is_none(),
+            "nothing owed at the prefix's end: {prefix}"
+        );
         assert_eq!(
-            prefix["content"]["excludes"],
+            prefix["excludes"],
             value!([
-                "<think:opensource>",
-                "</think:opensource>",
                 "<tool_calls:opensource>",
                 "</tool_calls:opensource>",
                 "<tool_call:opensource>",
@@ -311,12 +315,10 @@ mod tests {
             .expect("a grammar")
             .payload();
         assert_eq!(payload["format"]["type"], "sequence");
-        assert_eq!(payload["format"]["elements"][0]["end"], "</think>");
+        assert_eq!(payload["format"]["elements"][0]["type"], "any_text");
         assert_eq!(
-            payload["format"]["elements"][0]["content"]["excludes"],
+            payload["format"]["elements"][0]["excludes"],
             value!([
-                "<think>",
-                "</think>",
                 "<tool_call>",
                 "</tool_call>",
                 "<arg_key>",
