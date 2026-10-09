@@ -9,6 +9,7 @@
 //! - SSRF protection: only HTTPS URLs allowed, private IPs blocked
 //! - Response size limits to prevent DoS
 //! - Redirect prevention
+//! - Rate-limited refresh on an unknown `kid`
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -16,12 +17,18 @@ use std::{
 };
 
 use jsonwebtoken::jwk::{Jwk, JwkSet};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use url::Url;
 
 /// Maximum allowed JWKS response size (1 MB)
 const MAX_JWKS_RESPONSE_SIZE: u64 = 1024 * 1024;
+
+/// Minimum time between two fetches of the key set caused by a token whose `kid`
+/// is not in the cached set. That refresh is how a rotated key gets picked up,
+/// but the `kid` comes from an unauthenticated caller, so without a floor every
+/// made-up `kid` costs the issuer one request.
+const UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Error types for JWKS operations.
 #[derive(Debug, thiserror::Error)]
@@ -216,6 +223,9 @@ pub(crate) struct JwksProvider {
     cache: RwLock<Option<CachedJwks>>,
     /// Cache TTL
     ttl: Duration,
+    /// When the key set was last requested, whether or not the fetch succeeded;
+    /// gates the refresh on an unknown `kid`.
+    last_fetch_attempt: Mutex<Option<Instant>>,
 }
 
 impl JwksProvider {
@@ -238,6 +248,7 @@ impl JwksProvider {
             jwks_uri,
             cache: RwLock::new(None),
             ttl,
+            last_fetch_attempt: Mutex::new(None),
         })
     }
 
@@ -297,6 +308,7 @@ impl JwksProvider {
             jwks_uri: discovery.jwks_uri,
             cache: RwLock::new(None),
             ttl,
+            last_fetch_attempt: Mutex::new(None),
         })
     }
 
@@ -310,6 +322,7 @@ impl JwksProvider {
     /// Response size is limited to prevent DoS attacks.
     async fn fetch_jwks(&self) -> Result<JwkSet, JwksError> {
         debug!("Fetching JWKS from: {}", self.jwks_uri);
+        *self.last_fetch_attempt.lock() = Some(Instant::now());
 
         let response = self
             .client
@@ -389,7 +402,15 @@ impl JwksProvider {
             return Ok(key.clone());
         }
 
-        // Key not found - try refreshing the cache in case keys were rotated
+        // Key not found - try refreshing the cache in case keys were rotated,
+        // at most once per interval: inside it the kid is simply unknown.
+        if !self.unknown_kid_refresh_due() {
+            debug!(
+                "Key {} not found in cached JWKS; last fetch less than {:?} ago, not refreshing",
+                kid, UNKNOWN_KID_REFRESH_INTERVAL
+            );
+            return Err(JwksError::KeyNotFound(kid.to_string()));
+        }
         warn!("Key {} not found in cached JWKS, refreshing...", kid);
         let jwks = self.fetch_jwks().await?;
 
@@ -408,6 +429,18 @@ impl JwksProvider {
             .ok_or_else(|| JwksError::KeyNotFound(kid.to_string()))
     }
 
+    /// Whether a refresh for an unknown `kid` may go out now: only when no fetch
+    /// was attempted within [`UNKNOWN_KID_REFRESH_INTERVAL`]. Claims the slot, so
+    /// concurrent misses inside the window do not each fetch.
+    fn unknown_kid_refresh_due(&self) -> bool {
+        let mut last_attempt = self.last_fetch_attempt.lock();
+        if last_attempt.is_some_and(|at| at.elapsed() < UNKNOWN_KID_REFRESH_INTERVAL) {
+            return false;
+        }
+        *last_attempt = Some(Instant::now());
+        true
+    }
+
     /// Force refresh the JWKS cache.
     #[expect(dead_code)]
     pub async fn refresh(&self) -> Result<(), JwksError> {
@@ -424,6 +457,15 @@ impl JwksProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
+
     use super::*;
 
     #[test]
@@ -546,5 +588,156 @@ mod tests {
         // Public IPs should not be blocked
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+
+    /// A JWKS endpoint over loopback that counts its hits and serves whatever
+    /// key set (or failure) it currently holds.
+    #[derive(Clone)]
+    struct JwksServer {
+        url: String,
+        hits: Arc<AtomicUsize>,
+        keys: Arc<RwLock<Vec<&'static str>>>,
+        failing: Arc<RwLock<bool>>,
+    }
+
+    impl JwksServer {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the server lives exactly as long as the test"
+        )]
+        async fn start(kids: &[&'static str]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = Self {
+                url: format!(
+                    "http://127.0.0.1:{}/jwks.json",
+                    listener.local_addr().unwrap().port()
+                ),
+                hits: Arc::default(),
+                keys: Arc::new(RwLock::new(kids.to_vec())),
+                failing: Arc::default(),
+            };
+            let app = Router::new()
+                .route(
+                    "/jwks.json",
+                    get(|State(server): State<Self>| async move { server.respond() }),
+                )
+                .with_state(server.clone());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            server
+        }
+
+        fn respond(&self) -> (StatusCode, Json<Value>) {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            if *self.failing.read() {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+            }
+            let keys: Vec<Value> = self
+                .keys
+                .read()
+                .iter()
+                .map(|kid| {
+                    json!({ "kty": "RSA", "use": "sig", "alg": "RS256", "kid": kid,
+                            "n": "sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1Wl", "e": "AQAB" })
+                })
+                .collect();
+            (StatusCode::OK, Json(json!({ "keys": keys })))
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+
+        fn provider(&self) -> JwksProvider {
+            JwksProvider::new(self.url.clone(), Duration::from_secs(3600)).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_kid_does_not_refetch_a_recently_fetched_key_set() {
+        let server = JwksServer::start(&["k1"]).await;
+        let provider = server.provider();
+
+        assert_eq!(
+            provider
+                .get_key("k1")
+                .await
+                .unwrap()
+                .common
+                .key_id
+                .as_deref(),
+            Some("k1")
+        );
+        assert_eq!(server.hits(), 1);
+
+        for kid in ["unknown-1", "unknown-2", "unknown-1"] {
+            let err = provider.get_key(kid).await.unwrap_err();
+            assert!(
+                matches!(&err, JwksError::KeyNotFound(k) if k == kid),
+                "{err:?}"
+            );
+        }
+        assert_eq!(
+            server.hits(),
+            1,
+            "misses inside the interval must not fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotated_key_is_fetched_once_the_interval_has_passed() {
+        let server = JwksServer::start(&["k1"]).await;
+        let provider = server.provider();
+        provider.get_key("k1").await.unwrap();
+        *server.keys.write() = vec!["k2"];
+
+        // Inside the interval the new key is still unknown ...
+        assert!(matches!(
+            provider.get_key("k2").await,
+            Err(JwksError::KeyNotFound(_))
+        ));
+        assert_eq!(server.hits(), 1);
+
+        // ... and once the interval has passed, one refetch picks it up.
+        *provider.last_fetch_attempt.lock() = Some(Instant::now() - UNKNOWN_KID_REFRESH_INTERVAL);
+        assert_eq!(
+            provider
+                .get_key("k2")
+                .await
+                .unwrap()
+                .common
+                .key_id
+                .as_deref(),
+            Some("k2")
+        );
+        assert_eq!(server.hits(), 2);
+
+        // That refetch opened a new interval: the next miss does not fetch.
+        assert!(matches!(
+            provider.get_key("k3").await,
+            Err(JwksError::KeyNotFound(_))
+        ));
+        assert_eq!(server.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refetch_counts_against_the_interval() {
+        let server = JwksServer::start(&["k1"]).await;
+        let provider = server.provider();
+        provider.get_key("k1").await.unwrap();
+        *server.failing.write() = true;
+        *provider.last_fetch_attempt.lock() = Some(Instant::now() - UNKNOWN_KID_REFRESH_INTERVAL);
+
+        assert!(matches!(
+            provider.get_key("k2").await,
+            Err(JwksError::JwksFetch(_))
+        ));
+        assert_eq!(server.hits(), 2);
+
+        // The issuer is failing: further misses do not retry it until the interval has passed.
+        assert!(matches!(
+            provider.get_key("k2").await,
+            Err(JwksError::KeyNotFound(_))
+        ));
+        assert_eq!(server.hits(), 2);
     }
 }
