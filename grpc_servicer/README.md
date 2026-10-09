@@ -336,15 +336,35 @@ subscription from zero while it is complete, and a state snapshot
 replay is conservatively reset because it cannot distinguish an idle publisher
 from a restarted one.
 
-#### Rust request path (`SMG_SGLANG_SERVICER_IMPL=rust`)
+#### Rust request path (`--servicer-impl rust`)
 
-`sglang.launch_server --grpc-mode` hands the process to this package's
-`serve_grpc`. With `SMG_SGLANG_SERVICER_IMPL=rust` that entry serves the
-`sglang.grpc.scheduler.SglangScheduler` contract from Rust
-(`smg.servicer.SglangGrpcServer`, which needs the `smg` wheel) instead: the
-scheduler runs headless in a spawned child over the msgpack ZMQ wire below,
-the Rust server speaks the gRPC contract on top of it, and Python keeps the
-lifecycle only. The Router cannot tell the two implementations apart: text
+`sglang serve --grpc-mode` (`python -m sglang.launch_server --grpc-mode`)
+hands the process to this package's `serve_grpc`. With `--servicer-impl rust`
+that entry serves the `sglang.grpc.scheduler.SglangScheduler` contract from
+Rust (`smg.servicer.SglangGrpcServer`, which needs the `smg` wheel) instead:
+the scheduler runs headless in a spawned child over the msgpack ZMQ wire
+below, the Rust server speaks the gRPC contract on top of it, and Python keeps
+the lifecycle only. The flag is this package's, as it is for vLLM: SGLang
+loads it as an `sglang.srt.plugins` entry point while it builds its parser
+(`smg_grpc_servicer/sglang/plugin.py`), and `SMG_SGLANG_SERVICER_IMPL` is the
+fallback the flag overrides (flag, then the environment, then `python`; the
+servicer logs which one decided). A `SGLANG_PLUGINS` whitelist without
+`smg-servicer` removes the flag, not the environment form.
+
+```bash
+# Python (default)
+sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000
+
+# Rust request path, same entrypoint
+sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --servicer-impl rust
+
+# The environment form, overridden by the flag when both are given
+SMG_SGLANG_SERVICER_IMPL=rust sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000
+```
+
+`python -m sglang.launch_server --help` lists the flag; `sglang serve --help`
+prints SGLang's help before it loads plugins, so the flag is missing from that
+listing but accepted. The Router cannot tell the two implementations apart: text
 generation with sampled and prompt logprobs, reasoning-token counts, LoRA ids
 and custom logit processors forwarded as the Python servicer forwards them,
 `Embed`, `FlushCache` and profiling (the scheduler's own control requests,

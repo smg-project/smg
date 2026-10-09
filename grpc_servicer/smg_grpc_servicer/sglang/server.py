@@ -30,7 +30,7 @@ from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_servicer.hostport import host_port, loopback_target
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
-from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, resolve_servicer_impl, serve_rust
+from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, serve_rust, servicer_impl_source
 from smg_grpc_servicer.sglang.scheduler_launcher import (
     launch_scheduler_process_only,
     terminate_scheduler_processes,
@@ -110,9 +110,12 @@ async def serve_grpc(
             callback signature is a public contract.
     """
 
-    # One flag selects the Rust request path; the entrypoint and every
+    # One flag selects the Rust request path (--servicer-impl, this package's
+    # flag on SGLang's parser, else the environment); the entrypoint and every
     # ServerArgs flag stay the same, and the Router cannot tell them apart.
-    if resolve_servicer_impl() == "rust":
+    impl, origin = servicer_impl_source(server_args)
+    logger.info("Servicer implementation: %s (source=%s)", impl, origin)
+    if impl == "rust":
         if on_request_manager_ready is not None:
             logger.warning(
                 "%s=rust: SGLang's HTTP sidecar (metrics, profiling endpoints) stays off; "

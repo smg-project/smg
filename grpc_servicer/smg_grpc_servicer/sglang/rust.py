@@ -3,8 +3,11 @@
 ``sglang.launch_server --grpc-mode`` hands the process to this package's
 :func:`smg_grpc_servicer.sglang.server.serve_grpc`, which serves
 ``sglang.grpc.scheduler.SglangScheduler`` from Python over a request manager
-in front of the scheduler. With ``SMG_SGLANG_SERVICER_IMPL=rust`` the same
-entrypoint hands the process to :func:`serve_rust` before any of that exists:
+in front of the scheduler. With ``--servicer-impl rust`` (a flag this package
+adds to SGLang's parser as an SGLang plugin, see
+:mod:`smg_grpc_servicer.sglang.plugin`; ``SMG_SGLANG_SERVICER_IMPL=rust`` is
+the fallback the flag overrides) the same entrypoint hands the process to
+:func:`serve_rust` before any of that exists:
 the contract is served by the Rust :class:`smg.servicer.SglangGrpcServer` on a
 Rust-owned thread, and the scheduler runs headless in a spawned child (this
 package's :mod:`headless` launcher, with its SGLang plugin dialing the
@@ -25,7 +28,7 @@ import json
 import logging
 import multiprocessing
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port
@@ -57,16 +60,46 @@ _OFF_VALUES = ("0", "false", "no", "off")
 # the topic; no replay socket).
 DEFAULT_KV_EVENTS_CONFIG = '{"publisher": "zmq"}'
 IMPLS = ("python", "rust")
+# Where the implementation choice came from, for the startup log line.
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
 
 
-def resolve_servicer_impl(environ: Mapping[str, str] | None = None) -> str:
-    """Which implementation serves this process: ``$SMG_SGLANG_SERVICER_IMPL``,
-    else python."""
+def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
+    """Which implementation serves this process: the launcher's
+    ``--servicer-impl`` when it carried one (``args.servicer_impl``, or the
+    value this package's SGLang plugin parsed in this process), else
+    ``$SMG_SGLANG_SERVICER_IMPL``, else python."""
+    return servicer_impl_source(args, environ)[0]
+
+
+def servicer_impl_source(
+    args: Any = None, environ: Mapping[str, str] | None = None
+) -> tuple[str, str]:
+    """:func:`resolve_servicer_impl`'s answer with where it came from:
+    ``flag``, ``env`` or ``default``.
+
+    A decision made with the launcher's flag in hand is written back to the
+    environment, so the headless scheduler child and anything that reads only
+    the variable agree with it when ``--servicer-impl python`` overrides an
+    exported ``rust``."""
     source = os.environ if environ is None else environ
-    value = str(source.get(SERVICER_IMPL_ENV) or "python").strip().lower()
+    value = getattr(args, "servicer_impl", None) if args is not None else None
+    if not value:
+        from smg_grpc_servicer.sglang import plugin
+
+        value = plugin.parsed_flag()
+    origin = SOURCE_FLAG
+    if not value:
+        value = source.get(SERVICER_IMPL_ENV)
+        origin = SOURCE_ENV if value else SOURCE_DEFAULT
+    value = str(value or "python").strip().lower()
     if value not in IMPLS:
         raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    return value
+    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
+        source[SERVICER_IMPL_ENV] = value
+    return value, origin
 
 
 # ---------------------------------------------------------------------------
