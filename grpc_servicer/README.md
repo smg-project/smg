@@ -49,11 +49,16 @@ vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc --mm-processor inprocess \
 ```
 
 The `--mm-*` flags come from a vLLM launcher that knows them (it hands an
-`MmSettings` to `VllmEngineServicer`); an older launcher, or a flag left out,
-falls back to the matching `SMG_VLLM_MM_*` variable, which logs a deprecation
-line and goes away in the next minor release. The startup line
-`VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and the
-`mm_processor_source` label name where the value came from.
+`MmSettings` to `VllmEngineServicer`), or from this package's general plugin,
+which defines them on a gRPC launcher's parser that lacks them: `vllm serve
+--grpc` and the stock `python -m vllm.entrypoints.grpc_server` (there the
+values also reach a servicer built without the namespace, through the
+environment). A flag left out falls back to the matching `SMG_VLLM_MM_*`
+variable, which logs a deprecation line on a launcher that has the flag; a
+launcher without the flags (no plugins loaded, a servicer built on its own)
+takes the variable as its documented setting and logs nothing. The startup
+line `VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and
+the `mm_processor_source` label name where the value came from.
 
 The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards

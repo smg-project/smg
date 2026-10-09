@@ -196,6 +196,73 @@ def test_plugin_adds_the_servicer_impl_flag_to_grpc_parsers(monkeypatch):
     assert not hasattr(plain.parse_args(["--model", "m"]), "servicer_impl")
 
 
+def test_plugin_defines_the_mm_flags_on_grpc_launcher_parsers(monkeypatch):
+    """The stock gRPC launcher's parser defines no --mm-* flag, so the media
+    mode was selectable there through the environment only: the plugin adds
+    the flags when the process's __main__ is that launcher module, and to a
+    `vllm serve` parser (--grpc) that lacks them; other commands' parsers and
+    a __main__ without a spec (a console script) are left alone."""
+    from smg_grpc_servicer.vllm import plugin
+
+    def launcher_parser():
+        parser = argparse.ArgumentParser(prog="grpc_server")
+        parser.add_argument("--host")
+        parser.add_argument("--port", type=int, default=50051)
+        parser.add_argument("--model")
+        return parser
+
+    def main_module(name):
+        spec = None if name is None else types.SimpleNamespace(name=name)
+        return types.SimpleNamespace(__spec__=spec)
+
+    monkeypatch.setitem(sys.modules, "__main__", main_module("vllm.entrypoints.cli.main"))
+    assert plugin.add_mm_arguments_to_grpc_parser(launcher_parser()) == []
+    serve = launcher_parser()
+    serve.add_argument("--grpc", action="store_true")
+    assert plugin.add_mm_arguments_to_grpc_parser(serve)[0] == "--mm-processor"
+    for name in ("vllm.entrypoints.grpc_server", "vllm.entrypoints.launchers.grpc_server"):
+        monkeypatch.setitem(sys.modules, "__main__", main_module(name))
+        parser = launcher_parser()
+        assert plugin.add_mm_arguments_to_grpc_parser(parser)[0] == "--mm-processor"
+        args = parser.parse_args(["--model", "m", "--mm-processor", "smg", "--mm-max-items", "2"])
+        assert (args.mm_processor, args.mm_max_items) == ("smg", 2)
+        assert plugin.add_mm_arguments_to_grpc_parser(parser) == []  # once
+    monkeypatch.setitem(sys.modules, "__main__", main_module(None))
+    assert plugin.add_mm_arguments_to_grpc_parser(launcher_parser()) == []
+
+
+def test_plugin_parses_the_mm_flags_and_exports_them_for_the_python_servicer(monkeypatch):
+    """With vLLM installed: the stock launcher's parse step grows the flags and
+    carries their values into the environment, where a servicer built without
+    the namespace (upstream's launcher) reads them."""
+    pytest.importorskip("vllm")
+    from smg_grpc_servicer.vllm import plugin
+    from smg_grpc_servicer.vllm.mm_processor import MmSettings
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    # Recorded, so teardown undoes what the parse step exports.
+    monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "off")
+    monkeypatch.setenv("SMG_VLLM_MM_MAX_ITEMS", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "__main__",
+        types.SimpleNamespace(__spec__=types.SimpleNamespace(name="vllm.entrypoints.grpc_server")),
+    )
+    plugin.register()
+    parser = FlexibleArgumentParser(prog="grpc_server")
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int, default=50051)
+    args = parser.parse_args(["--mm-processor", "smg", "--mm-max-items", "4"])
+    assert (args.mm_processor, args.mm_max_items) == ("smg", 4)
+    assert os.environ["SMG_VLLM_MM_PROCESSOR"] == "smg"
+    assert os.environ["SMG_VLLM_MM_MAX_ITEMS"] == "4"
+    assert "--mm-processor" in parser.format_help()
+    resolved = MmSettings.from_args(args).resolve(env={})
+    assert (resolved.processor, resolved.max_items, resolved.source) == ("smg", 4, "flag")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--mm-processor", "sidecar"])
+
+
 def test_plugin_entry_point_is_declared():
     pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
     assert 'smg-servicer = "smg_grpc_servicer.vllm.plugin:register"' in pyproject
