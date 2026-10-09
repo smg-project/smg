@@ -10,11 +10,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     ops::Deref,
-    time::Duration,
 };
 
 use bytes::Bytes;
-use tokio::{sync::mpsc, time::timeout};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use zeromq::{
     prelude::{Socket, SocketRecv, SocketSend},
@@ -31,6 +30,7 @@ use crate::{
         },
         EngineBatch, EngineProtocol,
     },
+    startup::{StartupBudget, StartupClock},
 };
 
 /// Single-frame sentinel Python `EngineCoreProc` emits on the output socket when
@@ -160,16 +160,21 @@ fn unexpected_handshake(message: impl Into<String>) -> Error {
 /// The frontend binds the shared input/output sockets first, then the handshake
 /// socket, drives HELLO -> INIT -> READY per engine, and finally waits for each
 /// engine to register (its `EngineCoreReadyResponse`) on the input socket.
+///
+/// `startup` bounds the waits: a plain [`std::time::Duration`] is a
+/// per-message timeout; a [`StartupBudget`] lets signs of life from outside
+/// the wire extend the silence bound, under a ceiling.
 pub async fn connect_handshake(
     handshake_address: &str,
     engine_count: usize,
     local_input_address: &str,
     local_output_address: &str,
-    ready_timeout: Duration,
+    startup: impl Into<StartupBudget>,
 ) -> Result<ConnectedTransport> {
     if engine_count == 0 {
         return Err(unexpected_handshake("expected engine_count >= 1"));
     }
+    let clock = StartupClock::new(startup);
 
     info!(
         engine_count,
@@ -191,12 +196,7 @@ pub async fn connect_handshake(
 
     // 3. Receive HELLO from every engine and send a matching INIT.
     while engines.len() < engine_count {
-        let message = timeout(ready_timeout, handshake_socket.recv())
-            .await
-            .map_err(|_| Error::HandshakeTimeout {
-                stage: "HELLO",
-                timeout: ready_timeout,
-            })??;
+        let message = clock.wait("HELLO", handshake_socket.recv()).await??;
         let (engine_id, handshake_message) = decode_handshake_message(message)?;
         match handshake_message.status.as_deref() {
             Some("HELLO") => {
@@ -238,12 +238,7 @@ pub async fn connect_handshake(
 
     // 4. Every engine may now send READY (no coordinator gate in this scope).
     while engines.values().any(|state| !state.is_ready_received()) {
-        let message = timeout(ready_timeout, handshake_socket.recv())
-            .await
-            .map_err(|_| Error::HandshakeTimeout {
-                stage: "READY",
-                timeout: ready_timeout,
-            })??;
+        let message = clock.wait("READY", handshake_socket.recv()).await??;
         let (engine_id, handshake_message) = decode_handshake_message(message)?;
         match handshake_message.status.as_deref() {
             Some("READY") => match engines.get_mut(&engine_id) {
@@ -272,7 +267,7 @@ pub async fn connect_handshake(
 
     // 5. Wait for every engine to register on the shared input socket.
     let engines =
-        wait_for_input_registrations(&mut input_socket, engines.into_keys(), ready_timeout).await?;
+        wait_for_input_registrations(&mut input_socket, engines.into_keys(), &clock).await?;
     info!(engine_count = engines.len(), "engines connected");
 
     let (input_send, _) = input_socket.split();
@@ -346,17 +341,21 @@ async fn send_init_message(
 async fn wait_for_input_registrations(
     input_socket: &mut RouterSocket,
     expected_engines: impl IntoIterator<Item = EngineId>,
-    ready_timeout: Duration,
+    clock: &StartupClock,
 ) -> Result<Vec<ConnectedEngine>> {
     let expected_engines = expected_engines.into_iter().collect::<Vec<_>>();
     let mut pending = expected_engines.iter().cloned().collect::<BTreeSet<_>>();
     let mut ready_responses = BTreeMap::new();
 
     while !pending.is_empty() {
-        let registration = timeout(ready_timeout, input_socket.recv())
+        let registration = clock
+            .wait("input registration", input_socket.recv())
             .await
-            .map_err(|_| Error::InputRegistrationTimeout {
-                timeout: ready_timeout,
+            .map_err(|error| match error {
+                Error::HandshakeTimeout { timeout, .. } => {
+                    Error::InputRegistrationTimeout { timeout }
+                }
+                other => other,
             })??;
 
         let frames = registration.into_vec();
@@ -470,6 +469,8 @@ pub async fn run_output_loop<P: EngineProtocol>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::{
         codec::encode_msgpack,

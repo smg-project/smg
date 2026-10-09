@@ -23,7 +23,8 @@ use engine_servicer::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
     ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
     TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
-    VllmServicerConfig, VllmServicerServer, DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    VllmServicerConfig, VllmServicerServer, DEFAULT_ENGINE_STARTUP_CEILING,
+    DEFAULT_ENGINE_STARTUP_TIMEOUT,
 };
 use llm_multimodal::Modality;
 use prost::Message;
@@ -61,6 +62,27 @@ fn startup_timeout(secs: Option<f64>) -> PyResult<Duration> {
             "engine_startup_timeout_secs must be positive, got {secs}"
         ))),
     }
+}
+
+/// The bound on the whole engine start from the launcher's seconds: `None`
+/// is the crate default, `0` is no ceiling.
+fn startup_ceiling(secs: Option<f64>) -> PyResult<Option<Duration>> {
+    let Some(secs) = secs else {
+        return Ok(Some(DEFAULT_ENGINE_STARTUP_CEILING));
+    };
+    if secs == 0.0 {
+        return Ok(None);
+    }
+    if secs < 0.0 || secs.is_nan() {
+        return Err(PyValueError::new_err(format!(
+            "engine_startup_ceiling_secs must be positive, or 0 for no ceiling, got {secs}"
+        )));
+    }
+    Duration::try_from_secs_f64(secs)
+        .map(Some)
+        .map_err(|error| {
+            PyValueError::new_err(format!("engine_startup_ceiling_secs {secs}: {error}"))
+        })
 }
 
 /// Install the Rust tracing subscriber for a process that only hosts a
@@ -558,6 +580,7 @@ impl PyVllmGrpcServer {
         media_processor = None,
         smg_media_processor = None,
         engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -600,6 +623,7 @@ impl PyVllmGrpcServer {
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
         engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
     ) -> PyResult<Self> {
         if media_processor.is_some() && smg_media_processor.is_some() {
             return Err(PyValueError::new_err(
@@ -655,6 +679,7 @@ impl PyVllmGrpcServer {
             model,
             media_processor,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
         let inner = py.detach(|| -> PyResult<VllmServicerServer> {
             let Some(native) = native else {
@@ -717,6 +742,16 @@ impl PyVllmGrpcServer {
     #[getter]
     fn engine_ready(&self) -> bool {
         self.inner.engine_ready()
+    }
+
+    /// Report that the engine process is alive while the handshake runs: the
+    /// launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the engine
+    /// is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
     }
 
     /// The last fatal error (engine connect or server exit), if any.

@@ -19,7 +19,7 @@ use engine_zmq_client::{
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams},
         EngineLoad,
     },
-    ConnectedEngine,
+    ConnectedEngine, StartupBudget,
 };
 use futures::{stream::SelectAll, StreamExt};
 use llm_tokenizer::traits::Tokenizer;
@@ -157,10 +157,11 @@ pub async fn connect_for_worker(
 /// data-plane sockets under `base_url`, clear stale socket files, and complete
 /// the handshake. For a frontend that already knows the model's EOS ids from
 /// the engine's own config (the Rust gRPC servicer) and has no model dir to
-/// read them from. `startup_timeout` bounds the handshake: the gateway's
-/// connector passes [`ZMQ_CONNECT_TIMEOUT`]; a servicer that launches its own
-/// engine passes what that engine's start may take. `handshake` is the
-/// endpoint the engine dials: a registered worker's is tcp-only
+/// read them from. `startup` bounds the handshake: the gateway's connector
+/// passes [`ZMQ_CONNECT_TIMEOUT`]; a servicer that launches its own engine
+/// passes a [`StartupBudget`] shaped by what that engine's start may take
+/// and by the signs of life it sees from the engine process. `handshake` is
+/// the endpoint the engine dials: a registered worker's is tcp-only
 /// ([`Handshake::registered`]); a servicer's own link may bind an `ipc://`
 /// socket ([`Handshake::TcpOrIpc`]).
 pub async fn connect_with_eos(
@@ -170,7 +171,7 @@ pub async fn connect_with_eos(
     handshake: Handshake<'_>,
     engine_count: usize,
     eos: EosTokenIds,
-    startup_timeout: Duration,
+    startup: impl Into<StartupBudget>,
 ) -> Result<ZmqEngineClient, String> {
     let (handshake, input, output) = zmq_socket_addresses(base_url, handshake)?;
     ensure_ipc_socket_dir(base_url).await?;
@@ -195,7 +196,7 @@ pub async fn connect_with_eos(
         model_id,
         eos,
         runtime,
-        startup_timeout,
+        startup,
     )
     .await
     .map_err(|e| format!("Failed to connect ZMQ engine: {e}"))
@@ -232,7 +233,9 @@ impl ZmqEngineClient {
     /// `input_address`/`output_address` are the `ipc://` data-plane endpoints the
     /// engines connect to (chosen by SMG). `engine_count` is the number of DP
     /// ranks to await. `runtime` selects the wire protocol spoken over the shared
-    /// transport (vLLM EngineCore vs TokenSpeed).
+    /// transport (vLLM EngineCore vs TokenSpeed). `startup` bounds the
+    /// handshake (see [`StartupBudget`]; a plain [`Duration`] is a per-message
+    /// timeout).
     #[expect(
         clippy::too_many_arguments,
         reason = "transport constructor: endpoints, engine count, and runtime are all irreducible connection inputs"
@@ -245,7 +248,7 @@ impl ZmqEngineClient {
         model_id: String,
         eos: EosTokenIds,
         runtime: RuntimeType,
-        timeout: Duration,
+        startup: impl Into<StartupBudget>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Resolve the dialect before the handshake: no silent fallback for a
         // runtime with no ZMQ engine adapter, and no such engine ever dials in,
@@ -270,7 +273,7 @@ impl ZmqEngineClient {
             engine_count,
             input_address,
             output_address,
-            timeout,
+            startup,
         )
         .await?;
         let backend = match dialect {

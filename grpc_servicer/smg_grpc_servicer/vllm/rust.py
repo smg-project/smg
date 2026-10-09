@@ -52,6 +52,7 @@ from typing import Any
 from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
+    DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
     EngineProcessGroup,
@@ -74,6 +75,7 @@ SERVICER_IMPL_ENV = "SMG_VLLM_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_VLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS"
+STARTUP_CEILING_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep vLLM's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_VLLM_SERVICER_KV_EVENTS"
@@ -422,6 +424,8 @@ async def serve_rust(args: argparse.Namespace) -> int:
     )
 
     init_servicer_tracing()
+    startup_timeout_secs = _env_float(STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS)
+    startup_ceiling_secs = _env_float(STARTUP_CEILING_SECS_ENV, DEFAULT_STARTUP_CEILING_SECS)
     server = VllmGrpcServer(
         # `vllm serve` leaves host unset and upstream binds all interfaces then.
         bind_address=host_port(getattr(args, "host", None) or "0.0.0.0", args.port),
@@ -431,9 +435,8 @@ async def serve_rust(args: argparse.Namespace) -> int:
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=data_parallel_size,
         tokenizer_dir=tokenizer_dir,
-        engine_startup_timeout_secs=_env_float(
-            STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS
-        ),
+        engine_startup_timeout_secs=startup_timeout_secs,
+        engine_startup_ceiling_secs=startup_ceiling_secs,
         media_processor=media,
         smg_media_processor=smg_media,
         **info,
@@ -443,6 +446,14 @@ async def serve_rust(args: argparse.Namespace) -> int:
         server.address,
         handshake_port,
         data_parallel_size,
+    )
+    logger.info(
+        "Engine startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+        "the handshake waits while the engine process is alive",
+        startup_timeout_secs,
+        STARTUP_TIMEOUT_SECS_ENV,
+        f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
+        STARTUP_CEILING_SECS_ENV,
     )
     try:
         engine = launch_engine_cores(

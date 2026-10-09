@@ -149,9 +149,14 @@ pub struct VllmServicerConfig {
     /// Worker-side media processing for `media_refs`; `None` refuses them, as
     /// the Python servicer does with `--mm-processor off`.
     pub media_processor: Option<Arc<dyn MediaProcessor>>,
-    /// Bound on the engine's startup handshake; see
-    /// [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
+    /// Bound on silence during the engine's startup handshake: a handshake
+    /// message or a [`VllmServicerServer::note_engine_alive`] report resets
+    /// it; see [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
     pub engine_startup_timeout: Duration,
+    /// Bound on the whole startup handshake however alive the engine is;
+    /// `None` leaves that to the silence bound and the lifecycle owner. See
+    /// [`crate::DEFAULT_ENGINE_STARTUP_CEILING`].
+    pub engine_startup_ceiling: Option<Duration>,
 }
 
 impl std::fmt::Debug for VllmServicerConfig {
@@ -321,6 +326,12 @@ impl VllmServicerServer {
         if config.engine_startup_timeout.is_zero() {
             return Err(invalid("engine_startup_timeout must be positive"));
         }
+        if config
+            .engine_startup_ceiling
+            .is_some_and(|ceiling| ceiling.is_zero())
+        {
+            return Err(invalid("engine_startup_ceiling must be positive when set"));
+        }
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
@@ -366,6 +377,7 @@ impl VllmServicerServer {
             engine_count,
             tokenizer_dir,
             engine_startup_timeout,
+            engine_startup_ceiling,
             ..
         } = config;
         let thread = ServerThread::start(
@@ -390,6 +402,7 @@ impl VllmServicerServer {
                     handshake_address,
                     engine_count,
                     engine_startup_timeout,
+                    engine_startup_ceiling,
                     tokenizer_dir,
                     last_error,
                 ));
@@ -461,6 +474,18 @@ impl VllmServicerServer {
     /// Whether the engine handshake completed.
     pub fn engine_ready(&self) -> bool {
         self.state.engine.client.get().is_some()
+    }
+
+    /// Report a sign of life from the engine process while the handshake
+    /// runs: the lifecycle owner that launched it calls this each time it
+    /// polls the process and finds it alive. Each report resets the
+    /// handshake's silence bound (`engine_startup_timeout`); the ceiling
+    /// (`engine_startup_ceiling`) still holds. A no-op once the engine is
+    /// connected.
+    pub fn note_engine_alive(&self) {
+        if !self.engine_ready() {
+            self.state.engine.liveness.touch();
+        }
     }
 
     pub fn last_error(&self) -> Result<Option<String>, ServicerError> {

@@ -182,9 +182,14 @@ explicit one is kept as given, and `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the
 publisher off). Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
 `SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
 `SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800: how long the servicer
-waits for the engine's handshake; an engine's first start on a host
-JIT-compiles and autotunes kernels, and a dead engine fails fast regardless),
-`SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS` (default 4).
+waits for a sign of life from the engine during its handshake; the launcher
+reports the engine process alive each time it polls it, and the handshake's
+own messages count too, so a healthy start that takes longer, a large
+checkpoint streaming in for an hour, still completes, while an engine that
+exits fails fast regardless), `SMG_VLLM_SERVICER_STARTUP_CEILING_SECS`
+(default 14400: the most a start may take however alive the engine is; 0
+lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
+(default 4).
 
 Worker-side media processing uses the same `--mm-processor` /
 `SMG_VLLM_MM_PROCESSOR` setting as the Python servicer, with one more choice:

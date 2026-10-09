@@ -833,6 +833,10 @@ class FakeServer:
         self.last_error = None
         self.running = True
         self.events: list[str] = []
+        self.alive_reports = 0
+
+    def note_engine_alive(self) -> None:
+        self.alive_reports += 1
 
     def set_serving(self, serving: bool) -> None:
         self.events.append(f"serving:{serving}")
@@ -913,6 +917,25 @@ def test_supervise_drains_then_stops_on_a_signal():
     # Draining is announced before the stop, with the engine still up for it.
     assert server.events == ["serving:False", "stop:1.0"]
     assert engine.events == ["terminate"]
+
+
+def test_supervise_reports_the_engine_alive_while_its_handshake_runs():
+    """Every poll that finds the engine process alive before the handshake
+    completed is a sign of life for the server's startup bound; a connected
+    engine needs no more reports."""
+    server, engine = FakeServer(), FakeEngine()
+    assert _run_supervise(server, engine, before=lambda stop: stop.set()) == 0
+    assert server.alive_reports >= 1
+
+    connected, engine = FakeServer(), FakeEngine()
+    connected.engine_ready = True
+    assert _run_supervise(connected, engine, before=lambda stop: stop.set()) == 0
+    assert connected.alive_reports == 0
+
+    class ServerWithoutReports(FakeServer):
+        note_engine_alive = None  # an older binding: the supervisor does without
+
+    assert _run_supervise(ServerWithoutReports(), FakeEngine(), before=lambda stop: stop.set()) == 0
 
 
 def test_supervise_exits_nonzero_when_an_engine_core_dies_and_shuts_the_others_down():
@@ -1095,6 +1118,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert kwargs["engine_count"] == 2
     assert kwargs["tokenizer_dir"] == str(tmp_path)
     assert kwargs["engine_startup_timeout_secs"] == rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS
+    assert kwargs["engine_startup_ceiling_secs"] == rust_lifecycle.DEFAULT_STARTUP_CEILING_SECS
     assert kwargs["served_model_name"] == "served-a"
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
     assert kwargs["kv_connector"] == ""

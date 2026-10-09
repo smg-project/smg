@@ -27,6 +27,7 @@ pub mod codec;
 pub mod connector;
 mod error;
 pub mod protocol;
+pub mod startup;
 pub mod transport;
 
 /// Engine-side ZMQ driver for a mock vLLM EngineCore. Compiled for the crate's
@@ -42,4 +43,5 @@ pub use connector::{
     TokenSpeedClient, TokenSpeedStream,
 };
 pub use error::{Error, Result};
+pub use startup::{EngineLiveness, StartupBudget};
 pub use transport::{connect_handshake, ConnectedEngine, EngineId, ENGINE_CORE_DEAD_SENTINEL};
