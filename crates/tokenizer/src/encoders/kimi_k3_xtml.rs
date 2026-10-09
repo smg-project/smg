@@ -101,7 +101,9 @@ pub const DEFAULT_THINKING_EFFORT: &str = "max";
 ///
 /// `params.tools` (when non-empty) produces the leading `tool-declare` system
 /// message. `params.add_generation_prompt` appends the assistant generation
-/// prompt tail. Thinking mode is resolved from `template_kwargs["thinking"]`
+/// prompt tail. Thinking mode is resolved from `template_kwargs["thinking"]`,
+/// then vLLM's `enable_thinking` alias and a `reasoning_effort` of `"none"` in
+/// the kwargs (the rewrites the engine's own server applies before rendering),
 /// then `params.thinking`, defaulting to `true` to match the Python
 /// `build_chat_segments(thinking=True)` default; it selects `think` vs
 /// `response` for both the generation-prompt tail and (per-turn) any prior
@@ -162,10 +164,28 @@ fn render_xtml(
         .filter(|t| !t.is_empty())
         .map(|t| deep_sort(&Value::Array(t.to_vec())));
 
-    let thinking = params
-        .template_kwargs
-        .and_then(|k| k.get("thinking"))
-        .and_then(Value::as_bool)
+    // Thinking mode, resolved as the engine's own server resolves it before
+    // calling the checkpoint's `apply_chat_template` (vLLM's K3 renderer
+    // rewrites the kwargs first): an explicit `thinking` kwarg wins, then
+    // vLLM's `enable_thinking` alias, then a `reasoning_effort` of `"none"` in
+    // the kwargs, then the request-level toggle the gateway derived; absent
+    // all of them, the encoder's `build_chat_segments(thinking=True)` default.
+    let kwarg_bool = |key: &str| {
+        params
+            .template_kwargs
+            .and_then(|k| k.get(key))
+            .and_then(Value::as_bool)
+    };
+    let thinking = kwarg_bool("thinking")
+        .or_else(|| kwarg_bool("enable_thinking"))
+        .or_else(|| {
+            params
+                .template_kwargs
+                .and_then(|k| k.get("reasoning_effort"))
+                .and_then(Value::as_str)
+                .filter(|effort| *effort == "none")
+                .map(|_| false)
+        })
         .or(params.thinking)
         .unwrap_or(true);
 
@@ -1420,6 +1440,102 @@ mod tests {
                 "<|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|close|>call<|sep|>"
             ),
             "got: {rendered}"
+        );
+    }
+
+    // --- Thinking toggles the engine's own server honours before rendering ----
+    // vLLM's K3 renderer rewrites the kwargs before `apply_chat_template`:
+    // `enable_thinking` becomes `thinking` and a `reasoning_effort` of `"none"`
+    // switches thinking off; an explicit `thinking` kwarg outranks both.
+
+    #[test]
+    fn enable_thinking_alias_switches_the_channel_off_like_thinking() {
+        let messages = vec![
+            json!({"role": "user", "content": "What is 17 times 3?"}),
+            json!({"role": "assistant", "content": "51.", "reasoning_content": "17*3 = 51."}),
+            json!({"role": "user", "content": "And times 4?"}),
+        ];
+        let alias = HashMap::from([("enable_thinking".to_string(), json!(false))]);
+        let native = HashMap::from([("thinking".to_string(), json!(false))]);
+        let with_alias =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &alias, true))
+                .unwrap();
+        let with_native =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &native, true))
+                .unwrap();
+        assert_eq!(
+            with_alias, with_native,
+            "enable_thinking=false must render like thinking=false"
+        );
+        assert!(
+            with_alias.ends_with("<|open|>response<|sep|>"),
+            "generation prompt opens the response channel: {with_alias}"
+        );
+        assert!(
+            !with_alias.contains("thinking-effort"),
+            "no effort directive while thinking is off: {with_alias}"
+        );
+        assert!(
+            !with_alias.contains("<|open|>think<|sep|>"),
+            "the prior assistant turn's think channel is dropped: {with_alias}"
+        );
+
+        // The alias set by the caller outranks the request-level toggle the
+        // gateway derived from a top-level `reasoning_effort`.
+        let on = HashMap::from([("enable_thinking".to_string(), json!(true))]);
+        let with_on =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(Some(false), &on, true))
+                .unwrap();
+        assert!(
+            with_on.ends_with("<|open|>think<|sep|>"),
+            "enable_thinking=true keeps thinking on: {with_on}"
+        );
+    }
+
+    #[test]
+    fn thinking_kwarg_wins_over_the_enable_thinking_alias() {
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let kwargs = HashMap::from([
+            ("enable_thinking".to_string(), json!(false)),
+            ("thinking".to_string(), json!(true)),
+        ]);
+        let rendered =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
+                .unwrap();
+        assert!(
+            rendered.ends_with("<|open|>think<|sep|>"),
+            "thinking=true outranks the alias: {rendered}"
+        );
+    }
+
+    #[test]
+    fn kwargs_reasoning_effort_none_switches_thinking_off() {
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let kwargs = HashMap::from([("reasoning_effort".to_string(), json!("none"))]);
+        let rendered =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
+                .unwrap();
+        assert!(
+            rendered.ends_with("<|open|>response<|sep|>"),
+            "reasoning_effort=none in the kwargs switches thinking off: {rendered}"
+        );
+        assert!(
+            !rendered.contains("thinking-effort"),
+            "no effort directive while thinking is off: {rendered}"
+        );
+
+        // `enable_thinking=true` beside it keeps thinking on, as on the engine
+        // (the alias is applied before the effort word is read).
+        let both = HashMap::from([
+            ("reasoning_effort".to_string(), json!("none")),
+            ("enable_thinking".to_string(), json!(true)),
+        ]);
+        let rendered =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(Some(false), &both, true))
+                .unwrap();
+        assert!(
+            rendered.ends_with("<|open|>think<|sep|>"),
+            "enable_thinking=true outranks reasoning_effort=none: {rendered}"
         );
     }
 
