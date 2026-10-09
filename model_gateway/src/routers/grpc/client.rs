@@ -1,24 +1,28 @@
 //! Unified gRPC client wrapper for SGLang, vLLM, and TensorRT-LLM backends
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
 };
 use smg_grpc_client::{
-    common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, MlxEngineClient,
-    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
-    TrtllmServiceClient, VllmEngineClient,
+    common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, BoxedTraceInjector,
+    MlxEngineClient, SglangGenerateRequestOptions, SglangSchedulerClient,
+    TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
 };
 
-use crate::routers::grpc::{
-    proto_wrapper::{
-        cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
-        collect_vllm_generate_request_shm_handles, finish_tokenspeed_request, finish_vllm_request,
-        ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest, ProtoStream,
+use crate::{
+    observability::otel_trace::OtelTraceInjector,
+    routers::grpc::{
+        proto_wrapper::{
+            cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
+            collect_vllm_generate_request_shm_handles, finish_tokenspeed_request,
+            finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
+            ProtoStream,
+        },
+        MultimodalData,
     },
-    MultimodalData,
 };
 
 /// Health check response (common across backends)
@@ -201,13 +205,25 @@ impl GrpcClient {
         url: &str,
         runtime_type: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Every RPC carries the current span's W3C trace context in its
+        // metadata, so the engine side can continue the gateway's trace (a
+        // no-op while tracing is off).
+        let trace_injector: BoxedTraceInjector = Arc::new(OtelTraceInjector);
         match runtime_type {
-            "sglang" => Ok(Self::Sglang(SglangSchedulerClient::connect(url).await?)),
-            "vllm" => Ok(Self::Vllm(VllmEngineClient::connect(url).await?)),
-            "trtllm" | "tensorrt-llm" => Ok(Self::Trtllm(TrtllmServiceClient::connect(url).await?)),
-            "mlx" => Ok(Self::Mlx(MlxEngineClient::connect(url).await?)),
+            "sglang" => Ok(Self::Sglang(
+                SglangSchedulerClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "vllm" => Ok(Self::Vllm(
+                VllmEngineClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "trtllm" | "tensorrt-llm" => Ok(Self::Trtllm(
+                TrtllmServiceClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "mlx" => Ok(Self::Mlx(
+                MlxEngineClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
             "tokenspeed" => Ok(Self::TokenSpeed(
-                TokenSpeedSchedulerClient::connect(url).await?,
+                TokenSpeedSchedulerClient::connect_with_trace_injector(url, trace_injector).await?,
             )),
             _ => Err(format!("Unknown runtime type: {runtime_type}").into()),
         }

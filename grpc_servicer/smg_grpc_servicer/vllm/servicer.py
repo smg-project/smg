@@ -70,6 +70,7 @@ from smg_grpc_servicer.vllm.model_info import (
     model_facts,
     server_facts,
 )
+from smg_grpc_servicer.vllm.trace_context import trace_headers
 
 from .mm_keys import (
     batches_missing_pixels,
@@ -436,6 +437,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 sampling_params=sampling_params,
                 request_id=request_id,
                 tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers(context.invocation_metadata()),
                 data_parallel_rank=(
                     request.data_parallel_rank if request.HasField("data_parallel_rank") else None
                 ),

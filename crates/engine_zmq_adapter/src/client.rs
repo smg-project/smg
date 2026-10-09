@@ -3,7 +3,7 @@
 //! metadata reads.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -436,17 +436,20 @@ impl ZmqEngineClient {
         &self,
         req: vllm::GenerateRequest,
     ) -> Result<Vec<VllmGenerateStream>, tonic::Status> {
-        self.generate_vllm_streams_with_media(req, None).await
+        self.generate_vllm_streams_with_media(req, None, None).await
     }
 
     /// [`generate_vllm_streams`](Self::generate_vllm_streams) for a request
     /// whose `media_refs` a worker-side processor already turned into engine
     /// features: `processed` is attached in place of the request's own
-    /// multimodal batches (it must carry none).
+    /// multimodal batches (it must carry none). `trace_headers` is the
+    /// caller's W3C trace context, set on every choice's engine request as
+    /// vLLM's own frontend does for its tracer.
     pub async fn generate_vllm_streams_with_media(
         &self,
         mut req: vllm::GenerateRequest,
         processed: Option<ProcessedMedia>,
+        trace_headers: Option<BTreeMap<String, String>>,
     ) -> Result<Vec<VllmGenerateStream>, tonic::Status> {
         let ZmqBackend::Vllm(client) = &self.backend else {
             return Err(tonic::Status::internal(
@@ -516,7 +519,7 @@ impl ZmqEngineClient {
             // Worker-processed tensors ride as aux frames; each choice's
             // message carries them (shared bytes, not copies).
             let aux_frames = sub_media.aux_frames.clone();
-            let request = translate_request_with_media(
+            let mut request = translate_request_with_media(
                 sub,
                 sub_media,
                 max_model_len,
@@ -524,6 +527,7 @@ impl ZmqEngineClient {
                 structured_backend,
             )
             .map_err(tonic::Status::invalid_argument)?;
+            request.trace_headers.clone_from(&trace_headers);
             // The engine returns the sampled/prompt token's logprob
             // plus the requested ranked candidates per position; carry
             // the counts so the stream can shape both `top_logprobs`
