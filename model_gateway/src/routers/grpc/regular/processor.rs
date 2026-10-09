@@ -55,6 +55,9 @@ impl ResponseProcessor {
     }
 
     /// Process a single choice from GenerateComplete response
+    ///
+    /// Returns the choice and the number of output tokens the reasoning
+    /// parser routed to `reasoning_content` (0 when it did not run).
     #[expect(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
@@ -72,39 +75,48 @@ impl ResponseProcessor {
         // between availability check and parsing.
         reasoning_parser_name: Option<&str>,
         tool_parser_name: Option<&str>,
-    ) -> Result<ChatChoice, String> {
+    ) -> Result<(ChatChoice, u32), String> {
         stop_decoder.reset();
         // Decode tokens
         let outputs = stop_decoder
             .process_tokens(complete.output_ids())
             .map_err(|e| format!("Failed to process tokens: {e}"))?;
 
-        // Accumulate text with early breaks
+        // Accumulate text with early breaks, noting where each token's text
+        // ends to place the reasoning span in tokens.
         let mut final_text = String::new();
         let mut stopped = false;
+        let mut token_ends = Vec::with_capacity(outputs.len());
         for output in outputs {
             match output {
                 SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
                 SequenceDecoderOutput::StoppedWithText(t) => {
                     final_text.push_str(&t);
                     stopped = true;
-                    break;
                 }
-                SequenceDecoderOutput::Stopped => {
-                    stopped = true;
-                    break;
-                }
+                SequenceDecoderOutput::Stopped => stopped = true,
                 SequenceDecoderOutput::Held => {}
+            }
+            token_ends.push(final_text.len());
+            if stopped {
+                break;
             }
         }
 
-        // Flush remaining text
+        // Flush remaining text. The decoder held it back for a partial stop
+        // match; the last token takes it, so the tokens' ends reach the end
+        // of the text, and the held tokens before it stay zero-width inside
+        // the span it closes.
         if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
             final_text.push_str(&t);
+            if let Some(last) = token_ends.last_mut() {
+                *last = final_text.len();
+            }
         }
 
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
+        let mut reasoning_tokens = 0;
         let mut processed_text = final_text;
 
         if original_request.separate_reasoning && reasoning_parser_available {
@@ -124,6 +136,12 @@ impl ResponseProcessor {
                 match parser.detect_and_parse_reasoning(&processed_text) {
                     Ok(result) => {
                         if !result.reasoning_text.is_empty() {
+                            reasoning_tokens = reasoning_span_tokens(
+                                &token_ends,
+                                &processed_text,
+                                &result.reasoning_text,
+                                &result.normal_text,
+                            );
                             reasoning_text = Some(result.reasoning_text);
                         }
                         processed_text = result.normal_text;
@@ -224,14 +242,15 @@ impl ResponseProcessor {
         };
 
         // Step 6: Build ChatChoice
-        Ok(ChatChoice {
+        let choice = ChatChoice {
             index: index as u32,
             message: chat_message,
             logprobs,
             finish_reason: Some(final_finish_reason_str.to_string()),
             matched_stop,
             hidden_states: None,
-        })
+        };
+        Ok((choice, reasoning_tokens))
     }
 
     /// Process non-streaming chat response (collects all responses and builds final response)
@@ -287,6 +306,7 @@ impl ResponseProcessor {
 
         // Process all choices
         let mut choices = Vec::new();
+        let mut parsed_reasoning_tokens = 0;
         for (index, complete) in all_responses.iter().enumerate() {
             match self
                 .process_single_choice(
@@ -304,7 +324,10 @@ impl ResponseProcessor {
                 )
                 .await
             {
-                Ok(choice) => choices.push(choice),
+                Ok((choice, reasoning_tokens)) => {
+                    choices.push(choice);
+                    parsed_reasoning_tokens += reasoning_tokens;
+                }
                 Err(e) => {
                     return Err(error::internal_error(
                         "process_choice_failed",
@@ -314,9 +337,13 @@ impl ResponseProcessor {
             }
         }
 
-        // Build usage from gRPC response counters.
-        let usage = response_formatting::build_usage(&all_responses)
-            .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens);
+        // Build usage from gRPC response counters, with the reasoning tokens
+        // the gateway's parser split off when it ran (zero included).
+        let usage = response_formatting::with_parsed_reasoning_tokens(
+            response_formatting::build_usage(&all_responses)
+                .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens),
+            reasoning_parser_available.then_some(parsed_reasoning_tokens),
+        );
 
         // Build final ChatCompletionResponse
         Ok(
@@ -955,6 +982,29 @@ impl ResponseProcessor {
     }
 }
 
+/// Tokens of the output whose text overlaps the reasoning span, given the
+/// cumulative text length after each token. The span is `reasoning` as found
+/// in `text`, else (a delimiter inside it was removed) everything before the
+/// normal text. Tokens that decoded to nothing count with the token that
+/// released their text; the delimiters around the span are not reasoning,
+/// like the engines' own counts.
+fn reasoning_span_tokens(token_ends: &[usize], text: &str, reasoning: &str, normal: &str) -> u32 {
+    let (start, end) = match text.find(reasoning) {
+        Some(start) => (start, start + reasoning.len()),
+        None => (0, text.len().saturating_sub(normal.len())),
+    };
+    let mut token_start = 0;
+    let mut count = 0;
+    for &token_end in token_ends {
+        // A zero-width token at the span's start held the text that starts it.
+        if token_start < end && (token_end > start || token_start == start) {
+            count += 1;
+        }
+        token_start = token_end;
+    }
+    count
+}
+
 /// Residual assistant text → OpenAI `content`. Whitespace-only (the `"\n\n"` left
 /// after reasoning + tool-call extraction) becomes `None`, not `Some("\n\n")`, which
 /// would otherwise diverge multi-turn conversations. Real content is kept verbatim.
@@ -993,6 +1043,38 @@ mod content_normalization_tests {
             normalize_assistant_content("\n\nDone.".to_string()),
             Some("\n\nDone.".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod reasoning_span_tests {
+    use super::reasoning_span_tokens;
+
+    #[test]
+    fn reasoning_span_tokens_skips_the_delimiters_and_keeps_held_tokens() {
+        // Tokens: "<think>" | "a" | "" (text held back) | "b" | "</think>" | "c"
+        let text = "<think>ab</think>c";
+        assert_eq!(
+            reasoning_span_tokens(&[7, 8, 8, 9, 17, 18], text, "ab", "c"),
+            3
+        );
+        // Reasoning cut off before its end: every token is reasoning.
+        assert_eq!(reasoning_span_tokens(&[7, 8, 9], "<think>ab", "ab", ""), 2);
+        // The span text is not in the output verbatim: everything before the
+        // normal text, delimiters included.
+        assert_eq!(
+            reasoning_span_tokens(&[7, 8, 9, 17, 18], text, "xy", "c"),
+            4
+        );
+        // Text the stop decoder held back to the end ("ST" of a partial
+        // "STOP") went to the last token at the flush: the held tokens before
+        // it are zero-width inside the span, or at its start.
+        assert_eq!(
+            reasoning_span_tokens(&[7, 9, 9, 11], "<think>abST", "abST", ""),
+            3
+        );
+        assert_eq!(reasoning_span_tokens(&[7, 7, 9], "<think>ST", "ST", ""), 2);
+        assert_eq!(reasoning_span_tokens(&[0, 2], "ST", "ST", ""), 2);
     }
 }
 
@@ -1056,7 +1138,7 @@ mod responses_finish_reason_tests {
                 llm_tokenizer::StopSequenceConfig::default(),
                 false,
             );
-            let choice = processor
+            let (choice, _) = processor
                 .process_single_choice(
                     &complete,
                     0,

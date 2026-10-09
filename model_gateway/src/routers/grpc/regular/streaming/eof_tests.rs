@@ -458,6 +458,67 @@ async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
     }
 }
 
+/// The engine on this path does not count reasoning tokens; the gateway's
+/// reasoning parser does, and reports them whenever it ran (zero included),
+/// as an engine with a reasoning parser does.
+#[tokio::test]
+async fn chat_usage_counts_the_tokens_the_reasoning_parser_split_off() {
+    for (texts, reasoning, expected) in [
+        (vec!["<think>", "ab", "</think>", "de"], "ab", 2),
+        // Both delimiters in the reasoning chunk, alone and with content:
+        // they are not reasoning tokens.
+        (vec!["<think>ab</think>", "de"], "ab", 2),
+        (vec!["<think>ab</think>de"], "ab", 2),
+        (vec!["hi"], "", 0),
+    ] {
+        let mut responses: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
+        responses.push(complete(0, "stop"));
+        let (stream, server) = scripted_stream(responses, "0").await;
+        let (tx, rx) = sse_channel();
+        let request = serde_json::json!({
+            "model": "eof-test", "messages": [], "stream": true,
+            "separate_reasoning": true,
+            "stream_options": {"include_usage": true, "continuous_usage_stats": true}
+        });
+        let spec = ChatResponseSpec::from(
+            &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
+        );
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), reasoning);
+        let usage = &events.last().expect("final usage event")["usage"];
+        assert_eq!(
+            usage["completion_tokens_details"]["reasoning_tokens"], expected,
+            "{usage}"
+        );
+        // The continuous usage never counts fewer reasoning tokens than the
+        // chunk before it: the content chunk after a crossed delimiter agrees
+        // with the reasoning chunk of its frame.
+        let mut last = 0;
+        for event in &events {
+            if let Some(count) =
+                event["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64()
+            {
+                assert!(count >= last, "reasoning count fell from {last}: {event}");
+                last = count;
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn messages_eof_emits_thinking_tail_before_block_stop() {
     for send_complete in [true, false] {
@@ -688,7 +749,12 @@ async fn deepseek_usage_rides_on_the_last_finish_chunk() {
                 last["usage"]["prompt_tokens_details"]["cached_tokens"],
                 8.min(10 - unbilled)
             );
-            assert!(last["usage"]["completion_tokens_details"]["reasoning_tokens"].is_null());
+            // The six tokens of `reason` per choice, split out of the one
+            // chunk by the gateway's reasoning parser.
+            assert_eq!(
+                last["usage"]["completion_tokens_details"]["reasoning_tokens"],
+                6 * choices
+            );
             for event in &events[..events.len() - 1] {
                 if options["include_usage"] == true {
                     assert_eq!(event.get("usage"), Some(&Value::Null), "{event}");

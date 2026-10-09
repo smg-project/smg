@@ -4,5 +4,5 @@ data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":170000
 
 data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1700000000,"model":"fixture-model","choices":[{"index":0,"delta":{"reasoning_content":null},"logprobs":null,"finish_reason":"stop"}]}
 
-data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1700000000,"model":"fixture-model","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":0}}}
+data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1700000000,"model":"fixture-model","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}}
 

@@ -46,7 +46,9 @@ use crate::{
         grpc::{
             common::{
                 response_collection::drain_prefill,
-                response_formatting::{effective_weight_version, CompletionTokenTracker},
+                response_formatting::{
+                    effective_weight_version, with_parsed_reasoning_tokens, CompletionTokenTracker,
+                },
                 responses::{build_sse_response, build_sse_response_from_stream},
             },
             context,
@@ -98,6 +100,9 @@ struct CompletionStreamOutcome {
 #[derive(Default)]
 struct ChatStreamUsage {
     choices: HashMap<u32, ChatStreamTokenCounts>,
+    /// The gateway's reasoning parser runs for this request and counts the
+    /// tokens it routes to reasoning (reported even when zero).
+    reasoning_parsed: bool,
 }
 
 #[derive(Default)]
@@ -106,6 +111,7 @@ struct ChatStreamTokenCounts {
     completion: u32,
     cached: u32,
     reasoning: u32,
+    reasoning_parsed: u32,
     spec_accepted: u32,
     spec_drafted: u32,
 }
@@ -137,9 +143,14 @@ impl ChatStreamUsage {
         }
     }
 
+    /// Tokens of a chunk the reasoning parser attributed to reasoning.
+    fn record_reasoning(&mut self, index: u32, tokens: u32) {
+        self.choices.entry(index).or_default().reasoning_parsed += tokens;
+    }
+
     fn snapshot(&self) -> Usage {
         // Choices share one prompt/cache but each generates its own output.
-        Usage::from_counts(
+        let usage = Usage::from_counts(
             self.choices.values().map(|c| c.prompt).max().unwrap_or(0),
             self.choices.values().map(|c| c.completion).sum(),
         )
@@ -148,6 +159,11 @@ impl ChatStreamUsage {
         .with_speculative_tokens(
             self.choices.values().map(|c| c.spec_accepted).sum(),
             self.choices.values().map(|c| c.spec_drafted).sum(),
+        );
+        with_parsed_reasoning_tokens(
+            usage,
+            self.reasoning_parsed
+                .then(|| self.choices.values().map(|c| c.reasoning_parsed).sum()),
         )
     }
 }
@@ -400,6 +416,11 @@ impl StreamingProcessor {
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
         let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
+        // Tokens the gateway's reasoning parser routed to reasoning, and
+        // tokens of chunks that decoded to no text yet (counted with the
+        // chunk that releases their text).
+        let mut parsed_reasoning_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut held_tokens: HashMap<u32, u32> = HashMap::new();
         let mut spec_accepted: HashMap<u32, u32> = HashMap::new();
         let mut spec_drafted: HashMap<u32, u32> = HashMap::new();
 
@@ -442,6 +463,10 @@ impl StreamingProcessor {
                 reasoning_parser_name.as_deref(),
                 model,
             );
+
+        if let Some(usage) = &mut continuous_usage {
+            usage.reasoning_parsed = reasoning_parser_available;
+        }
 
         // If the template supports a thinking toggle and the user enabled it,
         // the template injected `<think>` in the prefill — parsers should start
@@ -521,7 +546,7 @@ impl StreamingProcessor {
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
             // below, so neither can reach the client without being parsed.
-            let pending: Option<(u32, String, Option<ChatLogProbs>)> = match response
+            let pending: Option<(u32, String, Option<ChatLogProbs>, u32)> = match response
                 .map(|response| response.into_response())
             {
                 Some(ProtoResponseVariant::Chunk(chunk)) => {
@@ -592,6 +617,7 @@ impl StreamingProcessor {
                     }
 
                     if chunk_text.is_empty() {
+                        *held_tokens.entry(index).or_default() += chunk.token_ids().len() as u32;
                         continue;
                     }
 
@@ -604,7 +630,9 @@ impl StreamingProcessor {
                         )
                     });
 
-                    Some((index, chunk_text, choice_logprobs))
+                    let chunk_tokens =
+                        chunk.token_ids().len() as u32 + held_tokens.remove(&index).unwrap_or(0);
+                    Some((index, chunk_text, choice_logprobs, chunk_tokens))
                 }
                 Some(ProtoResponseVariant::Complete(complete)) => {
                     let index = complete.index();
@@ -641,7 +669,9 @@ impl StreamingProcessor {
                     }
 
                     // Don't break - continue reading all Complete messages for n>1
-                    flushed.map(|text| (index, text, None))
+                    // Text the decoder held for a partial stop match: the
+                    // tokens that produced it were counted as held.
+                    flushed.map(|text| (index, text, None, held_tokens.remove(&index).unwrap_or(0)))
                 }
                 Some(ProtoResponseVariant::None) => continue,
                 None => {
@@ -649,16 +679,16 @@ impl StreamingProcessor {
                     let indices = final_indices
                         .get_or_insert_with(|| reasoning_parsers.keys().copied().collect());
                     let Some(index) = indices.pop() else { break };
-                    Some((index, String::new(), None))
+                    Some((index, String::new(), None, 0))
                 }
             };
 
-            let usage = continuous_usage.as_ref().map(|tracker| {
+            let mut usage = continuous_usage.as_ref().map(|tracker| {
                 tracker
                     .snapshot()
                     .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
             });
-            let Some((index, text, mut choice_logprobs)) = pending else {
+            let Some((index, text, mut choice_logprobs, chunk_tokens)) = pending else {
                 continue;
             };
 
@@ -687,9 +717,10 @@ impl StreamingProcessor {
 
             // Reasoning content handling
             let in_reasoning = if separate_reasoning && reasoning_parser_available {
-                let (normal_text, reasoning_choice, in_reasoning) = self
+                let (normal_text, reasoning_choice, in_reasoning, chunk_reasoning_tokens) = self
                     .process_reasoning_stream(
                         (!final_chunk).then_some(delta.as_str()),
+                        chunk_tokens,
                         index,
                         &mut reasoning_parsers,
                         thinking_override,
@@ -698,6 +729,20 @@ impl StreamingProcessor {
                         model,
                     )
                     .await;
+                // Recorded before this frame's usage is snapshotted again, so
+                // a continuous usage counts the reasoning text it rides with,
+                // and the content or tool chunks that follow in the frame
+                // agree with it.
+                if chunk_reasoning_tokens > 0 {
+                    *parsed_reasoning_tokens.entry(index).or_default() += chunk_reasoning_tokens;
+                    if let Some(tracker) = &mut continuous_usage {
+                        tracker.record_reasoning(index, chunk_reasoning_tokens);
+                        usage =
+                            Some(tracker.snapshot().with_unbilled_prompt_tokens(
+                                original_request.unbilled_prompt_tokens,
+                            ));
+                    }
+                }
                 if let Some(mut choice) = reasoning_choice {
                     // The chunk's token logprobs ride on its reasoning delta when
                     // none of its text is content, as on a content delta.
@@ -864,14 +909,18 @@ impl StreamingProcessor {
         // Every choice shares one prompt, so prompt/cache counts take max;
         // completion and reasoning counts sum across choices.
         let final_usage = (deepseek_usage || include_usage).then(|| {
-            Usage::from_counts(
+            let usage = Usage::from_counts(
                 prompt_tokens.values().copied().max().unwrap_or(0),
                 completion_tokens.total(),
             )
             .with_cached_tokens(cached_tokens.values().copied().max().unwrap_or(0))
             .with_reasoning_tokens(reasoning_tokens.values().sum())
             .with_speculative_tokens(spec_accepted.values().sum(), spec_drafted.values().sum())
-            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens);
+            with_parsed_reasoning_tokens(
+                usage,
+                reasoning_parser_available.then(|| parsed_reasoning_tokens.values().sum()),
+            )
         });
 
         // Phase 4: Finish reason chunks. Do not advertise partial counters as
@@ -1585,12 +1634,14 @@ impl StreamingProcessor {
 
     /// Helper: Process reasoning content in streaming mode
     /// `None` marks EOF and releases the parser's held text.
-    /// Returns the normal text, the choice carrying the reasoning delta (if any)
-    /// and whether the parser is still inside reasoning.
+    /// Returns the normal text, the choice carrying the reasoning delta (if any),
+    /// whether the parser is still inside reasoning, and how many of the chunk's
+    /// `chunk_tokens` are reasoning tokens.
     #[expect(clippy::too_many_arguments)]
     async fn process_reasoning_stream(
         &self,
         delta: Option<&str>,
+        chunk_tokens: u32,
         index: u32,
         reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         thinking_override: bool,
@@ -1600,7 +1651,7 @@ impl StreamingProcessor {
         // changed mid-stream, turning the `expect` below into a panic.
         reasoning_parser_name: Option<&str>,
         model: &str,
-    ) -> (String, Option<ChatStreamChoice>, bool) {
+    ) -> (String, Option<ChatStreamChoice>, bool, u32) {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         #[expect(
             clippy::expect_used,
@@ -1623,14 +1674,15 @@ impl StreamingProcessor {
         });
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
-            let (parse_result, in_reasoning) = {
+            let (parse_result, was_in_reasoning, in_reasoning) = {
                 let mut parser = pooled_parser.lock().await;
+                let was_in_reasoning = parser.is_in_reasoning();
                 let result = match delta {
                     Some(text) => parser.parse_reasoning_streaming_incremental(text),
                     None => parser.flush(),
                 };
                 let in_reasoning = parser.is_in_reasoning();
-                (result, in_reasoning)
+                (result, was_in_reasoning, in_reasoning)
             };
 
             match parse_result {
@@ -1638,12 +1690,34 @@ impl StreamingProcessor {
                     reasoning_text,
                     normal_text,
                 }) => {
+                    // The chunk's tokens are reasoning when its text came out
+                    // as reasoning or it stayed inside the block (text held
+                    // back); the delimiters opening or closing the block are
+                    // not, like the engines' own counts. A chunk that carries
+                    // both reasoning and content splits by text share.
+                    let reasoning_tokens = if reasoning_text.is_empty() {
+                        if was_in_reasoning && in_reasoning {
+                            chunk_tokens
+                        } else {
+                            0
+                        }
+                    } else {
+                        // The reasoning text's share of the chunk's text: the
+                        // whole chunk when it is all reasoning, less when the
+                        // chunk also carries a delimiter or content. An
+                        // approximation: the stream has the chunk's token count
+                        // and its decoded text, not the offset of each token,
+                        // which the non-streaming count attributes by.
+                        let chunk_len = delta.map_or(0, str::len).max(1) as f64;
+                        let share = reasoning_text.len() as f64 / chunk_len;
+                        (f64::from(chunk_tokens) * share.min(1.0)).round() as u32
+                    };
                     let choice = if reasoning_text.is_empty() {
                         None
                     } else {
                         Some(assistant_choice(index, None, Some(reasoning_text), None))
                     };
-                    return (normal_text, choice, in_reasoning);
+                    return (normal_text, choice, in_reasoning, reasoning_tokens);
                 }
                 Err(e) => {
                     warn!("Reasoning parsing error: {}", e);
@@ -1651,7 +1725,7 @@ impl StreamingProcessor {
             }
         }
 
-        (delta.unwrap_or_default().to_string(), None, false)
+        (delta.unwrap_or_default().to_string(), None, false, 0)
     }
 
     /// Helper: Process specific function case - emit tool call deltas with arguments
