@@ -87,6 +87,19 @@ fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
     }
 }
 
+/// A chunk that also reports one logprob per token.
+fn chunk_with_logprobs(index: u32, text: &str) -> proto::GenerateResponse {
+    let mut response = chunk(index, text);
+    if let Some(GenerationEvent::Chunk(chunk)) = &mut response.response {
+        chunk.output_logprobs = Some(proto::OutputLogProbs {
+            token_logprobs: vec![-0.5; chunk.token_ids.len()],
+            token_ids: chunk.token_ids.clone(),
+            top_logprobs: Vec::new(),
+        });
+    }
+    response
+}
+
 fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
     complete_with_prompt(index, reason, 1)
 }
@@ -327,6 +340,44 @@ async fn chat_stream_error_does_not_flush_a_success_tail() {
     assert!(events
         .iter()
         .all(|event| event["choices"][0]["finish_reason"].is_null()));
+}
+
+/// Token logprobs reach the client on reasoning deltas as they do on content
+/// deltas: a chunk whose text is all reasoning carries its logprobs there.
+#[tokio::test]
+async fn chat_stream_keeps_logprobs_on_reasoning_deltas() {
+    let (result, events) = chat_events(
+        vec![
+            chunk_with_logprobs(0, "<think>why"),
+            chunk_with_logprobs(0, "</think>ok"),
+            complete(0, "stop"),
+        ],
+        false,
+        "0",
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "why");
+    assert_eq!(chat_text(&events, 0, "content"), "ok");
+    let mut with_text = 0;
+    for event in &events {
+        let choice = &event["choices"][0];
+        let delta = &choice["delta"];
+        let has_text = delta["reasoning_content"].is_string()
+            || delta["content"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty());
+        if has_text {
+            with_text += 1;
+            assert!(
+                choice["logprobs"]["content"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                "text delta without logprobs: {event}"
+            );
+        }
+    }
+    assert!(with_text >= 2, "{events:?}");
 }
 
 #[tokio::test]

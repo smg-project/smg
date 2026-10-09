@@ -637,7 +637,7 @@ impl StreamingProcessor {
                     .snapshot()
                     .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
             });
-            let Some((index, text, choice_logprobs)) = pending else {
+            let Some((index, text, mut choice_logprobs)) = pending else {
                 continue;
             };
 
@@ -681,6 +681,13 @@ impl StreamingProcessor {
                     .await;
                 if let Some(mut chunk) = reasoning_chunk {
                     chunk.usage = usage.clone();
+                    // The chunk's token logprobs ride on its reasoning delta when
+                    // none of its text is content, as on a content delta.
+                    if normal_text.is_empty() {
+                        if let Some(choice) = chunk.choices.first_mut() {
+                            choice.logprobs = choice_logprobs.take();
+                        }
+                    }
                     Self::format_sse_chunk_into(&mut sse_buffer, &chunk, emit_usage_null);
                     tx.send(Ok(Bytes::from(sse_buffer.clone())))
                         .await
