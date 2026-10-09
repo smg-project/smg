@@ -1,5 +1,6 @@
 use std::{
     error::Error as _,
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -1720,17 +1721,33 @@ fn is_pre_response_transport_error(e: &reqwest::Error) -> bool {
         && !e.is_redirect()
 }
 
+/// Await `future` with no tracing dispatcher in scope.
+///
+/// hyper's client executor spawns every new pooled connection with
+/// `in_current_span()`. A connection created while a request span is current
+/// would enter that span on each of its polls, for every later request it
+/// serves, and keep the span alive for the connection's life. The upstream
+/// send is polled under the no-op dispatcher instead, so a connection it
+/// creates runs under no span.
+async fn untraced<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        tracing::dispatcher::with_default(&tracing::Dispatch::none(), || future.as_mut().poll(cx))
+    })
+    .await
+}
+
 /// Send with a single retry on pre-response transport failures. Requests
 /// whose body cannot be cloned (multipart streams) fail through unchanged.
 pub(crate) async fn send_with_stale_conn_retry(
     builder: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let retry = builder.try_clone();
-    match builder.send().await {
+    match untraced(builder.send()).await {
         Err(e) if is_pre_response_transport_error(&e) => match retry {
             Some(retry) => {
                 Metrics::record_upstream_send_retry(metrics_labels::ROUTER_HTTP);
-                retry.send().await
+                untraced(retry.send()).await
             }
             None => Err(e),
         },
@@ -3750,6 +3767,87 @@ mod tests {
         assert_eq!(
             response.headers()[error::HEADER_X_SMG_ERROR_CODE],
             "call_upstream_connection_failed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod upstream_span_tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use tracing::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
+
+    use super::send_with_stale_conn_retry;
+
+    /// Counts how often any span is entered on this thread's subscriber.
+    struct EnterCounter(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for EnterCounter {
+        fn on_enter(
+            &self,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A pooled connection created while a request span is current must not
+    /// run under that span: hyper's executor spawns the connection task with
+    /// the span current at creation, and the task would then enter it on
+    /// every poll while the body streams, and for every later request the
+    /// connection serves.
+    #[tokio::test]
+    async fn a_connection_created_under_a_request_span_does_not_enter_it_per_chunk() {
+        let enters = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(EnterCounter(enters.clone())),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let chunks = 64usize;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test server task; it ends with the connection"
+        )]
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .expect("response head");
+            for _ in 0..chunks {
+                socket
+                    .write_all(b"9\r\ndata: x\n\n\r\n")
+                    .await
+                    .expect("chunk");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            socket.write_all(b"0\r\n\r\n").await.expect("last chunk");
+        });
+        let client = reqwest::Client::new();
+        let response =
+            send_with_stale_conn_retry(client.get(format!("http://{addr}/v1/chat/completions")))
+                .instrument(tracing::info_span!("http_request"))
+                .await
+                .expect("response");
+        let before_body = enters.load(Ordering::Relaxed);
+        let body = response.bytes().await.expect("body");
+        assert_eq!(body.len(), chunks * b"data: x\n\n".len());
+        let during_body = enters.load(Ordering::Relaxed) - before_body;
+        assert_eq!(
+            during_body, 0,
+            "the connection task entered the request span {during_body} times while the body streamed"
         );
     }
 }
