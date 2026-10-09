@@ -1669,8 +1669,8 @@ mod request_release_tests {
     /// `fail_always` fails every call, and `answer_after` stalls the generate
     /// RPC, standing in for an engine that answers only at its own deadline;
     /// `frame_gap` paces the response frames, for a stream that outlasts its
-    /// dispatch. Every call's input token ids and engine request id are
-    /// recorded, as is every aborted request id.
+    /// dispatch. Every call's input token ids, prompt text and engine request
+    /// id are recorded, as is every aborted request id.
     #[derive(Clone, Default)]
     struct GatedScheduler {
         probe: Option<Weak<CompletionRequest>>,
@@ -1682,6 +1682,7 @@ mod request_release_tests {
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
         seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
+        seen_original_texts: Arc<Mutex<Vec<String>>>,
         seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
         seen_request_ids: Arc<Mutex<Vec<String>>>,
         aborted_request_ids: Arc<Mutex<Vec<String>>>,
@@ -1759,6 +1760,16 @@ mod request_release_tests {
                                 })
                                 .collect()
                         })
+                        .unwrap_or_default(),
+                );
+            self.seen_original_texts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(
+                    request
+                        .tokenized
+                        .as_ref()
+                        .map(|t| t.original_text.clone())
                         .unwrap_or_default(),
                 );
             self.seen_input_ids
@@ -2187,6 +2198,45 @@ mod request_release_tests {
         );
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("data: [DONE]"), "stream must finish: {body}");
+    }
+
+    /// A text-only request puts its token ids on the wire and not a second
+    /// copy of the rendered prompt: the worker generates from the ids, and a
+    /// million-token prompt's text would triple the Generate.
+    #[tokio::test]
+    async fn text_only_request_sends_its_ids_without_the_prompt_text() {
+        let request = completion_request(false);
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let seen_texts = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            seen_original_texts: Arc::clone(&seen_texts),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        run_and_drain(
+            pipeline,
+            components,
+            request,
+            &format!("grpc://127.0.0.1:{port}"),
+        )
+        .await;
+
+        let ids = seen_ids.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(ids.len(), 1, "one Generate: {ids:?}");
+        assert!(!ids[0].is_empty(), "the prompt's ids are on the wire");
+        let texts = seen_texts.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            texts.as_slice(),
+            [String::new()],
+            "a text-only request sends no prompt text next to its ids"
+        );
     }
 
     /// grpc_pd twin: the decode leg's stream task must not pin the parsed

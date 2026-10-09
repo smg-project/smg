@@ -129,11 +129,14 @@ pub(crate) async fn build_chat_backed_plan(
         tool_constraints.as_ref(),
     );
 
+    // The ids are the prompt; the text rides along only when the request
+    // carries media (see `helpers::wire_prompt_text`).
+    let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
     let mut proto_request = builder_client
         .build_chat_request(
             request_id,
             chat_request,
-            processed_text,
+            helpers::wire_prompt_text(processed_text, carries_media),
             token_ids,
             GenerateRequestBuildOptions {
                 multimodal_inputs: multimodal_data,

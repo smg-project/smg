@@ -143,11 +143,14 @@ impl BuildStage for MessageRequestBuildingStage {
             tool_constraints.as_ref(),
         );
 
+        // The ids are the prompt; the text rides along only when the request
+        // carries media (see `helpers::wire_prompt_text`).
+        let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
         let mut proto_request = builder_client
             .build_messages_request(
                 request_id,
                 &messages_request,
-                processed_messages.text,
+                helpers::wire_prompt_text(processed_messages.text, carries_media),
                 token_ids,
                 GenerateRequestBuildOptions {
                     multimodal_inputs: multimodal_data,
