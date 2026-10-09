@@ -1039,8 +1039,18 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     env.add_function("raise_exception", raise_exception);
     // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
     env.add_function("dict", dict_function);
+    env.add_test("iterable", is_iterable);
 
     Ok(env)
+}
+
+/// Jinja2's `iterable` test: `iter(value)` succeeds. minijinja iterates
+/// `none` as an empty sequence and would call it iterable; in Python
+/// `iter(None)` raises, so `none is iterable` is false, which the templates
+/// that guard with `tools is iterable and tools | length > 0` rely on when
+/// the request carries no tools. An undefined value is iterable in both.
+fn is_iterable(value: &Value) -> bool {
+    !value.is_none() && value.try_iter().is_ok()
 }
 
 /// Render the `"chat"` template in the given environment against messages and params.
@@ -1190,14 +1200,17 @@ fn render_chat_template(
     // Convert messages to minijinja::Value (messages already processed by router)
     let minijinja_messages: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
 
-    // Use Value::UNDEFINED for missing optional params so they are truly "undefined"
-    // in the template context, matching HuggingFace Python behavior. Many chat templates
-    // use `{% if tools is defined %}` guards — passing null (none) instead of undefined
-    // would bypass those guards since `none` IS defined, causing `tools | length` to fail.
-    let tools_value = params.tools.map_or(Value::UNDEFINED, Value::from_serialize);
+    // transformers renders with `tools=None` and `documents=None` when the
+    // request carries none: the names are defined and hold none. A template
+    // may test them either way (`tools is none`, `tools is defined and tools`,
+    // `tools is iterable`); undefined would send a template that tests
+    // `is none` down its tools branch with nothing to write.
+    let tools_value = params
+        .tools
+        .map_or_else(|| Value::from(()), Value::from_serialize);
     let documents_value = params
         .documents
-        .map_or(Value::UNDEFINED, Value::from_serialize);
+        .map_or_else(|| Value::from(()), Value::from_serialize);
 
     // Inject special tokens (bos_token, eos_token, etc.) into context.
     // Use UNDEFINED for missing tokens so `{% if bos_token is defined %}` works correctly.
@@ -1660,6 +1673,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("2 is required"), "{error}");
+    }
+
+    /// transformers renders with `tools=None` and `documents=None` when the
+    /// request carries none, so a template that tests `tools is none` (Olmo 3)
+    /// takes its no-tools branch, and one that guards with `is defined and
+    /// tools` does too.
+    #[test]
+    fn absent_tools_and_documents_are_none_as_transformers_passes_them() {
+        let template = "{% if tools is none %}no tools{% else %}{{ tools | tojson }}{% endif %}|\
+                        {% if tools is defined and tools %}has tools{% else %}none{% endif %}|\
+                        {% if tools is iterable and tools | length > 0 %}iterable{% else %}not iterable{% endif %}|\
+                        {% if documents is none %}no documents{% endif %}";
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages: [serde_json::Value; 0] = [];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "no tools|none|not iterable|no documents");
+
+        let tools = [serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let params = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let rendered = processor.apply_chat_template(&messages, params).unwrap();
+        assert_eq!(
+            rendered,
+            "[{\"type\": \"function\", \"function\": {\"name\": \"f\"}}]|has tools|iterable|no documents"
+        );
     }
 
     #[test]
