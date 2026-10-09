@@ -10,6 +10,7 @@ pub mod factory;
 pub mod hub;
 pub(crate) mod json_dumps;
 pub mod mock;
+mod native;
 pub mod registry;
 pub mod sequence;
 pub mod stop;
