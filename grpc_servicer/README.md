@@ -213,9 +213,12 @@ Worker-side media processing uses the same `--mm-processor` /
   request path: fetch, decode, preprocess, placeholder expansion, and the
   batches a Router-preprocessed request would carry, translated for the engine
   the same way. It serves the model families that pipeline supports
-  (`crates/multimodal`), takes `http`, `https` and `data` references, and
-  reads the model's `config.json` and preprocessor configs from the tokenizer
-  directory the launcher resolved. An engine that normalizes pixels on device
+  (`crates/multimodal`), takes `http`, `https` and `data` references, reads
+  the model's `config.json` and preprocessor configs from the tokenizer
+  directory the launcher resolved, and refuses a request above the engine's
+  own `--limit-mm-per-prompt` as the engine's server does (`--mm-max-items`
+  and `SMG_*_MAX_COUNT` tighten those limits, never loosen them). An engine
+  that normalizes pixels on device
   (vLLM's `mm_device_do_normalize`, on by default for the Qwen-VL family)
   takes raw `uint8` pixels, and the pipeline writes those for it; a model
   whose processor cannot emit raw pixels is refused at startup under that

@@ -59,12 +59,13 @@ fn env_count_override(cache: &'static OnceLock<Option<usize>>, env_var: &str) ->
     })
 }
 
-/// Deployment-wide override of a spec's per-request media-count limit.
+/// Deployment-wide override of a spec's per-request media-count limit
+/// (`SMG_IMAGE_MAX_COUNT`, `SMG_VIDEO_MAX_COUNT`, `SMG_AUDIO_MAX_COUNT`).
 ///
 /// The override replaces the spec's declared limit (it can raise or lower
 /// it) but never enables a modality the spec does not declare. Unset,
 /// non-numeric, or zero values are ignored.
-fn modality_limit_override(modality: Modality) -> Option<usize> {
+pub fn modality_limit_override(modality: Modality) -> Option<usize> {
     match modality {
         Modality::Image => env_count_override(&IMAGE_MAX_COUNT_OVERRIDE, "SMG_IMAGE_MAX_COUNT"),
         Modality::Video => env_count_override(&VIDEO_MAX_COUNT_OVERRIDE, "SMG_VIDEO_MAX_COUNT"),

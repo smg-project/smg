@@ -14,6 +14,7 @@
 //! run in this process.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -512,6 +513,23 @@ fn native_media_options(
         .map(|v| v.extract())
         .transpose()?
         .unwrap_or(10_000);
+    // The engine's per-prompt limits by modality name; one the pipeline does
+    // not fetch is of no consequence here.
+    let engine_item_limits = item("engine_item_limits")?
+        .map(|v| v.extract::<HashMap<String, usize>>())
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(modality, limit)| {
+            let modality = match modality.as_str() {
+                "image" => Modality::Image,
+                "video" => Modality::Video,
+                "audio" => Modality::Audio,
+                _ => return None,
+            };
+            Some((modality, limit))
+        })
+        .collect();
     Ok(NativeMediaOptions {
         settings: WorkerMediaSettings {
             model_dir: required("model_dir")?,
@@ -525,6 +543,7 @@ fn native_media_options(
             encoder_dtype: string("encoder_dtype")?.unwrap_or_else(|| "float32".to_string()),
             processor_kwargs,
             max_items: count("max_items")?,
+            engine_item_limits,
             max_item_bytes: count("max_item_bytes")?,
             allowed_domains,
             fetch_timeout: Duration::from_millis(fetch_timeout_ms),
@@ -723,6 +742,7 @@ impl PyVllmGrpcServer {
                 spec = pipeline.spec_name(),
                 pixel_format = ?pipeline.pixel_format(),
                 max_inflight = native.max_inflight,
+                item_limits = %pipeline.item_limits_summary(),
                 "smg media processor ready"
             );
             config.media_processor = Some(Arc::new(SmgMediaProcessor {

@@ -431,8 +431,18 @@ def test_smg_media_options_follow_the_engine_config(tmp_path):
         "processor_kwargs_json": None,
         "max_inflight": 3,
         "max_items": 2,
+        "engine_item_limits": None,
         "max_item_bytes": 10,
         "source": "flag",
+    }
+    # The engine's own per-prompt limits ride along for the pipeline to enforce.
+    config.model_config.multimodal_config = SimpleNamespace(
+        mm_device_do_normalize=True,
+        get_limit_per_prompt=lambda modality: {"image": 8, "video": 2, "audio": 1}[modality],
+    )
+    assert rust.smg_media_options(config, settings, str(tmp_path))["engine_item_limits"] == {
+        "image": 8,
+        "video": 2,
     }
     # A local model directory with its config is the pipeline's config source.
     (tmp_path / "config.json").write_text("{}")

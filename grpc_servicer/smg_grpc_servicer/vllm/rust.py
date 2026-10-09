@@ -62,6 +62,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     supervise,
 )
 from smg_grpc_servicer.rust_lifecycle import env_float as _env_float
+from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
     eos_token_ids_with_generation_config,
     mm_device_do_normalize,
@@ -183,7 +184,9 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     The engine's ``mm_processor_kwargs`` go along as overrides of the
     preprocessor config (less ``device``, which only says where vLLM's own
     processor would run); a knob the pipeline has no field for is refused
-    at launch rather than silently ignored.
+    at launch rather than silently ignored. The engine's own per-prompt media
+    limits (``--limit-mm-per-prompt``) go along too: the pipeline refuses
+    above them as the engine's own server does, whatever its own caps say.
     """
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
@@ -213,9 +216,22 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         ),
         "max_inflight": settings.max_inflight,
         "max_items": settings.max_items,
+        "engine_item_limits": engine_item_limits(model_config),
         "max_item_bytes": settings.max_item_bytes,
         "source": settings.source,
     }
+
+
+def engine_item_limits(model_config) -> dict[str, int] | None:
+    """The engine's per-prompt media limits for the modalities the pipeline
+    fetches, as vLLM resolved ``--limit-mm-per-prompt`` (its own server refuses
+    a prompt above them); ``None`` on a config that does not carry them, which
+    leaves the pipeline to its own caps."""
+    mm_config = getattr(model_config, "multimodal_config", None)
+    get_limit = getattr(mm_config, "get_limit_per_prompt", None)
+    if not callable(get_limit):
+        return None
+    return {modality: int(get_limit(modality)) for modality in FETCHABLE_MODALITIES}
 
 
 # ---------------------------------------------------------------------------
