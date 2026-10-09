@@ -368,6 +368,9 @@ impl Parser<'_> {
         Some(match atom {
             Node::Class(class) => Node::ClassRepeat { class, min, max },
             Node::NotAhead(_) => return None,
+            // A group repeats by recursion, one frame per repetition: only the
+            // optional form is accepted, longer runs stay with `tokenizers`.
+            _ if max > 1 => return None,
             node => Node::Repeat {
                 node: Box::new(node),
                 min,
@@ -391,6 +394,12 @@ impl Parser<'_> {
 
     fn parse_atom(&mut self) -> Option<Node> {
         let c = self.chars.next()?;
+        // Under `(?i:...)` only ASCII letters and plain ASCII literals are
+        // folded the way the engine folds them; a class, an escape or a
+        // non-ASCII literal there would match differently, so it is declined.
+        if self.case_insensitive && (c == '[' || c == '\\' || !c.is_ascii()) {
+            return None;
+        }
         match c {
             '(' => self.parse_group(),
             '[' => {
@@ -775,6 +784,12 @@ mod tests {
             r"\p{Han}",
             r"a{3,1}",
             r"[z-a]",
+            r"(?:ab)+",
+            r"(?: ?\p{L})*",
+            r"(?:ab){2}",
+            r"(?i:[sdmt]|ll|ve|re)",
+            r"(?i:\p{Ll})",
+            r"(?i:é)",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
