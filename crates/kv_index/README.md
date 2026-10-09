@@ -220,6 +220,36 @@ Metrics added: `smg_kv_index_lookup_seconds{index}`, `smg_kv_event_apply_seconds
 `smg_worker_stall_transitions_total`, `smg_worker_overload_fallback_total`,
 `smg_policy_inflight_reconciled_total{policy}`, `smg_cache_aware_policy_branch_total{branch}`.
 
+## Routing evidence per request
+
+Two opt-in switches on the gateway expose the evidence behind each dispatch; either one turns the
+capture on, and they are independent of each other.
+
+- `SMG_CACHE_TRACE=1` logs the full evidence of every dispatch as one INFO line (target
+  `smg::cache_trace`, field `evidence`): ids, the candidates with their load and health, the scores,
+  the gates and the policy's prediction, several KB per request on a large fleet.
+  `SMG_CACHE_TRACE_SAMPLE=N` keeps one line in N, `SMG_CACHE_TRACE_MAX_BYTES=B` drops the
+  per-candidate lists from a line longer than B bytes and keeps the decision record, and a failed
+  request logs a `Cache routing failure` line the same way.
+- `SMG_CACHE_TRACE_HEADER=1` returns the decision record of the dispatch that produced the
+  response in the `x-smg-cache-trace` header, on every response and without any log line, so a
+  client can compare the predicted overlap with the engine's
+  `usage.prompt_tokens_details.cached_tokens`. The header is one JSON object of at most 2048 ASCII
+  bytes (left out when larger), with one `selections` entry per worker selection of that dispatch:
+
+  ```json
+  {"schema": 1, "root_id": "<x-request-id>", "dispatch_id": "<uuid>", "attempt": 0,
+   "engine_ids": ["<request id the engine saw>"], "engine_ids_complete": true, "truncated": false,
+   "selections": [{"policy": "cache_aware", "origin": "policy",
+     "prediction": {"source": "event_index_overlap", "branch": "event_hit",
+                    "overlap_blocks": 4, "request_blocks": 6, "block_size": 128}}]}
+  ```
+
+  `attempt` counts the request's dispatches from 0, `origin` is `policy` or the routing-key branch
+  that placed the request, and `prediction` is the policy's estimate for the chosen worker: on the
+  event index `overlap_blocks` of `request_blocks`, on the approximate tree `matched_units` of
+  `input_units` with the `credited_units` the chosen worker is expected to have cached.
+
 ## Testing without engines
 
 `crates/mock_worker --engine realistic` is a vLLM-style engine: a pass scheduler with a token

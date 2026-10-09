@@ -2374,10 +2374,10 @@ mod request_release_tests {
             assert_eq!(ids.len(), 2);
             assert!(ids[0].starts_with("cmpl_") && ids[1].starts_with("cmpl_"));
             assert_ne!(ids[0], ids[1], "each attempt gets a fresh engine id");
+            // The header switch alone must yield the header: the capture
+            // does not depend on the log switch.
             let trace_header = response.headers().get("x-smg-cache-trace");
-            if cache_trace::enabled()
-                && std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1")
-            {
+            if std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1") {
                 let trace: serde_json::Value =
                     serde_json::from_str(trace_header.unwrap().to_str().unwrap()).unwrap();
                 assert_eq!(trace["attempt"], 1);

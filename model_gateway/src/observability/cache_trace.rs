@@ -50,11 +50,23 @@ tokio::task_local! {
     static CAPTURE: RefCell<Capture>;
 }
 
+/// Evidence is captured when either of its two consumers is switched on:
+/// the INFO line (`SMG_CACHE_TRACE=1`) or the response header
+/// (`SMG_CACHE_TRACE_HEADER=1`). Unset both and nothing is observed.
 pub(crate) fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| log_enabled() || header_enabled())
+}
+
+/// `SMG_CACHE_TRACE=1`: the evidence of a dispatch (one in every
+/// `SMG_CACHE_TRACE_SAMPLE`) and of a failed request as an INFO line.
+fn log_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("SMG_CACHE_TRACE").is_ok_and(|v| v == "1"))
 }
 
+/// `SMG_CACHE_TRACE_HEADER=1`: the decision record of a dispatch in the
+/// `x-smg-cache-trace` response header, with or without the log line.
 fn header_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1"))
@@ -118,6 +130,22 @@ fn parse_max_bytes(value: Option<&str>) -> Option<usize> {
 /// when it is longer than the cap.
 fn log_line(value: Value, sampler: &Sampler, cap: Option<usize>) -> Option<String> {
     sampler.admit().then(|| encode_capped(value, cap))
+}
+
+/// What one dispatch's evidence becomes: the response header when the header
+/// switch is on, the INFO line when the log switch is on and the sampler
+/// admits the dispatch. The header depends on neither the log switch nor the
+/// sampler.
+fn emit(
+    value: Value,
+    log: bool,
+    header: bool,
+    sampler: &Sampler,
+    cap: Option<usize>,
+) -> (Option<String>, Option<String>) {
+    let header = header.then(|| gateway_header(&value)).flatten();
+    let line = log.then(|| log_line(value, sampler, cap)).flatten();
+    (header, line)
 }
 
 fn encode_capped(mut value: Value, cap: Option<usize>) -> String {
@@ -282,14 +310,11 @@ pub(crate) fn dispatch(
             "unattributed_prediction": std::mem::take(&mut capture.prediction),
             "cache_evidence": "unknown",
         });
-        let header = header_enabled().then(|| {
-            let header = gateway_header(&value);
-            if header.is_none() {
-                tracing::info!(target: "smg::cache_trace", "Cache trace header omitted: size or encoding limit");
-            }
-            header
-        }).flatten();
-        if let Some(encoded) = log_line(value, sampler(), max_bytes()) {
+        let (header, line) = emit(value, log_enabled(), header_enabled(), sampler(), max_bytes());
+        if header_enabled() && header.is_none() {
+            tracing::info!(target: "smg::cache_trace", "Cache trace header omitted: size or encoding limit");
+        }
+        if let Some(encoded) = line {
             tracing::info!(target: "smg::cache_trace", evidence = %encoded, "Cache routing dispatch");
         }
         header
@@ -318,7 +343,7 @@ fn gateway_header(value: &Value) -> Option<String> {
 }
 
 pub(crate) fn failure(root_id: Option<&str>, status: u16) {
-    if enabled() {
+    if log_enabled() {
         let _ = CAPTURE.try_with(|capture| {
             let capture = capture.borrow();
             let evidence = json!({"root_id": root_id, "status": status,
@@ -445,5 +470,31 @@ mod tests {
         let decoded: Value = serde_json::from_str(&failure).unwrap();
         assert_eq!(decoded["status"], 503);
         assert!(decoded.get("gates").is_none());
+    }
+
+    #[test]
+    fn the_header_switch_alone_yields_the_header_and_no_log_line() {
+        let every_dispatch = Sampler::new(1);
+        let (header, line) = emit(fleet_evidence(2), false, true, &every_dispatch, None);
+        let header: Value = serde_json::from_str(&header.unwrap()).unwrap();
+        assert_eq!(header["selections"][0]["prediction"]["overlap_blocks"], 4);
+        assert!(line.is_none(), "the log switch is off");
+        let (header, line) = emit(fleet_evidence(2), true, false, &every_dispatch, None);
+        assert!(header.is_none(), "the header switch is off");
+        assert!(line.is_some());
+        let (header, line) = emit(fleet_evidence(2), true, true, &every_dispatch, None);
+        assert!(header.is_some() && line.is_some());
+        let one_in_hundred = Sampler::new(100);
+        let outcomes: Vec<_> = (0..200)
+            .map(|_| emit(fleet_evidence(2), true, true, &one_in_hundred, None))
+            .collect();
+        assert!(
+            outcomes.iter().all(|(header, _)| header.is_some()),
+            "sampling the log line leaves the header on every dispatch"
+        );
+        assert_eq!(
+            outcomes.iter().filter(|(_, line)| line.is_some()).count(),
+            2
+        );
     }
 }
