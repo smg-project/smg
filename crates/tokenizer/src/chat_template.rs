@@ -1035,33 +1035,80 @@ fn detect_developer_role_support(template: &str) -> bool {
 }
 
 /// The messages with every `developer` message rewritten as a `system`
-/// message without its `tools` field (vLLM's `_convert_developer_to_system`).
-/// `None` when no message has the role, so the caller keeps its slice.
+/// message without its `tools` field (vLLM's `_convert_developer_to_system`),
+/// then the system messages merged into one at the front when a system
+/// message is not the first message (vLLM's `_consolidate_system_messages`,
+/// which follows the rewrite in its renderer). `None` when no message has
+/// the role, so the caller keeps its slice.
 fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
     let is_developer =
         |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("developer");
     if !messages.iter().any(is_developer) {
         return None;
     }
-    Some(
-        messages
-            .iter()
-            .map(|m| {
-                if !is_developer(m) {
-                    return m.clone();
-                }
-                let mut rewritten = m.clone();
-                if let Some(fields) = rewritten.as_object_mut() {
-                    fields.insert(
-                        "role".to_string(),
-                        serde_json::Value::String("system".to_string()),
-                    );
-                    fields.remove("tools");
-                }
-                rewritten
-            })
-            .collect(),
-    )
+    let rewritten = messages
+        .iter()
+        .map(|m| {
+            if !is_developer(m) {
+                return m.clone();
+            }
+            let mut rewritten = m.clone();
+            if let Some(fields) = rewritten.as_object_mut() {
+                fields.insert(
+                    "role".to_string(),
+                    serde_json::Value::String("system".to_string()),
+                );
+                fields.remove("tools");
+            }
+            rewritten
+        })
+        .collect();
+    Some(consolidate_system_messages(rewritten))
+}
+
+/// vLLM's `_consolidate_system_messages`, for the templates that want the
+/// system message first: the messages unchanged when the only system message
+/// is the first one; otherwise one system message at the front carrying the
+/// non-empty system texts joined by blank lines (a parts list contributes its
+/// text parts joined by newlines), then the other messages in their order.
+fn consolidate_system_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let is_system =
+        |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("system");
+    if !messages
+        .iter()
+        .enumerate()
+        .any(|(index, m)| index > 0 && is_system(m))
+    {
+        return messages;
+    }
+    let mut system_texts: Vec<String> = Vec::new();
+    let mut others = Vec::with_capacity(messages.len());
+    for message in messages {
+        if !is_system(&message) {
+            others.push(message);
+            continue;
+        }
+        let text = match message.get("content") {
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    serde_json::Value::String(text) => Some(text.as_str()),
+                    serde_json::Value::Object(fields) => {
+                        fields.get("text").and_then(serde_json::Value::as_str)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            system_texts.push(text);
+        }
+    }
+    let merged = serde_json::json!({"role": "system", "content": system_texts.join("\n\n")});
+    std::iter::once(merged).chain(others).collect()
 }
 
 fn render_chat_template(
@@ -1548,6 +1595,55 @@ mod tests {
             .apply(&messages, ChatTemplateParams::default())
             .unwrap();
         assert_eq!(rendered, "<sys>Be terse.</sys><usr>hi</usr>");
+    }
+
+    /// With a system message of its own in the request, the rewritten
+    /// developer message is no longer the first message: the two merge into
+    /// one system turn at the front, as vLLM's renderer merges them.
+    #[test]
+    fn a_developer_message_after_a_system_message_merges_into_one_system_turn() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "You are terse."}),
+            serde_json::json!({"role": "developer", "content": "Answer in French."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<sys>You are terse.\n\nAnswer in French.</sys><usr>hi</usr>"
+        );
+    }
+
+    /// A developer message in the middle of the conversation becomes the
+    /// system turn at the front; the other messages keep their order, and a
+    /// parts list contributes its text parts.
+    #[test]
+    fn a_developer_message_after_an_assistant_turn_moves_to_the_front() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>\
+                        {% elif m.role == 'assistant' %}<ast>{{ m.content }}</ast>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "hello"}),
+            serde_json::json!({"role": "developer", "content": [
+                {"type": "text", "text": "Be brief."},
+                {"type": "text", "text": "No lists."},
+            ]}),
+            serde_json::json!({"role": "user", "content": "go on"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<sys>Be brief.\nNo lists.</sys><usr>hi</usr><ast>hello</ast><usr>go on</usr>"
+        );
     }
 
     #[test]
