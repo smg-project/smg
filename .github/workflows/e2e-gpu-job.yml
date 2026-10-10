@@ -3,6 +3,10 @@ name: E2E GPU Job
 on:
   workflow_call:
     inputs:
+      pilot_profile:
+        required: true
+        type: string
+        description: "Temporary first-batch physical GPU profile: 1g, 2g, or 4g"
       engine:
         required: true
         type: string
@@ -108,6 +112,7 @@ jobs:
     permissions:
       contents: read
     env:
+      PILOT_PROFILE: ${{ inputs.pilot_profile }}
       E2E_ENGINE: ${{ inputs.engine }}
       E2E_RUNTIME: ${{ inputs.engine }}
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
@@ -185,6 +190,32 @@ jobs:
           pip install wheel/*.whl
           bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
 
+      - name: Require actual prepared adoption and native CUDA imports
+        run: |
+          source scripts/ci_prepared_backend_env.sh
+          smg_prepared_env_matches "$E2E_ENGINE" "/opt/smg-ci/$E2E_ENGINE/.venv"
+          python3 - <<'PYTHON'
+          import importlib, importlib.metadata as metadata, json, os, sys
+          import torch
+          from smg.smg_rs import Router
+          backend, profile = os.environ['E2E_ENGINE'], os.environ['PILOT_PROFILE']
+          expected = f'/opt/smg-ci/{backend}/.venv'
+          assert os.getuid() == 1001, 'Runner user changed'
+          assert os.path.realpath(sys.prefix) == expected, 'Fresh installation is not prepared adoption'
+          assert torch.cuda.device_count() == int(profile[0]), 'Physical GPU profile changed'
+          for module in (backend, 'nixl._api', 'mooncake.engine'):
+              importlib.import_module(module)
+          torch.empty(1, device='cuda')
+          torch.cuda.synchronize()
+          print(json.dumps({'uid': os.getuid(), 'profile': profile, 'venv': sys.prefix,
+                            'venv_realpath': os.path.realpath(sys.prefix),
+                            'devices': [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+                            'cuda': torch.version.cuda,
+                            'versions': {name: metadata.version(name) for name in
+                                         ('torch', backend, 'nixl', 'mooncake-transfer-engine-cuda13', 'smg')},
+                            'native_imports': 'passed', 'cuda_allocation': 'passed'}))
+          PYTHON
+
       # The servicer's engine-gated unit tests (importorskip("vllm"),
       # importorskip("sglang") for the SGLang ZMQ wire pins) only meet a real
       # engine here; the CPU unit-test job skips them. One lane per engine opts in.
@@ -230,8 +261,55 @@ jobs:
             --ignore=e2e_test/benchmarks \
             --ignore=e2e_test/bindings_go \
             ${{ inputs.test_filter }} \
-            --reruns 2 --reruns-delay 5 \
+            --reruns 0 --force-reruns 0 \
+            --junitxml=runner-pilot-results.xml \
             -s -vv
+
+      - name: Require exact original assertions without skips or retries
+        if: always()
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import xml.etree.ElementTree as ET
+          profile, engine = os.environ['PILOT_PROFILE'], os.environ['E2E_ENGINE']
+          assert profile in ('1g', '2g', '4g') and engine in ('vllm', 'sglang'), 'Unknown pilot slice'
+          expected = set()
+          if profile == '1g' or (profile == '2g' and engine == 'vllm'):
+              paths = (
+                  ('chat_completions.test_function_calling.TestOpenAIServerFunctionCalling', 'test_streaming_multiple_choices_without_tools'),
+                  ('chat_completions.test_function_calling.TestToolChoiceLlama', 'test_tool_choice_required_non_streaming'),
+                  ('chat_completions.test_validation.TestEosTokenStripping', 'test_no_eos_in_content_default'),
+              )
+              expected = {(cls, f'{method}[{sdk}-grpc]') for cls, method in paths for sdk in ('openai', 'smg')}
+          else:
+              topology = '1p1d' if profile == '2g' else '2p2d'
+              cls = 'router.test_pd_topologies.TestPDTopology'
+              expected = {(cls, f'{method}[{topology}]') for method in
+                          ('test_workers_registered_by_role', 'test_every_leg_takes_traffic',
+                           'test_concurrent_requests_do_not_alias', 'test_long_prompt_context_reaches_decode')}
+              if profile == '4g':
+                  cls = 'chat_completions.test_openai_server.TestChatCompletionGptOss120B'
+                  expected |= {(cls, f'{method}[{sample}-{logprobs}-{sdk}-grpc]')
+                               for method in ('test_chat_completion', 'test_chat_completion_stream')
+                               for sample in (1, 2) for logprobs in ('None', '5') for sdk in ('openai', 'smg')}
+                  if engine == 'vllm':
+                      expected.add(('router.test_pd_topologies.TestPDMixedTransport',
+                                    'test_every_request_lands_on_a_matching_pair[2p2d-mixed-kv]'))
+          cases = ET.parse('runner-pilot-results.xml').getroot().findall('.//testcase')
+          actual = {(case.attrib['classname'].removeprefix('e2e_test.'), case.attrib['name']) for case in cases}
+          assert len(cases) == len(expected) and actual == expected, f'Original selection changed: missing={expected - actual}, extra={actual - expected}'
+          assert all(child.tag in ('system-out', 'system-err', 'properties') for case in cases for child in case), 'An assertion failed, errored, skipped, or reran'
+          print(f'{profile}/{engine}: {len(cases)} exact original assertions passed without skips or retries')
+          PYTHON
+
+      - name: Upload pilot assertion evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runner-pilot-${{ inputs.pilot_profile }}-${{ inputs.engine }}
+          path: runner-pilot-results.xml
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Worker failure diagnostics
         if: failure() || cancelled()
