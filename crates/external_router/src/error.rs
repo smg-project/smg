@@ -89,7 +89,7 @@ pub fn create_error(
         headers,
         Json(ErrorResponse {
             error: ErrorDetail {
-                error_type: status_code_to_str(status),
+                error_type: error_type_for_status(status),
                 code: &code_str,
                 message: &message_str,
                 param: None,
@@ -101,10 +101,21 @@ pub fn create_error(
     response
 }
 
-fn status_code_to_str(status_code: StatusCode) -> &'static str {
-    status_code
-        .canonical_reason()
-        .unwrap_or("Unknown Status Code")
+/// The `error.type` of the OpenAI-shaped envelope for a status.
+///
+/// The public API's vocabulary, which clients switch on to decide between
+/// fixing the request, re-authenticating, backing off and retrying: a 4xx is
+/// an `invalid_request_error` (the public API files its 404s there too, the
+/// detail in `code`, e.g. `model_not_found`, and its 401s, with the code
+/// `invalid_api_key`), except the two statuses with a word of their own;
+/// every 5xx is a `server_error`.
+pub fn error_type_for_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        status if status.is_server_error() => "server_error",
+        _ => "invalid_request_error",
+    }
 }
 
 pub fn model_not_found(model: &str) -> Response {
@@ -177,6 +188,56 @@ pub fn sanitize_error_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reason phrase ("Bad Request", "Not Found") is not a `type` the SDKs
+    /// know; the envelope's `type` is the public vocabulary, `code` stays the
+    /// gateway's string and `param` is present (null when no field is named).
+    #[tokio::test]
+    async fn envelope_type_is_the_public_vocabulary_for_every_status_class() {
+        for (status, expected) in [
+            (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            (StatusCode::NOT_FOUND, "invalid_request_error"),
+            (StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
+            (StatusCode::FAILED_DEPENDENCY, "invalid_request_error"),
+            (StatusCode::UNAUTHORIZED, "invalid_request_error"),
+            (StatusCode::FORBIDDEN, "permission_error"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            (StatusCode::NOT_IMPLEMENTED, "server_error"),
+            (StatusCode::BAD_GATEWAY, "server_error"),
+            (StatusCode::SERVICE_UNAVAILABLE, "server_error"),
+            (StatusCode::GATEWAY_TIMEOUT, "server_error"),
+        ] {
+            let response = create_error(status, "some_code", "what went wrong");
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], expected, "{status}");
+            assert_eq!(json["error"]["code"], "some_code", "{status}");
+            assert_eq!(json["error"]["message"], "what went wrong", "{status}");
+            assert!(
+                json["error"].get("param").is_some_and(Value::is_null),
+                "{status}: param must be present and null, got {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_not_found_is_an_invalid_request_error_with_the_code() {
+        let response = model_not_found("gpt-nope");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "model_not_found"
+        );
+        assert_eq!(
+            error_type_for_status(response.status()),
+            "invalid_request_error"
+        );
+    }
 
     #[test]
     fn extract_error_code_reads_gateway_minted_code() {

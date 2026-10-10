@@ -81,7 +81,7 @@ pub struct RouterConfig {
     pub stream_body_stall_timeout_secs: u64,
     pub request_timeout_secs: u64,
     /// Idle timeout for pooled upstream connections. Must stay below the
-    /// backend HTTP server's keep-alive timeout (vLLM and SGLang default to
+    /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
     /// and non-idempotent sends fail. `0` keeps idle connections forever.
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
@@ -146,7 +146,7 @@ pub struct RouterConfig {
     pub worker_warmup_divert_every: u64,
     /// How long a disaggregated (PD) dispatch waits for a slot in the decode
     /// engine's running window before shedding. Must stay well under the
-    /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
+    /// engine's bootstrap deadline (120s on one engine): a request that waits
     /// out this budget and then dispatches still has the whole deadline ahead
     /// of it. `0` sheds immediately instead of waiting. Ignored for engines
     /// that report no running window.
@@ -233,7 +233,7 @@ pub struct RouterConfig {
     /// spec's built-in limit; beats `SMG_IMAGE_MAX_COUNT`. Unset keeps spec limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_per_request_image_limit: Option<usize>,
-    /// Where media for vLLM gRPC workers is fetched and preprocessed (`auto` |
+    /// Where media for one engine's gRPC workers is fetched and preprocessed (`auto` |
     /// `router` | `worker`); when unset, falls back to `SMG_MM_PROCESSING`,
     /// then `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,6 +298,10 @@ pub struct RouterConfig {
     /// permit is held for the full response, including streaming bodies.
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
+    /// Longest a request may wait inside the gateway: in the admission queue,
+    /// and, in the gRPC router, from its admission (its acceptance without an
+    /// admission layer) to worker selection: a request still ahead of
+    /// selection after this long is refused with a 503, once per request.
     pub queue_timeout_secs: u64,
     /// Maximum in-flight Prefill requests per worker in PD or EPD mode.
     /// A non-positive value disables the limit.

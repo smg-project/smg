@@ -74,6 +74,14 @@ impl RouteRequestMeta {
         self
     }
 
+    /// Set or replace an extension on a meta that already exists.
+    pub fn insert_extension<T>(&mut self, value: T)
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.extensions.insert(value);
+    }
+
     #[must_use]
     pub fn extension<T>(&self) -> Option<&T>
     where

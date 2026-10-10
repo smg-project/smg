@@ -209,21 +209,19 @@ impl HyV4Parser {
         })
     }
 
-    /// Close prefilled reasoning before the forced call. Prefix exclusions also
-    /// prevent checkpoint-suffixed control markers from appearing in reasoning.
+    /// What precedes a forced call on a thinking prompt: free text without
+    /// the call markers (their checkpoint-suffixed spellings included) and
+    /// nothing owed at its end, as `Glm4MoeParser::reasoning_prefix`: an
+    /// engine that runs a reasoning parser applies the grammar only after the
+    /// model's own `</think>`, and a prefix closed by `</think>` would be owed
+    /// a second time.
     pub fn reasoning_prefix() -> Value {
         json!({
-            "type": "tag",
-            "begin": "",
-            "content": {
-                "type": "any_text",
-                "excludes": [
-                    "<think", "</think",
-                    "<tool_call", "</tool_call",
-                    "<arg_key", "</arg_key", "<arg_value", "</arg_value",
-                ],
-            },
-            "end": "</think>",
+            "type": "any_text",
+            "excludes": [
+                "<tool_call", "</tool_call",
+                "<arg_key", "</arg_key", "<arg_value", "</arg_value",
+            ],
         })
     }
 }

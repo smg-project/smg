@@ -280,7 +280,7 @@ mod tests {
     fn deepseek_v32_renderer_honors_thinking_kwarg_only() {
         // `thinking: true` → prompt ends with <think> (thinking mode).
         // `enable_thinking: true` alone → ignored (chat mode), matching
-        // `thinking_key_name() == Some(Thinking)` and sglang's DeepSeek path.
+        // `thinking_key_name() == Some(Thinking)` and the serving engine's DeepSeek path.
         let (_tmp, tok) = write_dir(Some(&["DeepseekV32ForCausalLM"]));
         let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
         let messages = vec![json!({ "role": "user", "content": "Hi" })];
@@ -369,7 +369,7 @@ mod tests {
         let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
         let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
         let chat = "<｜User｜>Hi<｜Assistant｜></think>";
-        // `thinking: false`, vLLM's `enable_thinking: false` alias and
+        // `thinking: false`, the engine's `enable_thinking: false` alias and
         // `reasoning_effort: "none"` (kwarg or top-level) render chat mode
         // without any effort prefix.
         for kwargs in [
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn deepseek_v4_maps_reasoning_effort_like_the_engine() {
-        // vLLM's mapping of the kwarg: `max` the top level, `low`/`minimal`/
+        // The engine's mapping of the kwarg: `max` the top level, `low`/`minimal`/
         // `medium` the bottom one (no prefix), everything else `high`; the
         // top-level field counts the same as the kwarg.
         let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
@@ -530,7 +530,7 @@ mod tests {
     fn missing_encoder_renders_the_engines_effort_table() {
         // Without the checkpoint's encoder (a tokenizer directory streamed from
         // a worker has none), whatever the directory is called, the effort
-        // table is the one vLLM's port renders for every V4 checkpoint.
+        // table is the one the engine's port renders for every V4 checkpoint.
         for name in ["DeepSeek-V4-Flash-0731", "DeepSeek-V4-Flash", "tmp8f2k1"] {
             let (_tmp, tok) = write_v4_model_dir(name, None);
             let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn v41_explicit_thinking_true_overrides_reasoning_effort_none() {
-        // Deliberate divergence from vLLM Python, where "none" forces chat
+        // Deliberate divergence from the engine's Python renderer, where "none" forces chat
         // mode: the gateway arms the reasoning parser from the explicit toggle
         // first, so the prompt must enter thinking mode as well. "none"
         // carries no effort level, so the default budget is rendered.
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn v41_enable_thinking_alias_switches_the_mode_like_thinking() {
-        // vLLM's `enable_thinking` alias is honoured on both sides: the shim
+        // The engine's `enable_thinking` alias is honoured on both sides: the shim
         // reads it here and the gateway reads it when it arms the parser
         // (`renderer_capabilities().enable_thinking_alias`).
         let (_tmp, tokenizer) = v41_tokenizer();
@@ -901,7 +901,7 @@ mod tests {
 
     #[test]
     fn v41_tools_attach_to_a_mid_conversation_system_message() {
-        // vLLM's V4.1 rule: tools attach to the FIRST system message wherever
+        // The engine's V4.1 rule: tools attach to the FIRST system message wherever
         // it is, even when the conversation opens with a user turn — unlike
         // V3.2/V4, which only rewrite a *leading* system/developer message.
         let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));

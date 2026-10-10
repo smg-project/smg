@@ -1,7 +1,7 @@
 //! DeepSeek-V4.1 DSML tool-call parser: spaced tags, reference parsing rules.
 //!
-//! Parity cases ported from vLLM `tests/parser/engine/test_deepseek_v41.py`
-//! (parallel calls at chunk sizes 1/7/10000) and SGLang
+//! Parity cases ported from one serving engine's `tests/parser/engine/test_deepseek_v41.py`
+//! (parallel calls at chunk sizes 1/7/10000) and another's
 //! `test_deepseekv41_detector.py` (nested JSON string, list values, JSON-body
 //! invoke, chunk sizes 1..1000).
 

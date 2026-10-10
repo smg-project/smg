@@ -84,4 +84,6 @@ class TestRlControlPlaneDisabled:
         _backend, _model, _client, gateway = setup_backend
         resp = httpx.get(f"{gateway.base_url}/v1/rl/workers", timeout=TIMEOUT)
         assert resp.status_code == 404
-        assert resp.content == b""
+        # An unmounted route answers the JSON not-found envelope, never an empty body.
+        body = resp.json()
+        assert body["error"]["code"] == "unknown_url", body

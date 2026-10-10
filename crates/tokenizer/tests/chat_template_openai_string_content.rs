@@ -1,7 +1,7 @@
 //! String message content under an "openai"-format chat template renders
-//! through the template's parts branch, as it does on vLLM's own server.
+//! through the template's parts branch, as it does on the engine's own server.
 //!
-//! vLLM hands a template it detects as "openai" format every message's string
+//! The serving engine hands a template it detects as "openai" format every message's string
 //! content as a one-item text part list, so such a template takes its parts
 //! branch for a plain string too. A template whose two branches differ (a
 //! separator after every part, a truthiness check on the content) renders a
@@ -125,7 +125,7 @@ fn an_empty_string_is_a_one_item_part_list_to_an_openai_template() {
 
 #[test]
 fn a_tool_result_stays_a_string() {
-    // vLLM joins a tool message's text parts back into one string, so a
+    // The engine joins a tool message's text parts back into one string, so a
     // template may concatenate it.
     const TEMPLATE: &str = r"{%- for message in messages -%}
 {%- if message['role'] == 'tool' -%}

@@ -1,7 +1,7 @@
-// Ported from vLLM's `vllm/tokenizers/deepseek_v41_encoding.py` (itself a port
+// Ported from the serving engine's `tokenizers/deepseek_v41_encoding.py` (itself a port
 // of the `encoding/encoding.py` shipped with deepseek-ai/DeepSeek-V4.1-Flash),
 // function by function and in the same order, plus the message normalisation
-// that vLLM keeps in `vllm/tokenizers/deepseek_v41.py::_normalize_messages`.
+// that the engine keeps in `tokenizers/deepseek_v41.py::_normalize_messages`.
 //
 // V4.1 differs from V4 (`deepseek_v4.rs`) in four places: the DSML tag strings
 // carry a leading space (` invoke`, ` parameter`, ` calls`), the reasoning
@@ -90,7 +90,7 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    /// Spec D1: engine table. Flip these four numbers if vLLM/SGLang adopt
+    /// Spec D1: engine table. Flip these four numbers if the serving engines adopt
     /// DeepSeek's 50/75/100.
     pub const fn budget(self) -> u8 {
         match self {
@@ -206,7 +206,7 @@ fn render_response_format(schema: &Value) -> String {
 // ---------------------------------------------------------------------------
 // Python's `to_json` is `json.dumps(value, ensure_ascii=False)`: spaced
 // separators, raw UTF-8. Compact `serde_json::to_string` would change the
-// prompt bytes vLLM trained on.
+// prompt bytes the model was trained on.
 fn to_json(value: &Value) -> String {
     crate::json_dumps::to_string(value)
 }
@@ -242,13 +242,13 @@ fn has_tools(msg: &Value) -> bool {
 // ---------------------------------------------------------------------------
 // Image/content-part normalisation
 // ---------------------------------------------------------------------------
-// vLLM's `_normalize_messages` plus the reference encoder's
+// The engine's `_normalize_messages` plus the reference encoder's
 // `process_image_messages`: list content collapses to a single string in which
 // every image part became `IMAGE_PLACEHOLDER`, parts joined by a blank line.
 // The image payloads themselves are not collected here — SMG's multimodal path
 // carries them separately, the prompt only needs the marker.
 
-/// Mirrors vLLM's `_normalize_messages` flattening plus the HF
+/// Mirrors the engine's `_normalize_messages` flattening plus the HF
 /// `_validate_no_image_sp_tokens` check (see the header comment above): list
 /// content collapses to the text V4.1 encodes, and no text may carry the image
 /// placeholder.

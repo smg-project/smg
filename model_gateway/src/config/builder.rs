@@ -371,7 +371,7 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// Where media for vLLM gRPC workers is fetched and preprocessed.
+    /// Where media for one engine's gRPC workers is fetched and preprocessed.
     pub fn mm_processing(mut self, mode: Option<MmProcessingMode>) -> Self {
         self.config.mm_processing = mode;
         self

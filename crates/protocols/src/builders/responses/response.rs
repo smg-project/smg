@@ -37,7 +37,7 @@ pub struct ResponsesResponseBuilder {
     store: bool,
     temperature: Option<f32>,
     text: Option<TextConfig>,
-    tool_choice: String,
+    tool_choice: ResponsesToolChoice,
     tools: Vec<ResponseTool>,
     top_logprobs: Option<u32>,
     top_p: Option<f32>,
@@ -81,7 +81,7 @@ impl ResponsesResponseBuilder {
             store: true,
             temperature: None,
             text: None,
-            tool_choice: "auto".to_string(),
+            tool_choice: ResponsesToolChoice::default(),
             tools: Vec::new(),
             top_logprobs: None,
             top_p: None,
@@ -126,11 +126,9 @@ impl ResponsesResponseBuilder {
         // request's union-typed reference down to its underlying id string.
         self.conversation = request.conversation.as_ref().map(|c| c.as_id().to_string());
         self.temperature = request.temperature;
-        self.tool_choice = if let Some(ref tc) = request.tool_choice {
-            serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string())
-        } else {
-            "auto".to_string()
-        };
+        // Echoed as sent: the object form stays an object, a bare string stays
+        // a string; `"auto"` when the request had none.
+        self.tool_choice = request.tool_choice.clone().unwrap_or_default();
         self.tools = request.tools.clone().unwrap_or_default();
         self.top_p = request.top_p;
         self.user.clone_from(&request.user);
@@ -244,8 +242,8 @@ impl ResponsesResponseBuilder {
     }
 
     /// Set tool choice setting
-    pub fn tool_choice(mut self, tool_choice: impl Into<String>) -> Self {
-        self.tool_choice = tool_choice.into();
+    pub fn tool_choice(mut self, tool_choice: ResponsesToolChoice) -> Self {
+        self.tool_choice = tool_choice;
         self
     }
 

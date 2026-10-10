@@ -250,7 +250,11 @@ impl Encoder for CachedTokenizer {
             };
 
             if let Some(l0) = &self.l0 {
-                l0.insert(input.to_string(), add_special_tokens, encoding.clone());
+                l0.insert(
+                    input.to_string(),
+                    add_special_tokens,
+                    Encoding::Plain(encoding.token_ids().to_vec()),
+                );
             }
 
             return Ok(encoding);
@@ -260,7 +264,11 @@ impl Encoder for CachedTokenizer {
         let encoding = self.inner.encode(input, add_special_tokens)?;
 
         if let Some(l0) = &self.l0 {
-            l0.insert(input.to_string(), add_special_tokens, encoding.clone());
+            l0.insert(
+                input.to_string(),
+                add_special_tokens,
+                Encoding::Plain(encoding.token_ids().to_vec()),
+            );
         }
 
         Ok(encoding)

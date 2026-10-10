@@ -18,8 +18,10 @@
 //! that leaves it unset or empty replays every case. A second parity test replays
 //! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
-//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves; it
-//! skips the slugs bellwether has not recorded yet, and says so. When a preview run sets
+//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves,
+//! on as many threads as the run has CPUs, each model's report written in the table's order as
+//! soon as it and the models before it are done; it skips the slugs bellwether has not recorded
+//! yet, and says so. When a preview run sets
 //! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows the classes of difference the recorded
 //! sets have ([`Allowance`]): a reference argument whose type contradicts the one the tool
 //! declares, which the template writes the same way as the string; reasoning in a reference whose
@@ -48,7 +50,18 @@
 
 mod common;
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{BufRead, BufReader},
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
 
 use common::{bytes_of, chunkings, prompt, replay, replay_after};
 use openai_protocol::common::Tool;
@@ -684,7 +697,7 @@ const CONTENT_OR_CALLS: &[&str] = &[
 enum Allowance {
     /// The reference's argument is a boolean, a number or null for a parameter the tool declares
     /// `string`, so the template writes it as it writes the string, and the parser gives the
-    /// string back, as vLLM does (BFCL declares `smoking_allowed` an enum of `"True"`, `"False"`
+    /// string back, as the engine's parser does (BFCL declares `smoking_allowed` an enum of `"True"`, `"False"`
     /// and `"dontcare"` and answers `false`). Bellwether #56 refuses such a case.
     DeclaredTypeConflict,
     /// The template writes no thought, so the reasoning the reference carries is not in the output
@@ -931,7 +944,8 @@ impl Said {
 #[test]
 #[expect(
     clippy::print_stderr,
-    reason = "the skip notice is test diagnostic output"
+    clippy::print_stdout,
+    reason = "the skip notice and the per-case report are test diagnostic output"
 )]
 fn qwen3_parse_fixtures_match_the_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
@@ -948,7 +962,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
         "no parse fixtures under {}",
         root.display()
     );
-    let failures = parity(
+    let Parity { report, failures } = parity(
         &fixtures,
         &ids,
         &|fixture| Family::Qwen3.engine(SLUG, fixture),
@@ -957,6 +971,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
         &[],
         Family::Qwen3.think_markers(),
     );
+    print!("{report}");
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
@@ -964,7 +979,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
 #[expect(
     clippy::print_stderr,
     clippy::print_stdout,
-    reason = "the skip notice and the per-case report are test diagnostic output"
+    reason = "the skip notices and the per-case reports are test diagnostic output"
 )]
 fn every_recorded_qwen_model_parses_like_its_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
@@ -976,29 +991,21 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
     };
     let mut failures = Vec::new();
     let mut recorded = 0;
-    for &(slug, family, prompt) in MODELS {
-        let dir = root.join(slug).join("parse");
-        if !dir.is_dir() {
-            eprintln!("skipping {slug}: bellwether has not recorded its parse sets yet");
-            continue;
-        }
-        if let Some((_, reason)) = SKIPPED.iter().find(|(skipped, _)| *skipped == slug) {
-            eprintln!("skipping {slug}: {reason}");
-            continue;
-        }
-        let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
-        println!("{slug} ({family:?}, {prompt:?}):");
-        failures.extend(parity(
-            &fixtures,
-            &ids,
-            &|fixture| family.engine(slug, fixture),
-            &|fixture| prompt.tail(fixture, family),
-            &family.known_differences(slug, prompt),
-            &family.allowances(slug, prompt),
-            family.think_markers(),
-        ));
-        recorded += 1;
-    }
+    in_order(
+        MODELS,
+        |&(slug, family, prompt)| replay_model(&root, slug, family, prompt),
+        |replayed| match replayed {
+            Replayed::Skipped(notice) => eprintln!("{notice}"),
+            Replayed::Compared {
+                report,
+                failures: of_model,
+            } => {
+                print!("{report}");
+                failures.extend(of_model);
+                recorded += 1;
+            }
+        },
+    );
     if recorded == 0 {
         eprintln!(
             "skipping: none of the table's slugs is recorded under {}",
@@ -1008,16 +1015,133 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
-/// case's `prompt_tail`, on every chunking, prints one line per case, and returns every difference
-/// that neither `known_differences` nor `allowed` allows. `every_id` is the id of every case the
-/// set files hold, before any sample thinned them: a listed difference no longer among them is a
-/// failure too, so the list cannot rot.
+/// What replaying one of [`MODELS`] gave: the notice for a slug the run leaves out, or the
+/// report a serial run would have printed for the model and the differences nothing allows.
+enum Replayed {
+    Skipped(String),
+    Compared {
+        report: String,
+        failures: Vec<String>,
+    },
+}
+
+/// Replay one of [`MODELS`]: its parse sets under `root`, read as [`read_fixtures`] reads them,
+/// through its table after its prompt tail, with its known differences and allowances.
 #[expect(
-    clippy::print_stdout,
     clippy::panic,
-    reason = "the per-case report is diagnostic output; a fixture that cannot be replayed ends \
-              the test with its id"
+    reason = "a set that cannot be read ends the test with its path"
+)]
+fn replay_model(
+    root: &std::path::Path,
+    slug: &str,
+    family: Family,
+    prompt: GenerationPrompt,
+) -> Replayed {
+    let dir = root.join(slug).join("parse");
+    if !dir.is_dir() {
+        return Replayed::Skipped(format!(
+            "skipping {slug}: bellwether has not recorded its parse sets yet"
+        ));
+    }
+    if let Some((_, reason)) = SKIPPED.iter().find(|(skipped, _)| *skipped == slug) {
+        return Replayed::Skipped(format!("skipping {slug}: {reason}"));
+    }
+    let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let Parity { report, failures } = parity(
+        &fixtures,
+        &ids,
+        &|fixture| family.engine(slug, fixture),
+        &|fixture| prompt.tail(fixture, family),
+        &family.known_differences(slug, prompt),
+        &family.allowances(slug, prompt),
+        family.think_markers(),
+    );
+    Replayed::Compared {
+        report: format!("{slug} ({family:?}, {prompt:?}):\n{report}"),
+        failures,
+    }
+}
+
+/// Run `each` on every item, on as many threads as the run has CPUs, each thread taking the
+/// next item from a shared index, and hand what it gives to `then` in the items' order, each
+/// as soon as it and the ones before it are done. A panic in `each` ends the run once the items
+/// in flight are done, as it would on one thread: the thread that panics raises a flag as it
+/// unwinds, and no thread takes an item once it is up.
+fn in_order<I: Sync, T: Send>(items: &[I], each: impl Fn(&I) -> T + Sync, then: impl FnMut(T)) {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(items.len())
+        .max(1);
+    in_order_on(threads, items, each, then);
+}
+
+/// [`in_order`] on `threads` threads.
+fn in_order_on<I: Sync, T: Send>(
+    threads: usize,
+    items: &[I],
+    each: impl Fn(&I) -> T + Sync,
+    mut then: impl FnMut(T),
+) {
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let (next, stop, each) = (&next, &stop, &each);
+            scope.spawn(move || {
+                let _raised_on_panic = StopOnPanic(stop);
+                while !stop.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    if tx.send((index, each(item))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut pending = BTreeMap::new();
+        let mut done = 0;
+        for (index, outcome) in rx {
+            pending.insert(index, outcome);
+            while let Some(outcome) = pending.remove(&done) {
+                then(outcome);
+                done += 1;
+            }
+        }
+    });
+}
+
+/// Raises the flag it holds when its thread unwinds from a panic, so that the other threads of
+/// [`in_order_on`] take no further item.
+struct StopOnPanic<'a>(&'a AtomicBool);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// What [`parity`] gave for a set: the report, one line per case and the set's summary, as a
+/// serial run would have printed it, and every difference that nothing allows.
+struct Parity {
+    report: String,
+    failures: Vec<String>,
+}
+
+/// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
+/// case's `prompt_tail`, on every chunking, reports one line per case and the set's summary, and
+/// returns with them every difference that neither `known_differences` nor `allowed` allows.
+/// `every_id` is the id of every case the set files hold, before any sample thinned them: a
+/// listed difference no longer among them is a failure too, so the list cannot rot.
+#[expect(
+    clippy::panic,
+    reason = "a fixture that cannot be replayed ends the test with its id"
 )]
 fn parity(
     fixtures: &[Fixture],
@@ -1027,13 +1151,14 @@ fn parity(
     known_differences: &[KnownDifference],
     allowed: &[Allowance],
     think_markers: (&str, &str),
-) -> Vec<String> {
+) -> Parity {
     let known = |id: &str| {
         known_differences
             .iter()
             .find(|known| known.id == after_slug(id))
     };
     let mut failures = Vec::new();
+    let mut out = String::new();
     let (mut bitwise, mut separators_only, mut listed, mut allowed_count) = (0, 0, 0, 0);
     let (mut token_plans_run, mut without_pieces) = (0, 0);
     for fixture in fixtures {
@@ -1163,9 +1288,9 @@ fn parity(
                 fixture.id
             ));
         }
-        println!("  {verdict:34} {}", fixture.id);
+        out.push_str(&format!("  {verdict:34} {}\n", fixture.id));
         if let Some(listed_case) = known(&fixture.id) {
-            println!("  {:34} {}", "", listed_case.reason);
+            out.push_str(&format!("  {:34} {}\n", "", listed_case.reason));
         }
     }
     // A listed case that is no longer among the fixtures would let the list rot. The check reads
@@ -1179,13 +1304,16 @@ fn parity(
         }
     }
     let sample = sample_note(sample_every());
-    println!(
+    out.push_str(&format!(
         "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, \
          {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} token plans \
-         replayed, {without_pieces} cases without output_pieces",
+         replayed, {without_pieces} cases without output_pieces\n",
         fixtures.len()
-    );
-    failures
+    ));
+    Parity {
+        report: out,
+        failures,
+    }
 }
 
 /// The allowance that covers the difference between `said` and `expected`, if one of `allowed`
@@ -1699,9 +1827,10 @@ fn step_for(file: &std::path::Path, every: usize) -> usize {
     }
 }
 
-/// Every `every`-th of `items`, the first included: the same slice of a set every run.
-fn sampled<T>(items: Vec<T>, every: usize) -> Vec<T> {
-    items.into_iter().step_by(every.max(1)).collect()
+/// Whether the case at `index` of its set is in the sample: every `every`-th from the first, the
+/// same slice of a set every run.
+fn kept(index: usize, every: usize) -> bool {
+    index.is_multiple_of(every.max(1))
 }
 
 /// The cases a slug's set files gave.
@@ -1727,19 +1856,27 @@ fn read_fixtures(dir: &std::path::Path) -> Result<Cases, String> {
     let mut fixtures = Vec::new();
     let mut ids = Vec::new();
     for file in files {
-        let text = fs::read_to_string(&file)
-            .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-        let mut of_this_set = Vec::new();
-        for (number, line) in text.lines().enumerate() {
+        let step = step_for(&file, every);
+        let reader = BufReader::new(
+            fs::File::open(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?,
+        );
+        // The set is read a line at a time, every case parsed as before, and a case outside the
+        // sample dropped as it is read, so the run holds the sampled cases and one line of a
+        // set, however many models are in flight.
+        let mut index = 0;
+        for (number, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| format!("cannot read {}: {e}", file.display()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let fixture: Fixture = serde_json::from_str(line)
+            let fixture: Fixture = serde_json::from_str(&line)
                 .map_err(|e| format!("{}:{}: {e}", file.display(), number + 1))?;
-            of_this_set.push(fixture);
+            ids.push(fixture.id.clone());
+            if kept(index, step) {
+                fixtures.push(fixture);
+            }
+            index += 1;
         }
-        ids.extend(of_this_set.iter().map(|fixture| fixture.id.clone()));
-        fixtures.extend(sampled(of_this_set, step_for(&file, every)));
     }
     Ok(Cases { fixtures, ids })
 }
@@ -1780,11 +1917,77 @@ fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
 }
 
 #[test]
+fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
+    // Item 0 waits until item 1 is done, so on two threads item 1 finishes first and items 2
+    // and 3 may follow it, all before item 0; `then` still sees them in the items' order.
+    let item_1_done = AtomicBool::new(false);
+    let items = [0, 1, 2, 3];
+    let mut handed = Vec::new();
+    in_order_on(
+        2,
+        &items,
+        |&item| {
+            if item == 0 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !item_1_done.load(Ordering::Relaxed) {
+                    assert!(Instant::now() < deadline, "item 1 never finished");
+                    std::thread::yield_now();
+                }
+            }
+            if item == 1 {
+                item_1_done.store(true, Ordering::Relaxed);
+            }
+            item * 10
+        },
+        |outcome| handed.push(outcome),
+    );
+    assert_eq!(handed, [0, 10, 20, 30]);
+}
+
+#[test]
+fn a_panic_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_more() {
+    // Item 0 panics at once; every other item waits for that panic and then a while longer, so
+    // the flag is up before any other thread looks for its next item: on two threads, the
+    // other thread finishes the one item it had and takes none of the six left.
+    let item_0_panicked = AtomicBool::new(false);
+    let started = AtomicUsize::new(0);
+    let items: Vec<usize> = (0..8).collect();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        in_order_on(
+            2,
+            &items,
+            |&item| {
+                if item == 0 {
+                    item_0_panicked.store(true, Ordering::Relaxed);
+                    panic!("item 0");
+                }
+                started.fetch_add(1, Ordering::Relaxed);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !item_0_panicked.load(Ordering::Relaxed) {
+                    assert!(Instant::now() < deadline, "item 0 never panicked");
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                item
+            },
+            |_| {},
+        );
+    }));
+    assert!(outcome.is_err(), "the panic reaches the caller");
+    let started = started.load(Ordering::Relaxed);
+    assert!(
+        started <= 1,
+        "{started} items started beside the one that panicked; the other thread had one in flight"
+    );
+}
+
+#[test]
 fn a_sample_keeps_every_nth_case_of_a_set_from_its_first() {
-    assert_eq!(sampled((0..10).collect::<Vec<_>>(), 3), [0, 3, 6, 9]);
-    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 1), [0, 1, 2, 3]);
-    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 10), [0]);
-    assert!(sampled(Vec::<u8>::new(), 2).is_empty());
+    let sampled = |cases: usize, every| (0..cases).filter(|&i| kept(i, every)).collect::<Vec<_>>();
+    assert_eq!(sampled(10, 3), [0, 3, 6, 9]);
+    assert_eq!(sampled(4, 1), [0, 1, 2, 3]);
+    assert_eq!(sampled(4, 10), [0]);
+    assert!(sampled(0, 2).is_empty());
 }
 
 #[test]

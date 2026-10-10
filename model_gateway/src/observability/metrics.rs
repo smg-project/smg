@@ -262,7 +262,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_admission_queue_rejected_total",
-        "Requests rejected at admission by reason (full/timeout)"
+        "Requests rejected at admission by reason (full/timeout), or refused ahead of worker selection after waiting longer than the queue timeout inside the gateway (selection_timeout)"
     );
     describe_gauge!(
         "smg_admission_inflight",

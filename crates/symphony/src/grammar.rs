@@ -3,7 +3,7 @@
 //! output is exactly what the format parses.
 //!
 //! [`Grammar`] is Symphony's own tree, in the shape the engines' structural-tag format takes
-//! (xgrammar's, which vLLM and SGLang accept): a `triggered_tags` of per-tool `tag`s, each a
+//! (xgrammar's, which the serving engines accept): a `triggered_tags` of per-tool `tag`s, each a
 //! `begin`, a content grammar and an `end`; `sequence`, `or`, `star`, `plus` and `optional` to
 //! compose; `const_string`, `any_text`, `regex` and `json_schema` as leaves. [`Grammar::to_json`]
 //! writes it as the engine reads it, and [`Grammar::payload`] wraps it as the request carries it.

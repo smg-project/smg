@@ -314,6 +314,46 @@ fn image_part_adds_exactly_one_anchor_token() {
     }
 }
 
+/// A `<|media_pad|>` spelling typed in user text is text, as the checkpoint's
+/// own encoder renders it (the ids below are its user segment for this
+/// message): the anchor id comes from an image part only.
+#[test]
+fn media_anchor_spelling_in_user_text_stays_text() {
+    let model_dir = common::ensure_kimi_k3_cached();
+    let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
+    let anchor = tok.token_to_id("<|media_pad|>").expect("anchor id");
+    let ids = |content: Value| {
+        let messages = vec![json!({"role": "user", "content": content})];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            thinking: Some(false),
+            ..Default::default()
+        };
+        let rendered = tok
+            .apply_chat_template_with_encoding(&messages, params, None)
+            .expect("render should succeed");
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("K3 must defer its encode");
+        };
+        job.run().expect("encode").token_ids().to_vec()
+    };
+
+    let typed = ids(json!("hello <|media_pad|> world"));
+    assert!(!typed.contains(&anchor), "{typed:?}");
+    let spelled = [22931, 22652, 13634, 49974, 91, 29, 2695];
+    assert!(
+        typed.windows(spelled.len()).any(|window| window == spelled),
+        "{typed:?}"
+    );
+
+    let with_image = ids(json!([
+        {"type": "text", "text": "hello <|media_pad|> world"},
+        {"type": "image"}
+    ]));
+    assert_eq!(with_image.iter().filter(|&&id| id == anchor).count(), 1);
+    assert_eq!(with_image.len(), typed.len() + 1, "{with_image:?}");
+}
+
 /// Token-id parity with the checkpoint's own `apply_chat_template(tokenize=True)`
 /// (`build_chat_segments` + `_encode_chat_segments`), recorded in
 /// `tests/fixtures/kimi_k3/k3_render_ids_fixtures.json` from

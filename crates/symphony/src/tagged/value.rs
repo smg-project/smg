@@ -7,7 +7,7 @@
 //! [`json`] turns one value's text into the JSON a client receives for it.
 //!
 //! The text [`json`] takes is the value's own: the template writes one newline after the opening
-//! tag and one before the closing tag, and the caller has removed exactly those two, as vLLM's
+//! tag and one before the closing tag, and the caller has removed exactly those two, as the engine's
 //! parsers do. Every other byte is the value's.
 //!
 //! The rules, in the order [`json`] applies them:
@@ -17,11 +17,11 @@
 //!   `&amp;` is five characters. A parameter is declared `string` when its schema admits that
 //!   type at all: `"type": "string"`, a list of types or an `anyOf` that includes it, or, when the
 //!   schema has no `type`, an `enum` of strings, with or without `null` among them. A `type`
-//!   decides alone when it is there, as it does for vLLM: BFCL declares
+//!   decides alone when it is there, as it does for the engine's parser: BFCL declares
 //!   `{"type": "array", "enum": [...]}` for a list whose members come from the enum, and that is
 //!   an array. When the schema admits `null` as well as `string`, the text `null`, and the `None`
 //!   a template writes for a null argument, are null; any other text is the string. A string
-//!   declared alone keeps `null` as its text, as vLLM's readers do; bellwether #56 refuses a case
+//!   declared alone keeps `null` as its text, as the engine's readers do; bellwether #56 refuses a case
 //!   whose reference holds a null there, since no output carries it.
 //! - A parameter declared `integer` is that integer when its text is a sign and digits, with the
 //!   whitespace around it ignored. It may be spelled `+5` or `007`; it is written in JSON's
@@ -760,7 +760,7 @@ mod tests {
                 "mixed": {"enum": [1, "two"]},
                 "empty": {"enum": []},
                 "only_null": {"enum": [null]},
-                // Aliases and other spellings of a type name are not read today; vLLM reads
+                // Aliases and other spellings of a type name are not read today; the engine's parser reads
                 // these as string and integer. Whether Symphony follows is the maintainer's
                 // decision.
                 "alias": {"type": "str"},

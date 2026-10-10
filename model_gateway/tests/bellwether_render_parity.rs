@@ -54,13 +54,14 @@ use std::{
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc,
     },
+    time::{Duration, Instant},
 };
 
 use llm_tokenizer::{create_tokenizer, traits::Tokenizer, MockTokenizer};
-use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
+use openai_protocol::{chat::ChatCompletionRequest, common::ToolChoice, validated::Normalizable};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use smg::routers::grpc::utils::process_chat_messages;
@@ -201,6 +202,22 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "muse-glimmer-30b/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "olmo-3-7b-instruct/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "olmo-3-7b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
+        "olmo-3-7b-instruct/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
@@ -836,19 +853,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "nvidia-nemotron-3-nano-30b-a3b-bf16/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "olmo-3-7b-instruct/render/*",
-        "the gateway renders continue_final_message by popping the assistant turn and appending \
-         its text after the generation header, which does not reproduce this template's \
-         continued turn (smg-project/smg#2779); and add_generation_prompt is not a field of \
-         SMG's chat request; the header is always appended (smg-project/smg#2780); and the \
-         gateway's system prompt for this template is not the reference's: the function-calling \
-         preamble is rendered for a request without tools, where the template writes that no \
-         functions are available, and a system message is placed differently \
-         (smg-project/smg-lab#107); and SMG's request schema types tool-call arguments as a \
-         string, as the API and the engines do; the template accepts an object \
-         (smg-project/bellwether#12)",
     ),
     (
         "phi-4-mini-instruct/render/no-generation-prompt",
@@ -1926,29 +1930,53 @@ where
 /// Run `each` on every model, on as many threads as the run has CPUs, and
 /// hand what it gives to `then` in the models' order, each as soon as it and
 /// the ones before it are done. An error from `each` ends the run once the
-/// models in flight are done.
+/// models in flight are done: the thread that met it raises a flag, as does
+/// one that unwinds from a panic, and no thread takes a model once it is up.
 fn in_order<T: Send>(
     manifests: &[(String, Manifest)],
     each: impl Fn(&str, &Manifest) -> Result<T, String> + Sync,
-    mut then: impl FnMut(T),
+    then: impl FnMut(T),
 ) -> Result<(), String> {
     let threads = std::thread::available_parallelism()
         .map_or(1, NonZeroUsize::get)
         .min(manifests.len())
         .max(1);
+    in_order_on(
+        threads,
+        manifests,
+        |(slug, manifest)| each(slug, manifest),
+        then,
+    )
+}
+
+/// [`in_order`] on `threads` threads, over any items.
+fn in_order_on<I: Sync, T: Send>(
+    threads: usize,
+    items: &[I],
+    each: impl Fn(&I) -> Result<T, String> + Sync,
+    mut then: impl FnMut(T),
+) -> Result<(), String> {
     let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let tx = tx.clone();
-            let (next, each) = (&next, &each);
-            scope.spawn(move || loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some((slug, manifest)) = manifests.get(index) else {
-                    break;
-                };
-                if tx.send((index, each(slug, manifest))).is_err() {
-                    break;
+            let (next, stop, each) = (&next, &stop, &each);
+            scope.spawn(move || {
+                let _raised_on_panic = StopOnPanic(stop);
+                while !stop.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    let outcome = each(item);
+                    if outcome.is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    if tx.send((index, outcome)).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -1966,6 +1994,18 @@ fn in_order<T: Send>(
     })
 }
 
+/// Raises the flag it holds when its thread unwinds from a panic, so that the
+/// other threads of [`in_order_on`] take no further item.
+struct StopOnPanic<'a>(&'a AtomicBool);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Hand a corpus request to the gateway's own request processing. The request
 /// becomes the `ChatCompletionRequest` the HTTP layer would hand on: the
 /// manifest's model added, keys SMG does not know ignored the way the gateway
@@ -1973,7 +2013,8 @@ fn in_order<T: Send>(
 /// every chat request (the provider profile's rewrites, deprecated-field
 /// migration, the `tool_choice` default; a request the gateway would answer
 /// with 400 is a difference, not a rendering), then the tools narrowed by
-/// `tool_choice` as the chat preparation stage does before rendering.
+/// `tool_choice` as the chat preparation stage does before rendering (every
+/// tool for a named choice, the subset for `allowed_tools`).
 /// `process_chat_messages` then renders it exactly as the gateway does before
 /// tokenizing, and the ids are the flat encode of that text, which is the
 /// gateway's tokenize step for a renderer that returns text to encode.
@@ -1987,8 +2028,12 @@ fn render(tok: &dyn Tokenizer, model: &str, request: &Value) -> Result<Rendered,
     request
         .validate()
         .map_err(|e| format!("the gateway rejects this request with 400: {e}"))?;
-    // `filter_chat_request_by_tool_choice`, crate-private, applies this rule.
+    // `request_as_rendered`, crate-private, applies this rule: a named
+    // `tool_choice` renders every tool (the engine's own server renders them
+    // all and forces the call with its grammar); an `allowed_tools` choice
+    // renders its subset.
     let narrowed = match (&request.tools, &request.tool_choice) {
+        (Some(_), Some(ToolChoice::Function { .. })) => None,
         (Some(tools), Some(choice)) => choice.narrow_tools(tools),
         _ => None,
     };
@@ -2641,5 +2686,71 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
                 && !failure.contains("bfcl")
         }),
         "{failures:#?}"
+    );
+}
+
+#[test]
+fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
+    // Item 0 waits until item 1 is done, so on two threads item 1 finishes
+    // first and items 2 and 3 may follow it, all before item 0; `then` still
+    // sees them in the items' order.
+    let item_1_done = AtomicBool::new(false);
+    let items = [0, 1, 2, 3];
+    let mut handed = Vec::new();
+    let ran = in_order_on(
+        2,
+        &items,
+        |&item| {
+            if item == 0 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !item_1_done.load(Ordering::Relaxed) {
+                    assert!(Instant::now() < deadline, "item 1 never finished");
+                    std::thread::yield_now();
+                }
+            }
+            if item == 1 {
+                item_1_done.store(true, Ordering::Relaxed);
+            }
+            Ok(item * 10)
+        },
+        |outcome| handed.push(outcome),
+    );
+    assert_eq!(ran, Ok(()));
+    assert_eq!(handed, [0, 10, 20, 30]);
+}
+
+#[test]
+fn an_error_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_more() {
+    // Item 0 fails at once; every other item waits for that failure and then
+    // a while longer, so the flag is up before any other thread looks for its
+    // next item: on two threads, the other thread finishes the one item it
+    // had and takes none of the six left, and the error reaches the caller.
+    let item_0_failed = AtomicBool::new(false);
+    let started = AtomicUsize::new(0);
+    let items: Vec<usize> = (0..8).collect();
+    let ran = in_order_on(
+        2,
+        &items,
+        |&item| {
+            if item == 0 {
+                item_0_failed.store(true, Ordering::Relaxed);
+                return Err("item 0".to_string());
+            }
+            started.fetch_add(1, Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !item_0_failed.load(Ordering::Relaxed) {
+                assert!(Instant::now() < deadline, "item 0 never failed");
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(item)
+        },
+        |_| {},
+    );
+    assert_eq!(ran, Err("item 0".to_string()));
+    let started = started.load(Ordering::Relaxed);
+    assert!(
+        started <= 1,
+        "{started} items started beside the one that failed; the other thread had one in flight"
     );
 }

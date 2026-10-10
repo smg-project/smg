@@ -476,3 +476,72 @@ class TestResponseObjectShapeLocal:
         assert isinstance(body["completed_at"], int)
         assert body["usage"]["output_tokens_details"]["reasoning_tokens"] >= 0
         assert body["usage"]["input_tokens_details"]["cached_tokens"] >= 0
+
+
+# =============================================================================
+# item_reference input items (local gRPC backend)
+# =============================================================================
+
+
+@pytest.mark.engine("sglang")
+@pytest.mark.gpu(1)
+@pytest.mark.e2e
+@pytest.mark.model("Qwen/Qwen2.5-14B-Instruct")
+@pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestItemReferenceLocal:
+    """``{"type": "item_reference", "id": ...}`` input items resolve against
+    the response store, as the public API resolves them."""
+
+    @staticmethod
+    def _post(gw, body: dict) -> httpx.Response:
+        return httpx.post(
+            f"{gw.base_url}/v1/responses",
+            json=body,
+            headers={"Authorization": "Bearer not-used"},
+            timeout=120.0,
+        )
+
+    def test_item_reference_resolves_a_stored_output_item(self, setup_backend):
+        _, model_path, _, gw = setup_backend
+        first = self._post(
+            gw,
+            {
+                "model": model_path,
+                "input": "Name one colour.",
+                "max_output_tokens": 32,
+                "store": True,
+            },
+        )
+        assert first.status_code == 200, first.text
+        item_id = first.json()["output"][0]["id"]
+
+        second = self._post(
+            gw,
+            {
+                "model": model_path,
+                "max_output_tokens": 32,
+                "input": [
+                    {"type": "item_reference", "id": item_id},
+                    {"type": "message", "role": "user", "content": "Name another one."},
+                ],
+            },
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["status"] in ("completed", "incomplete")
+
+    def test_item_reference_to_an_unknown_id_is_404(self, setup_backend):
+        _, model_path, _, gw = setup_backend
+        resp = self._post(
+            gw,
+            {
+                "model": model_path,
+                "max_output_tokens": 32,
+                "input": [
+                    {"type": "item_reference", "id": "msg_does_not_exist"},
+                    {"type": "message", "role": "user", "content": "continue"},
+                ],
+            },
+        )
+        assert resp.status_code == 404, resp.text
+        assert "msg_does_not_exist" in resp.json()["error"]["message"]

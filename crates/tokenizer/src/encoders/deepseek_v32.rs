@@ -150,7 +150,7 @@ fn user_msg(content: &str) -> String {
 
 /// Mirrors the Python `to_json` helper: `json.dumps(value, ensure_ascii=False)`,
 /// which uses spaced `", "` / `": "` separators. Compact `serde_json::to_string`
-/// would change the prompt bytes vLLM renders from.
+/// would change the prompt bytes the serving engine renders from.
 fn to_json(value: &Value) -> String {
     crate::json_dumps::to_string(value)
 }

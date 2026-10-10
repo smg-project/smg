@@ -51,8 +51,8 @@ pub enum ChatMessage {
         content: Option<MessageContent>,
         name: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
-        /// Reasoning content for O1-style models (SGLang extension); vLLM's
-        /// `reasoning` spelling is accepted on input.
+        /// Reasoning content for O1-style models (an engine extension); another
+        /// engine's `reasoning` spelling is accepted on input.
         #[serde(alias = "reasoning")]
         reasoning_content: Option<String>,
         #[serde(flatten)]
@@ -386,7 +386,7 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     pub sampling_seed: Option<u64>,
 
-    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
@@ -785,7 +785,7 @@ impl GenerationRequest for ChatCompletionRequest {
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition {
             // Engine extensions carried in the passthrough map, not typed
-            // fields: vLLM/SGLang `cache_salt`, SGLang `extra_key`.
+            // fields: the engines' `cache_salt`, one engine's `extra_key`.
             cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
             extra_key: self.other.get("extra_key").and_then(Value::as_str),
             lora_path: self.lora_path.as_deref(),
@@ -871,6 +871,17 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<ChatChoice>,
     pub usage: Option<Usage>,
     pub system_fingerprint: Option<String>,
+    /// The service tier the completion ran under. Always present, as the
+    /// OpenAI API sends it; the gateway has one tier, `default`.
+    #[serde(default = "default_service_tier")]
+    pub service_tier: String,
+}
+
+/// The one service tier the gateway serves.
+pub const DEFAULT_SERVICE_TIER: &str = "default";
+
+fn default_service_tier() -> String {
+    DEFAULT_SERVICE_TIER.to_string()
 }
 
 impl ChatCompletionResponse {
@@ -889,24 +900,29 @@ pub struct ChatCompletionMessage {
     pub role: String, // Always "assistant" for responses
     /// Always present, `null` on a tool-call turn (as the OpenAI API sends it).
     pub content: Option<String>,
+    /// Always present, as the OpenAI API sends it; the gateway produces no
+    /// refusals, so it is `null`.
+    #[serde(default)]
+    pub refusal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     pub reasoning_content: Option<String>,
     // Note: function_call is deprecated and not included
-    // Note: refusal, annotations, audio are not added yet
+    // Note: annotations, audio are not added yet
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatChoice {
     pub index: u32,
     pub message: ChatCompletionMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present (`null` unless log probabilities were requested), as
+    /// the OpenAI API sends it.
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "tool_calls", "content_filter", "function_call"
     /// Information about which stop condition was matched
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>, // Can be string or integer
-    /// Hidden states from the model (SGLang extension)
+    /// Hidden states from the model (an engine extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
 }
@@ -1287,6 +1303,7 @@ mod tests {
         let message = super::ChatCompletionMessage {
             role: "assistant".to_string(),
             content: None,
+            refusal: None,
             tool_calls: Some(vec![crate::common::ToolCall {
                 id: "call_1".to_string(),
                 tool_type: "function".to_string(),

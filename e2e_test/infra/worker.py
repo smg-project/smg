@@ -853,10 +853,10 @@ def start_workers(
         mode: Connection mode (HTTP or GRPC).
         count: Number of workers to start.
         worker_type: Worker specialization (regular, prefill, decode).
-        timeout: Seconds to wait for each worker to become healthy.
+        timeout: Shared startup bound for all workers to become healthy.
         log_dir: Directory to store worker log files.
         gpu_offset: Starting GPU index for worker assignment.
-        wait_ready: If True (default), block until each worker is healthy.
+        wait_ready: If True (default), spawn all workers before waiting for health.
             If False, spawn processes and return immediately.
         gpus: GPUs per worker; defaults to the model spec's tp (e.g. DP needs dp*tp).
         extra_engine_args: Extra CLI args appended to the engine launch command.
@@ -939,7 +939,19 @@ def start_workers(
                 time.sleep(LAUNCH_STAGGER_DELAY)
 
             workers.append(worker)
-            worker.start(timeout=timeout, wait_ready=wait_ready)
+            # Each worker has its own GPU slice. Let model loading overlap
+            # instead of holding later workers' GPUs idle during this wait.
+            worker.start(timeout=timeout, wait_ready=False)
+        if wait_ready:
+            # Launch staggering must not shorten the last worker's load budget.
+            deadline = time.monotonic() + timeout
+            for worker in workers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Workers for {model_id} did not become healthy within {timeout}s"
+                    )
+                worker.wait_ready(max(1, int(remaining)))
     except Exception:
         stop_workers(workers)
         raise

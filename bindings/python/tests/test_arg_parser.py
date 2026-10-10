@@ -1387,6 +1387,35 @@ class TestParseRouterArgs:
         assert router_args.mesh_port == 39527
         assert router_args.mesh_peer_urls == ["10.0.0.43:39527"]
 
+    def test_parse_mesh_tls_args(self):
+        """The mesh TLS flags land in the dataclass; absent, they stay None."""
+        router_args = parse_router_args(
+            [
+                "--enable-mesh",
+                "--mesh-host",
+                "::",
+                "--mesh-advertise-host",
+                "fd00::7",
+                "--mesh-tls-ca-cert",
+                "/etc/smg/mesh/ca.pem",
+                "--mesh-tls-cert",
+                "/etc/smg/mesh/node.pem",
+                "--mesh-tls-key",
+                "/etc/smg/mesh/node-key.pem",
+            ]
+        )
+
+        assert router_args.mesh_tls_ca_cert == "/etc/smg/mesh/ca.pem"
+        assert router_args.mesh_tls_cert == "/etc/smg/mesh/node.pem"
+        assert router_args.mesh_tls_key == "/etc/smg/mesh/node-key.pem"
+
+        plain = parse_router_args(["--enable-mesh", "--mesh-host", "127.0.0.1"])
+        assert (plain.mesh_tls_ca_cert, plain.mesh_tls_cert, plain.mesh_tls_key) == (
+            None,
+            None,
+            None,
+        )
+
     def test_parse_cors_args(self):
         """Test parsing CORS arguments."""
         args = [
@@ -1669,7 +1698,6 @@ class TestRouterArgsFieldOrder:
         "disable_tokenizer_autoload",
         "tokenizer_cache_enable_l0",
         "tokenizer_cache_l0_max_entries",
-        "tokenizer_cache_l0_max_memory",
         "tokenizer_cache_enable_l1",
         "tokenizer_cache_l1_max_memory",
         "reasoning_parser",
@@ -1776,6 +1804,10 @@ class TestRouterArgsFieldOrder:
         "tenant_rate_limit_enabled",
         "tenant_rate_limit_config",
         "jemalloc_prof_dir",
+        "mesh_tls_ca_cert",
+        "mesh_tls_cert",
+        "mesh_tls_key",
+        "tokenizer_cache_l0_max_memory",
         "token_dump_dir",
         "token_dump_on_start",
         "token_dump_max_mb",
@@ -1838,6 +1870,7 @@ class TestRouterArgsFieldOrder:
             "priority_scheduler_tenant_metric_top_n",
             "tenant_rate_limit_enabled",
             "tenant_rate_limit_config",
+            "tokenizer_cache_l0_max_memory",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

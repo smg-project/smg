@@ -552,3 +552,38 @@ async fn hy4_constrained_calls_parse_complete_and_streaming() {
         assert_eq!(streamed.parameters, call.function.arguments);
     }
 }
+
+/// Same as for GLM: on a thinking prompt whatever precedes the forced calls
+/// is free text with nothing owed at its end, so an engine that applies the
+/// grammar only after the model's own `</think>` does not hold the model to
+/// a second one.
+#[test]
+fn hy4_forced_call_grammar_owes_nothing_before_the_calls_on_a_thinking_prompt() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let tools = constraint_tools();
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    let Some(ToolConstraint::StructuralTag(tag)) = registry
+        .generate_tool_constraint(Some("hy_v4"), &tools, &required, true)
+        .unwrap()
+    else {
+        panic!("expected a structural tag");
+    };
+    let tag: serde_json::Value = serde_json::from_str(&tag).unwrap();
+    let format = &tag["format"];
+    let calls = if format["type"] == "sequence" {
+        let elements = format["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2, "{format}");
+        assert_eq!(
+            elements[0]["type"], "any_text",
+            "free text before the calls, nothing the model owes: {format}"
+        );
+        assert!(elements[0].get("end").is_none(), "{format}");
+        &elements[1]
+    } else {
+        format
+    };
+    assert_eq!(calls["type"], "triggered_tags", "{format}");
+    assert_eq!(calls["triggers"], json!(["<tool_calls>"]));
+    assert_eq!(calls["at_least_one"], true);
+}

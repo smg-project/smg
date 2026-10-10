@@ -76,7 +76,8 @@ impl SincePollDispatch {
 /// time-to-drain plus a convex KV-pressure barrier (argmin, lower is better):
 ///
 /// ```text
-///   score_i = (queued_tokens_i + running_estimated_tokens_i + inflight_tokens_i) / throughput_i
+///   score_i = (queued_tokens_i + running_estimated_tokens_i + unaccounted_i · p̄
+///              + inflight_tokens_i) / throughput_i
 ///             + kv_pressure_weight · k_i / (1 − k_i)
 /// ```
 ///
@@ -89,6 +90,13 @@ impl SincePollDispatch {
 ///   since its last load poll. Polls are stale between intervals; without this
 ///   correction, plain argmin sends a whole interval's arrivals to one worker
 ///   (incast). Crediting each dispatch water-fills load across workers instead.
+/// - `unaccounted` — requests this router holds on the worker that neither the
+///   report nor the since-poll credit accounts for: dispatches still on their
+///   way to an engine that has not seen them. A report releases the credit of
+///   the dispatches made before its sample; while those sit in transit the
+///   report reads emptier than the worker is, and the router would keep
+///   piling on (see [`Self::unaccounted_requests`]). Each is priced at `p̄`,
+///   like a dispatch whose size is unknown.
 /// - `/ throughput` — normalizes work to *time*, comparing heterogeneous
 ///   workers by drain time rather than raw token count.
 /// - `k / (1 − k)` — the M/M/1 expected-occupancy barrier on KV utilization
@@ -135,7 +143,8 @@ impl SincePollDispatch {
 ///   in-flight correction absorbs staleness between polls.
 /// - `max_waiting_requests` (default `0` = disabled) — per-worker waiting-queue
 ///   cap: a worker whose reported waiting requests, plus requests dispatched to
-///   it since its last poll, have reached the cap is skipped. When every
+///   it since its last poll and the requests the router holds on it beyond
+///   its report, have reached the cap is skipped. When every
 ///   candidate is at the cap the selection returns none, so the request falls
 ///   to the router's admission queue instead of deepening a backlog. Set it
 ///   below the engine's max batch size.
@@ -291,8 +300,13 @@ impl LeastLoadPolicy {
         let url = worker.url();
         match Self::fresh_load(loads, complete_snapshot, url) {
             Some(load) => {
-                let inflight_tokens = inflight.get(url).map_or(0, |dispatch| dispatch.tokens);
-                let queued_tokens = self.queued_tokens(load) + self.running_estimated_tokens(load);
+                let dispatch = inflight.get(url);
+                let inflight_tokens = dispatch.map_or(0, |dispatch| dispatch.tokens);
+                let since_poll = dispatch.map_or(0, |dispatch| dispatch.requests);
+                let queued_tokens = self.queued_tokens(load)
+                    + self.running_estimated_tokens(load)
+                    + Self::unaccounted_requests(worker, load, since_poll) as f64
+                        * f64::from(self.mean_prefill_tokens);
                 ExpectedWait::new(
                     queued_tokens,
                     self.drain_rate(load),
@@ -426,6 +440,31 @@ impl LeastLoadPolicy {
             .sum()
     }
 
+    /// Requests the router holds on `worker` beyond what its report and the
+    /// since-poll credit account for: work in transit that the engine has not
+    /// seen yet.
+    ///
+    /// A report is sampled at the engine, and the credit for the dispatches
+    /// made before its sample is released on the assumption that the engine
+    /// had them by then. Under a backlog between the router and the engine's
+    /// queue (a saturated router, a slow servicer) that assumption fails: the
+    /// report keeps saying "nearly idle" while the router piles requests on
+    /// the worker, every fresh sample releases the credit for dispatches the
+    /// engine never saw, and the worker reads as the emptiest of the fleet
+    /// until it holds most of it (a fleet sent every new request to three of
+    /// its workers for over a minute this way while the rest sat idle). The
+    /// router's own in-flight count is the floor: a report cannot claim fewer
+    /// requests than the router has outstanding on the worker.
+    fn unaccounted_requests(
+        worker: &Arc<dyn Worker>,
+        load: &WorkerLoadResponse,
+        since_poll_requests: u64,
+    ) -> u64 {
+        let reported =
+            u64::try_from(load.total_running_reqs() + load.total_waiting_reqs()).unwrap_or(0);
+        (worker.load() as u64).saturating_sub(reported.saturating_add(since_poll_requests))
+    }
+
     /// Token-work the request being routed adds to the chosen worker's
     /// in-flight estimate: its token count if known, else the mean prefill.
     fn request_tokens(&self, info: &SelectWorkerInfo) -> u64 {
@@ -465,7 +504,8 @@ impl LeastLoadPolicy {
         let loads = loads_guard.as_deref();
 
         // Waiting-queue veto: drop candidates whose reported queue, plus
-        // requests dispatched since their last poll, has reached the cap.
+        // requests dispatched since their last poll and the requests the
+        // router holds on them beyond the report, has reached the cap.
         // Workers without a snapshot stay eligible — there is no queue
         // evidence to veto on, and a dark fleet must keep routing.
         let capped: Vec<usize>;
@@ -487,12 +527,15 @@ impl LeastLoadPolicy {
                             let since_poll = inflight_guard
                                 .get(url)
                                 .map_or(0, |dispatch| dispatch.requests);
+                            let unaccounted =
+                                Self::unaccounted_requests(&workers[i], load, since_poll);
                             let waiting = load.total_waiting_reqs().max(0) as u64;
-                            let eligible = waiting + since_poll < cap;
+                            let eligible = waiting + since_poll + unaccounted < cap;
                             if cache_trace::enabled() {
                                 cache_trace::gate(serde_json::json!({
                                     "source": "waiting_queue_cap", "worker": url,
                                     "waiting_requests": waiting, "since_poll_requests": since_poll,
+                                    "unaccounted_requests": unaccounted,
                                     "cap": cap, "eligible": eligible,
                                 }));
                             }
@@ -531,6 +574,10 @@ impl LeastLoadPolicy {
                     "resident_token_usage": load.map(WorkerLoadResponse::effective_token_usage),
                     "drain_rate": load.map(|load| self.drain_rate(load)),
                     "since_poll_tokens": inflight.get(url).map_or(0, |dispatch| dispatch.tokens),
+                    "unaccounted_requests": load.map(|load| {
+                        let since_poll = inflight.get(url).map_or(0, |dispatch| dispatch.requests);
+                        Self::unaccounted_requests(&workers[idx], load, since_poll)
+                    }),
                     "fresh_load": load.is_some(),
                 }));
             }
@@ -984,6 +1031,166 @@ mod tests {
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn unaccounted_requests_are_the_in_flight_beyond_the_report_and_the_credit() {
+        let w = mk("http://a:8000");
+        for _ in 0..12 {
+            w.increment_load();
+        }
+        let mut load = make_load(0, 0.0, 100.0);
+        load.loads[0].num_running_reqs = 5;
+        load.loads[0].num_waiting_reqs = 2;
+        assert_eq!(
+            LeastLoadPolicy::unaccounted_requests(&w, &load, 3),
+            2,
+            "12 held, 7 reported, 3 credited since the sample"
+        );
+        assert_eq!(
+            LeastLoadPolicy::unaccounted_requests(&w, &load, 10),
+            0,
+            "a report that covers the in-flight leaves nothing"
+        );
+    }
+
+    #[test]
+    fn a_report_that_omits_the_requests_the_router_holds_is_floored_by_them() {
+        // Both workers report an empty engine, sampled now; the router holds
+        // 40 requests on `a` that the report does not show (dispatched, not
+        // yet seen by the engine, their credit released by the fresh sample).
+        // `a` must read as 40 requests of work, not as an idle peer of `b`:
+        // every pick goes to `b` until its own credit has grown to the same.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0).with_tie_break_seed(1);
+        let a = mk("http://a:8000");
+        let b = mk("http://b:8000");
+        for _ in 0..40 {
+            a.increment_load();
+        }
+        let workers = vec![a, b];
+        let mut idle = make_load(0, 0.0, 2000.0);
+        idle.sampled_at = Some(Instant::now());
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), idle.clone());
+        loads.insert("http://b:8000".to_string(), idle);
+        policy.update_loads(&loads);
+        let info = SelectWorkerInfo::default();
+        for pick in 0..40 {
+            assert_eq!(
+                policy.select_worker(&workers, &info),
+                Some(1),
+                "pick {pick} went to the worker whose report hides its load"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_that_accounts_for_the_routers_requests_adds_nothing() {
+        // `a` holds 10 requests and reports them running; `b` holds 10 and
+        // reports them waiting, at the mean prefill each. The floor adds
+        // nothing to either, so the reports alone decide: `a`, whose work is
+        // running rather than queued, ties with `b` on the estimate, and a
+        // third worker that holds nothing wins outright.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let a = mk("http://a:8000");
+        let b = mk("http://b:8000");
+        let c = mk("http://c:8000");
+        for _ in 0..10 {
+            a.increment_load();
+            b.increment_load();
+        }
+        let workers = vec![a, b, c];
+        let mut running = make_load(0, 0.0, 2000.0);
+        running.loads[0].num_running_reqs = 10;
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), running);
+        loads.insert(
+            "http://b:8000".to_string(),
+            make_load_reqs_only(10, 0.0, 2000.0),
+        );
+        loads.insert("http://c:8000".to_string(), make_load(0, 0.0, 2000.0));
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(2)
+        );
+        let inputs = ScoreInputs {
+            loads: Some(&loads),
+            complete_snapshot: None,
+            inflight: &HashMap::new(),
+            nominal_throughput: 2000.0,
+            fleet_has_loads: true,
+            peer_baseline: 0.0,
+        };
+        let score_a = policy.score(&workers[0], &inputs);
+        let score_b = policy.score(&workers[1], &inputs);
+        assert!(
+            (score_a - score_b).abs() < TIE_EPSILON_SECS,
+            "{score_a} vs {score_b}"
+        );
+        assert!((score_a - 10.0 * 1024.0 / 2000.0).abs() < 1e-9, "{score_a}");
+    }
+
+    #[test]
+    fn waiting_queue_veto_counts_the_requests_the_router_holds_beyond_the_report() {
+        // Cap 5: `a` reports 1 waiting and nothing running while the router
+        // holds 6 on it; the 5 the report does not show count toward the
+        // cap, so `a` is skipped and the pick goes to `b` although `b`
+        // scores far worse.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 5);
+        let a = mk("http://a:8000");
+        for _ in 0..6 {
+            a.increment_load();
+        }
+        let workers = vec![a, mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            make_load_reqs_only(1, 0.0, 100.0),
+        );
+        loads.insert("http://b:8000".to_string(), make_load(400_000, 0.0, 100.0));
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_floor_excludes_hidden_backlogs_without_tilting_the_healthy_fleet() {
+        // Two of eight workers hold 16 requests each that their fresh reports
+        // do not show (admission throttled: the requests wait in front of the
+        // engine); the six healthy ones hold 2 each, reported as running.
+        // Over 60 picks, each dispatched (the load counter moves as the
+        // router's would) with no report in between, the two take nothing
+        // and the six water-fill evenly: the floor steers off the hidden
+        // backlogs, not onto a favourite.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let workers: Vec<Arc<dyn Worker>> =
+            (0..8).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let mut loads = HashMap::new();
+        for (i, worker) in workers.iter().enumerate() {
+            let hidden = i < 2;
+            for _ in 0..if hidden { 16 } else { 2 } {
+                worker.increment_load();
+            }
+            let mut load = make_load(0, 0.0, 2000.0);
+            load.loads[0].num_running_reqs = if hidden { 0 } else { 2 };
+            loads.insert(worker.url().to_string(), load);
+        }
+        policy.update_loads(&loads);
+        let mut picks = [0usize; 8];
+        for _ in 0..60 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            workers[idx].increment_load();
+            picks[idx] += 1;
+        }
+        assert_eq!(&picks[..2], &[0, 0], "{picks:?}");
+        let healthy = &picks[2..];
+        let spread = healthy.iter().max().unwrap() - healthy.iter().min().unwrap();
+        assert!(spread <= 1, "{picks:?}");
     }
 
     #[test]

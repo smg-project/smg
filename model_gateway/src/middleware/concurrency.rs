@@ -26,7 +26,9 @@ use http_body::Frame;
 use tokio::{sync::Semaphore, time::error::Elapsed};
 use tracing::{debug, warn};
 
-use super::{token_bucket::TokenBucket, SHED_RETRY_AFTER_SECS};
+use super::{
+    tenant_resolution::restamp_accepted_at, token_bucket::TokenBucket, SHED_RETRY_AFTER_SECS,
+};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::error::create_error,
@@ -140,7 +142,10 @@ impl http_body::Body for TokenGuardBody {
     }
 }
 
-async fn run_with_permit(next: Next, request: Request<Body>, permit: TokenPermit) -> Response {
+async fn run_with_permit(next: Next, mut request: Request<Body>, permit: TokenPermit) -> Response {
+    // The wait for the permit was the admission queue's, bounded by its own
+    // timeout; the bound ahead of worker selection counts from here.
+    restamp_accepted_at(request.extensions_mut());
     let (parts, body) = next.run(request).await.into_parts();
     let body = TokenGuardBody::with_permit(body, permit);
     Response::from_parts(parts, Body::new(body))

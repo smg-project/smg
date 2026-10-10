@@ -13,7 +13,7 @@ use chrono::{
 use minijinja::{
     context,
     machinery::{
-        ast::{Expr, Stmt},
+        ast::{Call, CallArg, Expr, ForLoop, Macro, Set, Stmt},
         parse, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
@@ -155,123 +155,378 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 
 /// Detect the content format expected by a Jinja2 chat template
 ///
-/// This implements the same detection logic as SGLang's detect_jinja_template_content_format
-/// which uses AST parsing to look for content iteration patterns.
+/// The rule is the serving engine's own content-format detection, so that
+/// the gateway hands string content as a one-item text part list to the
+/// same templates as the engine does (see [`ChatTemplateState::apply`]). A
+/// template is of the "openai" format when it has a loop over a message's
+/// content, a message being a loop variable over `messages` or over a
+/// variable assigned from it: the loop runs over `message.content` (also
+/// through a filter, a test or a slice), over a macro parameter the template
+/// fills with a message's content, or, outside any macro, over a variable
+/// named `content`. Any other template is of the "string" format, one that
+/// does not parse included; a type test, a `length` filter or an index on the
+/// content does not make the "openai" format, as it does not on the engine.
 ///
 /// Returns:
 /// - ChatTemplateContentFormat::OpenAI if template expects structured content (list of parts)
 /// - ChatTemplateContentFormat::String if template expects simple string content
 pub fn detect_chat_template_content_format(template: &str) -> ChatTemplateContentFormat {
-    // Use AST-based detection (enabled by default)
     detect_all_with_ast(template).0
 }
 
-/// Flags tracking which OpenAI-style patterns we've seen
-#[derive(Default, Debug, Clone, Copy)]
-struct Flags {
-    saw_iteration: bool,
-    saw_structure: bool,
-    saw_assignment: bool,
-    saw_macro: bool,
+/// A loop or assignment target that is not a plain name where the engine's
+/// walk asserts one; the engine then falls back to its default, the "string"
+/// format.
+struct NotAName;
+
+/// The nodes of a template the engine's rule reads, in document order: each
+/// loop with the macros it sits in (outermost first), the assignments, the
+/// macros and the calls.
+#[derive(Default)]
+struct Nodes<'a> {
+    loops: Vec<(&'a ForLoop<'a>, Vec<&'a Macro<'a>>)>,
+    sets: Vec<&'a Set<'a>>,
+    macros: Vec<&'a Macro<'a>>,
+    calls: Vec<&'a Call<'a>>,
 }
 
-impl Flags {
-    fn any(self) -> bool {
-        // `saw_assignment` alone (e.g. `set content = message.content`) is NOT sufficient
-        // to classify as OpenAI format. Many string-format templates (Qwen3, etc.) use this
-        // pattern to extract content into a local variable, then check `content is string`.
-        // Without iteration or structural access, the template handles string content only.
-        self.saw_iteration || self.saw_structure || self.saw_macro
+impl<'a> Nodes<'a> {
+    fn of(ast: &'a Stmt<'a>) -> Self {
+        let mut nodes = Self::default();
+        nodes.stmt(ast, &mut Vec::new());
+        nodes
+    }
+
+    fn stmts(&mut self, stmts: &'a [Stmt<'a>], macros: &mut Vec<&'a Macro<'a>>) {
+        for stmt in stmts {
+            self.stmt(stmt, macros);
+        }
+    }
+
+    fn stmt(&mut self, stmt: &'a Stmt<'a>, macros: &mut Vec<&'a Macro<'a>>) {
+        match stmt {
+            Stmt::Template(t) => self.stmts(&t.children, macros),
+            Stmt::EmitExpr(e) => self.expr(&e.expr),
+            Stmt::EmitRaw(_) | Stmt::Continue(_) | Stmt::Break(_) => {}
+            Stmt::ForLoop(fl) => {
+                self.loops.push((fl, macros.clone()));
+                self.expr(&fl.target);
+                self.expr(&fl.iter);
+                self.stmts(&fl.body, macros);
+                self.stmts(&fl.else_body, macros);
+                if let Some(filter) = &fl.filter_expr {
+                    self.expr(filter);
+                }
+            }
+            Stmt::IfCond(ic) => {
+                self.expr(&ic.expr);
+                self.stmts(&ic.true_body, macros);
+                self.stmts(&ic.false_body, macros);
+            }
+            Stmt::WithBlock(w) => {
+                for (target, value) in &w.assignments {
+                    self.expr(target);
+                    self.expr(value);
+                }
+                self.stmts(&w.body, macros);
+            }
+            Stmt::Set(s) => {
+                self.sets.push(s);
+                self.expr(&s.target);
+                self.expr(&s.expr);
+            }
+            Stmt::SetBlock(s) => {
+                self.expr(&s.target);
+                if let Some(filter) = &s.filter {
+                    self.expr(filter);
+                }
+                self.stmts(&s.body, macros);
+            }
+            Stmt::AutoEscape(a) => {
+                self.expr(&a.enabled);
+                self.stmts(&a.body, macros);
+            }
+            Stmt::FilterBlock(f) => {
+                self.expr(&f.filter);
+                self.stmts(&f.body, macros);
+            }
+            Stmt::Block(b) => self.stmts(&b.body, macros),
+            Stmt::Import(i) => {
+                self.expr(&i.expr);
+                self.expr(&i.name);
+            }
+            Stmt::FromImport(f) => {
+                self.expr(&f.expr);
+                for (name, alias) in &f.names {
+                    self.expr(name);
+                    if let Some(alias) = alias {
+                        self.expr(alias);
+                    }
+                }
+            }
+            Stmt::Extends(e) => self.expr(&e.name),
+            Stmt::Include(i) => self.expr(&i.name),
+            Stmt::Macro(m) => {
+                self.macros.push(m);
+                for default in &m.defaults {
+                    self.expr(default);
+                }
+                macros.push(m);
+                self.stmts(&m.body, macros);
+                macros.pop();
+            }
+            // A `{% call %}` block is a call with a body, not a macro of the
+            // template (jinja2 keeps the two apart).
+            Stmt::CallBlock(cb) => {
+                self.call(&cb.call);
+                self.stmts(&cb.macro_decl.body, macros);
+            }
+            Stmt::Do(d) => self.call(&d.call),
+        }
+    }
+
+    fn call(&mut self, call: &'a Call<'a>) {
+        self.calls.push(call);
+        self.expr(&call.expr);
+        self.args(&call.args);
+    }
+
+    fn args(&mut self, args: &'a [CallArg<'a>]) {
+        for arg in args {
+            match arg {
+                CallArg::Pos(e)
+                | CallArg::Kwarg(_, e)
+                | CallArg::PosSplat(e)
+                | CallArg::KwargSplat(e) => {
+                    self.expr(e);
+                }
+            }
+        }
+    }
+
+    fn expr(&mut self, expr: &'a Expr<'a>) {
+        match expr {
+            Expr::Var(_) | Expr::Const(_) => {}
+            Expr::Slice(s) => {
+                self.expr(&s.expr);
+                for bound in [&s.start, &s.stop, &s.step].into_iter().flatten() {
+                    self.expr(bound);
+                }
+            }
+            Expr::UnaryOp(u) => self.expr(&u.expr),
+            Expr::BinOp(b) => {
+                self.expr(&b.left);
+                self.expr(&b.right);
+            }
+            Expr::Compare(c) => {
+                self.expr(&c.expr);
+                for op in &c.ops {
+                    self.expr(&op.expr);
+                }
+            }
+            Expr::IfExpr(i) => {
+                self.expr(&i.test_expr);
+                self.expr(&i.true_expr);
+                if let Some(e) = &i.false_expr {
+                    self.expr(e);
+                }
+            }
+            Expr::Filter(f) => {
+                if let Some(e) = &f.expr {
+                    self.expr(e);
+                }
+                self.args(&f.args);
+            }
+            Expr::Test(t) => {
+                self.expr(&t.expr);
+                self.args(&t.args);
+            }
+            Expr::GetAttr(g) => self.expr(&g.expr),
+            Expr::GetItem(g) => {
+                self.expr(&g.expr);
+                self.expr(&g.subscript_expr);
+            }
+            Expr::Call(c) => self.call(c),
+            Expr::List(l) => {
+                for item in &l.items {
+                    self.expr(item);
+                }
+            }
+            Expr::Map(m) => {
+                for e in m.keys.iter().chain(&m.values) {
+                    self.expr(e);
+                }
+            }
+        }
     }
 }
 
-/// Single-pass AST detector with scope tracking
-struct Detector<'a> {
-    ast: &'a Stmt<'a>,
-    /// Message loop vars currently in scope (e.g., `message`, `m`, `msg`)
-    scope: std::collections::VecDeque<String>,
-    scope_set: std::collections::HashSet<String>,
-    flags: Flags,
-    /// Whether `<think>` appears inside an `add_generation_prompt` if-block
+/// Whether `expr` reads the variable `varname` itself (`key` None) or its
+/// `key` entry (`varname.key`, `varname['key']`), through filters, tests and
+/// slices: the engine's `_is_var_or_elems_access`.
+fn is_var_or_elems_access(expr: &Expr<'_>, varname: &str, key: Option<&str>) -> bool {
+    match expr {
+        Expr::Filter(f) => f
+            .expr
+            .as_ref()
+            .is_some_and(|e| is_var_or_elems_access(e, varname, key)),
+        Expr::Test(t) => is_var_or_elems_access(&t.expr, varname, key),
+        Expr::Slice(s) => is_var_or_elems_access(&s.expr, varname, key),
+        Expr::Var(v) => key.is_none() && v.id == varname,
+        // The base of the attribute is the name itself, as in the engine's
+        // `_is_attr_access`; the wrappers above are allowed around the whole
+        // access only.
+        Expr::GetAttr(g) => key.is_some_and(|key| g.name == key && is_var(&g.expr, varname)),
+        Expr::GetItem(g) => key.is_some_and(|key| {
+            matches!(&g.subscript_expr, Expr::Const(c) if c.value.as_str() == Some(key))
+                && is_var(&g.expr, varname)
+        }),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is the plain name `varname`: the engine's `_is_var_access`.
+fn is_var(expr: &Expr<'_>, varname: &str) -> bool {
+    matches!(expr, Expr::Var(v) if v.id == varname)
+}
+
+/// `root` and every name assigned from it or from such a name, through
+/// filters, tests and slices: the engine's `_iter_nodes_assign_var_or_elems`.
+fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<&'a str>, NotAName> {
+    let mut names = vec![root];
+    let mut queue = std::collections::VecDeque::from([root]);
+    while let Some(related) = queue.pop_front() {
+        for set in sets {
+            if !is_var_or_elems_access(&set.expr, related, None) {
+                continue;
+            }
+            let Expr::Var(target) = &set.target else {
+                return Err(NotAName);
+            };
+            if !names.contains(&target.id) {
+                names.push(target.id);
+                queue.push_back(target.id);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The loop variables of the loops over a messages name: the engine's
+/// `_iter_nodes_assign_messages_item`.
+fn message_loop_vars<'a>(
+    loops: &[(&'a ForLoop<'a>, Vec<&'a Macro<'a>>)],
+    messages_names: &[&str],
+) -> Result<Vec<&'a str>, NotAName> {
+    let mut vars = Vec::new();
+    for (fl, _) in loops {
+        if messages_names
+            .iter()
+            .any(|name| is_var_or_elems_access(&fl.iter, name, None))
+        {
+            let Expr::Var(target) = &fl.target else {
+                return Err(NotAName);
+            };
+            vars.push(target.id);
+        }
+    }
+    Ok(vars)
+}
+
+/// Whether the template has a loop over a message's content: the engine's
+/// `_iter_nodes_assign_content_item`, which decides its content format.
+fn iterates_message_content(ast: &Stmt<'_>) -> Result<bool, NotAName> {
+    let nodes = Nodes::of(ast);
+    let messages_names = names_assigned_from(&nodes.sets, "messages")?;
+    let message_vars = message_loop_vars(&nodes.loops, &messages_names)?;
+    let is_message_content = |expr: &Expr<'_>| {
+        message_vars
+            .iter()
+            .any(|var| is_var_or_elems_access(expr, var, Some("content")))
+    };
+
+    // The parameters of each macro that a call fills with a message's content.
+    let fed_params: Vec<(&Macro<'_>, std::collections::HashSet<&str>)> = nodes
+        .macros
+        .iter()
+        .map(|m| {
+            let param = |index: usize| match m.args.get(index) {
+                Some(Expr::Var(v)) => Some(v.id),
+                _ => None,
+            };
+            let mut fed = std::collections::HashSet::new();
+            for call in nodes
+                .calls
+                .iter()
+                .filter(|call| matches!(&call.expr, Expr::Var(callee) if callee.id == m.name))
+            {
+                let mut position = 0;
+                for arg in &call.args {
+                    match arg {
+                        CallArg::Pos(value) => {
+                            if let Some(name) =
+                                param(position).filter(|_| is_message_content(value))
+                            {
+                                fed.insert(name);
+                            }
+                            position += 1;
+                        }
+                        CallArg::Kwarg(name, value) => {
+                            if (0..m.args.len()).any(|i| param(i) == Some(name))
+                                && is_message_content(value)
+                            {
+                                fed.insert(*name);
+                            }
+                        }
+                        CallArg::PosSplat(_) | CallArg::KwargSplat(_) => {}
+                    }
+                }
+            }
+            (*m, fed)
+        })
+        .collect();
+
+    for (fl, enclosing) in &nodes.loops {
+        let matched = if is_message_content(&fl.iter) {
+            true
+        } else if let Expr::Var(iter) = &fl.iter {
+            // Inside a macro, the innermost macro with fed parameters decides;
+            // outside any macro, a variable named `content` does.
+            let fed = enclosing.iter().rev().find_map(|m| {
+                fed_params
+                    .iter()
+                    .find(|(fed_macro, fed)| std::ptr::eq(*fed_macro, *m) && !fed.is_empty())
+                    .map(|(_, fed)| fed)
+            });
+            match fed {
+                Some(fed) => fed.contains(iter.id),
+                None => enclosing.is_empty() && iter.id == "content",
+            }
+        } else {
+            false
+        };
+        if matched {
+            if !matches!(fl.target, Expr::Var(_)) {
+                return Err(NotAName);
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `<think>` appears inside an `add_generation_prompt` if-block.
+struct ThinkDetector {
     think_in_prefill: bool,
 }
 
-impl<'a> Detector<'a> {
-    fn new(ast: &'a Stmt<'a>) -> Self {
-        Self {
-            ast,
-            scope: std::collections::VecDeque::new(),
-            scope_set: std::collections::HashSet::new(),
-            flags: Flags::default(),
+impl ThinkDetector {
+    fn run(ast: &Stmt<'_>) -> bool {
+        let mut detector = Self {
             think_in_prefill: false,
-        }
-    }
-
-    fn run(mut self) -> (Flags, bool) {
-        self.walk_stmt(self.ast);
-        (self.flags, self.think_in_prefill)
-    }
-
-    fn push_scope(&mut self, var: String) {
-        self.scope.push_back(var.clone());
-        self.scope_set.insert(var);
-    }
-
-    fn pop_scope(&mut self) {
-        if let Some(v) = self.scope.pop_back() {
-            self.scope_set.remove(&v);
-        }
-    }
-
-    fn is_var_access(expr: &Expr, varname: &str) -> bool {
-        matches!(expr, Expr::Var(v) if v.id == varname)
-    }
-
-    fn is_const_str(expr: &Expr, value: &str) -> bool {
-        matches!(expr, Expr::Const(c) if c.value.as_str() == Some(value))
-    }
-
-    fn is_numeric_const(expr: &Expr) -> bool {
-        matches!(expr, Expr::Const(c) if c.value.is_number())
-    }
-
-    /// Check if expr is varname.content or varname["content"]
-    fn is_var_dot_content(expr: &Expr, varname: &str) -> bool {
-        match expr {
-            Expr::GetAttr(g) => Self::is_var_access(&g.expr, varname) && g.name == "content",
-            Expr::GetItem(g) => {
-                Self::is_var_access(&g.expr, varname)
-                    && Self::is_const_str(&g.subscript_expr, "content")
-            }
-            // Unwrap filters/tests that just wrap the same expr
-            Expr::Filter(f) => f
-                .expr
-                .as_ref()
-                .is_some_and(|e| Self::is_var_dot_content(e, varname)),
-            Expr::Test(t) => Self::is_var_dot_content(&t.expr, varname),
-            _ => false,
-        }
-    }
-
-    /// Check if expr accesses .content on any variable in our scope, or any descendant of it.
-    fn is_any_scope_var_content(&self, expr: &Expr) -> bool {
-        let mut current_expr = expr;
-        loop {
-            // Check if current level matches <scopeVar>.content
-            if self
-                .scope_set
-                .iter()
-                .any(|v| Self::is_var_dot_content(current_expr, v))
-            {
-                return true;
-            }
-            // Walk up the expression tree
-            match current_expr {
-                Expr::GetAttr(g) => current_expr = &g.expr,
-                Expr::GetItem(g) => current_expr = &g.expr,
-                _ => return false,
-            }
-        }
+        };
+        detector.walk_stmt(ast);
+        detector.think_in_prefill
     }
 
     /// Check if an expression references a variable by name (walks through BinOp/UnaryOp).
@@ -318,41 +573,12 @@ impl<'a> Detector<'a> {
                     self.walk_stmt(ch);
                 }
             }
-            // {% for message in messages %}
             Stmt::ForLoop(fl) => {
-                // Detect "for X in messages" → push X into scope
-                if let Expr::Var(iter) = &fl.iter {
-                    if iter.id == "messages" {
-                        if let Expr::Var(target) = &fl.target {
-                            self.push_scope(target.id.to_string());
-                        }
-                    }
-                }
-
-                // Also detect "for ... in message.content" or "for ... in content"
-                // - Iterating directly over <scopeVar>.content => OpenAI style
-                if self.is_any_scope_var_content(&fl.iter) {
-                    self.flags.saw_iteration = true;
-                }
-                // - Iterating over a local var named "content"
-                if matches!(&fl.iter, Expr::Var(v) if v.id == "content") {
-                    self.flags.saw_iteration = true;
-                }
-
                 for b in &fl.body {
                     self.walk_stmt(b);
                 }
-
-                // Pop scope if we pushed it
-                if let Expr::Var(iter) = &fl.iter {
-                    if iter.id == "messages" && matches!(&fl.target, Expr::Var(_)) {
-                        self.pop_scope();
-                    }
-                }
             }
             Stmt::IfCond(ic) => {
-                self.inspect_expr_for_structure(&ic.expr);
-
                 // Detect <think> inside {% if add_generation_prompt [and ...] %} body
                 if !self.think_in_prefill
                     && Self::expr_references_var(&ic.expr, "add_generation_prompt")
@@ -367,103 +593,7 @@ impl<'a> Detector<'a> {
                     self.walk_stmt(b);
                 }
             }
-            Stmt::EmitExpr(e) => {
-                self.inspect_expr_for_structure(&e.expr);
-            }
-            // {% set content = message.content %}
-            Stmt::Set(s)
-                if Self::is_var_access(&s.target, "content")
-                    && self.is_any_scope_var_content(&s.expr) =>
-            {
-                self.flags.saw_assignment = true;
-            }
-            Stmt::Macro(m) => {
-                // Heuristic: macro that checks type (via `is` test) and also has any loop
-                let mut has_type_check = false;
-                let mut has_loop = false;
-                Self::scan_macro_body(&m.body, &mut has_type_check, &mut has_loop);
-                if has_type_check && has_loop {
-                    self.flags.saw_macro = true;
-                }
-            }
             _ => {}
-        }
-    }
-
-    fn inspect_expr_for_structure(&mut self, expr: &Expr) {
-        if self.flags.saw_structure {
-            return;
-        }
-
-        match expr {
-            // content[0] or message.content[0]
-            Expr::GetItem(gi)
-                if (matches!(&gi.expr, Expr::Var(v) if v.id == "content")
-                    || self.is_any_scope_var_content(&gi.expr))
-                    && Self::is_numeric_const(&gi.subscript_expr) =>
-            {
-                self.flags.saw_structure = true;
-            }
-            // content|length or message.content|length
-            Expr::Filter(f) => {
-                if f.name == "length" {
-                    if let Some(inner) = &f.expr {
-                        // Box derefs automatically, so `&**inner` is `&Expr`
-                        let inner_ref: &Expr = inner;
-                        let is_content_var = matches!(inner_ref, Expr::Var(v) if v.id == "content");
-                        if is_content_var || self.is_any_scope_var_content(inner_ref) {
-                            self.flags.saw_structure = true;
-                        }
-                    }
-                } else if let Some(inner) = &f.expr {
-                    let inner_ref: &Expr = inner;
-                    self.inspect_expr_for_structure(inner_ref);
-                }
-            }
-            // Type tests like `content is iterable` or `message.content is string`
-            // These are used for branching (e.g., Llama 3.1 uses them for tool output formatting),
-            // not as indicators that the template expects structured content. Keep walking.
-            Expr::Test(t) => self.inspect_expr_for_structure(&t.expr),
-            Expr::GetAttr(g) => {
-                // Keep walking; nested expressions can hide structure checks
-                self.inspect_expr_for_structure(&g.expr);
-            }
-            // Handle binary operations like: if (message.content is string) and other_cond
-            Expr::BinOp(op) => {
-                self.inspect_expr_for_structure(&op.left);
-                self.inspect_expr_for_structure(&op.right);
-            }
-            // Handle unary operations like: if not (message.content is string)
-            Expr::UnaryOp(op) => {
-                self.inspect_expr_for_structure(&op.expr);
-            }
-            _ => {}
-        }
-    }
-
-    fn scan_macro_body(body: &[Stmt], has_type_check: &mut bool, has_loop: &mut bool) {
-        for s in body {
-            if *has_type_check && *has_loop {
-                return;
-            }
-
-            match s {
-                Stmt::IfCond(ic) => {
-                    if matches!(&ic.expr, Expr::Test(_)) {
-                        *has_type_check = true;
-                    }
-                    Self::scan_macro_body(&ic.true_body, has_type_check, has_loop);
-                    Self::scan_macro_body(&ic.false_body, has_type_check, has_loop);
-                }
-                Stmt::ForLoop(fl) => {
-                    *has_loop = true;
-                    Self::scan_macro_body(&fl.body, has_type_check, has_loop);
-                }
-                Stmt::Template(t) => {
-                    Self::scan_macro_body(&t.children, has_type_check, has_loop);
-                }
-                _ => {}
-            }
         }
     }
 }
@@ -500,13 +630,11 @@ fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool) {
         Err(_) => return (ChatTemplateContentFormat::String, false),
     };
 
-    let (flags, think_in_prefill) = Detector::new(&ast).run();
-    let content_format = if flags.any() {
-        ChatTemplateContentFormat::OpenAI
-    } else {
-        ChatTemplateContentFormat::String
+    let content_format = match iterates_message_content(&ast) {
+        Ok(true) => ChatTemplateContentFormat::OpenAI,
+        Ok(false) | Err(NotAName) => ChatTemplateContentFormat::String,
     };
-    (content_format, think_in_prefill)
+    (content_format, ThinkDetector::run(&ast))
 }
 
 /// Parameters for chat template application
@@ -1039,8 +1167,18 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     env.add_function("raise_exception", raise_exception);
     // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
     env.add_function("dict", dict_function);
+    env.add_test("iterable", is_iterable);
 
     Ok(env)
+}
+
+/// Jinja2's `iterable` test: `iter(value)` succeeds. minijinja iterates
+/// `none` as an empty sequence and would call it iterable; in Python
+/// `iter(None)` raises, so `none is iterable` is false, which the templates
+/// that guard with `tools is iterable and tools | length > 0` rely on when
+/// the request carries no tools. An undefined value is iterable in both.
+fn is_iterable(value: &Value) -> bool {
+    !value.is_none() && value.try_iter().is_ok()
 }
 
 /// Render the `"chat"` template in the given environment against messages and params.
@@ -1089,7 +1227,7 @@ fn render_instant() -> DateTime<FixedOffset> {
         .unwrap_or_else(|| Local::now().fixed_offset())
 }
 
-/// Whether the template mentions the `developer` role at all (vLLM's
+/// Whether the template mentions the `developer` role at all (the engine's
 /// `_detect_developer_role_support`): a template that never names it has no
 /// branch for it, and the renderer rewrites developer messages to system ones.
 fn detect_developer_role_support(template: &str) -> bool {
@@ -1097,9 +1235,9 @@ fn detect_developer_role_support(template: &str) -> bool {
 }
 
 /// The messages with every `developer` message rewritten as a `system`
-/// message without its `tools` field (vLLM's `_convert_developer_to_system`),
+/// message without its `tools` field (the engine's `_convert_developer_to_system`),
 /// then the system messages merged into one at the front when a system
-/// message is not the first message (vLLM's `_consolidate_system_messages`,
+/// message is not the first message (the engine's `_consolidate_system_messages`,
 /// which follows the rewrite in its renderer). `None` when no message has
 /// the role, so the caller keeps its slice.
 fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
@@ -1128,7 +1266,7 @@ fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<se
     Some(consolidate_system_messages(rewritten))
 }
 
-/// vLLM's `_consolidate_system_messages`, for the templates that want the
+/// The engine's `_consolidate_system_messages`, for the templates that want the
 /// system message first: the messages unchanged when the only system message
 /// is the first one; otherwise one system message at the front carrying the
 /// non-empty system texts joined by blank lines (a parts list contributes its
@@ -1190,14 +1328,17 @@ fn render_chat_template(
     // Convert messages to minijinja::Value (messages already processed by router)
     let minijinja_messages: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
 
-    // Use Value::UNDEFINED for missing optional params so they are truly "undefined"
-    // in the template context, matching HuggingFace Python behavior. Many chat templates
-    // use `{% if tools is defined %}` guards — passing null (none) instead of undefined
-    // would bypass those guards since `none` IS defined, causing `tools | length` to fail.
-    let tools_value = params.tools.map_or(Value::UNDEFINED, Value::from_serialize);
+    // transformers renders with `tools=None` and `documents=None` when the
+    // request carries none: the names are defined and hold none. A template
+    // may test them either way (`tools is none`, `tools is defined and tools`,
+    // `tools is iterable`); undefined would send a template that tests
+    // `is none` down its tools branch with nothing to write.
+    let tools_value = params
+        .tools
+        .map_or_else(|| Value::from(()), Value::from_serialize);
     let documents_value = params
         .documents
-        .map_or(Value::UNDEFINED, Value::from_serialize);
+        .map_or_else(|| Value::from(()), Value::from_serialize);
 
     // Inject special tokens (bos_token, eos_token, etc.) into context.
     // Use UNDEFINED for missing tokens so `{% if bos_token is defined %}` works correctly.
@@ -1365,7 +1506,7 @@ pub struct ChatTemplateState {
     think_in_prefill: bool,
     /// Whether the template has a branch for the `developer` role. When it
     /// has none, `apply` renders developer messages as system messages, as
-    /// vLLM's HF renderer does, instead of letting the template drop them.
+    /// the engine's HF renderer does, instead of letting the template drop them.
     developer_role_supported: bool,
 }
 
@@ -1427,21 +1568,21 @@ impl ChatTemplateState {
             )
         })?;
 
-        // vLLM hands an "openai"-format template every message's string content
+        // The serving engine hands an "openai"-format template every message's string content
         // as a one-item text part list (`_parse_chat_message_content`: a `str`
         // becomes `[{"type": "text", "text": ...}]`, and in that format the
         // parts stay dicts), so such a template always takes its parts branch.
         // Render the same way, so that a template whose two branches differ (a
         // separator after every part, a truthiness check on the content)
         // produces the engine's prompt for string content too. A tool result
-        // stays a string: vLLM joins its text parts back into one.
+        // stays a string: the engine joins its text parts back into one.
         let wrapped = (self.content_format == ChatTemplateContentFormat::OpenAI)
             .then(|| string_content_as_text_parts(messages))
             .flatten();
         let messages = wrapped.as_deref().unwrap_or(messages);
 
         // A template without a `developer` branch renders nothing for a
-        // developer message; vLLM's renderer hands such a template the message
+        // developer message; the engine's renderer hands such a template the message
         // as a system message, and so does this one (`tools` on it dropped).
         let converted;
         let messages: &[serde_json::Value] = if self.developer_role_supported {
@@ -1662,6 +1803,35 @@ mod tests {
         assert!(error.contains("2 is required"), "{error}");
     }
 
+    /// transformers renders with `tools=None` and `documents=None` when the
+    /// request carries none, so a template that tests `tools is none` (Olmo 3)
+    /// takes its no-tools branch, and one that guards with `is defined and
+    /// tools` does too.
+    #[test]
+    fn absent_tools_and_documents_are_none_as_transformers_passes_them() {
+        let template = "{% if tools is none %}no tools{% else %}{{ tools | tojson }}{% endif %}|\
+                        {% if tools is defined and tools %}has tools{% else %}none{% endif %}|\
+                        {% if tools is iterable and tools | length > 0 %}iterable{% else %}not iterable{% endif %}|\
+                        {% if documents is none %}no documents{% endif %}";
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages: [serde_json::Value; 0] = [];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "no tools|none|not iterable|no documents");
+
+        let tools = [serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let params = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let rendered = processor.apply_chat_template(&messages, params).unwrap();
+        assert_eq!(
+            rendered,
+            "[{\"type\": \"function\", \"function\": {\"name\": \"f\"}}]|has tools|iterable|no documents"
+        );
+    }
+
     #[test]
     fn test_chat_template_state_no_template() {
         let state = ChatTemplateState::new(None).unwrap();
@@ -1680,7 +1850,7 @@ mod tests {
     #[test]
     fn developer_message_renders_as_system_when_the_template_has_no_developer_branch() {
         // The template names system/user/assistant only: a developer message
-        // would render nothing. vLLM's renderer turns it into a system message.
+        // would render nothing. The engine's renderer turns it into a system message.
         let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
                         {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}\
                         {% if messages[0].tools is defined %}TOOLS{% endif %}";
@@ -1697,7 +1867,7 @@ mod tests {
 
     /// With a system message of its own in the request, the rewritten
     /// developer message is no longer the first message: the two merge into
-    /// one system turn at the front, as vLLM's renderer merges them.
+    /// one system turn at the front, as the engine's renderer merges them.
     #[test]
     fn a_developer_message_after_a_system_message_merges_into_one_system_turn() {
         let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\

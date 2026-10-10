@@ -2,16 +2,16 @@
 """Record DeepSeek-V4.1 render fixtures from the reference encoders.
 
 Oracle `hf` (the default): oracle/deepseek_v41_encoding.py (HF encoding.py @
-517ef625df, the revision vLLM and SGLang ported). The effort tiers are
+517ef625df, the revision the serving engines ported). The effort tiers are
 overridden to the engine table (spec D1). Token ids come from the real
 tokenizer.json.
 
-Oracle `vllm_python`: vLLM's port of that encoder, imported from the clone at
+Oracle `vllm_python`: the serving engine's port of that encoder, imported from the clone at
 VLLM_REPO_DIR (never vendored) and named in the fixture with the clone's HEAD
 commit. It records the shapes the HF encoder cannot render, today a developer
-message it keeps (vLLM and SGLang render it as a user turn; the HF encoder has
+message it keeps (the serving engines render it as a user turn; the HF encoder has
 no developer branch). Without VLLM_REPO_DIR those cases keep their recorded
-text and a warning says so. Its cases take string content only: vLLM flattens
+text and a warning says so. Its cases take string content only: the engine flattens
 content parts in its tokenizer wrapper, not in the encoder.
 
 Usage: generate_deepseek_v41_fixtures.py <checkpoint>/encoding/tests <checkpoint>/tokenizer.json
@@ -37,10 +37,10 @@ TOKENIZER = Path(sys.argv[2])  # .../DeepSeek-V4.1-Flash/tokenizer.json
 OUT = Path(__file__).parents[1] / "tests" / "fixtures" / "deepseek_v41"
 RENDER_FIXTURES = OUT / "render_fixtures.json"
 
-# Repo-relative path of vLLM's encoder inside the clone at VLLM_REPO_DIR.
+# Repo-relative path of the engine's encoder inside the clone at VLLM_REPO_DIR.
 VLLM_SOURCE = "vllm/tokenizers/deepseek_v41_encoding.py"
 
-# The content-part spellings vLLM's `_normalize_messages` accepts. The reference
+# The content-part spellings the engine's `_normalize_messages` accepts. The reference
 # encoder knows only `text` and `image_url`/`image`; a part in any other spelling
 # would silently vanish from its prompt.
 TEXT_PART_TYPES = ("text", "input_text", "output_text")
@@ -70,9 +70,9 @@ def read_head_commit(repo):
 
 
 def load_vllm_encoder():
-    """vLLM's encoder module and the clone's HEAD commit, or (None, None) with
+    """The engine's encoder module and the clone's HEAD commit, or (None, None) with
     a warning when VLLM_REPO_DIR is unset. Its effort table must already be
-    the engine table: the Rust renderer's tiers follow vLLM (spec D1), so a
+    the engine table: the Rust renderer's tiers follow the engine (spec D1), so a
     change there is a decision to make, not something to record quietly."""
     repo = os.environ.get("VLLM_REPO_DIR")
     if not repo:
@@ -120,7 +120,7 @@ def oracle_part(part):
     `input_text`/`output_text` become `text`; `input_image`/`image_pil` become
     `image_url`. No payload reaches the prompt, but the oracle insists on an
     image source: `input_image` carries its URL as a string, and `image_pil`
-    holds a PIL object in vLLM, which JSON cannot hold, so the oracle gets the
+    holds a PIL object in the engine, which JSON cannot hold, so the oracle gets the
     spelling itself as a stand-in. The oracle then substitutes the image
     placeholder and joins the parts, so it stays the byte authority for both.
     The fixture records the request as sent, spellings included: the renderer
@@ -143,7 +143,7 @@ def oracle_messages(messages):
 
 def attach_tools(msgs, tools):
     """Rule D4, as `inject_tools_into_first_system_message` (huggingface.rs)
-    and vLLM's `apply_chat_template` do it: the request's tools land on the
+    and the engine's `apply_chat_template` do it: the request's tools land on the
     FIRST system message wherever it sits; without one, an empty system
     message is inserted at index 0 and carries them."""
     system = next((msg for msg in msgs if msg["role"] == "system"), None)
@@ -375,7 +375,7 @@ cases += [
     ),
     # A developer message before the last user turn is dropped by drop_thinking,
     # which is the only developer shape the HF encoder can render; the kept
-    # shapes are recorded from vLLM's port at the end of this list.
+    # shapes are recorded from the engine's port at the end of this list.
     case("developer_then_user_thinking", DEVELOPER_THEN_USER, thinking_mode="thinking"),
     case(
         "two_user_turns",
@@ -397,8 +397,8 @@ cases += [
             }
         ],
     ),
-    # vLLM-only spellings (see oracle_part). `image_pil` carries a PIL object in
-    # vLLM, which JSON cannot hold; no image payload reaches the prompt anyway.
+    # Engine-only spellings (see oracle_part). `image_pil` carries a PIL object in
+    # the engine, which JSON cannot hold; no image payload reaches the prompt anyway.
     case(
         "input_image_and_image_pil_spellings",
         [
@@ -498,8 +498,8 @@ cases += [
         thinking_mode="thinking",
     ),
     # A kept developer message (chat mode; thinking with tools, where
-    # drop_thinking is off) renders as a <｜User｜> turn in vLLM and SGLang;
-    # the HF encoder raises on it, so vLLM's port records these two. With
+    # drop_thinking is off) renders as a <｜User｜> turn in the serving engines;
+    # the HF encoder raises on it, so the engine's port records these two. With
     # tools, D4 puts them on a synthesised leading system message.
     case("developer_then_user_chat", DEVELOPER_THEN_USER, oracle="vllm_python"),
     case(

@@ -16,7 +16,7 @@ use rustls::{
 };
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use tokio::{fs, sync::RwLock};
-use tonic::transport::Certificate;
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tracing::{info, warn};
 
 /// mTLS configuration
@@ -120,6 +120,33 @@ impl MTLSManager {
     pub async fn load_ca_certificate(&self) -> Result<Certificate> {
         let ca_cert = fs::read(&self.config.ca_cert_path).await?;
         Ok(Certificate::from_pem(ca_cert))
+    }
+
+    /// This node's certificate chain and private key as a tonic identity.
+    async fn load_identity(&self) -> Result<Identity> {
+        let cert = fs::read(&self.config.server_cert_path).await?;
+        let key = fs::read(&self.config.server_key_path).await?;
+        Ok(Identity::from_pem(cert, key))
+    }
+
+    /// What the mesh listener serves: this node's certificate and key, and,
+    /// when client certificates are required, the CA as the trust root the
+    /// peers' certificates must chain to.
+    pub async fn server_tls_config(&self) -> Result<ServerTlsConfig> {
+        let mut tls = ServerTlsConfig::new().identity(self.load_identity().await?);
+        if self.config.require_client_cert {
+            tls = tls.client_ca_root(self.load_ca_certificate().await?);
+        }
+        Ok(tls)
+    }
+
+    /// What a dial to the peer named `server_name` trusts and presents: the
+    /// CA as the trust root, this node's certificate as its identity.
+    pub async fn client_tls_config(&self, server_name: &str) -> Result<ClientTlsConfig> {
+        Ok(ClientTlsConfig::new()
+            .domain_name(server_name)
+            .ca_certificate(self.load_ca_certificate().await?)
+            .identity(self.load_identity().await?))
     }
 
     /// Load certificates from file

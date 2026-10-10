@@ -27,10 +27,12 @@ type ParserCreator = Arc<dyn Fn() -> Box<dyn ToolParser> + Send + Sync>;
 /// Takes (tools, at_least_one) and returns the full xgrammar structural tag value.
 type BuildStructuralTagFn = Arc<dyn Fn(&[Tool], bool) -> serde_json::Value + Send + Sync>;
 
-/// Function that builds the reasoning block a parser's structural tag is
-/// wrapped in when the prompt ends inside the model's thinking block: one
-/// xgrammar format element (a `tag` with an empty `begin`, free text, and the
-/// think-end token as `end`) the model must complete before the calls start.
+/// Function that builds what precedes a parser's forced calls when the prompt
+/// ends inside the model's thinking block: one xgrammar format element of free
+/// text without the call markers, which holds the thought and its close where
+/// the engine applies the grammar from the first token and nothing where the
+/// engine defers the grammar past the model's own `</think>`. Nothing the model
+/// owes at its end.
 type ReasoningPrefixFn = fn() -> serde_json::Value;
 
 /// Constraint type returned by [`ParserRegistry::generate_tool_constraint`].
@@ -136,11 +138,13 @@ impl ParserRegistry {
     /// tag builder.
     ///
     /// When [`Self::generate_tool_constraint`] is called with `reasoning`
-    /// set, the parser's tag becomes `sequence[prefix, tag.format]`: the
-    /// model reasons, closes its thinking block, and only then emits the
-    /// forced call — the layout of xgrammar's built-in tags with
-    /// `reasoning=True`. Parsers without a prefix keep their unwrapped tag
-    /// whatever `reasoning` says.
+    /// set, the parser's tag becomes `sequence[prefix, tag.format]`: free
+    /// text, then the forced call. Unlike xgrammar's built-in tags with
+    /// `reasoning=True`, the prefix is not closed by the thought's end token:
+    /// an engine that runs a reasoning parser applies the
+    /// grammar only after the model's own `</think>` and would hold the
+    /// model to a second one. Parsers without a prefix keep their unwrapped
+    /// tag whatever `reasoning` says.
     pub fn register_reasoning_prefix(&self, name: &str, reasoning_prefix: ReasoningPrefixFn) {
         let mut entries = self.entries.write();
         let Some(existing) = entries.get(name).map(Arc::clone) else {
@@ -625,8 +629,8 @@ impl Default for ParserFactory {
     }
 }
 
-/// `sequence[prefix, tag.format]`: the model's reasoning block, then the calls
-/// the builder produced. Needs the extended structural-tag shape (a top-level
+/// `sequence[prefix, tag.format]`: the free text a forced call follows on a
+/// thinking prompt, then the calls the builder produced. Needs the extended structural-tag shape (a top-level
 /// `format`), which every builder in this crate emits.
 fn wrap_in_reasoning_prefix(
     mut tag: serde_json::Value,

@@ -1704,7 +1704,7 @@ mod tests {
         let k3 = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
         let caps = k3.renderer_capabilities();
         assert!(caps.raw_tool_call_arguments, "{caps:?}");
-        // vLLM's K3 renderer honours `enable_thinking` as an alias of the
+        // The engine's K3 renderer honours `enable_thinking` as an alias of the
         // encoder's `thinking`; the parser must be armed from it as well.
         assert!(
             caps.enable_thinking_alias && !caps.native_assistant_continuation,

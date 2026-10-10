@@ -1,4 +1,4 @@
-//! Load balancing policies for SGLang router
+//! Load balancing policies for the router
 //!
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
@@ -160,7 +160,7 @@ pub struct CacheAwareConfig {
     pub max_tree_size: usize,
     /// Backend KV cache block size (tokens per block) for event-driven routing.
     /// Used by `compute_request_content_hashes` to chunk request tokens into blocks.
-    /// Must match the backend's block size. Default: 16 (SGLang page size).
+    /// Must match the backend's block size. Default: 16 (one engine's page size).
     pub block_size: usize,
     /// KV-usage **spread** (hottest minus coldest backend, 0.0–1.0) above which
     /// the pool is treated as imbalanced and cache affinity is abandoned for

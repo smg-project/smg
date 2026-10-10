@@ -11,6 +11,7 @@ This package contains modular pytest fixtures split by responsibility:
 from .hooks import (
     pytest_collection_modifyitems,
     pytest_configure,
+    pytest_runtest_makereport,
     pytest_runtest_setup,
     pytest_sessionfinish,
 )
@@ -25,6 +26,7 @@ __all__ = [
     # Hooks
     "pytest_collection_modifyitems",
     "pytest_configure",
+    "pytest_runtest_makereport",
     "pytest_runtest_setup",
     "pytest_sessionfinish",
     # Backend fixtures

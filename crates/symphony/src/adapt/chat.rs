@@ -186,6 +186,7 @@ pub fn message<'a>(choice: u32, events: impl IntoIterator<Item = &'a Event>) -> 
         message: ChatCompletionMessage {
             role: "assistant".to_string(),
             content: (!content.trim().is_empty()).then_some(content),
+            refusal: None,
             tool_calls: (!calls.is_empty())
                 .then(|| calls.into_iter().map(|(_, call)| call).collect()),
             reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
@@ -437,6 +438,7 @@ mod tests {
                 "message": {
                     "role": "assistant",
                     "content": "Let me check.",
+                    "refusal": null,
                     "tool_calls": [{
                         "id": "call_0",
                         "type": "function",
@@ -444,6 +446,7 @@ mod tests {
                     }],
                     "reasoning_content": "plan more",
                 },
+                "logprobs": null,
                 "finish_reason": "tool_calls",
             })
         );
@@ -459,7 +462,8 @@ mod tests {
             serde_json::to_value(message(0, &events)).expect("serializable"),
             json!({
                 "index": 0,
-                "message": {"role": "assistant", "content": null, "reasoning_content": null},
+                "message": {"role": "assistant", "content": null, "refusal": null, "reasoning_content": null},
+                "logprobs": null,
                 "finish_reason": "stop",
             })
         );

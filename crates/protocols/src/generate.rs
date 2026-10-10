@@ -14,13 +14,13 @@ use super::{
 use crate::validated::Normalizable;
 
 // ============================================================================
-// SGLang Generate API (native format)
+// The native Generate API (one engine's own format)
 // ============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
-    /// Text input - SGLang native format
+    /// Text input - the native format
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 
@@ -58,7 +58,7 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_data: Option<Value>,
 
-    /// Sampling parameters (sglang style)
+    /// Sampling parameters (the native API's style)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_params: Option<SamplingParams>,
 
@@ -111,7 +111,7 @@ pub struct GenerateRequest {
     pub lora_id: Option<String>,
 
     /// Custom logit processor for advanced sampling control. Must be a serialized instance
-    /// of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    /// of the engine's `CustomLogitProcessor` (srt/sampling/custom_logit_processor.py).
     /// Use the processor's `to_str()` method to generate the serialized string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_logit_processor: Option<String>,
@@ -216,8 +216,8 @@ impl GenerationRequest for GenerateRequest {
 
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition {
-            // vLLM's `cache_salt` is a passthrough extension on this
-            // protocol; `extra_key` is SGLang's typed classification key.
+            // Another engine's `cache_salt` is a passthrough extension on this
+            // protocol; `extra_key` is the native API's typed classification key.
             cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
             extra_key: self.extra_key.as_deref(),
             // Either name identifies the adapter the engine namespaces by.
@@ -271,10 +271,10 @@ impl GenerationRequest for GenerateRequest {
 }
 
 // ============================================================================
-// SGLang Generate Response Types
+// Native Generate Response Types
 // ============================================================================
 
-/// SGLang generate response (single completion or array for n>1)
+/// Native generate response (single completion or array for n>1)
 ///
 /// Format for n=1:
 /// ```json

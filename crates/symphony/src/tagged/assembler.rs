@@ -15,7 +15,7 @@
 //!
 //! Where a template puts the value on a line of its own ([`Placement::OwnLine`]: Qwen 3.5,
 //! Qwen3-Coder) it writes one newline after `<parameter=KEY>` and one before `</parameter>`;
-//! neither is the value's, and the assembler takes exactly those two away, as vLLM's parsers do.
+//! neither is the value's, and the assembler takes exactly those two away, as the engine's parsers do.
 //! The second cannot be told from a newline the value ends with until the closing tag follows it,
 //! so a newline at the end of a streamed piece is held back until the next piece says which it is.
 //! Where a template writes the value between the tags directly ([`Placement::Direct`]: Seed-OSS,
@@ -29,7 +29,7 @@
 //! and a name that is empty come back as `Malformed` with a reason, so the model's bytes are never
 //! read as something they are not and never vanish into a source. Inside a value only
 //! `</parameter>` is a tag; `<function=`, `<parameter=` and `</function>` there are the value's
-//! text (vLLM ends a value at the next `<parameter=` or `</function>` as well, a tolerance to judge
+//! text (the engine's parser ends a value at the next `<parameter=` or `</function>` as well, a tolerance to judge
 //! with adversarial fixtures rather than port).
 //!
 //! Two endings. [`Assembler::close`] is for a block the model ended before `</function>` (its own
@@ -468,7 +468,7 @@ impl Assembler {
     /// The parameter's tag is whole: the value begins. A declared string opens its fragment now.
     fn parameter_named(&mut self, key: String, declared: &Declared, out: &mut Events) {
         if key.is_empty() {
-            // vLLM keeps an empty parameter name and writes `"": value`; here it is reported.
+            // The engine's parser keeps an empty parameter name and writes `"": value`; here it is reported.
             self.report_tag(EMPTY_NAME, out);
             self.stage = Stage::Between;
             return;
@@ -928,7 +928,7 @@ mod tests {
     #[test]
     fn a_type_beside_an_enum_decides_and_an_array_stays_one() {
         // bellwether's qwen3-coder-next/parse/bfcl-live-multiple-146-58-0: BFCL declares the list
-        // `{"type": "array", "items": {"type": "string"}, "enum": [...]}`, and vLLM reads it as an
+        // `{"type": "array", "items": {"type": "string"}, "enum": [...]}`, and the engine's parser reads it as an
         // array; before this the enum made it a string holding `[]`.
         let declared = Declared::of(&[Tool {
             tool_type: "function".to_string(),
