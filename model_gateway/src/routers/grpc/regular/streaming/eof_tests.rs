@@ -319,7 +319,7 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
                 None,
             )
             .await;
-        let body = tokio::time::timeout(
+        let body = timeout(
             Duration::from_secs(5),
             axum::body::to_bytes(response.into_body(), 65536),
         )
@@ -395,7 +395,7 @@ async fn byte_fallback_generate_eof_reports_gateway_stop() {
             dispatch(),
             &mut decoder,
             false,
-            std::time::Instant::now(),
+            Instant::now(),
         )
         .await
         .unwrap();
