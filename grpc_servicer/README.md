@@ -260,6 +260,17 @@ grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
 explicitly when that matters; the engine keeps the backend of its first
 structured request either way, as it does behind vLLM's own frontend.
 
+Both vLLM servicers also advertise the engine's reasoning parser
+(`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
+a router reads off a worker's labels) and where its grammar starts on a prompt
+that ends inside the model's thinking block (`structured_outputs_start`): `after_reasoning` when
+a reasoning parser is set and `enable_in_reasoning` is off, since vLLM then
+holds a request's grammar back until the parser has seen the thought's end,
+`first_token` otherwise. A router shapes a forced tool call's grammar by it as
+the engine's own server would: the bare calls behind the parser's gate, so the
+call is forced right there; the thought and then the calls from the first
+token.
+
 #### Multi-node engines: the worker pod's liveness
 
 An engine whose tensor-parallel ranks span pods runs its EngineCore and the

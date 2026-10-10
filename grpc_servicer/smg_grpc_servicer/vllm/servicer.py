@@ -67,11 +67,13 @@ from smg_grpc_servicer.vllm.mm_salt import (
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
+    engine_reasoning_parser,
     mm_device_do_normalize,
     mm_item_limits,
     model_facts,
     running_window,
     server_facts,
+    structured_outputs_start,
 )
 from smg_grpc_servicer.vllm.trace_context import trace_headers
 
@@ -743,6 +745,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # pipeline to hold requests to; likewise absent from an older package.
         if "mm_item_limits" in info.DESCRIPTOR.fields_by_name:
             info.mm_item_limits = mm_item_limits(self.engine.vllm_config)
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt, for the Router to shape a forced tool call's
+        # grammar by; likewise absent from an older package.
+        if "structured_outputs_start" in info.DESCRIPTOR.fields_by_name:
+            info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
+            info.structured_outputs_start = structured_outputs_start(self.engine.vllm_config)
         return info
 
     async def GetLoads(
