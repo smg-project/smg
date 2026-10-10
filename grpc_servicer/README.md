@@ -347,8 +347,11 @@ the launcher is given no `--kv-events-config` (an explicit one is kept as
 given; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off). Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
-`SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800, as for vLLM
-above), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
+`SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
+`SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
+bounds as for vLLM above: the launcher reports the scheduler process alive each
+time it polls it, so a slow but living start completes, under the ceiling, and
+0 lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
 (default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
 TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
 tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
@@ -475,7 +478,13 @@ and LoRA loading answers UNIMPLEMENTED, as it does on the Python servicer.
 turns on by itself when the launcher is given no `--kv-events-config` (an
 explicit one is kept as given; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the
 publisher off). SGLang's HTTP sidecar (metrics and profiling endpoints) is not
-started on this path.
+started on this path. Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
+free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 5),
+`SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
+`SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
+bounds as for vLLM above: the launcher reports the scheduler process alive each
+time it polls it, so a slow but living start completes, under the ceiling, and
+0 lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`.
 
 #### Headless over ZMQ (no SGLang change)
 

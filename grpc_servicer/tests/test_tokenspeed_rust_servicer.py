@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import dataclasses
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -431,6 +432,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_DRAIN_SECS", "1.5")
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS", "42")
+    monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS", "0")
 
     assert asyncio.run(rust.serve_rust(FakeServerArgs(port=50123))) == 0
 
@@ -441,6 +443,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert server["engine_count"] == 2
     assert server["tokenizer_dir"] == str(tmp_path)
     assert server["engine_startup_timeout_secs"] == 42.0
+    assert server["engine_startup_ceiling_secs"] == 0.0  # 0 lifts the ceiling
     assert server["model_path"] == "org/m"
     headless = recorded["headless"]
     assert headless.zmq_msgpack is True and headless.skip_tokenizer_init is True
@@ -451,3 +454,70 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert isinstance(supervised_server, FakeServer)
     assert engine == "engine-handle"
     assert drain_secs == 1.5
+
+
+def _run_serve_rust(monkeypatch, tmp_path) -> dict:
+    """``serve_rust`` against a recording fake server with the launcher's own
+    fact producers (over a fake model config and the stub servicer module), the
+    scheduler launch and the supervisor stubbed; the keywords the server was
+    constructed with."""
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+            self.address = kwargs["bind_address"]
+
+    _install(
+        monkeypatch,
+        "smg.servicer",
+        TokenSpeedGrpcServer=FakeServer,
+        init_servicer_tracing=lambda level=None: None,
+    )
+    _stub_servicer_module(monkeypatch)
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            eos_token_id=2, model_type="qwen3", architectures=["Qwen3ForCausalLM"]
+        ),
+        context_len=8192,
+        vocab_size=151936,
+        dtype="torch.bfloat16",
+        is_multimodal=False,
+    )
+    monkeypatch.setattr(rust, "_model_config", lambda args: model_config)
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
+    monkeypatch.setattr(rust, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.setattr(rust, "launch_headless_scheduler", lambda headless: "engine-handle")
+
+    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
+    assert asyncio.run(rust.serve_rust(FakeServerArgs(port=50123))) == 0
+    return created
+
+
+def test_serve_rust_defaults_both_startup_bounds(monkeypatch, tmp_path):
+    """Without the environment variables the server gets the lifecycle's
+    defaults for the silence bound and the ceiling."""
+    monkeypatch.delenv(rust.STARTUP_TIMEOUT_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.STARTUP_CEILING_SECS_ENV, raising=False)
+    created = _run_serve_rust(monkeypatch, tmp_path)
+    assert created["engine_startup_timeout_secs"] == rust.DEFAULT_STARTUP_TIMEOUT_SECS
+    assert created["engine_startup_ceiling_secs"] == rust.DEFAULT_STARTUP_CEILING_SECS
+
+
+def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):
+    """The keyword set `serve_rust` hands the Rust server is bound against the
+    compiled binding's constructor: a fact or a knob the launcher gains without
+    a parameter on the binding fails here, not at the scheduler's start.
+    Skipped where the `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    signature = inspect.signature(servicer.TokenSpeedGrpcServer)
+    created = _run_serve_rust(monkeypatch, tmp_path)
+    unexpected = sorted(set(created) - set(signature.parameters))
+    assert not unexpected, f"keywords the binding's constructor does not take: {unexpected}"
+    # The required parameters are all given too; pyo3 refuses the call otherwise.
+    signature.bind(**created)

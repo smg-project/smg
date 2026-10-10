@@ -871,6 +871,7 @@ impl PyTokenSpeedGrpcServer {
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
         engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -907,6 +908,7 @@ impl PyTokenSpeedGrpcServer {
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
         engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
     ) -> PyResult<Self> {
         let model = TokenSpeedModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -944,6 +946,7 @@ impl PyTokenSpeedGrpcServer {
             tokenizer_dir,
             model,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
         let inner = py
             .detach(|| TokenSpeedServicerServer::start(config))
@@ -967,6 +970,16 @@ impl PyTokenSpeedGrpcServer {
     #[getter]
     fn engine_ready(&self) -> bool {
         self.inner.engine_ready()
+    }
+
+    /// Report that the scheduler process is alive while the handshake runs:
+    /// the launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the
+    /// scheduler is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
     }
 
     /// The last fatal error (scheduler connect or server exit), if any.
@@ -1040,6 +1053,7 @@ impl PySglangGrpcServer {
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
         engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1076,6 +1090,7 @@ impl PySglangGrpcServer {
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
         engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
     ) -> PyResult<Self> {
         let model = SglangModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1113,6 +1128,7 @@ impl PySglangGrpcServer {
             tokenizer_dir,
             model,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
         let inner = py
             .detach(|| SglangServicerServer::start(config))
@@ -1136,6 +1152,16 @@ impl PySglangGrpcServer {
     #[getter]
     fn engine_ready(&self) -> bool {
         self.inner.engine_ready()
+    }
+
+    /// Report that the scheduler process is alive while the handshake runs:
+    /// the launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the
+    /// scheduler is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
     }
 
     /// The last fatal error (scheduler connect or server exit), if any.

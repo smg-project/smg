@@ -12,7 +12,7 @@ use bytes::Bytes;
 use engine_zmq_client::{
     codec::{decode_msgpack, encode_msgpack},
     mock_engine::{
-        connect_to_frontend, default_ready_response, MockEngineInput, MockEngineOutput,
+        connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
     },
     protocol::{
@@ -75,6 +75,7 @@ fn config(
         tokenizer_dir: None,
         model,
         engine_startup_timeout: Duration::from_secs(10),
+        engine_startup_ceiling: None,
     }
 }
 
@@ -251,6 +252,126 @@ fn complete(response: ts::GenerateResponse) -> ts::GenerateComplete {
     }
 }
 
+/// Nothing reaches a mock scheduler that was only handshaken.
+async fn assert_scheduler_idle(engine_in: &mut MockEngineInput) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), engine_in.recv())
+            .await
+            .is_err(),
+        "nothing should have reached the scheduler"
+    );
+}
+
+/// Between HELLO and READY a real scheduler loads its model, and nothing
+/// crosses the wire meanwhile. The lifecycle owner's reports that the
+/// scheduler process is alive keep the link waiting well past the silence
+/// bound, and the start then completes.
+#[tokio::test]
+async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
+        engine_startup_timeout: silence,
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    // The scheduler dials in at once, then "loads" for four silences.
+    let loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let load_time = Instant::now() + 4 * silence;
+    while Instant::now() < load_time {
+        server.note_engine_alive();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        server.last_error().unwrap(),
+        None,
+        "the link gave up on a living scheduler"
+    );
+    assert!(!server.engine_ready());
+
+    let engine = loading
+        .ready(default_ready_response())
+        .bounded()
+        .await
+        .expect("READY and registration accepted");
+    wait_until(|| server.engine_ready()).await;
+    let (mut engine_in, _engine_out) = engine.split();
+    assert_scheduler_idle(&mut engine_in).await;
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// A scheduler that dials in and then falls silent, with nobody reporting it
+/// alive, fails the link at the silence bound as before.
+#[tokio::test]
+async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
+        engine_startup_timeout: silence,
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let since_hello = Instant::now();
+    let deadline = since_hello + Duration::from_secs(10);
+    let error = loop {
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(since_hello.elapsed() >= silence);
+    assert!(
+        error.contains("timed out while waiting for READY"),
+        "{error}"
+    );
+    assert!(error.contains("without a sign of life"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// The ceiling bounds a start however alive the scheduler is reported.
+#[tokio::test]
+async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let ceiling = Duration::from_millis(900);
+    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
+        engine_startup_timeout: silence,
+        engine_startup_ceiling: Some(ceiling),
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let started = Instant::now();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let deadline = started + Duration::from_secs(10);
+    let error = loop {
+        server.note_engine_alive();
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(started.elapsed() >= ceiling);
+    assert!(error.contains("reached its ceiling"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
 #[test]
 fn config_is_validated_before_binding() {
     let dir = tempfile::tempdir().unwrap();
@@ -281,6 +402,20 @@ fn config_is_validated_before_binding() {
             "engines",
             TokenSpeedServicerConfig {
                 engine_count: 0,
+                ..good.clone()
+            },
+        ),
+        (
+            "timeout",
+            TokenSpeedServicerConfig {
+                engine_startup_timeout: Duration::ZERO,
+                ..good.clone()
+            },
+        ),
+        (
+            "ceiling",
+            TokenSpeedServicerConfig {
+                engine_startup_ceiling: Some(Duration::ZERO),
                 ..good.clone()
             },
         ),

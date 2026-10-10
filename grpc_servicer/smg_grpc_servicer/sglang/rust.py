@@ -36,6 +36,7 @@ from smg_grpc_servicer.mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_lim
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
+    DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
     default_socket_dir,
@@ -51,6 +52,7 @@ SERVICER_IMPL_ENV = "SMG_SGLANG_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_SGLANG_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_SGLANG_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS"
+STARTUP_CEILING_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep SGLang's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_SGLANG_SERVICER_KV_EVENTS"
@@ -392,21 +394,30 @@ async def serve_rust(server_args: Any) -> int:
             "No local tokenizer directory for %s; GetTokenizer will be unavailable",
             getattr(server_args, "model_path", ""),
         )
+    startup_timeout_secs = env_float(STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS)
+    startup_ceiling_secs = env_float(STARTUP_CEILING_SECS_ENV, DEFAULT_STARTUP_CEILING_SECS)
     server = SglangGrpcServer(
         bind_address=host_port(host, port),
         ipc_base_url=f"ipc://{socket_dir}/sglang-servicer-{os.getpid()}",
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=engine_count,
         tokenizer_dir=tokenizer_dir,
-        engine_startup_timeout_secs=env_float(
-            STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS
-        ),
+        engine_startup_timeout_secs=startup_timeout_secs,
+        engine_startup_ceiling_secs=startup_ceiling_secs,
         **facts,
     )
     logger.info(
         "Rust SGLang servicer listening on %s; headless scheduler dials handshake port %d",
         server.address,
         handshake_port,
+    )
+    logger.info(
+        "Scheduler startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+        "the handshake waits while the scheduler process is alive",
+        startup_timeout_secs,
+        STARTUP_TIMEOUT_SECS_ENV,
+        f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
+        STARTUP_CEILING_SECS_ENV,
     )
     engine = launch_headless_scheduler(server_args, handshake_port=handshake_port)
     return await supervise(server, engine, drain_secs=env_float(DRAIN_SECS_ENV, DEFAULT_DRAIN_SECS))

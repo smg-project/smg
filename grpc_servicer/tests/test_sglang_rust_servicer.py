@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import os
 import sys
@@ -408,6 +409,78 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert launched == {"args": args, "port": 24321}
     # No --kv-events-config was given: the headless scheduler publishes.
     assert args.kv_events_config == '{"publisher": "zmq"}'
+
+
+def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
+    """``serve_rust`` against a recording fake server, the scheduler launch and
+    the supervisor stubbed; the keywords the server was constructed with. With
+    ``real_facts`` the launcher's own fact producers run, over a fake model
+    config, as at a real start."""
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+            self.address = kwargs["bind_address"]
+
+    _install(monkeypatch, "smg")
+    _install(
+        monkeypatch,
+        "smg.servicer",
+        SglangGrpcServer=FakeServer,
+        init_servicer_tracing=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    if real_facts:
+        monkeypatch.setattr(rust, "_model_config", lambda args: _model_config())
+    else:
+        monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
+        monkeypatch.setattr(
+            rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+        )
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
+    monkeypatch.setattr(
+        rust, "launch_headless_scheduler", lambda server_args, *, handshake_port: "engine"
+    )
+
+    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    assert asyncio.run(rust.serve_rust(_server_args())) == 0
+    return created
+
+
+def test_serve_rust_hands_the_server_both_startup_bounds(monkeypatch, tmp_path):
+    """The silence bound and the ceiling reach the server from their
+    environment variables, the lifecycle defaults otherwise; 0 lifts the
+    ceiling."""
+    monkeypatch.delenv(rust.STARTUP_TIMEOUT_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.STARTUP_CEILING_SECS_ENV, raising=False)
+    created = _run_serve_rust(monkeypatch, tmp_path)
+    assert created["engine_startup_timeout_secs"] == rust.DEFAULT_STARTUP_TIMEOUT_SECS
+    assert created["engine_startup_ceiling_secs"] == rust.DEFAULT_STARTUP_CEILING_SECS
+
+    monkeypatch.setenv(rust.STARTUP_TIMEOUT_SECS_ENV, "42")
+    monkeypatch.setenv(rust.STARTUP_CEILING_SECS_ENV, "0")
+    created = _run_serve_rust(monkeypatch, tmp_path)
+    assert created["engine_startup_timeout_secs"] == 42.0
+    assert created["engine_startup_ceiling_secs"] == 0.0
+
+
+def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):
+    """The keyword set `serve_rust` hands the Rust server is bound against the
+    compiled binding's constructor: a fact or a knob the launcher gains without
+    a parameter on the binding fails here, not at the scheduler's start.
+    Skipped where the `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    signature = inspect.signature(servicer.SglangGrpcServer)
+    created = _run_serve_rust(monkeypatch, tmp_path, real_facts=True)
+    unexpected = sorted(set(created) - set(signature.parameters))
+    assert not unexpected, f"keywords the binding's constructor does not take: {unexpected}"
+    # The required parameters are all given too; pyo3 refuses the call otherwise.
+    signature.bind(**created)
 
 
 def test_serve_grpc_hands_the_process_to_rust_when_the_flag_says_so(
