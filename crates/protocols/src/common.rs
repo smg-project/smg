@@ -357,6 +357,57 @@ pub struct JsonSchemaFormat {
     pub strict: Option<bool>,
 }
 
+/// Strict structured outputs (`strict: true`) require every object node of the
+/// schema to pin `additionalProperties: false`, as the public API enforces.
+/// Walks `properties`, `items`, `prefixItems`, `anyOf`/`oneOf`/`allOf`,
+/// `$defs`/`definitions` and `not`; returns the JSON-pointer-like path of the
+/// first object node that lacks the pin.
+pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<String> {
+    fn walk(node: &Value, path: &str) -> Option<String> {
+        let obj = node.as_object()?;
+        let is_object_node = obj.get("type").and_then(Value::as_str) == Some("object")
+            || obj
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|types| types.iter().any(|t| t.as_str() == Some("object")))
+            || (obj.get("type").is_none() && obj.contains_key("properties"));
+        if is_object_node && obj.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return Some(if path.is_empty() {
+                "()".to_string()
+            } else {
+                path.to_string()
+            });
+        }
+        for key in ["properties", "$defs", "definitions"] {
+            if let Some(children) = obj.get(key).and_then(Value::as_object) {
+                for (name, child) in children {
+                    if let Some(found) = walk(child, &format!("{path}/{key}/{name}")) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+            if let Some(children) = obj.get(key).and_then(Value::as_array) {
+                for (index, child) in children.iter().enumerate() {
+                    if let Some(found) = walk(child, &format!("{path}/{key}/{index}")) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        for key in ["items", "not"] {
+            if let Some(child) = obj.get(key) {
+                if let Some(found) = walk(child, &format!("{path}/{key}")) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    walk(schema, "")
+}
+
 /// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
 pub fn validate_json_schema_shape(
     name: &str,

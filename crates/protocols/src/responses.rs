@@ -9,10 +9,10 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, validate_json_schema_shape, validate_stop, ChatLogProbs,
-        ContextManagementEntry, ConversationRef, Detail, Function, FunctionChoice,
-        GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo, ResponsePrompt,
-        StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
+        default_true, strict_schema_missing_additional_properties, validate_json_schema_shape,
+        validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function,
+        FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
+        ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
         ToolChoiceValue as ChatToolChoiceValue, ToolReference, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
@@ -3052,12 +3052,24 @@ fn default_temperature() -> Option<f32> {
 // Request/Response Types
 // ============================================================================
 
+/// The body of `POST /v1/responses`.
+///
+/// Unknown top-level parameters are rejected (`deny_unknown_fields`), as the
+/// public API rejects them with `unknown_parameter`; a parameter the gateway
+/// accepts must be declared here, including the sampling extensions below.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[validate(schema(function = "validate_responses_cross_parameters"))]
 pub struct ResponsesRequest {
     /// Fields to include in the response
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<IncludeField>>,
+
+    /// Run the response in the background. Spec: body param `background`.
+    /// Accepted so a client that sets it is not rejected as sending an
+    /// unknown parameter; the gateway still generates in the foreground.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
 
     /// Input content - can be string or structured items
     #[validate(custom(function = "validate_response_input"))]
@@ -3067,9 +3079,9 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
-    /// Maximum number of output tokens
+    /// Maximum number of output tokens (the public API's minimum is 16)
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(range(min = 1))]
+    #[validate(custom(function = "validate_max_output_tokens"))]
     pub max_output_tokens: Option<u32>,
 
     /// Maximum number of tool calls
@@ -3077,8 +3089,10 @@ pub struct ResponsesRequest {
     #[validate(range(min = 1))]
     pub max_tool_calls: Option<u32>,
 
-    /// Additional metadata
+    /// Additional metadata: at most 16 pairs, keys up to 64 characters,
+    /// string values up to 512 characters (the public API's limits)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_metadata"))]
     pub metadata: Option<HashMap<String, Value>>,
 
     /// Model to use
@@ -3240,6 +3254,7 @@ impl Default for ResponsesRequest {
     fn default() -> Self {
         Self {
             include: None,
+            background: None,
             input: ResponseInput::Text(String::new()),
             instructions: None,
             max_output_tokens: None,
@@ -3567,21 +3582,9 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
     // 1. Validate tool_choice requires tools (enhanced)
     validate_tool_choice_with_tools(request)?;
 
-    // 2. Validate top_logprobs requires include field
-    if request.top_logprobs.is_some() {
-        let has_logprobs_include = request
-            .include
-            .as_ref()
-            .is_some_and(|inc| inc.contains(&IncludeField::MessageOutputTextLogprobs));
-
-        if !has_logprobs_include {
-            let mut e = ValidationError::new("top_logprobs_requires_include");
-            e.message = Some(
-                "top_logprobs requires include field with 'message.output_text.logprobs'".into(),
-            );
-            return Err(e);
-        }
-    }
+    // 2. `top_logprobs` without `include: ["message.output_text.logprobs"]` is
+    //    accepted as the public API accepts it: the logprobs are simply not
+    //    attached to the output text.
 
     // 3. Validate conversation and previous_response_id are mutually exclusive
     if request.conversation.is_some() && request.previous_response_id.is_some() {
@@ -3590,10 +3593,130 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
         return Err(e);
     }
 
+    // 4. `text.format` of type json_object needs the word "json" somewhere in
+    //    the prompt (instructions or input text), as the public API requires.
+    if matches!(
+        request.text.as_ref().and_then(|t| t.format.as_ref()),
+        Some(TextFormat::JsonObject)
+    ) && !request_mentions_json(request)
+    {
+        let mut e = ValidationError::new("json_object_requires_json_in_input");
+        e.message = Some(
+            "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'."
+                .into(),
+        );
+        return Err(e);
+    }
+
     // Tool-result-only continuations are valid; validate_response_input checks
     // individual items without requiring a message already held in history.
 
     Ok(())
+}
+
+/// Whether the instructions or any input text mention "json" (case-insensitive).
+fn request_mentions_json(request: &ResponsesRequest) -> bool {
+    let mentions = |text: &str| text.to_ascii_lowercase().contains("json");
+    if request.instructions.as_deref().is_some_and(mentions) {
+        return true;
+    }
+    match &request.input {
+        ResponseInput::Text(text) => mentions(text),
+        ResponseInput::Items(items) => items.iter().any(|item| {
+            match item {
+            ResponseInputOutputItem::Message { content, .. } => content.iter().any(|part| {
+                matches!(part, ResponseContentPart::InputText { text } if mentions(text))
+            }),
+            ResponseInputOutputItem::SimpleInputMessage { content, .. } => match content {
+                StringOrContentParts::String(text) => mentions(text),
+                StringOrContentParts::Array(parts) => parts.iter().any(|part| {
+                    matches!(part, ResponseContentPart::InputText { text } if mentions(text))
+                }),
+            },
+            _ => false,
+        }
+        }),
+    }
+}
+
+/// The public API's `max_output_tokens` minimum.
+const MIN_MAX_OUTPUT_TOKENS: u32 = 16;
+
+fn validate_max_output_tokens(value: u32) -> Result<(), ValidationError> {
+    if value < MIN_MAX_OUTPUT_TOKENS {
+        let mut e = ValidationError::new("integer_below_min_value");
+        e.message = Some(
+            format!(
+                "Invalid 'max_output_tokens': integer below minimum value. Expected a value >= {MIN_MAX_OUTPUT_TOKENS}, but got {value} instead."
+            )
+            .into(),
+        );
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The public API's metadata limits: 16 pairs, 64-character keys, 512-character string values.
+const MAX_METADATA_PAIRS: usize = 16;
+const MAX_METADATA_KEY_CHARS: usize = 64;
+const MAX_METADATA_VALUE_CHARS: usize = 512;
+
+fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), ValidationError> {
+    if metadata.len() > MAX_METADATA_PAIRS {
+        let mut e = ValidationError::new("object_above_max_properties");
+        e.message = Some(
+            format!(
+                "Invalid 'metadata': too many properties. The object has {} properties, but the maximum is {MAX_METADATA_PAIRS}.",
+                metadata.len()
+            )
+            .into(),
+        );
+        return Err(e);
+    }
+    for (key, value) in metadata {
+        if key.chars().count() > MAX_METADATA_KEY_CHARS {
+            let mut e = ValidationError::new("string_above_max_length");
+            e.message = Some(
+                format!(
+                    "Invalid 'metadata': a key is too long. Expected a key with a maximum length of {MAX_METADATA_KEY_CHARS}, but got one of {} characters instead.",
+                    key.chars().count()
+                )
+                .into(),
+            );
+            return Err(e);
+        }
+        if let Some(text) = value.as_str() {
+            if text.chars().count() > MAX_METADATA_VALUE_CHARS {
+                let mut e = ValidationError::new("string_above_max_length");
+                e.message = Some(
+                    format!(
+                        "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
+                        text.chars().count()
+                    )
+                    .into(),
+                );
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The roles an input message may carry.
+const INPUT_MESSAGE_ROLES: [&str; 4] = ["assistant", "system", "developer", "user"];
+
+fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
+    if INPUT_MESSAGE_ROLES.contains(&role) {
+        return Ok(());
+    }
+    let mut e = ValidationError::new("invalid_value");
+    e.message = Some(
+        format!(
+            "Invalid value: '{role}'. Supported values are: 'assistant', 'system', 'developer', and 'user'."
+        )
+        .into(),
+    );
+    Err(e)
 }
 
 // ============================================================================
@@ -3628,26 +3751,30 @@ fn validate_response_input(input: &ResponseInput) -> Result<(), ValidationError>
 /// Validates individual input items have valid content
 fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationError> {
     match item {
-        ResponseInputOutputItem::Message { content, .. } => {
+        ResponseInputOutputItem::Message { content, role, .. } => {
+            validate_input_message_role(role)?;
             if content.is_empty() {
                 let mut e = ValidationError::new("message_content_empty");
                 e.message = Some("Message content cannot be empty".into());
                 return Err(e);
             }
         }
-        ResponseInputOutputItem::SimpleInputMessage { content, .. } => match content {
-            StringOrContentParts::String(s) if s.is_empty() => {
-                let mut e = ValidationError::new("message_content_empty");
-                e.message = Some("Message content cannot be empty".into());
-                return Err(e);
+        ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+            validate_input_message_role(role)?;
+            match content {
+                StringOrContentParts::String(s) if s.is_empty() => {
+                    let mut e = ValidationError::new("message_content_empty");
+                    e.message = Some("Message content cannot be empty".into());
+                    return Err(e);
+                }
+                StringOrContentParts::Array(parts) if parts.is_empty() => {
+                    let mut e = ValidationError::new("message_content_empty");
+                    e.message = Some("Message content parts cannot be empty".into());
+                    return Err(e);
+                }
+                _ => {}
             }
-            StringOrContentParts::Array(parts) if parts.is_empty() => {
-                let mut e = ValidationError::new("message_content_empty");
-                e.message = Some("Message content parts cannot be empty".into());
-                return Err(e);
-            }
-            _ => {}
-        },
+        }
         ResponseInputOutputItem::Reasoning { .. } => {
             // Reasoning content can be empty - no validation needed
         }
@@ -3724,6 +3851,50 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
     let mut seen_mcp_labels: HashSet<String> = HashSet::new();
 
     for (idx, tool) in tools.iter().enumerate() {
+        match tool {
+            // Function parameters are a JSON Schema object; a strict function
+            // pins additionalProperties: false on every object node.
+            ResponseTool::Function(function_tool) => {
+                let function = &function_tool.function;
+                if !function.parameters.is_object() {
+                    let mut e = ValidationError::new("invalid_type");
+                    e.message = Some(
+                        format!(
+                            "Invalid type for 'tools[{idx}].parameters': expected an object, but got {} instead.",
+                            json_type_name(&function.parameters)
+                        )
+                        .into(),
+                    );
+                    return Err(e);
+                }
+                if function.strict == Some(true) {
+                    if let Some(path) =
+                        strict_schema_missing_additional_properties(&function.parameters)
+                    {
+                        let mut e = ValidationError::new("invalid_function_parameters");
+                        e.message = Some(
+                            format!(
+                                "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
+                                function.name
+                            )
+                            .into(),
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+            // The hosted local_shell tool is not served by the gateway, and the
+            // public API no longer accepts it either.
+            ResponseTool::LocalShell => {
+                let mut e = ValidationError::new("tool_not_supported");
+                e.message = Some(
+                    format!("Invalid 'tools[{idx}]': the local_shell tool is not supported.")
+                        .into(),
+                );
+                return Err(e);
+            }
+            _ => {}
+        }
         if let ResponseTool::Mcp(mcp) = tool {
             let raw_label = mcp.server_label.as_str();
             if raw_label.is_empty() {
@@ -3781,10 +3952,40 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
 
 /// Validates text format configuration (JSON schema name non-empty, schema an object)
 fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
-    if let Some(TextFormat::JsonSchema { name, schema, .. }) = &text.format {
+    if let Some(TextFormat::JsonSchema {
+        name,
+        schema,
+        strict,
+        ..
+    }) = &text.format
+    {
         validate_json_schema_shape(name, schema)?;
+        if *strict == Some(true) {
+            if let Some(path) = strict_schema_missing_additional_properties(schema) {
+                let mut e = ValidationError::new("invalid_json_schema");
+                e.message = Some(
+                    format!(
+                        "Invalid schema for response_format '{name}': In context={path}, 'additionalProperties' is required to be supplied and to be false."
+                    )
+                    .into(),
+                );
+                return Err(e);
+            }
+        }
     }
     Ok(())
+}
+
+/// The JSON type name used in validation messages.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Normalize a SimpleInputMessage to a proper Message item

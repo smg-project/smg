@@ -4514,3 +4514,187 @@ fn test_mcp_list_tools_input_item_with_error_round_trip() {
 
     assert_eq!(serde_json::to_value(&item).expect("serialize"), payload);
 }
+
+// ============================================================================
+// Request shapes the public API rejects with 400 (smg-lab #134)
+// ============================================================================
+
+fn plain_request(body: serde_json::Value) -> Result<ResponsesRequest, serde_json::Error> {
+    serde_json::from_value(body)
+}
+
+/// The validator's verdict in its debug form (codes and messages): the tests
+/// assert the expected code is in it, which an accepted request (`Ok(())`)
+/// never satisfies.
+fn validation_code(request: &ResponsesRequest) -> String {
+    format!("{:?}", request.validate())
+}
+
+#[test]
+fn unknown_top_level_parameter_is_rejected_at_the_body_parser() {
+    let err = plain_request(json!({"model": "m", "input": "hi", "frobnicate": true}))
+        .expect_err("an unknown top-level parameter must not deserialize");
+    assert!(err.to_string().contains("frobnicate"), "{err}");
+}
+
+#[test]
+fn background_and_the_sampling_extensions_stay_accepted() {
+    let request = plain_request(json!({
+        "model": "m", "input": "hi", "background": true, "stop": ["END"],
+        "top_k": 40, "min_p": 0.05, "repetition_penalty": 1.1,
+        "frequency_penalty": 0.5, "presence_penalty": 0.3
+    }))
+    .expect("declared parameters deserialize");
+    assert_eq!(request.background, Some(true));
+    assert!(request.validate().is_ok());
+}
+
+#[test]
+fn unknown_input_message_role_is_rejected() {
+    let request = plain_request(json!({
+        "model": "m",
+        "input": [{"type": "message", "role": "robot", "content": "hi"}]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        code.contains("invalid_value") && code.contains("robot"),
+        "{code}"
+    );
+
+    for role in ["assistant", "system", "developer", "user"] {
+        let request = plain_request(json!({
+            "model": "m",
+            "input": [{"type": "message", "role": role, "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok(), "{role} is an input role");
+    }
+}
+
+#[test]
+fn max_output_tokens_below_sixteen_is_rejected() {
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 1})).unwrap();
+    assert!(validation_code(&request).contains("integer_below_min_value"));
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 16})).unwrap();
+    assert!(request.validate().is_ok());
+}
+
+#[test]
+fn metadata_limits_are_enforced() {
+    let too_many: serde_json::Map<String, serde_json::Value> =
+        (0..17).map(|i| (format!("k{i}"), json!("v"))).collect();
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "metadata": too_many})).unwrap();
+    assert!(validation_code(&request).contains("object_above_max_properties"));
+
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "metadata": {"k": "v".repeat(600)}}))
+            .unwrap();
+    assert!(validation_code(&request).contains("string_above_max_length"));
+
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "metadata": {"k": "v".repeat(512)}}))
+            .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "512 characters is the maximum, not over it"
+    );
+}
+
+#[test]
+fn function_tool_parameters_must_be_an_object() {
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [{"type": "function", "name": "f", "parameters": "not-an-object"}]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        code.contains("invalid_type") && code.contains("tools[0].parameters"),
+        "{code}"
+    );
+}
+
+#[test]
+fn strict_function_schema_needs_additional_properties_false() {
+    let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [{"type": "function", "name": "f", "strict": true, "parameters": loose}]
+    }))
+    .unwrap();
+    assert!(validation_code(&request).contains("invalid_function_parameters"));
+
+    let pinned = json!({
+        "type": "object",
+        "properties": {"x": {"type": "string"}, "inner": {"type": "object", "properties": {}, "additionalProperties": false}},
+        "additionalProperties": false
+    });
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [{"type": "function", "name": "f", "strict": true, "parameters": pinned}]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok());
+
+    // Not strict: the pin is not required.
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok());
+}
+
+#[test]
+fn strict_json_schema_text_format_needs_additional_properties_false() {
+    let request = plain_request(json!({
+        "model": "m", "input": "Tokyo facts.",
+        "text": {"format": {"type": "json_schema", "name": "bad", "strict": true,
+                 "schema": {"type": "object", "properties": {"x": {"type": "string"}}}}}
+    }))
+    .unwrap();
+    assert!(validation_code(&request).contains("invalid_json_schema"));
+}
+
+#[test]
+fn json_object_format_needs_the_word_json_in_the_prompt() {
+    let request = plain_request(json!({
+        "model": "m", "input": "Tell me about Tokyo.",
+        "text": {"format": {"type": "json_object"}}
+    }))
+    .unwrap();
+    assert!(validation_code(&request).contains("json_object_requires_json_in_input"));
+
+    let request = plain_request(json!({
+        "model": "m", "input": "Tell me about Tokyo as JSON.",
+        "text": {"format": {"type": "json_object"}}
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok());
+
+    let request = plain_request(json!({
+        "model": "m", "input": "Tell me about Tokyo.", "instructions": "Answer in json.",
+        "text": {"format": {"type": "json_object"}}
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok(), "the instructions count too");
+}
+
+#[test]
+fn local_shell_tool_is_rejected() {
+    let request = plain_request(json!({
+        "model": "m", "input": "list files", "tools": [{"type": "local_shell"}]
+    }))
+    .unwrap();
+    assert!(validation_code(&request).contains("tool_not_supported"));
+}
+
+#[test]
+fn top_logprobs_without_include_is_accepted() {
+    let request = plain_request(json!({"model": "m", "input": "hi", "top_logprobs": 5})).unwrap();
+    assert!(request.validate().is_ok());
+}

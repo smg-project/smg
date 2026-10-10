@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Extension, Path, Query, Request, State},
+    extract::{Extension, Path, Query, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -479,12 +479,6 @@ async fn v1_conversations_list_items(
     .await
 }
 
-#[derive(Deserialize, Default)]
-struct GetItemQuery {
-    /// Additional fields to include in response (not yet implemented)
-    include: Option<Vec<String>>,
-}
-
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
@@ -502,14 +496,20 @@ async fn v1_conversations_create_items(
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Path((conversation_id, item_id)): Path<(String, String)>,
-    Query(query): Query<GetItemQuery>,
+    RawQuery(query): RawQuery,
 ) -> Response {
+    // `include` arrives as repeated `include[]=` / `include=` pairs; each value
+    // must name an includable field, as the public API requires.
+    let include = match conversations::parse_item_include_query(query.as_deref()) {
+        Ok(include) => include,
+        Err(response) => return response,
+    };
     conversations::get_conversation_item(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
         &conversation_id,
         &item_id,
-        query.include,
+        include,
     )
     .await
 }

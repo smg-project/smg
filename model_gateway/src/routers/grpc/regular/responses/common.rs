@@ -500,6 +500,7 @@ pub(super) fn build_next_request(
         user: current_request.user,
         metadata: current_request.metadata,
         include: current_request.include,
+        background: current_request.background,
         reasoning: current_request.reasoning,
         service_tier: current_request.service_tier,
         top_logprobs: current_request.top_logprobs,

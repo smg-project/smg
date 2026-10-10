@@ -486,6 +486,57 @@ async fn process_new_item(
     Ok((created, warning))
 }
 
+/// The `include` values a conversation item GET accepts (the public API's
+/// includable fields).
+const ITEM_INCLUDE_VALUES: [&str; 8] = [
+    "code_interpreter_call.outputs",
+    "computer_call_output.output.image_url",
+    "file_search_call.results",
+    "message.input_image.image_url",
+    "message.output_text.logprobs",
+    "reasoning.encrypted_content",
+    "web_search_call.action.sources",
+    "web_search_call.results",
+];
+
+/// Parse the `include` parameter of `GET /v1/conversations/{id}/items/{item}`
+/// from the raw query string (`include[]=x`, `include=x`, `include[0]=x`).
+/// An empty or unknown value is rejected with `invalid_value` on
+/// `include[<index>]`, as the public API answers.
+pub fn parse_item_include_query(query: Option<&str>) -> Result<Option<Vec<String>>, Response> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let mut include = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let is_include = key == "include"
+            || key
+                .strip_prefix("include[")
+                .is_some_and(|rest| rest.ends_with(']'));
+        if !is_include {
+            continue;
+        }
+        if !ITEM_INCLUDE_VALUES.contains(&value.as_ref()) {
+            let index = include.len();
+            return Err(bad_request_structured(json!({
+                "message": format!(
+                    "Invalid value: '{value}'. Supported values are: {}.",
+                    ITEM_INCLUDE_VALUES
+                        .iter()
+                        .map(|v| format!("'{v}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "type": "invalid_request_error",
+                "param": format!("include[{index}]"),
+                "code": "invalid_value"
+            })));
+        }
+        include.push(value.into_owned());
+    }
+    Ok((!include.is_empty()).then_some(include))
+}
+
 pub async fn get_conversation_item(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
