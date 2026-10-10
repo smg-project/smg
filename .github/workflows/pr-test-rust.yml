@@ -78,7 +78,7 @@ jobs:
           source, integrated = os.environ['SOURCE_SHA'], os.environ['INTEGRATED_SHA']
           assert source == '657ee979b44d7766f46ac96a19b8be070d21e6d3', 'Artifact application source changed'
           assert integrated == 'b30674ede40154cb385eb8d6b7cf82ae9231d4e8', 'Integration commit changed'
-          assert git('rev-parse', f'{integrated}^{tree}') == '3e03a1584dc79353c54ce5d4ee02e8fe3a410a3d', 'Integration tree changed'
+          assert git('rev-parse', integrated + '^{tree}') == '3e03a1584dc79353c54ce5d4ee02e8fe3a410a3d', 'Integration tree changed'
           ci_paths = {'docker/ci-gpu-runner.Dockerfile', 'scripts/ci_ensure_python_headers.sh', 'scripts/ci_install_vllm.sh', 'scripts/ci_setup_python_venv.sh', '.github/actions/setup-sglang/action.yml', 'scripts/ci_prepared_backend_env.sh', '.github/workflows/ci-gpu-runner-image.yml', 'scripts/ci_install_sglang.sh', 'scripts/tests/test_ci_gpu_runner_image.py', 'scripts/ci_gpu_runner_image.py', '.github/workflows/pr-test-rust.yml', 'scripts/tests/test_ci_prepared_backend_env.py', '.github/actions/setup-vllm/action.yml'}
           changed = set(git('diff', '--name-only', source, integrated).splitlines())
           assert changed == ci_paths, f'Application or approved CI scope changed: {changed ^ ci_paths}'
