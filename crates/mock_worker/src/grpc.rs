@@ -539,9 +539,18 @@ fn load_record(
     }
 }
 
+/// The engine's silence on its in-flight requests, as the Rust servicer's
+/// record carries it (`EngineLoad.engine_silence_ms`).
+fn silence_ms(engine: &engine::Engine) -> Option<u32> {
+    engine
+        .output_silence()
+        .map(|silence| u32::try_from(silence.as_millis()).unwrap_or(u32::MAX))
+}
+
 /// Whether a record moved enough from `last` to be worth a `load_only`
 /// batch: the Rust relay's rule (any queue, running or window change, KV
-/// usage by half a percent, the rate by 5 % or 50 tokens per second).
+/// usage by half a percent, the rate by 5 % or 50 tokens per second, the
+/// engine's silence by a whole second).
 fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
     last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
@@ -552,6 +561,8 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
             let delta = (last.gen_throughput - current.gen_throughput).abs();
             delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
         }
+        || last.engine_silence_ms.map(|ms| ms / 1000)
+            != current.engine_silence_ms.map(|ms| ms / 1000)
 }
 
 /// How often the stream checks the record while no batch flows, the silence
@@ -587,6 +598,7 @@ impl LoadRecords {
         self.sample += 1;
         let snapshot = self.engine.load().as_reported_by(self.like);
         let mut record = load_record(&snapshot, self.like, self.sample);
+        record.engine_silence_ms = silence_ms(&self.engine);
         record.load_only = load_only;
         // As the Rust relay: telemetry on heartbeats and the first record.
         if !load_only && self.sample > 1 {
@@ -601,7 +613,8 @@ impl LoadRecords {
     /// unchanged heartbeats); it repeats the last sequence sent, as the
     /// gateway expects.
     fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
-        let current = load_record(&self.engine.load().as_reported_by(self.like), self.like, 0);
+        let mut current = load_record(&self.engine.load().as_reported_by(self.like), self.like, 0);
+        current.engine_silence_ms = silence_ms(&self.engine);
         let changed = self
             .last_record
             .as_ref()

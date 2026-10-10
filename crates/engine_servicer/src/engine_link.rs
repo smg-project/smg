@@ -29,4 +29,12 @@ impl EngineLink {
             slot.get_or_insert(message);
         }
     }
+
+    /// The engine's silence on its in-flight requests, for the pushed load
+    /// record (`EngineLoad.engine_silence_ms`): `None` while the handshake
+    /// runs, while nothing is in flight, or right after an output.
+    pub(crate) fn output_silence_ms(&self) -> Option<u32> {
+        let silence = self.client.get()?.output_silence()?;
+        Some(u32::try_from(silence.as_millis()).unwrap_or(u32::MAX))
+    }
 }

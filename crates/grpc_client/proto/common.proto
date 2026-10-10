@@ -79,6 +79,13 @@ message EngineLoad {
   optional EngineSpeculative speculative = 15;
   optional EngineLora lora = 16;
   optional EngineDisaggregation disaggregation = 17;
+  // Milliseconds since the engine last produced any output (a token, a
+  // completion, a scheduler step's stats) while the servicer held requests in
+  // flight on it; unset while nothing is in flight or when the servicer
+  // cannot tell. The servicer sees the engine's silence before any one
+  // request does: a subscriber that finds it past its wedge bound vetoes the
+  // worker without needing a pile of its own requests on it.
+  optional uint32 engine_silence_ms = 19;
 }
 
 // The sections below mirror the SGLang scheduler's GetLoads messages field

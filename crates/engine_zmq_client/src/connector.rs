@@ -18,10 +18,10 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -146,6 +146,11 @@ impl<O: EngineOutput> RequestRegistry<O> {
         }
     }
 
+    /// Requests submitted and not yet finished, aborted or failed.
+    fn in_flight(&self) -> usize {
+        self.requests.len()
+    }
+
     /// Register a utility call, returning the receiver its reply resolves.
     fn register_utility(&mut self, call_id: i64) -> Result<oneshot::Receiver<Result<OpaqueValue>>> {
         if self.closed {
@@ -230,6 +235,12 @@ struct ClientInner<P: EngineProtocol> {
     /// Issues utility call ids; the engine echoes one on its reply. Positive
     /// only: vLLM reserves negative ids for notices it sends unprompted.
     next_call_id: AtomicI64,
+    /// The engine's last output of any kind (a token, a completion, a
+    /// stats-only step), in milliseconds on `output_clock`; reset at the
+    /// first submission after an idle spell, so the silence a request sees
+    /// counts from its own dispatch. Read by [`Client::output_silence`].
+    output_clock: Instant,
+    last_output_ms: AtomicU64,
 }
 
 impl<P: EngineProtocol> ClientInner<P> {
@@ -329,6 +340,12 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// every request, so an empty in-flight set is ground truth that the
     /// rank's queue is empty; the KV term is left as reported (cache pages
     /// outlive requests).
+    /// Stamp an output from the engine (or a dispatch onto an idle one) now.
+    fn note_output(&self) {
+        let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_output_ms.store(millis, Ordering::Relaxed);
+    }
+
     fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a String>) {
         let mut routing = self.routing.lock();
         let Some(ids) = routing.inflight.get_mut(&engine_index) else {
@@ -525,6 +542,8 @@ impl<P: EngineProtocol> Client<P> {
             wave: lockstep.then(|| Mutex::new(0)),
             abort_tx,
             next_call_id: AtomicI64::new(1),
+            output_clock: Instant::now(),
+            last_output_ms: AtomicU64::new(0),
         });
 
         // Transport output loop: decode raw frames -> EngineBatch channel.
@@ -564,6 +583,22 @@ impl<P: EngineProtocol> Client<P> {
         self.inner.routing.lock().load.get(&engine_index).copied()
     }
 
+    /// How long the engine has produced nothing while this client holds
+    /// requests in flight on it: the time since its last output batch of any
+    /// kind (a token, a completion, a stats-only step), counted from the
+    /// dispatch when the engine was idle before it; `None` while nothing is
+    /// in flight. A frozen engine keeps its connection open and its last
+    /// load report standing, so this is the first sign of it: the servicer
+    /// puts it on the load record it pushes (`EngineLoad.engine_silence_ms`)
+    /// for the gateway's wedge rule.
+    pub fn output_silence(&self) -> Option<Duration> {
+        if self.inner.registry.lock().in_flight() == 0 {
+            return None;
+        }
+        let since = Duration::from_millis(self.inner.last_output_ms.load(Ordering::Relaxed));
+        Some(self.inner.output_clock.elapsed().saturating_sub(since))
+    }
+
     /// Submit a request and return a stream of its outputs. The request is
     /// routed by `data_parallel_rank` (SMG-pinned) or, unpinned, to the
     /// least-loaded engine (see [`ClientInner::select_engine`]).
@@ -587,7 +622,17 @@ impl<P: EngineProtocol> Client<P> {
         // rejects a duplicate id), and in-flight slots are held by id, so a
         // reservation taken before that gate could collide with the live
         // request's own slot and release it on rollback.
-        let receiver = self.inner.registry.lock().register(request_id.clone())?;
+        let receiver = {
+            let mut registry = self.inner.registry.lock();
+            let idle = registry.in_flight() == 0;
+            let receiver = registry.register(request_id.clone())?;
+            // The silence a request sees counts from its dispatch: an engine
+            // idle until now had nothing to produce.
+            if idle {
+                self.inner.note_output();
+            }
+            receiver
+        };
 
         // Selection reserves the engine's in-flight slot; every failure path
         // from here to a successful hand-off must release it.
@@ -764,6 +809,7 @@ async fn run_dispatcher<P: EngineProtocol>(
                 match output {
                     Some(Ok(batch)) => {
                         consecutive_decode_errors = 0;
+                        inner.note_output();
                         if let Some(load) = batch.load {
                             inner.routing.lock().load.insert(batch.engine_index, load);
                         }
@@ -1086,6 +1132,70 @@ mod tests {
         assert!(second.finished());
         // Terminal output ends the stream.
         assert!(stream.next().await.is_none());
+    }
+
+    /// The silence the servicer reports for a frozen engine: nothing while
+    /// idle, counted from the dispatch, reset by any output batch (a
+    /// stats-only step included), gone with the last in-flight request.
+    #[tokio::test]
+    async fn output_silence_counts_from_the_dispatch_and_ends_with_the_requests() {
+        let (client, mut engine, _ns) = connect().await;
+        assert_eq!(client.output_silence(), None, "nothing in flight");
+        let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+        engine.recv_request().await.unwrap();
+        let at_dispatch = client.output_silence().expect("a request is in flight");
+        assert!(at_dispatch < Duration::from_millis(500), "{at_dispatch:?}");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let grown = client.output_silence().expect("still in flight");
+        assert!(
+            grown >= Duration::from_millis(70),
+            "grows while the engine is silent: {grown:?}"
+        );
+
+        // A stats-only step is output: the engine is alive, if quiet.
+        let stats_only = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            scheduler_stats: Some(Box::new(SchedulerStats {
+                num_running_reqs: 1,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&stats_only).unwrap())])
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while client.engine_load(0).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stats never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let after_stats = client.output_silence().expect("still in flight");
+        assert!(
+            after_stats < grown,
+            "reset by the step: {after_stats:?} after {grown:?}"
+        );
+
+        // The terminal output ends the request: nothing in flight, no silence.
+        engine
+            .send_output(batch(
+                0,
+                EngineCoreOutput {
+                    request_id: "req-1".into(),
+                    new_token_ids: vec![11],
+                    finish_reason: Some(EngineCoreFinishReason::Stop),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap();
+        let last = stream.next().await.unwrap().unwrap();
+        assert!(last.finished());
+        assert!(stream.next().await.is_none());
+        assert_eq!(client.output_silence(), None, "nothing in flight again");
     }
 
     /// A stream that outlives its client is truncated, not complete: it must
