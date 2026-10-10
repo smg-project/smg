@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use super::{
     admission::{BatchOutcome, WorkerStreamState},
     apply::{WorkerIndexCounters, WorkerIndexState},
-    KvEventMonitor,
+    KvBlockSize, KvEventMonitor,
 };
 use crate::{
     observability::metrics::Metrics,
@@ -111,39 +111,63 @@ fn error_class(code: tonic::Code) -> &'static str {
 }
 
 impl KvEventMonitor {
-    /// Learn `block_size` from the first `KvBlock` in a stored event.
+    /// Learn the model's `block_size` from the stored blocks of a batch.
     ///
-    /// Called once per model when the first stored event arrives, providing
-    /// ground truth from the backend. `CacheAwarePolicy` uses this to chunk
-    /// request tokens into blocks for overlap scoring.
-    ///
-    /// Overwrites any provisional value seeded from `WorkerSpec` since the
-    /// event stream reflects the backend's actual page size.
+    /// The first stored block replaces a provisional size (a `WorkerSpec`
+    /// seed): the event stream reflects the backend's actual page size.
+    /// After that a block only raises the size. Hybrid engines publish,
+    /// beside their full blocks, partial entries at their hash granularity
+    /// (a fraction of the block, for a prefix boundary a later request can
+    /// resume at); a request chunked at that size would never match a full
+    /// block, so a smaller block never lowers the size of record.
+    /// `CacheAwarePolicy` uses the size to chunk request tokens into blocks
+    /// for overlap scoring.
     fn learn_block_size(
-        block_sizes: &DashMap<String, usize>,
+        block_sizes: &DashMap<String, KvBlockSize>,
         model_id: &str,
-        learned: &mut bool,
         batch: &KvEventBatch,
     ) {
-        if *learned {
-            return;
-        }
         for event in &batch.events {
-            if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
-                if let Some(block) = stored.blocks.first() {
-                    if block.block_size > 0 {
-                        let bs = block.block_size as usize;
-                        block_sizes.insert(model_id.to_string(), bs);
-                        info!(
-                            model_id = %model_id,
-                            block_size = bs,
-                            "Learned block_size from KV event"
-                        );
-                        *learned = true;
-                        return;
-                    }
-                }
+            let Some(kv_cache_event::Data::Stored(stored)) = &event.data else {
+                continue;
+            };
+            let Some(block) = stored.blocks.first() else {
+                continue;
+            };
+            let Ok(tokens) = usize::try_from(block.block_size) else {
+                continue;
+            };
+            if tokens == 0 {
+                continue;
             }
+            // The common case, a block of the size of record, costs one shared
+            // read; the write lock is taken only to change the size.
+            if block_sizes
+                .get(model_id)
+                .is_some_and(|size| size.from_events && tokens <= size.tokens)
+            {
+                continue;
+            }
+            let mut entry = block_sizes
+                .entry(model_id.to_string())
+                .or_insert(KvBlockSize {
+                    tokens: 0,
+                    from_events: false,
+                });
+            if entry.from_events && tokens <= entry.tokens {
+                continue;
+            }
+            let previous = (entry.tokens > 0).then_some(entry.tokens);
+            *entry = KvBlockSize {
+                tokens,
+                from_events: true,
+            };
+            info!(
+                model_id = %model_id,
+                block_size = tokens,
+                previous,
+                "Learned block_size from KV event"
+            );
         }
     }
 
@@ -191,7 +215,7 @@ impl KvEventMonitor {
         worker: Arc<dyn Worker>,
         worker_url: String,
         indexer: Arc<KvIndex>,
-        block_sizes: Arc<DashMap<String, usize>>,
+        block_sizes: Arc<DashMap<String, KvBlockSize>>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
         load_sink: Option<Weak<WorkerMonitor>>,
@@ -215,7 +239,6 @@ impl KvEventMonitor {
         // at once instead of after the remaining delay.
         let wake = worker.contact_wake();
         let mut reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
-        let mut block_size_learned = false;
 
         /// Sleep with shutdown check. Returns `true` if shutdown was signaled.
         /// A contact with the worker ends the sleep early, but never before
@@ -405,7 +428,7 @@ impl KvEventMonitor {
             let on_batch = |batch: &KvEventBatch| {
                 applied = true;
                 liveness::on_contact(&worker);
-                Self::learn_block_size(&block_sizes, &model_id, &mut block_size_learned, batch);
+                Self::learn_block_size(&block_sizes, &model_id, batch);
             };
             // The load record on a batch is a poll of this worker, received now.
             let on_load = |batch: &KvEventBatch, load: &EngineLoad| {
@@ -589,6 +612,71 @@ mod tests {
 
     use super::*;
     use crate::worker::BasicWorkerBuilder;
+
+    /// One batch of stored events, one block per event, `(hash, block_size)` each.
+    fn stored_batch(blocks: &[(i64, usize)]) -> KvEventBatch {
+        KvEventBatch {
+            sequence_number: 1,
+            events: blocks
+                .iter()
+                .map(|&(hash, block_size)| common::KvCacheEvent {
+                    event_id: hash as u64,
+                    data: Some(kv_cache_event::Data::Stored(common::KvBlocksStored {
+                        blocks: vec![common::KvBlock {
+                            block_hash: hash,
+                            token_ids: (0..block_size as u32).collect(),
+                            block_size: block_size as i32,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn learned(sizes: &DashMap<String, KvBlockSize>) -> Option<usize> {
+        sizes.get("m").map(|size| size.tokens)
+    }
+
+    #[test]
+    fn a_partial_entry_never_sets_the_block_size_below_the_full_block() {
+        let sizes: DashMap<String, KvBlockSize> = DashMap::new();
+        // The engine's first batch names a partial entry before a full block.
+        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(1, 64), (2, 128)]));
+        assert_eq!(learned(&sizes), Some(128));
+        // A partial entry on its own never lowers the size.
+        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(3, 64)]));
+        assert_eq!(learned(&sizes), Some(128));
+        // A larger block raises it.
+        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(4, 256)]));
+        assert_eq!(learned(&sizes), Some(256));
+    }
+
+    #[test]
+    fn the_first_stored_block_replaces_a_provisional_seed() {
+        let sizes: DashMap<String, KvBlockSize> = DashMap::new();
+        sizes.insert(
+            "m".to_string(),
+            KvBlockSize {
+                tokens: 1152,
+                from_events: false,
+            },
+        );
+        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(1, 128)]));
+        assert_eq!(
+            sizes.get("m").map(|size| *size),
+            Some(KvBlockSize {
+                tokens: 128,
+                from_events: true,
+            })
+        );
+        // Empty blocks and batches without stores change nothing.
+        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(2, 0)]));
+        KvEventMonitor::learn_block_size(&sizes, "m", &KvEventBatch::default());
+        assert_eq!(learned(&sizes), Some(128));
+    }
 
     /// What the test scheduler's `SubscribeKvEvents` does.
     enum Subscribe {

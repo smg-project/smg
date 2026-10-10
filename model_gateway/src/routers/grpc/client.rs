@@ -846,6 +846,29 @@ impl ServerInfo {
                 // inferring it from the worker URL. See `worker_shares_dev_shm`.
                 if let Some(ref sched) = info.scheduler_info {
                     pick_prost_fields(&mut labels, sched, &["shm_namespace_id"]);
+                    if let Some(prost_types::Value {
+                        kind: Some(prost_types::value::Kind::ListValue(values)),
+                    }) = sched.fields.get("cache_trace_epochs")
+                    {
+                        let epochs: Option<Vec<&str>> = values
+                            .values
+                            .iter()
+                            .map(|value| match &value.kind {
+                                Some(prost_types::value::Kind::StringValue(epoch))
+                                    if !epoch.is_empty() =>
+                                {
+                                    Some(epoch.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if let Some(epochs) = epochs.filter(|epochs| !epochs.is_empty()) {
+                            labels.insert(
+                                "cache_trace_epochs".to_string(),
+                                serde_json::json!(epochs).to_string(),
+                            );
+                        }
+                    }
                 }
                 labels
             }
@@ -1113,7 +1136,22 @@ mod tests {
                 ]),
             }),
             scheduler_info: Some(prost_types::Struct {
-                fields: BTreeMap::from([("status".to_string(), string_value("ready"))]),
+                fields: BTreeMap::from([
+                    ("status".to_string(), string_value("ready")),
+                    (
+                        "cache_trace_epochs".to_string(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::ListValue(
+                                prost_types::ListValue {
+                                    values: vec![
+                                        string_value("replica-one"),
+                                        string_value("replica-two"),
+                                    ],
+                                },
+                            )),
+                        },
+                    ),
+                ]),
             }),
             active_requests: 3,
             uptime_seconds: 12.5,
@@ -1139,6 +1177,10 @@ mod tests {
             Some("8192")
         );
         assert_eq!(labels.get("version").map(String::as_str), Some("0.1.0"));
+        assert_eq!(
+            labels.get("cache_trace_epochs").map(String::as_str),
+            Some(r#"["replica-one","replica-two"]"#)
+        );
         assert!(!labels.contains_key("host"));
         // The pairing-protocol facts survive, under the engine's own names;
         // the discovery step canonicalises the parallelism spellings.

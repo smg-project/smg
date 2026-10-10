@@ -190,11 +190,21 @@ fn extract_template_effort_thinking(
     {
         return None;
     }
-    let effort = kwargs
+    let effort = reasoning_effort_as_rendered(kwargs, reasoning_effort)?;
+    native_effort_thinking(effort, tokenizer)
+}
+
+/// The `reasoning_effort` the template sees: the request's template kwargs
+/// entry, else the request-level field the gateway forwards under that key
+/// (`build_chat_template_kwargs` in `chat_utils` merges them the same way).
+fn reasoning_effort_as_rendered<'a>(
+    kwargs: Option<&'a std::collections::HashMap<String, Value>>,
+    reasoning_effort: Option<&'a str>,
+) -> Option<&'a str> {
+    kwargs
         .and_then(|k| k.get("reasoning_effort"))
         .and_then(Value::as_str)
-        .or(reasoning_effort)?;
-    native_effort_thinking(effort, tokenizer)
+        .or(reasoning_effort)
 }
 
 /// What a `reasoning_effort` value means to this renderer, wherever it
@@ -323,19 +333,53 @@ pub fn constraint_covers_reasoning(
             .has_reasoning_prefix(configured_parser)
 }
 
-/// Resolve the user's effective thinking preference.
+/// Resolve the user's effective thinking preference: the answer of a
+/// renderer that resolves the mode by its own rule, else the generic
+/// precedence of [`resolve_thinking_pref`].
 pub fn resolve_user_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
     thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
+    if let Some(mode) = rendered_thinking_mode(kwargs, reasoning_effort, thinking, tokenizer) {
+        return Some(mode);
+    }
     resolve_thinking_pref(
         extract_thinking_from_kwargs(kwargs, tokenizer),
         extract_template_effort_thinking(kwargs, reasoning_effort, tokenizer),
         thinking,
         reasoning_effort,
     )
+}
+
+/// The mode a renderer with its own thinking rule renders for the request,
+/// asked with the inputs the render receives (`build_chat_template_kwargs`
+/// and `resolve_template_thinking` in `chat_utils` build the same for the
+/// render): the request's template kwargs with the effective `reasoning_effort`
+/// under its key unless they carry that key themselves (an entry of any type
+/// wins, as the render's merge writes the kwargs over the request-level
+/// field), and the typed toggle or the protocol's reading of the effort.
+/// `None` for every other renderer.
+fn rendered_thinking_mode(
+    kwargs: Option<&std::collections::HashMap<String, Value>>,
+    reasoning_effort: Option<&str>,
+    thinking: Option<bool>,
+    tokenizer: &dyn Tokenizer,
+) -> Option<bool> {
+    let template_thinking = thinking.or_else(|| thinking_from_reasoning_effort(reasoning_effort));
+    let carries_effort = kwargs.is_some_and(|k| k.contains_key("reasoning_effort"));
+    match reasoning_effort {
+        Some(effort) if !carries_effort => {
+            let mut as_rendered = kwargs.cloned().unwrap_or_default();
+            as_rendered.insert(
+                "reasoning_effort".to_string(),
+                Value::String(effort.to_string()),
+            );
+            tokenizer.native_thinking_mode(Some(&as_rendered), template_thinking)
+        }
+        _ => tokenizer.native_thinking_mode(kwargs, template_thinking),
+    }
 }
 
 /// Check if a reasoning parser is available for the given model
@@ -745,6 +789,97 @@ mod tests {
             &request(serde_json::json!({"effort": "high"})),
             &v41
         ));
+    }
+
+    /// A K3 directory with a byte-complete stub vocabulary (every byte one
+    /// token, no merges) and the real renderer: prompts render and encode
+    /// without the checkpoint's files.
+    fn k3_stub() -> (tempfile::TempDir, llm_tokenizer::TiktokenTokenizer) {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let vocabulary: String = (0..=255u8)
+            .map(|byte| format!("{} {byte}\n", BASE64.encode([byte])))
+            .collect();
+        std::fs::write(dir.path().join("tiktoken.model"), vocabulary).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures": ["KimiK3ForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        let tokenizer = llm_tokenizer::TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        (dir, tokenizer)
+    }
+
+    /// The K3 parser is armed from the decision the prompt was rendered
+    /// with, whatever the request's mix of typed toggle, top-level effort and
+    /// kwargs: the renderer's own rule decides both (an effort word other
+    /// than `none` leaves the mode to the typed toggle, `none` switches it
+    /// off, a kwargs `minimal` keeps the default on).
+    #[test]
+    fn k3_parser_is_armed_the_way_the_prompt_was_rendered() {
+        use crate::routers::grpc::utils::process_chat_messages;
+
+        let (_dir, tokenizer) = k3_stub();
+        let request = |fields: Value| -> ChatCompletionRequest {
+            let mut body = serde_json::json!({
+                "model": "kimi-k3",
+                "messages": [{"role": "user", "content": "q"}],
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            serde_json::from_value(body).expect("chat request")
+        };
+        let armed_like_the_prompt = |fields: Value| -> bool {
+            let request = request(fields.clone());
+            let prompt = process_chat_messages(&request, &tokenizer, None)
+                .expect("render")
+                .text;
+            let opens_think = prompt.ends_with("<|open|>think<|sep|>");
+            assert!(
+                opens_think || prompt.ends_with("<|open|>response<|sep|>"),
+                "{prompt}"
+            );
+            assert_eq!(
+                chat_reasoning_starts_in_prefill(&request, &tokenizer),
+                opens_think,
+                "{fields}: prompt {prompt:?}"
+            );
+            opens_think
+        };
+        // Typed disabled plus an effort word: chat mode on both sides.
+        assert!(!armed_like_the_prompt(serde_json::json!({
+            "thinking": {"type": "disabled"}, "reasoning_effort": "high"
+        })));
+        // A kwargs `minimal` is not the renderer's off word: thinking stays on.
+        assert!(armed_like_the_prompt(serde_json::json!({
+            "chat_template_kwargs": {"reasoning_effort": "minimal"}
+        })));
+        // `none` switches thinking off, even against a typed enabled.
+        assert!(!armed_like_the_prompt(serde_json::json!({
+            "chat_template_kwargs": {"reasoning_effort": "none"}, "thinking": {"type": "enabled"}
+        })));
+        assert!(!armed_like_the_prompt(
+            serde_json::json!({"reasoning_effort": "none"})
+        ));
+        // The top-level `minimal` reaches the renderer as the protocol's off toggle.
+        assert!(!armed_like_the_prompt(
+            serde_json::json!({"reasoning_effort": "minimal"})
+        ));
+        assert!(armed_like_the_prompt(
+            serde_json::json!({"reasoning_effort": "high"})
+        ));
+        assert!(!armed_like_the_prompt(serde_json::json!({
+            "chat_template_kwargs": {"thinking": false, "reasoning_effort": "high"}
+        })));
+        // A kwargs entry of any type is what the render sees (its merge writes
+        // the kwargs over the request-level field): a null entry hides the
+        // top-level `none`, so the typed enabled decides on both sides.
+        assert!(armed_like_the_prompt(serde_json::json!({
+            "thinking": {"type": "enabled"}, "reasoning_effort": "none",
+            "chat_template_kwargs": {"reasoning_effort": null}
+        })));
+        assert!(armed_like_the_prompt(serde_json::json!({})));
     }
 
     #[test]

@@ -71,7 +71,7 @@ env:
 jobs:
   fixture-tests:
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    timeout-minutes: 60
+    timeout-minutes: 140
     permissions:
       contents: read
     steps:
@@ -117,6 +117,10 @@ jobs:
           install -m 0755 "$dir/git-lfs-${GIT_LFS_VERSION}/git-lfs" "$dir/git-lfs"
           echo "$dir" >> "$GITHUB_PATH"
           "$dir/git-lfs" version
+          # `git lfs pull` (what `bellwether unpack` runs) refuses to work until
+          # the LFS filters are in the git configuration; set them for the
+          # runner user, outside any repository.
+          "$dir/git-lfs" install --skip-repo
 
       - name: Check out bellwether
         uses: actions/checkout@v7
@@ -164,18 +168,70 @@ jobs:
           restore-keys: |
             bellwether-tokenizers-
 
-      # One invocation, so the test targets build with the same features (the
-      # tokenizer files are downloaded over the TLS backend the gateway
+      # One build for the test targets, so they build with the same features
+      # (the tokenizer files are downloaded over the TLS backend the gateway
       # enables), and the pattern takes in every test file named bellwether_*
-      # in these crates.
+      # in these crates. Then each target runs on its own, all at once: each
+      # is one thread comparing its sets, the runner has 8 CPUs, so the step
+      # takes as long as the longest target, not their sum. The pinned commit
+      # records 78 models: the tokenizer harness takes about an hour on the
+      # CPU runner and the gateway's render parity about as long, so the step
+      # has twice the time of the longest and the build; Symphony's replay
+      # runs on 1 case in 200 of each benchmark set (its SYMPHONY_SAMPLE_EVERY
+      # switch, the hand-written sets whole), as the whole replay of every
+      # recorded model takes hours. Each target's output is its own group in
+      # the log, written as the target ends, and a target that failed fails
+      # the step once the others have ended.
       - name: Run the tests that read bellwether
-        timeout-minutes: 45
+        timeout-minutes: 120
         env:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
+          SYMPHONY_SAMPLE_EVERY: "200"
+          # Two of the recorded templates (Apertus, Muse Glimmer) write the day
+          # of the render into the prompt with strftime_now, so their references
+          # carry the day they were recorded: 2026-10-07, in every case of both.
+          # The gateway's strftime_now takes its instant from SOURCE_DATE_EPOCH
+          # when it is set, so the harness renders that day too; noon UTC of it,
+          # so the day is the same in whichever zone the runner formats it. The
+          # value belongs with the pin: when .github/versions/bellwether.ref
+          # moves to a commit that re-recorded those sets, set it to the day
+          # their references carry (neither the pin's commit date nor the sets'
+          # commit date is that day).
+          SOURCE_DATE_EPOCH: "1791374400"
         run: |
           source "$HOME/.cargo/env"
-          cargo test -p llm-tokenizer -p smg -p smg-symphony --test 'bellwether_*' -- --nocapture
+          cargo test -p llm-tokenizer -p smg -p smg-symphony --test 'bellwether_*' --no-run
+          targets=()
+          for file in crates/symphony/tests/bellwether_*.rs model_gateway/tests/bellwether_*.rs crates/tokenizer/tests/bellwether_*.rs; do
+            targets+=("$(basename "$file" .rs)")
+          done
+          declare -A pid
+          for target in "${targets[@]}"; do
+            cargo test -p llm-tokenizer -p smg -p smg-symphony --test "$target" -- --nocapture \
+              > "$RUNNER_TEMP/$target.log" 2>&1 &
+            pid[$target]=$!
+          done
+          failed=()
+          for target in "${targets[@]}"; do
+            wait "${pid[$target]}" || failed+=("$target")
+            echo "::group::$target"
+            cat "$RUNNER_TEMP/$target.log"
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} > 0 )); then
+            echo "::error::tests that read bellwether failed: ${failed[*]}"
+            exit 1
+          fi
 
+      # The stats are for reading, not a verdict. When the job ends before the
+      # Rust setup put sccache on PATH (the unpack failed, say), the step says
+      # so and passes, instead of failing in its turn and hiding the step that
+      # did.
       - name: Show sccache stats
         if: always()
-        run: sccache --show-stats
+        run: |
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --show-stats
+          else
+            echo "::notice::sccache is not on PATH, the Rust setup did not run: no stats to show"
+          fi

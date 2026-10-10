@@ -1,4 +1,7 @@
 //! Opt-in routing evidence, scoped to one pipeline run across async retries.
+//! Backend epochs come from registration metadata and are withdrawn after a
+//! health failure until worker removal and registration. An undetected restart still needs
+//! native epoch evidence; several epochs do not identify a request's DP replica.
 
 use std::{
     cell::RefCell,
@@ -37,10 +40,18 @@ impl Capture {
             .iter()
             .take(32)
             .map(|worker| {
+                let epochs = worker.cache_trace_epochs();
+                let epoch = if epochs.len() == 1 {
+                    epochs.first()
+                } else {
+                    None
+                };
                 json!({
                     "worker": worker.url(), "load": worker.load(), "healthy": worker.is_healthy(),
                     "overloaded": worker.is_overloaded(), "registry_revision": worker.revision(),
-                    "backend_cache_epoch": null,
+                    "backend_cache_epoch": epoch,
+                    "backend_cache_epochs": epochs,
+                    "backend_cache_epoch_source": "registration_metadata",
                 })
             })
             .collect();
@@ -404,6 +415,33 @@ mod tests {
         assert_eq!(workers[0].load(), 1);
         assert!(capture.candidates_complete);
         assert!(capture.observation_started_ns <= capture.observation_finished_ns);
+    }
+
+    #[test]
+    fn candidate_epochs_are_replica_scoped_and_invalidated_after_failure() {
+        use openai_protocol::worker::WorkerStatus;
+
+        use crate::worker::BasicWorkerBuilder;
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8000")
+                .labels(std::collections::HashMap::from([(
+                    "cache_trace_epochs".to_string(),
+                    r#"["one","two"]"#.to_string(),
+                )]))
+                .build(),
+        );
+        let mut capture = Capture::default();
+        capture.observe_candidates(std::slice::from_ref(&worker));
+        assert_eq!(
+            capture.candidates[0]["backend_cache_epochs"],
+            json!(["one", "two"])
+        );
+        assert!(capture.candidates[0]["backend_cache_epoch"].is_null());
+        worker.set_status(WorkerStatus::NotReady);
+        worker.set_status(WorkerStatus::Ready);
+        capture.observe_candidates(&[worker]);
+        assert_eq!(capture.candidates[0]["backend_cache_epochs"], json!([]));
+        assert!(capture.candidates[0]["backend_cache_epoch"].is_null());
     }
 
     #[test]

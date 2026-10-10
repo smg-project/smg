@@ -1984,6 +1984,23 @@ fn test_custom_tool_grammar_format_round_trip() {
     }
 }
 
+/// A function tool keeps rejecting keys outside its schema (alone and inside
+/// a namespace), as before the function object learned to carry them for the
+/// chat API.
+#[test]
+fn test_function_tool_rejects_unknown_fields() {
+    let function =
+        json!({"type": "function", "name": "f", "parameters": {}, "response": {"type": "dict"}});
+    let namespace =
+        json!({"type": "namespace", "name": "ns", "description": "d", "tools": [function]});
+    for tool in [function, namespace] {
+        let error = serde_json::from_value::<ResponseTool>(tool)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `response`"), "{error}");
+    }
+}
+
 #[test]
 fn test_namespace_tool_with_function_round_trip() {
     // Spec (openai-responses-api-spec.md §tools L475):

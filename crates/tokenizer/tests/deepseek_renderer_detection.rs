@@ -959,6 +959,7 @@ mod tests {
                 description: None,
                 parameters: parameters.clone(),
                 strict: None,
+                extra: Default::default(),
             },
         })
         .unwrap();

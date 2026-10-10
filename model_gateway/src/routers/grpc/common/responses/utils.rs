@@ -209,6 +209,7 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
             "additionalProperties": false
         }),
         strict: Some(false),
+        extra: Default::default(),
     }
 }
 

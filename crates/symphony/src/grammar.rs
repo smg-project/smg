@@ -27,11 +27,16 @@
 //! engine sees.
 //!
 //! With the prompt's reasoning still open, the tag is wrapped in a prefix: free text that can
-//! write none of the table's markers nor the call syntax's inner tags, closed by the thought's
-//! close, so the forced call follows the reasoning instead of replacing it, as the gateway's
-//! `wrap_in_reasoning_prefix` does. A table without a thought has nothing to wrap, and the tag
-//! comes back as it is; a thought that does not close back to where it opened has no prefix yet,
-//! and the table gives `None` rather than a tag the model could write inside its thought. Kimi
+//! write none of the table's markers but the thought's own, nor the call syntax's inner tags,
+//! with nothing owed at its end, so the forced call follows the reasoning instead of replacing
+//! it, as the gateway's `wrap_in_reasoning_prefix` does. The text is the thought and its close
+//! where the engine applies the grammar from the first token, and a newline or nothing where
+//! the engine runs a reasoning parser and applies the grammar only after the model's own close;
+//! a prefix the thought's close ended would be owed a second time there, and the model would
+//! fill the gap with a fabricated observation and answer. A table without a thought has nothing
+//! to wrap, and the tag comes back as it is; a thought that does not close back to where it
+//! opened has no prefix yet, and the table gives `None` rather than a tag the model could write
+//! inside its thought. Kimi
 //! K3's tag takes no prefix: the block of calls can be entered from the turn itself, from the
 //! thought or from the answer, and the tag has one way in per state: from a region with a close
 //! of its own, that close and then the row into the block from where the close returns; from any
@@ -251,9 +256,11 @@ impl Format {
     /// table's call syntax has no derivation yet, the table has no calls, or no tool has a name.
     /// `at_least_one` asks for at least one call (`tool_choice` `required`, a named function, or
     /// an allowed-tools list in `required` mode). With `reasoning_open`, the prompt left the model
-    /// inside its thought, and the tag follows a reasoning prefix the thought's close ends; a
-    /// table without a thought has no prefix, and the tag comes back as it is; a table whose
-    /// thought does not close back to where it opened has no prefix yet, and gives `None`. Kimi
+    /// inside its thought, and the tag follows a prefix of free text without the call markers,
+    /// nothing owed at its end (the thought and its close, or nothing, by where the engine starts
+    /// the grammar); a table without a thought has no prefix, and the tag comes back as it is; a
+    /// table whose thought does not close back to where it opened has no prefix yet, and gives
+    /// `None`. Kimi
     /// K3's tag has a way in per state its block is entered from, the state's close first when it
     /// has one, so it is the same either way.
     pub fn grammar(
@@ -296,10 +303,15 @@ impl Format {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return Some(calls);
         };
-        let think_close = self
-            .region(reasoning, |state| self.is_call_state(state))?
-            .close;
-        let mut excludes: Vec<String> = self.terminal_texts().map(str::to_string).collect();
+        // The thought's own markers stay writable: the model closes its thought inside the
+        // prefix where the engine applies the grammar from the first token, and an engine that
+        // runs a reasoning parser has consumed them before the grammar starts.
+        let thought = self.region(reasoning, |state| self.is_call_state(state))?;
+        let mut excludes: Vec<String> = self
+            .terminal_texts()
+            .filter(|text| *text != thought.open && *text != thought.close)
+            .map(str::to_string)
+            .collect();
         let inner: &[&str] = match self.call_syntax() {
             Some(CallSyntax::Keyed(tags)) => &[
                 tags.key_open,
@@ -312,8 +324,10 @@ impl Format {
             _ => &[],
         };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
-        let prefix = Grammar::Tag(Tag::new("", Grammar::AnyText { excludes }, think_close));
-        Some(Grammar::Sequence(vec![prefix, calls]))
+        Some(Grammar::Sequence(vec![
+            Grammar::AnyText { excludes },
+            calls,
+        ]))
     }
 
     /// The JSON family: each call is the call markers around one JSON object whose `name` is the
@@ -586,6 +600,7 @@ mod tests {
                 description: None,
                 parameters,
                 strict,
+                extra: Default::default(),
             },
         }
     }
@@ -638,8 +653,10 @@ mod tests {
 
     #[test]
     fn the_reasoning_prefix_wraps_the_tag_as_the_gateway_does() {
-        // `wrap_in_reasoning_prefix(tag, Glm4MoeParser::reasoning_prefix())`: a sequence of free
-        // text that writes none of the markers, closed by `</think>`, then the tag.
+        // `wrap_in_reasoning_prefix(tag, Glm4MoeParser::reasoning_prefix(..))`: a sequence of free
+        // text that writes none of the call markers, with nothing owed at its end (an engine that
+        // runs a reasoning parser applies the grammar only after the model's own `</think>`, so a
+        // prefix closed by `</think>` would be owed a second time), then the tag.
         let grammar = formats::glm()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar");
@@ -651,13 +668,11 @@ mod tests {
         assert_eq!(
             elements[0],
             value!({
-                "type": "tag",
-                "begin": "",
-                "content": {"type": "any_text", "excludes": [
-                    "<think>", "</think>", "<tool_call>", "</tool_call>",
+                "type": "any_text",
+                "excludes": [
+                    "<tool_call>", "</tool_call>",
                     "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
-                ]},
-                "end": "</think>",
+                ],
             })
         );
         assert_eq!(elements[1]["type"], "triggered_tags");
@@ -687,16 +702,16 @@ mod tests {
 
     #[test]
     fn the_prefix_excludes_each_tables_own_terminals_and_inner_tags() {
-        // No old builder wraps these two, so the derived shape is pinned here: the prefix's
-        // excludes are the table's terminals in order and the syntax's inner tags, its end the
-        // thought's close back to content, and the second element the tag as derived without it.
+        // No old builder wraps these two, so the derived shape is pinned here: the prefix is free
+        // text whose excludes are the table's terminals in order, the thought's own two left out
+        // so the model may close it where the engine runs the grammar from the first token, and
+        // the syntax's inner tags; nothing is owed at its end; the second element is the tag as
+        // derived without it.
         let tools = weather_tools();
         for (format, excludes) in [
             (
                 formats::deepseek_v4_1(),
                 value!([
-                    "<think>",
-                    "</think>",
                     "<｜DSML｜ calls>",
                     "</｜DSML｜ calls>",
                     "<｜DSML｜ invoke name=\"",
@@ -707,7 +722,7 @@ mod tests {
             ),
             (
                 formats::qwen3(CallSyntax::Json),
-                value!(["<think>", "</think>", "<tool_call>", "</tool_call>"]),
+                value!(["<tool_call>", "</tool_call>"]),
             ),
         ] {
             let wrapped = format
@@ -721,12 +736,7 @@ mod tests {
             assert_eq!(wrapped["type"], "sequence", "{}", format.name());
             assert_eq!(
                 wrapped["elements"][0],
-                value!({
-                    "type": "tag",
-                    "begin": "",
-                    "content": {"type": "any_text", "excludes": excludes},
-                    "end": "</think>",
-                }),
+                value!({"type": "any_text", "excludes": excludes}),
                 "{}",
                 format.name()
             );

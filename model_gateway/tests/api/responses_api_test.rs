@@ -1146,26 +1146,9 @@ fn test_usage_conversion() {
     assert_eq!(response_usage.output_tokens, 25);
     assert_eq!(response_usage.total_tokens, 40);
 
-    // Check details are converted correctly
-    assert!(response_usage.input_tokens_details.is_some());
-    assert_eq!(
-        response_usage
-            .input_tokens_details
-            .as_ref()
-            .unwrap()
-            .cached_tokens,
-        3
-    );
-
-    assert!(response_usage.output_tokens_details.is_some());
-    assert_eq!(
-        response_usage
-            .output_tokens_details
-            .as_ref()
-            .unwrap()
-            .reasoning_tokens,
-        8
-    );
+    // Check details are converted correctly (both blocks are always present)
+    assert_eq!(response_usage.input_tokens_details.cached_tokens, 3);
+    assert_eq!(response_usage.output_tokens_details.reasoning_tokens, 8);
 
     let back_to_usage = response_usage.to_usage_info();
     assert_eq!(back_to_usage.prompt_tokens, 15);

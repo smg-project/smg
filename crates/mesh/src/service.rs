@@ -30,7 +30,7 @@ use gossip::{
 use crate::{
     gossip_controller::GossipController,
     gossip_service::GossipService,
-    mtls::{MTLSConfig, MTLSManager},
+    mtls::{tls_server_name, MTLSConfig, MTLSManager},
     partition::PartitionDetector,
 };
 
@@ -473,11 +473,10 @@ pub async fn try_ping(
             ))
         })?;
 
-        let tls_domain = endpoint
-            .uri()
-            .host()
-            .map(str::to_owned)
-            .unwrap_or_else(|| peer_name.clone());
+        let tls_domain = endpoint.uri().host().map_or_else(
+            || peer_name.clone(),
+            |host| tls_server_name(host).to_owned(),
+        );
         let ca_certificate = mtls_manager.load_ca_certificate().await.map_err(|e| {
             tonic::Status::unavailable(format!(
                 "Failed to load mTLS CA certificate for {peer_name}: {e}"
@@ -555,15 +554,24 @@ macro_rules! mesh_run {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        sync::Once,
+    };
 
+    use rustls::crypto::ring;
+    use tokio::net::TcpListener;
+    use tonic::transport::{server::TcpIncoming, Identity, Server, ServerTlsConfig};
     use tracing as log;
     use tracing_subscriber::{
         filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
     };
 
-    use super::*;
-    use crate::tests::test_utils::{bind_node, wait_for};
+    use super::{gossip::gossip_server::GossipServer, *};
+    use crate::tests::{
+        mtls_certs::MtlsTestCerts,
+        test_utils::{bind_node, wait_for},
+    };
 
     static INIT: Once = Once::new();
     fn init() {
@@ -697,5 +705,106 @@ mod tests {
         }
 
         log::info!("All nodes converged to expected state");
+    }
+
+    /// A gossip peer answering over TLS with the test node certificate (IP
+    /// SANs for both loopback addresses), bound to an ephemeral port of
+    /// `loopback`.
+    async fn gossip_peer_over_tls(loopback: IpAddr, certs: &MtlsTestCerts) -> SocketAddr {
+        let listener = TcpListener::bind((loopback, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service =
+            GossipService::new(Arc::new(RwLock::new(BTreeMap::new())), addr, addr, "peer");
+        let identity = Identity::from_pem(
+            std::fs::read(&certs.node_cert_path).unwrap(),
+            std::fs::read(&certs.node_key_path).unwrap(),
+        );
+        let server = Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(identity))
+            .unwrap()
+            .add_service(
+                GossipServer::new(service)
+                    .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(MAX_MESSAGE_SIZE)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                    .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+            )
+            .serve_with_incoming(TcpIncoming::from(listener));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test peer runs in the background for the duration of the assertion"
+        )]
+        tokio::spawn(server);
+        addr
+    }
+
+    /// The process-level crypto provider rustls needs before any TLS
+    /// configuration is built: the gateway installs it at start-up, the test
+    /// binary does it itself, and before the peer's server is built, since a
+    /// build with both rustls backends enabled (the workspace's test build)
+    /// cannot pick one on its own.
+    fn install_crypto_provider() {
+        let _ = ring::default_provider().install_default();
+    }
+
+    /// `try_ping` with mTLS on, the way the gossip loop dials a peer.
+    async fn mtls_ping(
+        peer: SocketAddr,
+        certs: &MtlsTestCerts,
+    ) -> Result<NodeUpdate, tonic::Status> {
+        install_crypto_provider();
+        let mtls = MTLSManager::new(MTLSConfig {
+            ca_cert_path: certs.ca_cert_path.clone(),
+            server_cert_path: certs.node_cert_path.clone(),
+            server_key_path: certs.node_key_path.clone(),
+            require_client_cert: false,
+            rotation_check_interval: Duration::from_secs(300),
+        });
+        try_ping(
+            &NodeState {
+                name: "peer".to_string(),
+                address: peer.to_string(),
+                status: NodeStatus::Alive as i32,
+                version: 1,
+                metadata: HashMap::new(),
+            },
+            Some(gossip_message::Payload::Ping(Ping {
+                state_sync: Some(StateSync { nodes: vec![] }),
+            })),
+            Some(Arc::new(mtls)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn mtls_ping_reaches_an_ipv6_peer_by_its_ip_san() {
+        init();
+        install_crypto_provider();
+        // Nothing to assert on a host without an IPv6 loopback.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        let certs = MtlsTestCerts::generate();
+        let peer = gossip_peer_over_tls(Ipv6Addr::LOCALHOST.into(), &certs).await;
+
+        let update = mtls_ping(peer, &certs)
+            .await
+            .unwrap_or_else(|e| panic!("ping over TLS to {peer} failed: {e}"));
+
+        assert_eq!(update.address, peer.to_string());
+    }
+
+    #[tokio::test]
+    async fn mtls_ping_reaches_an_ipv4_peer_by_its_ip_san() {
+        init();
+        install_crypto_provider();
+        let certs = MtlsTestCerts::generate();
+        let peer = gossip_peer_over_tls(Ipv4Addr::LOCALHOST.into(), &certs).await;
+
+        let update = mtls_ping(peer, &certs)
+            .await
+            .unwrap_or_else(|e| panic!("ping over TLS to {peer} failed: {e}"));
+
+        assert_eq!(update.address, peer.to_string());
     }
 }

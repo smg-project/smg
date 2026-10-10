@@ -75,21 +75,19 @@ impl ToolLoopState {
         let Some(usage) = usage else {
             return;
         };
-        let total = self.usage.get_or_insert(ResponseUsage {
+        let total = self.usage.get_or_insert_with(|| ResponseUsage {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
-            input_tokens_details: None,
-            output_tokens_details: None,
+            input_tokens_details: InputTokensDetails::default(),
+            output_tokens_details: OutputTokensDetails::default(),
         });
         total.input_tokens = total.input_tokens.saturating_add(usage.prompt_tokens);
         total.output_tokens = total.output_tokens.saturating_add(usage.completion_tokens);
         total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
         if let Some(details) = &usage.prompt_tokens_details {
-            let accumulated = total
+            total.input_tokens_details.cached_tokens = total
                 .input_tokens_details
-                .get_or_insert(InputTokensDetails { cached_tokens: 0 });
-            accumulated.cached_tokens = accumulated
                 .cached_tokens
                 .saturating_add(details.cached_tokens);
         }
@@ -98,12 +96,10 @@ impl ToolLoopState {
             .as_ref()
             .and_then(|details| details.reasoning_tokens)
         {
-            let accumulated = total
+            total.output_tokens_details.reasoning_tokens = total
                 .output_tokens_details
-                .get_or_insert(OutputTokensDetails {
-                    reasoning_tokens: 0,
-                });
-            accumulated.reasoning_tokens = accumulated.reasoning_tokens.saturating_add(tokens);
+                .reasoning_tokens
+                .saturating_add(tokens);
         }
     }
 

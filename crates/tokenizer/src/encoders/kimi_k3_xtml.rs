@@ -35,6 +35,8 @@
 //! prompt expansion replaces it — see `llm_multimodal::registry::kimi_k3`. A
 //! literal anchor inside string content is kept as a control segment too.
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
 
@@ -147,6 +149,38 @@ pub(crate) fn render_kimi_k3_xtml_prompt(
     Ok(out)
 }
 
+/// The thinking mode the renderer renders, resolved as the engine's own
+/// server resolves it before calling the checkpoint's `apply_chat_template`
+/// (vLLM's K3 renderer rewrites the kwargs first): an explicit `thinking`
+/// kwarg wins, then vLLM's `enable_thinking` alias, then a `reasoning_effort`
+/// of `"none"` in the kwargs, then the request-level toggle the gateway
+/// derived; absent all of them, the encoder's `build_chat_segments(thinking=True)`
+/// default. Any other effort word leaves the mode alone (it only picks the
+/// `thinking-effort` directive). The gateway arms its reasoning parser from
+/// this answer too (`Tokenizer::native_thinking_mode`), so the prompt and the
+/// parser never disagree.
+pub fn resolve_thinking(
+    template_kwargs: Option<&HashMap<String, Value>>,
+    thinking: Option<bool>,
+) -> bool {
+    let kwarg_bool = |key: &str| {
+        template_kwargs
+            .and_then(|k| k.get(key))
+            .and_then(Value::as_bool)
+    };
+    kwarg_bool("thinking")
+        .or_else(|| kwarg_bool("enable_thinking"))
+        .or_else(|| {
+            template_kwargs
+                .and_then(|k| k.get("reasoning_effort"))
+                .and_then(Value::as_str)
+                .filter(|effort| *effort == "none")
+                .map(|_| false)
+        })
+        .or(thinking)
+        .unwrap_or(true)
+}
+
 fn render_xtml(
     messages: &[Value],
     params: &ChatTemplateParams,
@@ -164,30 +198,7 @@ fn render_xtml(
         .filter(|t| !t.is_empty())
         .map(|t| deep_sort(&Value::Array(t.to_vec())));
 
-    // Thinking mode, resolved as the engine's own server resolves it before
-    // calling the checkpoint's `apply_chat_template` (vLLM's K3 renderer
-    // rewrites the kwargs first): an explicit `thinking` kwarg wins, then
-    // vLLM's `enable_thinking` alias, then a `reasoning_effort` of `"none"` in
-    // the kwargs, then the request-level toggle the gateway derived; absent
-    // all of them, the encoder's `build_chat_segments(thinking=True)` default.
-    let kwarg_bool = |key: &str| {
-        params
-            .template_kwargs
-            .and_then(|k| k.get(key))
-            .and_then(Value::as_bool)
-    };
-    let thinking = kwarg_bool("thinking")
-        .or_else(|| kwarg_bool("enable_thinking"))
-        .or_else(|| {
-            params
-                .template_kwargs
-                .and_then(|k| k.get("reasoning_effort"))
-                .and_then(Value::as_str)
-                .filter(|effort| *effort == "none")
-                .map(|_| false)
-        })
-        .or(params.thinking)
-        .unwrap_or(true);
+    let thinking = resolve_thinking(params.template_kwargs, params.thinking);
 
     let mut out: Vec<PromptSegment> = Vec::new();
 
@@ -536,7 +547,7 @@ fn push_thinking_effort(out: &mut Vec<PromptSegment>, effort: &str) {
 fn push_response_format(
     out: &mut Vec<PromptSegment>,
     response_format: &Value,
-    template_kwargs: Option<&std::collections::HashMap<String, Value>>,
+    template_kwargs: Option<&HashMap<String, Value>>,
 ) -> Result<()> {
     let response_type = response_format
         .get("type")
@@ -1017,6 +1028,45 @@ mod tests {
             template_kwargs: Some(template_kwargs),
             ..Default::default()
         }
+    }
+
+    /// The rule the prompt is rendered with, which the parser is armed from:
+    /// `none` is the only effort word that switches thinking off, so a typed
+    /// `disabled` beats an on word and a kwargs `minimal` keeps the default.
+    #[test]
+    fn thinking_is_resolved_by_the_renderer_s_own_rule() {
+        let kw = |pairs: &[(&str, Value)]| -> HashMap<String, Value> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect()
+        };
+        assert!(resolve_thinking(None, None));
+        assert!(!resolve_thinking(None, Some(false)));
+        let high = kw(&[("reasoning_effort", json!("high"))]);
+        assert!(!resolve_thinking(Some(&high), Some(false)));
+        assert!(resolve_thinking(Some(&high), None));
+        let minimal = kw(&[("reasoning_effort", json!("minimal"))]);
+        assert!(resolve_thinking(Some(&minimal), None));
+        let none = kw(&[("reasoning_effort", json!("none"))]);
+        assert!(!resolve_thinking(Some(&none), Some(true)));
+        let off = kw(&[
+            ("thinking", json!(false)),
+            ("reasoning_effort", json!("high")),
+        ]);
+        assert!(!resolve_thinking(Some(&off), Some(true)));
+        let alias = kw(&[
+            ("enable_thinking", json!(true)),
+            ("reasoning_effort", json!("none")),
+        ]);
+        assert!(resolve_thinking(Some(&alias), Some(false)));
+
+        // The rendered tail follows the same answer.
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let rendered = apply_kimi_k3_xtml(&messages, &params_kw(Some(false), &high, true)).unwrap();
+        assert!(rendered.ends_with("<|open|>response<|sep|>"), "{rendered}");
+        let rendered = apply_kimi_k3_xtml(&messages, &params_kw(None, &minimal, true)).unwrap();
+        assert!(rendered.ends_with("<|open|>think<|sep|>"), "{rendered}");
     }
 
     #[test]

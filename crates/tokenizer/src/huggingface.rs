@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use anyhow::{Error, Result};
 use serde::Deserialize;
 use tokenizers::{
-    models::bpe::BPE,
+    models::{bpe::BPE, ModelWrapper},
     normalizers::unicode::NFC,
     pre_tokenizers::{
         byte_level::ByteLevel,
@@ -291,6 +291,7 @@ impl HuggingFaceTokenizer {
             .map(detect_renderer_from_config)
             .unwrap_or(Renderer::Jinja);
 
+        Self::bound_bpe_cache(&mut tokenizer);
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             native: NativeEncoder::from_tokenizer(&tokenizer),
@@ -352,8 +353,35 @@ impl HuggingFaceTokenizer {
             .ok()
     }
 
+    /// Words the `tokenizers` BPE model keeps in its per-thread cache. The
+    /// crate's default is 10,000 for every thread that ever encodes, and the
+    /// gateway encodes on each of its runtime and blocking threads, so the
+    /// caches of one model grew with the thread count (a few MB per thread)
+    /// instead of settling. The cache fills first-come and never evicts, so a
+    /// thread keeps the first thousand distinct words it sees, which in
+    /// practice catches the frequent ones; the native encoder's piece cache,
+    /// bounded in total, sits in front of them.
+    const BPE_WORDS_CACHED_PER_THREAD: usize = 1024;
+
+    /// Bounds the per-thread word cache of a BPE model
+    /// ([`Self::BPE_WORDS_CACHED_PER_THREAD`]); other model kinds have none.
+    fn bound_bpe_cache(tokenizer: &mut HfTokenizer) {
+        let bounded = match tokenizer.get_model() {
+            ModelWrapper::BPE(bpe) => {
+                let mut bpe = bpe.clone();
+                bpe.resize_cache(Self::BPE_WORDS_CACHED_PER_THREAD);
+                Some(bpe)
+            }
+            _ => None,
+        };
+        if let Some(bpe) = bounded {
+            tokenizer.with_model(ModelWrapper::BPE(bpe));
+        }
+    }
+
     /// Create from an existing HuggingFace tokenizer
-    pub fn from_tokenizer(tokenizer: HfTokenizer) -> Self {
+    pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
+        Self::bound_bpe_cache(&mut tokenizer);
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab

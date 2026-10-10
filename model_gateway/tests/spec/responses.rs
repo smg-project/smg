@@ -816,6 +816,7 @@ fn test_validate_text_format_json_schema_empty_name() {
                 description: None,
                 strict: None,
             }),
+            verbosity: None,
         }),
         ..Default::default()
     };
@@ -839,6 +840,7 @@ fn test_validate_text_format_json_schema_schema_not_object() {
                     description: None,
                     strict: None,
                 }),
+                verbosity: None,
             }),
             ..Default::default()
         }
@@ -874,6 +876,7 @@ fn test_validate_tool_choice_requires_tools() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
@@ -1173,6 +1176,7 @@ fn test_normalize_tool_choice_auto() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: None,
@@ -1234,6 +1238,7 @@ fn test_normalize_tool_choice_no_override() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
@@ -1264,6 +1269,7 @@ fn test_normalize_parallel_tool_calls() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         parallel_tool_calls: None,
@@ -1316,6 +1322,7 @@ fn test_normalize_parallel_tool_calls_no_override() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         parallel_tool_calls: Some(false),

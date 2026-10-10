@@ -69,6 +69,19 @@ const STATS_INTERVAL_SECS: u64 = 30;
 /// Each gRPC worker gets a dedicated tokio task that subscribes to the backend's
 /// KV cache event stream and feeds events into a shared [`KvIndex`]
 /// (one per `model_id`). Workers serving the same model share the same indexer.
+/// A model's KV block size as the monitor knows it: provisional until a
+/// stored event names it. A provisional size (a `WorkerSpec` seed or
+/// `set_block_size`) is replaced by the first stored block; a size the
+/// events named is only ever raised. Hybrid engines publish, beside their
+/// full blocks, partial entries at their hash granularity (a fraction of
+/// the block), and a request hashed at that size would never match a full
+/// block, so the size of record is the largest block the events carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KvBlockSize {
+    pub(crate) tokens: usize,
+    pub(crate) from_events: bool,
+}
+
 pub struct KvEventMonitor {
     /// Per-model KV indexes: model_id → shared indexer.
     /// Arc-wrapped so the prune task can share the map WITHOUT holding (even
@@ -79,7 +92,7 @@ pub struct KvEventMonitor {
     /// Per-model block sizes learned from KV events or set via WorkerSpec.
     /// Used by CacheAwarePolicy to chunk request tokens at query time.
     /// Arc-wrapped so subscription tasks can update it from events.
-    block_sizes: Arc<DashMap<String, usize>>,
+    block_sizes: Arc<DashMap<String, KvBlockSize>>,
     /// Per-worker subscription slots: worker_url → the live subscription, or
     /// the reservation a removal leaves until the old task has cleaned up.
     /// Mutex matches LoadMonitor pattern for atomic abort + remove; Arc so a
@@ -351,7 +364,12 @@ impl KvEventMonitor {
         // overwrite this with the backend's actual page size once received.
         if let Some(bs) = worker.metadata().spec.kv_block_size {
             if bs > 0 {
-                self.block_sizes.entry(model_id.clone()).or_insert(bs);
+                self.block_sizes
+                    .entry(model_id.clone())
+                    .or_insert(KvBlockSize {
+                        tokens: bs,
+                        from_events: false,
+                    });
             } else {
                 warn!(worker_url = %url, "Worker reports kv_block_size=0, ignoring");
             }
@@ -451,7 +469,7 @@ impl KvEventMonitor {
     async fn complete_removal(
         slots: &Mutex<HashMap<String, Slot>>,
         indexers: &DashMap<String, Arc<KvIndex>>,
-        block_sizes: &DashMap<String, usize>,
+        block_sizes: &DashMap<String, KvBlockSize>,
         kind: KvIndexKind,
         worker_url: &str,
         id: u64,
@@ -594,7 +612,7 @@ impl KvEventMonitor {
 
     /// Get the block size for a model (learned from events or set via `set_block_size`).
     pub fn block_size(&self, model_id: &str) -> Option<usize> {
-        self.block_sizes.get(model_id).map(|v| *v)
+        self.block_sizes.get(model_id).map(|v| v.tokens)
     }
 
     /// Set the block size for a model (e.g. from WorkerSpec during registration).
@@ -602,7 +620,10 @@ impl KvEventMonitor {
     pub fn set_block_size(&self, model_id: &str, block_size: usize) {
         self.block_sizes
             .entry(model_id.to_string())
-            .or_insert(block_size);
+            .or_insert(KvBlockSize {
+                tokens: block_size,
+                from_events: false,
+            });
     }
 
     /// Normalize model_id to match routing's `normalize_model_key`.

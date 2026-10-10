@@ -613,6 +613,14 @@ pub struct Function {
     pub parameters: Value, // JSON Schema
     /// Whether to enable strict schema adherence (OpenAI structured outputs)
     pub strict: Option<bool>,
+    /// The fields of the function object beyond the ones above, as the request
+    /// carried them and in their order: a vendor's extension, such as the
+    /// `response` schema some tool corpora describe a tool's result with. The
+    /// chat template renders the tool object as given, so they must reach it
+    /// as they reach the engine's own template, and a forwarded request keeps
+    /// them.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1122,6 +1130,31 @@ mod tests {
         assert_eq!(exact["top_p"], json!(0.95));
         assert_eq!(exact["temperature"], json!(0.7));
         assert_eq!(exact["model"], json!("glm-5.3-flash"));
+    }
+
+    /// A tool definition may carry fields the OpenAI schema does not name
+    /// (the `response` schema of a BFCL tool); the typed view keeps them, in
+    /// their order, so the chat template and a forwarded request see the tool
+    /// as the client wrote it.
+    #[test]
+    fn a_function_keeps_the_fields_beyond_the_schema_in_their_order() {
+        let written = json!({
+            "type": "function",
+            "function": {
+                "name": "authenticate",
+                "description": "Authenticate a user.",
+                "parameters": {"type": "object", "properties": {"user": {"type": "string"}}},
+                "response": {"type": "dict", "properties": {"ok": {"type": "boolean"}}},
+                "x_vendor": ["kept", 1]
+            }
+        });
+        let tool: Tool = serde_json::from_value(written.clone()).unwrap();
+        assert_eq!(tool.function.name, "authenticate");
+        assert_eq!(tool.function.extra.len(), 2);
+        assert_eq!(
+            serde_json::to_string(&tool).unwrap(),
+            serde_json::to_string(&written).unwrap()
+        );
     }
 
     #[derive(Deserialize)]

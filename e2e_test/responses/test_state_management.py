@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 
+import httpx
 import openai
 import pytest
 import smg_client
@@ -433,3 +434,45 @@ class TestStateManagementGptOss:
                 previous_response_id=resp1.id,
                 conversation=conversation_id,
             )
+
+
+# =============================================================================
+# Response object shape (always-present fields)
+# =============================================================================
+
+
+@pytest.mark.engine("sglang")
+@pytest.mark.gpu(1)
+@pytest.mark.e2e
+@pytest.mark.model("Qwen/Qwen2.5-14B-Instruct")
+@pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestResponseObjectShapeLocal:
+    """The Response object carries every field the public API always returns."""
+
+    def test_response_object_carries_always_present_fields(self, setup_backend):
+        """Spec-required fields are present (``null`` when unset) and the
+        request-parameter echoes carry their defaults; read on the raw JSON so a
+        tolerant SDK model cannot hide a missing key."""
+        _, model_path, _, gw = setup_backend
+        resp = httpx.post(
+            f"{gw.base_url}/v1/responses",
+            json={"model": model_path, "input": "Say hi", "max_output_tokens": 16},
+            headers={"Authorization": "Bearer not-used"},
+            timeout=120.0,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        for key in ("error", "instructions", "previous_response_id", "user", "incomplete_details"):
+            assert key in body, f"{key} missing from the Response object: {sorted(body)}"
+        assert body["error"] is None
+        assert body["instructions"] is None
+        assert body["top_p"] == 1.0
+        assert body["truncation"] == "disabled"
+        assert body["background"] is False
+        assert body["reasoning"] == {"effort": None, "summary": None}
+        assert body["text"]["verbosity"] == "medium"
+        assert isinstance(body["completed_at"], int)
+        assert body["usage"]["output_tokens_details"]["reasoning_tokens"] >= 0
+        assert body["usage"]["input_tokens_details"]["cached_tokens"] >= 0

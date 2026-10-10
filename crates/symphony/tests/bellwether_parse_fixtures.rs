@@ -78,6 +78,12 @@ const COMMON_SET: &str = "common";
 /// its size (a 252 KB swebench case took 80 minutes and 13 GB under every split).
 const EVERY_SPLIT_UP_TO: usize = 256;
 const SLUG: &str = "qwen3-8b";
+/// Slugs the replay over [`MODELS`] leaves out for now, each with the reason
+/// and where it is tracked: a family whose parser is known to differ from the
+/// reference on whole sets, which no per-case list could carry. The slug stays
+/// in the table so its family and prompt tail are kept; the issue brings it
+/// back.
+const SKIPPED: &[(&str, &str)] = &[];
 /// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
 /// the table that reads it and how its template ends the generation prompt. The fixtures carry
 /// the request and the output, not the rendered prompt, so the prompt's tail is stated here until
@@ -976,6 +982,10 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
             eprintln!("skipping {slug}: bellwether has not recorded its parse sets yet");
             continue;
         }
+        if let Some((_, reason)) = SKIPPED.iter().find(|(skipped, _)| *skipped == slug) {
+            eprintln!("skipping {slug}: {reason}");
+            continue;
+        }
         let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
         println!("{slug} ({family:?}, {prompt:?}):");
         failures.extend(parity(
@@ -1804,4 +1814,14 @@ fn the_common_set_is_replayed_whole_whatever_the_step() {
     let parse = std::path::Path::new("fixtures/qwen3-8b/parse");
     assert_eq!(step_for(&parse.join("common.jsonl"), 10), 1);
     assert_eq!(step_for(&parse.join("gsm8k-test-content.jsonl"), 10), 10);
+}
+
+#[test]
+fn every_skipped_slug_is_in_the_table() {
+    for (slug, _) in SKIPPED {
+        assert!(
+            MODELS.iter().any(|(listed, _, _)| listed == slug),
+            "{slug} is skipped but not in MODELS"
+        );
+    }
 }

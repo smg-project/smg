@@ -804,6 +804,7 @@ mod tests {
                 description: None,
                 parameters: serde_json::json!({"type": "object", "properties": props}),
                 strict: None,
+                extra: Default::default(),
             },
         }]
     }
@@ -913,6 +914,7 @@ mod tests {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         }]
     }

@@ -430,6 +430,25 @@ impl ZmqEngineClient {
         self.engines().first().map(|engine| &engine.ready_response)
     }
 
+    /// Capture identities from every connected replica, or none if any replica
+    /// has no identity. The first engine alone cannot identify a grouped worker.
+    pub fn cache_trace_epochs(&self) -> Vec<String> {
+        let engines = self.engines();
+        if engines
+            .iter()
+            .any(|engine| engine.ready_response.cache_trace_epochs.is_empty())
+        {
+            return Vec::new();
+        }
+        let mut epochs: Vec<String> = engines
+            .iter()
+            .flat_map(|engine| engine.ready_response.cache_trace_epochs.iter().cloned())
+            .collect();
+        epochs.sort_unstable();
+        epochs.dedup();
+        epochs
+    }
+
     /// The vLLM half of [`Self::generate`] as one stream per choice: the
     /// `n > 1` fan-out submitted to the engine, each sub tagged with its proto
     /// `index`, left unmerged so a caller can end one choice without the
@@ -1110,7 +1129,10 @@ mod tests {
             connect_to_frontend(
                 &handshake,
                 EngineId::from_engine_index(rank),
-                default_ready_response(),
+                EngineCoreReadyResponse {
+                    cache_trace_epochs: vec![format!("capture-{rank}")],
+                    ..default_ready_response()
+                },
             )
         });
         let (client, engines) = tokio::join!(
@@ -1131,6 +1153,13 @@ mod tests {
             .map(|engine| engine.expect("mock engine"))
             .collect();
         (client.expect("adapter connect"), engines)
+    }
+
+    #[tokio::test]
+    async fn cache_trace_epochs_include_all_connected_replicas() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _engines) = connected_ranks(dir.path(), 2).await;
+        assert_eq!(client.cache_trace_epochs(), vec!["capture-0", "capture-1"]);
     }
 
     /// Answer each rank's next utility call with its entry in `answers`,
