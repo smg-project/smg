@@ -781,7 +781,7 @@ mod tests {
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
         let cut = Some((2, Status::unavailable("injected"), Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        let mut stream = generate_stream(rx, true, "r".to_string(), cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
@@ -798,7 +798,7 @@ mod tests {
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
         let cut = Some((1, Status::internal("injected"), Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        let mut stream = generate_stream(rx, true, "r".to_string(), cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         let complete = stream.next().await.expect("complete").expect("ok");
         assert!(matches!(complete.response, Some(GenResp::Complete(_))));
