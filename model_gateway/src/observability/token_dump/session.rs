@@ -24,7 +24,7 @@ use std::{
 };
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
-use metrics::counter;
+use metrics::{counter, gauge};
 use tokio::sync::oneshot;
 use tracing::warn;
 
@@ -129,6 +129,9 @@ impl Stats {
         count.fetch_add(1, Ordering::Relaxed);
         counter!("smg_token_dump_lines_dropped_total", "reason" => reason.as_str()).increment(1);
         if matches!(reason, DropReason::SizeCap) && !self.full.swap(true, Ordering::AcqRel) {
+            // A full session takes no new call, so it no longer counts as
+            // recording.
+            gauge!("smg_token_dump_active").set(0.0);
             warn!(
                 max_bytes = self.max_bytes,
                 "token dump: the dump file reached its size cap; its session records no new call"
@@ -343,6 +346,9 @@ impl Session {
             call,
             started: Instant::now(),
             responses: 0,
+            completes_expected: 1,
+            completes_seen: 0,
+            completed_ms: None,
             ended: false,
         }
     }
@@ -383,6 +389,11 @@ pub struct CallRecorder {
     call: u64,
     started: Instant,
     responses: u64,
+    /// `Complete` messages the request asks for: one per sample.
+    completes_expected: u32,
+    completes_seen: u32,
+    /// When the last expected `Complete` arrived (ms since the call began).
+    completed_ms: Option<u64>,
     ended: bool,
 }
 
@@ -406,14 +417,38 @@ impl CallRecorder {
         }
     }
 
-    /// Record how the call ended; only the first end counts.
+    /// The request asks for `n` samples, so the engine finishes it with `n`
+    /// `Complete` messages.
+    pub fn expect_completes(&mut self, n: u32) {
+        self.completes_expected = n.max(1);
+    }
+
+    /// The engine sent a (non-error) `Complete`. Once every expected one has
+    /// arrived the call is over as far as the engine is concerned: it ends
+    /// `ok`, timed at that moment, even if the gateway drops the stream later
+    /// without reading on.
+    pub fn complete(&mut self) {
+        self.completes_seen += 1;
+        if self.completes_seen >= self.completes_expected && self.completed_ms.is_none() {
+            self.completed_ms = Some(self.elapsed_ms());
+        }
+    }
+
+    /// Record how the call ended; only the first end counts. A call the
+    /// engine completed ends `ok` at its completion time unless it failed.
     pub fn finish(&mut self, status: EndStatus, error: Option<&tonic::Status>) {
         if std::mem::replace(&mut self.ended, true) {
             return;
         }
+        let (status, t_ms) = match (status, self.completed_ms) {
+            (EndStatus::Ok | EndStatus::Cancelled, Some(completed_ms)) => {
+                (EndStatus::Ok, completed_ms)
+            }
+            (status, _) => (status, self.elapsed_ms()),
+        };
         self.session.write(line::end_line(
             self.call,
-            self.elapsed_ms(),
+            t_ms,
             status,
             self.responses,
             error,
@@ -786,6 +821,42 @@ mod tests {
         assert_eq!(totals.lines_dropped.queue_full, 20);
         assert_eq!(stats.queued_bytes.load(Ordering::Acquire), 0);
         assert_eq!(kinds(&sink.lines()), ["session", "session_end"]);
+    }
+
+    #[test]
+    fn a_call_that_got_every_complete_ends_ok_even_when_dropped() {
+        let sink = Shared::default();
+        let session = open(sink.clone(), limits(1 << 20, 1 << 20));
+        let mut short = session.begin_call(&meta(), 0, request);
+        short.expect_completes(2);
+        short.response(0, chunk);
+        short.complete();
+        drop(short);
+        let mut whole = session.begin_call(&meta(), 0, request);
+        whole.expect_completes(2);
+        whole.complete();
+        whole.complete();
+        drop(whole);
+        close(session);
+        let ends: Vec<Value> = sink
+            .lines()
+            .into_iter()
+            .filter(|line| line["kind"] == "end")
+            .collect();
+        assert_eq!(ends[0]["status"], "cancelled", "one Complete of two");
+        assert_eq!(ends[1]["status"], "ok", "every Complete arrived");
+    }
+
+    #[test]
+    fn an_error_after_every_complete_is_still_an_error() {
+        let sink = Shared::default();
+        let session = open(sink.clone(), limits(1 << 20, 1 << 20));
+        let mut call = session.begin_call(&meta(), 0, request);
+        call.complete();
+        call.finish(EndStatus::Error, Some(&tonic::Status::internal("late")));
+        drop(call);
+        close(session);
+        assert_eq!(sink.lines()[2]["status"], "error");
     }
 
     #[test]

@@ -25,10 +25,13 @@
 //!   request line, `part` (`chunk`/`complete`/`empty`), and the `index`,
 //!   `token_ids` and `finish_reason` that message carries, with no
 //!   accumulation across messages.
-//! - `end`: `status` is `ok`, `error`, `cancelled` (the gateway dropped the
-//!   call before it ended) or `start_failed`, with the `error` code and
-//!   message for the failures; `responses` counts the call's response lines,
-//!   so a reader can tell when some were dropped.
+//! - `end`: `status` is `ok` (the engine sent every `Complete` the request
+//!   asked for, one per sample, and `t_ms` is when the last one arrived; or
+//!   the stream ended, or the gateway marked it completed), `error`,
+//!   `cancelled` (the gateway dropped the call before the engine finished it)
+//!   or `start_failed`, with the `error` code and message for the failures;
+//!   `responses` counts the call's response lines, so a reader can tell when
+//!   some were dropped.
 //! - `session_end`: last line: the reason (`stopped`/`expired`/`shutdown`)
 //!   and the session's counters. A file without it was cut short and its
 //!   last line may be partial.
@@ -590,6 +593,44 @@ mod tests {
             StopError::NotRunning.into_response().status(),
             StatusCode::CONFLICT
         );
+    }
+
+    #[test]
+    fn the_active_gauge_drops_when_the_session_fills() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let dir = tempfile::tempdir().unwrap();
+            let dump = Arc::new(TokenDump::new(dir.path().to_path_buf(), 4096));
+            dump.start(StartRequest::default()).unwrap();
+            assert!(handle.render().contains("smg_token_dump_active 1"));
+            let session = dump.session_for("m").unwrap();
+            let meta = CallMeta {
+                model: "m".to_string(),
+                worker: "grpc://w:1".to_string(),
+                runtime: "sglang",
+                transport: Transport::Grpc,
+                leg: Leg::Single,
+                root_request_id: None,
+            };
+            for _ in 0..100 {
+                if session.is_full() {
+                    break;
+                }
+                drop(session.begin_call(&meta, 0, || RequestEvent {
+                    type_name: "t.Request",
+                    request_id: "r",
+                    input_ids: &[1, 2, 3],
+                    msg: vec![0; 64],
+                }));
+            }
+            assert!(session.is_full());
+            assert!(
+                handle.render().contains("smg_token_dump_active 0"),
+                "{}",
+                handle.render()
+            );
+        });
     }
 
     #[tokio::test]

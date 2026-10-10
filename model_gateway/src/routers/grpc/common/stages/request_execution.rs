@@ -279,13 +279,6 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
     }
 }
 
-/// Dispatch one attempt of the retained plan: create the attempt's load
-/// guards, fan out encode jobs on the first EPD dispatch, and store the
-/// execution result on the context for response processing.
-///
-/// `last_attempt` says whether a plan is still retained for a replay, which
-/// is what decides when the media bytes stop counting against the in-flight
-/// budget.
 /// The token dump session one dispatch records into: set when a session runs
 /// for the request's model.
 pub(crate) struct DumpScope {
@@ -327,8 +320,11 @@ impl DumpScope {
             leg,
             root_request_id: self.root_request_id.clone(),
         };
-        self.session
-            .begin_call(&meta, request.dump_min_len(), || request.dump_event())
+        let mut call = self
+            .session
+            .begin_call(&meta, request.dump_min_len(), || request.dump_event());
+        call.expect_completes(request.sampling_n());
+        call
     }
 }
 
@@ -352,6 +348,13 @@ async fn start_generate(
     }
 }
 
+/// Dispatch one attempt of the retained plan: create the attempt's load
+/// guards, fan out encode jobs on the first EPD dispatch, and store the
+/// execution result on the context for response processing.
+///
+/// `last_attempt` says whether a plan is still retained for a replay, which
+/// is what decides when the media bytes stop counting against the in-flight
+/// budget.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,

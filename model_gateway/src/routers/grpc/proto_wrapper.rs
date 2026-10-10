@@ -1999,6 +1999,32 @@ impl ProtoGenerateResponse {
         }
     }
 
+    /// Whether this is a `Complete` (the end of one sample).
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Self::Sglang(resp) => matches!(
+                resp.response,
+                Some(sglang::generate_response::Response::Complete(_))
+            ),
+            Self::Vllm(resp) => matches!(
+                resp.response,
+                Some(vllm::generate_response::Response::Complete(_))
+            ),
+            Self::Trtllm(resp) => matches!(
+                resp.response,
+                Some(trtllm::generate_response::Response::Complete(_))
+            ),
+            Self::Mlx(resp) => matches!(
+                resp.response,
+                Some(mlx::generate_response::Response::Complete(_))
+            ),
+            Self::TokenSpeed(resp) => matches!(
+                resp.response,
+                Some(tokenspeed::generate_response::Response::Complete(_))
+            ),
+        }
+    }
+
     /// A lower bound on this response's token dump line, known without
     /// encoding it.
     pub fn dump_min_len(&self) -> usize {
@@ -2777,6 +2803,9 @@ fn record_and_reject(
 ) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
     if let Some(Ok(response)) = &raw {
         call.response(response.dump_min_len(), || response.dump_event());
+        if response.is_complete() && !response.engine_error() {
+            call.complete();
+        }
     }
     let item = raw.map(reject_engine_error);
     match &item {
@@ -4236,6 +4265,38 @@ mod token_dump_tests {
         assert_eq!(lines[2]["finish_reason"], "error");
         assert_eq!(lines[3]["status"], "error");
         assert_eq!(lines[3]["responses"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_that_got_its_complete_ends_ok() {
+        let (_dir, dump, file) = running_dump();
+        let session = dump.session_for("m").unwrap();
+        let request = tokenspeed_request();
+        let mut call = session.begin_call(&dump_meta(), 0, || request.dump_event());
+        let complete = ProtoGenerateResponse::TokenSpeed(Box::new(tokenspeed::GenerateResponse {
+            response: Some(tokenspeed::generate_response::Response::Complete(
+                tokenspeed::GenerateComplete {
+                    finish_reason: "stop".to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }));
+        assert!(matches!(
+            record_and_reject(&mut call, Some(Ok(complete))),
+            Some(Ok(_))
+        ));
+        // The gateway drops the stream without reading on, as a PD prefill
+        // leg does when its decode fails.
+        drop(call);
+        drop(session);
+        dump.shutdown().await;
+        let (kinds, lines) = dump_kinds_and_status(&file);
+        assert_eq!(
+            kinds,
+            ["session", "request", "response", "end", "session_end"]
+        );
+        assert_eq!(lines[3]["status"], "ok");
     }
 
     #[tokio::test]
