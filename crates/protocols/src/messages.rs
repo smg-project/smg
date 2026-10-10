@@ -215,6 +215,8 @@ impl Tool {
 }
 /// Validate cross-field constraints for Messages API requests.
 fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator::ValidationError> {
+    crate::messages_validation::validate(req)?;
+
     if req.has_mcp_toolset() && req.mcp_server_configs().is_none() {
         let mut e = validator::ValidationError::new("mcp_servers_required");
         e.message = Some("mcp_servers is required when mcp_toolset tools are present".into());
@@ -288,8 +290,10 @@ pub enum SystemContentBlock {
     Text(TextBlock),
 }
 
-/// A single input message in a conversation
+/// A single input message in a conversation: a role and content, nothing
+/// else (the public API refuses any other field).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InputMessage {
     /// The role of the message sender (user or assistant)
     pub role: Role,
@@ -719,6 +723,11 @@ pub struct CustomTool {
 
     /// Cache control for this tool
     pub cache_control: Option<CacheControl>,
+
+    /// The public API's further tool fields (`strict`, `input_examples`, ...),
+    /// forwarded as written; validation refuses any other field.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// JSON Schema for tool input
@@ -2184,6 +2193,7 @@ mod tests {
             },
             defer_loading: None,
             cache_control: None,
+            extra: Map::new(),
         })
     }
 
