@@ -20,11 +20,37 @@ PY_VERSION="${CI_PYTHON_VERSION:-3.12}"
 # Pinned so the job's toolchain does not change under it between runs.
 UV_VERSION="${UV_VERSION:-0.12.5}"
 
-# sudo is absent when this runs as root inside `docker build`; degrade to
-# running the commands directly.
-if command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
+install_uv() {
+    echo "Installing uv $UV_VERSION..."
+    $RETRY 3 5 bash -c "set -o pipefail; curl -LsSf 'https://astral.sh/uv/${UV_VERSION}/install.sh' | sh"
+    export PATH="$HOME/.local/bin:$PATH"
+}
+
+# CPU image builds need uv's driver-profile override even when host Python
+# already matches. Reuse this script's pin instead of the floating installer.
+if [ "${SMG_BUILD_PREPARED_ENV:-0}" = 1 ]; then
+    install_uv
+fi
+
+# Image builds run as root, even when the base image also provides sudo.
+if [ "$(id -u)" != 0 ] && command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
 
 HOST_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "none")"
+
+# vLLM and SGLang runner images have separate, Pod-local environments. Only
+# adopt one when its installation recipe still matches this checkout; stale
+# images fall back to the existing fresh-venv installation path.
+if [ -n "${SMG_CI_BACKEND:-}" ]; then
+    source "${SCRIPT_DIR}/ci_prepared_backend_env.sh"
+    case "$SMG_CI_BACKEND" in vllm|sglang) ;; *) echo "Unknown backend: $SMG_CI_BACKEND" >&2; exit 1 ;; esac
+    PREPARED_VENV="${SMG_PREINSTALLED_ROOT:-/opt/smg-ci}/${SMG_CI_BACKEND}/.venv"
+    SMG_BAKED_VENV=""
+    if smg_prepared_env_matches "$SMG_CI_BACKEND" "$PREPARED_VENV"; then
+        SMG_BAKED_VENV="$PREPARED_VENV"
+    else
+        echo "Prepared $SMG_CI_BACKEND environment unavailable or incompatible; using a fresh environment"
+    fi
+fi
 
 # Prebuilt CI images (docker/ci-tokenspeed.Dockerfile) bake a fully-provisioned
 # venv and advertise it via SMG_BAKED_VENV. Adopt it as ./.venv so every
@@ -77,9 +103,7 @@ else
         # Version-pinned installer URL. This script runs before the others that
         # install uv and they all skip when it is present, so the pin holds for
         # the whole job.
-        echo "Installing uv $UV_VERSION..."
-        $RETRY 3 5 bash -c "set -o pipefail; curl -LsSf 'https://astral.sh/uv/${UV_VERSION}/install.sh' | sh"
-        export PATH="$HOME/.local/bin:$PATH"
+        install_uv
     fi
     $RETRY 3 10 uv python install "$PY_VERSION"
     # --seed: a uv venv ships without pip, and downstream CI steps run
@@ -104,7 +128,11 @@ echo "venv interpreter: $ACTUAL_VERSION (pinned)"
 # Add to GitHub Actions PATH if running in CI
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
-    echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+    CI_CUDA_HOME=/usr/local/cuda
+    if [ -n "$ADOPTED_VENV" ] && [ "${SMG_CI_BACKEND:-}" = sglang ]; then
+        CI_CUDA_HOME=/usr/local/cuda-13.0
+    fi
+    echo "CUDA_HOME=$CI_CUDA_HOME" >> "$GITHUB_ENV"
     # Expose the host CUDA toolkit when there is one. vLLM only enables its
     # FlashInfer paths when `nvcc` is on PATH (or flashinfer-cubin is installed,
     # which no longer ships for current FlashInfer releases); the pip
@@ -114,8 +142,8 @@ if [ -n "${GITHUB_PATH:-}" ]; then
     # kernel selector then picks a FlashInfer kernel it cannot run
     # ("module 'vllm.utils.flashinfer' has no attribute 'mm_mxfp8'"). The k8s
     # GPU images ship the CUDA runtime but no toolkit, so this is a no-op there.
-    if [ -x /usr/local/cuda/bin/nvcc ]; then
-        echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+    if [ -x "$CI_CUDA_HOME/bin/nvcc" ]; then
+        echo "$CI_CUDA_HOME/bin" >> "$GITHUB_PATH"
     fi
 else
     echo "Activate venv with: source .venv/bin/activate"
