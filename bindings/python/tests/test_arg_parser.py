@@ -840,6 +840,32 @@ class TestParseRouterArgs:
         assert router_args.tenant_rate_limit_enabled is True
         assert router_args.tenant_rate_limit_config == "/etc/smg/rate-limit.yaml"
 
+    def test_token_dump_flags(self):
+        """The token dump flags reach RouterArgs, prefixed or not."""
+        for dash, use_prefix in (("--", False), ("--router-", True)):
+            parser = argparse.ArgumentParser()
+            RouterArgs.add_cli_args(parser, use_router_prefix=use_prefix)
+            namespace = parser.parse_args(
+                [
+                    f"{dash}token-dump-dir",
+                    "/tmp/dumps",
+                    f"{dash}token-dump-on-start",
+                    f"{dash}token-dump-max-mb",
+                    "8",
+                ]
+            )
+
+            router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=use_prefix)
+
+            assert router_args.token_dump_dir == "/tmp/dumps"
+            assert router_args.token_dump_on_start is True
+            assert router_args.token_dump_max_mb == 8
+
+        defaults = RouterArgs()
+        assert defaults.token_dump_dir is None
+        assert defaults.token_dump_on_start is False
+        assert defaults.token_dump_max_mb == 1024
+
     def test_prefixed_disable_overload_protection_flag(self):
         """The --router-prefixed disable flag reaches the same field."""
         parser = argparse.ArgumentParser()
@@ -1750,6 +1776,9 @@ class TestRouterArgsFieldOrder:
         "tenant_rate_limit_enabled",
         "tenant_rate_limit_config",
         "jemalloc_prof_dir",
+        "token_dump_dir",
+        "token_dump_on_start",
+        "token_dump_max_mb",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

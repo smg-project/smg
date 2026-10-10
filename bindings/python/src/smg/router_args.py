@@ -333,6 +333,11 @@ class RouterArgs:
     # Heap profiles of the router process (a jemalloc-profiling build); appended
     # last: positional callers bind the fields by position
     jemalloc_prof_dir: str | None = None
+    # Token dump: every engine call of the gRPC router as JSON lines; appended
+    # last: positional callers bind the fields by position
+    token_dump_dir: str | None = None
+    token_dump_on_start: bool = False
+    token_dump_max_mb: int = 1024
 
     @staticmethod
     def add_cli_args(
@@ -1423,6 +1428,31 @@ class RouterArgs:
                 " started with _RJEM_MALLOC_CONF=prof:true,prof_active:true; unset, the route"
                 " answers 404"
             ),
+        )
+        token_dump_group = parser.add_argument_group(
+            "Token dump", "Every engine call of the gRPC router, recorded as JSON lines"
+        )
+        token_dump_group.add_argument(
+            f"--{prefix}token-dump-dir",
+            type=str,
+            default=None,
+            help=(
+                "Directory where token dumps are written: POST /start_token_dump (an admin"
+                " route) and --token-dump-on-start record every engine call there; unset,"
+                " the routes answer 404"
+            ),
+        )
+        token_dump_group.add_argument(
+            f"--{prefix}token-dump-on-start",
+            action="store_true",
+            default=False,
+            help="Record every engine call from startup until shutdown (needs --token-dump-dir)",
+        )
+        token_dump_group.add_argument(
+            f"--{prefix}token-dump-max-mb",
+            type=int,
+            default=RouterArgs.token_dump_max_mb,
+            help="Size cap of one token dump file, in MiB; lines past it are dropped and counted",
         )
 
         # Request handling configuration
