@@ -138,11 +138,14 @@ class TestStructuredOutputRegular(_TestStructuredOutputBase):
 # Harmony model (GPT-OSS)
 # =============================================================================
 
+# Keep a fresh pair here: a plain-chat vLLM DP pair can hang when its first
+# grammar-constrained request arrives after cross-class reuse.
+
 
 @pytest.mark.engine("sglang", "vllm", "trtllm")
 @pytest.mark.gpu(1)
 @pytest.mark.model("openai/gpt-oss-20b")
-@pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
+@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestStructuredOutputGptOss(_TestStructuredOutputBase):
@@ -152,7 +155,7 @@ class TestStructuredOutputGptOss(_TestStructuredOutputBase):
 @pytest.mark.engine("sglang", "vllm", "trtllm")
 @pytest.mark.gpu(4)
 @pytest.mark.model("openai/gpt-oss-120b")
-@pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
+@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestStructuredOutputGptOss120B(_TestStructuredOutputBase):
