@@ -151,7 +151,7 @@ impl ProcessStage for MessageResponseProcessingStage {
             .await?;
 
         // Store the final response
-        ctx.response.final_response = Some(FinalResponse::Messages(response));
+        ctx.response.final_response = Some(FinalResponse::Messages(Box::new(response)));
 
         Ok(None)
     }

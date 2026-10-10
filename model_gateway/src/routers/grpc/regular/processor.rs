@@ -625,29 +625,36 @@ impl ResponseProcessor {
                 )
             })?;
 
+        // Accumulate text with early breaks, noting where each token's text
+        // ends to place the thinking span in tokens (as the chat path does).
         let mut final_text = String::new();
         let mut stopped = false;
+        let mut token_ends = Vec::with_capacity(outputs.len());
         for output in outputs {
             match output {
                 SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
                 SequenceDecoderOutput::StoppedWithText(t) => {
                     final_text.push_str(&t);
                     stopped = true;
-                    break;
                 }
-                SequenceDecoderOutput::Stopped => {
-                    stopped = true;
-                    break;
-                }
+                SequenceDecoderOutput::Stopped => stopped = true,
                 SequenceDecoderOutput::Held => {}
+            }
+            token_ends.push(final_text.len());
+            if stopped {
+                break;
             }
         }
         if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
             final_text.push_str(&t);
+            if let Some(last) = token_ends.last_mut() {
+                *last = final_text.len();
+            }
         }
 
         // Step 1: Parse reasoning content
         let mut reasoning_text: Option<String> = None;
+        let mut thinking_tokens = 0;
         let mut processed_text = final_text;
 
         if reasoning_parser_available {
@@ -676,6 +683,12 @@ impl ResponseProcessor {
                 match parser.detect_and_parse_reasoning(&processed_text) {
                     Ok(result) => {
                         if !result.reasoning_text.is_empty() {
+                            thinking_tokens = reasoning_span_tokens(
+                                &token_ends,
+                                &processed_text,
+                                &result.reasoning_text,
+                                &result.normal_text,
+                            );
                             reasoning_text = Some(result.reasoning_text);
                         }
                         processed_text = result.normal_text;
@@ -805,9 +818,21 @@ impl ResponseProcessor {
             None
         };
 
-        // Step 5: Build usage
-        let usage =
-            messages_usage_from_counts(complete.prompt_tokens(), complete.completion_tokens());
+        // Step 5: Build usage. A turn that ran with thinking reports its
+        // thinking tokens: the engine's own count when it keeps one, else the
+        // tokens the parser placed in the thinking span.
+        let thinking_requested = matches!(
+            &messages_request.thinking,
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                    | messages::ThinkingConfig::Adaptive { .. }
+            )
+        );
+        let usage = messages_usage_from_counts(
+            complete.prompt_tokens(),
+            complete.completion_tokens(),
+            thinking_requested.then_some(complete.reasoning_tokens().max(thinking_tokens)),
+        );
 
         // Step 6: Build Message
         Ok(Message {
@@ -818,7 +843,9 @@ impl ResponseProcessor {
             model: dispatch.model,
             stop_reason,
             stop_sequence,
+            stop_details: None,
             usage,
+            container: None,
         })
     }
 
@@ -1018,16 +1045,18 @@ fn normalize_assistant_content(text: String) -> Option<String> {
 
 /// Usage for a unary Messages response. Cache counters are integer zeros,
 /// never null: the Anthropic wire contract has always-present cache counters
-/// (0 when caching is unused) and clients do arithmetic on them.
-fn messages_usage_from_counts(input_tokens: u32, output_tokens: u32) -> messages::Usage {
-    messages::Usage {
-        input_tokens,
-        output_tokens,
-        cache_creation_input_tokens: Some(0),
-        cache_read_input_tokens: Some(0),
-        cache_creation: None,
-        server_tool_use: None,
-        service_tier: None,
+/// (0 when caching is unused) and clients do arithmetic on them; the
+/// cache-creation breakdown, service tier and inference geography are always
+/// written too, and `output_tokens_details` when the turn ran with thinking.
+fn messages_usage_from_counts(
+    input_tokens: u32,
+    output_tokens: u32,
+    thinking_tokens: Option<u32>,
+) -> messages::Usage {
+    let usage = messages::Usage::from_counts(input_tokens, output_tokens);
+    match thinking_tokens {
+        Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens),
+        None => usage,
     }
 }
 
@@ -1087,11 +1116,40 @@ mod messages_usage_wire_tests {
     /// a serde attr silently skipped would still fail here).
     #[test]
     fn cache_counters_serialize_as_integer_zeros() {
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150)).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, None)).unwrap();
         assert_eq!(v["input_tokens"], 25);
         assert_eq!(v["output_tokens"], 150);
         assert_eq!(v["cache_creation_input_tokens"], 0);
         assert_eq!(v["cache_read_input_tokens"], 0);
+    }
+
+    /// The public API writes these keys on every message; a typed client
+    /// reads a missing `cache_creation` as a decode error, not as zero.
+    #[test]
+    fn always_present_usage_keys_are_written_without_thinking() {
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, None)).unwrap();
+        assert_eq!(
+            v["cache_creation"],
+            serde_json::json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})
+        );
+        assert_eq!(v["service_tier"], "standard");
+        assert_eq!(v["inference_geo"], "not_available");
+        let keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        assert!(
+            !keys.contains(&"output_tokens_details".to_string()),
+            "{keys:?}"
+        );
+        assert!(!keys.contains(&"server_tool_use".to_string()), "{keys:?}");
+    }
+
+    /// A turn that ran with thinking reports its thinking tokens, zero
+    /// included: the key says thinking was on, the count says how much.
+    #[test]
+    fn thinking_tokens_are_written_when_the_turn_ran_with_thinking() {
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, Some(40))).unwrap();
+        assert_eq!(v["output_tokens_details"]["thinking_tokens"], 40);
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, Some(0))).unwrap();
+        assert_eq!(v["output_tokens_details"]["thinking_tokens"], 0);
     }
 }
 

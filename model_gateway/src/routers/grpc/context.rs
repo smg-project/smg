@@ -1406,8 +1406,8 @@ pub(crate) enum FinalResponse {
     Embedding(EmbeddingResponse),
     /// Classification response
     Classify(ClassifyResponse),
-    /// Messages API response
-    Messages(Message),
+    /// Messages API response (boxed: the object outgrew the other variants)
+    Messages(Box<Message>),
     /// Transcription: the decoded transcript plus its wire format.
     Transcription {
         text: String,

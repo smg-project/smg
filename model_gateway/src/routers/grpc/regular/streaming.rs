@@ -2392,8 +2392,22 @@ impl StreamingProcessor {
             model: model.clone(),
             stop_reason: None,
             stop_sequence: None,
+            stop_details: None,
             usage: Self::initial_messages_usage(),
+            container: None,
         };
+        // Thinking tokens of the turn: the engine's count when it keeps one,
+        // else the tokens the parser routed to thinking, chunk by chunk.
+        let thinking_requested = matches!(
+            &original_request.thinking,
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                    | messages::ThinkingConfig::Adaptive { .. }
+            )
+        );
+        let mut parsed_thinking_tokens: u32 = 0;
+        let mut engine_thinking_tokens: u32 = 0;
+        let mut was_in_reasoning = false;
         Self::send_messages_event(
             tx,
             &mut sse_buffer,
@@ -2416,6 +2430,7 @@ impl StreamingProcessor {
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
             // below, so neither can reach the client without being parsed.
+            let mut chunk_tokens: u32 = 0;
             let pending: Option<String> = match response.map(|response| response.into_response()) {
                 Some(ProtoResponseVariant::Chunk(chunk)) => {
                     if first_token_time.is_none() {
@@ -2429,6 +2444,7 @@ impl StreamingProcessor {
                     }
 
                     completion_tokens.record_chunk(&chunk);
+                    chunk_tokens = chunk.token_ids().len() as u32;
 
                     let (chunk_text, should_stop) =
                         Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids())?;
@@ -2463,6 +2479,7 @@ impl StreamingProcessor {
                     prompt_tokens = complete.prompt_tokens();
                     saw_complete = true;
                     completion_tokens.record_complete(&complete);
+                    engine_thinking_tokens = complete.reasoning_tokens();
                     // A local stop-decoder match already pinned "stop"; don't let
                     // the engine's finish reason overwrite it.
                     if !stopped {
@@ -2479,6 +2496,7 @@ impl StreamingProcessor {
             let Some(chunk_text) = pending else {
                 continue;
             };
+            let chunk_text_len = chunk_text.len();
 
             // Apply reasoning parser
             let (normal_text, reasoning_chunk_text, in_reasoning) = if reasoning_parser_available {
@@ -2494,6 +2512,21 @@ impl StreamingProcessor {
             } else {
                 (chunk_text, String::new(), false)
             };
+            // The chunk's tokens are thinking when its text came out as
+            // thinking or it stayed inside the block (text held back); a
+            // chunk carrying both thinking and content splits by text share,
+            // as the chat stream counts its reasoning tokens.
+            if reasoning_parser_available {
+                parsed_thinking_tokens += if !reasoning_chunk_text.is_empty() {
+                    let share = reasoning_chunk_text.len() as f64 / chunk_text_len.max(1) as f64;
+                    (f64::from(chunk_tokens) * share.min(1.0)).round() as u32
+                } else if was_in_reasoning && in_reasoning {
+                    chunk_tokens
+                } else {
+                    0
+                };
+                was_in_reasoning = in_reasoning;
+            }
 
             // Emit thinking content block deltas
             if !reasoning_chunk_text.is_empty() {
@@ -2937,10 +2970,14 @@ impl StreamingProcessor {
                 delta: MessageDelta {
                     stop_reason,
                     stop_sequence,
+                    stop_details: None,
+                    container: None,
                 },
                 usage: Self::final_messages_delta_usage(
                     completion_tokens.total(),
                     saw_complete.then_some(prompt_tokens),
+                    thinking_requested
+                        .then_some(engine_thinking_tokens.max(parsed_thinking_tokens)),
                 ),
             },
         )
@@ -3665,27 +3702,23 @@ impl StreamingProcessor {
 
     /// Skeleton usage for the `message_start` event. Cache counters are
     /// integer zeros, never null: the Anthropic wire contract has
-    /// always-present cache counters and clients do arithmetic on them.
+    /// always-present cache counters and clients do arithmetic on them; the
+    /// cache-creation breakdown, service tier and inference geography are
+    /// written on the skeleton too, as the public API writes them.
     fn initial_messages_usage() -> messages::Usage {
-        messages::Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: Some(0),
-            cache_read_input_tokens: Some(0),
-            cache_creation: None,
-            server_tool_use: None,
-            service_tier: None,
-        }
+        messages::Usage::from_counts(0, 0)
     }
 
     /// Usage for the final `message_delta` event. `authoritative_input` is the
     /// prompt count only when a `Complete` was seen; a clean EOF without one
     /// must serialize `input_tokens: null` rather than claim a zero-token
     /// prompt. Cache counters follow the same integer-not-null contract as
-    /// [`Self::initial_messages_usage`].
+    /// [`Self::initial_messages_usage`]; `thinking_tokens` is reported when
+    /// the turn ran with thinking.
     fn final_messages_delta_usage(
         output_tokens: u32,
         authoritative_input: Option<u32>,
+        thinking_tokens: Option<u32>,
     ) -> MessageDeltaUsage {
         MessageDeltaUsage {
             output_tokens,
@@ -3693,6 +3726,8 @@ impl StreamingProcessor {
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
             server_tool_use: None,
+            output_tokens_details: thinking_tokens
+                .map(|thinking_tokens| messages::OutputTokensDetails { thinking_tokens }),
         }
     }
 }
@@ -3939,22 +3974,56 @@ mod tests {
         assert_eq!(start["cache_creation_input_tokens"], 0);
         assert_eq!(start["cache_read_input_tokens"], 0);
 
-        let delta =
-            serde_json::to_value(StreamingProcessor::final_messages_delta_usage(15, Some(25)))
-                .unwrap();
+        let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
+            15,
+            Some(25),
+            None,
+        ))
+        .unwrap();
         assert_eq!(delta["output_tokens"], 15);
         assert_eq!(delta["input_tokens"], 25);
         assert_eq!(delta["cache_creation_input_tokens"], 0);
         assert_eq!(delta["cache_read_input_tokens"], 0);
     }
 
+    /// The `message_start` skeleton carries every key the public API writes
+    /// on a message's usage; the final delta carries the thinking tokens of a
+    /// turn that ran with thinking and no such key otherwise.
+    #[test]
+    fn messages_usage_always_present_keys_and_thinking_tokens() {
+        let start = serde_json::to_value(StreamingProcessor::initial_messages_usage()).unwrap();
+        assert_eq!(
+            start["cache_creation"],
+            serde_json::json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})
+        );
+        assert_eq!(start["service_tier"], "standard");
+        assert_eq!(start["inference_geo"], "not_available");
+
+        let plain = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
+            15,
+            Some(25),
+            None,
+        ))
+        .unwrap();
+        assert!(plain.get("output_tokens_details").is_none());
+        let thinking = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
+            15,
+            Some(25),
+            Some(9),
+        ))
+        .unwrap();
+        assert_eq!(thinking["output_tokens_details"]["thinking_tokens"], 9);
+    }
+
     /// A clean EOF without a `Complete` message has no authoritative prompt
     /// count: `input_tokens` must serialize as null, not a fabricated zero.
     #[test]
     fn message_delta_input_tokens_null_without_authoritative_usage() {
-        let delta =
-            serde_json::to_value(StreamingProcessor::final_messages_delta_usage(15, None)).unwrap();
-        assert!(delta["input_tokens"].is_null());
+        let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
+            15, None, None,
+        ))
+        .unwrap();
+        assert!(delta.get("input_tokens").is_some_and(Value::is_null));
         assert_eq!(delta["cache_creation_input_tokens"], 0);
     }
 

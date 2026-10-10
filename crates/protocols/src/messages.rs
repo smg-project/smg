@@ -889,8 +889,16 @@ pub struct Message {
     /// Which custom stop sequence was generated (if any)
     pub stop_sequence: Option<String>,
 
+    /// Details of the stop when the stop reason carries any; null otherwise
+    /// (the public API always writes the key).
+    pub stop_details: Option<Value>,
+
     /// Billing and rate-limit usage
     pub usage: Usage,
+
+    /// The code-execution container of the turn when one ran; null otherwise
+    /// (the public API always writes the key).
+    pub container: Option<Value>,
 }
 
 /// Output content block types
@@ -968,7 +976,13 @@ pub enum StopReason {
     Refusal,
 }
 
-/// Billing and rate-limit usage
+/// Billing and rate-limit usage.
+///
+/// The public API writes the cache counters, the cache-creation breakdown,
+/// the service tier and the inference geography on every message (zero,
+/// "standard" and "not_available" when nothing else applies), so those keys
+/// are always serialized; `output_tokens_details` comes with thinking and
+/// `server_tool_use` with a server tool, as the public API sends them.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(rename = "MessagesUsage")]
@@ -980,27 +994,81 @@ pub struct Usage {
     pub output_tokens: u32,
 
     /// The number of input tokens used to create the cache entry
+    #[serialize_always]
     pub cache_creation_input_tokens: Option<u32>,
 
     /// The number of input tokens read from the cache
+    #[serialize_always]
     pub cache_read_input_tokens: Option<u32>,
 
     /// Breakdown of cached tokens by TTL
+    #[serialize_always]
     pub cache_creation: Option<CacheCreation>,
 
     /// Server tool usage information
     pub server_tool_use: Option<ServerToolUsage>,
 
     /// Service tier used for the request
+    #[serialize_always]
     pub service_tier: Option<String>,
+
+    /// Where the request was served (`not_available` when the deployment
+    /// does not say)
+    #[serialize_always]
+    pub inference_geo: Option<String>,
+
+    /// Breakdown of the output tokens, present when thinking ran
+    pub output_tokens_details: Option<OutputTokensDetails>,
 }
 
-/// Cache creation breakdown
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+/// Cache creation breakdown by cache lifetime
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CacheCreation {
-    #[serde(flatten)]
-    pub tokens_by_ttl: HashMap<String, u32>,
+    /// Input tokens written to the five-minute cache
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u32,
+
+    /// Input tokens written to the one-hour cache
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u32,
 }
+
+/// Breakdown of the output tokens
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OutputTokensDetails {
+    /// Output tokens spent on thinking
+    pub thinking_tokens: u32,
+}
+
+impl Usage {
+    /// The usage of a message served from a deployment of this gateway:
+    /// the counts, no cache hits, the standard tier, no geography.
+    pub fn from_counts(input_tokens: u32, output_tokens: u32) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            cache_creation: Some(CacheCreation::default()),
+            server_tool_use: None,
+            service_tier: Some(SERVICE_TIER_STANDARD.to_owned()),
+            inference_geo: Some(INFERENCE_GEO_NOT_AVAILABLE.to_owned()),
+            output_tokens_details: None,
+        }
+    }
+
+    /// Report the thinking tokens of a turn that ran with thinking.
+    pub fn with_thinking_tokens(mut self, thinking_tokens: u32) -> Self {
+        self.output_tokens_details = Some(OutputTokensDetails { thinking_tokens });
+        self
+    }
+}
+
+/// The service tier of a message nobody prioritized or batched.
+pub const SERVICE_TIER_STANDARD: &str = "standard";
+
+/// The inference geography of a deployment that reports none.
+pub const INFERENCE_GEO_NOT_AVAILABLE: &str = "not_available";
 
 /// Server tool usage information
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1043,28 +1111,41 @@ pub enum MessageStreamEvent {
     Error { error: ErrorResponse },
 }
 
-/// Message delta for streaming updates
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+/// Message delta for streaming updates: the public API writes all four
+/// keys on the final `message_delta`, null where nothing applies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessageDelta {
     pub stop_reason: Option<StopReason>,
 
     pub stop_sequence: Option<String>,
+
+    #[serde(default)]
+    pub stop_details: Option<Value>,
+
+    #[serde(default)]
+    pub container: Option<Value>,
 }
 
-/// Usage delta for streaming updates
+/// Usage delta for streaming updates. The token counts are always written
+/// (`input_tokens` null until the engine's count is known), `output_tokens_details`
+/// comes with thinking and `server_tool_use` with a server tool.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessageDeltaUsage {
     pub output_tokens: u32,
 
+    #[serialize_always]
     pub input_tokens: Option<u32>,
 
+    #[serialize_always]
     pub cache_creation_input_tokens: Option<u32>,
 
+    #[serialize_always]
     pub cache_read_input_tokens: Option<u32>,
 
     pub server_tool_use: Option<ServerToolUsage>,
+
+    pub output_tokens_details: Option<OutputTokensDetails>,
 }
 
 /// Content block delta for streaming updates
