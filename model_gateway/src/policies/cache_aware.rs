@@ -1785,6 +1785,18 @@ impl CacheAwarePolicy {
         )
     }
 
+    /// The count-pressure gate's comparison alone, with no trace record: a
+    /// worker holding more than `balance_rel_threshold` times the mean load
+    /// AND `balance_abs_threshold` requests above it is over the gate. The
+    /// affinity path records its decision through
+    /// [`Self::candidate_requires_spill`]; the warm-up slice checks its
+    /// candidates here, so a thin-overlap miss writes no gate entries for
+    /// workers it did not pick.
+    fn over_count_pressure_gate(&self, load: f64, avg_load: f64) -> bool {
+        load > avg_load * f64::from(self.config.balance_rel_threshold)
+            && load > avg_load + self.config.balance_abs_threshold as f64
+    }
+
     /// Per-request count-pressure predicate: over
     /// `balance_rel_threshold` times the healthy-fleet mean load AND
     /// `balance_abs_threshold` requests above it, the request spills to the
@@ -1801,8 +1813,7 @@ impl CacheAwarePolicy {
         avg_load: f64,
     ) -> bool {
         let load = workers[selected].load() as f64;
-        let spill = load > avg_load * f64::from(self.config.balance_rel_threshold)
-            && load > avg_load + self.config.balance_abs_threshold as f64;
+        let spill = self.over_count_pressure_gate(load, avg_load);
         if cache_trace::enabled() {
             cache_trace::gate(serde_json::json!({
                 "worker": workers[selected].url(), "load": load, "average_load": avg_load,
@@ -1869,7 +1880,7 @@ impl CacheAwarePolicy {
             ) {
                 continue;
             }
-            if self.candidate_requires_spill(workers, idx, avg_load) {
+            if self.over_count_pressure_gate(workers[idx].load() as f64, avg_load) {
                 continue;
             }
             match pick {
@@ -3791,9 +3802,12 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
         // `w2` holds one request the router dispatched, and its report counts
-        // it: one waiting request of 500 uncached tokens. The live count and
-        // the expected-wait score disagree (`w2` is the busier worker by
-        // count, the cheaper by wait) while the report hides nothing, so the
+        // it: one waiting request of 500 uncached tokens. Right after the
+        // update `w2` is the busier worker by count (1 vs 0) and the more
+        // expensive by wait (5 s vs 0 s), so the first miss goes to `w1`;
+        // once that miss credits `w1` with 1,024 tokens (10.24 s), `w2` is
+        // the busier by count but the cheaper by wait, which is the state the
+        // second-miss assertion checks. The report hides nothing, so the
         // charge for requests a report does not show stays out of this test.
         workers[1].increment_load();
         update_expected_wait_loads_counting_held(&policy, &workers, &[0, 500]);
