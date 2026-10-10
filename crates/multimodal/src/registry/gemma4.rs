@@ -239,7 +239,7 @@ impl ModelProcessorSpec for Gemma4Spec {
             Modality::Image => self.placeholder_token(metadata),
             Modality::Video => Self::token_for(metadata, "video_token_id"),
             Modality::Audio => Self::token_for(metadata, "audio_token_id"),
-            _ => Err(Self::unsupported(modality)),
+            Modality::ImageEmbeds => Err(Self::unsupported(modality)),
         }
     }
 
@@ -252,7 +252,7 @@ impl ModelProcessorSpec for Gemma4Spec {
             Modality::Image => self.placeholder_token_id(metadata),
             Modality::Video => Self::config_token_id(metadata, "video_token_id"),
             Modality::Audio => Self::config_token_id(metadata, "audio_token_id"),
-            _ => Err(Self::unsupported(modality)),
+            Modality::ImageEmbeds => Err(Self::unsupported(modality)),
         }
     }
 
