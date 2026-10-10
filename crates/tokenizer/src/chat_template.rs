@@ -593,39 +593,81 @@ impl ThinkDetector {
     /// Whether a `<think>` block is open after the generation prompt an `if`
     /// writes, starting from `open` (the state the generation-prompt blocks
     /// before it left; a template may write the prompt in several of them).
-    /// A block that always runs for a generation prompt (`add_generation_prompt`
-    /// alone, or `not add_generation_prompt` for its false body) carries the
-    /// state through its text; a block that may run (`add_generation_prompt
-    /// and ...`) can only leave the block open, since its text runs on some
-    /// requests and not on others; `None` for any other condition.
+    /// A block whose condition is decided by `add_generation_prompt` alone
+    /// (see [`Self::generation_prompt_truth`]) carries the state through the
+    /// body that runs for a generation prompt; a block whose condition also
+    /// depends on something else may run either body, so the block is open
+    /// after it when either body leaves it open; `None` for a condition that
+    /// does not mention the variable.
     fn generation_prompt_open_after(ic: &IfCond, open: bool) -> Option<bool> {
-        const VAR: &str = "add_generation_prompt";
-        match &ic.expr {
-            Expr::Var(v) if v.id == VAR => Some(Self::think_block_open_after(&ic.true_body, open)),
-            Expr::UnaryOp(u) if matches!(u.op, UnaryOpKind::Not) => match &u.expr {
-                Expr::Var(v) if v.id == VAR => {
-                    Some(Self::think_block_open_after(&ic.false_body, open))
-                }
-                _ => None,
-            },
-            expr if Self::expr_references_var_positively(expr, VAR) => {
-                Some(open || Self::think_block_open_after(&ic.true_body, open))
-            }
-            _ => None,
+        match Self::generation_prompt_truth(&ic.expr) {
+            Some(true) => Some(Self::think_block_open_after(&ic.true_body, open)),
+            Some(false) => Some(Self::think_block_open_after(&ic.false_body, open)),
+            None if Self::expr_references_var(&ic.expr, "add_generation_prompt") => Some(
+                Self::think_block_open_after(&ic.true_body, open)
+                    || Self::think_block_open_after(&ic.false_body, open),
+            ),
+            None => None,
         }
     }
 
-    /// `expr_references_var` through `and` / `or` only: a comparison such as
-    /// `add_generation_prompt == false` is not a positive reference (its true
-    /// body runs without a generation prompt), and nothing negated is.
-    fn expr_references_var_positively(expr: &Expr, name: &str) -> bool {
+    /// The truth of a condition when `add_generation_prompt` is true: `Some`
+    /// when the variable alone decides it (the variable itself, `not`, `and`,
+    /// `or`, `==` / `!=` against a boolean, `is true` / `is false` /
+    /// `is defined`), `None` when it depends on anything else.
+    fn generation_prompt_truth(expr: &Expr) -> Option<bool> {
         match expr {
-            Expr::Var(v) => v.id == name,
-            Expr::BinOp(b) if matches!(b.op, BinOpKind::ScAnd | BinOpKind::ScOr) => {
-                Self::expr_references_var_positively(&b.left, name)
-                    || Self::expr_references_var_positively(&b.right, name)
+            Expr::Var(v) if v.id == "add_generation_prompt" => Some(true),
+            Expr::UnaryOp(u) if matches!(u.op, UnaryOpKind::Not) => {
+                Self::generation_prompt_truth(&u.expr).map(|truth| !truth)
             }
-            _ => false,
+            Expr::BinOp(b) => match b.op {
+                BinOpKind::ScAnd => match (
+                    Self::generation_prompt_truth(&b.left),
+                    Self::generation_prompt_truth(&b.right),
+                ) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                BinOpKind::ScOr => match (
+                    Self::generation_prompt_truth(&b.left),
+                    Self::generation_prompt_truth(&b.right),
+                ) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+                BinOpKind::Eq | BinOpKind::Ne => {
+                    let (side, constant) = match (&b.left, &b.right) {
+                        (side, Expr::Const(constant)) | (Expr::Const(constant), side) => {
+                            (side, constant)
+                        }
+                        _ => return None,
+                    };
+                    if !matches!(constant.value.kind(), ValueKind::Bool) {
+                        return None;
+                    }
+                    let equal = Self::generation_prompt_truth(side)? == constant.value.is_true();
+                    Some(if matches!(b.op, BinOpKind::Eq) {
+                        equal
+                    } else {
+                        !equal
+                    })
+                }
+                _ => None,
+            },
+            Expr::Test(t) => {
+                let truth = Self::generation_prompt_truth(&t.expr)?;
+                match t.name {
+                    "defined" => Some(true),
+                    "undefined" | "none" => Some(false),
+                    "true" => Some(truth),
+                    "false" => Some(!truth),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -2145,11 +2187,30 @@ mod tests {
         let state = ChatTemplateState::new(Some(maybe_then_closed.to_string())).unwrap();
         assert!(!state.prefill_opens_think_block());
 
-        // A negated comparison is no branch of the prompt either.
+        // Conditions the variable alone decides: `not (add_generation_prompt
+        // == false)` (the parse of the unparenthesised form) and
+        // `add_generation_prompt == true` run their true body for a
+        // generation prompt; `add_generation_prompt or x` always runs too, so
+        // it closes what an earlier block opened; `not (add_generation_prompt
+        // or x)` always runs its false body.
         let negated_comparison = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
                         {%- if not add_generation_prompt == false -%}<think>{%- endif -%}";
         let state = ChatTemplateState::new(Some(negated_comparison.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+        let eq_true = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt == true -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(eq_true.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+        let or_closes = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt or continue_final_message -%}</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(or_closes.to_string())).unwrap();
         assert!(!state.prefill_opens_think_block());
+        let not_or = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not (add_generation_prompt or continue_final_message) -%}done\
+                        {%- else -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(not_or.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
     }
 
     #[test]
