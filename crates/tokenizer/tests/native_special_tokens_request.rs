@@ -14,7 +14,7 @@ use tokenizers::{
     decoders::byte_level::ByteLevel as ByteLevelDecoder,
     models::bpe::{Merges, Vocab, BPE},
     pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer,
-    processors::byte_level::ByteLevel as ByteLevelProcessor,
+    processors::{byte_level::ByteLevel as ByteLevelProcessor, template::TemplateProcessing},
     AddedToken, Tokenizer,
 };
 
@@ -99,6 +99,49 @@ fn a_request_for_special_tokens_takes_the_direct_path_with_the_same_ids() {
         assert!(
             matches!(with, Encoding::Plain(_)),
             "{text:?}: the direct path serves the request for special tokens"
+        );
+    }
+}
+
+/// The negative case the direct path's correctness now rests on: a tokenizer
+/// whose post-processor adds a token (`add_bos` / `add_eos` style) must not
+/// take the direct path, so a request for special tokens still gets the
+/// added token from `tokenizers`.
+#[test]
+fn a_tokenizer_whose_post_processor_adds_a_token_keeps_the_tokenizers_path() {
+    let mut reference = byte_level_bpe();
+    let eot = reference
+        .token_to_id("<|endoftext|>")
+        .expect("the special token's id");
+    let template = TemplateProcessing::builder()
+        .try_single("<|endoftext|> $A:0")
+        .expect("a single-sequence template")
+        .special_tokens(vec![("<|endoftext|>", eot)])
+        .build()
+        .expect("a template post-processor");
+    reference.with_post_processor(Some(template));
+    let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+    for text in TEXTS {
+        let with = ours.encode(text, true).expect("an encode");
+        let expected = reference.encode(*text, true).expect("the reference encode");
+        assert_eq!(with.token_ids(), expected.get_ids(), "{text:?}");
+        assert_eq!(
+            with.token_ids().first(),
+            Some(&eot),
+            "{text:?}: the added token leads the ids"
+        );
+        assert!(
+            !matches!(with, Encoding::Plain(_)),
+            "{text:?}: a token-adding post-processor keeps the request off the direct path"
+        );
+        let without = ours.encode(text, false).expect("an encode");
+        assert_eq!(
+            without.token_ids(),
+            reference
+                .encode(*text, false)
+                .expect("the reference encode")
+                .get_ids(),
+            "{text:?}"
         );
     }
 }
