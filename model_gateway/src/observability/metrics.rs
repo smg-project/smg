@@ -867,6 +867,7 @@ pub fn init_startup_series() {
     // publishes the family with an empty distribution.
     let _ = histogram!("smg_worker_retry_backoff_seconds", "attempt" => "1");
     super::heap_profile::init_series();
+    super::token_dump::init_series();
 }
 
 /// Publish process-lifetime totals without scanning or retaining tokenizer instances.
