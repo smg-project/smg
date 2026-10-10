@@ -92,6 +92,10 @@ fn param_from_deserialize_message(message: &str) -> Option<String> {
         .and_then(|(_, rest)| rest.split_once('`'))
         .map(|(field, _)| field);
     match (path, field) {
+        // A refused unknown key is already the last segment of serde's path.
+        (Some(path), Some(field)) if path == field || path.ends_with(&format!(".{field}")) => {
+            Some(path.to_string())
+        }
         (Some(path), Some(field)) => Some(format!("{path}.{field}")),
         (Some(path), None) => Some(path.to_string()),
         (None, Some(field)) => Some(field.to_string()),
@@ -368,6 +372,15 @@ mod tests {
         role: String,
     }
 
+    /// A plain field whose type refuses unknown keys: serde's path to such a
+    /// key already ends with it, so the param must not repeat it.
+    #[derive(Debug, Deserialize, Serialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct Dependency {
+        #[validate(length(min = 1))]
+        version: String,
+    }
+
     fn not_vip(tier: &str) -> Result<(), ValidationError> {
         if tier == "vip" {
             return Err(ValidationError::new("unsupported_value"));
@@ -404,6 +417,9 @@ mod tests {
         #[serde(default)]
         #[validate(nested)]
         items: Vec<Item>,
+        #[serde(default)]
+        #[validate(nested)]
+        dependency: Option<Dependency>,
         #[serde(default)]
         #[validate(custom(function = "not_vip"))]
         tier: Option<String>,
@@ -586,6 +602,18 @@ mod tests {
         }
     }
 
+    /// `Dependency` refuses unknown keys, and serde's path to such a key
+    /// already ends with it (`dependency.nope`): the param names it once.
+    #[tokio::test]
+    async fn an_unknown_key_of_a_nested_object_is_named_once() {
+        let body = r#"{"value": 0.5, "name": "x", "dependency": {"version": "1", "nope": true}}"#;
+        let (status, kind, code, param) = envelope(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(kind, "invalid_request_error");
+        assert_eq!(code, "json_parse_error");
+        assert_eq!(param.as_deref(), Some("dependency.nope"));
+    }
+
     #[tokio::test]
     async fn syntax_errors_have_no_param() {
         let (status, json) = reject(r#"{"value": "#).await;
@@ -610,6 +638,14 @@ mod tests {
             (
                 "Failed to deserialize the JSON body into the target type: messages[0]: unknown field `foo`, expected one of `role`, `content` at line 1 column 40",
                 Some("messages[0].foo"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: dependency.nope: unknown field `nope`, expected `version` at line 1 column 58",
+                Some("dependency.nope"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: frobnicate: unknown field `frobnicate`, expected one of `model`, `input` at line 1 column 44",
+                Some("frobnicate"),
             ),
             (
                 "Failed to deserialize the JSON body into the target type: messages[0].content: data did not match any variant of untagged enum Content at line 1 column 60",
