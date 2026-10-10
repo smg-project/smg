@@ -505,6 +505,8 @@ mod video_param_tests {
 
 #[cfg(test)]
 mod repeat_tests {
+    use rustls::crypto::ring;
+
     use super::*;
     use crate::media::MediaConnectorConfig;
 
@@ -553,6 +555,7 @@ mod repeat_tests {
     }
 
     fn tracker() -> AsyncMultiModalTracker {
+        let _ = ring::default_provider().install_default();
         let connector =
             MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
                 .expect("default connector");

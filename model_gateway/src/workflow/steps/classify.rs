@@ -213,6 +213,7 @@ mod tests {
                 .unwrap();
         });
 
+        crate::tls::install_crypto_provider();
         let owned_by = probe_models_owned_by(&format!("http://{addr}"), 5, &Client::new(), None)
             .await
             .unwrap();

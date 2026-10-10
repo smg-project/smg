@@ -7,6 +7,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use rustls::crypto::ring;
+
 // Tokenizer download configuration
 const TINYLLAMA_TOKENIZER_URL: &str =
     "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
@@ -15,6 +17,15 @@ const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
 
 // Global mutex to prevent concurrent downloads
 static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// The blocking HTTP client of the download helpers. The client takes the
+/// process-level TLS crypto provider (reqwest's `rustls-no-provider`
+/// feature) and panics at build time when there is none, so `ring` is
+/// installed first; a provider installed earlier in the process stays.
+pub fn http_client() -> reqwest::blocking::Client {
+    let _ = ring::default_provider().install_default();
+    reqwest::blocking::Client::new()
+}
 
 /// Downloads the TinyLlama tokenizer from HuggingFace if not already cached.
 /// Returns the path to the cached tokenizer file.
@@ -44,7 +55,7 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
         println!("Downloading TinyLlama tokenizer from HuggingFace...");
 
         // Use blocking reqwest client since we're in tests/benchmarks
-        let client = reqwest::blocking::Client::new();
+        let client = http_client();
         let response = client
             .get(TINYLLAMA_TOKENIZER_URL)
             .send()
@@ -126,7 +137,7 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
             continue;
         }
         println!("Downloading Kimi-K3 {file} from HuggingFace...");
-        let client = reqwest::blocking::Client::new();
+        let client = http_client();
         let response = client
             .get(format!("{KIMI_K3_REPO}/{file}"))
             .send()
@@ -188,7 +199,7 @@ fn download_tokenizer_file(
     min_bytes: usize,
 ) -> bool {
     println!("Downloading {label} {file} from HuggingFace...");
-    let client = reqwest::blocking::Client::new();
+    let client = http_client();
     let url = format!("{base}/{file}");
     let response = match client.get(&url).send() {
         Ok(response) => response,

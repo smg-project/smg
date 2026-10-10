@@ -86,6 +86,7 @@ impl WorkerTestContext {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        smg::tls::install_crypto_provider();
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -118,6 +119,7 @@ impl WorkerTestContext {
     ) -> Result<Vec<String>, String> {
         use futures_util::StreamExt;
 
+        smg::tls::install_crypto_provider();
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -415,6 +417,7 @@ async fn build_test_app_context(
     use smg_mcp::McpOrchestrator;
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
+    smg::tls::install_crypto_provider();
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -675,6 +678,7 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
         println!("Downloading TinyLlama tokenizer from HuggingFace...");
 
         // Use blocking reqwest client since we're in tests/benchmarks
+        smg::tls::install_crypto_provider();
         let client = reqwest::blocking::Client::new();
         let response = client
             .get(TINYLLAMA_TOKENIZER_URL)

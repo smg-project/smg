@@ -197,6 +197,7 @@ pub(crate) fn build_client(
     tls_configured: bool,
     purpose: &str,
 ) -> Result<reqwest::Client, String> {
+    crate::tls::install_crypto_provider();
     let error = match make_builder().build() {
         Ok(client) => return Ok(client),
         Err(error) => error,

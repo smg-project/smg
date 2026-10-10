@@ -146,6 +146,7 @@ mod tests {
         }
         let job_queue = Arc::new(std::sync::OnceLock::new());
 
+        crate::tls::install_crypto_provider();
         Arc::new(AppContext {
             gateway_auth: AuthConfig::new(None),
             client: reqwest::Client::new(),

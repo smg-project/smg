@@ -57,6 +57,7 @@ fn grpc_modes() -> Vec<RoutingMode> {
     reason = "test setup helper; failures should panic"
 )]
 async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
+    smg::tls::install_crypto_provider();
     let config = RouterConfig::builder()
         .mode(mode)
         .grpc_connection()

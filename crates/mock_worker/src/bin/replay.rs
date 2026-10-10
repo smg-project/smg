@@ -34,6 +34,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::StreamExt;
+use rustls::crypto::ring;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
@@ -159,6 +160,9 @@ fn http_client(
     max_inflight: usize,
     pins: &[(String, Vec<std::net::SocketAddr>)],
 ) -> reqwest::Result<reqwest::Client> {
+    // The client takes the process-level TLS crypto provider; `ring` is the
+    // only backend compiled in, installed here unless one is there already.
+    let _ = ring::default_provider().install_default();
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(600));
     for (host, addrs) in pins {
         builder = builder.resolve_to_addrs(host, addrs);
@@ -1417,6 +1421,7 @@ mod tests {
         let path = dir.join("fleet.csv");
         let (stop, rx) = watch::channel(false);
         // The test server is local: no proxy from the environment.
+        let _ = ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()

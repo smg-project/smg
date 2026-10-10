@@ -56,6 +56,7 @@ use tower::ServiceExt;
 const MODEL: &str = "counter-test-model";
 
 async fn scrape(addr: SocketAddr) -> String {
+    smg::tls::install_crypto_provider();
     reqwest::get(format!("http://{addr}/metrics"))
         .await
         .expect("metrics endpoint reachable")

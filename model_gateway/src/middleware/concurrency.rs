@@ -272,6 +272,7 @@ mod tests {
         admission_queue: Option<Arc<AdmissionQueue>>,
     ) -> Arc<AppState> {
         let router_config = RouterConfig::default();
+        crate::tls::install_crypto_provider();
         let context = Arc::new(
             AppContext::builder()
                 .client(reqwest::Client::new())

@@ -133,6 +133,7 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
 
     // Idle engines publish no KV events; their streams still send the load
     // record as heartbeats within a second or so of the subscription.
+    smg::tls::install_crypto_provider();
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()

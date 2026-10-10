@@ -231,6 +231,7 @@ mod tests {
             upstream_http2,
             ..RouterConfig::default()
         };
+        crate::tls::install_crypto_provider();
         Arc::new(
             AppContext::builder()
                 .client(reqwest::Client::new())

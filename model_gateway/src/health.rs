@@ -903,6 +903,7 @@ mod tests {
         let addr = start_probe_listener("127.0.0.1", 0, state.clone()).unwrap();
         let base = format!("http://{addr}");
 
+        crate::tls::install_crypto_provider();
         let resp = reqwest::get(format!("{base}/liveness")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "OK");

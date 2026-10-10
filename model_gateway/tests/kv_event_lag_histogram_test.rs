@@ -25,6 +25,7 @@ async fn kv_event_lag_renders_histogram_buckets() {
     Metrics::record_kv_event_lag("grpc://worker-a:50051", 0.004);
     Metrics::record_kv_event_lag("grpc://worker-b:50051", 2.0);
 
+    smg::tls::install_crypto_provider();
     let body = reqwest::get(format!("http://{addr}/metrics"))
         .await
         .expect("metrics endpoint reachable")

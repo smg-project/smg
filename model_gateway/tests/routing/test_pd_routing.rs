@@ -229,6 +229,7 @@ mod pd_routing_unit_tests {
                     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
                 };
 
+                smg::tls::install_crypto_provider();
                 let client = reqwest::Client::new();
 
                 // Initialize rate limiter

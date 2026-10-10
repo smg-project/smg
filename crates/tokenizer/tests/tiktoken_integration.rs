@@ -20,6 +20,7 @@ use llm_tokenizer::{
     tiktoken::TiktokenTokenizer,
     traits::{Decoder, Encoder, Tokenizer as TokenizerTrait},
 };
+use rustls::crypto::ring;
 
 // -- Download configuration --
 
@@ -58,6 +59,9 @@ fn ensure_kimi_k2_cached() -> PathBuf {
         fs::create_dir_all(&cache_dir).expect("Failed to create Kimi K2 cache directory");
     }
 
+    // The client takes the process-level TLS crypto provider and panics
+    // without one: `ring` is installed before the first client is built.
+    let _ = ring::default_provider().install_default();
     let client = reqwest::blocking::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
         .build()
