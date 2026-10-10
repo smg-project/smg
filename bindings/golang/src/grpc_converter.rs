@@ -683,6 +683,8 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_free(
 mod tests {
     use super::*;
 
+    const SPLIT_TOOL_PREFIX: &str = r#"{"name":"get_weather","arguments":{"city":"#;
+
     fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
         let path =
             std::env::temp_dir().join(format!("smg-byte-fallback-{}.json", uuid::Uuid::now_v7()));
@@ -691,6 +693,8 @@ mod tests {
         for byte in 0_u32..=255 {
             vocab.insert(format!("<0x{byte:02X}>"), serde_json::json!(byte + 1));
         }
+        // A regular piece releases a tool prefix before a byte-only final run.
+        vocab.insert(SPLIT_TOOL_PREFIX.into(), serde_json::json!(257));
         let definition = serde_json::json!({
             "version":"1.0", "added_tokens":[],
             "model":{"type":"WordLevel", "unk_token":"[UNK]", "vocab":vocab},
@@ -730,6 +734,7 @@ mod tests {
                 skip_special_tokens: true,
             };
             let chunk = proto::GenerateResponse {
+                request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
                         token_ids: vec![0xC3 + 1, 0xA9 + 1],
@@ -745,6 +750,7 @@ mod tests {
                     .is_none()
             );
             let complete = proto::GenerateResponse {
+                request_id: String::new(),
                 response: Some(proto::generate_response::Response::Complete(
                     proto::GenerateComplete {
                         completion_tokens: 2,
@@ -768,13 +774,11 @@ mod tests {
             }
         }
     }
-    #[tokio::test]
-    async fn byte_fallback_complete_parses_tool_tail_and_respects_none() {
-        let tokenizer = byte_fallback_tokenizer();
-        let tool_text = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
-        let token_ids: Vec<u32> = tool_text.bytes().map(|byte| u32::from(byte) + 1).collect();
-        let completion_tokens = token_ids.len() as u32;
-        let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
+    fn tool_test_handle(
+        tokenizer: Arc<dyn Tokenizer>,
+        tool_choice: Option<ToolChoice>,
+    ) -> GrpcResponseConverterHandle {
+        let tools = serde_json::from_value(serde_json::json!([{
             "type":"function", "function":{
                 "name":"get_weather", "parameters":{
                     "type":"object", "properties":{"city":{"type":"string"}}
@@ -782,31 +786,41 @@ mod tests {
             }
         }]))
         .unwrap();
+        let decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("NEVER"),
+            true,
+        );
+        GrpcResponseConverterHandle {
+            tokenizer,
+            tool_parser: Some(Arc::new(TokioMutex::new(
+                Box::new(tool_parser::JsonParser::new()) as Box<dyn ToolParser>,
+            ))),
+            stop_decoder: Some(Arc::new(TokioMutex::new(decoder))),
+            model: "byte-fallback-test".into(),
+            request_id: "tool-tail".into(),
+            created: 0,
+            system_fingerprint: None,
+            tools: Some(tools),
+            tool_choice,
+            history_tool_calls_count: 0,
+            stream_state: StreamStateManager::new(),
+            initial_prompt_tokens: None,
+            skip_special_tokens: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_fallback_complete_parses_tool_tail_and_respects_none() {
+        let tokenizer = byte_fallback_tokenizer();
+        let tool_text = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
+        let token_ids: Vec<u32> = tool_text.bytes().map(|byte| u32::from(byte) + 1).collect();
+        let completion_tokens = token_ids.len() as u32;
         for tool_choice in [None, Some(ToolChoice::Value(ToolChoiceValue::None))] {
             let disabled = tool_choice.is_some();
-            let decoder = StopSequenceDecoder::new(
-                tokenizer.clone(),
-                llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("NEVER"),
-                true,
-            );
-            let mut handle = GrpcResponseConverterHandle {
-                tokenizer: tokenizer.clone(),
-                tool_parser: Some(Arc::new(TokioMutex::new(
-                    Box::new(tool_parser::JsonParser::new()) as Box<dyn ToolParser>,
-                ))),
-                stop_decoder: Some(Arc::new(TokioMutex::new(decoder))),
-                model: "byte-fallback-test".into(),
-                request_id: "tool-tail".into(),
-                created: 0,
-                system_fingerprint: None,
-                tools: Some(tools.clone()),
-                tool_choice,
-                history_tool_calls_count: 0,
-                stream_state: StreamStateManager::new(),
-                initial_prompt_tokens: None,
-                skip_special_tokens: true,
-            };
+            let mut handle = tool_test_handle(tokenizer.clone(), tool_choice);
             let chunk = proto::GenerateResponse {
+                request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
                         token_ids: token_ids.clone(),
@@ -823,6 +837,7 @@ mod tests {
                     .is_none()
             );
             let complete = proto::GenerateResponse {
+                request_id: String::new(),
                 response: Some(proto::generate_response::Response::Complete(
                     proto::GenerateComplete {
                         output_ids: token_ids.clone(),
@@ -878,5 +893,105 @@ mod tests {
                 assert_eq!(arguments, serde_json::json!({"city":"Paris"}));
             }
         }
+    }
+    #[tokio::test]
+    async fn byte_fallback_complete_closed_split_tool_control() {
+        let tokenizer = byte_fallback_tokenizer();
+        let tail = r#""Paris"}}"#;
+        let mut handle = tool_test_handle(tokenizer.clone(), None);
+        // Prime the role state directly so the known first-Chunk behavior
+        // does not discard any part of the tool prefix used by this fixture.
+        handle.stream_state.get_or_create(0).is_first_chunk = false;
+        let prefix_chunk = proto::GenerateResponse {
+            request_id: String::new(),
+            response: Some(proto::generate_response::Response::Chunk(
+                proto::GenerateStreamChunk {
+                    token_ids: vec![257],
+                    prompt_tokens: 7,
+                    completion_tokens: 1,
+                    ..Default::default()
+                },
+            )),
+        };
+        let prefix_response = convert_proto_chunk_to_openai(prefix_chunk, &mut handle, &tokenizer)
+            .await
+            .unwrap()
+            .unwrap();
+        let prefix_calls = prefix_response.choices[0]
+            .delta
+            .tool_calls
+            .as_ref()
+            .unwrap();
+        assert!(prefix_calls.iter().any(|call| call
+            .function
+            .as_ref()
+            .and_then(|function| function.name.as_deref())
+            == Some("get_weather")));
+        let mut arguments: String = prefix_calls
+            .iter()
+            .filter_map(|call| {
+                call.function
+                    .as_ref()
+                    .and_then(|function| function.arguments.as_deref())
+            })
+            .collect();
+        let tail_ids: Vec<u32> = tail.bytes().map(|byte| u32::from(byte) + 1).collect();
+        let completion_tokens = 1 + tail_ids.len() as u32;
+        let tail_chunk = proto::GenerateResponse {
+            request_id: String::new(),
+            response: Some(proto::generate_response::Response::Chunk(
+                proto::GenerateStreamChunk {
+                    token_ids: tail_ids.clone(),
+                    prompt_tokens: 7,
+                    completion_tokens,
+                    ..Default::default()
+                },
+            )),
+        };
+        assert!(
+            convert_proto_chunk_to_openai(tail_chunk, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut output_ids = vec![257];
+        output_ids.extend(tail_ids);
+        let complete = proto::GenerateResponse {
+            request_id: String::new(),
+            response: Some(proto::generate_response::Response::Complete(
+                proto::GenerateComplete {
+                    output_ids,
+                    prompt_tokens: 7,
+                    completion_tokens,
+                    cached_tokens: 3,
+                    finish_reason: "stop".into(),
+                    matched_stop: Some(proto::generate_complete::MatchedStop::MatchedTokenId(99)),
+                    ..Default::default()
+                },
+            )),
+        };
+        let final_response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
+            .await
+            .unwrap()
+            .unwrap();
+        let choice = &final_response.choices[0];
+        for call in choice.delta.tool_calls.as_ref().unwrap() {
+            assert_eq!(call.index, 0);
+            if let Some(fragment) = call
+                .function
+                .as_ref()
+                .and_then(|function| function.arguments.as_deref())
+            {
+                arguments.push_str(fragment);
+            }
+        }
+        let parsed: Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(parsed, serde_json::json!({"city":"Paris"}));
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(choice.matched_stop, Some(serde_json::json!(99)));
+        let wire = serde_json::to_value(&final_response).unwrap();
+        assert_eq!(wire["usage"]["prompt_tokens"], 7);
+        assert_eq!(wire["usage"]["completion_tokens"], completion_tokens);
+        assert_eq!(wire["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
     }
 }
