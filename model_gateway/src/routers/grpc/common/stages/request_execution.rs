@@ -327,7 +327,8 @@ impl DumpScope {
             leg,
             root_request_id: self.root_request_id.clone(),
         };
-        self.session.begin_call(&meta, &request.dump_event())
+        self.session
+            .begin_call(&meta, request.dump_min_len(), || request.dump_event())
     }
 }
 

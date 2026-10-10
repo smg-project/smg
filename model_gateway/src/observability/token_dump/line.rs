@@ -231,6 +231,12 @@ struct SessionEndLine<'a> {
     bytes_written: u64,
 }
 
+/// The base64 length of a protobuf message `encoded_len` bytes long: a lower
+/// bound on the length of the line that carries it, known before encoding.
+pub fn min_line_len(encoded_len: usize) -> usize {
+    encoded_len.div_ceil(3) * 4
+}
+
 /// The `session` line that opens every file.
 pub fn session_line(header: &SessionHeader<'_>) -> Vec<u8> {
     to_line(&SessionLine {

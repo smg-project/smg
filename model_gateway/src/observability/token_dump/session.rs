@@ -95,6 +95,9 @@ struct Stats {
     size_cap: AtomicU64,
     write_error: AtomicU64,
     write_error_logged: AtomicBool,
+    /// Set by the first line the file cap refused: a full session takes no
+    /// new call.
+    full: AtomicBool,
     end_reason: AtomicU8,
 }
 
@@ -112,6 +115,7 @@ impl Stats {
             size_cap: AtomicU64::new(0),
             write_error: AtomicU64::new(0),
             write_error_logged: AtomicBool::new(false),
+            full: AtomicBool::new(false),
             end_reason: AtomicU8::new(EndReason::Shutdown.to_u8()),
         }
     }
@@ -124,6 +128,12 @@ impl Stats {
         };
         count.fetch_add(1, Ordering::Relaxed);
         counter!("smg_token_dump_lines_dropped_total", "reason" => reason.as_str()).increment(1);
+        if matches!(reason, DropReason::SizeCap) && !self.full.swap(true, Ordering::AcqRel) {
+            warn!(
+                max_bytes = self.max_bytes,
+                "token dump: the dump file reached its size cap; its session records no new call"
+            );
+        }
     }
 
     fn written(&self, len: u64) {
@@ -274,21 +284,60 @@ impl Session {
             .take()
     }
 
-    /// Record a new engine call: writes its `request` line now.
-    pub fn begin_call(
+    /// Whether the file cap has refused a line: a full session takes no new
+    /// call.
+    pub(super) fn is_full(&self) -> bool {
+        self.stats.full.load(Ordering::Acquire)
+    }
+
+    /// Whether a line at least `min_len` bytes long could still be taken by
+    /// the file cap and the writer queue. A check, not a reservation:
+    /// [`write`](Self::write) reserves the line's exact size. It lets a
+    /// caller skip building a line that cannot fit.
+    fn room_for(&self, min_len: usize) -> Result<(), DropReason> {
+        let stats = &self.stats;
+        let min_len = min_len as u64;
+        let file_cap = stats.max_bytes.saturating_sub(SESSION_END_RESERVE);
+        if stats
+            .file_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(min_len)
+            > file_cap
+        {
+            return Err(DropReason::SizeCap);
+        }
+        if stats
+            .queued_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(min_len)
+            > stats.queue_budget
+        {
+            return Err(DropReason::QueueFull);
+        }
+        Ok(())
+    }
+
+    /// Record a new engine call. Its `request` line, at least `min_len` bytes
+    /// long, is built by `request` and written now; when even `min_len` bytes
+    /// cannot fit, the line is counted dropped without being built.
+    pub fn begin_call<'a>(
         self: &Arc<Self>,
         meta: &CallMeta,
-        request: &RequestEvent<'_>,
+        min_len: usize,
+        request: impl FnOnce() -> RequestEvent<'a>,
     ) -> CallRecorder {
         let call = self.next_call.fetch_add(1, Ordering::Relaxed);
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
         counter!("smg_token_dump_calls_total").increment(1);
-        self.write(line::request_line(
-            call,
-            &rfc3339(Utc::now()),
-            meta,
-            request,
-        ));
+        match self.room_for(min_len) {
+            Ok(()) => self.write(line::request_line(
+                call,
+                &rfc3339(Utc::now()),
+                meta,
+                &request(),
+            )),
+            Err(reason) => self.stats.dropped(reason),
+        }
         CallRecorder {
             session: Arc::clone(self),
             call,
@@ -338,19 +387,23 @@ pub struct CallRecorder {
 }
 
 impl CallRecorder {
-    /// Record one engine message. Ignored once the call has ended.
-    pub fn response(&mut self, event: &ResponseEvent<'_>) {
+    /// Record one engine message, built by `event` unless its line (at least
+    /// `min_len` bytes long) cannot fit. Ignored once the call has ended.
+    pub fn response<'a>(&mut self, min_len: usize, event: impl FnOnce() -> ResponseEvent<'a>) {
         if self.ended {
             return;
         }
         let seq = self.responses;
         self.responses += 1;
-        self.session.write(line::response_line(
-            self.call,
-            seq,
-            self.elapsed_ms(),
-            event,
-        ));
+        match self.session.room_for(min_len) {
+            Ok(()) => self.session.write(line::response_line(
+                self.call,
+                seq,
+                self.elapsed_ms(),
+                &event(),
+            )),
+            Err(reason) => self.session.stats.dropped(reason),
+        }
     }
 
     /// Record how the call ended; only the first end counts.
@@ -569,8 +622,8 @@ mod tests {
     fn a_session_writes_header_call_lines_and_session_end() {
         let sink = Shared::default();
         let session = open(sink.clone(), limits(1 << 20, 1 << 20));
-        let mut call = session.begin_call(&meta(), &request());
-        call.response(&chunk());
+        let mut call = session.begin_call(&meta(), 0, request);
+        call.response(0, chunk);
         call.finish(EndStatus::Ok, None);
         drop(call);
         session.set_end_reason(EndReason::Stopped);
@@ -601,7 +654,7 @@ mod tests {
     fn a_call_dropped_before_it_ends_is_recorded_cancelled() {
         let sink = Shared::default();
         let session = open(sink.clone(), limits(1 << 20, 1 << 20));
-        drop(session.begin_call(&meta(), &request()));
+        drop(session.begin_call(&meta(), 0, request));
         close(session);
         let lines = sink.lines();
         assert_eq!(kinds(&lines), ["session", "request", "end", "session_end"]);
@@ -613,9 +666,9 @@ mod tests {
     fn a_call_dropped_mid_stream_counts_its_responses() {
         let sink = Shared::default();
         let session = open(sink.clone(), limits(1 << 20, 1 << 20));
-        let mut call = session.begin_call(&meta(), &request());
-        call.response(&chunk());
-        call.response(&chunk());
+        let mut call = session.begin_call(&meta(), 0, request);
+        call.response(0, chunk);
+        call.response(0, chunk);
         drop(call);
         close(session);
         let lines = sink.lines();
@@ -628,10 +681,10 @@ mod tests {
     fn a_call_ends_once() {
         let sink = Shared::default();
         let session = open(sink.clone(), limits(1 << 20, 1 << 20));
-        let mut call = session.begin_call(&meta(), &request());
+        let mut call = session.begin_call(&meta(), 0, request);
         call.finish(EndStatus::Error, Some(&tonic::Status::internal("boom")));
         call.finish(EndStatus::Ok, None);
-        call.response(&chunk());
+        call.response(0, chunk);
         drop(call);
         close(session);
         let lines = sink.lines();
@@ -645,10 +698,10 @@ mod tests {
         let sink = Shared::default();
         let session = open(sink.clone(), limits(1 << 20, 1 << 20));
         let done = session.take_writer_done().unwrap();
-        let mut call = session.begin_call(&meta(), &request());
+        let mut call = session.begin_call(&meta(), 0, request);
         session.set_end_reason(EndReason::Stopped);
         drop(session);
-        call.response(&chunk());
+        call.response(0, chunk);
         call.finish(EndStatus::Ok, None);
         drop(call);
         done.blocking_recv().unwrap();
@@ -667,8 +720,8 @@ mod tests {
                 let session = Arc::clone(&session);
                 thread::spawn(move || {
                     for _ in 0..25 {
-                        let mut call = session.begin_call(&meta(), &request());
-                        call.response(&chunk());
+                        let mut call = session.begin_call(&meta(), 0, request);
+                        call.response(0, chunk);
                         call.finish(EndStatus::Ok, None);
                     }
                 })
@@ -701,7 +754,7 @@ mod tests {
         let session = open(sink.clone(), limits(max_bytes, 1 << 20));
         let stats = Arc::clone(&session.stats);
         for _ in 0..50 {
-            drop(session.begin_call(&meta(), &request()));
+            drop(session.begin_call(&meta(), 0, request));
         }
         close(session);
 
@@ -724,7 +777,7 @@ mod tests {
         let session = open(sink.clone(), limits(1 << 20, 16));
         let stats = Arc::clone(&session.stats);
         for _ in 0..10 {
-            drop(session.begin_call(&meta(), &request()));
+            drop(session.begin_call(&meta(), 0, request));
         }
         close(session);
 
@@ -736,6 +789,30 @@ mod tests {
     }
 
     #[test]
+    fn a_line_that_cannot_fit_is_never_built() {
+        fn never_built() -> RequestEvent<'static> {
+            panic!("built a request line that cannot fit")
+        }
+        fn never_built_response() -> ResponseEvent<'static> {
+            panic!("built a response line that cannot fit")
+        }
+        // Past the file cap: a 1 MiB line in a 4 KiB file.
+        let capped = open(io::sink(), limits(4096, 1 << 30));
+        let mut call = capped.begin_call(&meta(), 1 << 20, never_built);
+        call.response(1 << 20, never_built_response);
+        drop(call);
+        let totals = capped.totals();
+        assert_eq!(totals.lines_dropped.size_cap, 2);
+        assert!(capped.is_full());
+
+        // Past the queue budget: a 1 KiB line through a 16-byte queue.
+        let queued = open(io::sink(), limits(1 << 20, 16));
+        drop(queued.begin_call(&meta(), 1024, never_built));
+        assert!(queued.totals().lines_dropped.queue_full >= 1);
+        assert!(!queued.is_full(), "a full queue is not a full file");
+    }
+
+    #[test]
     fn write_errors_are_counted_not_raised() {
         let session = open(
             FailsAfterHeader {
@@ -744,7 +821,7 @@ mod tests {
             limits(1 << 20, 1 << 20),
         );
         let stats = Arc::clone(&session.stats);
-        drop(session.begin_call(&meta(), &request()));
+        drop(session.begin_call(&meta(), 0, request));
         close(session);
         // The request, its end and the session_end line all failed.
         assert_eq!(stats.totals().lines_dropped.write_error, 3);

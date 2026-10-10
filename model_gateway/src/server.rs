@@ -7,6 +7,7 @@ use std::{
 };
 
 use axum::{
+    body::Bytes,
     extract::{Extension, Path, Query, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -630,14 +631,16 @@ async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
 
 /// `POST /start_token_dump`: start recording every engine call into a new
 /// file under `--token-dump-dir` (see [`token_dump`]).
-async fn start_token_dump(
-    State(state): State<Arc<AppState>>,
-    body: Option<Json<token_dump::StartRequest>>,
-) -> Response {
+async fn start_token_dump(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let Some(dump) = state.context.token_dump.clone() else {
         return token_dump::not_configured();
     };
-    let request = body.map(|Json(body)| body).unwrap_or_default();
+    // Raw bytes, not `Option<Json>`: that reads a body sent without a
+    // content type as no body, and would start a wider dump than asked for.
+    let request = match token_dump::parse_start_body(&body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
     match token_dump::start_blocking(dump, request).await {
         Ok(started) => Json(started).into_response(),
         Err(error) => error.into_response(),

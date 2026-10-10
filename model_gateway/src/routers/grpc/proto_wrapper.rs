@@ -43,7 +43,9 @@ use smg_grpc_client::{
 use smg_mm_rdma::RdmaExporter;
 
 use crate::{
-    observability::token_dump::{CallRecorder, EndStatus, Part, RequestEvent, ResponseEvent},
+    observability::token_dump::{
+        min_line_len, CallRecorder, EndStatus, Part, RequestEvent, ResponseEvent,
+    },
     routers::grpc::{
         multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
         zmq_client::ZmqGenerateStream,
@@ -1697,6 +1699,12 @@ impl ProtoGenerateRequest {
         self.input_ids().len()
     }
 
+    /// A lower bound on this request's token dump line, known without
+    /// encoding it.
+    pub fn dump_min_len(&self) -> usize {
+        min_line_len(self.wire_len())
+    }
+
     /// This request as a token dump `request` event: its protobuf name and
     /// encoding.
     pub fn dump_event(&self) -> RequestEvent<'_> {
@@ -1989,6 +1997,19 @@ impl ProtoGenerateResponse {
                 Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == "error"
             ),
         }
+    }
+
+    /// A lower bound on this response's token dump line, known without
+    /// encoding it.
+    pub fn dump_min_len(&self) -> usize {
+        use prost::Message;
+        min_line_len(match self {
+            Self::Sglang(resp) => resp.encoded_len(),
+            Self::Vllm(resp) => resp.encoded_len(),
+            Self::Trtllm(resp) => resp.encoded_len(),
+            Self::Mlx(resp) => resp.encoded_len(),
+            Self::TokenSpeed(resp) => resp.encoded_len(),
+        })
     }
 
     /// This response as a token dump `response` event, exactly as the engine
@@ -2755,7 +2776,7 @@ fn record_and_reject(
     raw: Option<Result<ProtoGenerateResponse, tonic::Status>>,
 ) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
     if let Some(Ok(response)) = &raw {
-        call.response(&response.dump_event());
+        call.response(response.dump_min_len(), || response.dump_event());
     }
     let item = raw.map(reject_engine_error);
     match &item {
@@ -4189,7 +4210,8 @@ mod token_dump_tests {
     async fn record_and_reject_keeps_the_engine_error_response() {
         let (_dir, dump, file) = running_dump();
         let session = dump.session_for("m").unwrap();
-        let mut call = session.begin_call(&dump_meta(), &tokenspeed_request().dump_event());
+        let request = tokenspeed_request();
+        let mut call = session.begin_call(&dump_meta(), 0, || request.dump_event());
         let error_complete =
             ProtoGenerateResponse::TokenSpeed(Box::new(tokenspeed::GenerateResponse {
                 response: Some(tokenspeed::generate_response::Response::Complete(
@@ -4221,7 +4243,8 @@ mod token_dump_tests {
         for (mark, status) in [(false, "ok"), (true, "ok")] {
             let (_dir, dump, file) = running_dump();
             let session = dump.session_for("m").unwrap();
-            let call = session.begin_call(&dump_meta(), &tokenspeed_request().dump_event());
+            let request = tokenspeed_request();
+            let call = session.begin_call(&dump_meta(), 0, || request.dump_event());
             let mut stream =
                 ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new())).recorded(call);
             if mark {
@@ -4242,7 +4265,8 @@ mod token_dump_tests {
     async fn a_recorded_stream_dropped_unfinished_is_cancelled() {
         let (_dir, dump, file) = running_dump();
         let session = dump.session_for("m").unwrap();
-        let call = session.begin_call(&dump_meta(), &tokenspeed_request().dump_event());
+        let request = tokenspeed_request();
+        let call = session.begin_call(&dump_meta(), 0, || request.dump_event());
         let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
             .recorded(call)
             .defer_abort_until_first_item();

@@ -64,7 +64,8 @@ use self::{
 };
 pub use self::{
     line::{
-        CallMeta, Dropped, EndStatus, Leg, Part, RequestEvent, ResponseEvent, Totals, Transport,
+        min_line_len, CallMeta, Dropped, EndStatus, Leg, Part, RequestEvent, ResponseEvent, Totals,
+        Transport,
     },
     session::{CallRecorder, Session},
 };
@@ -123,6 +124,7 @@ pub struct Stopped {
 #[derive(Debug)]
 pub enum StartError {
     AlreadyRunning,
+    BadBody(String),
     BadDuration(u64),
     Open(io::Error),
     Task(String),
@@ -174,7 +176,7 @@ impl TokenDump {
     pub fn session_for(&self, model: &str) -> Option<Arc<Session>> {
         let current = self.current.load();
         let session = Option::as_ref(&*current)?;
-        (session.records_model(model) && !session.expired(Instant::now()))
+        (session.records_model(model) && !session.is_full() && !session.expired(Instant::now()))
             .then(|| Arc::clone(session))
     }
 
@@ -297,6 +299,16 @@ impl TokenDump {
     }
 }
 
+/// The `POST /start_token_dump` body: empty for the defaults, else JSON. The
+/// content type is not consulted, so a JSON body sent without one is read,
+/// never silently replaced by the defaults.
+pub fn parse_start_body(body: &[u8]) -> Result<StartRequest, StartError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(StartRequest::default());
+    }
+    serde_json::from_slice(body).map_err(|error| StartError::BadBody(error.to_string()))
+}
+
 /// [`TokenDump::start`] off the async runtime: it creates a file.
 pub async fn start_blocking(
     dump: Arc<TokenDump>,
@@ -338,6 +350,12 @@ impl IntoResponse for StartError {
                 StatusCode::CONFLICT,
                 "token_dump_already_running",
                 "a token dump session is running; POST /stop_token_dump first",
+            ),
+            Self::BadBody(reason) => error::bad_request(
+                "token_dump_bad_body",
+                format!(
+                    "the body must be empty or a JSON object of duration_secs and models: {reason}"
+                ),
             ),
             Self::BadDuration(secs) => error::bad_request(
                 "token_dump_bad_duration",
@@ -571,6 +589,62 @@ mod tests {
         assert_eq!(
             StopError::NotRunning.into_response().status(),
             StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_session_records_no_new_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = Arc::new(TokenDump::new(dir.path().to_path_buf(), 4096));
+        dump.start(StartRequest::default()).unwrap();
+        let session = dump.session_for("m").unwrap();
+        let meta = CallMeta {
+            model: "m".to_string(),
+            worker: "grpc://w:1".to_string(),
+            runtime: "sglang",
+            transport: Transport::Grpc,
+            leg: Leg::Single,
+            root_request_id: None,
+        };
+        let request = || RequestEvent {
+            type_name: "t.Request",
+            request_id: "r",
+            input_ids: &[1, 2, 3],
+            msg: vec![0; 64],
+        };
+        for _ in 0..100 {
+            if session.is_full() {
+                break;
+            }
+            drop(session.begin_call(&meta, 0, request));
+        }
+        assert!(session.is_full(), "4 KiB fills within 100 calls");
+        assert!(
+            dump.session_for("m").is_none(),
+            "a full session takes no new call"
+        );
+    }
+
+    #[test]
+    fn the_start_body_is_read_whatever_its_content_type() {
+        assert!(parse_start_body(b"").unwrap().models.is_empty());
+        assert!(parse_start_body(b" \n").unwrap().duration_secs.is_none());
+        let body = parse_start_body(br#"{"duration_secs":5,"models":["a"]}"#).unwrap();
+        assert_eq!(body.duration_secs, Some(5));
+        assert_eq!(body.models, ["a"]);
+        assert!(matches!(
+            parse_start_body(br#"{"path":"/etc"}"#),
+            Err(StartError::BadBody(_))
+        ));
+        assert!(matches!(
+            parse_start_body(b"duration_secs=5"),
+            Err(StartError::BadBody(_))
+        ));
+        assert_eq!(
+            StartError::BadBody("x".to_string())
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
         );
     }
 
