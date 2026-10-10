@@ -1729,6 +1729,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         orchestrator.shutdown().await;
     }
 
+    // Close the token dump file, so a boot-time session ends with its
+    // session_end line.
+    if let Some(dump) = &app_context.token_dump {
+        dump.shutdown().await;
+    }
+
     info!("Cleanup complete. Process exiting.");
 
     // Return original server error if any, otherwise Ok
