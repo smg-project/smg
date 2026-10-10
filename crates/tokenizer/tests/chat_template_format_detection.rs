@@ -126,9 +126,9 @@ fn test_detect_openai_format_with_length_check() {
 
 #[test]
 fn test_index_access_without_a_content_loop_is_string_format() {
-    // An index on the content is not a loop over it: the engine (vLLM's
-    // `_detect_content_format`) keeps such a template in the string format,
-    // so the gateway does too and hands it string content as a string.
+    // An index on the content is not a loop over it: the engine's own
+    // detection keeps such a template in the string format, so the gateway
+    // does too and hands it string content as a string.
     let template = r"
         {%- for message in messages %}
         {%- if message.content[0] %}
@@ -400,9 +400,9 @@ fn test_assignment_with_iteration_is_openai() {
     );
 }
 
-// The rule is the engine's (vLLM's `_detect_content_format`): a template is of
-// the parts format only when it loops over a message's content. The shapes
-// below are those of recorded templates whose renders depend on the verdict.
+// The rule is the serving engine's own: a template is of the parts format
+// only when it loops over a message's content. The shapes below are those of
+// recorded templates whose renders depend on the verdict.
 
 #[test]
 fn a_length_test_on_the_content_without_a_loop_is_string_format() {

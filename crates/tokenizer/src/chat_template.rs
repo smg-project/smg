@@ -155,8 +155,8 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 
 /// Detect the content format expected by a Jinja2 chat template
 ///
-/// The rule is vLLM's `_detect_content_format` (`vllm/renderers/hf.py`), so
-/// that the gateway hands string content as a one-item text part list to the
+/// The rule is the serving engine's own content-format detection, so that
+/// the gateway hands string content as a one-item text part list to the
 /// same templates as the engine does (see [`ChatTemplateState::apply`]). A
 /// template is of the "openai" format when it has a loop over a message's
 /// content, a message being a loop variable over `messages` or over a
