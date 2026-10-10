@@ -35,7 +35,10 @@ use super::{
     mode::Mode,
     multimodal::{mm_settings, MultimodalComponents},
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
-    regular::{responses, stages::decisions::supports_worker as supports_decisions_worker},
+    regular::{
+        responses, stages::decisions::supports_worker as supports_decisions_worker,
+        streaming::StreamingProcessor,
+    },
     utils::{message_utils, ParserResolver},
 };
 use crate::{
@@ -486,6 +489,9 @@ impl GrpcRouter {
 
         // `max_tokens: 0` is answered as the public API answers it: an empty
         // message that reports the prompt's token count; nothing is generated.
+        // No worker takes part, so the answer carries neither the rate-limit
+        // reservation nor the pipeline's dispatch metrics, as count_tokens
+        // carries neither.
         if canonical_body.max_tokens == 0 {
             return self
                 .empty_message_response(tenant_meta, canonical_body, &model_id_cloned)
@@ -596,7 +602,10 @@ impl GrpcRouter {
     /// in `usage`, counted as `/v1/messages/count_tokens` counts it; no worker
     /// takes part, and the message carries the id the pipeline would have
     /// given it. A streaming request gets that message as `message_start`,
-    /// then `message_delta` with the stop reason and `message_stop`.
+    /// then `message_delta` with the stop reason and `message_stop`. A request
+    /// with media is counted at the placeholders the template writes for it,
+    /// as count_tokens counts it: the media is neither fetched nor checked, so
+    /// the count is the template's, not the expanded prompt's.
     async fn empty_message_response(
         &self,
         tenant_meta: &TenantRequestMeta,
@@ -661,8 +670,16 @@ impl GrpcRouter {
             },
             MessageStreamEvent::MessageStop,
         ];
-        let frames: Vec<Result<bytes::Bytes, std::io::Error>> =
-            events.iter().map(messages_sse_frame).map(Ok).collect();
+        let mut frames: Vec<Result<bytes::Bytes, std::io::Error>> =
+            Vec::with_capacity(events.len());
+        let mut buffer = Vec::new();
+        for event in &events {
+            if let Err(e) = StreamingProcessor::format_messages_sse_into(&mut buffer, event) {
+                tracing::error!(model = %model_id, error = %e, "max_tokens 0: a stream event does not serialize");
+                return error::internal_error("messages_event_serialization_failed", e);
+            }
+            frames.push(Ok(bytes::Bytes::from(std::mem::take(&mut buffer))));
+        }
         build_sse_response_from_stream(futures::stream::iter(frames))
     }
 
@@ -974,17 +991,6 @@ fn canonicalize_responses_request<'a>(
         Cow::Owned(canonical_body),
         Cow::Owned(canonical_model.to_string()),
     )
-}
-
-/// One Messages SSE frame, `event: <type>\ndata: <json>\n\n`; the type is the
-/// event's own tag.
-fn messages_sse_frame(event: &MessageStreamEvent) -> bytes::Bytes {
-    let json = serde_json::to_value(event).unwrap_or_default();
-    let name = json
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("ping");
-    bytes::Bytes::from(format!("event: {name}\ndata: {json}\n\n"))
 }
 
 #[cfg(test)]

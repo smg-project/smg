@@ -2130,6 +2130,9 @@ impl RouterTrait for Router {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
+        if let Some(refused) = super::refuse_max_tokens_zero(&body) {
+            return refused;
+        }
         self.route_typed_request(headers, body, "/v1/messages", model_id)
             .await
     }
@@ -3670,6 +3673,85 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The relay renders no prompt, so it cannot give `max_tokens: 0` the
+    /// public API's empty message; it refuses the shape with a 400 naming the
+    /// field, unary and streamed, and the worker never sees the request. A
+    /// positive `max_tokens` is forwarded as before.
+    #[tokio::test]
+    async fn max_tokens_zero_is_refused_by_the_relay_and_not_forwarded() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |body: Bytes| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                    (
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"type":"message"}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let request = |max_tokens: u32, stream: bool| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": max_tokens,
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hello"}],
+            }))
+            .unwrap()
+        };
+
+        for stream in [false, true] {
+            let response = router
+                .route_messages(
+                    None,
+                    &tenant,
+                    request(0, stream),
+                    crate::worker::UNKNOWN_MODEL_ID,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "max_tokens_zero_not_relayed"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused request reached the worker"
+        );
+
+        let response = router
+            .route_messages(
+                None,
+                &tenant,
+                request(16, false),
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let forwarded = rx.recv().await.unwrap();
+        assert_eq!(forwarded["max_tokens"], 16);
     }
 
     /// With retries enabled the request must survive for replay: a 503 on the

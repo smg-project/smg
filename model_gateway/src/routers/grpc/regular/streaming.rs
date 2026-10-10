@@ -1984,7 +1984,7 @@ impl StreamingProcessor {
     /// Writes `event: {type}\ndata: {json}\n\n` into `buffer`, avoiding per-event
     /// allocations by reusing the same buffer across multiple events.
     #[inline]
-    fn format_messages_sse_into(
+    pub(crate) fn format_messages_sse_into(
         buffer: &mut Vec<u8>,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {

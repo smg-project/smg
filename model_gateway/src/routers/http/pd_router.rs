@@ -2643,6 +2643,9 @@ impl RouterTrait for PDRouter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
+        if let Some(refused) = super::refuse_max_tokens_zero(&body) {
+            return refused;
+        }
         let is_stream = body.stream.unwrap_or(false);
 
         let request_text = if self.policies_need_request_text() {
@@ -3462,6 +3465,61 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
+    }
+
+    /// The prefill/decode relay renders no prompt either: `max_tokens: 0` is
+    /// refused with the 400 naming the field before any leg is dispatched, and
+    /// neither worker sees the request; a positive `max_tokens` takes both legs.
+    #[tokio::test]
+    async fn max_tokens_zero_is_refused_before_the_prefill_decode_dispatch() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+
+        let router = create_test_pd_router();
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request = |max_tokens: u32| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .expect("valid messages request")
+        };
+
+        let response = router
+            .route_messages(None, &tenant, request(0), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "max_tokens_zero_not_relayed"
+        );
+        for seen in [&prefill_seen, &decode_seen] {
+            assert!(seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty());
+        }
+
+        let response = router
+            .route_messages(None, &tenant, request(16), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for seen in [&prefill_seen, &decode_seen] {
+            let seen = seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, "/v1/messages");
+        }
     }
 
     /// Serves `app` on an ephemeral loopback port.

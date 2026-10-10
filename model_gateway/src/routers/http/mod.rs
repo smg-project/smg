@@ -6,7 +6,11 @@ pub(crate) mod request_body;
 pub(crate) mod request_stream;
 pub mod router;
 
+use axum::response::Response;
+use openai_protocol::messages::CreateMessageRequest;
 use serde_json::Value;
+
+use crate::routers::error;
 
 /// Rewrite the `model` field of an outbound request body.
 ///
@@ -22,6 +26,23 @@ pub(crate) fn set_request_model(json: &mut Value, canonical_model_id: &str) {
     if let Some(model) = json.get_mut("model") {
         *model = Value::String(canonical_model_id.to_owned());
     }
+}
+
+/// The relay routers' answer to `max_tokens: 0`. The relay forwards a Messages
+/// request to the worker as sent and renders no prompt, so it cannot give the
+/// shape the public API's answer (an empty message carrying the prompt's token
+/// count, which the gateway gives where it renders the prompt itself); it
+/// keeps the 400 the request validation gave before, naming the field, rather
+/// than handing the engine a request that generates nothing.
+pub(crate) fn refuse_max_tokens_zero(body: &CreateMessageRequest) -> Option<Response> {
+    (body.max_tokens == 0).then(|| {
+        error::bad_request(
+            "max_tokens_zero_not_relayed",
+            "max_tokens: must be greater than 0 for this model, which is served through \
+             the HTTP relay: the relay forwards the request as sent and does not count \
+             the prompt",
+        )
+    })
 }
 
 #[cfg(test)]
