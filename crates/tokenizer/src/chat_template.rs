@@ -553,7 +553,8 @@ impl ThinkDetector {
         (detector.think_in_prefill, detector.prefill_opens_think_block)
     }
 
-    /// Check if an expression references a variable by name (walks through BinOp/UnaryOp).
+    /// Check if an expression references a variable by name (walks through
+    /// BinOp/UnaryOp/Test).
     fn expr_references_var(expr: &Expr, name: &str) -> bool {
         match expr {
             Expr::Var(v) => v.id == name,
