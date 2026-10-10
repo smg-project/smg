@@ -127,7 +127,7 @@ pub fn should_mark_reasoning_started(
     tokenizer: &dyn Tokenizer,
 ) -> bool {
     match tokenizer.thinking_toggle() {
-        ThinkingToggle::None => tokenizer.think_in_prefill(),
+        ThinkingToggle::None => tokenizer.prefill_opens_think_block(),
         ThinkingToggle::DefaultOn => user_thinking != Some(false),
         ThinkingToggle::DefaultOff => user_thinking == Some(true),
     }
@@ -524,6 +524,18 @@ mod tests {
         for user_thinking in [None, Some(true), Some(false)] {
             assert!(
                 should_mark_reasoning_started(user_thinking, &always_thinks),
+                "{user_thinking:?}"
+            );
+        }
+        // A non-thinking template without a switch writes an empty, closed
+        // think block: the tag is in the prefill, nothing is open.
+        let closed_block = MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::None)
+            .with_think_in_prefill(true)
+            .with_prefill_opens_think_block(false);
+        for user_thinking in [None, Some(true), Some(false)] {
+            assert!(
+                !should_mark_reasoning_started(user_thinking, &closed_block),
                 "{user_thinking:?}"
             );
         }

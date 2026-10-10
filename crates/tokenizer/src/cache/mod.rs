@@ -373,6 +373,10 @@ impl Tokenizer for CachedTokenizer {
         self.inner.think_in_prefill()
     }
 
+    fn prefill_opens_think_block(&self) -> bool {
+        self.inner.prefill_opens_think_block()
+    }
+
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
         self.inner.renderer_capabilities()
     }

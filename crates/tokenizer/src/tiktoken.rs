@@ -901,6 +901,15 @@ impl TokenizerTrait for TiktokenTokenizer {
         }
     }
 
+    fn prefill_opens_think_block(&self) -> bool {
+        match self.renderer {
+            // K3's generation-prompt tail opens `<think>` when thinking is on
+            // (the default), so completions start mid-reasoning.
+            Renderer::KimiK3Xtml => true,
+            _ => self.chat_template.prefill_opens_think_block(),
+        }
+    }
+
     fn renderer_capabilities(&self) -> RendererCapabilities {
         match self.renderer {
             // The K3 encoder parses `arguments` itself; the gateway forwards them as written.

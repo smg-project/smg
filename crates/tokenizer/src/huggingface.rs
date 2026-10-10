@@ -745,6 +745,16 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         }
     }
 
+    fn prefill_opens_think_block(&self) -> bool {
+        match self.renderer {
+            // All three native encoders emit `<｜Assistant｜><think>` at the end
+            // of the prompt when thinking mode is on; the completion therefore
+            // starts mid-reasoning and the parser must be told so.
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => true,
+            Renderer::Jinja => self.chat_template.prefill_opens_think_block(),
+        }
+    }
+
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
         match self.renderer {
             // The V4.1 shim honours the engine's `enable_thinking` alias, renders a
