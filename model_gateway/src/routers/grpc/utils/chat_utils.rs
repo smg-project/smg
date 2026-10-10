@@ -232,7 +232,7 @@ pub(crate) fn process_content_format(
     )
 }
 
-const REASONING_EFFORT_KEY: &str = "reasoning_effort";
+pub(super) const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const TOOL_CHOICE_KEY: &str = "tool_choice";
 const RESPONSE_FORMAT_KEY: &str = "response_format";
 
