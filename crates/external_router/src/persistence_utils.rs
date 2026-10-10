@@ -231,7 +231,7 @@ pub fn build_stored_response(
 }
 
 /// Extract and normalize input items from ResponseInput
-fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
+pub fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
     let items = match input {
         ResponseInput::Text(text) => {
             // Convert simple text to message item

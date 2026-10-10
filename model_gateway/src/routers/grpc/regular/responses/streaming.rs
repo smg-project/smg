@@ -62,7 +62,7 @@ use crate::{
                 utils::{
                     function_call_status, generation_failure_error, resolve_function_identity,
                 },
-                ResponsesContext,
+                BackgroundStream, ResponsesContext,
             },
             utils,
         },
@@ -86,8 +86,10 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     chat_request: Arc<ChatCompletionRequest>,
     params: ResponsesCallContext,
     original_request: &ResponsesRequest,
+    background: Option<BackgroundStream>,
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
+    let response_id = params.response_id;
 
     // Get chat streaming response
     let chat_response = ctx
@@ -126,15 +128,18 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let conversation_storage = ctx.conversation_storage.clone();
     let conversation_item_storage = ctx.conversation_item_storage.clone();
     let request_context = ctx.request_context.clone();
+    // A background stream's events go through a relay, so the work and its
+    // terminal record outlive a client that leaves.
+    let tx = match &background {
+        Some(_) => BackgroundStream::detach(tx),
+        None => tx,
+    };
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "streaming task is fire-and-forget; client disconnect terminates it"
-    )]
-    tokio::spawn(async move {
+    let transform = async move {
         if let Err(e) = process_and_transform_sse_stream(
             body,
             original_request_clone,
+            response_id,
             response_storage,
             conversation_storage,
             conversation_item_storage,
@@ -146,7 +151,21 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             warn!("Error transforming SSE stream: {}", e);
             utils::send_error_sse(&tx, &e, "stream_error").await;
         }
-    });
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "streaming task is fire-and-forget; client disconnect terminates it unless it runs a background response, whose slot bounds it"
+    )]
+    match background {
+        Some(run) => {
+            let storage = ctx.response_storage.clone();
+            let request_context = ctx.request_context.clone();
+            tokio::spawn(run.run(storage, request_context, transform));
+        }
+        None => {
+            tokio::spawn(transform);
+        }
+    }
 
     // Build SSE response with transformed stream
     build_sse_response(rx)
@@ -166,9 +185,14 @@ fn sse_events(frame: &str) -> impl Iterator<Item = &str> {
 }
 
 /// Process chat SSE stream and transform to responses format
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stream transform takes the storage handles and the pre-stored id of a background response"
+)]
 async fn process_and_transform_sse_stream(
     body: Body,
     original_request: ResponsesRequest,
+    response_id: Option<String>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -178,19 +202,29 @@ async fn process_and_transform_sse_stream(
     // Create accumulator for final response
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
 
-    // Create event emitter for OpenAI-compatible streaming
-    let response_id = format!("resp_{}", Uuid::now_v7());
+    // Create event emitter for OpenAI-compatible streaming; a background
+    // response streams under the id its queued record was stored under.
+    let response_id = response_id.unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id.clone(), model, created_at);
     event_emitter.set_original_request(original_request.clone());
 
-    // Emit initial response.created and response.in_progress events
+    // Emit initial response.created and response.in_progress events (a
+    // background stream reports response.queued between the two)
     let event = event_emitter.emit_created();
     event_emitter
         .send_event(&event, &tx)
         .await
         .map_err(|_| "Failed to send response.created event".to_string())?;
+
+    if original_request.background.unwrap_or(false) {
+        let event = event_emitter.emit_queued();
+        event_emitter
+            .send_event(&event, &tx)
+            .await
+            .map_err(|_| "Failed to send response.queued event".to_string())?;
+    }
 
     let event = event_emitter.emit_in_progress();
     event_emitter
@@ -533,6 +567,7 @@ pub(super) async fn execute_tool_loop_streaming(
     original_request: &ResponsesRequest,
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
+    background: Option<BackgroundStream>,
 ) -> Response {
     // Create SSE channel for client
     let (tx, rx) = sse_channel();
@@ -541,13 +576,14 @@ pub(super) async fn execute_tool_loop_streaming(
     // Clone data for background task
     let ctx_clone = ctx.clone();
     let original_request_clone = original_request.clone();
+    // A background stream's events go through a relay, so the work and its
+    // terminal record outlive a client that leaves.
+    let tx = match &background {
+        Some(_) => BackgroundStream::detach(tx),
+        None => tx,
+    };
 
-    // Spawn background task for tool loop
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "streaming task is fire-and-forget; client disconnect terminates it"
-    )]
-    tokio::spawn(async move {
+    let tool_loop = async move {
         let result = execute_tool_loop_streaming_internal(
             &ctx_clone,
             current_request,
@@ -563,7 +599,22 @@ pub(super) async fn execute_tool_loop_streaming(
             warn!("Streaming tool loop error: {}", e);
             utils::send_error_sse(&tx, &e, "tool_loop_error").await;
         }
-    });
+    };
+    // Spawn background task for tool loop
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "streaming task is fire-and-forget; client disconnect terminates it unless it runs a background response, whose slot bounds it"
+    )]
+    match background {
+        Some(run) => {
+            let storage = ctx.response_storage.clone();
+            let request_context = ctx.request_context.clone();
+            tokio::spawn(run.run(storage, request_context, tool_loop));
+        }
+        None => {
+            tokio::spawn(tool_loop);
+        }
+    }
 
     await_stream_startup(startup_rx, rx).await
 }
@@ -582,7 +633,11 @@ async fn execute_tool_loop_streaming_internal(
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session
-    let response_id = format!("resp_{}", Uuid::now_v7());
+    // (a background response streams under the id its queued record holds)
+    let response_id = params
+        .response_id
+        .clone()
+        .unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
 
     // Create session once — bundles orchestrator, request_ctx, server_keys, mcp_tools
     let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &response_id);
@@ -596,9 +651,14 @@ async fn execute_tool_loop_streaming_internal(
         ResponseStreamEventEmitter::new(response_id, current_request.model.clone(), created_at);
     emitter.set_original_request(original_request.clone());
 
-    // Emit initial response.created and response.in_progress events
+    // Emit initial response.created and response.in_progress events (a
+    // background stream reports response.queued between the two)
     let event = emitter.emit_created();
     emitter.send_event(&event, &tx).await?;
+    if original_request.background.unwrap_or(false) {
+        let event = emitter.emit_queued();
+        emitter.send_event(&event, &tx).await?;
+    }
     let event = emitter.emit_in_progress();
     emitter.send_event(&event, &tx).await?;
 
@@ -1355,6 +1415,7 @@ mod tests {
                 store: Some(false),
                 ..Default::default()
             },
+            None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
@@ -1658,6 +1719,7 @@ mod tests {
                 store: Some(false),
                 ..Default::default()
             },
+            None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),

@@ -121,6 +121,7 @@ impl ResponsesResponseBuilder {
         self.frequency_penalty = request.frequency_penalty;
         self.presence_penalty = request.presence_penalty;
         self.store = request.store.unwrap_or(true);
+        self.background = request.background;
         // ResponsesResponse stores `conversation` as a plain `Option<String>`
         // (response side per spec is `optional { id }` only); flatten the
         // request's union-typed reference down to its underlying id string.
@@ -545,6 +546,27 @@ mod tests {
             !body.contains_key("conversation"),
             "an unlinked response omits conversation"
         );
+    }
+
+    #[test]
+    fn background_is_echoed_from_the_request() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi", "background": true
+        }))
+        .unwrap();
+        let response = ResponsesResponse::builder("resp_bg", "m")
+            .copy_from_request(&request)
+            .status(ResponseStatus::Queued)
+            .build();
+        assert_eq!(response.background, Some(true));
+        assert_eq!(response.status, ResponseStatus::Queued);
+        assert!(response.completed_at.is_none(), "queued is not terminal");
+        assert!(response.usage.is_none());
+        assert!(response.output.is_empty());
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["status"], "queued");
+        assert_eq!(wire["background"], true);
+        assert_eq!(wire["usage"], Value::Null);
     }
 
     #[test]

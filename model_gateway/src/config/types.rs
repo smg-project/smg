@@ -308,6 +308,11 @@ pub struct RouterConfig {
     /// `max_concurrent_requests`, which keeps bounding standing concurrency.
     /// Unset or 0 = no rate limit.
     pub rate_limit_tokens_per_second: Option<i32>,
+    /// Most Responses API requests with `background: true` in flight at
+    /// once; one beyond answers 429. 0 switches background mode off: such
+    /// requests then run in the foreground, as every other request does.
+    #[serde(default = "default_max_background_responses")]
+    pub max_background_responses: usize,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior
     /// change for existing deployments.
@@ -529,6 +534,10 @@ fn default_pd_admission_wait_secs() -> u64 {
 
 const fn default_disabled_limit() -> i32 {
     -1
+}
+
+const fn default_max_background_responses() -> usize {
+    1024
 }
 
 pub const DEFAULT_PREFILL_QUEUE_SIZE: usize = 100;
@@ -1514,6 +1523,7 @@ impl Default for RouterConfig {
             prefill_queue_size: None,
             prefill_queue_timeout_secs: None,
             rate_limit_tokens_per_second: None,
+            max_background_responses: default_max_background_responses(),
             priority_scheduler_enabled: false,
             priority_scheduler_default_max_class: default_priority_scheduler_max_class(),
             priority_scheduler_config: None,

@@ -16,12 +16,14 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
-use tracing::debug;
+use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::{
     common::{
         responses::{
-            handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+            background, handlers::cancel_response_impl, utils::validate_worker_availability,
+            BackgroundResponses, BackgroundStream, ResponsesContext,
         },
         stages::{RateLimitCell, RateLimitOutcome},
     },
@@ -179,6 +181,11 @@ impl GrpcRouter {
 
             // Capture storage request context from middleware task-local (before any spawn)
             let storage_request_context = smg_data_connector::current_request_context();
+            // One registry of background responses for both contexts: one cap,
+            // one place a cancel looks a running id up.
+            let background_responses = Arc::new(BackgroundResponses::new(
+                ctx.router_config.max_background_responses,
+            ));
 
             // Helper closure to create responses context with a given pipeline
             let create_responses_context = |pipeline: &RequestPipeline| {
@@ -191,6 +198,7 @@ impl GrpcRouter {
                     mcp_orchestrator.clone(),
                     ctx.mcp_format_registry.clone(),
                     storage_request_context.clone(),
+                    background_responses.clone(),
                 )
             };
 
@@ -397,30 +405,55 @@ impl GrpcRouter {
         let is_harmony =
             HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
 
+        // `background: true` answers the queued object at once and runs the
+        // work behind the response id; with the mode switched off such a
+        // request runs in the foreground, and its object says so.
+        let mut body = body.into_owned();
+        if body.background == Some(true) {
+            if responses_context.background.enabled() {
+                let request_context = smg_data_connector::current_request_context();
+                let ctx = if is_harmony {
+                    self.harmony_responses_context(
+                        harmony_pipeline,
+                        harmony_responses_context,
+                        request_context,
+                    )
+                } else {
+                    ResponsesContext {
+                        request_context,
+                        ..responses_context.clone()
+                    }
+                };
+                return self
+                    .route_background_responses(
+                        &ctx,
+                        is_harmony,
+                        headers,
+                        tenant_meta,
+                        body,
+                        model_id,
+                    )
+                    .await;
+            }
+            body.background = None;
+        }
+
         if is_harmony {
             debug!(
                 "Processing Harmony responses request for model: {}, streaming: {}",
                 model_id,
                 body.stream.unwrap_or(false)
             );
-            let harmony_ctx = ResponsesContext::new(
-                Arc::new(harmony_pipeline.clone()),
-                self.shared_components.clone(),
-                harmony_responses_context.response_storage.clone(),
-                harmony_responses_context.conversation_storage.clone(),
-                harmony_responses_context.conversation_item_storage.clone(),
-                harmony_responses_context.mcp_orchestrator.clone(),
-                harmony_responses_context.mcp_format_registry.clone(),
+            let harmony_ctx = self.harmony_responses_context(
+                harmony_pipeline,
+                harmony_responses_context,
                 smg_data_connector::current_request_context(),
             );
 
             if body.stream.unwrap_or(false) {
-                serve_harmony_responses_stream(&harmony_ctx, body.into_owned(), tenant_meta.clone())
-                    .await
+                serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
             } else {
-                match serve_harmony_responses(&harmony_ctx, body.into_owned(), tenant_meta.clone())
-                    .await
-                {
+                match serve_harmony_responses(&harmony_ctx, body, tenant_meta.clone(), None).await {
                     Ok(response) => axum::Json(response).into_response(),
                     Err(error_response) => error_response,
                 }
@@ -428,13 +461,140 @@ impl GrpcRouter {
         } else {
             responses::route_responses(
                 responses_context,
-                Arc::new(body.into_owned()),
+                Arc::new(body),
                 headers.cloned(),
                 tenant_meta.clone(),
                 model_id.to_string(),
             )
             .await
         }
+    }
+
+    /// The per-request context of the Harmony Responses path: the Harmony
+    /// pipeline with the shared storage and MCP handles and this request's
+    /// storage context.
+    fn harmony_responses_context(
+        &self,
+        harmony_pipeline: &RequestPipeline,
+        harmony_responses_context: &ResponsesContext,
+        request_context: Option<smg_data_connector::RequestContext>,
+    ) -> ResponsesContext {
+        ResponsesContext::new(
+            Arc::new(harmony_pipeline.clone()),
+            self.shared_components.clone(),
+            harmony_responses_context.response_storage.clone(),
+            harmony_responses_context.conversation_storage.clone(),
+            harmony_responses_context.conversation_item_storage.clone(),
+            harmony_responses_context.mcp_orchestrator.clone(),
+            harmony_responses_context.mcp_format_registry.clone(),
+            request_context,
+            harmony_responses_context.background.clone(),
+        )
+    }
+
+    /// `background: true`: the `queued` Response object is stored under a new
+    /// id and answered (or streamed) at once; the work runs in a task of its
+    /// own behind that id, on the Harmony or the regular path. One beyond
+    /// the configured number in flight answers 429.
+    async fn route_background_responses(
+        &self,
+        ctx: &ResponsesContext,
+        is_harmony: bool,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        request: ResponsesRequest,
+        model_id: &str,
+    ) -> Response {
+        let id = format!("resp_{}", Uuid::now_v7());
+        let Some(slot) = ctx.background.admit(&id) else {
+            warn!(
+                in_flight = ctx.background.in_flight(),
+                max_in_flight = ctx.background.max_in_flight(),
+                "Background response refused: the limit is reached"
+            );
+            return background::limit_reached(ctx.background.max_in_flight());
+        };
+        let request = Arc::new(request);
+        let queued = background::queued_response(&id, &request);
+        if let Err(e) = background::store_record(
+            &ctx.response_storage,
+            &queued,
+            &request,
+            ctx.request_context.clone(),
+        )
+        .await
+        {
+            return error::internal_error(
+                "store_response_failed",
+                format!("Failed to store the queued response: {e}"),
+            );
+        }
+        debug!(response_id = %id, harmony = is_harmony, "Background response queued");
+
+        let tenant_meta = tenant_meta.clone();
+        let headers = headers.cloned();
+        let model_id = model_id.to_string();
+        if request.stream.unwrap_or(false) {
+            let stream = BackgroundStream::new(slot);
+            return if is_harmony {
+                serve_harmony_responses_stream(
+                    ctx,
+                    Arc::unwrap_or_clone(request),
+                    tenant_meta,
+                    Some(stream),
+                )
+                .await
+            } else {
+                responses::route_responses_background_stream(
+                    ctx,
+                    request,
+                    headers,
+                    tenant_meta,
+                    model_id,
+                    stream,
+                )
+                .await
+            };
+        }
+
+        if is_harmony {
+            background::spawn(
+                ctx.clone(),
+                slot,
+                request,
+                Box::new(move |ctx, request| {
+                    Box::pin(async move {
+                        serve_harmony_responses(
+                            ctx,
+                            Arc::unwrap_or_clone(request),
+                            tenant_meta,
+                            Some(id),
+                        )
+                        .await
+                    })
+                }),
+            );
+        } else {
+            background::spawn(
+                ctx.clone(),
+                slot,
+                request,
+                Box::new(move |ctx, request| {
+                    Box::pin(async move {
+                        responses::route_responses_background(
+                            ctx,
+                            request,
+                            headers,
+                            tenant_meta,
+                            model_id,
+                            id,
+                        )
+                        .await
+                    })
+                }),
+            );
+        }
+        (StatusCode::OK, axum::Json(queued)).into_response()
     }
 
     /// Main route_embeddings implementation

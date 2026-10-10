@@ -339,6 +339,10 @@ class RouterArgs:
     # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory);
     # appended last for the same reason
     tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
+    # Most Responses API requests with background: true in flight at once;
+    # one beyond answers 429. 0 = background mode off (such requests run in
+    # the foreground); appended last for the same reason
+    max_background_responses: int = 1024
 
     @staticmethod
     def add_cli_args(
@@ -1523,6 +1527,16 @@ class RouterArgs:
                 "Sustained admission rate in requests per second, bursting up"
                 " to --max-concurrent-requests, which keeps bounding standing"
                 " concurrency. Unset or 0 = no rate limit."
+            ),
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-background-responses",
+            type=int,
+            default=RouterArgs.max_background_responses,
+            help=(
+                "Most Responses API requests with background: true in flight"
+                " at once; one beyond answers 429. 0 switches background mode"
+                " off: such requests then run in the foreground."
             ),
         )
 

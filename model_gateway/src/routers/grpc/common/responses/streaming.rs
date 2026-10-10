@@ -149,6 +149,9 @@ pub(crate) struct ResponseStreamEventEmitter {
     /// Chat `finish_reason` of the final chunk, e.g. `"length"` for a
     /// `max_output_tokens` truncation. Drives the terminal event's status.
     finish_reason: Option<String>,
+    /// The response runs in the background: `response.created` reports it
+    /// `queued`, `response.queued` follows, and the objects echo the flag.
+    background: bool,
 }
 
 /// Streaming state for the reasoning output item of the current turn.
@@ -179,11 +182,13 @@ impl ResponseStreamEventEmitter {
             tool_call_items: Vec::new(),
             reasoning_item: None,
             finish_reason: None,
+            background: false,
         }
     }
 
     /// Set the original request for including all fields in response.completed
     pub fn set_original_request(&mut self, request: ResponsesRequest) {
+        self.background = request.background.unwrap_or(false);
         self.original_request = Some(request);
     }
 
@@ -239,9 +244,25 @@ impl ResponseStreamEventEmitter {
                 "id": self.response_id,
                 "object": "response",
                 "created_at": self.created_at,
-                "status": "in_progress",
+                "status": if self.background { "queued" } else { "in_progress" },
+                "background": self.background,
                 "model": self.model,
                 "output": []
+            }
+        })
+    }
+
+    /// The event after `response.created` on a background stream: the
+    /// response is accepted and waits for its turn.
+    pub fn emit_queued(&mut self) -> serde_json::Value {
+        json!({
+            "type": ResponseEvent::QUEUED,
+            "sequence_number": self.next_sequence(),
+            "response": {
+                "id": self.response_id,
+                "object": "response",
+                "status": "queued",
+                "background": true
             }
         })
     }
@@ -375,6 +396,7 @@ impl ResponseStreamEventEmitter {
             "object": "response",
             "created_at": self.created_at,
             "status": if failed { "failed" } else if truncated { "incomplete" } else { "completed" },
+            "background": self.background,
             "model": self.model,
             "output": output
         });

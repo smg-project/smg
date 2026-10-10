@@ -3060,8 +3060,10 @@ pub struct ResponsesRequest {
     pub include: Option<Vec<IncludeField>>,
 
     /// Run the response in the background. Spec: body param `background`.
-    /// Accepted so a client that sets it is not rejected as sending an
-    /// unknown parameter; the gateway still generates in the foreground.
+    /// The request answers at once with a `queued` Response object that is
+    /// polled with `GET /v1/responses/{id}` and cancelled with
+    /// `POST /v1/responses/{id}/cancel`; it needs the response stored
+    /// (`store` true or omitted), as an unstored response could not be polled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<bool>,
 
@@ -3593,6 +3595,18 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
     //    can constrain (see `profile::is_openai_vendor_model`).
     if is_openai_vendor_model(&request.model) {
         validate_openai_structured_output_rules(request)?;
+    }
+
+    // 5. A background response is answered before it is generated and read
+    //    back by polling, which needs it stored: `store: false` has nothing
+    //    to poll, so it is refused as the public API refuses it.
+    if request.background == Some(true) && request.store == Some(false) {
+        let mut e = ValidationError::new("invalid_value");
+        e.message = Some(
+            "Invalid 'store': background mode requires the response to be stored. Set 'store' to true or omit it when 'background' is true."
+                .into(),
+        );
+        return Err(e);
     }
 
     // Tool-result-only continuations are valid; validate_response_input checks
