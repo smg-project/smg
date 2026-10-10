@@ -60,7 +60,7 @@ def test_pd_default_spawns_all_legs_before_waiting(fleet):
     ]
     assert all(event[2] is False for event in events[:4])
     assert [event[1].gpu_ids for event in events[:4]] == [[0], [1], [2], [3]]
-    assert [event[2] for event in events[4:8]] == [6, 5, 4, 3]
+    assert [event[2] for event in events[4:8]] == [10, 9, 8, 7]
     backend.close()
     assert [event[0] for event in events[-5:]] == ["shutdown"] + ["stop"] * 4
 
@@ -74,19 +74,42 @@ def test_pd_explicit_false_retains_serial_escape_hatch(fleet):
     backend.close()
 
 
-def test_pd_launch_phase_uses_the_shared_deadline(fleet, monkeypatch):
+def test_pd_previous_pool_cleanup_does_not_consume_readiness_budget(fleet, monkeypatch):
     events, clock, create = fleet
     start = setup._start_workers_tracked
 
     def slow_start(**kwargs):
+        # Pool acquisition can stop old workers before spawning replacements.
+        clock[0] += 80
         workers = start(**kwargs)
-        clock[0] += 5
         return workers
 
     monkeypatch.setattr(setup, "_start_workers_tracked", slow_start)
+    backend = create()
+    next(backend)
+    assert len([event for event in events if event[0] == "ready"]) == 4
+    assert setup._worker_start_failures == {}
+    backend.close()
+
+
+def test_pd_expired_readiness_deadline_stops_the_fleet(fleet, monkeypatch):
+    events, clock, create = fleet
+    start = setup._start_workers_tracked
+
+    def slow_ready_start(**kwargs):
+        workers = start(**kwargs)
+
+        def ready(timeout):
+            events.append(("ready", workers[0], timeout))
+            clock[0] += timeout
+
+        workers[0].wait_ready = ready
+        return workers
+
+    monkeypatch.setattr(setup, "_start_workers_tracked", slow_ready_start)
     with pytest.raises(TimeoutError):
         next(create())
-    assert [event[0] for event in events] == ["start"] * 4 + ["shutdown"] + ["stop"] * 4
+    assert [event[0] for event in events] == ["start"] * 4 + ["ready", "shutdown"] + ["stop"] * 4
     assert setup._worker_start_failures == {"vllm": 1}
 
 

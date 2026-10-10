@@ -43,8 +43,7 @@ def test_workers_load_before_any_readiness_wait(launch):
     assert [event[0] for event in events] == ["start", "start", "ready", "ready"]
     assert [event[1] for event in events[:2]] == workers
     assert all(event[3] is False for event in events[:2])
-    # Time used for spawning and waiting is charged to the same fleet bound.
-    assert [event[2] for event in events[2:]] == [8, 4]
+    assert [event[2] for event in events[2:]] == [10, 6]
 
 
 def test_gpu_assignment_and_launch_configuration_are_preserved(launch, monkeypatch):
@@ -85,7 +84,30 @@ def test_launch_stagger_remains_but_does_not_wait_for_health(launch, monkeypatch
     worker_module.start_workers("model", engine="vllm", count=2, timeout=10)
 
     assert [event[0] for event in events] == ["start", "sleep", "start", "ready", "ready"]
-    assert [event[2] for event in events if event[0] == "ready"] == [6, 2]
+    assert [event[2] for event in events if event[0] == "ready"] == [10, 6]
+
+
+def test_later_workers_get_the_full_load_budget_after_staggering(launch, monkeypatch):
+    _, clock = launch
+
+    def start(worker, timeout, wait_ready):
+        worker.ready_at = clock[0] + 295
+
+    def ready(worker, timeout):
+        if worker.ready_at - clock[0] > timeout:
+            raise TimeoutError("load budget shortened by launch staggering")
+        clock[0] = max(clock[0], worker.ready_at)
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(worker_module.Worker, "start", start)
+    monkeypatch.setattr(worker_module.Worker, "wait_ready", ready)
+    monkeypatch.setattr(worker_module, "LAUNCH_STAGGER_DELAY", 10)
+    monkeypatch.setattr(worker_module.time, "sleep", sleep)
+    workers = worker_module.start_workers("model", engine="vllm", count=4, timeout=300)
+    assert len(workers) == 4
+    assert clock[0] == 425
 
 
 def test_spawn_only_leaves_readiness_to_the_caller(launch):
@@ -117,13 +139,19 @@ def test_failure_stops_every_attempted_worker(launch, monkeypatch, phase):
     assert len(stopped) == 2
 
 
-def test_expired_fleet_deadline_cleans_up_without_another_wait(launch):
-    events, _ = launch
+def test_expired_fleet_deadline_cleans_up_without_another_wait(launch, monkeypatch):
+    events, clock = launch
+
+    def ready(worker, timeout):
+        events.append(("ready", worker, timeout))
+        clock[0] += timeout
+
+    monkeypatch.setattr(worker_module.Worker, "wait_ready", ready)
     with pytest.raises(TimeoutError, match="within 5s"):
         worker_module.start_workers("model", engine="vllm", count=2, timeout=5)
 
     assert [event[0] for event in events] == ["start", "start", "ready", "stop", "stop"]
-    assert events[2][2] == 3
+    assert events[2][2] == 5
 
 
 def test_model_timeout_and_environment_floor_apply_to_whole_fleet(launch, monkeypatch):
@@ -132,4 +160,4 @@ def test_model_timeout_and_environment_floor_apply_to_whole_fleet(launch, monkey
     monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "30")
     worker_module.start_workers("model", engine="vllm", count=2, timeout=10)
     assert [event[2] for event in events[:2]] == [30, 30]
-    assert [event[2] for event in events[2:]] == [28, 24]
+    assert [event[2] for event in events[2:]] == [30, 26]

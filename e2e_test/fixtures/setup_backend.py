@@ -560,9 +560,6 @@ def _setup_pd(
     prefill_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("prefill_args"))
     decode_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("decode_args"))
     all_workers: list = []
-    deadline = time.monotonic() + effective_startup_timeout(
-        spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
-    )
     try:
         prefill_workers = _start_pd_leg(
             model_id=model_id,
@@ -604,6 +601,11 @@ def _setup_pd(
             # a user launching a fleet does.
             # One deadline for the fleet, and a failed load still counts toward
             # the session's fail-fast budget as it does on the sequential path.
+            # Evicting the previous pool and staggering new launches must not
+            # consume the replacement fleet's readiness budget.
+            deadline = time.monotonic() + effective_startup_timeout(
+                spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            )
             try:
                 for worker in all_workers:
                     remaining = deadline - time.monotonic()

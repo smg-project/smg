@@ -898,7 +898,6 @@ def start_workers(
     ib_device = detect_ib_device() if has_pd else None
 
     workers: list[Worker] = []
-    deadline = time.monotonic() + timeout
 
     try:
         for i in range(count):
@@ -944,6 +943,8 @@ def start_workers(
             # instead of holding later workers' GPUs idle during this wait.
             worker.start(timeout=timeout, wait_ready=False)
         if wait_ready:
+            # Launch staggering must not shorten the last worker's load budget.
+            deadline = time.monotonic() + timeout
             for worker in workers:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
