@@ -759,6 +759,15 @@ jobs:
             timeout: 32
             test_timeout: 24
             min_selected: 202 # the vllm chat row's floor: the same selection
+          # The TokenSpeed chat suite on the Rust servicer: the suite, floor
+          # and budgets of e2e-1gpu-chat's tokenspeed row (its prebuilt engine
+          # image, or the source build on a cold path, hence the budget), so
+          # the two rows differ by the servicer only. The admin-op and loads
+          # cases of that row stay on the Python servicer's row.
+          - engine: tokenspeed
+            timeout: 56
+            test_timeout: 26
+            min_selected: 114 # the tokenspeed chat row's floor: the same selection
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
