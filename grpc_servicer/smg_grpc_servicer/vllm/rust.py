@@ -64,11 +64,13 @@ from smg_grpc_servicer.rust_lifecycle import (
 from smg_grpc_servicer.rust_lifecycle import env_float as _env_float
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
+    engine_reasoning_parser,
     eos_token_ids_with_generation_config,
     mm_device_do_normalize,
     mm_item_limits,
     model_facts,
     server_facts,
+    structured_outputs_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,6 +140,8 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
         "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
         "mm_item_limits": mm_item_limits(vllm_config),
+        "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
+        "structured_outputs_start": structured_outputs_start(vllm_config),
     }
 
 

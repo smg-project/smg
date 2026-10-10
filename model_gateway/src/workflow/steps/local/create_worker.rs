@@ -1365,6 +1365,56 @@ mod tests {
         assert_eq!(card.reasoning_parser.as_deref(), Some("basic"));
     }
 
+    /// An engine's own reasoning parser rides in its own label
+    /// (`engine_reasoning_parser`), not in `reasoning_parser`, the per-model
+    /// parser override registration validates against the gateway's registry:
+    /// the engine's parser names are the engine's (`openai_gptoss`, `kimi_k2`),
+    /// which the gateway may not have, and a shared name must not outrank the
+    /// configured `--reasoning-parser`. Such a worker registers, its card
+    /// carries no override, and its grammar start reads as advertised.
+    #[test]
+    fn an_engines_advertised_reasoning_parser_is_not_a_parser_override() {
+        use tool_parser::GrammarStart;
+
+        use crate::routers::grpc::client::ServerInfo;
+
+        let tool_factory = tool_parser::ParserFactory::default();
+        let reasoning_factory = reasoning_parser::ParserFactory::default();
+        let spec = WorkerSpec::new("grpc://engine:50051");
+        for name in ["openai_gptoss", "kimi_k2", "qwen3", "glm45"] {
+            let info = ServerInfo::Vllm(Box::new(
+                smg_grpc_client::vllm_proto::GetServerInfoResponse {
+                    engine_reasoning_parser: name.to_string(),
+                    structured_outputs_start: "after_reasoning".to_string(),
+                    ..Default::default()
+                },
+            ));
+            let labels = info.to_labels();
+            assert_eq!(
+                labels.get("engine_reasoning_parser").map(String::as_str),
+                Some(name)
+            );
+            let card = build_model_card("m", &spec, &labels, &HashMap::new());
+            assert_eq!(
+                card.reasoning_parser, None,
+                "{name}: no override from the engine's fact"
+            );
+            assert_eq!(card.tool_parser, None);
+            validate_parser_overrides(
+                &card,
+                "grpc://engine:50051",
+                Some(&tool_factory),
+                Some(&reasoning_factory),
+            )
+            .unwrap_or_else(|e| panic!("{name}: the worker must register: {e}"));
+            assert_eq!(
+                GrammarStart::from_label(labels.get(GrammarStart::LABEL).map(String::as_str)),
+                GrammarStart::AfterReasoning,
+                "{name}: the grammar start reads as advertised"
+            );
+        }
+    }
+
     #[test]
     fn unknown_parser_override_fails_validation() {
         let tool_factory = tool_parser::ParserFactory::default();

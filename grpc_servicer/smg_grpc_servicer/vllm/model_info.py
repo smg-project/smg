@@ -173,6 +173,44 @@ def running_window(vllm_config: Any) -> int:
     return int(window)
 
 
+def engine_reasoning_parser(vllm_config: Any) -> str:
+    """The engine's reasoning parser (``--reasoning-parser``), as its
+    structured-outputs config carries it, for the ``engine_reasoning_parser``
+    label (a name of its own: ``reasoning_parser`` is the per-model parser
+    override the Router reads off a worker's labels); "" when the engine runs
+    none or the config has no such section."""
+    structured = getattr(vllm_config, "structured_outputs_config", None)
+    return str(getattr(structured, "reasoning_parser", None) or "")
+
+
+# The `structured_outputs_start` label's values: where the engine starts a
+# request's grammar on a prompt that ends inside the model's thinking block.
+STRUCTURED_OUTPUTS_AFTER_REASONING = "after_reasoning"
+STRUCTURED_OUTPUTS_FIRST_TOKEN = "first_token"
+# A config attribute that is not there at all, as opposed to one set to "".
+_UNKNOWN = object()
+
+
+def structured_outputs_start(vllm_config: Any) -> str:
+    """Where the engine starts a request's grammar on a thinking prompt, as the
+    ``structured_outputs_start`` label the Router shapes a forced tool call's
+    grammar by. vLLM's structured-output manager holds a grammar back until
+    its reasoning parser has seen the thought's end when a reasoning parser is
+    set and ``enable_in_reasoning`` is off (``after_reasoning``); otherwise the
+    grammar runs from the first generated token (``first_token``). "" when
+    the config has no structured-outputs section, or one without the reasoning
+    parser attribute, which leaves the Router to the shape that fits either
+    kind of engine."""
+    structured = getattr(vllm_config, "structured_outputs_config", None)
+    parser = getattr(structured, "reasoning_parser", _UNKNOWN)
+    if parser is _UNKNOWN:
+        # No section, or one that predates the reasoning parser: unknown.
+        return ""
+    if parser and not getattr(structured, "enable_in_reasoning", False):
+        return STRUCTURED_OUTPUTS_AFTER_REASONING
+    return STRUCTURED_OUTPUTS_FIRST_TOKEN
+
+
 def server_facts(vllm_config: Any) -> dict[str, Any]:
     """`GetServerInfo`'s config-derived fields, keyed as the proto names them:
     the PD identity and pairing facts, the data-parallel size, the running

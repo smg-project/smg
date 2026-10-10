@@ -13,11 +13,11 @@ use openai_protocol::{
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
 use tool_parser::{
-    ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
+    GrammarStart, ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
 };
 use tracing::warn;
 
-use crate::worker::WorkerRegistry;
+use crate::{routers::grpc::context::WorkerSelection, worker::WorkerRegistry};
 
 /// Per-request parser-name resolution.
 ///
@@ -323,6 +323,55 @@ pub fn messages_reasoning_starts_in_prefill(
     should_mark_reasoning_started(user_thinking, tokenizer)
 }
 
+/// Where the selected worker's engine starts a request's grammar on a prompt
+/// that ends inside the model's thinking block, from its
+/// `structured_outputs_start` label (the servicers advertise it off the
+/// engine's config); under PD the decode worker's, whose engine generates the
+/// tokens the grammar constrains. Unknown without a selection or a label.
+pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {
+    let worker = match workers {
+        Some(WorkerSelection::Single { worker }) => worker,
+        Some(WorkerSelection::Disaggregated { decode, .. }) => decode,
+        None => return GrammarStart::Unknown,
+    };
+    GrammarStart::from_label(
+        worker
+            .metadata()
+            .spec
+            .labels
+            .get(GrammarStart::LABEL)
+            .map(String::as_str),
+    )
+}
+
+/// The request's tool constraint, shaped for the worker that will run it. A
+/// forced call's structural tag built on a thinking prompt opens with free
+/// text that fits either kind of engine (`ParserRegistry::generate_tool_constraint`);
+/// once the worker is known it takes the one shape its engine needs
+/// (`ParserRegistry::structural_tag_for_grammar_start`): the bare calls for an
+/// engine that starts the grammar after its reasoning parser's gate, so the
+/// call is forced right there as the engine's own server does, the thought
+/// block and then the calls for an engine that starts it at the first token.
+/// A worker that does not say, a JSON-schema constraint and a tag without the
+/// prefix pass through unchanged.
+pub fn tool_constraints_for_worker(
+    tool_parser_factory: &ToolParserFactory,
+    configured_parser: Option<&str>,
+    tool_constraints: Option<(String, String)>,
+    workers: Option<&WorkerSelection>,
+) -> Result<Option<(String, String)>, String> {
+    let Some((kind, value)) = tool_constraints else {
+        return Ok(None);
+    };
+    if kind != "structural_tag" {
+        return Ok(Some((kind, value)));
+    }
+    let shaped = tool_parser_factory
+        .registry()
+        .structural_tag_for_grammar_start(configured_parser, &value, grammar_start_for(workers))?;
+    Ok(Some((kind, shaped.unwrap_or(value))))
+}
+
 /// Resolve the user's effective thinking preference: the answer of a
 /// renderer that resolves the mode by its own rule, else the generic
 /// precedence of [`resolve_thinking_pref`].
@@ -495,7 +544,133 @@ pub(crate) fn create_tool_parser(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
+    use tool_parser::ToolConstraint;
+
     use super::*;
+    use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+    fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
+        let mut builder =
+            BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        WorkerSelection::Single {
+            worker: Arc::new(builder.build()),
+        }
+    }
+
+    fn forced_call_on_a_thinking_prompt(factory: &ToolParserFactory) -> (String, String) {
+        let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
+        }]))
+        .unwrap();
+        let required = ToolChoice::Value(ToolChoiceValue::Required);
+        match factory
+            .registry()
+            .generate_tool_constraint(Some("glm47_moe"), &tools, &required, true)
+            .unwrap()
+        {
+            Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
+            other => panic!("expected a structural tag, got {other:?}"),
+        }
+    }
+
+    /// The worker's `structured_outputs_start` label names where its engine
+    /// starts the grammar; no selection, no label or another value is unknown.
+    #[test]
+    fn grammar_start_comes_from_the_workers_label() {
+        assert_eq!(grammar_start_for(None), GrammarStart::Unknown);
+        assert_eq!(grammar_start_for(Some(&worker(&[]))), GrammarStart::Unknown);
+        assert_eq!(
+            grammar_start_for(Some(&worker(&[(
+                "structured_outputs_start",
+                "after_reasoning"
+            )]))),
+            GrammarStart::AfterReasoning
+        );
+        assert_eq!(
+            grammar_start_for(Some(&worker(&[(
+                "structured_outputs_start",
+                "first_token"
+            )]))),
+            GrammarStart::FirstToken
+        );
+        assert_eq!(
+            grammar_start_for(Some(&worker(&[("structured_outputs_start", "later")]))),
+            GrammarStart::Unknown
+        );
+    }
+
+    /// A forced call's tag on a thinking prompt takes the shape the selected
+    /// worker's engine needs: the bare calls behind a reasoning parser's gate,
+    /// the thought block then the calls from the first token, and the
+    /// free-text prefix it was built with where the worker does not say.
+    #[test]
+    fn tool_constraints_take_the_shape_the_workers_engine_needs() {
+        let factory = ToolParserFactory::new();
+        let parser = Some("glm47_moe");
+        let built = forced_call_on_a_thinking_prompt(&factory);
+        let built_tag: Value = serde_json::from_str(&built.1).unwrap();
+        assert_eq!(built_tag["format"]["type"], "sequence");
+
+        let shape = |labels: &[(&str, &str)]| -> Value {
+            let (kind, value) = tool_constraints_for_worker(
+                &factory,
+                parser,
+                Some(built.clone()),
+                Some(&worker(labels)),
+            )
+            .unwrap()
+            .expect("the constraint stays");
+            assert_eq!(kind, "structural_tag");
+            serde_json::from_str(&value).unwrap()
+        };
+        let deferred = shape(&[("structured_outputs_start", "after_reasoning")]);
+        assert_eq!(
+            deferred["format"]["type"], "triggered_tags",
+            "nothing precedes the calls: {deferred}"
+        );
+        assert_eq!(deferred["format"]["at_least_one"], true);
+        let first_token = shape(&[("structured_outputs_start", "first_token")]);
+        assert_eq!(first_token["format"]["type"], "sequence");
+        assert_eq!(first_token["format"]["elements"][0]["type"], "tag");
+        assert_eq!(first_token["format"]["elements"][0]["end"], "</think>");
+        assert_eq!(
+            first_token["format"]["elements"][1],
+            built_tag["format"]["elements"][1]
+        );
+        assert_eq!(
+            shape(&[]),
+            built_tag,
+            "a worker that does not say keeps the shape that fits both"
+        );
+
+        // Nothing else is touched: no selection, a JSON-schema constraint, no constraint.
+        assert_eq!(
+            tool_constraints_for_worker(&factory, parser, Some(built.clone()), None).unwrap(),
+            Some(built.clone())
+        );
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        assert_eq!(
+            tool_constraints_for_worker(
+                &factory,
+                parser,
+                Some(schema.clone()),
+                Some(&worker(&[("structured_outputs_start", "after_reasoning")]))
+            )
+            .unwrap(),
+            Some(schema)
+        );
+        assert_eq!(
+            tool_constraints_for_worker(&factory, parser, None, Some(&worker(&[]))).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn resolve_thinking_pref_precedence() {

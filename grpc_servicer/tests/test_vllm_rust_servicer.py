@@ -544,6 +544,27 @@ def test_model_info_advertises_the_engines_item_limits():
     assert rust.model_info_from_config(config)["mm_item_limits"] == "image=8,video=2"
 
 
+def test_model_info_carries_where_the_engine_starts_a_grammar():
+    # The Rust servicer advertises the engine's reasoning parser and where its
+    # grammar starts on a thinking prompt, as the Python servicer does; a
+    # config without the structured-outputs section advertises neither.
+    info = rust.model_info_from_config(_config())
+    assert info["engine_reasoning_parser"] == ""
+    assert info["structured_outputs_start"] == ""
+    config = _config()
+    config.structured_outputs_config = SimpleNamespace(
+        backend="xgrammar", reasoning_parser="glm45", enable_in_reasoning=False
+    )
+    info = rust.model_info_from_config(config)
+    assert info["structured_outputs_backend"] == "xgrammar"
+    assert info["engine_reasoning_parser"] == "glm45"
+    assert info["structured_outputs_start"] == "after_reasoning"
+    config.structured_outputs_config = SimpleNamespace(backend="auto", reasoning_parser="")
+    info = rust.model_info_from_config(config)
+    assert info["engine_reasoning_parser"] == ""
+    assert info["structured_outputs_start"] == "first_token"
+
+
 def test_model_info_carries_the_running_window():
     # The Rust servicer advertises the launcher's `--max-num-seqs` as the
     # Python servicer does; a config without one leaves the handshake's.

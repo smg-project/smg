@@ -1049,6 +1049,34 @@ mod tests {
         assert!(!text_only.to_labels().contains_key("mm_item_limits"));
     }
 
+    /// A servicer's reasoning-parser facts flatten into the
+    /// `engine_reasoning_parser` and `structured_outputs_start` labels the
+    /// forced tool-call grammar is shaped by, and never into
+    /// `reasoning_parser`, the per-model parser override registration
+    /// validates against the router's own registry; an engine whose servicer
+    /// reports neither (the proto default) sets no such labels.
+    #[test]
+    fn server_info_to_labels_carries_where_the_engine_starts_a_grammar() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            engine_reasoning_parser: "glm45".to_string(),
+            structured_outputs_start: "after_reasoning".to_string(),
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(
+            labels.get("engine_reasoning_parser").map(String::as_str),
+            Some("glm45")
+        );
+        assert_eq!(
+            labels.get("structured_outputs_start").map(String::as_str),
+            Some("after_reasoning")
+        );
+        assert!(!labels.contains_key("reasoning_parser"));
+        let silent = ServerInfo::Vllm(Box::default()).to_labels();
+        assert!(!silent.contains_key("engine_reasoning_parser"));
+        assert!(!silent.contains_key("structured_outputs_start"));
+    }
+
     #[test]
     fn trtllm_status_healthy_matches_ok_exactly() {
         assert!(trtllm_status_healthy("ok"));

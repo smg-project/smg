@@ -3,7 +3,7 @@ mod common;
 
 use common::create_test_tools;
 use openai_protocol::common::{ToolChoice, ToolChoiceValue};
-use tool_parser::{Glm4MoeParser, ParserFactory, ToolConstraint, ToolParser};
+use tool_parser::{Glm4MoeParser, GrammarStart, ParserFactory, ToolConstraint, ToolParser};
 
 #[tokio::test]
 async fn test_glm47_complete_parsing() {
@@ -249,7 +249,10 @@ fn test_glm47_forced_choice_on_a_thinking_prompt_reasons_first() {
     assert_eq!(thinking["format"]["type"], "sequence");
     let elements = thinking["format"]["elements"].as_array().unwrap();
     assert_eq!(elements.len(), 2);
-    assert_eq!(elements[0], Glm4MoeParser::reasoning_prefix());
+    assert_eq!(
+        elements[0],
+        Glm4MoeParser::reasoning_prefix(GrammarStart::Unknown).unwrap()
+    );
     assert_eq!(elements[0]["type"], "any_text");
     assert_eq!(
         elements[1], plain["format"],
@@ -348,4 +351,91 @@ fn test_glm47_forced_call_grammar_owes_nothing_before_the_calls_on_a_thinking_pr
         assert_eq!(calls["at_least_one"], true);
         assert_eq!(calls["tags"].as_array().unwrap().len(), selected.len());
     }
+}
+
+/// Once the worker that runs the grammar is known, the prefix takes the one
+/// shape its engine needs. An engine that applies the grammar only after its
+/// reasoning parser has seen the model's own `</think>` gets the bare calls,
+/// so the call is forced right at that gate, as under the engine's own
+/// server; an engine that applies it from the first token gets the thought
+/// block closed by `</think>` in front of the calls; a worker that does not
+/// say leaves the free-text prefix. A tag built outside the thinking block,
+/// a JSON-schema constraint and a parser without a prefix are left alone.
+#[test]
+fn test_glm47_forced_call_grammar_follows_where_the_engine_starts_it() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("glm47_moe");
+    let tools = create_test_tools();
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    let built = |reasoning: bool| -> String {
+        match registry
+            .generate_tool_constraint(parser, &tools, &required, reasoning)
+            .unwrap()
+        {
+            Some(ToolConstraint::StructuralTag(tag)) => tag,
+            other => panic!("expected the structural tag, got {other:?}"),
+        }
+    };
+    let plain = built(false);
+    let thinking = built(true);
+    let calls: serde_json::Value = serde_json::from_str(&plain).unwrap();
+
+    let deferred = registry
+        .structural_tag_for_grammar_start(parser, &thinking, GrammarStart::AfterReasoning)
+        .unwrap()
+        .expect("re-shaped for an engine that starts the grammar after the thought");
+    let deferred: serde_json::Value = serde_json::from_str(&deferred).unwrap();
+    assert_eq!(
+        deferred["format"], calls["format"],
+        "nothing precedes the calls: the first constrained token opens the call"
+    );
+    assert_eq!(deferred["format"]["type"], "triggered_tags");
+    assert_eq!(deferred["format"]["at_least_one"], true);
+
+    let first_token = registry
+        .structural_tag_for_grammar_start(parser, &thinking, GrammarStart::FirstToken)
+        .unwrap()
+        .expect("re-shaped for an engine that starts the grammar at the first token");
+    let first_token: serde_json::Value = serde_json::from_str(&first_token).unwrap();
+    assert_eq!(first_token["format"]["type"], "sequence");
+    let elements = first_token["format"]["elements"].as_array().unwrap();
+    assert_eq!(elements.len(), 2);
+    assert_eq!(elements[0]["type"], "tag");
+    assert_eq!(elements[0]["begin"], "");
+    assert_eq!(elements[0]["end"], "</think>");
+    assert_eq!(elements[0]["content"]["type"], "any_text");
+    assert_eq!(elements[1], calls["format"], "the calls follow the thought");
+
+    assert_eq!(
+        registry
+            .structural_tag_for_grammar_start(parser, &thinking, GrammarStart::Unknown)
+            .unwrap(),
+        None,
+        "a worker that does not say keeps the prefix that fits both kinds"
+    );
+    assert_eq!(
+        registry
+            .structural_tag_for_grammar_start(parser, &plain, GrammarStart::AfterReasoning)
+            .unwrap(),
+        None,
+        "a tag without the prefix (prompt outside the thinking block) is left alone"
+    );
+    assert_eq!(
+        registry
+            .structural_tag_for_grammar_start(
+                Some("mistral"),
+                &thinking,
+                GrammarStart::AfterReasoning
+            )
+            .unwrap(),
+        None,
+        "a parser without a prefix never wrapped anything"
+    );
+    assert_eq!(
+        registry
+            .structural_tag_for_grammar_start(None, &thinking, GrammarStart::FirstToken)
+            .unwrap(),
+        None
+    );
 }

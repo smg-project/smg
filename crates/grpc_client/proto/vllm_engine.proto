@@ -465,6 +465,27 @@ message GetServerInfoResponse {
   // Uses the model dtype, matching TokenSpeed; empty when unknown.
   // Flattened into the worker label used to cast multimodal input tensors.
   string multimodal_encoder_dtype = 22;
+
+  // The engine's reasoning parser (`--reasoning-parser`, as the structured
+  // outputs config carries it: "glm45", "deepseek_r1", ...); "" when it runs
+  // none. Flattened into the `engine_reasoning_parser` worker label, a name of
+  // its own: `reasoning_parser` is the per-model parser override the router
+  // reads off a worker's labels and validates against its own registry at
+  // registration, and the engine's parser names are the engine's, not the
+  // router's.
+  string engine_reasoning_parser = 23;
+
+  // Where the engine starts applying a request's grammar (structured outputs)
+  // on a prompt that ends inside the model's thinking block:
+  // "after_reasoning" when its structured-output manager waits until the
+  // reasoning parser has seen the thought's end (a reasoning parser is set and
+  // `enable_in_reasoning` is off), "first_token" when the grammar runs from the
+  // first generated token; "" when the engine's config does not say.
+  // Flattened into the `structured_outputs_start` worker label, which shapes
+  // the router's forced tool-call grammar: the bare calls behind a reasoning
+  // parser's gate (the call is forced right there, as the engine's own server
+  // does), the thought and then the calls from the first token.
+  string structured_outputs_start = 24;
 }
 
 // =====================

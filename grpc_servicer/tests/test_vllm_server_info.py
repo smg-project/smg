@@ -32,6 +32,8 @@ def _server_info_method(response_type):
         "server_facts": model_info.server_facts,
         "mm_device_do_normalize": model_info.mm_device_do_normalize,
         "mm_item_limits": model_info.mm_item_limits,
+        "engine_reasoning_parser": model_info.engine_reasoning_parser,
+        "structured_outputs_start": model_info.structured_outputs_start,
     }
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(_SERVICER), "exec"), namespace)
     return namespace["GetServerInfo"]
@@ -91,3 +93,47 @@ def test_get_server_info_reports_encoder_dtype_with_current_and_legacy_protos(
         assert "multimodal_encoder_dtype" not in info.DESCRIPTOR.fields_by_name
     else:
         assert info.multimodal_encoder_dtype == expected
+
+
+def _response_type_without(*names):
+    """The installed wire schema minus the named fields (an older servicer package)."""
+    descriptor = descriptor_pb2.FileDescriptorProto.FromString(
+        vllm_engine_pb2.DESCRIPTOR.serialized_pb
+    )
+    response = next(m for m in descriptor.message_type if m.name == "GetServerInfoResponse")
+    for name in names:
+        field = next((f for f in response.field if f.name == name), None)
+        if field is not None:
+            response.field.remove(field)
+    pool = descriptor_pool.DescriptorPool()
+    pool.AddSerializedFile(common_pb2.DESCRIPTOR.serialized_pb)
+    pool.Add(descriptor)
+    return message_factory.GetMessageClass(
+        pool.FindMessageTypeByName("vllm.grpc.engine.GetServerInfoResponse")
+    )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy):
+    """The handler sets the reasoning-parser facts off the structured-outputs config when the
+    schema carries the fields, and leaves them alone (no error) under an older schema."""
+    response_type = (
+        _response_type_without("engine_reasoning_parser", "structured_outputs_start")
+        if legacy
+        else _response_type(False)
+    )
+    model_config = SimpleNamespace(dtype="torch.bfloat16", is_multimodal_model=False)
+    config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        structured_outputs_config=SimpleNamespace(
+            reasoning_parser="deepseek_r1", enable_in_reasoning=False
+        ),
+    )
+    servicer = SimpleNamespace(engine=SimpleNamespace(vllm_config=config), _mm_processor=None)
+    info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
+    if legacy:
+        assert "structured_outputs_start" not in info.DESCRIPTOR.fields_by_name
+    else:
+        assert info.engine_reasoning_parser == "deepseek_r1"
+        assert info.structured_outputs_start == "after_reasoning"
