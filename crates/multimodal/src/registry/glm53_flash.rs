@@ -134,11 +134,16 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         // a full media fetch + preprocess. Images need the placeholder id;
         // video additionally splices <|begin_of_image|>/<|end_of_image|>
         // frame markers into the prompt.
+        // The counts are the model's as the vendor's own API serves them (its
+        // recorded answers take 64 images and two videos in one request) and
+        // as the engine's own server accepts them; a worker that advertises
+        // its own per-prompt limits still overrides them, and the
+        // deployment-wide SMG_*_MAX_COUNT overrides still apply.
         let mut limits = HashMap::new();
         if Self::image_id(metadata).is_ok() {
-            limits.insert(Modality::Image, 10);
+            limits.insert(Modality::Image, 64);
             if metadata.token_id(BEGIN).is_ok() && metadata.token_id(END).is_ok() {
-                limits.insert(Modality::Video, 1);
+                limits.insert(Modality::Video, 2);
             }
         }
         Ok(limits)
@@ -325,8 +330,8 @@ mod tests {
                 config: &config,
             })
             .unwrap();
-        assert_eq!(limits.get(&Modality::Image), Some(&10));
-        assert_eq!(limits.get(&Modality::Video), Some(&1));
+        assert_eq!(limits.get(&Modality::Image), Some(&64));
+        assert_eq!(limits.get(&Modality::Video), Some(&2));
 
         // No frame markers in the vocab: image-only, video rejected up
         // front instead of after a full clip fetch + preprocess.
@@ -338,7 +343,7 @@ mod tests {
                 config: &config,
             })
             .unwrap();
-        assert_eq!(limits.get(&Modality::Image), Some(&10));
+        assert_eq!(limits.get(&Modality::Image), Some(&64));
         assert!(!limits.contains_key(&Modality::Video));
 
         // No image token id in the config: nothing advertised.
@@ -351,6 +356,33 @@ mod tests {
             })
             .unwrap();
         assert!(limits.is_empty());
+    }
+
+    #[test]
+    fn a_request_the_vendor_api_serves_passes_the_count_check() {
+        // The vendor's API answers 16, 32 and 64 images and two videos in one
+        // request; the spec must not refuse them before any media is fetched.
+        let tokenizer = tokenizer();
+        let config = json!({"model_type":"glm53_flash", "image_token_id":IMAGE_ID});
+        let metadata = ModelMetadata {
+            model_id: "capable",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        for count in [16usize, 32, 64] {
+            Glm53FlashSpec
+                .validate_media_request(&metadata, &[(Modality::Image, count)])
+                .unwrap_or_else(|e| panic!("{count} images refused: {e}"));
+        }
+        Glm53FlashSpec
+            .validate_media_request(&metadata, &[(Modality::Video, 2)])
+            .expect("two videos refused");
+        assert!(Glm53FlashSpec
+            .validate_media_request(&metadata, &[(Modality::Image, 65)])
+            .is_err());
+        assert!(Glm53FlashSpec
+            .validate_media_request(&metadata, &[(Modality::Video, 3)])
+            .is_err());
     }
 
     #[test]
