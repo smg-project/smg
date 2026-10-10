@@ -58,27 +58,44 @@ impl Gateway {
 
     /// Whether another process took one of the gateway's ports between the
     /// pick and the gateway's own bind. The HTTP and metrics listeners report
-    /// the OS error; the mesh listener's failed bind reaches the log as
-    /// tonic's "transport error", the OS error being its unprinted source.
+    /// the OS error; the mesh server reports its failure without it, so a
+    /// failed mesh server counts when its port is held by someone else.
     fn lost_a_port(&self) -> bool {
         let log = self.log();
         log.contains("Address already in use")
-            || log.contains("Mesh server failed: transport error")
+            || (log.contains("Mesh server failed") && connect(self.mesh_port).is_ok())
     }
 
-    /// Waits for `/health`; the reason when the start-up ended otherwise. A
-    /// lost port ends the wait too and is the caller's to handle.
-    fn start_up(&mut self) -> Option<&'static str> {
+    /// Waits for `/health`, then for the mesh listener's verdict: a TLS
+    /// handshake with `probe` (its "ready"; nothing is logged for a bound
+    /// listener) or `Mesh server failed`, which the mesh server logs about a
+    /// second after its listener's task started, so possibly after `/health`
+    /// answers. The reason when the start-up ended otherwise; a lost port
+    /// ends the wait too and is the caller's to handle.
+    fn start_up(
+        &mut self,
+        certs: &TestCertificates,
+        probe: &(PathBuf, PathBuf),
+    ) -> Option<&'static str> {
         wait_until(STARTUP_TIMEOUT, || {
             healthy(self) || self.lost_a_port() || self.exited()
         });
-        if healthy(self) || self.lost_a_port() {
-            None
-        } else if self.exited() {
-            Some("exited before it was healthy")
-        } else {
-            Some("did not come up")
+        if !healthy(self) {
+            return if self.lost_a_port() {
+                None
+            } else if self.exited() {
+                Some("exited before it was healthy")
+            } else {
+                Some("did not come up")
+            };
         }
+        wait_until(MESH_TIMEOUT, || {
+            matches!(
+                mesh_handshake(self.mesh_port, certs, Some(probe)),
+                Ok(Handshake::Accepted(_))
+            ) || self.log().contains("Mesh server failed")
+        });
+        None
     }
 }
 
@@ -143,17 +160,18 @@ fn spawn_gateway(
     }
 }
 
-/// Both gateways healthy, B dialing A's mesh port. The pair is respawned on
-/// fresh ports when a gateway lost one of its ports between the pick and its
-/// bind, at most `SPAWN_ATTEMPTS` times.
-fn spawn_pair(certs: &TestCertificates) -> (Gateway, Gateway) {
+/// Both gateways healthy with their mesh listeners' verdict in, B dialing
+/// A's mesh port. The pair is respawned on fresh ports when a gateway lost
+/// one of its ports between the pick and its bind, at most `SPAWN_ATTEMPTS`
+/// times.
+fn spawn_pair(certs: &TestCertificates, probe: &(PathBuf, PathBuf)) -> (Gateway, Gateway) {
     let mut attempts = 0;
     loop {
         attempts += 1;
         let [http_a, mesh_a, metrics_a, http_b, mesh_b, metrics_b] = free_ports::<6>();
         let mut a = spawn_gateway("nodea", certs, [http_a, mesh_a, metrics_a], None);
         let mut b = spawn_gateway("nodeb", certs, [http_b, mesh_b, metrics_b], Some(mesh_a));
-        let failures = [a.start_up(), b.start_up()];
+        let failures = [a.start_up(certs, probe), b.start_up(certs, probe)];
         if a.lost_a_port() || b.lost_a_port() {
             assert!(
                 attempts < SPAWN_ATTEMPTS,
@@ -324,11 +342,11 @@ fn logs(gateways: &[&Gateway]) -> String {
 #[test]
 fn mesh_with_mtls_forms_between_two_gateway_processes() {
     let certs = TestCertificates::generate().expect("test certificates");
-    let (a, b) = spawn_pair(&certs);
+    let probe = certs.node_identity("probe").expect("probe identity");
+    let (a, b) = spawn_pair(&certs, &probe);
 
     // The mesh listener serves TLS to a peer that presents a certificate
     // from the CA.
-    let probe = certs.node_identity("probe").expect("probe identity");
     let mut handshake = Err("not attempted".to_owned());
     assert!(
         wait_until(MESH_TIMEOUT, || {
