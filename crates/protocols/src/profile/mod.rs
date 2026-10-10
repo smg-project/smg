@@ -192,6 +192,52 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
+/// Whether the model id names one of OpenAI's own hosted models: `gpt-*`
+/// (but not the open-weight `gpt-oss-*`), `chatgpt-*`, `codex-*`, the
+/// `o1`/`o3`/`o4` reasoning series, `computer-use-preview`, or a model behind
+/// an `openai` route segment such as `openai/gpt-4.1`.
+///
+/// The rules the public OpenAI API enforces on request *content* beyond the
+/// schema (a strict-mode schema must pin `additionalProperties: false` on
+/// every object node; a `json_object` format needs the word "json" in the
+/// prompt) hold for those models only. A self-hosted model passes such
+/// requests through to the engine, whose grammar compiler decides what it can
+/// constrain, so the gateway does not refuse ahead of it.
+pub fn is_openai_vendor_model(model: &str) -> bool {
+    const PREFIXES: [&str; 6] = [
+        "gpt-",
+        "chatgpt-",
+        "codex-",
+        "computer-use-preview",
+        "text-embedding-",
+        "omni-moderation",
+    ];
+    // The open-weight gpt-oss models are served locally whatever route
+    // segment precedes them: never the vendor's hosted contract.
+    if model
+        .split('/')
+        .any(|segment| starts_with_ignore_ascii_case(segment, "gpt-oss"))
+    {
+        return false;
+    }
+    model.split('/').any(|segment| {
+        segment.eq_ignore_ascii_case("openai")
+            || PREFIXES
+                .iter()
+                .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
+            || is_openai_reasoning_series(segment)
+    })
+}
+
+/// `o1`, `o3`, `o4-mini`, `o3-pro-2025-06-10`: an `o`, the series digit, then
+/// the end of the segment or a dash.
+fn is_openai_reasoning_series(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some('o' | 'O'))
+        && matches!(chars.next(), Some('1' | '3' | '4'))
+        && matches!(chars.next(), None | Some('-'))
+}
+
 /// The `root` role is a MiniMax-only extension; other dialects reject it the
 /// way their reference APIs do.
 fn reject_root(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
@@ -254,6 +300,37 @@ mod tests {
         assert!(!ProviderProfile::Kimi.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::Zai.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::OpenAi.parses_tool_calls_without_tools());
+    }
+
+    #[test]
+    fn openai_vendor_models_are_told_apart_from_self_hosted_ones() {
+        for model in [
+            "gpt-4.1",
+            "gpt-5-nano",
+            "GPT-4o-mini",
+            "chatgpt-4o-latest",
+            "o1",
+            "o3-pro-2025-06-10",
+            "o4-mini",
+            "codex-mini-latest",
+            "computer-use-preview",
+            "openai/gpt-4.1",
+            "openrouter/openai/o3",
+        ] {
+            assert!(is_openai_vendor_model(model), "{model}");
+        }
+        for model in [
+            "Qwen/Qwen2.5-14B-Instruct",
+            "meta-llama/Llama-3.3-70B-Instruct",
+            "openai/gpt-oss-120b",
+            "gpt-oss-20b",
+            "olmo-2",
+            "o5",
+            "m1",
+            "",
+        ] {
+            assert!(!is_openai_vendor_model(model), "{model}");
+        }
     }
 
     #[test]

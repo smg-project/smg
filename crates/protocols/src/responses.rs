@@ -17,7 +17,9 @@ use super::{
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
-use crate::{builders::ResponsesResponseBuilder, validated::Normalizable};
+use crate::{
+    builders::ResponsesResponseBuilder, profile::is_openai_vendor_model, validated::Normalizable,
+};
 
 // ============================================================================
 // Responses API Tool Choice
@@ -3593,24 +3595,75 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
         return Err(e);
     }
 
-    // 4. `text.format` of type json_object needs the word "json" somewhere in
-    //    the prompt (instructions or input text), as the public API requires.
-    if matches!(
-        request.text.as_ref().and_then(|t| t.format.as_ref()),
-        Some(TextFormat::JsonObject)
-    ) && !request_mentions_json(request)
-    {
-        let mut e = ValidationError::new("json_object_requires_json_in_input");
-        e.message = Some(
-            "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'."
-                .into(),
-        );
-        return Err(e);
+    // 4. The public OpenAI API's rules on request content beyond the schema
+    //    hold for OpenAI's own models only; a self-hosted model passes these
+    //    shapes through to the engine, whose grammar compiler decides what it
+    //    can constrain (see `profile::is_openai_vendor_model`).
+    if is_openai_vendor_model(&request.model) {
+        validate_openai_structured_output_rules(request)?;
     }
 
     // Tool-result-only continuations are valid; validate_response_input checks
     // individual items without requiring a message already held in history.
 
+    Ok(())
+}
+
+/// The public OpenAI API's structured-output rules: a strict function schema or
+/// a strict `json_schema` text format pins `additionalProperties: false` on
+/// every object node, and a `json_object` format needs the word "json"
+/// somewhere in the prompt (instructions or input text).
+fn validate_openai_structured_output_rules(
+    request: &ResponsesRequest,
+) -> Result<(), ValidationError> {
+    for tool in request.tools.as_deref().unwrap_or_default() {
+        let ResponseTool::Function(function_tool) = tool else {
+            continue;
+        };
+        let function = &function_tool.function;
+        if function.strict == Some(true) {
+            if let Some(path) = strict_schema_missing_additional_properties(&function.parameters) {
+                let mut e = ValidationError::new("invalid_function_parameters");
+                e.message = Some(
+                    format!(
+                        "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
+                        function.name
+                    )
+                    .into(),
+                );
+                return Err(e);
+            }
+        }
+    }
+
+    match request.text.as_ref().and_then(|t| t.format.as_ref()) {
+        Some(TextFormat::JsonSchema {
+            name,
+            schema,
+            strict: Some(true),
+            ..
+        }) => {
+            if let Some(path) = strict_schema_missing_additional_properties(schema) {
+                let mut e = ValidationError::new("invalid_json_schema");
+                e.message = Some(
+                    format!(
+                        "Invalid schema for response_format '{name}': In context={path}, 'additionalProperties' is required to be supplied and to be false."
+                    )
+                    .into(),
+                );
+                return Err(e);
+            }
+        }
+        Some(TextFormat::JsonObject) if !request_mentions_json(request) => {
+            let mut e = ValidationError::new("json_object_requires_json_in_input");
+            e.message = Some(
+                "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'."
+                    .into(),
+            );
+            return Err(e);
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -3852,8 +3905,9 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
 
     for (idx, tool) in tools.iter().enumerate() {
         match tool {
-            // Function parameters are a JSON Schema object; a strict function
-            // pins additionalProperties: false on every object node.
+            // Function parameters are a JSON Schema object (the strict-mode
+            // pin on additionalProperties is a public-API rule applied under
+            // the OpenAI vendor profile in the cross-parameter validation).
             ResponseTool::Function(function_tool) => {
                 let function = &function_tool.function;
                 if !function.parameters.is_object() {
@@ -3866,21 +3920,6 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                         .into(),
                     );
                     return Err(e);
-                }
-                if function.strict == Some(true) {
-                    if let Some(path) =
-                        strict_schema_missing_additional_properties(&function.parameters)
-                    {
-                        let mut e = ValidationError::new("invalid_function_parameters");
-                        e.message = Some(
-                            format!(
-                                "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
-                                function.name
-                            )
-                            .into(),
-                        );
-                        return Err(e);
-                    }
                 }
             }
             // The hosted local_shell tool is not served by the gateway, and the
@@ -3952,26 +3991,8 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
 
 /// Validates text format configuration (JSON schema name non-empty, schema an object)
 fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
-    if let Some(TextFormat::JsonSchema {
-        name,
-        schema,
-        strict,
-        ..
-    }) = &text.format
-    {
+    if let Some(TextFormat::JsonSchema { name, schema, .. }) = &text.format {
         validate_json_schema_shape(name, schema)?;
-        if *strict == Some(true) {
-            if let Some(path) = strict_schema_missing_additional_properties(schema) {
-                let mut e = ValidationError::new("invalid_json_schema");
-                e.message = Some(
-                    format!(
-                        "Invalid schema for response_format '{name}': In context={path}, 'additionalProperties' is required to be supplied and to be false."
-                    )
-                    .into(),
-                );
-                return Err(e);
-            }
-        }
     }
     Ok(())
 }

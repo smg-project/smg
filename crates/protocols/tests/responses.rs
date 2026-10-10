@@ -4618,11 +4618,16 @@ fn function_tool_parameters_must_be_an_object() {
     );
 }
 
+/// One of OpenAI's own models: the public API's structured-output rules apply.
+const OPENAI_MODEL: &str = "gpt-4.1";
+/// A self-hosted model: those rules are the engine's business, not the gateway's.
+const SELF_HOSTED_MODEL: &str = "Qwen/Qwen2.5-14B-Instruct";
+
 #[test]
-fn strict_function_schema_needs_additional_properties_false() {
+fn strict_function_schema_needs_additional_properties_false_for_openai_models() {
     let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
     let request = plain_request(json!({
-        "model": "m", "input": "hi",
+        "model": OPENAI_MODEL, "input": "hi",
         "tools": [{"type": "function", "name": "f", "strict": true, "parameters": loose}]
     }))
     .unwrap();
@@ -4634,7 +4639,7 @@ fn strict_function_schema_needs_additional_properties_false() {
         "additionalProperties": false
     });
     let request = plain_request(json!({
-        "model": "m", "input": "hi",
+        "model": OPENAI_MODEL, "input": "hi",
         "tools": [{"type": "function", "name": "f", "strict": true, "parameters": pinned}]
     }))
     .unwrap();
@@ -4642,7 +4647,7 @@ fn strict_function_schema_needs_additional_properties_false() {
 
     // Not strict: the pin is not required.
     let request = plain_request(json!({
-        "model": "m", "input": "hi",
+        "model": OPENAI_MODEL, "input": "hi",
         "tools": [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}]
     }))
     .unwrap();
@@ -4650,38 +4655,67 @@ fn strict_function_schema_needs_additional_properties_false() {
 }
 
 #[test]
-fn strict_json_schema_text_format_needs_additional_properties_false() {
+fn strict_function_schema_passes_through_for_self_hosted_models() {
+    let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
     let request = plain_request(json!({
-        "model": "m", "input": "Tokyo facts.",
-        "text": {"format": {"type": "json_schema", "name": "bad", "strict": true,
-                 "schema": {"type": "object", "properties": {"x": {"type": "string"}}}}}
+        "model": SELF_HOSTED_MODEL, "input": "hi",
+        "tools": [{"type": "function", "name": "f", "strict": true, "parameters": loose}]
     }))
     .unwrap();
-    assert!(validation_code(&request).contains("invalid_json_schema"));
+    assert!(
+        request.validate().is_ok(),
+        "the engine's grammar compiler decides a self-hosted model's strict schema"
+    );
 }
 
 #[test]
-fn json_object_format_needs_the_word_json_in_the_prompt() {
+fn strict_json_schema_text_format_needs_additional_properties_false_for_openai_models() {
+    let body = |model: &str| {
+        json!({
+            "model": model, "input": "Tokyo facts.",
+            "text": {"format": {"type": "json_schema", "name": "bad", "strict": true,
+                     "schema": {"type": "object", "properties": {"x": {"type": "string"}}}}}
+        })
+    };
+    let request = plain_request(body(OPENAI_MODEL)).unwrap();
+    assert!(validation_code(&request).contains("invalid_json_schema"));
+
+    let request = plain_request(body(SELF_HOSTED_MODEL)).unwrap();
+    assert!(request.validate().is_ok(), "passed through to the engine");
+}
+
+#[test]
+fn json_object_format_needs_the_word_json_in_the_prompt_for_openai_models() {
     let request = plain_request(json!({
-        "model": "m", "input": "Tell me about Tokyo.",
+        "model": OPENAI_MODEL, "input": "Tell me about Tokyo.",
         "text": {"format": {"type": "json_object"}}
     }))
     .unwrap();
     assert!(validation_code(&request).contains("json_object_requires_json_in_input"));
 
     let request = plain_request(json!({
-        "model": "m", "input": "Tell me about Tokyo as JSON.",
+        "model": OPENAI_MODEL, "input": "Tell me about Tokyo as JSON.",
         "text": {"format": {"type": "json_object"}}
     }))
     .unwrap();
     assert!(request.validate().is_ok());
 
     let request = plain_request(json!({
-        "model": "m", "input": "Tell me about Tokyo.", "instructions": "Answer in json.",
+        "model": OPENAI_MODEL, "input": "Tell me about Tokyo.", "instructions": "Answer in json.",
         "text": {"format": {"type": "json_object"}}
     }))
     .unwrap();
     assert!(request.validate().is_ok(), "the instructions count too");
+
+    let request = plain_request(json!({
+        "model": SELF_HOSTED_MODEL, "input": "Tell me about Tokyo.",
+        "text": {"format": {"type": "json_object"}}
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "a self-hosted model's json_object request is passed through"
+    );
 }
 
 #[test]
