@@ -288,6 +288,9 @@ jobs:
 
           def node_id(case):
               module, cls = case.attrib["classname"].rsplit(".", 1)
+              assert module.startswith(("router.", "e2e_test.router.")), "Unexpected JUnit module"
+              if module.startswith("router."):
+                  module = "e2e_test." + module
               return f"{module.replace('.', '/')}.py::{cls}::{case.attrib['name']}"
 
 
