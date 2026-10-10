@@ -544,7 +544,7 @@ impl GrpcRouter {
         let model_id = model_id.to_string();
         if request.stream.unwrap_or(false) {
             let stream = BackgroundStream::new(slot);
-            return if is_harmony {
+            let answer = if is_harmony {
                 serve_harmony_responses_stream(
                     ctx,
                     Arc::unwrap_or_clone(request),
@@ -563,6 +563,15 @@ impl GrpcRouter {
                 )
                 .await
             };
+            // A plain error before the stream opened closes the record as
+            // failed; the stream itself runs behind the id.
+            return background::close_before_stream(
+                &ctx.response_storage,
+                ctx.request_context.clone(),
+                &id,
+                answer,
+            )
+            .await;
         }
 
         if is_harmony {

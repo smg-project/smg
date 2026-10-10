@@ -135,8 +135,10 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         None => tx,
     };
 
+    // The transform answers the error it ended with (after the error frame
+    // went to the client), so the runner of a background stream can store it.
     let transform = async move {
-        if let Err(e) = process_and_transform_sse_stream(
+        match process_and_transform_sse_stream(
             body,
             original_request_clone,
             response_id,
@@ -148,8 +150,12 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         )
         .await
         {
-            warn!("Error transforming SSE stream: {}", e);
-            utils::send_error_sse(&tx, &e, "stream_error").await;
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("Error transforming SSE stream: {}", e);
+                utils::send_error_sse(&tx, &e, "stream_error").await;
+                Err(json!({ "code": "stream_error", "message": e }))
+            }
         }
     };
     #[expect(
@@ -583,8 +589,10 @@ pub(super) async fn execute_tool_loop_streaming(
         None => tx,
     };
 
+    // The loop answers the error it ended with (after the error frame went
+    // to the client), so the runner of a background stream can store it.
     let tool_loop = async move {
-        let result = execute_tool_loop_streaming_internal(
+        match execute_tool_loop_streaming_internal(
             &ctx_clone,
             current_request,
             &original_request_clone,
@@ -593,11 +601,14 @@ pub(super) async fn execute_tool_loop_streaming(
             tx.clone(),
             Some(startup_tx),
         )
-        .await;
-
-        if let Err(e) = result {
-            warn!("Streaming tool loop error: {}", e);
-            utils::send_error_sse(&tx, &e, "tool_loop_error").await;
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("Streaming tool loop error: {}", e);
+                utils::send_error_sse(&tx, &e, "tool_loop_error").await;
+                Err(json!({ "code": "tool_loop_error", "message": e }))
+            }
         }
     };
     // Spawn background task for tool loop
@@ -1026,7 +1037,25 @@ async fn execute_tool_loop_streaming_internal(
     let terminal_usage = state.usage.as_ref().map(|usage| json!(usage));
     emitter
         .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
-        .await
+        .await?;
+
+    // Store the final object, as the other streaming paths do; a background
+    // response needs its terminal record under the id the client polls.
+    let mut final_response = emitter.finalize(None);
+    final_response.usage = state.usage.clone().map(ResponsesUsage::Modern);
+    if let Some(error) = terminal_error {
+        final_response.error = Some(error);
+    }
+    persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &final_response,
+        original_request,
+        ctx.request_context.clone(),
+    )
+    .await;
+    Ok(())
 }
 
 /// Convert chat stream to Responses API events while accumulating for tool call detection

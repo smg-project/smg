@@ -102,17 +102,17 @@ pub(crate) async fn serve_harmony_responses_stream(
         // background stream reports response.queued between the two)
         let event = emitter.emit_created();
         if emitter.send_event(&event, &tx).await.is_err() {
-            return;
+            return Ok(());
         }
         if request.background.unwrap_or(false) {
             let event = emitter.emit_queued();
             if emitter.send_event(&event, &tx).await.is_err() {
-                return;
+                return Ok(());
             }
         }
         let event = emitter.emit_in_progress();
         if emitter.send_event(&event, &tx).await.is_err() {
-            return;
+            return Ok(());
         }
 
         if has_mcp_tools {
@@ -139,6 +139,9 @@ pub(crate) async fn serve_harmony_responses_stream(
             )
             .await;
         }
+        // The error the stream ended with, if any, for the runner of a
+        // background stream to store.
+        emitter.take_error().map_or(Ok(()), Err)
     };
     // Spawn async task to handle streaming
     #[expect(

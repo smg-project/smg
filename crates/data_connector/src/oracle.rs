@@ -1305,35 +1305,40 @@ impl OracleResponseStorage {
     }
 }
 
-/// The statement that stores a response: a merge on the id (the first
-/// column, the table's primary key) that inserts a new row or updates every
-/// other column of the existing one, so a record written as `queued` is
-/// replaced by its terminal object under the one id.
-fn store_response_sql(table: &str, columns: &[&str]) -> String {
-    let source: Vec<String> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, col)| format!(":{} AS {col}", i + 1))
-        .collect();
+/// The statement that stores a response, with the names of its binds in the
+/// columns' order: a merge on the id (the first column, the table's primary
+/// key) that inserts a new row or updates every other column of the
+/// existing one, so a record written as `queued` is replaced by its terminal
+/// object under the one id. Only the id is bound inside the USING source;
+/// the values are bound in UPDATE SET and INSERT VALUES, where a string
+/// above 4,000 bytes (the JSON of `input` or `raw_response`) is accepted
+/// for a CLOB column as it is in an INSERT, while the same bind in a
+/// subquery's select list fails with ORA-01461. Named binds, so the id's
+/// two occurrences are bound once.
+fn store_response_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
+    let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
     let id_col = columns.first().copied().unwrap_or("id");
+    let id_bind = binds.first().cloned().unwrap_or_else(|| "v1".to_string());
     let updates: Vec<String> = columns
         .iter()
+        .zip(&binds)
         .skip(1)
-        .map(|col| format!("t.{col} = s.{col}"))
+        .map(|(col, bind)| format!("t.{col} = :{bind}"))
         .collect();
-    let inserted: Vec<String> = columns.iter().map(|col| format!("s.{col}")).collect();
+    let values: Vec<String> = binds.iter().map(|bind| format!(":{bind}")).collect();
     let matched = if updates.is_empty() {
         String::new()
     } else {
         format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(", "))
     };
-    format!(
-        "MERGE INTO {table} t USING (SELECT {} FROM dual) s ON (t.{id_col} = s.{id_col}){matched} \
+    let sql = format!(
+        "MERGE INTO {table} t USING (SELECT :{id_bind} AS {id_col} FROM dual) s \
+         ON (t.{id_col} = s.{id_col}){matched} \
          WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
-        source.join(", "),
         columns.join(", "),
-        inserted.join(", ")
-    )
+        values.join(", ")
+    );
+    (sql, binds)
 }
 
 #[async_trait]
@@ -1399,8 +1404,13 @@ impl ResponseStorage for OracleResponseStorage {
                     params.push(val);
                 }
 
-                let sql = store_response_sql(&table, &columns);
-                conn.execute(&sql, &params[..])
+                let (sql, binds) = store_response_sql(&table, &columns);
+                let named: Vec<(&str, &dyn ToSql)> = binds
+                    .iter()
+                    .map(String::as_str)
+                    .zip(params.iter().copied())
+                    .collect();
+                conn.execute_named(&sql, &named)
                     .map(|_| ())
                     .map_err(map_oracle_error)
             })
@@ -1639,19 +1649,32 @@ mod tests {
     }
 
     #[test]
-    fn store_response_sql_merges_on_the_id() {
-        let sql = store_response_sql("responses", &["id", "input", "raw_response"]);
+    fn store_response_sql_merges_on_the_id_and_binds_the_values_outside_the_source() {
+        let (sql, binds) = store_response_sql("responses", &["id", "input", "raw_response"]);
         assert_eq!(
             sql,
-            "MERGE INTO responses t USING (SELECT :1 AS id, :2 AS input, :3 AS raw_response FROM dual) s \
-             ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.input = s.input, t.raw_response = s.raw_response \
-             WHEN NOT MATCHED THEN INSERT (id, input, raw_response) VALUES (s.id, s.input, s.raw_response)"
+            "MERGE INTO responses t USING (SELECT :v1 AS id FROM dual) s ON (t.id = s.id) \
+             WHEN MATCHED THEN UPDATE SET t.input = :v2, t.raw_response = :v3 \
+             WHEN NOT MATCHED THEN INSERT (id, input, raw_response) VALUES (:v1, :v2, :v3)"
         );
-        let sql = store_response_sql("r", &["id"]);
+        assert_eq!(
+            binds,
+            ["v1", "v2", "v3"],
+            "one bind per column, in the columns' order"
+        );
+        // The CLOB-sized values never sit in the USING source (ORA-01461 above
+        // 4,000 bytes there); they are bound where an INSERT binds them.
+        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
+        assert!(
+            !source.contains(":v2") && !source.contains(":v3"),
+            "{source}"
+        );
+        let (sql, binds) = store_response_sql("r", &["id"]);
         assert_eq!(
             sql,
-            "MERGE INTO r t USING (SELECT :1 AS id FROM dual) s ON (t.id = s.id) \
-             WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)"
+            "MERGE INTO r t USING (SELECT :v1 AS id FROM dual) s ON (t.id = s.id) \
+             WHEN NOT MATCHED THEN INSERT (id) VALUES (:v1)"
         );
+        assert_eq!(binds, ["v1"]);
     }
 }

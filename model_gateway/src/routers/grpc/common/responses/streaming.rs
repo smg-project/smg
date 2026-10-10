@@ -152,6 +152,9 @@ pub(crate) struct ResponseStreamEventEmitter {
     /// The response runs in the background: `response.created` reports it
     /// `queued`, `response.queued` follows, and the objects echo the flag.
     background: bool,
+    /// The error of the last `error` event sent, for the runner of a
+    /// background stream that ends without a terminal object.
+    last_error: Option<serde_json::Value>,
 }
 
 /// Streaming state for the reasoning output item of the current turn.
@@ -183,6 +186,7 @@ impl ResponseStreamEventEmitter {
             reasoning_item: None,
             finish_reason: None,
             background: false,
+            last_error: None,
         }
     }
 
@@ -1351,9 +1355,11 @@ impl ResponseStreamEventEmitter {
     /// Uses OpenAI's error event format.
     /// Use this for terminal errors that should abort the streaming response.
     pub async fn emit_error(&mut self, error_msg: &str, error_code: Option<&str>, tx: &SseSender) {
+        let code = error_code.unwrap_or("internal_error");
+        self.last_error = Some(json!({ "code": code, "message": error_msg }));
         let event = json!({
             "type": "error",
-            "code": error_code.unwrap_or("internal_error"),
+            "code": code,
             "message": error_msg,
             "param": null,
             "sequence_number": self.next_sequence()
@@ -1363,6 +1369,11 @@ impl ResponseStreamEventEmitter {
             Err(_) => "data: {\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}\n\n".to_string(),
         };
         let _ = tx.send(Ok(Bytes::from(sse_data))).await;
+    }
+
+    /// The error of the last `error` event this emitter sent, if any.
+    pub fn take_error(&mut self) -> Option<serde_json::Value> {
+        self.last_error.take()
     }
 
     /// Emit the full mcp_list_tools output-item sequence.
@@ -1509,6 +1520,23 @@ pub(crate) fn attach_mcp_server_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_error_event_is_remembered_for_the_stream_runner() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".to_string(), "test-model".to_string(), 1);
+        assert!(emitter.take_error().is_none());
+        let (tx, mut rx) = sse_channel();
+        emitter
+            .emit_error("Pipeline execution failed", Some("pipeline_error"), &tx)
+            .await;
+        let frame = rx.recv().await.expect("the error frame").expect("a frame");
+        assert!(frame.starts_with(b"data: "), "{frame:?}");
+        let error = emitter.take_error().expect("remembered");
+        assert_eq!(error["code"], "pipeline_error");
+        assert_eq!(error["message"], "Pipeline execution failed");
+        assert!(emitter.take_error().is_none(), "taken once");
+    }
 
     #[test]
     fn finalized_streaming_response_serializes_responses_api_usage() {
