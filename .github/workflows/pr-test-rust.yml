@@ -1057,12 +1057,19 @@ jobs:
           - engine: sglang
             timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          # The vLLM rows' job budget sits above the sum of their steps: the
+          # engine setup takes 3 to 9 minutes (its packages come from the
+          # network), the test step has 34, checkout, downloads, diagnostics
+          # and the log upload about 4. At 40 the job budget cancelled a long
+          # test step minutes before the step's own timeout would have failed
+          # it, and the leg ended "cancelled" with its cases passing instead
+          # of failing in the step that ran long (smg-project/smg-lab#170).
           - engine: vllm
-            timeout: 40
+            timeout: 50
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             kv_backend: mooncake
-            timeout: 40
+            timeout: 50
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           # TokenSpeed prefill/decode over its Mooncake transfer, on the model
           # its disaggregation path is proven on (Qwen3.5-9B, fetched by id).
