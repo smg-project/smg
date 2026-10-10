@@ -46,6 +46,7 @@ from infra.model_specs import get_model_spec
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
 
+from .hooks import FINALIZED_ZMQ_GATEWAY_KEY, SERVING_CLASS_FAILED_KEY
 from .markers import get_marker_kwargs, get_marker_value, model_id_for_engine, resolve_class_marker
 
 logger = logging.getLogger(__name__)
@@ -345,7 +346,7 @@ def setup_backend(request: pytest.FixtureRequest):
         and gateway_config["reuse"]
     ):
         yield from _setup_pooled_zmq(
-            request.session,
+            request.node,
             model_id,
             model_path,
             engine,
@@ -403,7 +404,7 @@ def setup_backend(request: pytest.FixtureRequest):
 
 
 def _setup_pooled_zmq(
-    session,
+    class_node,
     model_id,
     model_path,
     engine,
@@ -413,7 +414,8 @@ def _setup_pooled_zmq(
     log_dir,
 ):
     """Reuse only explicitly compatible classes; failed classes evict the pair."""
-    failures_before = session.testsfailed
+    class_node.stash[SERVING_CLASS_FAILED_KEY] = False
+    class_node.stash[FINALIZED_ZMQ_GATEWAY_KEY] = None
     pool = get_pool()
     try:
         gateway = pool.acquire_zmq(
@@ -442,7 +444,8 @@ def _setup_pooled_zmq(
     finally:
         # Keep the service for the remaining methods of a failed class, then
         # start the next class fresh rather than carrying potentially bad state.
-        if session.testsfailed > failures_before:
+        class_node.stash[FINALIZED_ZMQ_GATEWAY_KEY] = gateway
+        if class_node.stash[SERVING_CLASS_FAILED_KEY]:
             pool.discard_zmq(gateway)
 
 

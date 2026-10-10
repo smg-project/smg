@@ -16,6 +16,7 @@ import os
 import pytest
 from infra import (
     ConnectionMode,
+    Gateway,
     cleanup_pool,
     get_connection_mode_override,
     get_runtime,
@@ -23,6 +24,7 @@ from infra import (
     get_tokenspeed_servicer_impl,
     get_zmq_engine_count,
 )
+from infra.worker_pool import get_pool
 
 from .markers import model_id_for_engine, resolve_class_marker
 
@@ -35,6 +37,25 @@ _ZMQ_LOCAL_WIRES = frozenset({"grpc", "http"})
 # Per-session selection accounting filled in by ``pytest_collection_modifyitems``
 # and printed as one greppable ``e2e selection:`` line after collection.
 _SELECTION_STATS_KEY: pytest.StashKey[dict] = pytest.StashKey()
+
+# Rerun plugins can finalize fixtures before logging the last failed report.
+SERVING_CLASS_FAILED_KEY: pytest.StashKey[bool] = pytest.StashKey()
+FINALIZED_ZMQ_GATEWAY_KEY: pytest.StashKey[Gateway | None] = pytest.StashKey()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call):
+    """Invalidate failed classes without depending on delayed report logging."""
+    outcome = yield
+    if outcome.get_result().failed:
+        class_node = item.getparent(pytest.Class)
+        if class_node is not None:
+            class_node.stash[SERVING_CLASS_FAILED_KEY] = True
+            # A teardown report can arrive after the class fixture finalized.
+            gateway = class_node.stash.get(FINALIZED_ZMQ_GATEWAY_KEY, None)
+            if gateway is not None:
+                get_pool().discard_zmq(gateway)
+
 
 # ---------------------------------------------------------------------------
 # Marker registration

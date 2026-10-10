@@ -58,13 +58,14 @@ def pooled_setup(monkeypatch):
         discard_zmq=discarded.append,
     )
     monkeypatch.setattr(setup, "get_pool", lambda: pool)
+    monkeypatch.setattr(hooks, "get_pool", lambda: pool)
     monkeypatch.setattr(setup, "_make_openai_client", lambda gw: "client")
     monkeypatch.setattr(setup, "_gateway_readiness_timeout", lambda *args: 600)
-    session = SimpleNamespace(testsfailed=0)
+    class_node = SimpleNamespace(stash=pytest.Stash())
 
     def start():
         return setup._setup_pooled_zmq(
-            session,
+            class_node,
             "model-id",
             "model-path",
             "vllm",
@@ -74,7 +75,7 @@ def pooled_setup(monkeypatch):
             None,
         )
 
-    return start, session, gateway, acquired, discarded
+    return start, class_node, gateway, acquired, discarded
 
 
 def test_successful_class_retains_pair_and_preserves_topology(pooled_setup):
@@ -90,50 +91,66 @@ def test_successful_class_retains_pair_and_preserves_topology(pooled_setup):
 
 
 def test_failed_class_releases_pair_at_teardown(pooled_setup):
-    start, session, gateway, _, discarded = pooled_setup
+    start, class_node, gateway, _, discarded = pooled_setup
     fixture = start()
     next(fixture)
-    session.testsfailed += 1
+    class_node.stash[hooks.SERVING_CLASS_FAILED_KEY] = True
     assert discarded == []
     with pytest.raises(StopIteration):
         next(fixture)
     assert discarded == [gateway]
 
 
-def test_real_pytest_class_failure_invalidates_before_next_class(pytester, pooled_setup):
+@pytest.mark.parametrize("reruns", [0, 2])
+@pytest.mark.parametrize("phase", ["call", "teardown"])
+def test_real_pytest_class_failure_invalidates_before_next_class(
+    pytester, pooled_setup, reruns, phase
+):
     _, _, gateway, acquired, discarded = pooled_setup
     pytester.makeconftest(
         """
         import pytest
+        from fixtures.hooks import pytest_runtest_makereport
         from fixtures.setup_backend import _setup_pooled_zmq, _GW_DEFAULTS
 
         @pytest.fixture(scope="class")
         def serving(request):
             yield from _setup_pooled_zmq(
-                request.session, "model-id", "model-path", "vllm",
+                request.node, "model-id", "model-path", "vllm",
                 {"count": 1, "gpus": 2}, _GW_DEFAULTS, "grpc", None,
             )
+
+        @pytest.fixture
+        def fail_teardown():
+            yield
+            raise AssertionError("intentional teardown failure")
         """
     )
     pytester.makepyfile(
-        """
+        f"""
         class TestA:
             def test_pass(self, serving):
                 assert serving[0] == "grpc"
 
         class TestB:
-            def test_fail(self, serving):
-                assert False, "intentional failure"
+            def test_fail(self, serving{", fail_teardown" if phase == "teardown" else ""}):
+                {"assert False, 'intentional failure'" if phase == "call" else 'assert serving[0] == "grpc"'}
 
         class TestC:
             def test_after_failure(self, serving):
                 assert serving[0] == "grpc"
         """
     )
-    result = pytester.runpytest("-q")
-    result.assert_outcomes(passed=2, failed=1)
-    assert len(acquired) == 3
-    assert discarded == [gateway]
+    result = pytester.runpytest("-q", "--reruns", str(reruns))
+    if phase == "call":
+        result.assert_outcomes(passed=2, failed=1)
+        assert len(acquired) == 3
+        assert discarded == [gateway]
+    else:
+        result.assert_outcomes(passed=3 + reruns, errors=1)
+        assert len(acquired) == 3 + reruns
+        assert discarded == [gateway] * (1 + reruns)
+    assert result.parseoutcomes().get("rerun", 0) == reruns
 
 
 @pytest.mark.parametrize("reuse", [False, True])

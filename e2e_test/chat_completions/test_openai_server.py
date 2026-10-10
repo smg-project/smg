@@ -488,7 +488,6 @@ class TestChatCompletionGptOss120B(TestChatCompletionGptOss):
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
-@pytest.mark.gateway(reuse=True)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestRequestIdPassthrough:
     """Backend request ids derive from client correlation signals."""
