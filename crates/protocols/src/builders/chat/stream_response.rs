@@ -96,7 +96,9 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
-    /// Add a choice delta that sets `role` and `content`
+    /// Add a choice delta that sets `role` and `content`: a stream's first
+    /// chunk only, since the role is sent once; the content chunks after it
+    /// go through `add_choice_content_with_logprobs`, which sets no role.
     pub fn add_choice_content(
         mut self,
         index: u32,
