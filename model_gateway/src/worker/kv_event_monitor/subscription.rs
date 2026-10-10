@@ -362,7 +362,7 @@ impl KvEventMonitor {
                     stream
                 }
                 Err(e) => {
-                    // If the backend doesn't implement SubscribeKvEvents (e.g. vLLM),
+                    // If the backend doesn't implement SubscribeKvEvents (some engines don't),
                     // stop retrying — this RPC will never succeed.
                     if e.code() == tonic::Code::Unimplemented {
                         warn!(

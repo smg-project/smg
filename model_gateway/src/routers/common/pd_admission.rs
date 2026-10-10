@@ -48,7 +48,7 @@ use crate::{
 };
 
 /// Default seconds a PD dispatch may wait for decode rooms. Well under the
-/// engines' bootstrap deadline (120 s on TokenSpeed), so a request that does
+/// engines' bootstrap deadline (120 s on one engine), so a request that does
 /// wait still dispatches with the whole deadline ahead of it.
 pub const DEFAULT_PD_ADMISSION_WAIT_SECS: u64 = 30;
 

@@ -58,7 +58,7 @@ pub fn get_version() -> &'static str {
 
 /// Print the startup banner with braille art and key configuration info.
 ///
-/// Layout inspired by vLLM's startup banner — art on the left,
+/// Layout inspired by a serving engine's startup banner — art on the left,
 /// useful context on the right. Shepherd with sheep motif.
 #[expect(
     clippy::print_stdout,

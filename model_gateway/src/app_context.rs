@@ -577,7 +577,7 @@ impl AppContextBuilder {
         let tls_required = has_tls_config || has_https_worker(config);
 
         // Idle pooled connections must expire before the backend server's
-        // keep-alive closes them (vLLM/SGLang default: 5s), or checkout races
+        // keep-alive closes them (the engines' default: 5s), or checkout races
         // the server's FIN and non-idempotent sends fail.
         let pool_idle_timeout = match config.upstream_pool_idle_timeout_secs {
             0 => None,
