@@ -19,11 +19,26 @@ mod kimi;
 mod minimax;
 mod zai;
 
+use std::{
+    collections::HashMap,
+    sync::{OnceLock, RwLock},
+};
+
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage},
     common::Tool,
     ext::retain_if,
 };
+
+/// Served model ids that take a vendor's profile from an alias they are served
+/// under, recorded once at startup from the configured model aliases. An alias
+/// is resolved into the request's model id before the response side reads it,
+/// so the served name has to select the profile its vendor-named alias does,
+/// or a request that entered under the vendor name loses the profile half-way.
+fn alias_profiles() -> &'static RwLock<HashMap<String, ProviderProfile>> {
+    static ALIAS_PROFILES: OnceLock<RwLock<HashMap<String, ProviderProfile>>> = OnceLock::new();
+    ALIAS_PROFILES.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 /// Provider dialect for a request, selected from the model id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,15 +88,60 @@ impl ProviderProfile {
     /// Matches the way the tool and reasoning parser factories do: any
     /// `/`-separated segment that starts with a vendor marker selects the
     /// profile, so `kimi-k3`, `/models/Kimi-K3`, `moonshotai/kimi-k2` and
-    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. Aliases are not
-    /// visible here, because normalization runs before alias resolution: an
-    /// aliased vendor model falls back to the OpenAI baseline, any extension
-    /// it carried is dropped with a warning, and a `root` message is rejected
-    /// outright, so that role needs a canonical MiniMax model id.
+    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. A served model id
+    /// that names no vendor takes the profile of a vendor-named alias it was
+    /// registered with (see [`Self::register_model_aliases`]), so the profile
+    /// stays the same before and after an alias is resolved into the served
+    /// name. Without such an alias, an opaque served name keeps the OpenAI
+    /// baseline: any extension a request carried is dropped with a warning,
+    /// and a `root` message is rejected outright, so that role needs a
+    /// MiniMax model id.
     /// DeepSeek is narrower: only the calibrated V4 / V4.1 model segments
     /// and `deepseek-flash` alias select its profile; older versions and
     /// unrecognized suffixes keep the baseline.
     pub fn for_model(model: &str) -> Self {
+        let profile = Self::from_model_segments(model);
+        if profile != ProviderProfile::OpenAi {
+            return profile;
+        }
+        let aliased = alias_profiles().read().unwrap_or_else(|e| e.into_inner());
+        aliased
+            .get(model)
+            .copied()
+            .unwrap_or(ProviderProfile::OpenAi)
+    }
+
+    /// Record the configured model aliases (`alias -> served model id`). A
+    /// served model id that has a vendor-named alias selects that vendor's
+    /// profile from now on, whichever of its names a request carries. Aliases
+    /// that select no vendor profile change nothing; when two aliases of one
+    /// served model name different vendors, the first registered wins and the
+    /// conflict is logged.
+    pub fn register_model_aliases<'a>(aliases: impl IntoIterator<Item = (&'a str, &'a str)>) {
+        let mut map = alias_profiles().write().unwrap_or_else(|e| e.into_inner());
+        for (alias, canonical) in aliases {
+            let profile = Self::from_model_segments(alias);
+            if profile == ProviderProfile::OpenAi {
+                continue;
+            }
+            match map.get(canonical) {
+                Some(existing) if *existing != profile => tracing::warn!(
+                    canonical,
+                    alias,
+                    kept = ?existing,
+                    ignored = ?profile,
+                    "model alias names a different vendor than an earlier alias of the same served model"
+                ),
+                Some(_) => {}
+                None => {
+                    map.insert(canonical.to_string(), profile);
+                }
+            }
+        }
+    }
+
+    /// The vendor a model id names in one of its `/`-separated segments.
+    fn from_model_segments(model: &str) -> Self {
         for segment in model.split('/') {
             if deepseek::matches_model(segment) {
                 return ProviderProfile::DeepSeek;
@@ -246,6 +306,49 @@ mod tests {
                 "{model} must not pick up message-declared tools"
             );
         }
+    }
+
+    #[test]
+    fn a_vendor_named_alias_gives_the_served_model_its_vendor_profile() {
+        // Names unique to this test: the alias table is process-wide.
+        ProviderProfile::register_model_aliases([
+            ("kimi-k3-public-name", "served-model-alpha"),
+            ("gpt-4o-public-name", "served-model-beta"),
+            // A second, disagreeing alias of the same served model is ignored.
+            ("MiniMax-M3-public-name", "served-model-alpha"),
+        ]);
+        assert_eq!(
+            ProviderProfile::for_model("served-model-alpha"),
+            ProviderProfile::Kimi
+        );
+        assert_eq!(
+            ProviderProfile::for_model("served-model-beta"),
+            ProviderProfile::OpenAi
+        );
+        assert_eq!(
+            ProviderProfile::for_model("served-model-gamma"),
+            ProviderProfile::OpenAi
+        );
+
+        // A request that entered under the vendor name and had its model id
+        // rewritten to the served name keeps the profile's dynamic tools.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "served-model-alpha",
+            "messages": [
+                {"role": "system", "content": "", "tools": [
+                    {"type": "function", "function": {"name": "get_weather"}}
+                ]},
+                {"role": "user", "content": "hi"}
+            ],
+            "tool_choice": "required"
+        }))
+        .expect("request deserializes");
+        let names: Vec<&str> = request
+            .effective_tools()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["get_weather"]);
+        assert_eq!(request.callable_tools().len(), 1);
     }
 
     #[test]

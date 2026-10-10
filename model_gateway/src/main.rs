@@ -860,7 +860,9 @@ struct CliArgs {
     /// (format: alias=canonical, repeatable). Applied to every locally
     /// registered worker whose model ID equals the canonical side,
     /// including workers registered by Kubernetes service discovery.
-    /// Matching is case-sensitive.
+    /// Matching is case-sensitive. A vendor-named alias (kimi-*, minimax-*,
+    /// ...) also gives the served model that vendor's contract profile under
+    /// both names.
     #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Service Discovery (Kubernetes)")]
     model_alias: Vec<String>,
 

@@ -4,6 +4,7 @@ use std::{
 };
 
 use llm_tokenizer::registry::TokenizerRegistry;
+use openai_protocol::profile::ProviderProfile;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
 use smg_data_connector::{
@@ -534,6 +535,14 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
+        // A served model aliased under a vendor name keeps that vendor's
+        // contract profile after the alias is resolved into the served name.
+        ProviderProfile::register_model_aliases(
+            router_config
+                .model_aliases
+                .iter()
+                .map(|(alias, canonical)| (alias.as_str(), canonical.as_str())),
+        );
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)

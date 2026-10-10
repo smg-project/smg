@@ -1383,7 +1383,9 @@ class RouterArgs:
             help=(
                 "Accept an extra client-facing model name for a served model."
                 " Format: <alias>=<canonical>. Repeat for multiple aliases."
-                " Matching is case-sensitive."
+                " Matching is case-sensitive. A vendor-named alias (kimi-*,"
+                " minimax-*, ...) also gives the served model that vendor's"
+                " contract profile under both names."
             ),
         )
         # Prometheus configuration
