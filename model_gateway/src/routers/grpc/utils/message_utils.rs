@@ -524,6 +524,23 @@ pub(crate) fn anthropic_tool_use_id(id: &str) -> String {
     }
 }
 
+/// The field a request asks for a structured output format with
+/// (`output_format`, or `output_config.format`), if any.
+pub(crate) fn output_format_field(request: &CreateMessageRequest) -> Option<&'static str> {
+    let set = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
+    if set(request.other.get("output_format")) {
+        Some("output_format")
+    } else if set(request
+        .other
+        .get("output_config")
+        .and_then(|c| c.get("format")))
+    {
+        Some("output_config.format")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use messages::{InputMessage, Role, TextBlock};

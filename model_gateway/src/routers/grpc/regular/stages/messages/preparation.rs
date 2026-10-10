@@ -53,6 +53,15 @@ impl MessagePreparationStage {
         ctx: &mut RequestContext,
         request: &CreateMessageRequest,
     ) -> Result<(), Response> {
+        // A structured output format would be dropped with the other
+        // pass-through fields, and the answer returned unconstrained.
+        if let Some(field) = message_utils::output_format_field(request) {
+            return Err(error::bad_request(
+                "unsupported_response_format",
+                format!("{field} is not supported: the gateway cannot constrain a Messages answer to a format"),
+            ));
+        }
+
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer = utils::resolve_tokenizer(ctx, "MessagePreparationStage::prepare_messages")
             .map_err(|e| *e)?;
