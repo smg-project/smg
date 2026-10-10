@@ -106,11 +106,11 @@ pub fn create_error(
 /// The public API's vocabulary, which clients switch on to decide between
 /// fixing the request, re-authenticating, backing off and retrying: a 4xx is
 /// an `invalid_request_error` (the public API files its 404s there too, the
-/// detail in `code`, e.g. `model_not_found`), except the three statuses with a
-/// word of their own; every 5xx is a `server_error`.
+/// detail in `code`, e.g. `model_not_found`, and its 401s, with the code
+/// `invalid_api_key`), except the two statuses with a word of their own;
+/// every 5xx is a `server_error`.
 pub fn error_type_for_status(status: StatusCode) -> &'static str {
     match status {
-        StatusCode::UNAUTHORIZED => "authentication_error",
         StatusCode::FORBIDDEN => "permission_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
         status if status.is_server_error() => "server_error",
@@ -200,7 +200,7 @@ mod tests {
             (StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error"),
             (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
             (StatusCode::FAILED_DEPENDENCY, "invalid_request_error"),
-            (StatusCode::UNAUTHORIZED, "authentication_error"),
+            (StatusCode::UNAUTHORIZED, "invalid_request_error"),
             (StatusCode::FORBIDDEN, "permission_error"),
             (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
             (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
