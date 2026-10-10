@@ -373,15 +373,21 @@ fn is_var_or_elems_access(expr: &Expr<'_>, varname: &str, key: Option<&str>) -> 
         Expr::Test(t) => is_var_or_elems_access(&t.expr, varname, key),
         Expr::Slice(s) => is_var_or_elems_access(&s.expr, varname, key),
         Expr::Var(v) => key.is_none() && v.id == varname,
-        Expr::GetAttr(g) => {
-            key.is_some_and(|key| g.name == key && is_var_or_elems_access(&g.expr, varname, None))
-        }
+        // The base of the attribute is the name itself, as in the engine's
+        // `_is_attr_access`; the wrappers above are allowed around the whole
+        // access only.
+        Expr::GetAttr(g) => key.is_some_and(|key| g.name == key && is_var(&g.expr, varname)),
         Expr::GetItem(g) => key.is_some_and(|key| {
             matches!(&g.subscript_expr, Expr::Const(c) if c.value.as_str() == Some(key))
-                && is_var_or_elems_access(&g.expr, varname, None)
+                && is_var(&g.expr, varname)
         }),
         _ => false,
     }
+}
+
+/// Whether `expr` is the plain name `varname`: the engine's `_is_var_access`.
+fn is_var(expr: &Expr<'_>, varname: &str) -> bool {
+    matches!(expr, Expr::Var(v) if v.id == varname)
 }
 
 /// `root` and every name assigned from it or from such a name, through

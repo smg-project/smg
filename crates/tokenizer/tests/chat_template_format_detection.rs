@@ -599,3 +599,19 @@ fn an_assignment_from_messages_to_a_namespace_falls_back_to_string_format() {
         ChatTemplateContentFormat::String
     );
 }
+
+#[test]
+fn a_loop_over_the_content_of_a_wrapped_message_is_string_format() {
+    // The base of `.content` must be the message name itself, as in the
+    // engine's `_is_attr_access`: a filter between them (`(message |
+    // default({})).content`) is not a loop over a message's content there.
+    let template = r"
+        {%- for message in messages %}
+        {%- for item in (message | default({})).content %}{{ item.text }}{%- endfor %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
