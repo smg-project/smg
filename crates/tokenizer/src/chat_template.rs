@@ -13,7 +13,7 @@ use chrono::{
 use minijinja::{
     context,
     machinery::{
-        ast::{Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
+        ast::{BinOpKind, Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
         parse, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
@@ -605,11 +605,13 @@ impl ThinkDetector {
         }
     }
 
-    /// `expr_references_var` with no negation above the reference.
+    /// `expr_references_var` through `and` / `or` only: a comparison such as
+    /// `add_generation_prompt == false` is not a positive reference (its true
+    /// body runs without a generation prompt), and nothing negated is.
     fn expr_references_var_positively(expr: &Expr, name: &str) -> bool {
         match expr {
             Expr::Var(v) => v.id == name,
-            Expr::BinOp(b) => {
+            Expr::BinOp(b) if matches!(b.op, BinOpKind::ScAnd | BinOpKind::ScOr) => {
                 Self::expr_references_var_positively(&b.left, name)
                     || Self::expr_references_var_positively(&b.right, name)
             }
@@ -2092,6 +2094,17 @@ mod tests {
         let else_prompt = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
                         {%- if not add_generation_prompt -%}done{%- else -%}<|assistant|><think>{%- endif -%}";
         let state = ChatTemplateState::new(Some(else_prompt.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // A comparison is not a positive reference either: this true body
+        // runs without a generation prompt.
+        let compared = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt == false -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(compared.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let conjunction = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt and messages -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(conjunction.to_string())).unwrap();
         assert!(state.prefill_opens_think_block());
     }
 
