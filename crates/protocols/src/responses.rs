@@ -1603,12 +1603,23 @@ impl ReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningSummary {
     Auto,
     Concise,
     Detailed,
+}
+
+impl ReasoningSummary {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Concise => "concise",
+            Self::Detailed => "detailed",
+        }
+    }
 }
 
 // ============================================================================
@@ -2762,12 +2773,22 @@ pub enum ServiceTier {
     Priority,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Truncation {
     Auto,
     #[default]
     Disabled,
+}
+
+impl Truncation {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2807,11 +2828,22 @@ pub struct IncompleteDetails {
     pub reason: IncompleteReason,
 }
 
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// The `reasoning` block of a Response object. The public API returns it on
+/// every response, both keys present (`null` when the request set none), so
+/// neither key is skipped here.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReasoningInfo {
     pub effort: Option<String>,
     pub summary: Option<String>,
+}
+
+impl From<&ResponseReasoningParam> for ReasoningInfo {
+    fn from(param: &ResponseReasoningParam) -> Self {
+        Self {
+            effort: param.effort.map(|effort| effort.as_str().to_string()),
+            summary: param.summary.map(|summary| summary.as_str().to_string()),
+        }
+    }
 }
 
 // ============================================================================
@@ -2819,10 +2851,39 @@ pub struct ReasoningInfo {
 // ============================================================================
 
 /// Text configuration for structured output requests
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TextConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<TextFormat>,
+
+    /// Spec: `text.verbosity` (`"low"` | `"medium"` | `"high"`). Accepted on
+    /// the request and echoed on the response, where the public API reports
+    /// `"medium"` when the request set none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<Verbosity>,
+}
+
+impl TextConfig {
+    /// The shape the public API reports on a Response object: `format`
+    /// defaults to `{"type": "text"}` and `verbosity` to `"medium"`.
+    pub fn with_response_defaults(self) -> Self {
+        Self {
+            format: self.format.or(Some(TextFormat::Text)),
+            verbosity: self.verbosity.or(Some(Verbosity::Medium)),
+        }
+    }
+}
+
+/// `text.verbosity` tiers of the Responses API.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Verbosity {
+    Low,
+    #[default]
+    Medium,
+    High,
 }
 
 /// Text format: text (default), json_object (legacy), or json_schema (recommended)
@@ -2870,15 +2931,20 @@ pub enum IncludeField {
 // Usage Types (Responses API format)
 // ============================================================================
 
-/// OpenAI Responses API usage format (different from standard UsageInfo)
-#[serde_with::skip_serializing_none]
+/// OpenAI Responses API usage format (different from standard UsageInfo).
+///
+/// The public schema marks `input_tokens_details` and `output_tokens_details`
+/// required, so both blocks are always on the wire (zeros when nothing was
+/// cached or no reasoning tokens were counted).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ResponseUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
-    pub input_tokens_details: Option<InputTokensDetails>,
-    pub output_tokens_details: Option<OutputTokensDetails>,
+    #[serde(default)]
+    pub input_tokens_details: InputTokensDetails,
+    #[serde(default)]
+    pub output_tokens_details: OutputTokensDetails,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2888,7 +2954,7 @@ pub enum ResponsesUsage {
     Modern(ResponseUsage),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct InputTokensDetails {
     pub cached_tokens: u32,
 }
@@ -2901,7 +2967,7 @@ impl From<&PromptTokenUsageInfo> for InputTokensDetails {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct OutputTokensDetails {
     pub reasoning_tokens: u32,
 }
@@ -2916,10 +2982,11 @@ impl UsageInfo {
             input_tokens_details: self
                 .prompt_tokens_details
                 .as_ref()
-                .map(InputTokensDetails::from),
-            output_tokens_details: self.reasoning_tokens.map(|tokens| OutputTokensDetails {
-                reasoning_tokens: tokens,
-            }),
+                .map(InputTokensDetails::from)
+                .unwrap_or_default(),
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: self.reasoning_tokens.unwrap_or(0),
+            },
         }
     }
 }
@@ -2937,14 +3004,9 @@ impl ResponseUsage {
             prompt_tokens: self.input_tokens,
             completion_tokens: self.output_tokens,
             total_tokens: self.total_tokens,
-            reasoning_tokens: self
-                .output_tokens_details
-                .as_ref()
-                .map(|details| details.reasoning_tokens),
-            prompt_tokens_details: self.input_tokens_details.as_ref().map(|details| {
-                PromptTokenUsageInfo {
-                    cached_tokens: details.cached_tokens,
-                }
+            reasoning_tokens: Some(self.output_tokens_details.reasoning_tokens),
+            prompt_tokens_details: Some(PromptTokenUsageInfo {
+                cached_tokens: self.input_tokens_details.cached_tokens,
             }),
         }
     }
@@ -3775,6 +3837,15 @@ pub fn generate_id(prefix: &str) -> String {
     format!("{prefix}_{hex_string}")
 }
 
+/// The Response object of `POST /v1/responses`.
+///
+/// The public API returns every field of this object on every response
+/// (`null` when a request parameter was not set), and the public schema marks
+/// `error`, `instructions`, `top_p`, `incomplete_details`, `temperature`,
+/// `tool_choice` and `tools` required; the `serialize_always` fields below
+/// therefore stay on the wire as `null` instead of being skipped. Only
+/// `conversation` is omitted when the response is not linked to one, as the
+/// public API does.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[non_exhaustive]
@@ -3792,10 +3863,12 @@ pub struct ResponsesResponse {
     /// Completion timestamp (unix seconds). `None` until the response reaches
     /// a terminal state (`completed`, `incomplete`, `failed`, `cancelled`).
     #[serde(default)]
+    #[serialize_always]
     pub completed_at: Option<i64>,
 
     /// Whether the response was created in background mode.
     #[serde(default)]
+    #[serialize_always]
     pub background: Option<bool>,
 
     /// Conversation this response is linked to, if any.
@@ -3806,16 +3879,25 @@ pub struct ResponsesResponse {
     pub status: ResponseStatus,
 
     /// Error information if status is failed
+    #[serialize_always]
     pub error: Option<Value>,
 
     /// Incomplete details if the response was truncated (`incomplete` status).
+    #[serialize_always]
     pub incomplete_details: Option<IncompleteDetails>,
 
     /// System instructions used
+    #[serialize_always]
     pub instructions: Option<String>,
 
     /// Max output tokens setting
+    #[serialize_always]
     pub max_output_tokens: Option<u32>,
+
+    /// Maximum number of built-in tool calls allowed for the response.
+    #[serde(default)]
+    #[serialize_always]
+    pub max_tool_calls: Option<u32>,
 
     /// Model name
     pub model: String,
@@ -3829,19 +3911,38 @@ pub struct ResponsesResponse {
     pub parallel_tool_calls: bool,
 
     /// Previous response ID if this is a continuation
+    #[serialize_always]
     pub previous_response_id: Option<String>,
 
+    /// Prompt cache key the request carried.
+    #[serde(default)]
+    #[serialize_always]
+    pub prompt_cache_key: Option<String>,
+
+    /// Prompt cache retention the request carried.
+    #[serde(default)]
+    #[serialize_always]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+
     /// Reasoning information
+    #[serialize_always]
     pub reasoning: Option<ReasoningInfo>,
+
+    /// Service tier the response was processed with.
+    #[serde(default)]
+    #[serialize_always]
+    pub service_tier: Option<ServiceTier>,
 
     /// Whether the response is stored
     #[serde(default = "default_true")]
     pub store: bool,
 
     /// Temperature setting used
+    #[serialize_always]
     pub temperature: Option<f32>,
 
     /// Text format settings
+    #[serialize_always]
     pub text: Option<TextConfig>,
 
     /// Tool choice setting
@@ -3852,20 +3953,40 @@ pub struct ResponsesResponse {
     #[serde(default)]
     pub tools: Vec<ResponseTool>,
 
+    /// Number of top logprobs requested (0 when none).
+    #[serde(default)]
+    #[serialize_always]
+    pub top_logprobs: Option<u32>,
+
     /// Top-p setting used
+    #[serialize_always]
     pub top_p: Option<f32>,
 
     /// Truncation strategy used
+    #[serialize_always]
     pub truncation: Option<String>,
 
     /// Usage information
+    #[serialize_always]
     pub usage: Option<ResponsesUsage>,
 
     /// User identifier
+    #[serialize_always]
     pub user: Option<String>,
 
     /// Safety identifier for content moderation
+    #[serialize_always]
     pub safety_identifier: Option<String>,
+
+    /// Frequency penalty used (0.0 when the request set none).
+    #[serde(default)]
+    #[serialize_always]
+    pub frequency_penalty: Option<f32>,
+
+    /// Presence penalty used (0.0 when the request set none).
+    #[serde(default)]
+    #[serialize_always]
+    pub presence_penalty: Option<f32>,
 
     /// Additional metadata
     #[serde(default)]

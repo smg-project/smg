@@ -733,6 +733,84 @@ mod tests {
         assert!(usage.get("completion_tokens").is_none());
     }
 
+    /// The public API returns these fields on every Response object (the
+    /// schema marks `error`, `instructions`, `top_p` and both usage detail
+    /// blocks required); a plain chat completion without reasoning or cache
+    /// hits must still produce all of them.
+    #[test]
+    fn chat_to_responses_carries_the_always_present_fields() {
+        let chat_response = ChatCompletionResponse::builder("chatcmpl_plain", "test-model")
+            .choices(vec![ChatChoice {
+                index: 0,
+                message: ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: Some("done".to_string()),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: Some("stop".to_string()),
+                matched_stop: None,
+                hidden_states: None,
+            }])
+            .usage(Usage::from_counts(5, 3))
+            .build();
+
+        let response = chat_to_responses(
+            &chat_response,
+            &ResponsesRequest::default(),
+            Some("resp_plain".to_string()),
+        )
+        .expect("chat response should convert");
+        let wire = serde_json::to_value(response).expect("response should serialize");
+        let body = wire.as_object().expect("object");
+
+        for key in [
+            "error",
+            "instructions",
+            "incomplete_details",
+            "previous_response_id",
+            "user",
+            "safety_identifier",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "max_tool_calls",
+        ] {
+            assert_eq!(
+                body.get(key),
+                Some(&serde_json::Value::Null),
+                "{key} must be present and null"
+            );
+        }
+        assert_eq!(body["top_p"], serde_json::json!(1.0));
+        assert_eq!(body["truncation"], "disabled");
+        assert_eq!(body["service_tier"], "default");
+        assert_eq!(body["top_logprobs"], 0);
+        assert_eq!(body["background"], false);
+        assert_eq!(body["frequency_penalty"], serde_json::json!(0.0));
+        assert_eq!(body["presence_penalty"], serde_json::json!(0.0));
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({"effort": null, "summary": null})
+        );
+        assert_eq!(
+            body["text"],
+            serde_json::json!({"format": {"type": "text"}, "verbosity": "medium"})
+        );
+        assert!(
+            body["completed_at"].is_i64(),
+            "completed responses are stamped"
+        );
+        assert_eq!(
+            body["usage"]["input_tokens_details"],
+            serde_json::json!({"cached_tokens": 0})
+        );
+        assert_eq!(
+            body["usage"]["output_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 0})
+        );
+    }
+
     #[test]
     fn test_text_input_conversion() {
         let req = ResponsesRequest {

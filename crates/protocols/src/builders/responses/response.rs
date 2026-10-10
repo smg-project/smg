@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::responses::*;
+use crate::{common::PromptCacheRetention, responses::*};
 
 /// Builder for ResponsesResponse
 ///
@@ -18,27 +18,35 @@ pub struct ResponsesResponseBuilder {
     object: String,
     created_at: i64,
     completed_at: Option<i64>,
+    background: Option<bool>,
     conversation: Option<String>,
     status: ResponseStatus,
     error: Option<Value>,
     incomplete_details: Option<IncompleteDetails>,
     instructions: Option<String>,
     max_output_tokens: Option<u32>,
+    max_tool_calls: Option<u32>,
     model: String,
     output: Vec<ResponseOutputItem>,
     parallel_tool_calls: bool,
     previous_response_id: Option<String>,
+    prompt_cache_key: Option<String>,
+    prompt_cache_retention: Option<PromptCacheRetention>,
     reasoning: Option<ReasoningInfo>,
+    service_tier: Option<ServiceTier>,
     store: bool,
     temperature: Option<f32>,
     text: Option<TextConfig>,
     tool_choice: String,
     tools: Vec<ResponseTool>,
+    top_logprobs: Option<u32>,
     top_p: Option<f32>,
     truncation: Option<String>,
     usage: Option<ResponsesUsage>,
     user: Option<String>,
     safety_identifier: Option<String>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
     metadata: HashMap<String, Value>,
 }
 
@@ -54,27 +62,35 @@ impl ResponsesResponseBuilder {
             object: "response".to_string(),
             created_at: chrono::Utc::now().timestamp(),
             completed_at: None,
+            background: None,
             conversation: None,
             status: ResponseStatus::InProgress,
             error: None,
             incomplete_details: None,
             instructions: None,
             max_output_tokens: None,
+            max_tool_calls: None,
             model: model.into(),
             output: Vec::new(),
             parallel_tool_calls: true,
             previous_response_id: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
             reasoning: None,
+            service_tier: None,
             store: true,
             temperature: None,
             text: None,
             tool_choice: "auto".to_string(),
             tools: Vec::new(),
+            top_logprobs: None,
             top_p: None,
             truncation: None,
             usage: None,
             user: None,
             safety_identifier: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             metadata: HashMap::new(),
         }
     }
@@ -83,16 +99,27 @@ impl ResponsesResponseBuilder {
     ///
     /// This populates fields like instructions, max_output_tokens, temperature, etc.
     /// from the original request, making it easy to construct a response that mirrors
-    /// the request parameters.
-    ///
-    /// Note: `safety_identifier` is intentionally NOT copied as it is for content moderation
-    /// and should be set independently from the request's `user` field (which is for billing/tracking).
+    /// the request parameters: the public API echoes every request parameter on
+    /// the Response object (`null` when unset), so the echoes are copied here and
+    /// the spec defaults are filled in by [`Self::build`].
     pub fn copy_from_request(mut self, request: &ResponsesRequest) -> Self {
         self.instructions.clone_from(&request.instructions);
         self.max_output_tokens = request.max_output_tokens;
+        self.max_tool_calls = request.max_tool_calls;
         self.parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
         self.previous_response_id
             .clone_from(&request.previous_response_id);
+        self.prompt_cache_key.clone_from(&request.prompt_cache_key);
+        self.prompt_cache_retention = request.prompt_cache_retention;
+        self.reasoning = request.reasoning.as_ref().map(ReasoningInfo::from);
+        self.service_tier.clone_from(&request.service_tier);
+        self.text.clone_from(&request.text);
+        self.top_logprobs = request.top_logprobs;
+        self.truncation = request.truncation.map(|t| t.as_str().to_string());
+        self.safety_identifier
+            .clone_from(&request.safety_identifier);
+        self.frequency_penalty = request.frequency_penalty;
+        self.presence_penalty = request.presence_penalty;
         self.store = request.store.unwrap_or(true);
         // ResponsesResponse stores `conversation` as a plain `Option<String>`
         // (response side per spec is `optional { id }` only); flatten the
@@ -286,35 +313,68 @@ impl ResponsesResponseBuilder {
         self
     }
 
-    /// Build the ResponsesResponse
+    /// Set whether the response runs in background mode
+    pub fn background(mut self, background: bool) -> Self {
+        self.background = Some(background);
+        self
+    }
+
+    /// Build the ResponsesResponse.
+    ///
+    /// Fields the public API always reports take their spec defaults when
+    /// nothing set them: `temperature`/`top_p` 1.0, `truncation` "disabled",
+    /// `service_tier` "default", `top_logprobs` 0, the penalties 0.0,
+    /// `background` false, `reasoning` with both keys null, `text` with the
+    /// plain text format and medium verbosity, and `completed_at` stamped the
+    /// moment a terminal status is built.
     pub fn build(self) -> ResponsesResponse {
+        let terminal = matches!(
+            self.status,
+            ResponseStatus::Completed
+                | ResponseStatus::Incomplete
+                | ResponseStatus::Failed
+                | ResponseStatus::Cancelled
+        );
+        let completed_at = self
+            .completed_at
+            .or_else(|| terminal.then(|| chrono::Utc::now().timestamp()));
         ResponsesResponse {
             id: self.id,
             object: self.object,
             created_at: self.created_at,
-            completed_at: self.completed_at,
-            background: None,
+            completed_at,
+            background: Some(self.background.unwrap_or(false)),
             conversation: self.conversation,
             status: self.status,
             error: self.error,
             incomplete_details: self.incomplete_details,
             instructions: self.instructions,
             max_output_tokens: self.max_output_tokens,
+            max_tool_calls: self.max_tool_calls,
             model: self.model,
             output: self.output,
             parallel_tool_calls: self.parallel_tool_calls,
             previous_response_id: self.previous_response_id,
-            reasoning: self.reasoning,
+            prompt_cache_key: self.prompt_cache_key,
+            prompt_cache_retention: self.prompt_cache_retention,
+            reasoning: Some(self.reasoning.unwrap_or_default()),
+            service_tier: Some(self.service_tier.unwrap_or(ServiceTier::Default)),
             store: self.store,
-            temperature: self.temperature,
-            text: self.text,
+            temperature: Some(self.temperature.unwrap_or(1.0)),
+            text: Some(self.text.unwrap_or_default().with_response_defaults()),
             tool_choice: self.tool_choice,
             tools: self.tools,
-            top_p: self.top_p,
-            truncation: self.truncation,
+            top_logprobs: Some(self.top_logprobs.unwrap_or(0)),
+            top_p: Some(self.top_p.unwrap_or(1.0)),
+            truncation: Some(
+                self.truncation
+                    .unwrap_or_else(|| Truncation::Disabled.as_str().to_string()),
+            ),
             usage: self.usage,
             user: self.user,
             safety_identifier: self.safety_identifier,
+            frequency_penalty: Some(self.frequency_penalty.unwrap_or(0.0)),
+            presence_penalty: Some(self.presence_penalty.unwrap_or(0.0)),
             metadata: self.metadata,
         }
     }
@@ -434,5 +494,117 @@ mod tests {
         assert_eq!(response.metadata.len(), 2);
         assert_eq!(response.metadata.get("key1").unwrap(), "value1");
         assert_eq!(response.metadata.get("key2").unwrap(), 42);
+    }
+
+    /// Every field the public API returns on every Response object is on the
+    /// wire even when nothing set it: the spec-required ones as `null`, the
+    /// rest with the spec defaults.
+    #[test]
+    fn minimal_response_carries_every_always_present_field() {
+        let response = ResponsesResponse::builder("resp_min", "m")
+            .status(ResponseStatus::Completed)
+            .build();
+        let wire = serde_json::to_value(&response).unwrap();
+        let body = wire.as_object().unwrap();
+
+        for key in [
+            "error",
+            "instructions",
+            "incomplete_details",
+            "previous_response_id",
+            "user",
+            "safety_identifier",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "max_output_tokens",
+            "max_tool_calls",
+            "usage",
+        ] {
+            assert_eq!(body.get(key), Some(&Value::Null), "{key} must be null");
+        }
+        assert_eq!(body["top_p"], serde_json::json!(1.0));
+        assert_eq!(body["temperature"], serde_json::json!(1.0));
+        assert_eq!(body["truncation"], "disabled");
+        assert_eq!(body["service_tier"], "default");
+        assert_eq!(body["top_logprobs"], 0);
+        assert_eq!(body["frequency_penalty"], serde_json::json!(0.0));
+        assert_eq!(body["presence_penalty"], serde_json::json!(0.0));
+        assert_eq!(body["background"], false);
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({"effort": null, "summary": null})
+        );
+        assert_eq!(
+            body["text"],
+            serde_json::json!({"format": {"type": "text"}, "verbosity": "medium"})
+        );
+        assert!(
+            body["completed_at"].is_i64(),
+            "a completed response is stamped: {}",
+            body["completed_at"]
+        );
+        assert!(
+            !body.contains_key("conversation"),
+            "an unlinked response omits conversation"
+        );
+    }
+
+    #[test]
+    fn in_progress_response_has_no_completed_at() {
+        let wire =
+            serde_json::to_value(ResponsesResponse::builder("resp_run", "m").build()).unwrap();
+        assert_eq!(wire["status"], "in_progress");
+        assert_eq!(wire["completed_at"], Value::Null);
+    }
+
+    #[test]
+    fn copy_from_request_echoes_the_request_parameters() {
+        let request = ResponsesRequest {
+            model: "m".to_string(),
+            input: ResponseInput::Text("test".to_string()),
+            reasoning: Some(ResponseReasoningParam {
+                effort: Some(ReasoningEffort::High),
+                summary: Some(ReasoningSummary::Concise),
+            }),
+            service_tier: Some(ServiceTier::Flex),
+            truncation: Some(Truncation::Auto),
+            top_logprobs: Some(3),
+            max_tool_calls: Some(4),
+            prompt_cache_key: Some("cache-1".to_string()),
+            prompt_cache_retention: Some(PromptCacheRetention::Duration24h),
+            safety_identifier: Some("safe-1".to_string()),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(-0.5),
+            text: Some(TextConfig {
+                format: None,
+                verbosity: Some(Verbosity::Low),
+            }),
+            ..Default::default()
+        };
+
+        let wire = serde_json::to_value(
+            ResponsesResponse::builder("resp_echo", "m")
+                .copy_from_request(&request)
+                .build(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            wire["reasoning"],
+            serde_json::json!({"effort": "high", "summary": "concise"})
+        );
+        assert_eq!(wire["service_tier"], "flex");
+        assert_eq!(wire["truncation"], "auto");
+        assert_eq!(wire["top_logprobs"], 3);
+        assert_eq!(wire["max_tool_calls"], 4);
+        assert_eq!(wire["prompt_cache_key"], "cache-1");
+        assert_eq!(wire["prompt_cache_retention"], "24h");
+        assert_eq!(wire["safety_identifier"], "safe-1");
+        assert_eq!(wire["frequency_penalty"], serde_json::json!(0.5));
+        assert_eq!(wire["presence_penalty"], serde_json::json!(-0.5));
+        assert_eq!(
+            wire["text"],
+            serde_json::json!({"format": {"type": "text"}, "verbosity": "low"})
+        );
     }
 }

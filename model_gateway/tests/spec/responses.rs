@@ -816,6 +816,7 @@ fn test_validate_text_format_json_schema_empty_name() {
                 description: None,
                 strict: None,
             }),
+            verbosity: None,
         }),
         ..Default::default()
     };
@@ -839,6 +840,7 @@ fn test_validate_text_format_json_schema_schema_not_object() {
                     description: None,
                     strict: None,
                 }),
+                verbosity: None,
             }),
             ..Default::default()
         }
