@@ -26,7 +26,7 @@ use openai_protocol::{
         self, ContentBlock, ContentBlockDelta, Message, MessageDelta, MessageDeltaUsage,
         MessageStreamEvent,
     },
-    profile::ProviderProfile,
+    profile::{ModelProfile, ProviderProfile},
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde::Serialize;
@@ -817,6 +817,7 @@ impl StreamingProcessor {
                             tool_choice.as_ref(),
                             model,
                             history_tool_calls_count,
+                            original_request.model_profile,
                         )
                     } else {
                         // Use incremental parser for regular/required modes
@@ -830,6 +831,7 @@ impl StreamingProcessor {
                             model,
                             history_tool_calls_count,
                             used_json_schema,
+                            original_request.model_profile,
                         )
                         .await
                     };
@@ -1765,6 +1767,7 @@ impl StreamingProcessor {
         tool_choice: Option<&ToolChoice>,
         model: &str,
         history_tool_calls_count: usize,
+        profile: ModelProfile,
     ) -> Vec<ChatStreamChoice> {
         let mut chunks = Vec::new();
 
@@ -1775,7 +1778,8 @@ impl StreamingProcessor {
                 // First chunk: send name and id
                 has_tool_calls.insert(index, true);
 
-                let tool_call_id = utils::generate_tool_call_id(
+                let tool_call_id = utils::generate_tool_call_id_with_profile(
+                    Some(profile),
                     model,
                     &function.name,
                     0,
@@ -1834,6 +1838,7 @@ impl StreamingProcessor {
         model: &str,
         history_tool_calls_count: usize,
         use_json_parser: bool,
+        profile: ModelProfile,
     ) -> Vec<ChatStreamChoice> {
         let mut chunks = Vec::new();
 
@@ -1868,7 +1873,8 @@ impl StreamingProcessor {
                         has_tool_calls.insert(index, true);
 
                         let tool_call_id = if let Some(ref name) = tool_call_item.name {
-                            Some(utils::generate_tool_call_id(
+                            Some(utils::generate_tool_call_id_with_profile(
+                                Some(profile),
                                 model,
                                 name,
                                 tool_call_item.tool_index,

@@ -914,6 +914,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().spec.models.all().to_vec()
     }
 
+    /// Visit the effective model cards once. The default preserves custom
+    /// `models` implementations; BasicWorker borrows its discovery snapshot
+    /// without cloning. The slice is valid only during the callback.
+    fn with_models(&self, visitor: &mut dyn FnMut(&[ModelCard])) {
+        visitor(&self.models());
+    }
+
     /// Context window (in tokens) this worker advertises for `model_id`, from
     /// the matching model card (falling back to the primary card). `None`
     /// when the worker never advertised one; callers then leave the length
@@ -2467,13 +2474,19 @@ impl Worker for BasicWorker {
     }
 
     fn models(&self) -> Vec<ModelCard> {
+        let mut models = Vec::new();
+        self.with_models(&mut |cards| models = cards.to_vec());
+        models
+    }
+
+    fn with_models(&self, visitor: &mut dyn FnMut(&[ModelCard])) {
         let overridden = self.models_override.load();
         let source = if overridden.is_wildcard() {
             self.metadata.spec.models.all()
         } else {
             overridden.all()
         };
-        source.to_vec()
+        visitor(source);
     }
 
     fn context_length(&self, model_id: &str) -> Option<u32> {

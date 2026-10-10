@@ -5,6 +5,7 @@ pub mod health;
 pub mod mesh;
 pub mod mesh_discovery;
 pub mod middleware;
+mod model_profile;
 pub mod observability;
 pub mod policies;
 pub mod posture;

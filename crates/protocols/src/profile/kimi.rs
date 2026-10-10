@@ -11,6 +11,7 @@ use crate::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent, ThinkingType},
     common::Tool,
     ext::kimi::DeclaredTools,
+    profile::ModelProfile,
 };
 
 /// Tool names longer than this are rejected (KVV pins 257).
@@ -41,7 +42,7 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
             .include_usage
             .get_or_insert(true);
     }
-    if !is_k3(&req.model) {
+    if req.model_profile() != ModelProfile::KimiK3 {
         return;
     }
     req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
@@ -52,7 +53,7 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
 }
 
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
-    if is_k3(&req.model) {
+    if req.model_profile() == ModelProfile::KimiK3 {
         validate_sampling(req)?;
         validate_thinking(req)?;
     }
@@ -190,7 +191,7 @@ fn error(code: &'static str, message: String) -> validator::ValidationError {
 }
 
 /// Whether a model id names Kimi K3, the only Kimi model with pinned sampling and thinking rules.
-fn is_k3(model: &str) -> bool {
+pub(super) fn is_k3(model: &str) -> bool {
     model.split('/').any(|segment| {
         super::starts_with_ignore_ascii_case(segment, "kimi-k3")
             || super::starts_with_ignore_ascii_case(segment, "kimi_k3")

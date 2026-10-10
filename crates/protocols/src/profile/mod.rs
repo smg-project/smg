@@ -30,13 +30,72 @@ use crate::{
     ext::retain_if,
 };
 
+/// A model's resolved contract, independent of its public serving name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelProfile {
+    OpenAi,
+    Kimi,
+    KimiK3,
+    Minimax,
+    Zai,
+    ZaiWithSamplingDefaults,
+    ZaiGlm53,
+    DeepSeekV4,
+    DeepSeekV41,
+}
+
+impl ModelProfile {
+    /// Infer from the model name, falling back to its configured alias contract.
+    pub fn for_model(model: &str) -> Self {
+        let profile = Self::for_model_name(model);
+        if profile != Self::OpenAi {
+            return profile;
+        }
+        let aliased = alias_profiles().read().unwrap_or_else(|e| e.into_inner());
+        aliased.get(model).copied().unwrap_or(Self::OpenAi)
+    }
+
+    /// Infer from the name itself, before applying configured alias fallbacks.
+    pub fn for_model_name(model: &str) -> Self {
+        Self::from_provider(ProviderProfile::from_model_segments(model), model)
+    }
+
+    /// Refine a provider family into the version-specific contract it names.
+    fn from_provider(provider: ProviderProfile, model: &str) -> Self {
+        match provider {
+            ProviderProfile::OpenAi => Self::OpenAi,
+            ProviderProfile::Kimi if kimi::is_k3(model) => Self::KimiK3,
+            ProviderProfile::Kimi => Self::Kimi,
+            ProviderProfile::Minimax => Self::Minimax,
+            ProviderProfile::Zai if zai::is_glm53(model) => Self::ZaiGlm53,
+            ProviderProfile::Zai if zai::uses_sampling_defaults(model) => {
+                Self::ZaiWithSamplingDefaults
+            }
+            ProviderProfile::Zai => Self::Zai,
+            ProviderProfile::DeepSeek if deepseek::is_v41_model(model) => Self::DeepSeekV41,
+            ProviderProfile::DeepSeek => Self::DeepSeekV4,
+        }
+    }
+
+    /// The provider family whose message extensions this contract accepts.
+    pub fn provider(self) -> ProviderProfile {
+        match self {
+            Self::OpenAi => ProviderProfile::OpenAi,
+            Self::Kimi | Self::KimiK3 => ProviderProfile::Kimi,
+            Self::Minimax => ProviderProfile::Minimax,
+            Self::Zai | Self::ZaiWithSamplingDefaults | Self::ZaiGlm53 => ProviderProfile::Zai,
+            Self::DeepSeekV4 | Self::DeepSeekV41 => ProviderProfile::DeepSeek,
+        }
+    }
+}
+
 /// Served model ids that take a vendor's profile from an alias they are served
 /// under, recorded once at startup from the configured model aliases. An alias
 /// is resolved into the request's model id before the response side reads it,
 /// so the served name has to select the profile its vendor-named alias does,
 /// or a request that entered under the vendor name loses the profile half-way.
-fn alias_profiles() -> &'static RwLock<HashMap<String, ProviderProfile>> {
-    static ALIAS_PROFILES: OnceLock<RwLock<HashMap<String, ProviderProfile>>> = OnceLock::new();
+fn alias_profiles() -> &'static RwLock<HashMap<String, ModelProfile>> {
+    static ALIAS_PROFILES: OnceLock<RwLock<HashMap<String, ModelProfile>>> = OnceLock::new();
     ALIAS_PROFILES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -100,28 +159,20 @@ impl ProviderProfile {
     /// and `deepseek-flash` alias select its profile; older versions and
     /// unrecognized suffixes keep the baseline.
     pub fn for_model(model: &str) -> Self {
-        let profile = Self::from_model_segments(model);
-        if profile != ProviderProfile::OpenAi {
-            return profile;
-        }
-        let aliased = alias_profiles().read().unwrap_or_else(|e| e.into_inner());
-        aliased
-            .get(model)
-            .copied()
-            .unwrap_or(ProviderProfile::OpenAi)
+        ModelProfile::for_model(model).provider()
     }
 
     /// Record the configured model aliases (`alias -> served model id`). A
-    /// served model id that has a vendor-named alias selects that vendor's
-    /// profile from now on, whichever of its names a request carries. Aliases
-    /// that select no vendor profile change nothing; when two aliases of one
-    /// served model name different vendors, the first registered wins and the
-    /// conflict is logged.
+    /// served model id that has a vendor-named alias selects that alias's
+    /// version-specific contract, whichever of its names a request carries.
+    /// Aliases that select no vendor profile change nothing; when two aliases
+    /// of one served model name different contracts, the first registered wins
+    /// and the conflict is logged. Recognized model names still take precedence.
     pub fn register_model_aliases<'a>(aliases: impl IntoIterator<Item = (&'a str, &'a str)>) {
         let mut map = alias_profiles().write().unwrap_or_else(|e| e.into_inner());
         for (alias, canonical) in aliases {
-            let profile = Self::from_model_segments(alias);
-            if profile == ProviderProfile::OpenAi {
+            let profile = ModelProfile::for_model_name(alias);
+            if profile == ModelProfile::OpenAi {
                 continue;
             }
             match map.get(canonical) {
@@ -130,7 +181,7 @@ impl ProviderProfile {
                     alias,
                     kept = ?existing,
                     ignored = ?profile,
-                    "model alias names a different vendor than an earlier alias of the same served model"
+                    "model alias names a different contract than an earlier alias of the same served model"
                 ),
                 Some(_) => {}
                 None => {

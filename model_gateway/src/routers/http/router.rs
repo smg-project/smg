@@ -58,8 +58,8 @@ use crate::{
             attempt_ledger::{mark_upstream_answer, AttemptLedger},
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
-                REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
-                REASON_WORKER_MUTATES_BODY,
+                REASON_MODEL_AMBIGUOUS, REASON_MODEL_PROFILE, REASON_MODEL_SELECTION,
+                REASON_NO_AVAILABLE_WORKER, REASON_WORKER_MUTATES_BODY,
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
@@ -635,15 +635,10 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        // The profile comes from the model the client asked for, as request
-        // validation selects it, not from the alias-resolved id.
+        // Preserve the same resolved contract used during request validation.
         let rechunk = is_stream
             && route == "/v1/chat/completions"
-            && lease.with_view(|view| {
-                view.request.get_model().is_some_and(|model| {
-                    ProviderProfile::for_model(model) == ProviderProfile::Minimax
-                })
-            });
+            && lease.with_view(|view| view.request.provider_profile() == ProviderProfile::Minimax);
         let response = match lease.serialize_with(|view| {
             if let Some(adapter) = &decision_adapter {
                 serialize_request_body(
@@ -1884,6 +1879,18 @@ impl Router {
             BodyPath::Stream(reason) => reason,
         };
         let model_id = crate::worker::UNKNOWN_MODEL_ID;
+        // Decline before selection: probing the load-balancing policy here
+        // and dispatching through it again on the typed path skips workers.
+        if route == "/v1/chat/completions"
+            && self
+                .worker_registry
+                .get_routing_pool(model_id, RoutingPool::HttpRegular)
+                .iter()
+                .any(|worker| crate::model_profile::worker_requires_chat_profile(worker.as_ref()))
+        {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_PROFILE);
+            return Err(req);
+        }
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
         // Streamed requests have no readable body, hence no rid key and no
@@ -1904,6 +1911,13 @@ impl Router {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
         };
+        // A worker registered since the fleet check still needs the typed path.
+        if route == "/v1/chat/completions"
+            && crate::model_profile::worker_requires_chat_profile(worker.as_ref())
+        {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_PROFILE);
+            return Err(req);
+        }
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
         // unmutated stream, and a second model appearing re-opens
