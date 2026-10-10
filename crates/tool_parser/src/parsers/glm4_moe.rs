@@ -150,8 +150,8 @@ impl Glm4MoeParser {
     /// starts the grammar; the registry emits `sequence[prefix, calls]`.
     ///
     /// Where the engine applies the grammar only after its reasoning parser
-    /// has seen the model's own `</think>` (vLLM with a reasoning parser,
-    /// SGLang alike), nothing precedes the calls: the first constrained
+    /// has seen the model's own `</think>`, nothing precedes the calls: the first
+    /// constrained
     /// token is the forced `<tool_call>`, as under the engine's own server.
     /// Where it applies the grammar from the first token, the prefix is
     /// xgrammar's built-in `glm_4_7` block (`reasoning=True`): the thought,

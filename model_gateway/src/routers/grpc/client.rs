@@ -1049,14 +1049,14 @@ mod tests {
         assert!(!text_only.to_labels().contains_key("mm_item_limits"));
     }
 
-    /// The vLLM servicers' reasoning-parser facts flatten into the
+    /// A servicer's reasoning-parser facts flatten into the
     /// `engine_reasoning_parser` and `structured_outputs_start` labels the
     /// forced tool-call grammar is shaped by, and never into
     /// `reasoning_parser`, the per-model parser override registration
     /// validates against the router's own registry; an engine whose servicer
     /// reports neither (the proto default) sets no such labels.
     #[test]
-    fn server_info_to_labels_vllm_carries_where_the_engine_starts_a_grammar() {
+    fn server_info_to_labels_carries_where_the_engine_starts_a_grammar() {
         let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
             engine_reasoning_parser: "glm45".to_string(),
             structured_outputs_start: "after_reasoning".to_string(),
