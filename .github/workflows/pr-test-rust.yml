@@ -267,7 +267,7 @@ jobs:
           pytest -q grpc_servicer/tests -rs
 
       - name: Run CI tooling unit tests
-        run: pytest -q scripts/tests/test_ci_node_health.py
+        run: pytest -q scripts/tests/test_ci_node_health.py scripts/tests/test_ci_prepared_backend_env.py
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
