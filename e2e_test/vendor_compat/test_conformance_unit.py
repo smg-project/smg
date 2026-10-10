@@ -1,4 +1,4 @@
-"""CPU unit tests for the vendor-conformance suite logic (no GPU, no gateway).
+"""CPU unit tests for the vendor-conformance suite logic (no engine, no gateway).
 
 Runs in the harness unit-test job (``pytest --noconftest``) alongside
 ``e2e_test/infra`` / ``e2e_test/fixtures``. Uses the real checked-in
