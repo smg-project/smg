@@ -140,30 +140,34 @@ pub(crate) fn process_message_content_format(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<Vec<Value>, String> {
-    messages.iter().try_fold(Vec::new(), |mut result, message| {
-        match message.role {
-            messages::Role::User => {
-                convert_user_message(
-                    &message.content,
-                    content_format,
-                    placeholder_tokens,
-                    media_order,
-                    &mut result,
-                );
+    messages
+        .iter()
+        .enumerate()
+        .try_fold(Vec::new(), |mut result, (index, message)| {
+            match message.role {
+                messages::Role::User => {
+                    convert_user_message(
+                        index,
+                        &message.content,
+                        content_format,
+                        placeholder_tokens,
+                        media_order,
+                        &mut result,
+                    )?;
+                }
+                messages::Role::Assistant => {
+                    result.push(convert_assistant_message(&message.content));
+                }
+                // A `system`-role message in `messages[]` (e.g. from Claude Code) is
+                // forwarded in place, preserving its position in the conversation so
+                // inline-`system` chat templates render it where it was sent.
+                // See https://github.com/smg-project/smg/issues/1795
+                messages::Role::System => {
+                    result.push(convert_system_message(&message.content));
+                }
             }
-            messages::Role::Assistant => {
-                result.push(convert_assistant_message(&message.content));
-            }
-            // A `system`-role message in `messages[]` (e.g. from Claude Code) is
-            // forwarded in place, preserving its position in the conversation so
-            // inline-`system` chat templates render it where it was sent.
-            // See https://github.com/smg-project/smg/issues/1795
-            messages::Role::System => {
-                result.push(convert_system_message(&message.content));
-            }
-        }
-        Ok(result)
-    })
+            Ok(result)
+        })
 }
 
 /// Convert a `system`-role message's content to a chat-template JSON value,
@@ -190,51 +194,55 @@ fn convert_system_message(content: &InputContent) -> Value {
 /// Tool results are split into separate "tool" role messages (the chat template
 /// expects tool results as their own messages, not embedded in user content).
 fn convert_user_message(
+    index: usize,
     content: &InputContent,
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
     result: &mut Vec<Value>,
-) {
+) -> Result<(), String> {
     match content {
         InputContent::String(text) => {
             result.push(json!({"role": "user", "content": text}));
         }
         InputContent::Blocks(blocks) => {
-            let (user_parts, tool_msgs) = blocks.iter().fold(
-                (Vec::new(), Vec::new()),
-                |(mut user_parts, mut tool_msgs), block| {
-                    match block {
-                        InputContentBlock::Text(t) => {
-                            user_parts.push(json!({"type": "text", "text": t.text}));
-                        }
-                        InputContentBlock::Image(_) => {
-                            user_parts.push(json!({"type": "image"}));
-                        }
-                        InputContentBlock::Document(_) => {
-                            user_parts.push(json!({"type": "document"}));
-                        }
-                        InputContentBlock::ToolResult(tr) => {
-                            tool_msgs.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tr.tool_use_id,
-                                "content": extract_tool_result_text(tr)
-                            }));
-                            // A tool result may carry images (a screenshot a
-                            // browser or shell tool returned). They join the
-                            // user content here, in block order, so the model
-                            // sees them; `media_plan_messages` lists them at
-                            // the same position, which keeps the plan aligned
-                            // with the placeholders this message renders.
-                            user_parts.extend(
-                                tool_result_image_blocks(tr).map(|_| json!({"type": "image"})),
-                            );
-                        }
-                        _ => {}
+            let mut user_parts = Vec::new();
+            let mut tool_msgs = Vec::new();
+            for (position, block) in blocks.iter().enumerate() {
+                match block {
+                    InputContentBlock::Text(t) => {
+                        user_parts.push(json!({"type": "text", "text": t.text}));
                     }
-                    (user_parts, tool_msgs)
-                },
-            );
+                    InputContentBlock::Image(_) => {
+                        user_parts.push(json!({"type": "image"}));
+                    }
+                    // A document is prompt text for every template, not a
+                    // media part the template may not know.
+                    InputContentBlock::Document(document) => {
+                        let text = render_document(
+                            document,
+                            &format!("messages.{index}.content.{position}"),
+                        )?;
+                        user_parts.push(json!({"type": "text", "text": text}));
+                    }
+                    InputContentBlock::ToolResult(tr) => {
+                        tool_msgs.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tr.tool_use_id,
+                            "content": extract_tool_result_text(tr)
+                        }));
+                        // A tool result may carry images (a screenshot a
+                        // browser or shell tool returned). They join the
+                        // user content here, in block order, so the model
+                        // sees them; `media_plan_messages` lists them at
+                        // the same position, which keeps the plan aligned
+                        // with the placeholders this message renders.
+                        user_parts
+                            .extend(tool_result_image_blocks(tr).map(|_| json!({"type": "image"})));
+                    }
+                    _ => {}
+                }
+            }
 
             if !user_parts.is_empty() {
                 let content = format_content_parts(
@@ -248,6 +256,63 @@ fn convert_user_message(
             result.extend(tool_msgs);
         }
     }
+    Ok(())
+}
+
+/// A document block as prompt text, so that any template reads it: the
+/// title and context the request gave, then the document's text, in the
+/// tagged layout the public API documents for documents in a prompt. Only
+/// text renders: a text source, or a content source made of text blocks. A
+/// PDF or URL source needs a document reader this gateway has no path for
+/// and is refused naming the block (`at`), not handed to the template.
+pub(crate) fn render_document(
+    document: &messages::DocumentBlock,
+    at: &str,
+) -> Result<String, String> {
+    let text = match &document.source {
+        messages::DocumentSource::Text { data } => data.as_str(),
+        messages::DocumentSource::Content { content } => {
+            let mut texts = Vec::with_capacity(content.len());
+            for block in content {
+                match block {
+                    InputContentBlock::Text(t) => texts.push(t.text.as_str()),
+                    _ => {
+                        return Err(format!(
+                            "{at}: a document content source may hold text blocks only"
+                        ))
+                    }
+                }
+            }
+            return Ok(document_text(document, &texts.join("\n")));
+        }
+        messages::DocumentSource::Base64 { media_type, .. } => {
+            return Err(format!(
+                "{at}: document source type 'base64' ({media_type}) is not supported; \
+                 send the document as a text or content source"
+            ))
+        }
+        messages::DocumentSource::Url { .. } => {
+            return Err(format!(
+                "{at}: document source type 'url' is not supported; send the document \
+                 as a text or content source"
+            ))
+        }
+    };
+    Ok(document_text(document, text))
+}
+
+fn document_text(document: &messages::DocumentBlock, text: &str) -> String {
+    let mut out = String::from("<document>\n");
+    if let Some(title) = &document.title {
+        out.push_str(&format!("<source>{title}</source>\n"));
+    }
+    if let Some(context) = &document.context {
+        out.push_str(&format!("<document_context>{context}</document_context>\n"));
+    }
+    out.push_str("<document_content>\n");
+    out.push_str(text);
+    out.push_str("\n</document_content>\n</document>");
+    out
 }
 
 /// The image blocks inside a ToolResult block's content, in order.
@@ -387,7 +452,7 @@ fn order_media_parts(parts: Vec<Value>, media_order: MediaPartOrder) -> Vec<Valu
             let (mut media, rest): (Vec<Value>, Vec<Value>) = parts.into_iter().partition(|p| {
                 matches!(
                     p.get("type").and_then(|t| t.as_str()),
-                    Some("image") | Some("video") | Some("audio") | Some("document")
+                    Some("image") | Some("video") | Some("audio")
                 )
             });
             media.extend(rest);
@@ -997,5 +1062,156 @@ mod tests {
             cache_control: None,
         };
         assert_eq!(tool_result_image_blocks(&empty).count(), 0);
+    }
+
+    fn document(
+        source: messages::DocumentSource,
+        title: Option<&str>,
+        context: Option<&str>,
+    ) -> Vec<InputMessage> {
+        vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![
+                InputContentBlock::Document(messages::DocumentBlock {
+                    source,
+                    cache_control: None,
+                    title: title.map(str::to_owned),
+                    context: context.map(str::to_owned),
+                    citations: Some(messages::CitationsConfig {
+                        enabled: Some(true),
+                    }),
+                }),
+                InputContentBlock::Text(TextBlock {
+                    text: "What is the powerhouse of the cell?".to_string(),
+                    cache_control: None,
+                    citations: None,
+                }),
+            ]),
+        }]
+    }
+
+    /// A text-source document is prompt text with its title and context,
+    /// kept in the order the request wrote it, for both content formats.
+    #[test]
+    fn text_document_renders_as_prompt_text_in_authored_order() {
+        let messages = document(
+            messages::DocumentSource::Text {
+                data: "The mitochondria is the powerhouse of the cell.".to_string(),
+            },
+            Some("Biology notes"),
+            Some("From a textbook"),
+        );
+        let expected = "<document>\n<source>Biology notes</source>\n<document_context>From a textbook</document_context>\n<document_content>\nThe mitochondria is the powerhouse of the cell.\n</document_content>\n</document>";
+
+        let parts = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        let arr = parts[0]["content"].as_array().unwrap();
+        assert_eq!(arr[0], json!({"type": "text", "text": expected}));
+        assert_eq!(arr[1]["text"], "What is the powerhouse of the cell?");
+
+        let flat = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(
+            flat[0]["content"],
+            json!(format!("{expected}\nWhat is the powerhouse of the cell?"))
+        );
+    }
+
+    /// A content-source document joins its text blocks; one holding anything
+    /// else is refused naming the block.
+    #[test]
+    fn content_document_joins_its_text_blocks() {
+        let text = |t: &str| {
+            InputContentBlock::Text(TextBlock {
+                text: t.to_string(),
+                cache_control: None,
+                citations: None,
+            })
+        };
+        let messages = document(
+            messages::DocumentSource::Content {
+                content: vec![text("First paragraph."), text("Second paragraph.")],
+            },
+            None,
+            None,
+        );
+        let parts = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+        assert_eq!(
+            parts[0]["content"][0]["text"],
+            "<document>\n<document_content>\nFirst paragraph.\nSecond paragraph.\n</document_content>\n</document>"
+        );
+
+        let messages = document(
+            messages::DocumentSource::Content {
+                content: vec![InputContentBlock::Image(messages::ImageBlock {
+                    source: messages::ImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "AAAA".to_string(),
+                    },
+                    cache_control: None,
+                })],
+            },
+            None,
+            None,
+        );
+        let err = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with(
+                "messages.0.content.0: a document content source may hold text blocks only"
+            ),
+            "{err}"
+        );
+    }
+
+    /// A PDF or URL document has no reader here: refused with a message
+    /// naming the block, before any template sees it.
+    #[test]
+    fn pdf_and_url_documents_are_refused_naming_the_block() {
+        for (source, needle) in [
+            (
+                messages::DocumentSource::Base64 {
+                    media_type: "application/pdf".to_string(),
+                    data: "JVBERi0=".to_string(),
+                },
+                "messages.0.content.0: document source type 'base64' (application/pdf) is not supported",
+            ),
+            (
+                messages::DocumentSource::Url {
+                    url: "https://example.com/paper.pdf".to_string(),
+                },
+                "messages.0.content.0: document source type 'url' is not supported",
+            ),
+        ] {
+            let err = process_message_content_format(
+                &document(source, None, None),
+                ChatTemplateContentFormat::OpenAI,
+                None,
+                MediaPartOrder::Authored,
+            )
+            .unwrap_err();
+            assert!(err.starts_with(needle), "{err}");
+        }
     }
 }
