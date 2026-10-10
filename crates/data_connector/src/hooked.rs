@@ -539,6 +539,16 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    /// An index lookup over data the hook already saw at `StoreResponse`; it
+    /// is delegated as is (no hook operation of its own), so the hook
+    /// interface does not change for it.
+    async fn find_response_by_output_item(
+        &self,
+        item_id: &str,
+    ) -> ResponseResult<Option<StoredResponse>> {
+        self.inner.find_response_by_output_item(item_id).await
+    }
+
     async fn list_identifier_responses(
         &self,
         identifier: &str,

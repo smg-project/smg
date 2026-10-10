@@ -415,6 +415,29 @@ impl ResponseStorage for MemoryResponseStorage {
         Ok(chain)
     }
 
+    async fn find_response_by_output_item(
+        &self,
+        item_id: &str,
+    ) -> ResponseResult<Option<StoredResponse>> {
+        let store = self.store.read();
+        let found = store
+            .responses
+            .values()
+            .find(|response| {
+                response
+                    .raw_response
+                    .get("output")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("id").and_then(serde_json::Value::as_str) == Some(item_id)
+                        })
+                    })
+            })
+            .cloned();
+        Ok(found)
+    }
+
     async fn list_identifier_responses(
         &self,
         identifier: &str,
@@ -603,6 +626,33 @@ mod tests {
             .unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().raw_response["output"], json!("Output"));
+    }
+
+    #[tokio::test]
+    async fn find_response_by_output_item_matches_an_output_item_id() {
+        let store = MemoryResponseStorage::new();
+
+        let mut response = StoredResponse::new(None);
+        response.input = json!([{"type": "message", "role": "user", "content": "hi"}]);
+        response.raw_response = json!({
+            "id": "resp_1",
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": "hello", "annotations": []}]}
+            ]
+        });
+        let response_id = store.store_response(response).await.unwrap();
+
+        let found = store.find_response_by_output_item("msg_1").await.unwrap();
+        assert_eq!(found.map(|r| r.id), Some(response_id.clone()));
+        let found = store.find_response_by_output_item("rs_1").await.unwrap();
+        assert_eq!(found.map(|r| r.id), Some(response_id));
+        assert!(store
+            .find_response_by_output_item("msg_unknown")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
