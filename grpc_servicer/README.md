@@ -355,6 +355,40 @@ tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
 engine serves more than about 512 concurrent streams and their inter-token p99
 matters more than the servicer's CPU).
 
+#### Multi-node engines: the worker pod's liveness
+
+An engine whose tensor-parallel ranks span pods is launched on every pod with
+the same flags, `--nnodes N --dist-init-addr <the leader>:<port>` among them,
+and the pod's own `--node-rank <k>`: the launcher above on the leader pod
+(`--node-rank 0`, where the gRPC servicer runs), the scheduler ranks alone on
+the worker pods. Every rank joins the process group through the TCP store at
+`--dist-init-addr`, which rank 0 on the leader pod hosts, and keeps that
+connection for its lifetime, so the contract of the vLLM section above holds
+here too: a leader restart must restart its workers, and
+`python -m smg_grpc_servicer.tokenspeed.worker_probe` is the worker pod's
+probe. It passes while at least one TCP connection from the pod to the
+leader's store port is established and fails otherwise; without arguments it
+reads the leader and the port off `--dist-init-addr` on the worker's own
+command line (`/proc/1/cmdline`), `--leader <name>` names the leader by its
+stable DNS name instead, re-resolved on every run, and `--port` names the
+store port (both are needed when TokenSpeed derives the flag from a multi-node
+Slurm step's environment rather than the command line). Run it with
+`python3 -I` and a `timeoutSeconds` of 30 or more, as above:
+
+```yaml
+# the worker pod's container; LEADER_HOST is the leader's stable DNS name
+startupProbe:
+  exec: {command: [/bin/sh, -c, 'python3 -I -m smg_grpc_servicer.tokenspeed.worker_probe --leader "$LEADER_HOST"']}
+  periodSeconds: 30
+  timeoutSeconds: 30
+  failureThreshold: 480
+livenessProbe:
+  exec: {command: [/bin/sh, -c, 'python3 -I -m smg_grpc_servicer.tokenspeed.worker_probe --leader "$LEADER_HOST"']}
+  periodSeconds: 30
+  timeoutSeconds: 30
+  failureThreshold: 3
+```
+
 ### SGLang
 
 ```bash
@@ -478,6 +512,40 @@ example (SMG fans out itself), are answered with a terminal abort rather than
 dropped. SGLang itself is unchanged; the plugin pins the wire of the SGLang
 version it was tested with, and a struct change upstream shows up in
 `grpc_servicer/tests/test_sglang_zmq_msgpack.py`.
+
+
+#### Multi-node engines: the worker pod's liveness
+
+An engine whose tensor-parallel ranks span pods is launched on every pod with
+the same flags, `--nnodes N --dist-init-addr <the leader>:<port>` among them,
+and the pod's own `--node-rank <k>`: the gRPC servicer (`sglang serve
+--grpc-mode`) or the headless launcher above on the leader pod (`--node-rank
+0`), the scheduler ranks alone on the worker pods. Every rank joins the
+process group through the TCP store at `--dist-init-addr`, which rank 0 on
+the leader pod hosts, and keeps that connection for its lifetime, so the
+contract of the vLLM section above holds here too: a leader restart must
+restart its workers, and `python -m smg_grpc_servicer.sglang.worker_probe` is
+the worker pod's probe. It passes while at least one TCP connection from the
+pod to the leader's store port is established and fails otherwise; without
+arguments it reads the leader and the port off `--dist-init-addr` on the
+worker's own command line (`/proc/1/cmdline`), `--leader <name>` names the
+leader by its stable DNS name instead, re-resolved on every run, and `--port`
+names the store port. Run it with `python3 -I` and a `timeoutSeconds` of 30
+or more, as above:
+
+```yaml
+# the worker pod's container; LEADER_HOST is the leader's stable DNS name
+startupProbe:
+  exec: {command: [/bin/sh, -c, 'python3 -I -m smg_grpc_servicer.sglang.worker_probe --leader "$LEADER_HOST"']}
+  periodSeconds: 30
+  timeoutSeconds: 30
+  failureThreshold: 480
+livenessProbe:
+  exec: {command: [/bin/sh, -c, 'python3 -I -m smg_grpc_servicer.sglang.worker_probe --leader "$LEADER_HOST"']}
+  periodSeconds: 30
+  timeoutSeconds: 30
+  failureThreshold: 3
+```
 
 
 ## Architecture
