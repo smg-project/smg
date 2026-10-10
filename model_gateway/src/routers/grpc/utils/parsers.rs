@@ -357,8 +357,10 @@ pub fn resolve_user_thinking(
 /// asked with the inputs the render receives (`build_chat_template_kwargs`
 /// and `resolve_template_thinking` in `chat_utils` build the same for the
 /// render): the request's template kwargs with the effective `reasoning_effort`
-/// under its key unless they carry their own, and the typed toggle or the
-/// protocol's reading of the effort. `None` for every other renderer.
+/// under its key unless they carry that key themselves (an entry of any type
+/// wins, as the render's merge writes the kwargs over the request-level
+/// field), and the typed toggle or the protocol's reading of the effort.
+/// `None` for every other renderer.
 fn rendered_thinking_mode(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -366,11 +368,9 @@ fn rendered_thinking_mode(
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
     let template_thinking = thinking.or_else(|| thinking_from_reasoning_effort(reasoning_effort));
-    let carried = kwargs
-        .and_then(|k| k.get("reasoning_effort"))
-        .and_then(Value::as_str);
-    match reasoning_effort_as_rendered(kwargs, reasoning_effort) {
-        Some(effort) if carried != Some(effort) => {
+    let carries_effort = kwargs.is_some_and(|k| k.contains_key("reasoning_effort"));
+    match reasoning_effort {
+        Some(effort) if !carries_effort => {
             let mut as_rendered = kwargs.cloned().unwrap_or_default();
             as_rendered.insert(
                 "reasoning_effort".to_string(),
@@ -871,6 +871,13 @@ mod tests {
         ));
         assert!(!armed_like_the_prompt(serde_json::json!({
             "chat_template_kwargs": {"thinking": false, "reasoning_effort": "high"}
+        })));
+        // A kwargs entry of any type is what the render sees (its merge writes
+        // the kwargs over the request-level field): a null entry hides the
+        // top-level `none`, so the typed enabled decides on both sides.
+        assert!(armed_like_the_prompt(serde_json::json!({
+            "thinking": {"type": "enabled"}, "reasoning_effort": "none",
+            "chat_template_kwargs": {"reasoning_effort": null}
         })));
         assert!(armed_like_the_prompt(serde_json::json!({})));
     }
