@@ -265,6 +265,50 @@ jobs:
             --junitxml=runner-pilot-results.xml \
             -s -vv
 
+      # These original transport cases require their own GPU-2 selection tier.
+      - name: Download the original DP rank-pinning model
+        if: inputs.pilot_profile == '4g' && inputs.engine == 'vllm'
+        run: bash scripts/ci_download_model.sh meta-llama/Llama-3.2-1B-Instruct
+
+      - name: Verify original gRPC DP and positive NIXL transfer assertions
+        if: inputs.pilot_profile == '4g' && inputs.engine == 'vllm'
+        timeout-minutes: 10
+        env:
+          E2E_GPU_TIER: '2'
+          E2E_KV_BACKEND: nixl
+          E2E_VLLM_KV_BACKEND: nixl
+          E2E_MIN_SELECTED: '3'
+          SHOW_WORKER_LOGS: '0'
+          SHOW_ROUTER_LOGS: '1'
+          E2E_LOG_DIR: e2e-logs
+        run: |
+          bash scripts/ci_killall_sglang.sh "nuke_gpus"
+          pytest \
+            'e2e_test/router/test_dp_routing.py::TestDpAwareRankPinning::test_requests_pinned_to_both_ranks[grpc]' \
+            'e2e_test/router/test_pd_nixl.py::TestPDNixlKvTransfer::test_kv_transfer_params_relayed[pd_grpc]' \
+            'e2e_test/router/test_pd_nixl.py::TestPDNixlKvTransfer::test_decode_worker_performed_nixl_handshake[pd_grpc]' \
+            --reruns 0 --force-reruns 0 \
+            --junitxml=runner-pilot-nixl-results.xml -s -vv
+
+      - name: Verify original positive Mooncake transfer assertions
+        if: inputs.pilot_profile == '4g' && inputs.engine == 'vllm'
+        timeout-minutes: 10
+        env:
+          E2E_GPU_TIER: '2'
+          E2E_KV_BACKEND: mooncake
+          E2E_VLLM_KV_BACKEND: mooncake
+          E2E_MIN_SELECTED: '2'
+          SHOW_WORKER_LOGS: '0'
+          SHOW_ROUTER_LOGS: '1'
+          E2E_LOG_DIR: e2e-logs
+        run: |
+          bash scripts/ci_killall_sglang.sh "nuke_gpus"
+          pytest \
+            'e2e_test/router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_minted_params_injected[pd_grpc]' \
+            'e2e_test/router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_workers_transferred_kv[pd_grpc]' \
+            --reruns 0 --force-reruns 0 \
+            --junitxml=runner-pilot-mooncake-results.xml -s -vv
+
       - name: Require exact original assertions without skips or retries
         if: always()
         run: |
@@ -300,6 +344,29 @@ jobs:
           assert len(cases) == len(expected) and actual == expected, f'Original selection changed: missing={expected - actual}, extra={actual - expected}'
           assert all(child.tag in ('system-out', 'system-err', 'properties') for case in cases for child in case), 'An assertion failed, errored, skipped, or reran'
           print(f'{profile}/{engine}: {len(cases)} exact original assertions passed without skips or retries')
+          if profile == '4g' and engine == 'vllm':
+              extra = {
+                  'runner-pilot-nixl-results.xml': {
+                      ('router.test_dp_routing.TestDpAwareRankPinning',
+                       'test_requests_pinned_to_both_ranks[grpc]'),
+                      ('router.test_pd_nixl.TestPDNixlKvTransfer',
+                       'test_kv_transfer_params_relayed[pd_grpc]'),
+                      ('router.test_pd_nixl.TestPDNixlKvTransfer',
+                       'test_decode_worker_performed_nixl_handshake[pd_grpc]'),
+                  },
+                  'runner-pilot-mooncake-results.xml': {
+                      ('router.test_pd_mooncake.TestPDMooncakeKvTransfer',
+                       'test_minted_params_injected[pd_grpc]'),
+                      ('router.test_pd_mooncake.TestPDMooncakeKvTransfer',
+                       'test_workers_transferred_kv[pd_grpc]'),
+                  },
+              }
+              for report, wanted in extra.items():
+                  added = ET.parse(report).getroot().findall('.//testcase')
+                  actual_added = {(c.attrib['classname'].removeprefix('e2e_test.'), c.attrib['name']) for c in added}
+                  assert len(added) == len(wanted) and actual_added == wanted, f'Original addendum selection changed in {report}'
+                  assert all(child.tag in ('system-out', 'system-err', 'properties') for c in added for child in c), f'Failure, error, skip or retry in {report}'
+              print('4g/vllm: all26 original assertions passed across three native invocations without skips or retries')
           PYTHON
 
       - name: Upload pilot assertion evidence
@@ -307,7 +374,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: runner-pilot-${{ inputs.pilot_profile }}-${{ inputs.engine }}
-          path: runner-pilot-results.xml
+          path: |
+            runner-pilot-results.xml
+            runner-pilot-nixl-results.xml
+            runner-pilot-mooncake-results.xml
           retention-days: 7
           if-no-files-found: error
 
