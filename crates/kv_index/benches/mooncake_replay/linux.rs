@@ -2,8 +2,8 @@
 //! drain-inclusive accounting.
 //!
 //! The corpus is a prepared schedule of the public Mooncake trace (after trace duplication,
-//! deadline sort and id assignment) in the export format described in `README.md` next to this
-//! file. Replaying it here measures the indexer alone, with the harness's own threads and queues:
+//! deadline sort and id assignment) in the export format described in `../README.md`.
+//! Replaying it here measures the indexer alone, with the harness's own threads and queues:
 //!
 //! - queries go to `worker_id % query_lanes` lanes, each an OS thread that services lookups
 //!   inline; events go to `(worker, dp_rank)`-pinned event lanes assigned round-robin on first
@@ -28,7 +28,6 @@
 // The harness pins threads and sleeps to absolute monotonic deadlines through libc, which the
 // standard library does not expose; the five calls are wrapped in small checked helpers below.
 #![expect(unsafe_code)]
-#![recursion_limit = "256"]
 
 use std::{
     collections::BTreeMap,
@@ -1874,7 +1873,7 @@ struct Args {
     result_json_output: String,
 }
 
-fn main() -> anyhow::Result<()> {
+pub(super) fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let corpus = load_corpus(&args.corpus)?;
     let window_ns = match (args.benchmark_duration_ms, args.offered_block_ops_per_sec) {

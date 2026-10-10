@@ -97,6 +97,10 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
     request path."""
     model_config = vllm_config.model_config
     facts = {**model_facts(model_config), **server_facts(vllm_config)}
+    # `server_facts` carries the multimodal encoder dtype for the Python
+    # servicer's GetServerInfo; the Rust servicer derives it from `model_dtype`
+    # itself, by the same rule, and its binding takes no such keyword.
+    facts.pop("multimodal_encoder_dtype", None)
     # KV-event publishing, as the Python servicer resolves it: only vLLM's ZMQ
     # publisher can be relayed; anything else leaves SubscribeKvEvents off.
     kv_events = getattr(vllm_config, "kv_events_config", None)

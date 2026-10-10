@@ -1150,6 +1150,27 @@ pub(super) struct OracleResponseStorage {
     select_base: String,
 }
 
+/// The query behind `find_response_by_output_item`: `raw_response` holds the
+/// response as JSON text, so `JSON_EXISTS` asks whether its `output` array has
+/// an item whose id equals the bind variable `:1` (passed into the path as
+/// `$iid`, never spliced into it). `None` when the schema skips the column.
+fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let col_raw = s.col("raw_response");
+    let order = if s.is_skipped("created_at") {
+        String::new()
+    } else {
+        format!(" ORDER BY {} DESC", s.col("created_at"))
+    };
+    Some(format!(
+        "SELECT * FROM ({select_base} WHERE JSON_EXISTS({col_raw}, \
+         '$.output[*]?(@.id == $iid)' PASSING :1 AS \"iid\"){order}) WHERE ROWNUM <= 1"
+    ))
+}
+
 impl OracleResponseStorage {
     pub fn new(store: OracleStore) -> Self {
         let select_base = build_response_select_base(&store.schema);
@@ -1390,6 +1411,32 @@ impl ResponseStorage for OracleResponseStorage {
             .map_err(ResponseStorageError::StorageError)
     }
 
+    async fn find_response_by_output_item(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+        let schema = self.store.schema.clone();
+        let Some(sql) = find_by_output_item_sql(&schema, &self.select_base) else {
+            return Ok(None);
+        };
+        let item_id = item_id.to_string();
+
+        self.store
+            .execute(move |conn| {
+                let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
+                let mut rows = stmt.query(&[&item_id]).map_err(map_oracle_error)?;
+                match rows.next() {
+                    Some(row) => {
+                        let row = row.map_err(map_oracle_error)?;
+                        Self::build_response_from_row(&row, &schema).map(Some)
+                    }
+                    None => Ok(None),
+                }
+            })
+            .await
+            .map_err(ResponseStorageError::StorageError)
+    }
+
     async fn delete_response(&self, response_id: &ResponseId) -> Result<(), ResponseStorageError> {
         let id = response_id.0.clone();
         let schema = self.store.schema.clone();
@@ -1533,4 +1580,36 @@ fn create_index_if_missing(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_item_lookup_binds_the_id_into_the_json_path_and_takes_one_row() {
+        let schema = SchemaConfig::default();
+        let sql = find_by_output_item_sql(&schema, &build_response_select_base(&schema))
+            .expect("raw_response is stored by default");
+        assert!(
+            sql.contains(
+                "JSON_EXISTS(raw_response, '$.output[*]?(@.id == $iid)' PASSING :1 AS \"iid\")"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with(" ORDER BY created_at DESC) WHERE ROWNUM <= 1"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn output_item_lookup_needs_the_raw_response_column() {
+        let mut schema = SchemaConfig::default();
+        schema
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(find_by_output_item_sql(&schema, "SELECT 1 FROM dual").is_none());
+    }
 }

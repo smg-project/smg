@@ -518,6 +518,12 @@ fn native_media_options(
         .map(|v| v.extract())
         .transpose()?
         .unwrap_or(10_000);
+    // A video gets the budget the engine's own loader gives one (30 s, against
+    // 5 s for an image): a clip is many times an image's size.
+    let video_fetch_timeout_ms: u64 = item("video_fetch_timeout_ms")?
+        .map(|v| v.extract())
+        .transpose()?
+        .unwrap_or(30_000);
     // The engine's per-prompt limits by modality name; one the pipeline does
     // not fetch is of no consequence here.
     let engine_item_limits = item("engine_item_limits")?
@@ -552,6 +558,7 @@ fn native_media_options(
             max_item_bytes: count("max_item_bytes")?,
             allowed_domains,
             fetch_timeout: Duration::from_millis(fetch_timeout_ms),
+            video_fetch_timeout: Duration::from_millis(video_fetch_timeout_ms),
             video_frame_budget,
             video_loader_rule: string("video_loader_rule")?,
         },

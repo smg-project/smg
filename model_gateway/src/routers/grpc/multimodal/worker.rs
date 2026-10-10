@@ -81,7 +81,10 @@ pub struct WorkerMediaSettings {
     /// capped by the connector's own limits.
     pub max_item_bytes: Option<usize>,
     pub allowed_domains: Option<Vec<String>>,
+    /// Budget for one image or audio fetch by URL, connect to last byte.
     pub fetch_timeout: Duration,
+    /// Budget for one video fetch by URL, connect to last byte.
+    pub video_fetch_timeout: Duration,
     /// The engine's own video frame budget: its `--media-io-kwargs`
     /// `video.num_frames` when set (`0` for every frame), else its loader's
     /// default; `None` when unknown. A spec that samples the way the engine's
@@ -425,6 +428,7 @@ impl WorkerMediaPipeline {
                 allowed_domains: settings.allowed_domains.clone(),
                 allowed_local_media_path: None,
                 fetch_timeout: settings.fetch_timeout,
+                video_fetch_timeout: settings.video_fetch_timeout,
             },
         )
         .context("building the media connector")?;
@@ -691,7 +695,7 @@ fn classify(error: anyhow::Error) -> WorkerMediaError {
 
 fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaError {
     match error {
-        MediaConnectorError::Timeout(_) => WorkerMediaError::Unavailable(message),
+        MediaConnectorError::Timeout { .. } => WorkerMediaError::Unavailable(message),
         MediaConnectorError::Http(http) if http.is_timeout() || http.is_connect() => {
             WorkerMediaError::Unavailable(message)
         }
@@ -812,6 +816,7 @@ mod tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
         };
@@ -862,9 +867,10 @@ mod tests {
 
     #[test]
     fn fetch_failures_are_classified_by_fault() {
-        let timeout = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout(
-            Duration::from_secs(1),
-        )))
+        let timeout = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
+            url: "https://media.example/clip.mp4".to_string(),
+            budget: Duration::from_secs(1),
+        }))
         .context("Failed to finalize multimodal tracker");
         assert!(matches!(
             classify(timeout),
@@ -967,6 +973,7 @@ mod unsupported_model_tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
         };
@@ -1006,6 +1013,7 @@ mod unsupported_model_tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
         };

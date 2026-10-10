@@ -5,7 +5,7 @@ identical placeholder-token runs; the decode worker must still keep their
 KV apart (per-image mm identity) and, for M-RoPE models, decode with
 grid-aware positions from the relayed grid tensors.
 
-Requirements: same as test_pd_mmlu (2 GPUs, 1 prefill + 1 decode). Runs
+Requirements: 2 GPUs (1 prefill + 1 decode), like the other 2-GPU PD tests. Runs
 under both NIXL and Mooncake KV backends. Under ``E2E_MM_PROCESSING=worker``
 the legs fetch and process the media themselves, and each class asserts the
 path the gateway took: Qwen3-VL forwards references, Phi-3.5 stays on the

@@ -58,6 +58,8 @@ fn smg_binary_applies_the_server_malloc_conf() {
         .expect("jemalloc statistics from the SMG executable");
     let opt = opt_section(&stats).expect("an \"opt\" section in the jemalloc statistics");
     for expected in [
+        // jemalloc does not compile background-thread support for Mach-O.
+        #[cfg(not(target_vendor = "apple"))]
         "\"background_thread\":true",
         "\"dirty_decay_ms\":10000",
         "\"muzzy_decay_ms\":0",
@@ -77,6 +79,7 @@ fn environment_overrides_the_server_malloc_conf_entry_by_entry() {
     .expect("jemalloc statistics from the SMG executable");
     let opt = opt_section(&stats).expect("an \"opt\" section in the jemalloc statistics");
     for expected in [
+        #[cfg(not(target_vendor = "apple"))]
         "\"background_thread\":false",
         "\"dirty_decay_ms\":2000",
         "\"muzzy_decay_ms\":0",

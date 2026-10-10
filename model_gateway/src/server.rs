@@ -38,7 +38,7 @@ use openai_protocol::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
     },
 };
-use rustls::crypto::ring;
+use rustls::crypto::{ring, CryptoProvider};
 use serde::Deserialize;
 use serde_json::Value;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
@@ -347,6 +347,81 @@ async fn v1_embeddings(
         .await
 }
 
+/// The public Messages API knows only its dated versions: a request whose
+/// `anthropic-version` is not a calendar date of 2023 or later is refused as
+/// the public API refuses it, before anything is routed. A request without
+/// the header is served as the current version: this gateway's own SDK
+/// clients send none, and the header selects nothing here.
+fn check_anthropic_version(headers: &HeaderMap) -> Result<(), Response> {
+    let Some(value) = headers.get("anthropic-version") else {
+        return Ok(());
+    };
+    let version = value.to_str().unwrap_or_default();
+    if is_anthropic_version(version) {
+        Ok(())
+    } else {
+        Err(route_error::bad_request(
+            "invalid_anthropic_version",
+            format!("anthropic-version: \"{version}\" is not a valid version"),
+        ))
+    }
+}
+
+/// `YYYY-MM-DD`, a real calendar date, 2023 (the first public version) or
+/// later.
+fn is_anthropic_version(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    let shaped = bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !shaped {
+        return false;
+    }
+    let field = |range: std::ops::Range<usize>| version[range].parse::<u32>().unwrap_or(0);
+    let (year, month, day) = (field(0..4), field(5..7), field(8..10));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    year >= 2023 && (1..=days).contains(&day)
+}
+
+/// `thinking.budget_tokens` must leave room under `max_tokens` for the
+/// answer, unless the interleaved-thinking beta is on: then the budget covers
+/// every thinking block of the turn and the public API takes a budget at or
+/// above `max_tokens`. The rule reads the `anthropic-beta` header, so it runs
+/// here rather than in the request's own validation.
+fn check_thinking_budget(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
+    let Some(openai_protocol::messages::ThinkingConfig::Enabled { budget_tokens, .. }) =
+        &body.thinking
+    else {
+        return Ok(());
+    };
+    let interleaved = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|beta| beta.trim().starts_with("interleaved-thinking"));
+    if interleaved || *budget_tokens < body.max_tokens {
+        Ok(())
+    } else {
+        Err(route_error::bad_request(
+            "thinking_budget_exceeds_max_tokens",
+            "`max_tokens` must be greater than `thinking.budget_tokens`",
+        ))
+    }
+}
+
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -354,6 +429,12 @@ async fn v1_messages(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
+    if let Err(refused) = check_anthropic_version(&headers) {
+        return refused;
+    }
+    if let Err(refused) = check_thinking_budget(&headers, &body) {
+        return refused;
+    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -371,6 +452,9 @@ async fn v1_messages_count_tokens(
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<CountMessageTokensRequest>,
 ) -> Response {
+    if let Err(refused) = check_anthropic_version(&headers) {
+        return refused;
+    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -1222,7 +1306,30 @@ fn supervise_discovery(
     abort
 }
 
+/// The process-level crypto provider rustls uses, installed before anything
+/// in this process builds a TLS configuration.
+///
+/// The gateway links both rustls backends: `ring` directly and through its
+/// gRPC stack, `aws-lc-rs` through the HTTP client's default feature set.
+/// With two backends compiled in rustls cannot pick one on its own, and a
+/// `ServerConfig::builder()` call panics in whichever task builds the first
+/// TLS configuration without a provider installed: the mesh listener's task,
+/// when the mesh runs with mTLS, so the listener never bound while the
+/// gateway kept serving. The provider is `ring`, the one every explicit
+/// choice in this binary already makes. Installing is idempotent: a provider
+/// installed earlier, by an embedding process or a previous start in the
+/// same process, stays.
+fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // An error here means another thread installed one in between,
+        // which is the outcome wanted.
+        let _ = ring::default_provider().install_default();
+    }
+}
+
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    install_crypto_provider();
+
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
     // is public and `Deserialize`, so a Rust library caller can construct
@@ -1739,10 +1846,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         &config.router_config.server_key,
     ) {
         info!("TLS enabled");
-        ring::default_provider()
-            .install_default()
-            .map_err(|e| format!("Failed to install rustls ring provider: {e:?}"))?;
-
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
             .await
             .map_err(|e| format!("Failed to create TLS config: {e}"))?;
@@ -1870,6 +1973,72 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// A request without `anthropic-version` is served (this gateway's own
+    /// SDK clients send none); a version that is not a real calendar date of
+    /// 2023 or later is refused, as the public API refuses it.
+    #[test]
+    fn messages_requests_take_a_missing_version_and_refuse_a_malformed_one() {
+        let with = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("anthropic-version", http::HeaderValue::from_static(value));
+            headers
+        };
+        assert!(check_anthropic_version(&HeaderMap::new()).is_ok());
+        for ok in ["2023-06-01", "2023-01-01", "2024-02-29", "2026-12-31"] {
+            assert!(check_anthropic_version(&with(ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "1999-01-01",
+            "latest",
+            "2023-6-1",
+            "2023-02-30",
+            "2023-13-01",
+            "2023-00-10",
+            "2023-02-29",
+        ] {
+            let refused = check_anthropic_version(&with(bad)).expect_err(bad);
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(
+                route_error::extract_error_code_from_response(&refused),
+                "invalid_anthropic_version",
+                "{bad}"
+            );
+        }
+    }
+
+    /// A thinking budget at or above `max_tokens` is refused as the public
+    /// API refuses it, except under the interleaved-thinking beta, where the
+    /// public API takes it.
+    #[test]
+    fn thinking_budget_must_stay_under_max_tokens_unless_interleaved() {
+        let request = |max_tokens: u32, budget: u32| -> CreateMessageRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "m", "max_tokens": max_tokens,
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap()
+        };
+        let plain = HeaderMap::new();
+        assert!(check_thinking_budget(&plain, &request(4096, 1024)).is_ok());
+        let refused = check_thinking_budget(&plain, &request(1024, 1024)).expect_err("refused");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            route_error::extract_error_code_from_response(&refused),
+            "thinking_budget_exceeds_max_tokens"
+        );
+
+        let mut interleaved = HeaderMap::new();
+        interleaved.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static(
+                "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+            ),
+        );
+        assert!(check_thinking_budget(&interleaved, &request(1024, 1024)).is_ok());
+        assert!(check_thinking_budget(&interleaved, &request(1024, 8192)).is_ok());
+    }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
     /// gets a request id (and a log line and a metric) like a known one.

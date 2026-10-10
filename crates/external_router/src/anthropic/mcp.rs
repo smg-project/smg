@@ -480,6 +480,7 @@ fn convert_tool_entry_to_anthropic_tool(entry: &ToolEntry, defer_loading: bool) 
         input_schema,
         defer_loading: defer_loading.then_some(true),
         cache_control: None,
+        extra: Default::default(),
     }
 }
 
