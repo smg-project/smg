@@ -297,6 +297,65 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_convert_chunk(
     }
 }
 
+/// Parse new text with the same tool-call and raw-text fallback rules at Chunk and Complete.
+async fn parse_tool_text(
+    handle: &GrpcResponseConverterHandle,
+    text: &str,
+) -> Option<(String, Vec<ToolCallDelta>)> {
+    if text.is_empty()
+        || matches!(
+            handle.tool_choice.as_ref(),
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        )
+    {
+        return None;
+    }
+    let (Some(tools), Some(tool_parser)) = (handle.tools.as_ref(), handle.tool_parser.as_ref())
+    else {
+        return None;
+    };
+    let mut parser = tool_parser.lock().await;
+    let result = match parser.parse_incremental(text, tools).await {
+        Ok(result) => result,
+        Err(error) => {
+            // Preserve the converter's existing fallback to regular content.
+            tracing::warn!("Tool parser error: {}", error);
+            return None;
+        }
+    };
+    if result.calls.is_empty() {
+        return None;
+    }
+    Some((
+        result.normal_text,
+        result
+            .calls
+            .into_iter()
+            .map(|item| {
+                let id = if let Some(ref name) = item.name {
+                    generate_tool_call_id(
+                        &handle.model,
+                        name,
+                        item.tool_index,
+                        handle.history_tool_calls_count,
+                    )
+                } else {
+                    format!("call_{}", item.tool_index)
+                };
+                ToolCallDelta {
+                    index: item.tool_index as u32,
+                    id: Some(id),
+                    tool_type: item.name.as_ref().map(|_| "function".to_string()),
+                    function: Some(FunctionCallDelta {
+                        name: item.name,
+                        arguments: (!item.parameters.is_empty()).then_some(item.parameters),
+                    }),
+                }
+            })
+            .collect(),
+    ))
+}
+
 /// Helper function to convert proto chunk to OpenAI format
 pub(crate) async fn convert_proto_chunk_to_openai(
     proto_response: proto::GenerateResponse,
@@ -405,86 +464,29 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                 .text_buffer
                 .push_str(&chunk_text);
 
-            // Handle tool calls if tools are provided
-            if let (Some(tools), Some(tool_parser)) =
-                (handle.tools.as_ref(), handle.tool_parser.as_ref())
-            {
-                let tool_choice_enabled = !matches!(
-                    handle.tool_choice,
-                    Some(ToolChoice::Value(ToolChoiceValue::None))
-                );
-
-                if tool_choice_enabled {
-                    let mut parser_guard = tool_parser.lock().await;
-                    match parser_guard.parse_incremental(&chunk_text, tools).await {
-                        Ok(streaming_result) => {
-                            if !streaming_result.calls.is_empty() {
-                                handle.stream_state.get_or_create(index).has_tool_calls = true;
-                                // Convert tool call items to OpenAI format
-                                let tool_call_deltas: Vec<_> = streaming_result
-                                    .calls
-                                    .into_iter()
-                                    .map(|item| {
-                                        let id = if let Some(ref name) = item.name {
-                                            generate_tool_call_id(
-                                                &handle.model,
-                                                name,
-                                                item.tool_index,
-                                                handle.history_tool_calls_count,
-                                            )
-                                        } else {
-                                            format!("call_{}", item.tool_index)
-                                        };
-
-                                        ToolCallDelta {
-                                            index: item.tool_index as u32,
-                                            id: Some(id),
-                                            tool_type: if item.name.is_some() {
-                                                Some("function".to_string())
-                                            } else {
-                                                None
-                                            },
-                                            function: Some(FunctionCallDelta {
-                                                name: item.name,
-                                                arguments: if item.parameters.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(item.parameters)
-                                                },
-                                            }),
-                                        }
-                                    })
-                                    .collect();
-
-                                let tool_response = ChatCompletionStreamResponse {
-                                    id: handle.request_id.clone(),
-                                    object: "chat.completion.chunk".to_string(),
-                                    created: handle.created,
-                                    model: handle.model.clone(),
-                                    system_fingerprint: handle.system_fingerprint.clone(),
-                                    choices: vec![ChatStreamChoice {
-                                        index,
-                                        delta: ChatMessageDelta {
-                                            role: Some("assistant".to_string()),
-                                            content: None,
-                                            tool_calls: Some(tool_call_deltas),
-                                            reasoning_content: None,
-                                        },
-                                        logprobs: None,
-                                        finish_reason: None,
-                                        matched_stop: None,
-                                    }],
-                                    usage: None,
-                                };
-                                return Ok(Some(tool_response));
-                            }
-                        }
-                        Err(e) => {
-                            // Log error but continue with regular content
-                            tracing::warn!("Tool parser error: {}", e);
-                        }
-                    }
-                }
+            if let Some((_, tool_call_deltas)) = parse_tool_text(handle, &chunk_text).await {
+                handle.stream_state.get_or_create(index).has_tool_calls = true;
+                let tool_response = ChatCompletionStreamResponse {
+                    id: handle.request_id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: handle.created,
+                    model: handle.model.clone(),
+                    system_fingerprint: handle.system_fingerprint.clone(),
+                    choices: vec![ChatStreamChoice {
+                        index,
+                        delta: ChatMessageDelta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                            tool_calls: Some(tool_call_deltas),
+                            reasoning_content: None,
+                        },
+                        logprobs: None,
+                        finish_reason: None,
+                        matched_stop: None,
+                    }],
+                    usage: None,
+                };
+                return Ok(Some(tool_response));
             }
 
             // Regular content emission
@@ -540,6 +542,13 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     (String::new(), false, None)
                 };
 
+            // EOF text is new parser input, just like text released by a Chunk.
+            let (pending_content, eof_tool_calls) =
+                match parse_tool_text(handle, &pending_text).await {
+                    Some((normal_text, calls)) => (normal_text, Some(calls)),
+                    None => (pending_text, None),
+                };
+
             // Get and remove state for this index
             let removed_state = handle.stream_state.remove(index);
             let (mut final_text, has_tool_calls, state_prompt_tokens, state_completion_tokens) =
@@ -561,7 +570,8 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     (String::new(), false, 0, 0)
                 };
 
-            final_text.push_str(&pending_text);
+            let has_tool_calls = has_tool_calls || eof_tool_calls.is_some();
+            final_text.push_str(&pending_content);
 
             // Determine finish reason
             let engine_finish_reason = if stopped_at_finish {
@@ -638,7 +648,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                         } else {
                             Some(final_text)
                         },
-                        tool_calls: None,
+                        tool_calls: eof_tool_calls,
                         reasoning_content: None,
                     },
                     logprobs: None,
@@ -676,11 +686,14 @@ mod tests {
     fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
         let path =
             std::env::temp_dir().join(format!("smg-byte-fallback-{}.json", uuid::Uuid::now_v7()));
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("[UNK]".into(), serde_json::json!(0));
+        for byte in 0_u32..=255 {
+            vocab.insert(format!("<0x{byte:02X}>"), serde_json::json!(byte + 1));
+        }
         let definition = serde_json::json!({
             "version":"1.0", "added_tokens":[],
-            "model":{"type":"WordLevel", "unk_token":"[UNK]", "vocab":{
-                "[UNK]":0, "<0xC3>":1, "<0xA9>":2
-            }},
+            "model":{"type":"WordLevel", "unk_token":"[UNK]", "vocab":vocab},
             "decoder":{"type":"Sequence", "decoders":[
                 {"type":"ByteFallback"}, {"type":"Fuse"}
             ]}
@@ -719,7 +732,7 @@ mod tests {
             let chunk = proto::GenerateResponse {
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
-                        token_ids: vec![1, 2],
+                        token_ids: vec![0xC3 + 1, 0xA9 + 1],
                         completion_tokens: 2,
                         ..Default::default()
                     },
@@ -752,6 +765,117 @@ mod tests {
             } else {
                 assert_eq!(choice.delta.content.as_deref(), Some("é"));
                 assert_eq!(choice.finish_reason.as_deref(), Some("length"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn byte_fallback_complete_parses_tool_tail_and_respects_none() {
+        let tokenizer = byte_fallback_tokenizer();
+        let tool_text = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
+        let token_ids: Vec<u32> = tool_text.bytes().map(|byte| u32::from(byte) + 1).collect();
+        let completion_tokens = token_ids.len() as u32;
+        let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
+            "type":"function", "function":{
+                "name":"get_weather", "parameters":{
+                    "type":"object", "properties":{"city":{"type":"string"}}
+                }
+            }
+        }]))
+        .unwrap();
+        for tool_choice in [None, Some(ToolChoice::Value(ToolChoiceValue::None))] {
+            let disabled = tool_choice.is_some();
+            let decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("NEVER"),
+                true,
+            );
+            let mut handle = GrpcResponseConverterHandle {
+                tokenizer: tokenizer.clone(),
+                tool_parser: Some(Arc::new(TokioMutex::new(
+                    Box::new(tool_parser::JsonParser::new()) as Box<dyn ToolParser>,
+                ))),
+                stop_decoder: Some(Arc::new(TokioMutex::new(decoder))),
+                model: "byte-fallback-test".into(),
+                request_id: "tool-tail".into(),
+                created: 0,
+                system_fingerprint: None,
+                tools: Some(tools.clone()),
+                tool_choice,
+                history_tool_calls_count: 0,
+                stream_state: StreamStateManager::new(),
+                initial_prompt_tokens: None,
+                skip_special_tokens: true,
+            };
+            let chunk = proto::GenerateResponse {
+                response: Some(proto::generate_response::Response::Chunk(
+                    proto::GenerateStreamChunk {
+                        token_ids: token_ids.clone(),
+                        prompt_tokens: 7,
+                        completion_tokens,
+                        ..Default::default()
+                    },
+                )),
+            };
+            assert!(
+                convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let complete = proto::GenerateResponse {
+                response: Some(proto::generate_response::Response::Complete(
+                    proto::GenerateComplete {
+                        output_ids: token_ids.clone(),
+                        prompt_tokens: 7,
+                        completion_tokens,
+                        cached_tokens: 3,
+                        finish_reason: "stop".into(),
+                        matched_stop: Some(proto::generate_complete::MatchedStop::MatchedTokenId(
+                            99,
+                        )),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .unwrap();
+            let choice = &response.choices[0];
+            assert_eq!(choice.matched_stop, Some(serde_json::json!(99)));
+            let wire = serde_json::to_value(&response).unwrap();
+            assert_eq!(wire["usage"]["prompt_tokens"], 7);
+            assert_eq!(wire["usage"]["completion_tokens"], completion_tokens);
+            assert_eq!(wire["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+            if disabled {
+                assert_eq!(choice.delta.content.as_deref(), Some(tool_text));
+                assert!(choice.delta.tool_calls.is_none());
+                assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+            } else {
+                assert!(choice.delta.content.is_none());
+                assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+                let calls = choice.delta.tool_calls.as_ref().unwrap();
+                // The existing parser sends the name and arguments as two deltas
+                // for one index; preserve that conversion instead of coalescing it.
+                assert_eq!(calls.len(), 2);
+                assert!(calls.iter().all(|call| call.index == 0));
+                let name_delta = &calls[0];
+                assert!(name_delta.id.as_deref().unwrap().starts_with("call_"));
+                assert_eq!(name_delta.tool_type.as_deref(), Some("function"));
+                assert_eq!(
+                    name_delta.function.as_ref().unwrap().name.as_deref(),
+                    Some("get_weather")
+                );
+                let arguments: String = calls
+                    .iter()
+                    .filter_map(|call| {
+                        call.function
+                            .as_ref()
+                            .and_then(|function| function.arguments.as_deref())
+                    })
+                    .collect();
+                let arguments: Value = serde_json::from_str(&arguments).unwrap();
+                assert_eq!(arguments, serde_json::json!({"city":"Paris"}));
             }
         }
     }
