@@ -155,21 +155,19 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 /// `thinking_mode`/`thinking_budget` name other variables, and a template
 /// that only reads those has no thinking switch.
 fn mentions_thinking_variable(template: &str) -> bool {
-    const FOLLOWERS: [&str; 3] = [" is ", " ==", " "];
-    template.match_indices("thinking").any(|(start, _)| {
-        let preceded_by_identifier = template[..start]
+    template.match_indices("thinking").any(|(start, matched)| {
+        let before = &template[..start];
+        let after = &template[start + matched.len()..];
+        if before
             .chars()
             .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-        if preceded_by_identifier {
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             return false;
         }
-        let before = &template[..start];
-        let after = &template[start + "thinking".len()..];
-        let keyword_before = before.ends_with("if ") || before.ends_with("set ");
-        (keyword_before && after.starts_with(FOLLOWERS[2]))
-            || after.starts_with(FOLLOWERS[0])
-            || after.starts_with(FOLLOWERS[1])
+        after.starts_with(" is ")
+            || after.starts_with(" ==")
+            || ((before.ends_with("if ") || before.ends_with("set ")) && after.starts_with(' '))
     })
 }
 
@@ -550,7 +548,10 @@ impl ThinkDetector {
             prefill_opens_think_block: false,
         };
         detector.walk_stmt(ast);
-        (detector.think_in_prefill, detector.prefill_opens_think_block)
+        (
+            detector.think_in_prefill,
+            detector.prefill_opens_think_block,
+        )
     }
 
     /// Check if an expression references a variable by name (walks through
