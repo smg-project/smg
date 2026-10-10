@@ -145,6 +145,14 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
         return (ThinkingToggle::DefaultOff, Some(key_name));
     }
 
+    // Gemma4 expresses its default with a Jinja filter instead of assignment.
+    let compact: String = template.split_whitespace().collect();
+    if compact.contains("enable_thinking|default(false)")
+        || compact.contains("thinking|default(false)")
+    {
+        return (ThinkingToggle::DefaultOff, Some(key_name));
+    }
+
     // All other models default to thinking ON
     (ThinkingToggle::DefaultOn, Some(key_name))
 }
@@ -2386,6 +2394,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, "True");
+    }
+
+    #[test]
+    fn gemma4_filter_default_keeps_thinking_off() {
+        let template = "{%- set enable_thinking = enable_thinking | default(false) -%}{% if enable_thinking %}<|channel>thought\n{% endif %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
+        assert_eq!(
+            state.thinking_key_name(),
+            Some(ThinkingKeyName::EnableThinking)
+        );
+        for (thinking, expected) in [
+            (None, ""),
+            (Some(false), ""),
+            (Some(true), "<|channel>thought\n"),
+        ] {
+            assert_eq!(
+                state
+                    .apply(
+                        &[],
+                        ChatTemplateParams {
+                            thinking,
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -79,7 +79,7 @@ impl MediaPlan {
         &self.parts
     }
 
-    /// Whether every part is a plain image/video URL without per-item
+    /// Whether every part is a plain image/audio/video URL without per-item
     /// processing hints, i.e. something a worker can fetch and process itself.
     pub(crate) fn is_forwardable(&self) -> bool {
         self.parts.iter().all(|part| {
@@ -88,11 +88,12 @@ impl MediaPlan {
                 MediaContentPart::ImageUrl {
                     max_long_side_pixel: None,
                     ..
-                } | MediaContentPart::VideoUrl {
-                    fps: None,
-                    max_long_side_pixel: None,
-                    ..
-                }
+                } | MediaContentPart::AudioUrl { .. }
+                    | MediaContentPart::VideoUrl {
+                        fps: None,
+                        max_long_side_pixel: None,
+                        ..
+                    }
             )
         })
     }

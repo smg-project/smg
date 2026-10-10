@@ -6,9 +6,10 @@ use parking_lot::RwLock;
 
 use crate::{
     parsers::{
-        BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, DeepSeekV41Parser, Glm45Parser,
-        HyV4Parser, InklingParser, KimiK3Parser, KimiParser, MiniMaxParser, MinimaxM3Parser,
-        NanoV3Parser, PassthroughParser, Qwen3Parser, QwenThinkingParser, Step3Parser,
+        BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, DeepSeekV41Parser, Gemma4Parser,
+        Glm45Parser, HyV4Parser, InklingParser, KimiK3Parser, KimiParser, MiniMaxParser,
+        MinimaxM3Parser, NanoV3Parser, PassthroughParser, Qwen3Parser, QwenThinkingParser,
+        Step3Parser,
     },
     traits::{ParserConfig, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE},
 };
@@ -130,6 +131,8 @@ impl ParserFactory {
         // starts with in_reasoning=false
         registry.register_parser("qwen3", || Box::new(Qwen3Parser::new()));
 
+        registry.register_parser("gemma4", || Box::new(Gemma4Parser::new()));
+
         // starts with in_reasoning=true
         registry.register_parser("qwen3_thinking", || Box::new(QwenThinkingParser::new()));
 
@@ -204,6 +207,8 @@ impl ParserFactory {
         // Kimi K3 XTML think channel (structural <|open|>/<|close|>/<|sep|> tokens).
         registry.register_parser("kimi_k3", || Box::new(KimiK3Parser::new()));
 
+        registry.register_pattern("gemma-4", "gemma4");
+        registry.register_pattern("gemma4", "gemma4");
         registry.register_pattern("hy4", "hy_v4");
         registry.register_pattern("hy_v4", "hy_v4");
         registry.register_pattern("deepseek-r1", "deepseek_r1");

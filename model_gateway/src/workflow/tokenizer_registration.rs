@@ -133,7 +133,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                                 source, local_err
                             );
 
-                            fetch_tokenizer_from_worker(&app_context, &id, &name).await.map_err(
+                            fetch_tokenizer_from_worker(&app_context, &id, &name, chat_template.as_deref()).await.map_err(
                                 |worker_err| {
                                     format!(
                                         "Failed to load tokenizer locally ({local_err}) and remotely from worker ({worker_err})"
@@ -222,6 +222,7 @@ fn with_optional_cache(
 
 fn load_tokenizer_from_bundle(
     bundle: &StreamBundle,
+    chat_template_path: Option<&str>,
 ) -> Result<(Arc<dyn Tokenizer>, Option<MultimodalModelConfig>), String> {
     tokenizer_bundle::with_extracted_bundle(bundle, |tokenizer_dir| {
         let tokenizer_path = tokenizer_dir.to_string_lossy().into_owned();
@@ -230,8 +231,9 @@ fn load_tokenizer_from_bundle(
             tokenizer_path
         );
 
-        let tokenizer = factory::create_tokenizer_with_chat_template(&tokenizer_path, None)
-            .map_err(|e| format!("tokenizer load failed: {e}"))?;
+        let tokenizer =
+            factory::create_tokenizer_with_chat_template(&tokenizer_path, chat_template_path)
+                .map_err(|e| format!("tokenizer load failed: {e}"))?;
 
         let mm_config = try_load_multimodal_config(tokenizer_dir);
 
@@ -284,6 +286,7 @@ async fn fetch_tokenizer_from_worker(
     app_context: &AppContext,
     tokenizer_id: &str,
     model_id: &str,
+    chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn Tokenizer>, String> {
     let workers = app_context.worker_registry.get_workers_filtered(
         Some(model_id),
@@ -360,7 +363,7 @@ async fn fetch_tokenizer_from_worker(
             worker.url()
         );
 
-        match load_tokenizer_from_bundle(&bundle) {
+        match load_tokenizer_from_bundle(&bundle, chat_template_path) {
             Ok((tokenizer, mm_config)) => {
                 if let Some(cfg) = mm_config {
                     app_context
@@ -433,6 +436,67 @@ pub fn create_tokenizer_workflow_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_tokenizer_bundle_preserves_configured_template() {
+        use std::io::{Cursor, Write};
+
+        use sha2::{Digest, Sha256};
+        use zip::{write::SimpleFileOptions, ZipWriter};
+
+        let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, data) in [
+            (
+                "tokenizer.json",
+                serde_json::json!({
+                    "version":"1.0", "truncation":null, "padding":null, "added_tokens":[],
+                    "normalizer":null, "pre_tokenizer":{"type":"Whitespace"},
+                    "post_processor":null, "decoder":null,
+                    "model":{"type":"BPE", "vocab":{"hello":0}, "merges":[]}
+                }),
+            ),
+            (
+                "tokenizer_config.json",
+                serde_json::json!({"chat_template":"worker_default"}),
+            ),
+        ] {
+            archive
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(data.to_string().as_bytes()).unwrap();
+        }
+        let compressed_data = archive.finish().unwrap().into_inner();
+        let bundle = StreamBundle {
+            sha256: Sha256::digest(&compressed_data)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            compressed_data,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let template = dir.path().join("override.jinja");
+        std::fs::write(&template, "router_override").unwrap();
+        let messages = [serde_json::json!({"role":"user", "content":"hello"})];
+        let (default, _) = load_tokenizer_from_bundle(&bundle, None).unwrap();
+        assert_eq!(
+            default
+                .apply_chat_template(&messages, Default::default())
+                .unwrap(),
+            "worker_default"
+        );
+        let (overridden, _) = load_tokenizer_from_bundle(&bundle, template.to_str()).unwrap();
+        assert_eq!(
+            overridden
+                .apply_chat_template(&messages, Default::default())
+                .unwrap(),
+            "router_override"
+        );
+        let missing = dir.path().join("missing.jinja");
+        assert!(
+            load_tokenizer_from_bundle(&bundle, missing.to_str()).is_err(),
+            "an invalid configured override must not silently use the worker default"
+        );
+    }
 
     #[test]
     fn test_tokenizer_config_request_serialization() {

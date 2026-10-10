@@ -49,7 +49,7 @@ pub(crate) enum MmRefsError {
     ModelNotOptedIn(Modality),
     /// vLLM does not accept this modality at all.
     ModalityUnsupported(Modality),
-    /// A part kind with no reference form (inline bytes, embeddings, audio).
+    /// A part kind with no reference form (inline bytes or embeddings).
     UnsupportedPart(&'static str),
     /// An inline `data:` payload above the router's byte cap.
     RefTooLarge {
@@ -161,7 +161,9 @@ fn ensure_worker_expandable(
     placeholders: &PlaceholderTokens,
 ) -> Result<(), MmRefsError> {
     for &modality in plan.modalities() {
-        if !runtime_supports_modality(RuntimeType::Vllm, modality) {
+        // Audio uses the native worker processor; preprocessed audio tensors
+        // remain unsupported on vLLM's separate router-processing path.
+        if modality != Modality::Audio && !runtime_supports_modality(RuntimeType::Vllm, modality) {
             return Err(MmRefsError::ModalityUnsupported(modality));
         }
         if !placeholders.worker_expandable(modality) {
@@ -335,8 +337,11 @@ fn forwardable_ref(
         MediaContentPart::VideoData { .. } => {
             Err(MmRefsError::UnsupportedPart("inline video bytes"))
         }
-        MediaContentPart::AudioUrl { .. } | MediaContentPart::AudioData { .. } => {
-            Err(MmRefsError::UnsupportedPart("audio"))
+        MediaContentPart::AudioUrl { url, .. } => {
+            Ok((common::Modality::Audio, url, media::audio_max_input_bytes()))
+        }
+        MediaContentPart::AudioData { .. } => {
+            Err(MmRefsError::UnsupportedPart("inline audio bytes"))
         }
         MediaContentPart::ImageEmbeds { .. } => {
             Err(MmRefsError::UnsupportedPart("image embeddings"))
@@ -842,13 +847,37 @@ mod tests {
     }
 
     #[test]
+    fn audio_refs_require_an_expandable_model_and_stay_in_prompt_order() {
+        let plan = plan(vec![
+            MediaContentPart::AudioUrl {
+                url: "data:audio/wav;base64,AAAA".to_string(),
+                uuid: None,
+            },
+            image_url("https://a/1.png"),
+        ]);
+        assert!(plan.is_forwardable());
+        let mut placeholders = expandable_placeholders();
+        assert_eq!(
+            ensure_worker_expandable(&plan, &placeholders),
+            Err(MmRefsError::ModelNotOptedIn(Modality::Audio))
+        );
+        placeholders.set_worker_expandable(Modality::Audio, true);
+        ensure_worker_expandable(&plan, &placeholders).unwrap();
+        let refs = assemble_media_refs(plan).unwrap();
+        assert_eq!(refs.items[0].modality, common::Modality::Audio as i32);
+        assert_eq!(refs.items[0].url, "data:audio/wav;base64,AAAA");
+        assert_eq!(refs.items[1].modality, common::Modality::Image as i32);
+    }
+
+    #[test]
     fn assemble_rejects_unsupported_parts_and_oversized_data_urls() {
-        let err = assemble_media_refs(plan(vec![MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
+        let err = assemble_media_refs(plan(vec![MediaContentPart::AudioData {
+            data: vec![0; 4],
+            mime_type: Some("audio/wav".to_string()),
             uuid: None,
         }]))
-        .expect_err("audio is not forwardable");
-        assert_eq!(err, MmRefsError::UnsupportedPart("audio"));
+        .expect_err("raw audio bytes have no reference form");
+        assert_eq!(err, MmRefsError::UnsupportedPart("inline audio bytes"));
 
         let oversized = format!(
             "data:image/png;base64,{}",

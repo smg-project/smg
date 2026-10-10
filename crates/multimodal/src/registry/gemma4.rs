@@ -201,8 +201,10 @@ impl ModelProcessorSpec for Gemma4Spec {
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         let id = metadata.model_id.to_ascii_lowercase();
-        metadata.config_model_type() == Some("gemma4")
-            || id.contains("gemma-4")
+        matches!(
+            metadata.config_model_type(),
+            Some("gemma4" | "gemma4_unified")
+        ) || id.contains("gemma-4")
             || id.contains("gemma4")
     }
 
@@ -211,10 +213,13 @@ impl ModelProcessorSpec for Gemma4Spec {
         MediaPartOrder::Authored
     }
 
-    /// `<|image|>` and `<|video|>` are the single tokens vLLM's prompt
-    /// updates target.
+    /// Image, video and native audio anchors are expanded by vLLM.
+    /// Audio is worker-only; the router has no Gemma 4 audio tensor processor.
     fn worker_expandable(&self, modality: Modality) -> bool {
-        matches!(modality, Modality::Image | Modality::Video)
+        matches!(
+            modality,
+            Modality::Image | Modality::Video | Modality::Audio
+        )
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -233,6 +238,7 @@ impl ModelProcessorSpec for Gemma4Spec {
         match modality {
             Modality::Image => self.placeholder_token(metadata),
             Modality::Video => Self::token_for(metadata, "video_token_id"),
+            Modality::Audio => Self::token_for(metadata, "audio_token_id"),
             _ => Err(Self::unsupported(modality)),
         }
     }
@@ -245,6 +251,7 @@ impl ModelProcessorSpec for Gemma4Spec {
         match modality {
             Modality::Image => self.placeholder_token_id(metadata),
             Modality::Video => Self::config_token_id(metadata, "video_token_id"),
+            Modality::Audio => Self::config_token_id(metadata, "audio_token_id"),
             _ => Err(Self::unsupported(modality)),
         }
     }
@@ -264,6 +271,15 @@ impl ModelProcessorSpec for Gemma4Spec {
             if metadata.config_u32(&["video_token_id"]).is_some() {
                 limits.insert(Modality::Video, MAX_VIDEOS_PER_REQUEST);
             }
+        }
+        if metadata
+            .config
+            .get("audio_config")
+            .is_some_and(Value::is_object)
+            && metadata.config_u32(&["audio_token_id"]).is_some()
+        {
+            // The native worker enforces its configured item count before fetching.
+            limits.insert(Modality::Audio, usize::MAX);
         }
         Ok(limits)
     }
@@ -679,6 +695,71 @@ mod tests {
     }
 
     #[test]
+    fn native_audio_uses_the_checkpoint_anchor_and_preserves_vision_limits() {
+        let tokenizer = TestTokenizer::new(&[("<|audio|>", 258881)]);
+        let mut config = config();
+        config["model_type"] = json!("gemma4_unified");
+        config["audio_config"] = json!({});
+        config["audio_token_id"] = json!(258881);
+        let metadata = metadata(&tokenizer, &config);
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).unwrap();
+        assert_eq!(spec.name(), "gemma4");
+        assert!(spec.worker_expandable(Modality::Audio));
+        spec.validate_media_request(&metadata, &[(Modality::Audio, 1)])
+            .unwrap();
+        assert_eq!(
+            spec.placeholder_token_for(&metadata, Modality::Audio)
+                .unwrap(),
+            "<|audio|>"
+        );
+        assert_eq!(
+            spec.placeholder_token_id_for(&metadata, Modality::Audio)
+                .unwrap(),
+            258881
+        );
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([
+                (Modality::Image, MAX_IMAGES_PER_REQUEST),
+                (Modality::Video, MAX_VIDEOS_PER_REQUEST),
+                (Modality::Audio, usize::MAX),
+            ])
+        );
+        assert!(matches!(
+            spec.prompt_replacements_for(
+                &metadata,
+                &test_preprocessed_with_tokens(&[], &[]),
+                Modality::Audio
+            ),
+            Err(ModelRegistryError::UnsupportedModality { .. })
+        ));
+    }
+
+    #[test]
+    fn audio_without_config_or_anchor_remains_rejected() {
+        let tokenizer = tokenizer();
+        for missing in ["audio_config", "audio_token_id"] {
+            let mut config = config();
+            config["audio_config"] = json!({});
+            config["audio_token_id"] = json!(258881);
+            config.as_object_mut().unwrap().remove(missing);
+            let metadata = metadata(&tokenizer, &config);
+            assert!(matches!(
+                Gemma4Spec.validate_media_request(&metadata, &[(Modality::Audio, 1)]),
+                Err(ModelRegistryError::UnsupportedModality { .. })
+            ));
+        }
+        let mut config = config();
+        config["audio_config"] = json!({});
+        config["audio_token_id"] = json!(258881);
+        assert!(matches!(
+            Gemma4Spec.placeholder_token_for(&metadata(&tokenizer, &config), Modality::Audio),
+            Err(ModelRegistryError::TokenNotFound { .. })
+        ));
+    }
+
+    #[test]
     fn limits_layouts_and_hooks() {
         let tokenizer = tokenizer();
         let config = config();
@@ -703,7 +784,7 @@ mod tests {
         assert_eq!(spec.media_part_order(), MediaPartOrder::Authored);
         assert!(spec.worker_expandable(Modality::Image));
         assert!(spec.worker_expandable(Modality::Video));
-        assert!(!spec.worker_expandable(Modality::Audio));
+        assert!(spec.worker_expandable(Modality::Audio));
         assert_eq!(
             spec.video_frame_sampling(),
             FrameSampling::UpTo { max_frames: 32 }

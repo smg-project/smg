@@ -169,12 +169,12 @@ class TestItemCount:
             mm_processor.enforce_item_count(items, {"image": 1, "video": 0})
 
     def test_limits_follow_the_engine_by_default(self):
-        cfg = self._MmConfig({"image": 200, "video": 4})
-        assert mm_processor.item_limits(cfg) == {"image": 200, "video": 4}
+        cfg = self._MmConfig({"image": 200, "video": 4, "audio": 3})
+        assert mm_processor.item_limits(cfg) == {"image": 200, "video": 4, "audio": 3}
 
     def test_override_applies_to_every_kind(self):
-        cfg = self._MmConfig({"image": 200, "video": 4})
-        assert mm_processor.item_limits(cfg, 2) == {"image": 2, "video": 2}
+        cfg = self._MmConfig({"image": 200, "video": 4, "audio": 3})
+        assert mm_processor.item_limits(cfg, 2) == {"image": 2, "video": 2, "audio": 2}
 
 
 class TestBuildProcessor:
@@ -745,7 +745,7 @@ class TestProcess:
         p._connector = self._Connector(fetch_exc)
         p._video_processor = None
         p._max_item_bytes = mm_processor.DEFAULT_MAX_ITEM_BYTES
-        p._item_limits = dict.fromkeys(("image", "video"), max_items)
+        p._item_limits = dict.fromkeys(("image", "video", "audio"), max_items)
         p._caller_error = self._CallerError
         return p
 
@@ -775,6 +775,26 @@ class TestProcess:
         assert renderer.calls[0]["prompt"] == "hi"
         assert renderer.calls[0]["prompt_token_ids"] == [1, 2, 3]
         assert len(renderer.calls[0]["multi_modal_data"]["image"]) == 1
+
+    def test_native_audio_waveform_and_rate_reach_renderer(self):
+        renderer = self._Renderer()
+        p = self.processor(renderer)
+        waveform = ([0.25, -0.25], 16000)
+        async def fetch_audio(url):
+            assert url == "data:audio/wav;base64,AAAA"
+            return waveform
+        p._connector.fetch_audio_async = fetch_audio
+        out = run(p.process([258881], "<|audio|>",
+            [_Item("audio", "data:audio/wav;base64,AAAA")], 0.0))
+        assert out["skip_mm_cache"] is True
+        assert renderer.calls[0]["multi_modal_data"]["audio"] == [waveform]
+        assert renderer.calls[0]["prompt_token_ids"] == [258881]
+
+    def test_audio_limit_zero_rejects_before_fetch(self):
+        p = self.processor(self._Renderer(), max_items=0)
+        with pytest.raises(ValueError, match="1 audio items.*limit of 0"):
+            run(p.process([258881], None, [_Item("audio", "https://a/x.wav")], 0.0))
+        assert p._connector.fetched == []
 
     def test_placeholder_validation_is_a_client_error(self):
         p = self.processor(self._Renderer(RuntimeError("Expected 1 image placeholders, found 0")))

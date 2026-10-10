@@ -813,7 +813,8 @@ pub fn video_max_input_bytes() -> usize {
     )
 }
 
-fn audio_max_input_bytes() -> usize {
+/// Byte cap for one decoded audio input (`SMG_AUDIO_MAX_INPUT_BYTES`).
+pub fn audio_max_input_bytes() -> usize {
     env_byte_limit(
         &AUDIO_MAX_INPUT_BYTES,
         "SMG_AUDIO_MAX_INPUT_BYTES",

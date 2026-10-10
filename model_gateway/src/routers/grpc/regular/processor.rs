@@ -162,11 +162,11 @@ impl ResponseProcessor {
 
         if tool_choice_enabled && original_request.tools.is_some() {
             // Check if JSON schema constraint was used (specific function or required mode)
-            let has_structural_tag = self
+            let native_tool_format = self
                 .tool_parser_factory
                 .registry()
-                .has_structural_tag_for_parser(tool_parser_name);
-            let used_json_schema = if has_structural_tag {
+                .uses_native_tool_format(tool_parser_name);
+            let used_json_schema = if native_tool_format {
                 false
             } else {
                 match &original_request.tool_choice {
@@ -708,11 +708,11 @@ impl ResponseProcessor {
 
         if tool_choice_enabled && messages_request.has_tools {
             // Check if JSON schema constraint was used (specific tool or any/required mode)
-            let has_structural_tag = self
+            let native_tool_format = self
                 .tool_parser_factory
                 .registry()
-                .has_structural_tag_for_parser(tool_parser_name.as_deref());
-            let used_json_schema = !has_structural_tag
+                .uses_native_tool_format(tool_parser_name.as_deref());
+            let used_json_schema = !native_tool_format
                 && matches!(
                     &messages_request.tool_choice,
                     Some(messages::ToolChoice::Tool { .. } | messages::ToolChoice::Any { .. })
@@ -1162,6 +1162,7 @@ mod responses_finish_reason_tests {
     use smg_grpc_client::tokenspeed_proto::GenerateComplete;
 
     use super::*;
+    use crate::routers::grpc::regular::stages::chat::chat_response_spec;
 
     #[expect(
         dead_code,
@@ -1218,5 +1219,196 @@ mod responses_finish_reason_tests {
             assert_eq!(choice.finish_reason.as_deref(), Some(expected));
             assert_eq!(choice.message.tool_calls.as_ref().unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn gemma4_nonstream_native_tool_choices_preserve_reasoning_and_arguments() {
+        let output = r#"<|channel>thought
+plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for tool_choice in [
+            serde_json::json!("auto"),
+            serde_json::json!("required"),
+            serde_json::json!({"type":"function", "function":{"name":"get_weather"}}),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"test-model", "messages":[], "separate_reasoning":true,
+                "tool_choice":tool_choice,
+                "tools":[{"type":"function","function":{"name":"get_weather",
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+            }))
+            .unwrap();
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: "stop".into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let choice = processor
+                .process_single_choice(
+                    &complete,
+                    0,
+                    &ChatResponseSpec::from(&request),
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    true,
+                    true,
+                    Some("gemma4"),
+                    Some("gemma4"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+            assert!(choice.message.content.is_none());
+            assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+            let calls = choice.message.tool_calls.unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].function.name, "get_weather");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    calls[0].function.arguments.as_deref().unwrap()
+                )
+                .unwrap(),
+                serde_json::json!({"city":"Paris"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_json_tool_nonstream_keeps_arguments_out_of_prefilled_reasoning() {
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for (choice, output) in [
+            (
+                serde_json::json!("required"),
+                r#"[{"name":"get_weather","parameters":{"city":"San Francisco"}}]"#,
+            ),
+            (
+                serde_json::json!({"type":"function","function":{"name":"get_weather"}}),
+                r#"{"city":"<think>San Francisco</think>"}"#,
+            ),
+            (
+                serde_json::json!({"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"get_weather"}]}),
+                r#"[{"name":"get_weather","parameters":{"city":"<think>San Francisco</think>"}}]"#,
+            ),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"test-model", "messages":[], "separate_reasoning":true,
+                "chat_template_kwargs":{"enable_thinking":true}, "tool_choice":choice,
+                "tools":[{"type":"function","function":{"name":"get_weather",
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+            }))
+            .unwrap();
+            let spec = chat_response_spec(&request, 0, Some(true), true);
+            let tokenizer: Arc<dyn Tokenizer> =
+                Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: "stop".into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let choice = processor
+                .process_single_choice(
+                    &complete,
+                    0,
+                    &spec,
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    true,
+                    true,
+                    Some("qwen3"),
+                    Some("qwen_coder"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+            assert!(choice.message.reasoning_content.is_none());
+            assert!(choice.message.content.is_none());
+            let calls = choice.message.tool_calls.unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].function.name, "get_weather");
+            let expected = if output.contains("<think>") {
+                "<think>San Francisco</think>"
+            } else {
+                "San Francisco"
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    calls[0].function.arguments.as_deref().unwrap()
+                )
+                .unwrap(),
+                serde_json::json!({"city":expected})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_json_tool_malformed_output_stays_visible() {
+        let output = r#"[{"name":"get_weather","parameters":{not-json}]"#;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test-model", "messages":[], "separate_reasoning":true,
+            "tool_choice":"required", "tools":[{"type":"function","function":{
+                "name":"get_weather","parameters":{"type":"object","properties":{}}
+            }}]
+        }))
+        .unwrap();
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+            output_ids: vec![100],
+            finish_reason: "stop".into(),
+            ..Default::default()
+        });
+        let choice = processor
+            .process_single_choice(
+                &complete,
+                0,
+                &chat_response_spec(&request, 0, Some(true), true),
+                "test-model",
+                &tokenizer,
+                &mut decoder,
+                0,
+                true,
+                true,
+                Some("qwen3"),
+                Some("qwen_coder"),
+            )
+            .await
+            .unwrap();
+        assert!(choice.message.tool_calls.is_none());
+        assert!(choice.message.reasoning_content.is_none());
+        assert_eq!(choice.message.content.as_deref(), Some(output));
     }
 }

@@ -478,11 +478,11 @@ impl StreamingProcessor {
         let think_in_prefill = tokenizer.think_in_prefill();
 
         // Check if JSON schema constraint was used (specific function or required mode)
-        let has_structural_tag = self
+        let native_tool_format = self
             .tool_parser_factory
             .registry()
-            .has_structural_tag_for_parser(tool_parser_name.as_deref());
-        let used_json_schema = if has_structural_tag {
+            .uses_native_tool_format(tool_parser_name.as_deref());
+        let used_json_schema = if native_tool_format {
             false
         } else {
             match tool_choice {
@@ -494,7 +494,7 @@ impl StreamingProcessor {
         };
 
         // Check if this is the specific function case (LLM generates parameters only, no name field).
-        // Only applies when json_schema is used — structural tags include framing tokens
+        // Only applies when json_schema is used — native formats include framing tokens
         // that the parser must handle.
         let is_specific_function =
             used_json_schema && matches!(tool_choice, Some(ToolChoice::Function { .. }));
@@ -2362,18 +2362,18 @@ impl StreamingProcessor {
                 model,
             );
 
-        let has_structural_tag = self
+        let native_tool_format = self
             .tool_parser_factory
             .registry()
-            .has_structural_tag_for_parser(tool_parser_name.as_deref());
-        let used_json_schema = !has_structural_tag
+            .uses_native_tool_format(tool_parser_name.as_deref());
+        let used_json_schema = !native_tool_format
             && matches!(
                 &original_request.tool_choice,
                 Some(messages::ToolChoice::Tool { .. } | messages::ToolChoice::Any { .. })
             );
 
         // Check if model output is arguments-only for a specific function (ToolChoice::Tool).
-        // Only applies when json_schema is used — structural tags include framing tokens.
+        // Only applies when json_schema is used — native formats include framing tokens.
         let is_specific_function = used_json_schema
             && matches!(
                 &original_request.tool_choice,

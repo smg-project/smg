@@ -100,6 +100,8 @@ pub(crate) struct ChatResponseSpec {
     pub skip_special_tokens: bool,
     /// Rendered prompt tokens the provider does not bill; set by request building.
     pub unbilled_prompt_tokens: u32,
+    /// Native channel formats can derive the initial state from the rendered prompt.
+    pub reasoning_in_prefill: Option<bool>,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -134,6 +136,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
             unbilled_prompt_tokens: 0,
+            reasoning_in_prefill: None,
         }
     }
 }
@@ -142,6 +145,9 @@ impl ChatResponseSpec {
     /// Whether the reasoning parser starts in reasoning mode for this
     /// request (see [`utils::reasoning_starts_in_prefill`]).
     pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
+        if let Some(in_prefill) = self.reasoning_in_prefill {
+            return in_prefill;
+        }
         utils::reasoning_starts_in_prefill(
             self.chat_template_kwargs.as_ref(),
             self.reasoning_effort.as_deref(),
@@ -315,6 +321,22 @@ mod tests {
         let spec = ChatResponseSpec::from(&request);
 
         assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
+    }
+
+    #[test]
+    fn gemma4_rendered_prompt_state_overrides_the_thinking_preference() {
+        let request = chat_request(json!({
+            "model": "vllm-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": true}
+        }));
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let mut spec = ChatResponseSpec::from(&request);
+        assert_eq!(spec.reasoning_in_prefill, None);
+        for in_prefill in [false, true] {
+            spec.reasoning_in_prefill = Some(in_prefill);
+            assert_eq!(spec.reasoning_starts_in_prefill(&tokenizer), in_prefill);
+        }
     }
 
     #[test]

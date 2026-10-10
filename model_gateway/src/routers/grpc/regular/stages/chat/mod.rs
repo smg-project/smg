@@ -8,5 +8,7 @@ mod request_building;
 mod response_processing;
 
 pub(crate) use preparation::{prepare_chat_like, ChatPreparationStage};
+#[cfg(test)]
+pub(crate) use request_building::chat_response_spec;
 pub(crate) use request_building::{build_chat_backed_plan, ChatRequestBuildingStage};
 pub(crate) use response_processing::ChatResponseProcessingStage;

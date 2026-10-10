@@ -260,6 +260,31 @@ impl BuildStage for ChatRequestBuildingStage {
         };
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
+        let vllm_json_tool = tool_constraints
+            .as_ref()
+            .is_some_and(|(kind, _)| kind == "json_schema")
+            && ctx
+                .state
+                .clients
+                .as_ref()
+                .is_some_and(|clients| match clients {
+                    ClientSelection::Single { client } => {
+                        client.runtime_type() == crate::worker::RuntimeType::Vllm
+                    }
+                    ClientSelection::Disaggregated { prefill, .. } => {
+                        prefill.runtime_type() == crate::worker::RuntimeType::Vllm
+                    }
+                });
+        let reasoning_in_prefill = ctx
+            .components
+            .parser_resolver
+            .reasoning_parser(&chat_request.model)
+            .filter(|name| name == "gemma4")
+            .map(|_| {
+                reasoning_parser::parsers::Gemma4Parser::prompt_ends_in_reasoning(
+                    &processed_messages.text,
+                )
+            });
         let (plan, stamp) = build_chat_backed_plan(
             ctx,
             &chat_request,
@@ -274,8 +299,12 @@ impl BuildStage for ChatRequestBuildingStage {
 
         // Only the client-facing usage drops them; settlement keeps the engine's count.
         ctx.state.response.unbilled_prompt_tokens = unbilled_prompt_tokens;
-        let mut spec = ChatResponseSpec::from(chat_request.as_ref());
-        spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
+        let spec = chat_response_spec(
+            chat_request.as_ref(),
+            unbilled_prompt_tokens,
+            reasoning_in_prefill,
+            vllm_json_tool,
+        );
 
         Ok(BuildOutput {
             plan,
@@ -294,5 +323,46 @@ impl BuildStage for ChatRequestBuildingStage {
             "ChatRequestBuildingStage(inject_pd_metadata={}, {:?})",
             self.inject_pd_metadata, self.plan_kind
         )
+    }
+}
+
+pub(crate) fn chat_response_spec(
+    request: &openai_protocol::chat::ChatCompletionRequest,
+    unbilled_prompt_tokens: u32,
+    reasoning_in_prefill: Option<bool>,
+    vllm_json_tool: bool,
+) -> ChatResponseSpec {
+    let mut spec = ChatResponseSpec::from(request);
+    spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
+    spec.reasoning_in_prefill = reasoning_in_prefill;
+    // vLLM's JSON tool grammar applies from token zero and cannot emit a
+    // reasoning prefix. Parse its payload as tools, including literal markers
+    // inside arguments. SGLang's deferred grammar and native tools are unchanged.
+    if vllm_json_tool {
+        spec.separate_reasoning = false;
+    }
+    spec
+}
+
+#[cfg(test)]
+mod response_spec_tests {
+    use super::*;
+
+    #[test]
+    fn native_and_deferred_tool_constraints_keep_reasoning_preferences() {
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"test-model", "messages":[], "separate_reasoning":true,
+            "chat_template_kwargs":{"enable_thinking":true}
+        }))
+        .unwrap();
+        // `false` includes auto/native/structural-tag vLLM requests and
+        // SGLang, whose require_reasoning defers its JSON constraint.
+        for in_prefill in [None, Some(false), Some(true)] {
+            let spec = chat_response_spec(&request, 7, in_prefill, false);
+            assert!(spec.separate_reasoning);
+            assert_eq!(spec.reasoning_in_prefill, in_prefill);
+            assert_eq!(spec.unbilled_prompt_tokens, 7);
+            assert_eq!(spec.chat_template_kwargs, request.chat_template_kwargs);
+        }
     }
 }

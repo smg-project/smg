@@ -9,10 +9,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     parsers::{
-        CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
-        HyV4Parser, InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser,
-        MinimaxM2Parser, MinimaxM3Parser, MistralParser, PassthroughParser, PythonicParser,
-        QwenParser, QwenXmlParser, SarashinaParser, Step3Parser,
+        CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Gemma4Parser,
+        Glm4MoeParser, HyV4Parser, InklingParser, JsonParser, KimiK2Parser, KimiK3Parser,
+        LlamaParser, MinimaxM2Parser, MinimaxM3Parser, MistralParser, PassthroughParser,
+        PythonicParser, QwenParser, QwenXmlParser, SarashinaParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -340,9 +340,18 @@ impl ParserRegistry {
         configured.is_some_and(|p| self.has_structural_tag(p))
     }
 
+    /// Whether required/named responses retain model-native framing rather
+    /// than the generic JSON schema fallback. Gemma4 follows vLLM's native
+    /// choice handling without claiming structural-tag grammar support.
+    pub fn uses_native_tool_format(&self, configured: Option<&str>) -> bool {
+        self.has_structural_tag_for_parser(configured)
+            || configured.is_some_and(|p| p == "gemma4" && self.has_parser(p))
+    }
+
     /// Generate tool call constraint.
     ///
     /// If `configured_parser` supports structural tags → `StructuralTag(json)`.
+    /// Gemma4 emits its native format without a decoding constraint.
     /// Otherwise → `JsonSchema(schema)` for required/function tool_choice.
     /// Returns `Ok(None)` for auto/none tool_choice.
     ///
@@ -368,6 +377,12 @@ impl ParserRegistry {
             ToolChoice::AllowedTools { mode, .. } if mode == "required" => true,
             _ => return Ok(None),
         };
+
+        // Like vLLM's Gemma4EngineToolParser.adjust_request, let Gemma4 emit
+        // native calls even for required/named choices instead of forcing JSON.
+        if configured_parser == Some("gemma4") && self.has_parser("gemma4") {
+            return Ok(None);
+        }
 
         // Try structural tag from configured parser
         if let Some(name) = configured_parser {
@@ -479,6 +494,7 @@ impl ParserFactory {
         // Register default parsers
         registry.register_parser("passthrough", || Box::new(PassthroughParser::new()));
         registry.register_parser("json", || Box::new(JsonParser::new()));
+        registry.register_parser("gemma4", || Box::new(Gemma4Parser::new()));
         registry.register_parser_with_structural_tag(
             "mistral",
             || Box::new(MistralParser::new()),
@@ -672,6 +688,8 @@ impl ParserFactory {
         // Other models
         registry.map_model("gemini-*", "json");
         registry.map_model("palm-*", "json");
+        registry.map_model("gemma-4*", "gemma4");
+        registry.map_model("gemma4*", "gemma4");
         registry.map_model("gemma-*", "json");
     }
 

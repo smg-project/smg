@@ -327,6 +327,8 @@ class InProcessMediaProcessor:
         try:
             if item.modality == "image":
                 return await self._connector.fetch_image_async(item.url)
+            if item.modality == "audio":
+                return await self._connector.fetch_audio_async(item.url)
             if item.modality == "video":
                 return await self._connector.fetch_video_async(
                     item.url, video_processor=self._video_processor

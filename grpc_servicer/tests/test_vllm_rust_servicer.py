@@ -461,6 +461,7 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
     assert rust.smg_media_options(config, settings, str(tmp_path))["engine_item_limits"] == {
         "image": 8,
         "video": 2,
+        "audio": 1,
     }
     # The engine's video frame budget rides along: its media kwargs when set
     # (a non-positive count meaning every frame), else the loader's default,

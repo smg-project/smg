@@ -20,7 +20,10 @@ use tool_parser::types::ToolCallItem;
 
 use super::*;
 use crate::{
-    routers::{common::sse::SseReceiver, grpc::regular::processor::ResponseProcessor},
+    routers::{
+        common::sse::SseReceiver,
+        grpc::regular::{processor::ResponseProcessor, stages::chat::chat_response_spec},
+    },
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, Worker, WorkerRegistry,
@@ -1360,6 +1363,292 @@ fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
         ),
         "vllm",
     )
+}
+
+#[tokio::test]
+async fn vllm_json_tool_stream_keeps_literal_reasoning_markers_in_arguments() {
+    for (choice, output) in [
+        (
+            serde_json::json!("required"),
+            r#"[{"name":"lookup","parameters":{"q":"Paris"}}]"#,
+        ),
+        (
+            serde_json::json!({"type":"function","function":{"name":"lookup"}}),
+            r#"{"q":"<think>Paris</think>"}"#,
+        ),
+        (
+            serde_json::json!({"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"lookup"}]}),
+            r#"[{"name":"lookup","parameters":{"q":"<think>Paris</think>"}}]"#,
+        ),
+    ] {
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"test-model", "messages":[], "separate_reasoning":true,
+            "chat_template_kwargs":{"enable_thinking":true}, "tool_choice":choice,
+            "tools":[{"type":"function","function":{"name":"lookup",
+                "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
+        }))
+        .unwrap();
+        let spec = chat_response_spec(&request, 0, Some(true), true);
+        let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+        frames.push(complete(0, "stop"));
+        let (stream, server) = scripted_stream(frames, "0").await;
+        let (tx, rx) = sse_channel();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "fixture collector is joined before assertions"
+        )]
+        let collector = tokio::spawn(collect_events(rx));
+        let result = named_processor("qwen_coder", "qwen3")
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collector.await.unwrap();
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
+        assert_eq!(chat_text(&events, 0, "content"), "");
+        let calls: Vec<_> = events
+            .iter()
+            .flat_map(|event| {
+                event["choices"][0]["delta"]["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        assert!(calls
+            .iter()
+            .any(|call| call["function"]["name"] == "lookup"));
+        assert!(calls
+            .iter()
+            .any(|call| call["id"].as_str().is_some_and(|id| !id.is_empty())));
+        let args: String = calls
+            .iter()
+            .filter_map(|call| call["function"]["arguments"].as_str())
+            .collect();
+        let expected = if output.contains("<think>") {
+            "<think>Paris</think>"
+        } else {
+            "Paris"
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&args).unwrap(),
+            serde_json::json!({"q":expected})
+        );
+        assert!(events
+            .iter()
+            .any(|event| event["choices"][0]["finish_reason"] == "tool_calls"));
+    }
+}
+
+#[tokio::test]
+async fn vllm_native_auto_tool_stream_keeps_prefilled_reasoning() {
+    let output = "plan</think>\n<tool_call>\n<function=lookup>\n<parameter=q>\nParis\n</parameter>\n</function>\n</tool_call>";
+    let request = serde_json::from_value(serde_json::json!({
+        "model":"test-model", "messages":[], "separate_reasoning":true,
+        "tool_choice":"auto", "tools":[{"type":"function","function":{"name":"lookup",
+            "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
+    }))
+    .unwrap();
+    let spec = chat_response_spec(&request, 0, Some(true), false);
+    let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+    frames.push(complete(0, "stop"));
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let (tx, rx) = sse_channel();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fixture collector is joined before assertions"
+    )]
+    let collector = tokio::spawn(collect_events(rx));
+    let result = named_processor("qwen_coder", "qwen3")
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collector.await.unwrap();
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+    assert_eq!(chat_text(&events, 0, "content").trim(), "");
+    let calls: Vec<_> = events
+        .iter()
+        .flat_map(|event| {
+            event["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .collect();
+    assert!(calls
+        .iter()
+        .any(|call| call["function"]["name"] == "lookup"));
+    let args: String = calls
+        .iter()
+        .filter_map(|call| call["function"]["arguments"].as_str())
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<Value>(&args).unwrap(),
+        serde_json::json!({"q":"Paris"})
+    );
+}
+
+#[tokio::test]
+async fn gemma4_stream_native_tool_choices_preserve_reasoning_and_arguments() {
+    let output = r#"<|channel>thought
+plan<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#;
+    for tool_choice in [
+        serde_json::json!("auto"),
+        serde_json::json!("required"),
+        serde_json::json!({"type":"function", "function":{"name":"lookup"}}),
+    ] {
+        let mut spec = chat_spec(true);
+        spec.tool_choice = Some(serde_json::from_value(tool_choice).unwrap());
+        let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+        frames.push(complete(0, "stop"));
+        let (stream, server) = scripted_stream(frames, "0").await;
+        let (tx, rx) = sse_channel();
+        let result = named_processor("gemma4", "gemma4")
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+        assert_eq!(chat_text(&events, 0, "content"), "");
+        let calls: Vec<_> = events
+            .iter()
+            .flat_map(|event| {
+                event["choices"][0]["delta"]["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(calls[0]["function"]["name"], "lookup");
+        assert!(calls[0]["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(
+            serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap())
+                .unwrap(),
+            serde_json::json!({"q":"Paris"})
+        );
+        assert!(events
+            .iter()
+            .any(|event| event["choices"][0]["finish_reason"] == "tool_calls"));
+    }
+}
+
+#[tokio::test]
+async fn gemma4_messages_stream_native_required_and_named_keep_block_order() {
+    for choice in [
+        messages::ToolChoice::Any {
+            disable_parallel_tool_use: None,
+        },
+        messages::ToolChoice::Tool {
+            name: "lookup".to_string(),
+            disable_parallel_tool_use: None,
+        },
+    ] {
+        let (blocks, inputs) = messages_blocks_and_inputs(
+            named_processor("gemma4", "gemma4"),
+            Some(choice),
+            &[
+                "<|channel>thought\nplan",
+                r#"<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#,
+            ],
+        )
+        .await;
+        assert_eq!(
+            blocks,
+            [
+                "start 0 \"thinking\"",
+                "stop 0",
+                "start 1 \"tool_use\"",
+                "stop 1",
+            ]
+        );
+        assert_eq!(inputs, [serde_json::json!({"q":"Paris"})]);
+    }
+}
+
+#[tokio::test]
+async fn gemma4_messages_nonstream_native_required_and_named_keep_arguments() {
+    let output = r#"<|channel>thought
+plan<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#;
+    for tool_choice in [
+        serde_json::json!({"type":"any"}),
+        serde_json::json!({"type":"tool","name":"lookup"}),
+    ] {
+        let request: messages::CreateMessageRequest = serde_json::from_value(serde_json::json!({
+            "model":"eof-test", "max_tokens":64,
+            "messages":[{"role":"user","content":"weather?"}],
+            "thinking":{"type":"enabled", "budget_tokens":1024}, "tool_choice":tool_choice,
+            "tools":[{"name":"lookup", "input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}]
+        })).unwrap();
+        let mut final_frame = complete(0, "stop");
+        if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
+            complete.output_ids = output.chars().map(u32::from).collect();
+        }
+        let (stream, server) = scripted_stream(vec![final_frame], "0").await;
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::new(
+                Arc::new(WorkerRegistry::new()),
+                Some("gemma4".to_string()),
+                Some("gemma4".to_string()),
+            ),
+        );
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let result = processor
+            .process_non_streaming_messages_response(
+                context::ExecutionResult::Single { stream },
+                MessagesResponseSpec::from(&request),
+                dispatch(),
+                tokenizer,
+                &mut decoder,
+            )
+            .await;
+        server.abort();
+        let response =
+            serde_json::to_value(result.unwrap_or_else(|error| panic!("{}", error.status())))
+                .unwrap();
+        assert_eq!(response["stop_reason"], "tool_use");
+        assert_eq!(response["content"].as_array().unwrap().len(), 2);
+        assert_eq!(response["content"][0]["type"], "thinking");
+        assert_eq!(response["content"][0]["thinking"], "plan");
+        assert_eq!(response["content"][1]["type"], "tool_use");
+        assert_eq!(response["content"][1]["name"], "lookup");
+        assert_eq!(
+            response["content"][1]["input"],
+            serde_json::json!({"q":"Paris"})
+        );
+    }
 }
 
 #[tokio::test]
