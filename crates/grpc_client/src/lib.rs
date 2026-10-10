@@ -16,6 +16,7 @@ pub mod common_proto {
 pub mod abort_on_drop;
 pub mod channel;
 pub mod engine_load;
+pub mod media_fault;
 pub mod mlx_engine;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
@@ -31,6 +32,7 @@ pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{
     connect_channel, connect_channel_with_timeout, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT,
 };
+pub use media_fault::WorkerMediaFault;
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use sglang_scheduler::{
     proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
