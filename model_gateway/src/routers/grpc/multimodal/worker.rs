@@ -14,12 +14,12 @@ use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, registry::modality_limit_override, vision::PreProcessorConfig,
     FrameSampling, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
-    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, VisionProcessorRegistry,
-    POOL_THREADS_ENV,
+    MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
+    VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
-use smg_grpc_client::vllm_proto as vllm;
+use smg_grpc_client::{vllm_proto as vllm, WorkerMediaFault};
 use tracing::warn;
 
 use super::{
@@ -263,10 +263,16 @@ pub enum WorkerMediaError {
     /// media than the model takes.
     #[error("{0}")]
     Invalid(String),
-    /// Not this worker's fault right now: a fetch that timed out or could not
-    /// connect.
-    #[error("{0}")]
-    Unavailable(String),
+    /// The media the request names failed, by whose fault (see
+    /// [`WorkerMediaFault`]): the request's own (a host that cannot be
+    /// resolved or refuses the connection, its 4xx, a payload that is not the
+    /// media it claims to be) or its host's for now (a fetch that ran out of
+    /// its budget, a 5xx, a broken transfer). Neither is this worker's.
+    #[error("{message}")]
+    Media {
+        fault: WorkerMediaFault,
+        message: String,
+    },
     /// A pipeline failure.
     #[error("{0}")]
     Internal(String),
@@ -672,8 +678,9 @@ fn apply_processor_kwargs(
 }
 
 /// Whose fault a pipeline failure is, from the typed error in its chain: a
-/// fetch that timed out or could not connect is the network's (retryable),
-/// a bad reference or undecodable media the caller's, anything else ours.
+/// fetch or decode failure is the media's, by the connector's own reading of
+/// it (the request's, or its host's for now); a bad part or a prompt the
+/// anchors do not fit the caller's; anything else ours.
 fn classify(error: anyhow::Error) -> WorkerMediaError {
     let message = format!("{error:#}");
     for cause in error.chain() {
@@ -694,14 +701,12 @@ fn classify(error: anyhow::Error) -> WorkerMediaError {
 }
 
 fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaError {
-    match error {
-        MediaConnectorError::Timeout { .. } => WorkerMediaError::Unavailable(message),
-        MediaConnectorError::Http(http) if http.is_timeout() || http.is_connect() => {
-            WorkerMediaError::Unavailable(message)
-        }
-        MediaConnectorError::Blocking(_) => WorkerMediaError::Internal(message),
-        _ => WorkerMediaError::Invalid(message),
-    }
+    let fault = match error.fault() {
+        MediaFault::Client => WorkerMediaFault::Client,
+        MediaFault::Transient => WorkerMediaFault::Transient,
+        MediaFault::Internal => return WorkerMediaError::Internal(message),
+    };
+    WorkerMediaError::Media { fault, message }
 }
 
 #[cfg(test)]
@@ -865,6 +870,9 @@ mod tests {
         assert_eq!(data_url_payload_bytes("https://example.com/x.png"), None);
     }
 
+    /// A fetch that ran out of its budget is the media host's fault for now,
+    /// a reference the request got wrong the request's, neither the worker's;
+    /// a failure with no connector error in its chain is the pipeline's.
     #[test]
     fn fetch_failures_are_classified_by_fault() {
         let timeout = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
@@ -874,10 +882,21 @@ mod tests {
         .context("Failed to finalize multimodal tracker");
         assert!(matches!(
             classify(timeout),
-            WorkerMediaError::Unavailable(_)
+            WorkerMediaError::Media {
+                fault: WorkerMediaFault::Transient,
+                ..
+            }
         ));
         let scheme = anyhow::Error::new(MediaConnectorError::UnsupportedScheme("ftp".to_string()));
-        assert!(matches!(classify(scheme), WorkerMediaError::Invalid(_)));
+        assert!(matches!(
+            classify(scheme),
+            WorkerMediaError::Media {
+                fault: WorkerMediaFault::Client,
+                ..
+            }
+        ));
+        let part = anyhow::Error::new(MultiModalError::UnsupportedContent("image_embeds"));
+        assert!(matches!(classify(part), WorkerMediaError::Invalid(_)));
         let other = anyhow::anyhow!("preprocess failed");
         assert!(matches!(classify(other), WorkerMediaError::Internal(_)));
     }
