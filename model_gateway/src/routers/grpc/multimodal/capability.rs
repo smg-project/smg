@@ -10,10 +10,14 @@
 //! defense in depth.
 
 use anyhow::Result;
+use axum::response::Response;
 use llm_multimodal::Modality;
 
-use super::MultimodalIntermediate;
-use crate::worker::{RuntimeType, Worker};
+use super::{plan::MediaPlan, MultimodalIntermediate};
+use crate::{
+    routers::error,
+    worker::{RuntimeType, Worker, WorkerRegistry},
+};
 
 /// Worker label carrying the engine's vision-input capability (the vLLM
 /// gRPC servicer's `GetModelInfoResponse.supports_vision`). `"false"` on a
@@ -34,6 +38,50 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
         .labels
         .get(SUPPORTS_VISION_LABEL)
         .is_some_and(|value| value == "false")
+}
+
+/// Whether every worker registered for `model_id` runs without a vision
+/// encoder (`supports_vision=false`, see [`SUPPORTS_VISION_LABEL`]). Such a
+/// pool takes no multimodal payload at all: a vLLM engine admits the request
+/// and never schedules it (encoder-cache budget 0), so a request carrying
+/// media must be refused before any of it is decoded, preprocessed or
+/// dispatched. An empty pool reads as capable: worker selection answers for a
+/// model with no workers.
+pub(crate) fn model_workers_language_model_only(registry: &WorkerRegistry, model_id: &str) -> bool {
+    let workers = registry.get_by_model(model_id);
+    !workers.is_empty()
+        && workers
+            .iter()
+            .all(|worker| worker_language_model_only(worker.as_ref()))
+}
+
+/// Refuse a request's media when every worker of `model_id` is language model
+/// only: the same prompt 400 the public API gives image input to a model
+/// without vision, instead of a dispatch the engine never schedules. Runs in
+/// preparation, before the media is decoded or preprocessed. A plan without
+/// media passes; so does a model with no registered workers (selection
+/// answers for it).
+pub(crate) fn ensure_model_accepts_media(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    plan: &MediaPlan,
+) -> Result<(), Response> {
+    if plan.is_empty() || !model_workers_language_model_only(registry, model_id) {
+        return Ok(());
+    }
+    let modalities = plan
+        .modalities()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(error::bad_request(
+        "multimodal_not_supported",
+        format!(
+            "{modalities} input is not supported by model '{model_id}': its workers run as a \
+             language model only, without a vision encoder"
+        ),
+    ))
 }
 
 /// Whether `runtime` accepts multimodal inputs of `modality`.
@@ -191,5 +239,103 @@ mod tests {
         // Image on MLX is not.
         let err = ensure_backend_supports_modalities(RuntimeType::Mlx, &intermediate).unwrap_err();
         assert_eq!(err.to_string(), "backend mlx does not support image inputs");
+    }
+
+    mod pool {
+        use std::sync::Arc;
+
+        use llm_multimodal::MediaContentPart;
+        use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+        use super::*;
+        use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
+
+        const MODEL: &str = "pool-test-model";
+
+        fn worker(url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                });
+            for (key, value) in labels {
+                builder = builder.label(*key, *value);
+            }
+            Arc::new(builder.build())
+        }
+
+        fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
+            let registry = WorkerRegistry::new();
+            for worker in workers {
+                registry.register(worker).expect("register");
+            }
+            registry
+        }
+
+        fn image_plan() -> MediaPlan {
+            MediaPlan::new([MediaContentPart::ImageUrl {
+                url: "data:image/png;base64,AAAA".to_string(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            }])
+        }
+
+        /// Only a pool whose every worker says `supports_vision=false` is
+        /// language model only; an absent label keeps today's reading
+        /// (capable), and an empty pool is left to worker selection.
+        #[test]
+        fn pool_is_language_model_only_when_every_worker_says_so() {
+            let lmo = |url| worker(url, &[(SUPPORTS_VISION_LABEL, "false")]);
+            let vision = |url| worker(url, &[(SUPPORTS_VISION_LABEL, "true")]);
+            let unlabeled = |url| worker(url, &[]);
+
+            let all_lmo = registry_with(vec![lmo("grpc://10.0.0.1:1"), lmo("grpc://10.0.0.2:1")]);
+            assert!(model_workers_language_model_only(&all_lmo, MODEL));
+
+            let mixed = registry_with(vec![lmo("grpc://10.0.0.1:1"), vision("grpc://10.0.0.2:1")]);
+            assert!(!model_workers_language_model_only(&mixed, MODEL));
+
+            let legacy = registry_with(vec![
+                lmo("grpc://10.0.0.1:1"),
+                unlabeled("grpc://10.0.0.2:1"),
+            ]);
+            assert!(!model_workers_language_model_only(&legacy, MODEL));
+
+            let empty = registry_with(vec![]);
+            assert!(!model_workers_language_model_only(&empty, MODEL));
+            assert!(!model_workers_language_model_only(
+                &all_lmo,
+                "another-model"
+            ));
+        }
+
+        /// Media to a language-model-only pool is a 400 naming the modality
+        /// and the model; text-only requests and capable pools pass.
+        #[test]
+        fn media_to_a_language_model_only_pool_is_a_bad_request() {
+            let all_lmo = registry_with(vec![worker(
+                "grpc://10.0.0.1:1",
+                &[(SUPPORTS_VISION_LABEL, "false")],
+            )]);
+            let response = ensure_model_accepts_media(&all_lmo, MODEL, &image_plan()).unwrap_err();
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+                "multimodal_not_supported"
+            );
+
+            assert!(ensure_model_accepts_media(&all_lmo, MODEL, &MediaPlan::default()).is_ok());
+
+            let vision = registry_with(vec![worker(
+                "grpc://10.0.0.1:1",
+                &[(SUPPORTS_VISION_LABEL, "true")],
+            )]);
+            assert!(ensure_model_accepts_media(&vision, MODEL, &image_plan()).is_ok());
+        }
     }
 }

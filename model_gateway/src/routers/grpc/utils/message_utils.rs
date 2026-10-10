@@ -264,6 +264,10 @@ pub(crate) async fn resolve_messages_media(
     };
 
     let plan = multimodal::media_plan_messages(messages);
+    // Same refusal as the chat path: no media to a pool whose every
+    // worker is language model only (see chat/preparation.rs); the count
+    // answers it as `/v1/messages` does.
+    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
     if plan.is_empty() {
         return Ok(MessagesMedia {
             media_order,

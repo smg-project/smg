@@ -1716,7 +1716,10 @@ mod request_release_tests {
     use crate::{
         config::types::PolicyConfig,
         routers::grpc::{
-            multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
+            multimodal::{
+                MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+                SUPPORTS_VISION_LABEL,
+            },
             utils::tonic_ext::TonicStatusExt,
         },
         worker::{
@@ -1727,6 +1730,11 @@ mod request_release_tests {
     };
 
     const MODEL: &str = "request-release-test-model";
+    /// A valid 1x1 PNG, as a client sends an inline image.
+    const ONE_PIXEL_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    /// The worker label of an engine without a vision encoder (vLLM
+    /// `--language-model-only`, or a text-only model).
+    const LANGUAGE_MODEL_ONLY: &[(&str, &str)] = &[(SUPPORTS_VISION_LABEL, "false")];
 
     /// The `(offset, length)` placeholder ranges of one generate call.
     type PlaceholderRanges = Vec<(u32, u32)>;
@@ -2027,18 +2035,28 @@ mod request_release_tests {
         port: u16,
         worker_type: WorkerType,
     ) -> Arc<dyn Worker> {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-                .worker_type(worker_type)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::TokenSpeed)
-                .model(ModelCard::new(MODEL))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        );
+        register_worker_with_labels(registry, port, worker_type, &[])
+    }
+
+    fn register_worker_with_labels(
+        registry: &WorkerRegistry,
+        port: u16,
+        worker_type: WorkerType,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::TokenSpeed)
+            .model(ModelCard::new(MODEL))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            });
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
         registry
             .register(Arc::clone(&worker))
             .expect("register release-test worker");
@@ -2076,6 +2094,16 @@ mod request_release_tests {
     }
 
     async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
+        components_with_multimodal(worker_registry, false).await
+    }
+
+    /// Components over the mock tokenizer; `with_multimodal` adds the
+    /// multimodal bundle (default settings, no model directory) so media
+    /// reaches the multimodal path instead of the "not available" refusal.
+    async fn components_with_multimodal(
+        worker_registry: Arc<WorkerRegistry>,
+        with_multimodal: bool,
+    ) -> Arc<SharedComponents> {
         let tokenizer_registry = Arc::new(TokenizerRegistry::new());
         let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
         tokenizer_registry
@@ -2087,14 +2115,114 @@ mod request_release_tests {
             )
             .await
             .expect("load mock tokenizer");
+        let multimodal = with_multimodal.then(|| {
+            Arc::new(
+                MultimodalComponents::new(
+                    Arc::new(MultimodalConfigRegistry::new()),
+                    None,
+                    None,
+                    &MultimodalSettings::default(),
+                )
+                .expect("multimodal components"),
+            )
+        });
         Arc::new(SharedComponents {
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
-            multimodal: None,
+            multimodal,
         })
+    }
+
+    /// An image to a model whose only worker runs without a vision encoder
+    /// is refused with a prompt 400 that names the modality and the model,
+    /// before any media is decoded and before anything reaches the worker
+    /// (an engine without an encoder admits such a request and never
+    /// schedules it, which the client saw as a hang).
+    #[tokio::test]
+    async fn image_to_a_language_model_only_pool_is_refused_before_dispatch() {
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_with_labels(
+            &worker_registry,
+            port,
+            WorkerType::Regular,
+            LANGUAGE_MODEL_ONLY,
+        );
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        let request: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }))
+            .expect("chat request"),
+        );
+
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the refusal must not wait on anything");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(
+            message.starts_with("image input is not supported by model"),
+            "{message}"
+        );
+        assert!(message.contains("language model only"), "{message}");
+        assert!(
+            seen_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing must reach the worker"
+        );
     }
 
     fn completion_request(stream: bool) -> Arc<CompletionRequest> {
@@ -3233,6 +3361,16 @@ mod request_release_tests {
         request: serde_json::Value,
         with_multimodal: bool,
     ) -> ChatRun {
+        v41_run_chat_on(dir, request, with_multimodal, &[]).await
+    }
+
+    /// [`v41_run_chat`] with `worker_labels` on the stub's worker.
+    async fn v41_run_chat_on(
+        dir: &Path,
+        request: serde_json::Value,
+        with_multimodal: bool,
+        worker_labels: &[(&str, &str)],
+    ) -> ChatRun {
         let seen_ids = Arc::new(Mutex::new(Vec::new()));
         let seen_mm = Arc::new(Mutex::new(Vec::new()));
         let port = spawn_stub(GatedScheduler {
@@ -3242,7 +3380,7 @@ mod request_release_tests {
         })
         .await;
         let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker(&worker_registry, port, WorkerType::Regular);
+        register_worker_with_labels(&worker_registry, port, WorkerType::Regular, worker_labels);
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
@@ -3452,6 +3590,42 @@ mod request_release_tests {
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"rate_limit_error\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// The same image to the same model served by a worker without a vision
+    /// encoder: refused with a 400 in preparation, nothing preprocessed or
+    /// dispatched (the engine would admit the request and never schedule it).
+    #[tokio::test]
+    async fn deepseek_v41_image_to_a_language_model_only_worker_is_refused() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let data_url = format!("data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG));
+        let (status, body, ids, mm) = v41_run_chat_on(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": {"url": data_url}}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            }),
+            true,
+            LANGUAGE_MODEL_ONLY,
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("multimodal_not_supported"), "{body}");
+        assert!(body.contains("language model only"), "{body}");
+        assert!(ids.is_empty(), "nothing must reach the worker");
+        assert!(mm.is_empty(), "nothing must be preprocessed");
     }
 }
 
