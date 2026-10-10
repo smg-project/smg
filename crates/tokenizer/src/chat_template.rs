@@ -562,6 +562,7 @@ impl ThinkDetector {
                     || Self::expr_references_var(&b.right, name)
             }
             Expr::UnaryOp(u) => Self::expr_references_var(&u.expr, name),
+            Expr::Test(t) => Self::expr_references_var(&t.expr, name),
             _ => false,
         }
     }
@@ -2210,6 +2211,13 @@ mod tests {
                         {%- if not (add_generation_prompt or continue_final_message) -%}done\
                         {%- else -%}<|assistant|><think>{%- endif -%}";
         let state = ChatTemplateState::new(Some(not_or.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // A test on the variable inside a condition something else also
+        // decides: the block may run, so what it opens counts.
+        let is_true_and = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt is true and not tools -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(is_true_and.to_string())).unwrap();
         assert!(state.prefill_opens_think_block());
     }
 
