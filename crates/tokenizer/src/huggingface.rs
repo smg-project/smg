@@ -291,10 +291,11 @@ impl HuggingFaceTokenizer {
             .map(detect_renderer_from_config)
             .unwrap_or(Renderer::Jinja);
 
-        Self::bound_bpe_cache(&mut tokenizer);
+        let native = NativeEncoder::from_tokenizer(&tokenizer);
+        Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
-            native: NativeEncoder::from_tokenizer(&tokenizer),
+            native,
             tokenizer,
             special_tokens,
             vocab,
@@ -353,23 +354,39 @@ impl HuggingFaceTokenizer {
             .ok()
     }
 
-    /// Words the `tokenizers` BPE model keeps in its per-thread cache. The
-    /// crate's default is 10,000 for every thread that ever encodes, and the
-    /// gateway encodes on each of its runtime and blocking threads, so the
-    /// caches of one model grew with the thread count (a few MB per thread)
-    /// instead of settling. The cache fills first-come and never evicts, so a
-    /// thread keeps the first thousand distinct words it sees, which in
-    /// practice catches the frequent ones; the native encoder's piece cache,
-    /// bounded in total, sits in front of them.
+    /// Words the `tokenizers` BPE model keeps in its per-thread cache when
+    /// every encode runs in `tokenizers`. The crate's default is 10,000 for
+    /// every thread that ever encodes, and the gateway encodes on each of its
+    /// runtime and blocking threads, so the caches of one model grew with the
+    /// thread count (a few MB per thread) instead of settling. The cache
+    /// fills first-come and never evicts, so a thread keeps the first
+    /// thousand distinct words it sees, which in practice catches the
+    /// frequent ones.
     const BPE_WORDS_CACHED_PER_THREAD: usize = 1024;
 
-    /// Bounds the per-thread word cache of a BPE model
-    /// ([`Self::BPE_WORDS_CACHED_PER_THREAD`]); other model kinds have none.
-    fn bound_bpe_cache(tokenizer: &mut HfTokenizer) {
+    /// Words the model may cache per thread: none behind the direct encode
+    /// path (`native`), whose own piece cache answers in front of the model
+    /// for the same pieces, else [`Self::BPE_WORDS_CACHED_PER_THREAD`]. The
+    /// model's cache outlives the model: it is a thread-local the crate
+    /// never clears, so every thread that encoded with a tokenizer the
+    /// gateway dropped (an unload, a re-registration, a reload) kept the
+    /// words it had cached for it, half a MB per thread per dropped
+    /// tokenizer. The piece cache is owned by the encoder and freed with it.
+    fn bpe_words_cached(native: Option<&NativeEncoder>) -> usize {
+        if native.is_some() {
+            0
+        } else {
+            Self::BPE_WORDS_CACHED_PER_THREAD
+        }
+    }
+
+    /// Sizes the per-thread word cache of a BPE model to `words`
+    /// ([`Self::bpe_words_cached`]); other model kinds have none.
+    fn bound_bpe_cache(tokenizer: &mut HfTokenizer, words: usize) {
         let bounded = match tokenizer.get_model() {
             ModelWrapper::BPE(bpe) => {
                 let mut bpe = bpe.clone();
-                bpe.resize_cache(Self::BPE_WORDS_CACHED_PER_THREAD);
+                bpe.resize_cache(words);
                 Some(bpe)
             }
             _ => None,
@@ -381,7 +398,8 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
-        Self::bound_bpe_cache(&mut tokenizer);
+        let native = NativeEncoder::from_tokenizer(&tokenizer);
+        Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
@@ -391,7 +409,7 @@ impl HuggingFaceTokenizer {
 
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
-            native: NativeEncoder::from_tokenizer(&tokenizer),
+            native,
             tokenizer,
             special_tokens,
             vocab,
