@@ -284,6 +284,37 @@ def run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
+class TestNativeAudio:
+    def test_fetched_waveform_reaches_the_sidecar_renderer(self):
+        s = sidecar(FakeRedis())
+        waveform = ([0.25, -0.25], 16000)
+        url = "data:audio/wav;base64,AAAA"
+        fetched, rendered = [], []
+
+        async def fetch_audio(actual_url):
+            fetched.append(actual_url)
+            return waveform
+
+        async def render(prompt, **kwargs):
+            rendered.append((prompt, kwargs))
+            return {"prompt_token_ids": [258881], "mm_kwargs": {},
+                    "mm_hashes": {}, "mm_placeholders": {}}
+
+        s._connector = types.SimpleNamespace(fetch_audio_async=fetch_audio)
+        s._tokens_prompt = lambda **kwargs: kwargs
+        s._renderer = types.SimpleNamespace(process_for_engine_async=render)
+        s._encoder = None  # The fake renderer produces no tensor payloads.
+        request = job()
+        request.items = [proto.JobItem(modality="audio", url=url)]
+        result = run(s.handle(request))
+        assert result.ok, result
+        assert fetched == [url]
+        assert rendered == [({"prompt_token_ids": [1, 2, 3],
+                              "multi_modal_data": {"audio": [waveform]}},
+                             {"arrival_time": 0.0, "skip_mm_cache": True})]
+        assert result.prompt_token_ids == [258881]
+
+
 class TestClassification:
     def test_fetch_errors(self):
         assert mm_sidecar.classify_fetch_error(ValueError("domain not allowed")) == (

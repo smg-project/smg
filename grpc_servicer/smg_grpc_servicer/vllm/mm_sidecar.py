@@ -404,6 +404,8 @@ class Sidecar:
     async def _fetch(self, modality: str, url: str):
         if modality == "image":
             return await self._connector.fetch_image_async(url)
+        if modality == "audio":
+            return await self._connector.fetch_audio_async(url)
         if modality == "video":
             return await self._connector.fetch_video_async(
                 url, video_processor=self._video_processor

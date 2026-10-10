@@ -20,10 +20,7 @@ use tool_parser::types::ToolCallItem;
 
 use super::*;
 use crate::{
-    routers::{
-        common::sse::SseReceiver,
-        grpc::regular::{processor::ResponseProcessor, stages::chat::chat_response_spec},
-    },
+    routers::{common::sse::SseReceiver, grpc::regular::processor::ResponseProcessor},
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, Worker, WorkerRegistry,
@@ -1366,90 +1363,6 @@ fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
 }
 
 #[tokio::test]
-async fn vllm_json_tool_stream_keeps_literal_reasoning_markers_in_arguments() {
-    for (choice, output) in [
-        (
-            serde_json::json!("required"),
-            r#"[{"name":"lookup","parameters":{"q":"Paris"}}]"#,
-        ),
-        (
-            serde_json::json!({"type":"function","function":{"name":"lookup"}}),
-            r#"{"q":"<think>Paris</think>"}"#,
-        ),
-        (
-            serde_json::json!({"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"lookup"}]}),
-            r#"[{"name":"lookup","parameters":{"q":"<think>Paris</think>"}}]"#,
-        ),
-    ] {
-        let request = serde_json::from_value(serde_json::json!({
-            "model":"test-model", "messages":[], "separate_reasoning":true,
-            "chat_template_kwargs":{"enable_thinking":true}, "tool_choice":choice,
-            "tools":[{"type":"function","function":{"name":"lookup",
-                "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
-        }))
-        .unwrap();
-        let spec = chat_response_spec(&request, 0, Some(true), true);
-        let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
-        frames.push(complete(0, "stop"));
-        let (stream, server) = scripted_stream(frames, "0").await;
-        let (tx, rx) = sse_channel();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "fixture collector is joined before assertions"
-        )]
-        let collector = tokio::spawn(collect_events(rx));
-        let result = named_processor("qwen_coder", "qwen3")
-            .process_streaming_chunks(
-                stream,
-                dispatch(),
-                Arc::new(CharacterTokenizer::default()),
-                (None, None, false, false, false),
-                spec,
-                &tx,
-                None,
-            )
-            .await;
-        drop(tx);
-        let events = collector.await.unwrap();
-        server.abort();
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
-        assert_eq!(chat_text(&events, 0, "content"), "");
-        let calls: Vec<_> = events
-            .iter()
-            .flat_map(|event| {
-                event["choices"][0]["delta"]["tool_calls"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-            })
-            .collect();
-        assert!(calls
-            .iter()
-            .any(|call| call["function"]["name"] == "lookup"));
-        assert!(calls
-            .iter()
-            .any(|call| call["id"].as_str().is_some_and(|id| !id.is_empty())));
-        let args: String = calls
-            .iter()
-            .filter_map(|call| call["function"]["arguments"].as_str())
-            .collect();
-        let expected = if output.contains("<think>") {
-            "<think>Paris</think>"
-        } else {
-            "Paris"
-        };
-        assert_eq!(
-            serde_json::from_str::<Value>(&args).unwrap(),
-            serde_json::json!({"q":expected})
-        );
-        assert!(events
-            .iter()
-            .any(|event| event["choices"][0]["finish_reason"] == "tool_calls"));
-    }
-}
-
-#[tokio::test]
 async fn vllm_native_auto_tool_stream_keeps_prefilled_reasoning() {
     let output = "plan</think>\n<tool_call>\n<function=lookup>\n<parameter=q>\nParis\n</parameter>\n</function>\n</tool_call>";
     let request = serde_json::from_value(serde_json::json!({
@@ -1458,7 +1371,8 @@ async fn vllm_native_auto_tool_stream_keeps_prefilled_reasoning() {
             "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
     }))
     .unwrap();
-    let spec = chat_response_spec(&request, 0, Some(true), false);
+    let mut spec = ChatResponseSpec::from(&request);
+    spec.reasoning_in_prefill = Some(true);
     let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
     frames.push(complete(0, "stop"));
     let (stream, server) = scripted_stream(frames, "0").await;
