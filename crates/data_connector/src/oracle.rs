@@ -1284,6 +1284,37 @@ impl OracleResponseStorage {
     }
 }
 
+/// The statement that stores a response: a merge on the id (the first
+/// column, the table's primary key) that inserts a new row or updates every
+/// other column of the existing one, so a record written as `queued` is
+/// replaced by its terminal object under the one id.
+fn store_response_sql(table: &str, columns: &[&str]) -> String {
+    let source: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| format!(":{} AS {col}", i + 1))
+        .collect();
+    let id_col = columns.first().copied().unwrap_or("id");
+    let updates: Vec<String> = columns
+        .iter()
+        .skip(1)
+        .map(|col| format!("t.{col} = s.{col}"))
+        .collect();
+    let inserted: Vec<String> = columns.iter().map(|col| format!("s.{col}")).collect();
+    let matched = if updates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(", "))
+    };
+    format!(
+        "MERGE INTO {table} t USING (SELECT {} FROM dual) s ON (t.{id_col} = s.{id_col}){matched} \
+         WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
+        source.join(", "),
+        columns.join(", "),
+        inserted.join(", ")
+    )
+}
+
 #[async_trait]
 impl ResponseStorage for OracleResponseStorage {
     async fn store_response(
@@ -1347,13 +1378,7 @@ impl ResponseStorage for OracleResponseStorage {
                     params.push(val);
                 }
 
-                let placeholders: Vec<String> =
-                    (1..=params.len()).map(|i| format!(":{i}")).collect();
-                let sql = format!(
-                    "INSERT INTO {table} ({}) VALUES ({})",
-                    columns.join(", "),
-                    placeholders.join(", ")
-                );
+                let sql = store_response_sql(&table, &columns);
                 conn.execute(&sql, &params[..])
                     .map(|_| ())
                     .map_err(map_oracle_error)
@@ -1533,4 +1558,26 @@ fn create_index_if_missing(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::store_response_sql;
+
+    #[test]
+    fn store_response_sql_merges_on_the_id() {
+        let sql = store_response_sql("responses", &["id", "input", "raw_response"]);
+        assert_eq!(
+            sql,
+            "MERGE INTO responses t USING (SELECT :1 AS id, :2 AS input, :3 AS raw_response FROM dual) s \
+             ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.input = s.input, t.raw_response = s.raw_response \
+             WHEN NOT MATCHED THEN INSERT (id, input, raw_response) VALUES (s.id, s.input, s.raw_response)"
+        );
+        let sql = store_response_sql("r", &["id"]);
+        assert_eq!(
+            sql,
+            "MERGE INTO r t USING (SELECT :1 AS id FROM dual) s ON (t.id = s.id) \
+             WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)"
+        );
+    }
 }

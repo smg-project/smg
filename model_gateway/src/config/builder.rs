@@ -450,6 +450,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Most background Responses in flight at once (0 = background mode off).
+    pub fn max_background_responses(mut self, max: usize) -> Self {
+        self.config.max_background_responses = max;
+        self
+    }
+
     // ==================== Priority Scheduler ====================
 
     pub fn priority_scheduler_enabled(mut self, enabled: bool) -> Self {

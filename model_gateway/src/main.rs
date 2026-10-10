@@ -1025,6 +1025,12 @@ struct CliArgs {
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 
+    /// Most Responses API requests with background: true in flight at once;
+    /// one beyond answers 429. 0 switches background mode off: such requests
+    /// then run in the foreground.
+    #[arg(long, default_value_t = 1024, help_heading = "Rate Limiting")]
+    max_background_responses: usize,
+
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
@@ -2260,6 +2266,7 @@ impl CliArgs {
             .trust_tenant_header(self.trust_tenant_header)
             .tenant_header_name(&self.tenant_header_name)
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .max_background_responses(self.max_background_responses)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())

@@ -51,10 +51,14 @@ use crate::{
 ///    - Build next request with tool results
 ///    - Repeat from step 1 (full pipeline re-execution)
 /// 4. If no tool calls, return final response
+///
+/// `response_id` is the id a background response was answered and stored
+/// under: its terminal object is persisted under that id.
 pub(crate) async fn serve_harmony_responses(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
     tenant_request_meta: TenantRequestMeta,
+    response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
     // Clone request for persistence
     let original_request = request.clone();
@@ -70,7 +74,7 @@ pub(crate) async fn serve_harmony_responses(
     )
     .await?;
 
-    let response = if has_mcp_tools {
+    let mut response = if has_mcp_tools {
         execute_with_mcp_loop(
             ctx,
             current_request,
@@ -82,6 +86,9 @@ pub(crate) async fn serve_harmony_responses(
         // No MCP tools - execute pipeline once (may have function tools or no tools)
         execute_without_mcp_loop(ctx, current_request, tenant_request_meta).await?
     };
+    if let Some(response_id) = response_id {
+        response.id = response_id;
+    }
 
     // Persist response to storage if store=true
     persist_response_if_needed(

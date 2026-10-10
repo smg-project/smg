@@ -3,51 +3,13 @@
 //! These handlers are used by both pipelines for retrieving and cancelling responses.
 
 use axum::response::Response;
-use smg_data_connector::ResponseId;
 
-use super::ResponsesContext;
-use crate::routers::error;
+use super::{background, ResponsesContext};
 
 /// Implementation for POST /v1/responses/{response_id}/cancel
 ///
-/// Background mode is no longer supported, so this endpoint always returns
-/// an error indicating that cancellation is not available.
+/// A background response this gateway runs is stopped and answered as
+/// `cancelled`; see [`background::cancel`] for the other cases.
 pub(crate) async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
-    let resp_id = ResponseId::from(response_id);
-
-    // Check if response exists
-    match ctx.response_storage.get_response(&resp_id).await {
-        Ok(Some(stored_response)) => {
-            let current_status = stored_response
-                .raw_response
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            match current_status {
-                "completed" => error::bad_request(
-                    "response_already_completed",
-                    "Cannot cancel completed response",
-                ),
-                "failed" => {
-                    error::bad_request("response_already_failed", "Cannot cancel failed response")
-                }
-                _ => {
-                    // Background mode is no longer supported, so there's nothing to cancel
-                    error::bad_request(
-                        "cancellation_not_supported",
-                        "Background mode is not supported. Synchronous and streaming responses cannot be cancelled.",
-                    )
-                }
-            }
-        }
-        Ok(None) => error::not_found(
-            "response_not_found",
-            format!("Response with id '{response_id}' not found"),
-        ),
-        Err(e) => error::internal_error(
-            "retrieve_response_failed",
-            format!("Failed to retrieve response: {e}"),
-        ),
-    }
+    background::cancel(ctx, response_id).await
 }

@@ -4550,6 +4550,27 @@ fn background_and_the_sampling_extensions_stay_accepted() {
 }
 
 #[test]
+fn background_without_storage_is_rejected() {
+    let request = plain_request(json!({
+        "model": "m", "input": "hi", "background": true, "store": false
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(code.contains("invalid_value"), "{code}");
+    assert!(code.contains("'store'"), "{code}");
+
+    for body in [
+        json!({"model": "m", "input": "hi", "background": true, "store": true}),
+        json!({"model": "m", "input": "hi", "background": true}),
+        json!({"model": "m", "input": "hi", "background": false, "store": false}),
+        json!({"model": "m", "input": "hi", "store": false}),
+    ] {
+        let request = plain_request(body.clone()).unwrap();
+        assert!(request.validate().is_ok(), "{body} must stay accepted");
+    }
+}
+
+#[test]
 fn unknown_input_message_role_is_rejected() {
     let request = plain_request(json!({
         "model": "m",

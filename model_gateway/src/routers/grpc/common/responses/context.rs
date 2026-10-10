@@ -10,6 +10,7 @@ use smg_data_connector::{
 };
 use smg_mcp::McpOrchestrator;
 
+use super::BackgroundResponses;
 use crate::routers::{
     common::openai_bridge::FormatRegistry,
     grpc::{context::SharedComponents, pipeline::RequestPipeline},
@@ -43,6 +44,10 @@ pub(crate) struct ResponsesContext {
 
     /// Storage hook request context extracted from HTTP headers by middleware.
     pub request_context: Option<StorageRequestContext>,
+
+    /// The background responses in flight (shared by every context of the
+    /// router, so one cap and one cancel registry serve all of them).
+    pub background: Arc<BackgroundResponses>,
 }
 
 impl ResponsesContext {
@@ -60,6 +65,7 @@ impl ResponsesContext {
         mcp_orchestrator: Arc<McpOrchestrator>,
         mcp_format_registry: FormatRegistry,
         request_context: Option<StorageRequestContext>,
+        background: Arc<BackgroundResponses>,
     ) -> Self {
         Self {
             pipeline,
@@ -70,6 +76,7 @@ impl ResponsesContext {
             mcp_orchestrator,
             mcp_format_registry,
             request_context,
+            background,
         }
     }
 }

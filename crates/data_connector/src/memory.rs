@@ -331,13 +331,16 @@ impl ResponseStorage for MemoryResponseStorage {
         // Single lock acquisition for atomic update
         let mut store = self.store.write();
 
-        // Update safety identifier index if specified
+        // Update safety identifier index if specified; a record replaced
+        // under its id keeps its one index entry.
         if let Some(ref safety_identifier) = response.safety_identifier {
-            store
+            let ids = store
                 .identifier_index
                 .entry(safety_identifier.clone())
-                .or_default()
-                .push(response_id.clone());
+                .or_default();
+            if !ids.contains(&response_id) {
+                ids.push(response_id.clone());
+            }
         }
 
         store.responses.insert(response_id.clone(), response);
@@ -626,6 +629,34 @@ mod tests {
             .unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().raw_response["output"], json!("Output"));
+    }
+
+    #[tokio::test]
+    async fn storing_under_an_existing_id_replaces_the_record_and_keeps_one_index_entry() {
+        let store = MemoryResponseStorage::new();
+        let mut queued = StoredResponse::new(None);
+        queued.id = ResponseId::from("resp_bg");
+        queued.safety_identifier = Some("user-1".to_string());
+        queued.raw_response = json!({"id": "resp_bg", "status": "queued", "output": []});
+        store.store_response(queued.clone()).await.unwrap();
+
+        let mut done = queued;
+        done.raw_response =
+            json!({"id": "resp_bg", "status": "completed", "output": [{"id": "msg_1"}]});
+        store.store_response(done).await.unwrap();
+
+        let stored = store
+            .get_response(&ResponseId::from("resp_bg"))
+            .await
+            .unwrap()
+            .expect("the record stays under its id");
+        assert_eq!(stored.raw_response["status"], "completed");
+        let listed = store
+            .list_identifier_responses("user-1", None)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "one record, one index entry");
+        assert_eq!(store.stats().response_count, 1);
     }
 
     #[tokio::test]

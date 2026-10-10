@@ -29,7 +29,7 @@ use crate::{
                 await_stream_startup, ensure_mcp_connection, persist_response_if_needed,
                 stream_startup_channel,
                 streaming::{ResponseStreamEventEmitter, StreamStartupSender},
-                ResponsesContext,
+                BackgroundStream, ResponsesContext,
             },
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
@@ -40,14 +40,15 @@ use crate::{
 ///
 /// This is the streaming equivalent of `serve_harmony_responses()`.
 /// Emits SSE events for lifecycle, MCP list_tools, and per-iteration streaming.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "streaming task is fire-and-forget; client disconnect terminates it"
-)]
+///
+/// `background` is set when the client streams a background response: the
+/// stream runs under the id its `queued` record was stored under, carries
+/// `response.queued`, and outlives a client that leaves.
 pub(crate) async fn serve_harmony_responses_stream(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
     tenant_request_meta: TenantRequestMeta,
+    background: Option<BackgroundStream>,
 ) -> Response {
     // Load previous conversation history if previous_response_id is set
     let current_request = match load_previous_messages(ctx, request.clone()).await {
@@ -67,12 +68,20 @@ pub(crate) async fn serve_harmony_responses_stream(
         Err(response) => return response,
     };
 
-    // Create SSE channel
+    // Create SSE channel; a background stream's events go through a relay, so
+    // the work and its terminal record outlive a client that leaves.
     let (tx, rx) = sse_channel();
+    let tx = match &background {
+        Some(_) => BackgroundStream::detach(tx),
+        None => tx,
+    };
     let (startup_tx, startup_rx) = stream_startup_channel();
 
     // Create response event emitter
-    let response_id = format!("resp_{}", Uuid::now_v7());
+    let response_id = background
+        .as_ref()
+        .map(|run| run.id().to_string())
+        .unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
     let model = current_request.model.clone();
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -86,14 +95,20 @@ pub(crate) async fn serve_harmony_responses_stream(
     // Clone context for spawned task
     let ctx_clone = ctx.clone();
 
-    // Spawn async task to handle streaming
-    tokio::spawn(async move {
+    let stream_task = async move {
         let ctx = &ctx_clone;
 
-        // Emit initial response.created and response.in_progress events
+        // Emit initial response.created and response.in_progress events (a
+        // background stream reports response.queued between the two)
         let event = emitter.emit_created();
         if emitter.send_event(&event, &tx).await.is_err() {
             return;
+        }
+        if request.background.unwrap_or(false) {
+            let event = emitter.emit_queued();
+            if emitter.send_event(&event, &tx).await.is_err() {
+                return;
+            }
         }
         let event = emitter.emit_in_progress();
         if emitter.send_event(&event, &tx).await.is_err() {
@@ -124,7 +139,22 @@ pub(crate) async fn serve_harmony_responses_stream(
             )
             .await;
         }
-    });
+    };
+    // Spawn async task to handle streaming
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "streaming task is fire-and-forget; client disconnect terminates it unless it runs a background response, whose slot bounds it"
+    )]
+    match background {
+        Some(run) => {
+            let storage = ctx.response_storage.clone();
+            let request_context = ctx.request_context.clone();
+            tokio::spawn(run.run(storage, request_context, stream_task));
+        }
+        None => {
+            tokio::spawn(stream_task);
+        }
+    }
 
     await_stream_startup(startup_rx, rx).await
 }

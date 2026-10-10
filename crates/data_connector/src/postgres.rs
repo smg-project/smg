@@ -983,6 +983,34 @@ impl PostgresResponseStorage {
     }
 }
 
+/// The statement that stores a response: an insert that becomes an update of
+/// every other column when a row with the same id exists (the first column
+/// is the id, the table's primary key), so a record written as `queued`
+/// is replaced by its terminal object under the one id.
+fn store_response_sql(table: &str, col_names: &[&str]) -> String {
+    let placeholders: String = (1..=col_names.len())
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let id_col = col_names.first().copied().unwrap_or("id");
+    let updates: Vec<String> = col_names
+        .iter()
+        .skip(1)
+        .map(|col| format!("{col} = EXCLUDED.{col}"))
+        .collect();
+    if updates.is_empty() {
+        return format!(
+            "INSERT INTO {table} ({}) VALUES ({placeholders}) ON CONFLICT ({id_col}) DO NOTHING",
+            col_names.join(", ")
+        );
+    }
+    format!(
+        "INSERT INTO {table} ({}) VALUES ({placeholders}) ON CONFLICT ({id_col}) DO UPDATE SET {}",
+        col_names.join(", "),
+        updates.join(", ")
+    )
+}
+
 #[async_trait]
 impl ResponseStorage for PostgresResponseStorage {
     async fn store_response(
@@ -1045,14 +1073,7 @@ impl ResponseStorage for PostgresResponseStorage {
             params.push(val);
         }
 
-        let placeholders: String = (1..=params.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {table} ({}) VALUES ({placeholders})",
-            col_names.join(", ")
-        );
+        let sql = store_response_sql(&table, &col_names);
 
         let client = self
             .store
@@ -1225,5 +1246,19 @@ mod tests {
     #[test]
     fn parse_metadata_non_object_is_error() {
         assert!(PostgresConversationStorage::parse_metadata(Some(json!("not an object"))).is_err());
+    }
+    #[test]
+    fn store_response_sql_replaces_an_existing_row_by_id() {
+        let sql = store_response_sql("responses", &["id", "input", "raw_response"]);
+        assert_eq!(
+            sql,
+            "INSERT INTO responses (id, input, raw_response) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET input = EXCLUDED.input, raw_response = EXCLUDED.raw_response"
+        );
+        let sql = store_response_sql("r", &["id"]);
+        assert_eq!(
+            sql,
+            "INSERT INTO r (id) VALUES ($1) ON CONFLICT (id) DO NOTHING"
+        );
     }
 }
