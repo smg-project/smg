@@ -849,6 +849,64 @@ mod tests {
     }
 
     #[test]
+    fn tool_schemas_render_in_the_clients_order() {
+        use llm_tokenizer::chat_template::ChatTemplateProcessor;
+
+        // More keys than a hash map would keep in order by chance.
+        let names = [
+            "zeta", "alpha", "mu", "beta", "omega", "delta", "kappa", "gamma",
+        ];
+        let properties: serde_json::Map<String, Value> = names
+            .iter()
+            .map(|name| (name.to_string(), json!({"type": "string"})))
+            .collect();
+        let body = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "lookup", "input_schema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["mu", "alpha"],
+                "additionalProperties": false
+            }}]
+        });
+        let template = "{% for tool in tools %}{{ tool | tojson }}{% endfor %}";
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        // The tools of a fresh request, rendered as `process_messages` does.
+        let render = || {
+            let request: CreateMessageRequest = serde_json::from_value(body.clone()).unwrap();
+            let tools: Vec<Value> = extract_chat_tools(request.tools.as_deref().unwrap())
+                .iter()
+                .map(|tool| serde_json::to_value(tool).unwrap())
+                .collect();
+            let params = ChatTemplateParams {
+                tools: Some(&tools),
+                ..Default::default()
+            };
+            processor.apply_chat_template(&[], params).unwrap()
+        };
+
+        // The same request renders the same prompt, so its prefix stays cached.
+        let prompt = render();
+        assert_eq!(prompt, render());
+        let tool: Value = serde_json::from_str(&prompt).unwrap();
+        let parameters = tool["function"]["parameters"].as_object().unwrap();
+        let keys: Vec<&str> = parameters["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, names);
+        let keys: Vec<&str> = parameters.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["type", "properties", "required", "additionalProperties"]
+        );
+    }
+
+    #[test]
     fn test_get_history_tool_calls_count_messages() {
         // No tool calls
         let request = CreateMessageRequest {
