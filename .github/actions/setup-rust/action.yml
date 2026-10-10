@@ -44,8 +44,23 @@ runs:
           bindings/golang/target
         shared-key: ${{ inputs.cache-key }}
         cache-all-crates: true
-        cache-on-failure: true
-        save-if: true
+        # Only a job that completed, on main, saves (smg-project/smg-lab#157):
+        # - cache-on-failure would widen the post step to failed AND cancelled
+        #   jobs, and a push to main cancels the run before it; the partial
+        #   target directory of a cancelled job was then saved under the exact
+        #   key, and every pull request restored that fragment.
+        # - an entry a pull request saves is visible only to that pull request,
+        #   and at a few hundred runs a day their 1-2.4 GB entries pushed every
+        #   entry out of the repository's 10 GB cache within about twenty
+        #   minutes, main's included.
+        # A pull request's run restores the newest entry main saved under the
+        # same key (the restore keys match on the prefix, so a different
+        # lockfile still restores). For the unit-tests job that entry comes
+        # from the Rust Cache Warmer workflow (rust-cache-warmer.yml), which
+        # builds the test profile under the key `unit-tests` on a schedule,
+        # since main's own unit-tests job seldom completes between merges.
+        cache-on-failure: false
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Start sccache
       shell: bash

@@ -302,8 +302,15 @@ jobs:
         with:
           python-version: "3.13"
 
+      # Its own cache key: this job's target directory is the workspace's test
+      # profile, which the Rust Cache Warmer workflow builds on main under the
+      # same key (and the same action inputs and environment, which the key
+      # hashes), so a pull request restores a complete, current entry and
+      # compiles only what it changed. The other jobs keep the default key.
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
+        with:
+          cache-key: unit-tests
 
       - name: Verify default multimodal build does not require OpenCV
         run: |
