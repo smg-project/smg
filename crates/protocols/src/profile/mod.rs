@@ -45,9 +45,14 @@ pub enum ModelProfile {
 }
 
 impl ModelProfile {
-    /// Infer the same contract as the legacy name-based selection.
+    /// Infer from the model name, falling back to its configured alias contract.
     pub fn for_model(model: &str) -> Self {
-        Self::from_provider(ProviderProfile::for_model(model), model)
+        let profile = Self::for_model_name(model);
+        if profile != Self::OpenAi {
+            return profile;
+        }
+        let aliased = alias_profiles().read().unwrap_or_else(|e| e.into_inner());
+        aliased.get(model).copied().unwrap_or(Self::OpenAi)
     }
 
     /// Infer from the name itself, before applying configured alias fallbacks.
@@ -89,8 +94,8 @@ impl ModelProfile {
 /// is resolved into the request's model id before the response side reads it,
 /// so the served name has to select the profile its vendor-named alias does,
 /// or a request that entered under the vendor name loses the profile half-way.
-fn alias_profiles() -> &'static RwLock<HashMap<String, ProviderProfile>> {
-    static ALIAS_PROFILES: OnceLock<RwLock<HashMap<String, ProviderProfile>>> = OnceLock::new();
+fn alias_profiles() -> &'static RwLock<HashMap<String, ModelProfile>> {
+    static ALIAS_PROFILES: OnceLock<RwLock<HashMap<String, ModelProfile>>> = OnceLock::new();
     ALIAS_PROFILES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -154,28 +159,20 @@ impl ProviderProfile {
     /// and `deepseek-flash` alias select its profile; older versions and
     /// unrecognized suffixes keep the baseline.
     pub fn for_model(model: &str) -> Self {
-        let profile = Self::from_model_segments(model);
-        if profile != ProviderProfile::OpenAi {
-            return profile;
-        }
-        let aliased = alias_profiles().read().unwrap_or_else(|e| e.into_inner());
-        aliased
-            .get(model)
-            .copied()
-            .unwrap_or(ProviderProfile::OpenAi)
+        ModelProfile::for_model(model).provider()
     }
 
     /// Record the configured model aliases (`alias -> served model id`). A
-    /// served model id that has a vendor-named alias selects that vendor's
-    /// profile from now on, whichever of its names a request carries. Aliases
-    /// that select no vendor profile change nothing; when two aliases of one
-    /// served model name different vendors, the first registered wins and the
-    /// conflict is logged.
+    /// served model id that has a vendor-named alias selects that alias's
+    /// version-specific contract, whichever of its names a request carries.
+    /// Aliases that select no vendor profile change nothing; when two aliases
+    /// of one served model name different contracts, the first registered wins
+    /// and the conflict is logged. Recognized model names still take precedence.
     pub fn register_model_aliases<'a>(aliases: impl IntoIterator<Item = (&'a str, &'a str)>) {
         let mut map = alias_profiles().write().unwrap_or_else(|e| e.into_inner());
         for (alias, canonical) in aliases {
-            let profile = Self::from_model_segments(alias);
-            if profile == ProviderProfile::OpenAi {
+            let profile = ModelProfile::for_model_name(alias);
+            if profile == ModelProfile::OpenAi {
                 continue;
             }
             match map.get(canonical) {
@@ -184,7 +181,7 @@ impl ProviderProfile {
                     alias,
                     kept = ?existing,
                     ignored = ?profile,
-                    "model alias names a different vendor than an earlier alias of the same served model"
+                    "model alias names a different contract than an earlier alias of the same served model"
                 ),
                 Some(_) => {}
                 None => {

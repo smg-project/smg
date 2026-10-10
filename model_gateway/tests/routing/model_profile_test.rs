@@ -544,9 +544,9 @@ async fn vendor_contract_round_robin_uses_every_worker() {
     }
 }
 
-/// Startup's vendor-family alias must not hide a precise worker model path.
+/// Startup's configured alias must not override a precise worker model path.
 #[tokio::test]
-async fn worker_paths_take_precedence_over_configured_alias_family() {
+async fn worker_paths_take_precedence_over_configured_alias_profile() {
     use openai_protocol::profile::ProviderProfile;
 
     use crate::common::mock_worker::{set_request_recorder, RequestRecorder};
@@ -568,9 +568,17 @@ async fn worker_paths_take_precedence_over_configured_alias_family() {
             json!({}),
             StatusCode::OK,
         ),
+        (
+            19893,
+            "alias-path-v4-worker",
+            "deepseek-v4.1-flash",
+            "/models/deepseek-v4-pro",
+            json!({"reasoning_effort": "80"}),
+            StatusCode::BAD_REQUEST,
+        ),
     ] {
         // Test contexts bypass AppContext::from_config; register exactly the
-        // same family fallback the production startup installs.
+        // same profile fallback the production startup installs.
         ProviderProfile::register_model_aliases([(alias, model)]);
         let recorder = RequestRecorder::new();
         set_request_recorder(port, Arc::clone(&recorder));
@@ -596,4 +604,36 @@ async fn worker_paths_take_precedence_over_configured_alias_family() {
         }
         ctx.shutdown().await;
     }
+}
+
+/// Configured aliases retain the DeepSeek version even without a model path.
+#[tokio::test]
+async fn configured_deepseek_alias_preserves_v41_reasoning_at_ingress() {
+    use openai_protocol::profile::ProviderProfile;
+
+    use crate::common::mock_worker::{set_request_recorder, RequestRecorder};
+
+    let port = 19892;
+    let model = "alias-v41-routing-worker";
+    let alias = "deepseek-v4.1-flash";
+    ProviderProfile::register_model_aliases([(alias, model)]);
+    let recorder = RequestRecorder::new();
+    set_request_recorder(port, Arc::clone(&recorder));
+    let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(port)]).await;
+    register_model(&ctx, port, model, alias);
+    let app = ctx.create_app();
+    for name in [alias, model] {
+        for effort in ["xhigh", "80"] {
+            let response = app
+                .clone()
+                .oneshot(request(name, json!({"reasoning_effort": effort})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{name}: {effort}");
+            let bodies = recorder.bodies();
+            assert_eq!(bodies.last().unwrap()["reasoning_effort"], effort);
+            assert_eq!(bodies.last().unwrap()["model"], model);
+        }
+    }
+    ctx.shutdown().await;
 }
