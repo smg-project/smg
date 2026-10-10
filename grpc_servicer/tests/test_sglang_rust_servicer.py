@@ -282,6 +282,29 @@ def test_server_facts_carry_the_engines_media_limits_flat(monkeypatch):
     assert args["limit_mm_data_per_request"] == {"image": 1, "video": 1}
 
 
+def test_server_facts_carry_where_the_engine_starts_a_grammar(monkeypatch):
+    # The engine's reasoning parser and where it starts a request's grammar on
+    # a thinking prompt ride with the server args, as the Python servicer adds
+    # them: after the thought behind --reasoning-parser, from the first token
+    # without one; neither key when the server args predate the parser.
+    monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
+    gated = json.loads(
+        rust.server_facts(_server_args(reasoning_parser="qwen3"))["server_args_json"]
+    )
+    assert gated["engine_reasoning_parser"] == "qwen3"
+    assert gated["structured_outputs_start"] == "after_reasoning"
+    # The engine's own argument stays under its own name; the Router's label
+    # readers never take it as the per-model parser override.
+    assert gated["reasoning_parser"] == "qwen3"
+
+    plain = json.loads(rust.server_facts(_server_args(reasoning_parser=None))["server_args_json"])
+    assert plain["structured_outputs_start"] == "first_token"
+    assert "engine_reasoning_parser" not in plain
+
+    older = json.loads(rust.server_facts(_server_args())["server_args_json"])
+    assert "structured_outputs_start" not in older and "engine_reasoning_parser" not in older
+
+
 def test_server_facts_carry_the_kv_events_publisher(monkeypatch):
     monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
     off = rust.server_facts(_server_args())

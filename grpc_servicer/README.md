@@ -413,6 +413,18 @@ the engine's limits: the precomputed inputs it sends bypass the tokenizer
 manager's own check. Without the flag the engine has no such limit and the
 label is absent.
 
+They also advertise, as `server_args` keys, the engine's reasoning parser
+(`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
+a router reads off a worker's labels) and where its grammar starts on a prompt
+that ends inside the model's thinking block (`structured_outputs_start`):
+`after_reasoning` with `--reasoning-parser`, since the scheduler then wraps its
+grammar backend in a reasoner that holds a request's grammar back until the
+parser's thought-end sequence has been generated (for a request that asks for
+reasoning, which a router does on a thinking prompt), `first_token` without
+one. A router shapes a forced tool call's grammar by it as the engine's own
+server would: the bare calls behind the parser's gate, so the call is forced
+right there; the thought and then the calls from the first token.
+
 #### KV-event recovery
 
 To retain cache knowledge across a recoverable event gap, configure SGLang's

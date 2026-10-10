@@ -59,6 +59,7 @@ from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
+from ..structured_outputs import grammar_start_labels, sglang_structured_outputs_start
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -507,6 +508,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         item_limits = sglang_item_limits(self.server_args)
         if item_limits:
             serializable_args[MM_ITEM_LIMITS_KEY] = item_limits
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt (after the thought with a parser, from the first
+        # token without), for the gateway to shape a forced tool call's
+        # grammar by.
+        serializable_args.update(
+            grammar_start_labels(
+                self.server_args, sglang_structured_outputs_start(self.server_args)
+            )
+        )
         server_args_struct.update(serializable_args)
 
         # Convert scheduler_info to Struct

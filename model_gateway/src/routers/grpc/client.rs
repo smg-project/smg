@@ -906,6 +906,13 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // flattened by the servicer to `image=1,video=1`: the gateway's own media
     // pipeline holds requests to them, as the engine's front end would.
     "mm_item_limits",
+    // The engine's reasoning parser, under a name of its own (`reasoning_parser`
+    // is the per-model parser override read off a worker's labels), and where
+    // the engine starts a request's grammar on a thinking prompt, which shapes
+    // a forced tool call's grammar (`utils::tool_constraints_for_worker`); the
+    // servicer writes both.
+    "engine_reasoning_parser",
+    "structured_outputs_start",
 ];
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
@@ -1346,6 +1353,55 @@ mod tests {
             labels.get("mm_item_limits").map(String::as_str),
             Some("image=1,video=1")
         );
+    }
+
+    /// The servicer's grammar-start facts ride with the server args and become
+    /// the `engine_reasoning_parser` and `structured_outputs_start` labels. The
+    /// engine's own `reasoning_parser` argument, which the server args carry
+    /// as well, is not the router's parser override and stays out.
+    #[test]
+    fn server_info_to_labels_sglang_carries_where_the_engine_starts_a_grammar() {
+        let info = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+            server_args: Some(prost_types::Struct {
+                fields: BTreeMap::from([
+                    ("reasoning_parser".to_string(), string_value("qwen3")),
+                    ("engine_reasoning_parser".to_string(), string_value("qwen3")),
+                    (
+                        "structured_outputs_start".to_string(),
+                        string_value("after_reasoning"),
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        }));
+
+        let labels = info.to_labels();
+
+        assert_eq!(
+            labels.get("engine_reasoning_parser").map(String::as_str),
+            Some("qwen3")
+        );
+        assert_eq!(
+            labels.get("structured_outputs_start").map(String::as_str),
+            Some("after_reasoning")
+        );
+        assert!(
+            !labels.contains_key("reasoning_parser"),
+            "the engine's parser argument is not the router's parser override"
+        );
+
+        // A servicer that writes neither key (one from before the facts): no
+        // label, so the router keeps the grammar shape that fits either engine.
+        let silent = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+            server_args: Some(prost_types::Struct {
+                fields: BTreeMap::from([("reasoning_parser".to_string(), string_value("qwen3"))]),
+            }),
+            ..Default::default()
+        }))
+        .to_labels();
+        assert!(!silent.contains_key("engine_reasoning_parser"));
+        assert!(!silent.contains_key("structured_outputs_start"));
+        assert!(!silent.contains_key("reasoning_parser"));
     }
 
     /// `GetModelInfoResponse` is flat for every backend, so it serializes via

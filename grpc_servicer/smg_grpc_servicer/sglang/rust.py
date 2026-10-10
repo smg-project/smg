@@ -44,6 +44,10 @@ from smg_grpc_servicer.rust_lifecycle import (
     resolve_tokenizer_dir,
     supervise,
 )
+from smg_grpc_servicer.structured_outputs import (
+    grammar_start_labels,
+    sglang_structured_outputs_start,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +220,11 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     item_limits = sglang_item_limits(server_args)
     if item_limits:
         args_dict[MM_ITEM_LIMITS_KEY] = item_limits
+    # The engine's reasoning parser and where it starts a grammar on a thinking
+    # prompt, as the Python servicer adds them.
+    args_dict.update(
+        grammar_start_labels(server_args, sglang_structured_outputs_start(server_args))
+    )
     try:
         from sglang.version import __version__ as sglang_version
     except ImportError:  # the launcher's unit tests run without SGLang

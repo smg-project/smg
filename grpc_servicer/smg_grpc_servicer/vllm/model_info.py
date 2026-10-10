@@ -20,6 +20,10 @@ from typing import Any
 
 from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
+from smg_grpc_servicer.structured_outputs import (
+    STRUCTURED_OUTPUTS_AFTER_REASONING,
+    STRUCTURED_OUTPUTS_FIRST_TOKEN,
+)
 from smg_grpc_servicer.vllm.kv_transfer import pairing_fields, resolve_pd_connector
 from smg_grpc_servicer.vllm.mm_salt import engine_accepts_mm_inputs
 
@@ -183,10 +187,10 @@ def engine_reasoning_parser(vllm_config: Any) -> str:
     return str(getattr(structured, "reasoning_parser", None) or "")
 
 
-# The `structured_outputs_start` label's values: where the engine starts a
-# request's grammar on a prompt that ends inside the model's thinking block.
-STRUCTURED_OUTPUTS_AFTER_REASONING = "after_reasoning"
-STRUCTURED_OUTPUTS_FIRST_TOKEN = "first_token"
+# The `structured_outputs_start` label's values (where the engine starts a
+# request's grammar on a prompt that ends inside the model's thinking block)
+# are `smg_grpc_servicer.structured_outputs`', shared with the servicers of
+# the engines that carry them as server args.
 # A config attribute that is not there at all, as opposed to one set to "".
 _UNKNOWN = object()
 
