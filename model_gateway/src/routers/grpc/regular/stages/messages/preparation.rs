@@ -107,6 +107,13 @@ impl MessagePreparationStage {
 
         // Resolve multimodal context once (see chat/preparation.rs for details).
         let media_plan = multimodal::media_plan_messages(&request.messages);
+        // Same refusal as the chat path: no media to a pool whose every
+        // worker is language model only (see chat/preparation.rs).
+        multimodal::ensure_model_accepts_media(
+            &ctx.components.worker_registry,
+            model_id,
+            &media_plan,
+        )?;
         let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
             (None, None)
         } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
