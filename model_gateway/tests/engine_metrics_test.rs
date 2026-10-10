@@ -45,6 +45,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
     };
     Metrics::record_engine_load("grpc://prefill-0:30000", "test-model", &response);
 
+    smg::tls::install_crypto_provider();
     let body = reqwest::get(format!("http://{addr}/metrics"))
         .await
         .expect("metrics endpoint reachable")

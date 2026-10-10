@@ -27,6 +27,7 @@ pub(super) fn create_test_app_context() -> Arc<AppContext> {
 
     // Note: Using uninitialized queue for tests to avoid spawning background workers
     // Jobs submitted during tests will queue but not be processed
+    crate::tls::install_crypto_provider();
     Arc::new(AppContext {
         gateway_auth: AuthConfig::new(None),
         client: reqwest::Client::new(),

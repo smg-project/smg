@@ -466,6 +466,7 @@ mod tests {
 
         use rmcp::{transport::StreamableHttpClientTransport, ServiceExt};
 
+        smg::tls::install_crypto_provider();
         let transport = StreamableHttpClientTransport::from_uri(server.url().as_str());
         let client = ().serve(transport).await;
 
@@ -498,6 +499,7 @@ mod tests {
         assert!(server.port() > 0);
         assert!(server.url().contains(&server.port().to_string()));
 
+        smg::tls::install_crypto_provider();
         let transport = StreamableHttpClientTransport::from_uri(server.url().as_str());
         let client = ().serve(transport).await.expect("connect failing mock server");
 

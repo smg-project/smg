@@ -56,6 +56,7 @@ async fn every_smg_family_has_help_text() {
     Metrics::record_worker_cb_transition(worker, "closed", "open");
     Metrics::record_kv_event_lag(worker, 0.004);
 
+    smg::tls::install_crypto_provider();
     let body = reqwest::get(format!("http://{addr}/metrics"))
         .await
         .expect("metrics endpoint reachable")

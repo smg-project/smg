@@ -26,6 +26,7 @@ use smg::{
 const URL: &str = "grpc://[fd00::1]:50051";
 
 async fn scrape(addr: SocketAddr) -> String {
+    smg::tls::install_crypto_provider();
     reqwest::get(format!("http://{addr}/metrics"))
         .await
         .expect("metrics endpoint reachable")

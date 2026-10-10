@@ -81,6 +81,7 @@ impl ParserTestContext {
             _ => {} // PrefillDecode mode has its own setup
         }
 
+        smg::tls::install_crypto_provider();
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
             .build()

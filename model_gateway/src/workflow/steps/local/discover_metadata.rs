@@ -656,6 +656,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_sglang_http_metadata() {
+        crate::tls::install_crypto_provider();
         let labels = fetch_sglang_http_metadata(&Client::new(), "http://0.0.0.0:30000", None).await;
         dump_labels("SGLang HTTP combined", &labels);
         assert!(labels.contains_key("model_path"));
@@ -665,6 +666,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_vllm_http_metadata() {
+        crate::tls::install_crypto_provider();
         let labels = fetch_vllm_http_metadata(&Client::new(), "http://0.0.0.0:20000", None).await;
         dump_labels("vLLM HTTP", &labels);
         assert!(labels.contains_key("model_path"));
@@ -758,6 +760,7 @@ mod tests {
                 .unwrap();
         });
 
+        crate::tls::install_crypto_provider();
         let labels =
             fetch_sglang_http_metadata(&Client::new(), &format!("http://{addr}"), None).await;
         server.abort();

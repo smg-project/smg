@@ -21,6 +21,7 @@ use smg::{
 };
 
 async fn scrape(addr: SocketAddr) -> String {
+    smg::tls::install_crypto_provider();
     reqwest::get(format!("http://{addr}/metrics"))
         .await
         .expect("metrics endpoint reachable")

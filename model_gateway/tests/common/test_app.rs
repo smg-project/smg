@@ -229,6 +229,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
     let router_config = RouterConfig::default();
     // A test's upstreams are its own loopback servers; the environment's
     // proxy would otherwise sit in the path of every request.
+    smg::tls::install_crypto_provider();
     let client = Client::builder().no_proxy().build().expect("test client");
 
     // Initialize empty OnceLocks

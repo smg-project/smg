@@ -106,6 +106,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(addr.ip().is_ipv6(), "host {host} bound {addr}");
+            crate::tls::install_crypto_provider();
             let resp = reqwest::get(format!("http://{addr}/metrics"))
                 .await
                 .unwrap();
@@ -149,6 +150,7 @@ mod tests {
             .unwrap();
         assert_ne!(addr.port(), 0);
 
+        crate::tls::install_crypto_provider();
         let resp = reqwest::get(format!("http://{addr}/metrics"))
             .await
             .unwrap();

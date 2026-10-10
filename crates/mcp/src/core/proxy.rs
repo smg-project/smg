@@ -90,6 +90,8 @@ pub(super) fn apply_proxy_to_builder(
 mod tests {
     use std::collections::HashMap;
 
+    use rustls::crypto::ring;
+
     use super::*;
     use crate::core::config::McpTransport;
 
@@ -202,6 +204,7 @@ mod tests {
             password: None,
         };
 
+        let _ = ring::default_provider().install_default();
         let builder = reqwest::Client::builder();
         let result = apply_proxy_to_builder(builder, &proxy);
         assert!(result.is_ok(), "Should apply proxy to builder");
@@ -218,6 +221,7 @@ mod tests {
             password: Some("pass".to_string()),
         };
 
+        let _ = ring::default_provider().install_default();
         let builder = reqwest::Client::builder();
         let result = apply_proxy_to_builder(builder, &proxy);
         assert!(

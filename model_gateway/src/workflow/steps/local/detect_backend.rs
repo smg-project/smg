@@ -412,6 +412,7 @@ mod tests {
         })))
         .await;
 
+        crate::tls::install_crypto_provider();
         let runtime = detect_http_backend(&url, 5, &Client::new(), None)
             .await
             .unwrap();
@@ -428,6 +429,7 @@ mod tests {
         })))
         .await;
 
+        crate::tls::install_crypto_provider();
         let runtime = detect_http_backend(&url, 5, &Client::new(), None)
             .await
             .unwrap();
@@ -449,6 +451,7 @@ mod tests {
         );
         let (url, server) = serve_router(router).await;
 
+        crate::tls::install_crypto_provider();
         let runtime = detect_http_backend(&url, 5, &Client::new(), None)
             .await
             .unwrap();
@@ -465,6 +468,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
+        crate::tls::install_crypto_provider();
         let err = detect_http_backend(&format!("http://{addr}"), 1, &Client::new(), None)
             .await
             .unwrap_err();
@@ -478,6 +482,7 @@ mod tests {
         // retries instead of registering a backend with nothing to serve.
         let (url, server) = serve_router(models_route(json!({"object": "list", "data": []}))).await;
 
+        crate::tls::install_crypto_provider();
         let result = detect_http_backend(&url, 5, &Client::new(), None).await;
         server.abort();
 
@@ -492,6 +497,7 @@ mod tests {
         })))
         .await;
 
+        crate::tls::install_crypto_provider();
         let runtime = detect_http_backend(&url, 5, &Client::new(), None)
             .await
             .unwrap();
