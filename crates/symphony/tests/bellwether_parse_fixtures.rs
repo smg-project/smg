@@ -57,9 +57,10 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
+    time::{Duration, Instant},
 };
 
 use common::{bytes_of, chunkings, prompt, replay, replay_after};
@@ -1064,25 +1065,40 @@ fn replay_model(
 /// Run `each` on every item, on as many threads as the run has CPUs, each thread taking the
 /// next item from a shared index, and hand what it gives to `then` in the items' order, each
 /// as soon as it and the ones before it are done. A panic in `each` ends the run once the items
-/// in flight are done, as it would on one thread.
-fn in_order<I: Sync, T: Send>(items: &[I], each: impl Fn(&I) -> T + Sync, mut then: impl FnMut(T)) {
+/// in flight are done, as it would on one thread: the thread that panics raises a flag as it
+/// unwinds, and no thread takes an item once it is up.
+fn in_order<I: Sync, T: Send>(items: &[I], each: impl Fn(&I) -> T + Sync, then: impl FnMut(T)) {
     let threads = std::thread::available_parallelism()
         .map_or(1, NonZeroUsize::get)
         .min(items.len())
         .max(1);
+    in_order_on(threads, items, each, then);
+}
+
+/// [`in_order`] on `threads` threads.
+fn in_order_on<I: Sync, T: Send>(
+    threads: usize,
+    items: &[I],
+    each: impl Fn(&I) -> T + Sync,
+    mut then: impl FnMut(T),
+) {
     let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let tx = tx.clone();
-            let (next, each) = (&next, &each);
-            scope.spawn(move || loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some(item) = items.get(index) else {
-                    break;
-                };
-                if tx.send((index, each(item))).is_err() {
-                    break;
+            let (next, stop, each) = (&next, &stop, &each);
+            scope.spawn(move || {
+                let _raised_on_panic = StopOnPanic(stop);
+                while !stop.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    if tx.send((index, each(item))).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -1097,6 +1113,18 @@ fn in_order<I: Sync, T: Send>(items: &[I], each: impl Fn(&I) -> T + Sync, mut th
             }
         }
     });
+}
+
+/// Raises the flag it holds when its thread unwinds from a panic, so that the other threads of
+/// [`in_order_on`] take no further item.
+struct StopOnPanic<'a>(&'a AtomicBool);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// What [`parity`] gave for a set: the report, one line per case and the set's summary, as a
@@ -1886,6 +1914,71 @@ fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
         .known_differences("qwen3.5-2b", when_asked)
         .iter()
         .all(|known| known.id != REASONING_PROBE.id));
+}
+
+#[test]
+fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
+    // Item 0 waits until item 1 is done, so on two threads item 1 finishes first and items 2
+    // and 3 may follow it, all before item 0; `then` still sees them in the items' order.
+    let item_1_done = AtomicBool::new(false);
+    let items = [0, 1, 2, 3];
+    let mut handed = Vec::new();
+    in_order_on(
+        2,
+        &items,
+        |&item| {
+            if item == 0 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !item_1_done.load(Ordering::Relaxed) {
+                    assert!(Instant::now() < deadline, "item 1 never finished");
+                    std::thread::yield_now();
+                }
+            }
+            if item == 1 {
+                item_1_done.store(true, Ordering::Relaxed);
+            }
+            item * 10
+        },
+        |outcome| handed.push(outcome),
+    );
+    assert_eq!(handed, [0, 10, 20, 30]);
+}
+
+#[test]
+fn a_panic_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_more() {
+    // Item 0 panics at once; every other item waits for that panic and then a while longer, so
+    // the flag is up before any other thread looks for its next item: on two threads, the
+    // other thread finishes the one item it had and takes none of the six left.
+    let item_0_panicked = AtomicBool::new(false);
+    let started = AtomicUsize::new(0);
+    let items: Vec<usize> = (0..8).collect();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        in_order_on(
+            2,
+            &items,
+            |&item| {
+                if item == 0 {
+                    item_0_panicked.store(true, Ordering::Relaxed);
+                    panic!("item 0");
+                }
+                started.fetch_add(1, Ordering::Relaxed);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !item_0_panicked.load(Ordering::Relaxed) {
+                    assert!(Instant::now() < deadline, "item 0 never panicked");
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                item
+            },
+            |_| {},
+        );
+    }));
+    assert!(outcome.is_err(), "the panic reaches the caller");
+    let started = started.load(Ordering::Relaxed);
+    assert!(
+        started <= 1,
+        "{started} items started beside the one that panicked; the other thread had one in flight"
+    );
 }
 
 #[test]
