@@ -43,6 +43,7 @@ use smg_grpc_client::{
 use smg_mm_rdma::RdmaExporter;
 
 use crate::{
+    observability::token_dump::{CallRecorder, EndStatus, Part, RequestEvent, ResponseEvent},
     routers::grpc::{
         multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
         zmq_client::ZmqGenerateStream,
@@ -1662,31 +1663,59 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Prompt tokens the engine has to prefill for this request: the
-    /// tokenized input's length (zero for a text input, which the engine
+    /// The tokenized prompt (empty for a text input, which the engine
     /// tokenizes itself).
-    pub fn prompt_len(&self) -> usize {
+    pub fn input_ids(&self) -> &[u32] {
         match self {
             Self::Sglang(req) => req
                 .tokenized
                 .as_ref()
-                .map_or(0, |input| input.input_ids.len()),
+                .map_or(&[][..], |input| input.input_ids.as_slice()),
             Self::Vllm(req) => match &req.input {
-                Some(vllm::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
-                _ => 0,
+                Some(vllm::generate_request::Input::Tokenized(input)) => &input.input_ids,
+                _ => &[],
             },
             Self::Trtllm(req) => req
                 .tokenized
                 .as_ref()
-                .map_or(0, |input| input.input_token_ids.len()),
+                .map_or(&[][..], |input| input.input_token_ids.as_slice()),
             Self::Mlx(req) => match &req.input {
-                Some(mlx::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
-                _ => 0,
+                Some(mlx::generate_request::Input::Tokenized(input)) => &input.input_ids,
+                _ => &[],
             },
             Self::TokenSpeed(req) => req
                 .tokenized
                 .as_ref()
-                .map_or(0, |input| input.input_ids.len()),
+                .map_or(&[][..], |input| input.input_ids.as_slice()),
+        }
+    }
+
+    /// Prompt tokens the engine has to prefill for this request: the
+    /// tokenized input's length (zero for a text input, which the engine
+    /// tokenizes itself).
+    pub fn prompt_len(&self) -> usize {
+        self.input_ids().len()
+    }
+
+    /// This request as a token dump `request` event: its protobuf name and
+    /// encoding.
+    pub fn dump_event(&self) -> RequestEvent<'_> {
+        use prost::Message;
+        let (type_name, msg) = match self {
+            Self::Sglang(req) => ("sglang.grpc.scheduler.GenerateRequest", req.encode_to_vec()),
+            Self::Vllm(req) => ("vllm.grpc.engine.GenerateRequest", req.encode_to_vec()),
+            Self::Trtllm(req) => ("trtllm.GenerateRequest", req.encode_to_vec()),
+            Self::Mlx(req) => ("mlx.grpc.engine.GenerateRequest", req.encode_to_vec()),
+            Self::TokenSpeed(req) => (
+                "tokenspeed.grpc.scheduler.GenerateRequest",
+                req.encode_to_vec(),
+            ),
+        };
+        RequestEvent {
+            type_name,
+            request_id: self.request_id(),
+            input_ids: self.input_ids(),
+            msg,
         }
     }
 
@@ -1959,6 +1988,103 @@ impl ProtoGenerateResponse {
                 &resp.response,
                 Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == "error"
             ),
+        }
+    }
+
+    /// This response as a token dump `response` event, exactly as the engine
+    /// sent it: what the message carries, with no accumulation.
+    pub fn dump_event(&self) -> ResponseEvent<'_> {
+        use prost::Message;
+        let empty = (Part::Empty, 0, &[][..], None);
+        let (type_name, (part, index, token_ids, finish_reason), msg) = match self {
+            Self::Sglang(resp) => (
+                "sglang.grpc.scheduler.GenerateResponse",
+                match &resp.response {
+                    Some(sglang::generate_response::Response::Chunk(c)) => {
+                        (Part::Chunk, c.index, c.token_ids.as_slice(), None)
+                    }
+                    Some(sglang::generate_response::Response::Complete(c)) => (
+                        Part::Complete,
+                        c.index,
+                        c.output_ids.as_slice(),
+                        Some(c.finish_reason.as_str()),
+                    ),
+                    None => empty,
+                },
+                resp.encode_to_vec(),
+            ),
+            Self::Vllm(resp) => (
+                "vllm.grpc.engine.GenerateResponse",
+                match &resp.response {
+                    Some(vllm::generate_response::Response::Chunk(c)) => {
+                        (Part::Chunk, c.index, c.token_ids.as_slice(), None)
+                    }
+                    Some(vllm::generate_response::Response::Complete(c)) => (
+                        Part::Complete,
+                        c.index,
+                        c.output_ids.as_slice(),
+                        Some(c.finish_reason.as_str()),
+                    ),
+                    None => empty,
+                },
+                resp.encode_to_vec(),
+            ),
+            Self::Trtllm(resp) => (
+                "trtllm.GenerateResponse",
+                match &resp.response {
+                    Some(trtllm::generate_response::Response::Chunk(c)) => {
+                        (Part::Chunk, c.sequence_index, c.token_ids.as_slice(), None)
+                    }
+                    Some(trtllm::generate_response::Response::Complete(c)) => (
+                        Part::Complete,
+                        c.sequence_index,
+                        c.output_token_ids.as_slice(),
+                        Some(c.finish_reason.as_str()),
+                    ),
+                    None => empty,
+                },
+                resp.encode_to_vec(),
+            ),
+            Self::Mlx(resp) => (
+                "mlx.grpc.engine.GenerateResponse",
+                match &resp.response {
+                    Some(mlx::generate_response::Response::Chunk(c)) => {
+                        (Part::Chunk, c.index, c.token_ids.as_slice(), None)
+                    }
+                    Some(mlx::generate_response::Response::Complete(c)) => (
+                        Part::Complete,
+                        c.index,
+                        c.output_ids.as_slice(),
+                        Some(c.finish_reason.as_str()),
+                    ),
+                    None => empty,
+                },
+                resp.encode_to_vec(),
+            ),
+            Self::TokenSpeed(resp) => (
+                "tokenspeed.grpc.scheduler.GenerateResponse",
+                match &resp.response {
+                    Some(tokenspeed::generate_response::Response::Chunk(c)) => {
+                        (Part::Chunk, c.index, c.token_ids.as_slice(), None)
+                    }
+                    Some(tokenspeed::generate_response::Response::Complete(c)) => (
+                        Part::Complete,
+                        c.index,
+                        c.output_ids.as_slice(),
+                        Some(c.finish_reason.as_str()),
+                    ),
+                    None => empty,
+                },
+                resp.encode_to_vec(),
+            ),
+        };
+        ResponseEvent {
+            type_name,
+            part,
+            index,
+            token_ids,
+            finish_reason,
+            msg,
         }
     }
 
@@ -2597,6 +2723,8 @@ pub enum ProtoStream {
     /// Any of the above, with the worker it came from: every response is a
     /// sign of life for that worker (see [`crate::worker::liveness`]).
     Tracked(Box<TrackedStream>),
+    /// An engine stream recorded into a token dump (see [`RecordedStream`]).
+    Recorded(Box<RecordedStream>),
 }
 
 /// A [`ProtoStream`] paired with the worker serving it, so each response it
@@ -2609,6 +2737,33 @@ pub struct TrackedStream {
     /// The request's place in the worker's pile; a non-streaming generation
     /// holds none.
     progress: Option<ProgressTicket>,
+}
+
+/// An engine stream whose messages a token dump call records: each response
+/// as the engine sent it, then how the call ended. It wraps the stream
+/// `BackendClient::generate` returned, so it sits under `.tracked()`.
+pub struct RecordedStream {
+    inner: ProtoStream,
+    call: CallRecorder,
+}
+
+/// Record `raw`, the next item of a recorded engine stream, into `call`, and
+/// answer it as [`ProtoStream::next`] does: a response is recorded before an
+/// engine error is turned into a status, then the end the item marks.
+fn record_and_reject(
+    call: &mut CallRecorder,
+    raw: Option<Result<ProtoGenerateResponse, tonic::Status>>,
+) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+    if let Some(Ok(response)) = &raw {
+        call.response(&response.dump_event());
+    }
+    let item = raw.map(reject_engine_error);
+    match &item {
+        Some(Ok(_)) => {}
+        Some(Err(status)) => call.finish(EndStatus::Error, Some(status)),
+        None => call.finish(EndStatus::Ok, None),
+    }
+    item
 }
 
 /// The request's place in its worker's tracked pile (see
@@ -2753,9 +2908,40 @@ impl ProtoStream {
         }))
     }
 
+    /// Record this engine stream's responses and its end into `call`.
+    pub fn recorded(self, call: CallRecorder) -> Self {
+        Self::Recorded(Box::new(RecordedStream { inner: self, call }))
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let item = match self {
+            Self::Fanout(stream) => stream.next().await,
+            Self::Tracked(tracked) => {
+                let item = Box::pin(tracked.inner.next()).await;
+                if matches!(item, Some(Ok(_))) {
+                    liveness::on_token_progress(&tracked.worker);
+                    if let Some(ticket) = tracked.prefill.as_mut() {
+                        ticket.first_response();
+                    }
+                    tracked.prefill = None;
+                }
+                return item;
+            }
+            Self::Recorded(recorded) => {
+                let raw = Box::pin(recorded.inner.next_raw()).await;
+                return record_and_reject(&mut recorded.call, raw);
+            }
+            leaf => leaf.next_raw().await,
+        };
+        item.map(reject_engine_error)
+    }
+
+    /// The next message of an engine stream exactly as the engine sent it: an
+    /// error `Complete` is not yet a `Status`. A fan-out, tracked or recorded
+    /// stream answers its own [`next`](Self::next).
+    async fn next_raw(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        match self {
             Self::Sglang(stream) => stream
                 .next()
                 .await
@@ -2788,20 +2974,8 @@ impl ProtoStream {
                 .next()
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
-            Self::Fanout(stream) => stream.next().await,
-            Self::Tracked(tracked) => {
-                let item = Box::pin(tracked.inner.next()).await;
-                if matches!(item, Some(Ok(_))) {
-                    liveness::on_token_progress(&tracked.worker);
-                    if let Some(ticket) = tracked.prefill.as_mut() {
-                        ticket.first_response();
-                    }
-                    tracked.prefill = None;
-                }
-                return item;
-            }
-        };
-        item.map(reject_engine_error)
+            Self::Fanout(_) | Self::Tracked(_) | Self::Recorded(_) => Box::pin(self.next()).await,
+        }
     }
 
     /// Mark stream as completed (no abort needed)
@@ -2815,6 +2989,10 @@ impl ProtoStream {
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
             Self::Tracked(stream) => stream.inner.mark_completed(),
+            Self::Recorded(recorded) => {
+                recorded.call.finish(EndStatus::Ok, None);
+                recorded.inner.mark_completed();
+            }
         }
     }
 
@@ -2848,6 +3026,13 @@ impl ProtoStream {
                     worker,
                     prefill,
                     progress,
+                }))
+            }
+            Self::Recorded(recorded) => {
+                let RecordedStream { inner, call } = *recorded;
+                Self::Recorded(Box::new(RecordedStream {
+                    inner: inner.defer_abort_until_first_item(),
+                    call,
                 }))
             }
         }
@@ -3822,5 +4007,249 @@ mod tests {
             None,
             "no other proto carries the field"
         );
+    }
+}
+
+#[cfg(test)]
+mod token_dump_tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    use prost::Message;
+
+    use super::*;
+    use crate::observability::token_dump::{CallMeta, Leg, StartRequest, TokenDump, Transport};
+
+    fn dump_meta() -> CallMeta {
+        CallMeta {
+            model: "m".to_string(),
+            worker: "grpc://w:1".to_string(),
+            runtime: "tokenspeed",
+            transport: Transport::Grpc,
+            leg: Leg::Single,
+            root_request_id: None,
+        }
+    }
+
+    fn tokenspeed_request() -> ProtoGenerateRequest {
+        ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed::GenerateRequest {
+            request_id: "r1".to_string(),
+            tokenized: Some(tokenspeed::TokenizedInput {
+                input_ids: vec![1, 2, 3],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    /// A running dump whose file the test reads back after `shutdown`.
+    fn running_dump() -> (tempfile::TempDir, Arc<TokenDump>, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = Arc::new(TokenDump::new(dir.path().to_path_buf(), 1 << 20));
+        let file = dump.start(StartRequest::default()).unwrap().file;
+        (dir, dump, file)
+    }
+
+    fn dump_kinds_and_status(file: &Path) -> (Vec<String>, Vec<serde_json::Value>) {
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let kinds = lines
+            .iter()
+            .map(|line| line["kind"].as_str().unwrap().to_string())
+            .collect();
+        (kinds, lines)
+    }
+
+    #[test]
+    fn request_dump_events_name_and_encode_each_engine_request() {
+        let requests = [
+            (
+                ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+                    request_id: "r".to_string(),
+                    tokenized: Some(sglang::TokenizedInput {
+                        input_ids: vec![4, 5],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                "sglang.grpc.scheduler.GenerateRequest",
+            ),
+            (
+                ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+                    request_id: "r".to_string(),
+                    input: Some(vllm::generate_request::Input::Tokenized(
+                        vllm::TokenizedInput {
+                            input_ids: vec![4, 5],
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                })),
+                "vllm.grpc.engine.GenerateRequest",
+            ),
+            (
+                ProtoGenerateRequest::Trtllm(Box::new(trtllm::GenerateRequest {
+                    request_id: "r".to_string(),
+                    tokenized: Some(trtllm::TokenizedInput {
+                        input_token_ids: vec![4, 5],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                "trtllm.GenerateRequest",
+            ),
+            (
+                ProtoGenerateRequest::Mlx(Box::new(mlx::GenerateRequest {
+                    request_id: "r".to_string(),
+                    input: Some(mlx::generate_request::Input::Tokenized(
+                        mlx::TokenizedInput {
+                            input_ids: vec![4, 5],
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                })),
+                "mlx.grpc.engine.GenerateRequest",
+            ),
+            (
+                ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed::GenerateRequest {
+                    request_id: "r".to_string(),
+                    tokenized: Some(tokenspeed::TokenizedInput {
+                        input_ids: vec![4, 5],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                "tokenspeed.grpc.scheduler.GenerateRequest",
+            ),
+        ];
+        for (request, type_name) in requests {
+            let event = request.dump_event();
+            assert_eq!(event.type_name, type_name);
+            assert_eq!(event.request_id, "r");
+            assert_eq!(event.input_ids, [4, 5]);
+            assert_eq!(request.prompt_len(), 2);
+            assert_eq!(event.msg.len(), request.wire_len(), "{type_name}");
+        }
+        let ProtoGenerateRequest::TokenSpeed(original) = tokenspeed_request() else {
+            panic!("a TokenSpeed request");
+        };
+        let encoded = tokenspeed_request().dump_event().msg;
+        assert_eq!(
+            tokenspeed::GenerateRequest::decode(encoded.as_slice()).unwrap(),
+            *original
+        );
+    }
+
+    #[test]
+    fn response_dump_events_read_what_each_message_carries() {
+        let chunk = ProtoGenerateResponse::Trtllm(Box::new(trtllm::GenerateResponse {
+            response: Some(trtllm::generate_response::Response::Chunk(
+                trtllm::GenerateStreamChunk {
+                    token_ids: vec![11],
+                    sequence_index: 2,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }));
+        let event = chunk.dump_event();
+        assert_eq!(event.type_name, "trtllm.GenerateResponse");
+        assert_eq!(event.part, Part::Chunk);
+        assert_eq!((event.index, event.token_ids), (2, &[11][..]));
+        assert_eq!(event.finish_reason, None);
+
+        let complete = ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Complete(
+                sglang::GenerateComplete {
+                    output_ids: vec![7, 8],
+                    finish_reason: "stop".to_string(),
+                    index: 1,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }));
+        let event = complete.dump_event();
+        assert_eq!(event.type_name, "sglang.grpc.scheduler.GenerateResponse");
+        assert_eq!(event.part, Part::Complete);
+        assert_eq!((event.index, event.token_ids), (1, &[7, 8][..]));
+        assert_eq!(event.finish_reason, Some("stop"));
+
+        let empty = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse::default()));
+        assert_eq!(empty.dump_event().part, Part::Empty);
+    }
+
+    #[tokio::test]
+    async fn record_and_reject_keeps_the_engine_error_response() {
+        let (_dir, dump, file) = running_dump();
+        let session = dump.session_for("m").unwrap();
+        let mut call = session.begin_call(&dump_meta(), &tokenspeed_request().dump_event());
+        let error_complete =
+            ProtoGenerateResponse::TokenSpeed(Box::new(tokenspeed::GenerateResponse {
+                response: Some(tokenspeed::generate_response::Response::Complete(
+                    tokenspeed::GenerateComplete {
+                        finish_reason: "error".to_string(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }));
+        let item = record_and_reject(&mut call, Some(Ok(error_complete)));
+        assert!(matches!(item, Some(Err(ref status)) if status.code() == tonic::Code::Internal));
+        drop(call);
+        drop(session);
+        dump.shutdown().await;
+
+        let (kinds, lines) = dump_kinds_and_status(&file);
+        assert_eq!(
+            kinds,
+            ["session", "request", "response", "end", "session_end"]
+        );
+        assert_eq!(lines[2]["finish_reason"], "error");
+        assert_eq!(lines[3]["status"], "error");
+        assert_eq!(lines[3]["responses"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_stream_records_its_end() {
+        for (mark, status) in [(false, "ok"), (true, "ok")] {
+            let (_dir, dump, file) = running_dump();
+            let session = dump.session_for("m").unwrap();
+            let call = session.begin_call(&dump_meta(), &tokenspeed_request().dump_event());
+            let mut stream =
+                ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new())).recorded(call);
+            if mark {
+                stream.mark_completed();
+            } else {
+                assert!(stream.next().await.is_none());
+            }
+            drop(stream);
+            drop(session);
+            dump.shutdown().await;
+            let (kinds, lines) = dump_kinds_and_status(&file);
+            assert_eq!(kinds, ["session", "request", "end", "session_end"]);
+            assert_eq!(lines[2]["status"], status);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recorded_stream_dropped_unfinished_is_cancelled() {
+        let (_dir, dump, file) = running_dump();
+        let session = dump.session_for("m").unwrap();
+        let call = session.begin_call(&dump_meta(), &tokenspeed_request().dump_event());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .recorded(call)
+            .defer_abort_until_first_item();
+        drop(stream);
+        drop(session);
+        dump.shutdown().await;
+        let (_, lines) = dump_kinds_and_status(&file);
+        assert_eq!(lines[2]["status"], "cancelled");
     }
 }
