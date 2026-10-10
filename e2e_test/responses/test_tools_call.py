@@ -885,17 +885,32 @@ class TestToolChoiceGptOss:
         function_calls = [item for item in output if item.type == "function_call"]
         assert len(function_calls) > 0
 
-    def test_tool_choice_with_mcp_tools(self, model, api_client):
-        """Test tool_choice parameter works with MCP tools."""
+    def test_tool_choice_with_mcp_tools(self, model, api_client, mock_mcp_server):
+        """Test tool_choice parameter works with MCP tools.
 
-        tools = [DEEPWIKI_MCP_TOOL]
+        The MCP server is the suite's in-process ``MockMcpServer`` (its one
+        tool answers a fixed 1x1 image), attached as a request-level MCP tool
+        exactly as a public server would be. This case used to attach a live
+        public server: the size of that server's answer is not under the
+        test's control, and once fed back into the next turn it overflowed
+        the lane model's context, failing the case for unrelated changes.
+        What this case checks, that ``tool_choice="auto"`` lets the model call
+        an MCP tool and that the gateway runs the call, does not depend on
+        which server answers.
+        """
+
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "mock",
+                "server_url": mock_mcp_server.url,
+                "require_approval": "never",
+            }
+        ]
 
         resp = api_client.responses.create(
             model=model,
-            input=(
-                "What transport protocols does the 2025-03-26 version of the MCP spec "
-                "(modelcontextprotocol/modelcontextprotocol) support?"
-            ),
+            input="Generate a picture of a cat",
             tools=tools,
             tool_choice="auto",
             stream=False,
@@ -907,6 +922,7 @@ class TestToolChoiceGptOss:
         output = resp.output
         mcp_calls = [item for item in output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0, "tool_choice='auto' should allow MCP tool calls"
+        assert all(call.server_label == "mock" for call in mcp_calls)
 
     def test_tool_choice_mixed_function_and_mcp(self, model, api_client):
         """Test tool_choice with mixed function and MCP tools."""
@@ -1259,17 +1275,32 @@ class TestToolChoiceLocal:
         assert "response.created" in event_types
         assert "response.completed" in event_types
 
-    def test_tool_choice_with_mcp_tools(self, model, api_client):
-        """Test tool_choice parameter works with MCP tools."""
+    def test_tool_choice_with_mcp_tools(self, model, api_client, mock_mcp_server):
+        """Test tool_choice parameter works with MCP tools.
 
-        tools = [DEEPWIKI_MCP_TOOL]
+        The MCP server is the suite's in-process ``MockMcpServer`` (its one
+        tool answers a fixed 1x1 image), attached as a request-level MCP tool
+        exactly as a public server would be. This case used to attach a live
+        public server: the size of that server's answer is not under the
+        test's control, and once fed back into the next turn it overflowed
+        the lane model's context, failing the case for unrelated changes.
+        What this case checks, that ``tool_choice="auto"`` lets the model call
+        an MCP tool and that the gateway runs the call, does not depend on
+        which server answers.
+        """
+
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "mock",
+                "server_url": mock_mcp_server.url,
+                "require_approval": "never",
+            }
+        ]
 
         resp = api_client.responses.create(
             model=model,
-            input=(
-                "What transport protocols does the 2025-03-26 version of the MCP spec "
-                "(modelcontextprotocol/modelcontextprotocol) support?"
-            ),
+            input="Generate a picture of a cat",
             tools=tools,
             tool_choice="auto",
             stream=False,
@@ -1281,6 +1312,7 @@ class TestToolChoiceLocal:
         output = resp.output
         mcp_calls = [item for item in output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0, "tool_choice='auto' should allow MCP tool calls"
+        assert all(call.server_label == "mock" for call in mcp_calls)
 
     def test_tool_choice_mixed_function_and_mcp(self, model, api_client):
         """Test tool_choice with mixed function and MCP tools."""
