@@ -6,6 +6,22 @@ if [ "$1" = "rocm" ]; then
     # Clean SGLang processes
     pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::' | xargs -r kill -9
 
+    # `rocm nuke_gpus`: also kill every process holding the GPUs, like nuke_gpus
+    # below. On ROCm every GPU user holds /dev/kfd open.
+    if [ $# -gt 1 ]; then
+        if command -v lsof >/dev/null 2>&1; then
+            lsof -t /dev/kfd 2>/dev/null | xargs -r kill -9 2>/dev/null
+        elif command -v fuser >/dev/null 2>&1; then
+            fuser -k -9 /dev/kfd 2>/dev/null
+        else
+            echo "::warning::neither lsof nor fuser found; GPU processes were not cleaned"
+        fi
+        sleep 2
+        if command -v lsof >/dev/null 2>&1; then
+            echo "Processes still holding /dev/kfd: $(lsof -t /dev/kfd 2>/dev/null | wc -l)"
+        fi
+    fi
+
 else
     # Show current GPU status
     nvidia-smi

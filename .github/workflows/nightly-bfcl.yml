@@ -11,6 +11,9 @@
 # On PRs that touch this pipeline it runs a quick non-live sanity subset for
 # merge confidence. The A/B mechanics were validated manually on an H100 box
 # (see scripts/bfcl/README.md "Validation status").
+# AMD legs run the H100 legs' models on an AMD Instinct self-hosted runner; until
+# one is registered and the repo variable SMG_RUN_AMD_LEGS is "true", only a
+# dispatch that asks for them (`only`, or `hardware: amd`) runs them.
 name: Nightly BFCL
 
 on:
@@ -26,9 +29,18 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash|gpt-oss-amd|qwen3.8-amd); empty = all"
         required: false
         default: ""
+      hardware:
+        description: "Run only the legs on this hardware; both = NVIDIA and AMD"
+        required: false
+        type: choice
+        options:
+          - both
+          - nvidia
+          - amd
+        default: both
       model:
         description: "Override HF model id (weights) for the selected leg; empty = matrix default. Override model and bfcl_model together — mismatched weights/handler pair if only one is overridden."
         required: false
@@ -117,9 +129,13 @@ jobs:
       - id: build
         env:
           ONLY: ${{ github.event.inputs.only }}
+          HARDWARE: ${{ github.event.inputs.hardware }}
           EVENT_NAME: ${{ github.event_name }}
           MODEL_OVERRIDE: ${{ github.event.inputs.model }}
           BFCL_OVERRIDE: ${{ github.event.inputs.bfcl_model }}
+          # AMD legs: the AMD runner's label, and "true" once that runner is online.
+          AMD_RUNNER: ${{ vars.SMG_RUNNER_AMD_GPU_8 }}
+          AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
         run: |
           set -euo pipefail
           # Enforce the paired-override contract: `model` and `bfcl_model` must be
@@ -132,6 +148,7 @@ jobs:
           fi
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
+          amd_runner = os.environ.get("AMD_RUNNER") or "8-gpu-mi325x"
           # max_model_len "auto": largest window that fits in GPU memory (capped at
           # native max). A fixed 32768 400'd on multi_turn_long_context (>32k prompts).
           #
@@ -236,8 +253,28 @@ jobs:
                # arms serially); arms are concurrent here, so this is generous.
                "run_timeout": "7200",
                "model_cache": "/raid/models", "arm_mode": "concurrent", "max_model_len": "auto"},
+              # AMD legs (MI325X, 256 GB per GPU): the H100 legs' models and parsers,
+              # each arm on one GPU (TP=1), both arms concurrent (GPU 0 + GPU 1). vLLM
+              # is the ROCm wheel of the same CI pin (scripts/ci_install_vllm_rocm.sh).
+              {"name": "gpt-oss-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
+               "gpu_a": "0", "gpu_b": "1",
+               "model": "openai/gpt-oss-120b", "bfcl_model": "openai/gpt-oss-120b-FC",
+               "vllm_tool": "openai", "vllm_reason": "",
+               "smg_tool": "", "smg_reason": "",
+               "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
+               "run_timeout": "7200",
+               "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
+              {"name": "qwen3.8-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
+               "gpu_a": "0", "gpu_b": "1",
+               "model": "Qwen/Qwen3.8-27B", "bfcl_model": "Qwen/Qwen3.8-27B-FC",
+               "vllm_tool": "qwen3_xml", "vllm_reason": "qwen3",
+               "smg_tool": "qwen_xml", "smg_reason": "qwen3",
+               "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
+               "run_timeout": "18000",
+               "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
           ]
           only = os.environ.get("ONLY", "")
+          hardware = os.environ.get("HARDWARE") or "both"
           valid_names = [l["name"] for l in legs]
           if only:
               legs = [l for l in legs if l["name"] == only]
@@ -245,6 +282,11 @@ jobs:
           # below are a tiny non-live subset for every leg.
           if only and not legs:
               raise SystemExit(f"unknown leg {only!r}; valid: {valid_names}")
+          # A leg without "vendor" runs on NVIDIA.
+          if hardware != "both":
+              legs = [l for l in legs if l.get("vendor", "nvidia") == hardware]
+              if not legs:
+                  raise SystemExit(f"leg {only!r} does not run on {hardware}")
           # Scheduled runs take the H100 legs only: the `blackwell` runner has served
           # no job since 2026-09-18, and a leg queued against an offline label sits in
           # GitHub's queue for its 24h maximum and is cancelled, which marks the whole
@@ -253,6 +295,15 @@ jobs:
           # legs stay one click away once the runner is back.
           if os.environ.get("EVENT_NAME") == "schedule":
               legs = [l for l in legs if l["runner"] != "blackwell"]
+          # The AMD legs need AMD's runner. Until it is online (SMG_RUN_AMD_LEGS
+          # = "true") they run only when a dispatch asks for them (`only`, or
+          # `hardware: amd`), for the same 24h-queue reason, and never on
+          # pull_request: that runner takes code from main only.
+          amd_requested = bool(only) or hardware == "amd"
+          if os.environ.get("EVENT_NAME") == "pull_request" or (
+              os.environ.get("AMD_ENABLED") != "true" and not amd_requested
+          ):
+              legs = [l for l in legs if l.get("vendor") != "amd"]
           print("matrix=" + json.dumps({"include": legs}))
           PY
 
@@ -291,7 +342,13 @@ jobs:
           name: smg-wheel
           path: wheel
       - name: Setup vLLM env (provides vllm + grpc servicer + smg)
+        if: matrix.vendor != 'amd'
         uses: ./.github/actions/setup-vllm
+      - name: Setup vLLM env on ROCm (AMD legs)
+        if: matrix.vendor == 'amd'
+        run: |
+          bash scripts/ci_setup_python_venv.sh
+          bash scripts/ci_install_vllm_rocm.sh
       - name: Override vLLM with a per-commit main wheel (legs newer than the CI pin)
         # A leg whose model the pinned vLLM release (scripts/ci_install_vllm.sh)
         # cannot serve sets vllm_commit + vllm_version to a wheels.vllm.ai build.
@@ -345,6 +402,7 @@ jobs:
           ARM_MODE: ${{ matrix.arm_mode }}
           GPU_A: ${{ matrix.gpu_a }}
           GPU_B: ${{ matrix.gpu_b }}
+          GPU_VENDOR: ${{ matrix.vendor || 'nvidia' }}
           # Per-leg health-wait budget: big MoEs need minutes for load + compile + quant.
           BFCL_STARTUP_TIMEOUT: ${{ matrix.startup_timeout }}
           RUN_TIMEOUT: ${{ github.event.inputs.run_timeout || matrix.run_timeout }}
@@ -373,14 +431,17 @@ jobs:
           # a prior cancelled/killed leg whose always() teardown was skipped (a detached
           # vLLM/smg::router that the pidfile group-kill missed and that pins GPU mem).
           # Safe here: we hold the host lock, so no other bfcl leg is running; node-wide
-          # nuke (kills by GPU occupancy) is accepted on these hosts.
-          bash scripts/ci_killall_sglang.sh nuke_gpus 9>&- || true
+          # nuke (kills by GPU occupancy) is accepted on these hosts. The default
+          # nuke reads nvidia-smi; AMD hosts use the script's ROCm mode.
+          NUKE=(nuke_gpus)
+          [ "$GPU_VENDOR" = amd ] && NUKE=(rocm nuke_gpus)
+          bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
           # Tear this leg's servers down AND nuke GPUs before releasing the lock, so the
           # next leg starts clean. Both run inside the lock (never hit the next leg). The
           # always() Teardown step is a leg-scoped backstop for when this trap can't run.
           cleanup() {
             bash scripts/bfcl/launch_arm.sh stop 9>&- || true
-            bash scripts/ci_killall_sglang.sh nuke_gpus 9>&- || true
+            bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
           }
           trap cleanup EXIT
           trap 'cleanup; exit 143' INT TERM
@@ -500,4 +561,6 @@ jobs:
         # Backstop to the in-step trap: kill THIS leg's process groups via its
         # pidfiles. NOT a node-wide GPU nuke — these hosts run other orgs' runner
         # agents, so killing by GPU occupancy would take down their jobs too.
+        env:
+          BFCL_RUN_DIR: ${{ runner.temp }}/bfcl_run
         run: bash scripts/bfcl/launch_arm.sh stop || true
