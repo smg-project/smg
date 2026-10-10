@@ -83,6 +83,25 @@ impl TestCertificates {
         })
     }
 
+    /// A mesh node's identity, written next to the other files: a certificate
+    /// signed by the CA that serves (the node's listener) and dials (the node
+    /// as a client of its peers), with the loopback names and addresses as
+    /// SANs, and its PKCS#8 key. Returns the (certificate, key) paths.
+    pub fn node_identity(
+        &self,
+        name: &str,
+    ) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        let ca_cert = X509::from_pem(&std::fs::read(&self.ca_cert_path)?)?;
+        let ca_key = PKey::private_key_from_pem(&std::fs::read(&self.ca_key_path)?)?;
+        let key = generate_rsa_key()?;
+        let cert = generate_leaf_certificate(name, true, &key, &ca_cert, &ca_key)?;
+        let cert_path = self.temp_dir.path().join(format!("{name}_cert.pem"));
+        let key_path = self.temp_dir.path().join(format!("{name}_key.pem"));
+        std::fs::write(&cert_path, cert.to_pem()?)?;
+        std::fs::write(&key_path, key.private_key_to_pem_pkcs8()?)?;
+        Ok((cert_path, key_path))
+    }
+
     /// Get paths as string references for use with RouterConfig builder
     #[expect(
         clippy::unwrap_used,
@@ -184,12 +203,25 @@ fn generate_server_certificate(
     ca_cert: &X509,
     ca_key: &PKey<Private>,
 ) -> Result<X509, Box<dyn std::error::Error>> {
+    generate_leaf_certificate("localhost", false, key, ca_cert, ca_key)
+}
+
+/// Generate a certificate signed by the CA for `common_name`, valid for the
+/// loopback names and addresses, as a server and, with `client_auth`, as a
+/// client too (a mesh node is both: it listens and dials its peers).
+fn generate_leaf_certificate(
+    common_name: &str,
+    client_auth: bool,
+    key: &PKey<Private>,
+    ca_cert: &X509,
+    ca_key: &PKey<Private>,
+) -> Result<X509, Box<dyn std::error::Error>> {
     let mut name_builder = X509NameBuilder::new()?;
     name_builder.append_entry_by_text("C", "US")?;
     name_builder.append_entry_by_text("ST", "California")?;
     name_builder.append_entry_by_text("L", "Test City")?;
     name_builder.append_entry_by_text("O", "Test Server Organization")?;
-    name_builder.append_entry_by_text("CN", "localhost")?;
+    name_builder.append_entry_by_text("CN", common_name)?;
     let name = name_builder.build();
 
     let mut cert_builder = X509Builder::new()?;
@@ -222,8 +254,12 @@ fn generate_server_certificate(
         .build()?;
     cert_builder.append_extension(key_usage)?;
 
-    let ext_key_usage = ExtendedKeyUsage::new().server_auth().build()?;
-    cert_builder.append_extension(ext_key_usage)?;
+    let mut ext_key_usage = ExtendedKeyUsage::new();
+    ext_key_usage.server_auth();
+    if client_auth {
+        ext_key_usage.client_auth();
+    }
+    cert_builder.append_extension(ext_key_usage.build()?)?;
 
     // Subject Alternative Names for localhost
     let san = SubjectAlternativeName::new()
