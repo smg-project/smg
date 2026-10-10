@@ -132,6 +132,8 @@ impl crate::kv_events::LoadSource for LoadFromState {
         // record's `waiting_uncached_tokens` stays unset.
         let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
         record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
         Some(record)
     }
 }

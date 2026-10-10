@@ -217,6 +217,8 @@ impl crate::kv_events::LoadSource for LoadFromState {
         record.waiting_uncached_tokens =
             estimated.then(|| u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
         record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
         Some(record)
     }
 }

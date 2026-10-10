@@ -619,6 +619,19 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn engine_stalled(&self) -> bool {
         false
     }
+
+    /// Whether this worker has shown a prefill rate of its own (a closed
+    /// window of first tokens), so [`Self::prefill_backlog`] is measured
+    /// rather than the cold prior.
+    fn prefill_rate_known(&self) -> bool {
+        false
+    }
+
+    /// The prefill rate observed on this worker, tokens per second; zero
+    /// until a window of first tokens has been seen.
+    fn prefill_rate_tps(&self) -> u64 {
+        0
+    }
     /// Record the start of a request whose responses the gateway sees one by
     /// one (a streaming generation to this worker over gRPC): the pile the
     /// wedged rule counts, and the start of its clock when a run begins.
@@ -1662,6 +1675,10 @@ impl WorkerRuntime {
         self.prefill_rate_tps.load(Ordering::Relaxed)
     }
 
+    pub fn prefill_rate_known(&self) -> bool {
+        self.prefill_rate_tps.load(Ordering::Relaxed) > 0
+    }
+
     pub fn prefill_backlog(&self) -> Duration {
         let pending = self.prefill_tokens_pending.load(Ordering::Relaxed);
         if pending == 0 {
@@ -2357,6 +2374,14 @@ impl Worker for BasicWorker {
 
     fn engine_stalled(&self) -> bool {
         self.runtime.load().engine_stalled()
+    }
+
+    fn prefill_rate_known(&self) -> bool {
+        self.runtime.load().prefill_rate_known()
+    }
+
+    fn prefill_rate_tps(&self) -> u64 {
+        self.runtime.load().prefill_rate_tps()
     }
 
     fn swap_waiting_reqs(&self, waiting: i64) -> i64 {

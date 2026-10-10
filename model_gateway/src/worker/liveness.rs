@@ -28,12 +28,23 @@
 //!   answering health looks exactly like this. The servicer's pushed load
 //!   record carries the engine's own silence as well
 //!   (`EngineLoad.engine_silence_ms`: how long the engine has produced
-//!   nothing while the servicer holds requests on it); past the wedge
-//!   threshold that is the same veto without a pile, so a frozen engine with
-//!   one request on it, or with requests from another gateway, leaves
-//!   routing within the threshold instead of once a pile forms (the bare
-//!   threshold, not the prefill-stretched bound: the servicer counts every
-//!   scheduler step as output, prefill included). That veto ends with
+//!   nothing while the servicer holds requests on it); past the bound that
+//!   is the same veto without a pile, so a frozen engine with one request on
+//!   it, or with requests from another gateway, leaves routing within the
+//!   bound instead of once a pile forms. Which bound depends on the wire:
+//!   an engine whose wire has shown a scheduler step without any token
+//!   (`engine_reports_steps`: vLLM's stats-only step batches, sent every
+//!   step with stats logging on) is silent only when its scheduler is, so
+//!   the bare threshold applies; a wire that carries token batches only
+//!   (SGLang, TokenSpeed, vLLM with stats logging off) is silent through a
+//!   long prefill as well, so its silence is judged against the prefill its
+//!   servicer reports in hand (`prefill_pending_tokens`: every client's
+//!   requests, so a gateway with nothing of its own on the worker allows for
+//!   the same prefill) at the prefill rate this gateway has measured on that
+//!   worker (twice over, the rate being an estimate, under the wedge bound's
+//!   cap), and only once the worker has shown a rate: the cold prior behind
+//!   the bound is a guess, not evidence against an engine that prefills
+//!   slower than it. That veto ends with
 //!   progress, or with a record that shows the engine producing again while
 //!   this gateway has no silent pile of its own. The requests counted are the
 //!   tracked ones, streaming generations to the worker over gRPC, whose
@@ -383,16 +394,27 @@ pub(crate) fn on_token_progress(worker: &Arc<dyn Worker>) {
 /// requests are in flight, the engine reports a waiting queue (or one that
 /// grew since the previous report) and no token or completion arrived within
 /// the wedge threshold; wedged as well when the report itself says the engine
-/// has produced nothing for the wedge threshold while it holds requests
-/// (`engine_silence`, from a pushed record; a poll carries none), whatever
-/// this gateway has in flight on it.
+/// has produced nothing while it holds requests (`engine_silence`, from a
+/// pushed record; a poll carries none), whatever this gateway has in flight
+/// on it: for the wedge threshold when the engine's wire reports every
+/// scheduler step (`engine_reports_steps`), for the prefill-stretched bound
+/// when it carries token batches only and a long prefill is silence too.
 pub(crate) fn on_load_report(
     worker: &Arc<dyn Worker>,
     waiting: i64,
     engine_silence: Option<Duration>,
+    engine_reports_steps: bool,
+    engine_prefill_pending: Option<u64>,
 ) {
     let (_, wedge, _) = thresholds();
-    on_load_report_with(worker, waiting, engine_silence, wedge);
+    on_load_report_with(
+        worker,
+        waiting,
+        engine_silence,
+        engine_reports_steps,
+        engine_prefill_pending,
+        wedge,
+    );
 }
 
 /// [`on_load_report`] at the given wedge threshold.
@@ -400,21 +422,25 @@ fn on_load_report_with(
     worker: &Arc<dyn Worker>,
     waiting: i64,
     engine_silence: Option<Duration>,
+    engine_reports_steps: bool,
+    engine_prefill_pending: Option<u64>,
     wedge: Duration,
 ) {
     let previous = worker.swap_waiting_reqs(waiting);
     let bound = wedge_bound(worker, wedge);
-    // The engine's own silence is judged against the bare threshold, not the
-    // prefill-stretched bound: the servicer counts every scheduler step as
-    // output, so a batch in prefill is not silence in its view, and the
-    // bound's prefill estimate (first tokens over wall time) stretches to
-    // tens of seconds on a lightly used worker, which is exactly where a
-    // frozen engine holds one request and no pile.
-    let engine_stalled = engine_stalled(engine_silence, wedge);
+    let engine_stalled = engine_stalled(
+        engine_silence,
+        engine_reports_steps,
+        wedge,
+        silence_allowance(worker, wedge, engine_prefill_pending),
+    );
     worker.note_engine_stall(engine_stalled);
     match worker.stall_reason() {
         Some(StallReason::Wedged) => {
-            if worker.token_progress_age() < wedge {
+            // A clock that restarted with this gateway's first dispatch is
+            // not progress while the engine still reports silence: a token
+            // clears that veto through `on_token_progress`.
+            if !engine_stalled && worker.token_progress_age() < wedge {
                 set(worker, None, "progress");
             } else if !engine_stalled
                 && (worker.tracked_load() == 0 || worker.token_progress_age() < bound)
@@ -453,10 +479,52 @@ fn on_load_report_with(
 
 /// The engine-reported wedge rule on its inputs: the servicer says its
 /// engine has produced nothing for `silence` while holding requests, and
-/// that is the wedge threshold or longer. Off at a zero threshold; a record
-/// without the figure (an idle engine, an older servicer) says nothing.
-fn engine_stalled(silence: Option<Duration>, wedge: Duration) -> bool {
-    !wedge.is_zero() && silence.is_some_and(|silence| silence >= wedge)
+/// that is the wedge threshold or longer when the wire reports every
+/// scheduler step (`reports_steps`: the silence is the scheduler's own), or
+/// the `allowance` or longer when it carries token batches only (a long
+/// prefill is silence there; the allowance covers the prefill the servicer
+/// reports in hand, and is `None` when this gateway cannot size it). Off at
+/// a zero threshold; a record without the figure (an idle engine, an older
+/// servicer) says nothing.
+fn engine_stalled(
+    silence: Option<Duration>,
+    reports_steps: bool,
+    wedge: Duration,
+    allowance: Option<Duration>,
+) -> bool {
+    let allowed = if reports_steps {
+        wedge
+    } else if let Some(allowance) = allowance {
+        allowance
+    } else {
+        return false;
+    };
+    !wedge.is_zero() && silence.is_some_and(|silence| silence >= allowed)
+}
+
+/// What a token-batch wire may be silent for before its silence counts: the
+/// configured threshold or, if longer, twice the time the engine may need to
+/// prefill the prompt tokens its servicer reports in hand
+/// (`EngineLoad.prefill_pending_tokens`: every client's requests, not just
+/// this gateway's, so a gateway with nothing of its own on the worker allows
+/// for the same prefill) at the prefill rate this gateway has measured on
+/// the worker (twice, the rate being an estimate), under the same cap as the
+/// wedge bound. `None`, and so no verdict, while the servicer reports no
+/// pending figure or the worker has shown no rate: the cold prior behind the
+/// wedge bound is a guess, not evidence against an engine that prefills
+/// slower than it.
+fn silence_allowance(
+    worker: &Arc<dyn Worker>,
+    wedge: Duration,
+    engine_prefill_pending: Option<u64>,
+) -> Option<Duration> {
+    let pending = engine_prefill_pending?;
+    let rate = worker.prefill_rate_tps();
+    if rate == 0 {
+        return None;
+    }
+    let prefill = Duration::from_millis(pending.saturating_mul(2_000) / rate);
+    Some(wedge.max(prefill).min(wedge.max(WEDGE_BOUND_CAP)))
 }
 
 /// The unreachable rule on its inputs.
@@ -619,7 +687,7 @@ mod tests {
         );
         sweep(&w);
         assert!(w.stall_reason().is_none());
-        on_load_report(&w, 3, None);
+        on_load_report(&w, 3, None, false, None);
         assert!(w.stall_reason().is_none());
         // The same pile with a clock that had run from registration would be
         // the false positive.
@@ -818,7 +886,7 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
         sweep_with(&w, DEFAULT_STALL, Duration::from_millis(1), DEFAULT_STALE);
         assert!(w.stall_reason().is_none(), "no signal, no pile, no veto");
-        on_load_report_with(&w, 8, None, Duration::from_millis(1));
+        on_load_report_with(&w, 8, None, false, None, Duration::from_millis(1));
         assert!(
             w.stall_reason().is_none(),
             "a waiting queue without tracked requests is not a wedge either"
@@ -902,7 +970,7 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
         sweep_with(&w, DEFAULT_STALL, Duration::ZERO, DEFAULT_STALE);
         assert!(w.stall_reason().is_none(), "--worker-wedge-secs 0");
-        on_load_report_with(&w, 8, None, Duration::ZERO);
+        on_load_report_with(&w, 8, None, false, None, Duration::ZERO);
         assert!(w.stall_reason().is_none());
         assert!(
             wedged_by_pile(4, 4, Duration::from_millis(5), Duration::ZERO),
@@ -1183,40 +1251,194 @@ mod tests {
         tracked_pile(&w, 1);
         thread::sleep(Duration::from_millis(5));
         let wedge = Duration::from_millis(1);
-        on_load_report_with(&w, 0, None, wedge);
+        on_load_report_with(&w, 0, None, true, None, wedge);
         assert!(
             w.stall_reason().is_none(),
             "one quiet request alone is not a wedge"
         );
-        on_load_report_with(&w, 0, Some(Duration::from_millis(1)), wedge);
+        on_load_report_with(&w, 0, Some(Duration::from_millis(1)), true, None, wedge);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
         assert!(w.engine_stalled());
+        // This gateway's progress clock restarted with a dispatch after the
+        // veto: not progress while the engine still reports its silence.
+        on_load_report_with(&w, 0, Some(Duration::from_millis(2)), true, None, wedge);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "no flap");
         on_token_progress(&w);
         assert!(w.stall_reason().is_none(), "progress clears it");
     }
 
     #[test]
-    fn the_engines_silence_is_judged_against_the_bare_threshold() {
+    fn a_step_reporting_engines_silence_is_judged_against_the_bare_threshold() {
         // A batch in prefill stretches this gateway's bound, not the
-        // engine's: the servicer counts every scheduler step as output.
+        // engine's: a wire that reports every scheduler step (vLLM's
+        // stats-only step batches) is silent only when its scheduler is.
         let w = worker();
         tracked_pile(&w, 1);
         w.note_prefill_started(128 * 1_152);
         assert!(wedge_bound(&w, DEFAULT_WEDGE) > Duration::from_secs(10));
-        on_load_report_with(&w, 0, Some(Duration::from_millis(2_900)), DEFAULT_WEDGE);
+        on_load_report_with(
+            &w,
+            0,
+            Some(Duration::from_millis(2_900)),
+            true,
+            None,
+            DEFAULT_WEDGE,
+        );
         assert!(w.stall_reason().is_none(), "under the threshold");
-        on_load_report_with(&w, 0, Some(Duration::from_secs(3)), DEFAULT_WEDGE);
+        on_load_report_with(
+            &w,
+            0,
+            Some(Duration::from_secs(3)),
+            true,
+            None,
+            DEFAULT_WEDGE,
+        );
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
         // A zero threshold turns the rule off with the rest of the wedge rule.
         let off = worker();
         tracked_pile(&off, 1);
-        on_load_report_with(&off, 0, Some(Duration::from_secs(600)), Duration::ZERO);
+        on_load_report_with(
+            &off,
+            0,
+            Some(Duration::from_secs(600)),
+            true,
+            None,
+            Duration::ZERO,
+        );
         assert!(off.stall_reason().is_none());
         assert!(!engine_stalled(
             Some(Duration::from_secs(600)),
-            Duration::ZERO
+            true,
+            Duration::ZERO,
+            Some(Duration::ZERO)
         ));
-        assert!(!engine_stalled(None, DEFAULT_WEDGE));
+        assert!(!engine_stalled(
+            None,
+            true,
+            DEFAULT_WEDGE,
+            Some(DEFAULT_WEDGE)
+        ));
+    }
+
+    #[test]
+    fn a_token_batch_wires_silence_is_judged_against_the_servicers_pending_prefill() {
+        // The review's case: a lightly loaded single worker on a wire that
+        // sends nothing for a request still in chunked prefill (SGLang,
+        // TokenSpeed) takes one long prompt. Its servicer reports a growing
+        // silence from the dispatch on, and beside it the prompt tokens it
+        // holds with no output yet; the silence is judged against that
+        // prefill at the rate this gateway has measured on the worker (twice
+        // over, the rate being an estimate), not the bare threshold, and not
+        // this gateway's own backlog: a second gateway with nothing in flight
+        // on the worker sees the same record and reaches the same verdict.
+        let with_backlog = BasicWorkerBuilder::new("http://w1:8000").build();
+        let idle = BasicWorkerBuilder::new("http://w1:8000").build();
+        for basic in [&with_backlog, &idle] {
+            // Both gateways have measured the worker: 2,304 tokens in 1.5 s
+            // of first tokens, 1,536 tokens/s.
+            let runtime = basic.runtime.load_full();
+            runtime.observe_prefill_at(1_152, 1_000);
+            runtime.observe_prefill_at(1_152, 2_500);
+        }
+        let with_backlog: Arc<dyn Worker> = Arc::new(with_backlog);
+        let idle: Arc<dyn Worker> = Arc::new(idle);
+        tracked_pile(&with_backlog, 1);
+        with_backlog.note_prefill_started(16 * 1_152);
+        let pending = Some(16 * 1_152);
+        // 18,432 tokens at 1,536 tokens/s: 12 s of prefill, 24 s allowed.
+        assert_eq!(
+            silence_allowance(&idle, DEFAULT_WEDGE, pending),
+            Some(Duration::from_secs(24))
+        );
+        for w in [&with_backlog, &idle] {
+            on_load_report_with(
+                w,
+                0,
+                Some(Duration::from_secs(3)),
+                false,
+                pending,
+                DEFAULT_WEDGE,
+            );
+            assert!(w.stall_reason().is_none(), "3 s into a 12 s prefill");
+            on_load_report_with(
+                w,
+                0,
+                Some(Duration::from_secs(20)),
+                false,
+                pending,
+                DEFAULT_WEDGE,
+            );
+            assert!(w.stall_reason().is_none(), "a slow prefill is not a stall");
+            on_load_report_with(
+                w,
+                0,
+                Some(Duration::from_secs(24)),
+                false,
+                pending,
+                DEFAULT_WEDGE,
+            );
+            assert_eq!(
+                w.stall_reason(),
+                Some(StallReason::Wedged),
+                "silent past twice what the prefill could need"
+            );
+        }
+        // The first token ends the prefill (the servicer reports nothing
+        // pending) and the veto; with nothing pending the allowance is the
+        // threshold again, so a frozen engine on such a wire is vetoed at the
+        // threshold like any other, on both gateways.
+        with_backlog.note_prefill_ended(16 * 1_152, true);
+        for w in [&with_backlog, &idle] {
+            on_token_progress(w);
+            assert!(w.stall_reason().is_none());
+            on_load_report_with(
+                w,
+                0,
+                Some(Duration::from_millis(2_900)),
+                false,
+                Some(0),
+                DEFAULT_WEDGE,
+            );
+            assert!(w.stall_reason().is_none());
+            on_load_report_with(
+                w,
+                0,
+                Some(Duration::from_secs(3)),
+                false,
+                Some(0),
+                DEFAULT_WEDGE,
+            );
+            assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        }
+        // No verdict without a measured rate (the cold prior is a guess) or
+        // without the servicer's pending figure (an older servicer), and a
+        // record that does not say which wire it is counts as token batches.
+        let cold = worker();
+        assert_eq!(silence_allowance(&cold, DEFAULT_WEDGE, pending), None);
+        on_load_report_with(
+            &cold,
+            0,
+            Some(Duration::from_secs(60)),
+            false,
+            pending,
+            DEFAULT_WEDGE,
+        );
+        assert!(
+            cold.stall_reason().is_none(),
+            "no rate shown yet: no verdict"
+        );
+        assert_eq!(silence_allowance(&idle, DEFAULT_WEDGE, None), None);
+        assert!(!engine_stalled(
+            Some(Duration::from_secs(60)),
+            false,
+            DEFAULT_WEDGE,
+            None
+        ));
+        // The allowance never exceeds the wedge bound's cap.
+        assert_eq!(
+            silence_allowance(&idle, DEFAULT_WEDGE, Some(100_000_000)),
+            Some(WEDGE_BOUND_CAP)
+        );
     }
 
     #[test]
@@ -1228,7 +1450,7 @@ mod tests {
         let w = worker();
         thread::sleep(Duration::from_millis(5));
         let wedge = Duration::from_millis(1);
-        on_load_report_with(&w, 0, Some(Duration::from_secs(4)), wedge);
+        on_load_report_with(&w, 0, Some(Duration::from_secs(4)), true, None, wedge);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
         sweep_with(&w, DEFAULT_STALL, wedge, DEFAULT_STALE);
         assert_eq!(
@@ -1236,7 +1458,7 @@ mod tests {
             Some(StallReason::Wedged),
             "not drained while the engine says it is stuck"
         );
-        on_load_report_with(&w, 0, Some(Duration::ZERO), wedge);
+        on_load_report_with(&w, 0, Some(Duration::ZERO), true, None, wedge);
         assert!(w.stall_reason().is_none(), "the engine produces again");
         assert!(!w.engine_stalled());
         // A pile of this gateway's own that is still silent keeps the veto
@@ -1244,9 +1466,9 @@ mod tests {
         let busy = worker();
         tracked_pile(&busy, 2);
         thread::sleep(Duration::from_millis(5));
-        on_load_report_with(&busy, 0, Some(Duration::from_secs(4)), wedge);
+        on_load_report_with(&busy, 0, Some(Duration::from_secs(4)), true, None, wedge);
         assert_eq!(busy.stall_reason(), Some(StallReason::Wedged));
-        on_load_report_with(&busy, 0, None, wedge);
+        on_load_report_with(&busy, 0, None, true, None, wedge);
         assert_eq!(
             busy.stall_reason(),
             Some(StallReason::Wedged),
@@ -1256,7 +1478,7 @@ mod tests {
         assert!(busy.stall_reason().is_none());
         // The flag goes with the record channel: an unreachable veto forgets
         // it, and the next record speaks for the engine again.
-        on_load_report_with(&w, 0, Some(Duration::from_secs(4)), wedge);
+        on_load_report_with(&w, 0, Some(Duration::from_secs(4)), true, None, wedge);
         assert!(w.engine_stalled());
         set(&w, Some(StallReason::Unreachable), "test");
         assert!(!w.engine_stalled());

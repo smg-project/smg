@@ -18,7 +18,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -73,8 +73,19 @@ type OutputReceiver<O> = mpsc::UnboundedReceiver<Result<O>>;
 /// utility calls by the call id this client issued; closing fails both.
 struct RequestRegistry<O> {
     closed: bool,
-    requests: HashMap<String, OutputSender<O>>,
+    requests: HashMap<String, InFlight<O>>,
     utility_calls: HashMap<i64, UtilitySender>,
+    /// Prompt tokens of the registered requests that have produced no output
+    /// yet: the engine's prefill work in hand, as the servicer reports it.
+    prefill_pending: u64,
+}
+
+/// One registered request: its output stream and, until its first output,
+/// the prompt the engine still has to prefill for it.
+struct InFlight<O> {
+    sender: OutputSender<O>,
+    prompt_tokens: u64,
+    started: bool,
 }
 
 /// Completes one utility call with its value, or the error that ended it.
@@ -86,13 +97,15 @@ impl<O> Default for RequestRegistry<O> {
             closed: false,
             requests: HashMap::new(),
             utility_calls: HashMap::new(),
+            prefill_pending: 0,
         }
     }
 }
 
 impl<O: EngineOutput> RequestRegistry<O> {
-    /// Register a new request, returning the receiver for its output stream.
-    fn register(&mut self, request_id: String) -> Result<OutputReceiver<O>> {
+    /// Register a new request of `prompt_tokens`, returning the receiver for
+    /// its output stream.
+    fn register(&mut self, request_id: String, prompt_tokens: u64) -> Result<OutputReceiver<O>> {
         if self.closed {
             return Err(Error::ClientClosed {
                 message: "client is shutting down".to_string(),
@@ -102,8 +115,32 @@ impl<O: EngineOutput> RequestRegistry<O> {
             return Err(Error::DuplicateRequestId { request_id });
         }
         let (sender, receiver) = mpsc::unbounded_channel();
-        self.requests.insert(request_id, sender);
+        self.requests.insert(
+            request_id,
+            InFlight {
+                sender,
+                prompt_tokens,
+                started: false,
+            },
+        );
+        self.prefill_pending = self.prefill_pending.saturating_add(prompt_tokens);
         Ok(receiver)
+    }
+
+    /// The request's prompt is prefilled (its first output came, or it is
+    /// gone before one): it no longer counts as pending prefill.
+    fn prefilled(&mut self, entry: &mut InFlight<O>) {
+        if !entry.started {
+            entry.started = true;
+            self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
+        }
+    }
+
+    /// Drop a request's entry, settling its pending prefill.
+    fn retire(&mut self, request_id: &str) -> Option<InFlight<O>> {
+        let mut entry = self.requests.remove(request_id)?;
+        self.prefilled(&mut entry);
+        Some(entry)
     }
 
     /// Deliver one output to its request stream; drop the entry when terminal.
@@ -114,9 +151,9 @@ impl<O: EngineOutput> RequestRegistry<O> {
         if output.finished() {
             // Terminal: retire the entry before handing the output over, while
             // its request id is still borrowable.
-            match self.requests.remove(output.request_id()) {
-                Some(sender) => {
-                    let _ = sender.send(Ok(output));
+            match self.retire(output.request_id()) {
+                Some(entry) => {
+                    let _ = entry.sender.send(Ok(output));
                 }
                 None => trace!(
                     request_id = output.request_id(),
@@ -125,30 +162,40 @@ impl<O: EngineOutput> RequestRegistry<O> {
             }
             return;
         }
-        let Some(sender) = self.requests.get(output.request_id()) else {
+        let Some(entry) = self.requests.get_mut(output.request_id()) else {
             trace!(
                 request_id = output.request_id(),
                 "output for unknown/finished request; dropping"
             );
             return;
         };
+        if !entry.started {
+            // The first output: the prompt is prefilled.
+            entry.started = true;
+            self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
+        }
         // A failed send hands the output back, so the receiver-gone (stream
         // dropped) path retires the entry without an owned key either.
-        if let Err(mpsc::error::SendError(Ok(undelivered))) = sender.send(Ok(output)) {
-            self.requests.remove(undelivered.request_id());
+        if let Err(mpsc::error::SendError(Ok(undelivered))) = entry.sender.send(Ok(output)) {
+            self.retire(undelivered.request_id());
         }
     }
 
     /// Remove finished/aborted request ids reported out-of-band by the engine.
     fn remove_all<'a>(&mut self, request_ids: impl IntoIterator<Item = &'a String>) {
         for request_id in request_ids {
-            self.requests.remove(request_id);
+            self.retire(request_id);
         }
     }
 
     /// Requests submitted and not yet finished, aborted or failed.
     fn in_flight(&self) -> usize {
         self.requests.len()
+    }
+
+    /// Prompt tokens of the in-flight requests without a first output yet.
+    fn prefill_pending_tokens(&self) -> u64 {
+        self.prefill_pending
     }
 
     /// Register a utility call, returning the receiver its reply resolves.
@@ -184,9 +231,10 @@ impl<O: EngineOutput> RequestRegistry<O> {
     /// error and close the registry.
     fn fail_all(&mut self, error: Arc<Error>) {
         self.closed = true;
-        for (_, sender) in self.requests.drain() {
-            let _ = sender.send(Err(Error::Shared(error.clone())));
+        for (_, entry) in self.requests.drain() {
+            let _ = entry.sender.send(Err(Error::Shared(error.clone())));
         }
+        self.prefill_pending = 0;
         for (_, sender) in self.utility_calls.drain() {
             let _ = sender.send(Err(Error::Shared(error.clone())));
         }
@@ -241,6 +289,10 @@ struct ClientInner<P: EngineProtocol> {
     /// counts from its own dispatch. Read by [`Client::output_silence`].
     output_clock: Instant,
     last_output_ms: AtomicU64,
+    /// The engine has sent a scheduler step without any token (a stats-only
+    /// step report): its silence is then the scheduler's own, not a prefill
+    /// in progress. Read by [`Client::reports_steps`].
+    steps_reported: AtomicBool,
 }
 
 impl<P: EngineProtocol> ClientInner<P> {
@@ -329,6 +381,12 @@ impl<P: EngineProtocol> ClientInner<P> {
         }
     }
 
+    /// Stamp an output from the engine (or a dispatch onto an idle one) now.
+    fn note_output(&self) {
+        let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_output_ms.store(millis, Ordering::Relaxed);
+    }
+
     /// Retire in-flight request ids from a rank. Idempotent: an id already
     /// retired by a racing path is simply absent.
     ///
@@ -340,12 +398,6 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// every request, so an empty in-flight set is ground truth that the
     /// rank's queue is empty; the KV term is left as reported (cache pages
     /// outlive requests).
-    /// Stamp an output from the engine (or a dispatch onto an idle one) now.
-    fn note_output(&self) {
-        let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_output_ms.store(millis, Ordering::Relaxed);
-    }
-
     fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a String>) {
         let mut routing = self.routing.lock();
         let Some(ids) = routing.inflight.get_mut(&engine_index) else {
@@ -544,6 +596,7 @@ impl<P: EngineProtocol> Client<P> {
             next_call_id: AtomicI64::new(1),
             output_clock: Instant::now(),
             last_output_ms: AtomicU64::new(0),
+            steps_reported: AtomicBool::new(false),
         });
 
         // Transport output loop: decode raw frames -> EngineBatch channel.
@@ -590,13 +643,33 @@ impl<P: EngineProtocol> Client<P> {
     /// in flight. A frozen engine keeps its connection open and its last
     /// load report standing, so this is the first sign of it: the servicer
     /// puts it on the load record it pushes (`EngineLoad.engine_silence_ms`)
-    /// for the gateway's wedge rule.
+    /// for the gateway's wedge rule, with [`Self::reports_steps`] beside it
+    /// to say whether the silence is the scheduler's own.
     pub fn output_silence(&self) -> Option<Duration> {
         if self.inner.registry.lock().in_flight() == 0 {
             return None;
         }
         let since = Duration::from_millis(self.inner.last_output_ms.load(Ordering::Relaxed));
         Some(self.inner.output_clock.elapsed().saturating_sub(since))
+    }
+
+    /// Whether the engine's wire has shown a scheduler step without any
+    /// token (a stats-only step report, which vLLM sends every step while
+    /// its stats logging is on): from then on [`Self::output_silence`] is
+    /// the scheduler's silence. A wire that carries token batches only
+    /// (SGLang, TokenSpeed) never sets it, and its silence may be a prefill
+    /// in progress, which the gateway allows for.
+    pub fn reports_steps(&self) -> bool {
+        self.inner.steps_reported.load(Ordering::Relaxed)
+    }
+
+    /// Prompt tokens of the in-flight requests that have produced no output
+    /// yet: the engine's prefill work in hand, which the servicer puts on its
+    /// load record (`EngineLoad.prefill_pending_tokens`) so a gateway can
+    /// allow for it when it judges a token-batch wire's silence, whatever it
+    /// has in flight on the engine itself.
+    pub fn prefill_pending_tokens(&self) -> u64 {
+        self.inner.registry.lock().prefill_pending_tokens()
     }
 
     /// Submit a request and return a stream of its outputs. The request is
@@ -625,7 +698,7 @@ impl<P: EngineProtocol> Client<P> {
         let receiver = {
             let mut registry = self.inner.registry.lock();
             let idle = registry.in_flight() == 0;
-            let receiver = registry.register(request_id.clone())?;
+            let receiver = registry.register(request_id.clone(), P::prompt_tokens(&request))?;
             // The silence a request sees counts from its dispatch: an engine
             // idle until now had nothing to produce.
             if idle {
@@ -810,6 +883,12 @@ async fn run_dispatcher<P: EngineProtocol>(
                     Some(Ok(batch)) => {
                         consecutive_decode_errors = 0;
                         inner.note_output();
+                        if batch.outputs.is_empty()
+                            && batch.finished_request_ids.is_empty()
+                            && batch.load.is_some()
+                        {
+                            inner.steps_reported.store(true, Ordering::Relaxed);
+                        }
                         if let Some(load) = batch.load {
                             inner.routing.lock().load.insert(batch.engine_index, load);
                         }
@@ -1145,6 +1224,15 @@ mod tests {
         engine.recv_request().await.unwrap();
         let at_dispatch = client.output_silence().expect("a request is in flight");
         assert!(at_dispatch < Duration::from_millis(500), "{at_dispatch:?}");
+        assert!(
+            !client.reports_steps(),
+            "no step without a token seen yet: a token-batch wire until shown otherwise"
+        );
+        assert_eq!(
+            client.prefill_pending_tokens(),
+            3,
+            "the request's three prompt tokens are the engine's prefill in hand"
+        );
         tokio::time::sleep(Duration::from_millis(80)).await;
         let grown = client.output_silence().expect("still in flight");
         assert!(
@@ -1178,6 +1266,15 @@ mod tests {
             after_stats < grown,
             "reset by the step: {after_stats:?} after {grown:?}"
         );
+        assert!(
+            client.reports_steps(),
+            "a stats-only step shows the wire reports every step"
+        );
+        assert_eq!(
+            client.prefill_pending_tokens(),
+            3,
+            "a step without an output for the request leaves its prompt pending"
+        );
 
         // The terminal output ends the request: nothing in flight, no silence.
         engine
@@ -1196,6 +1293,11 @@ mod tests {
         assert!(last.finished());
         assert!(stream.next().await.is_none());
         assert_eq!(client.output_silence(), None, "nothing in flight again");
+        assert_eq!(
+            client.prefill_pending_tokens(),
+            0,
+            "its first output settled the prompt"
+        );
     }
 
     /// A stream that outlives its client is truncated, not complete: it must

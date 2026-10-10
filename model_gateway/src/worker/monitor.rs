@@ -542,6 +542,8 @@ impl WorkerMonitor {
             record
                 .engine_silence_ms
                 .map(|ms| Duration::from_millis(u64::from(ms))),
+            record.engine_reports_steps.unwrap_or(false),
+            record.prefill_pending_tokens.map(u64::from),
         );
         let single: HashMap<String, WorkerLoadResponse> =
             HashMap::from([(url.clone(), (*response).clone())]);
@@ -1457,7 +1459,7 @@ async fn poll_group_once(
                 .iter()
                 .map(|rank| i64::from(rank.num_waiting_reqs))
                 .sum();
-            liveness::on_load_report(&worker, waiting, None);
+            liveness::on_load_report(&worker, waiting, None, false, None);
             // Only feed the DP-rank cache from responses that carry real
             // absolute per-rank token counts. Ratio-only snapshots,
             // which would otherwise poison with a fake `{0: 0}`
@@ -2020,6 +2022,7 @@ mod worker_monitor_tests {
         monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
         assert!(worker.stall_reason().is_none(), "no silence reported");
         record.engine_silence_ms = Some(5_000);
+        record.engine_reports_steps = Some(true);
         monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
         assert_eq!(
             worker.stall_reason(),
