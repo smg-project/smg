@@ -507,7 +507,7 @@ pub(super) async fn resolve_item_references(
                     format!("Failed to resolve item '{id}': {e}"),
                 )
             })?;
-        let found = stored
+        let candidate = stored
             .as_ref()
             .and_then(|response| response.raw_response.get("output"))
             .and_then(Value::as_array)
@@ -515,16 +515,28 @@ pub(super) async fn resolve_item_references(
                 output
                     .iter()
                     .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(id))
-            })
-            .and_then(|candidate| {
-                serde_json::from_value::<ResponseInputOutputItem>(candidate.clone()).ok()
             });
-        match found {
-            Some(found) => resolved.push(found),
-            None => {
-                return Err(error::not_found(
-                    "item_not_found",
-                    format!("Item with id '{id}' not found."),
+        let Some(candidate) = candidate else {
+            return Err(error::not_found(
+                "item_not_found",
+                format!("Item with id '{id}' not found."),
+            ));
+        };
+        // a stored item that has no input form (a built-in tool call, an older
+        // schema) exists but cannot be re-injected: say so, not "not found"
+        match serde_json::from_value::<ResponseInputOutputItem>(candidate.clone()) {
+            Ok(found) => resolved.push(found),
+            Err(e) => {
+                let item_type = candidate
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                warn!(
+                    "item_reference '{id}' names a stored output item that cannot be used as input: {e}. Item: {candidate}"
+                );
+                return Err(error::bad_request(
+                    "item_not_usable_as_input",
+                    format!("Item '{id}' of type '{item_type}' cannot be used as an input item."),
                 ));
             }
         }
@@ -532,7 +544,8 @@ pub(super) async fn resolve_item_references(
     Ok(resolved)
 }
 
-/// The id an input item carries, for `item_reference` resolution.
+/// The id an input item carries, for `item_reference` resolution. Every
+/// variant is named, so a new one has to say whether it carries an id.
 fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
     match item {
         ResponseInputOutputItem::Message { id, .. }
@@ -540,13 +553,25 @@ fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
         | ResponseInputOutputItem::McpApprovalRequest { id, .. }
         | ResponseInputOutputItem::ImageGenerationCall { id, .. }
         | ResponseInputOutputItem::ComputerCall { id, .. }
+        | ResponseInputOutputItem::LocalShellCall { id, .. }
+        | ResponseInputOutputItem::LocalShellCallOutput { id, .. }
         | ResponseInputOutputItem::McpCall { id, .. }
         | ResponseInputOutputItem::McpListTools { id, .. } => Some(id.as_str()),
         ResponseInputOutputItem::FunctionToolCall { id, .. }
         | ResponseInputOutputItem::FunctionCallOutput { id, .. }
         | ResponseInputOutputItem::McpApprovalResponse { id, .. }
-        | ResponseInputOutputItem::Compaction { id, .. } => id.as_deref(),
-        _ => None,
+        | ResponseInputOutputItem::Compaction { id, .. }
+        | ResponseInputOutputItem::ComputerCallOutput { id, .. }
+        | ResponseInputOutputItem::CustomToolCall { id, .. }
+        | ResponseInputOutputItem::CustomToolCallOutput { id, .. }
+        | ResponseInputOutputItem::ShellCall { id, .. }
+        | ResponseInputOutputItem::ShellCallOutput { id, .. }
+        | ResponseInputOutputItem::ApplyPatchCall { id, .. }
+        | ResponseInputOutputItem::ApplyPatchCallOutput { id, .. } => id.as_deref(),
+        // a reference is what gets resolved, never a resolution; a bare input
+        // message carries no id
+        ResponseInputOutputItem::ItemReference { .. }
+        | ResponseInputOutputItem::SimpleInputMessage { .. } => None,
     }
 }
 
@@ -750,6 +775,40 @@ mod usage_tests {
             resolved[1],
             ResponseInputOutputItem::ItemReference { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn item_reference_to_a_stored_item_with_no_input_form_is_400() {
+        let storage = data_connector::MemoryResponseStorage::new();
+        let mut stored = data_connector::StoredResponse::new(None);
+        stored.raw_response = json!({
+            "id": "resp_stored",
+            "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}]
+        });
+        storage.store_response(stored).await.unwrap();
+
+        let response = resolve_item_references(&storage, vec![reference("ws_1")])
+            .await
+            .expect_err("a stored item without an input form is refused");
+
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn item_reference_finds_a_loaded_custom_tool_call_by_its_id() {
+        let storage = data_connector::MemoryResponseStorage::new();
+        let loaded: ResponseInputOutputItem = serde_json::from_value(json!({
+            "type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1",
+            "name": "lookup", "input": "weather"
+        }))
+        .unwrap();
+
+        let resolved = resolve_item_references(&storage, vec![loaded, reference("ctc_1")])
+            .await
+            .expect("an item already in the list resolves without storage");
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(input_item_id(&resolved[1]), Some("ctc_1"));
     }
 
     #[tokio::test]
