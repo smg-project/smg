@@ -325,7 +325,7 @@ pub fn messages_reasoning_starts_in_prefill(
 
 /// Where the selected worker's engine starts a request's grammar on a prompt
 /// that ends inside the model's thinking block, from its
-/// `structured_outputs_start` label (the vLLM servicers advertise it off the
+/// `structured_outputs_start` label (the servicers advertise it off the
 /// engine's config); under PD the decode worker's, whose engine generates the
 /// tokens the grammar constrains. Unknown without a selection or a label.
 pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {

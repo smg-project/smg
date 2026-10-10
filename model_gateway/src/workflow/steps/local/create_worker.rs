@@ -1365,7 +1365,7 @@ mod tests {
         assert_eq!(card.reasoning_parser.as_deref(), Some("basic"));
     }
 
-    /// A vLLM engine's own reasoning parser rides in its own label
+    /// An engine's own reasoning parser rides in its own label
     /// (`engine_reasoning_parser`), not in `reasoning_parser`, the per-model
     /// parser override registration validates against the gateway's registry:
     /// the engine's parser names are the engine's (`openai_gptoss`, `kimi_k2`),

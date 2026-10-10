@@ -37,13 +37,13 @@ type ReasoningPrefixFn = fn(GrammarStart) -> Option<serde_json::Value>;
 /// prompt that ends inside the model's thinking block, as its worker
 /// advertises it (the `structured_outputs_start` label).
 ///
-/// An engine's own server picks the grammar's shape from this: SGLang's chat
-/// server sends xgrammar's reasoning-aware tags (the thought, its close, then
-/// the calls) when it runs no reasoning parser and the bare calls when it
-/// does, because its grammar backend then waits for the thought's end; vLLM's
-/// structured-output manager waits the same way when a reasoning parser is
-/// set (and `enable_in_reasoning` is off). The gateway reads the same fact
-/// from the worker and shapes the calls' prefix accordingly.
+/// An engine's own server picks the grammar's shape from this: it sends
+/// xgrammar's reasoning-aware tags (the thought, its close, then the calls)
+/// when it runs no reasoning parser and the bare calls when it does, because
+/// its grammar backend then waits for the thought's end; an engine with a
+/// reasoning parser set (and `enable_in_reasoning` off) waits the same way.
+/// The gateway reads the same fact from the worker and shapes the calls'
+/// prefix accordingly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrammarStart {
     /// The worker does not say (an older servicer, an engine without the
@@ -187,7 +187,7 @@ impl ParserRegistry {
     /// prefix for [`GrammarStart::Unknown`]: free text, then the forced call.
     /// Unlike xgrammar's built-in tags with `reasoning=True`, that prefix is
     /// not closed by the thought's end token: an engine that runs a reasoning
-    /// parser (vLLM, SGLang) applies the grammar only after the model's own
+    /// parser applies the grammar only after the model's own
     /// `</think>` and would hold the model to a second one. Once the worker
     /// that runs the grammar is known,
     /// [`Self::structural_tag_for_grammar_start`] re-shapes the prefix for
