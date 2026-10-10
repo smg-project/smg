@@ -95,7 +95,7 @@ on:
         default: false
         description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
       servicer_impl:
-        description: "Which SGLang gRPC servicer the workers run (rust or python); empty keeps the engine default"
+        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty keeps the engine default"
         required: false
         type: string
         default: ""
@@ -117,7 +117,9 @@ jobs:
       E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
       E2E_ZMQ_ENGINE_COUNT: ${{ inputs.zmq_engine_count }}
       E2E_MM_PROCESSING: ${{ inputs.mm_processing }}
-      E2E_SGLANG_SERVICER_IMPL: ${{ inputs.servicer_impl }}
+      # The servicer choice reaches the harness flag of the job's engine only.
+      E2E_SGLANG_SERVICER_IMPL: ${{ inputs.engine == 'sglang' && inputs.servicer_impl || '' }}
+      E2E_VLLM_SERVICER_IMPL: ${{ inputs.engine == 'vllm' && inputs.servicer_impl || '' }}
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
@@ -254,6 +256,12 @@ jobs:
           MM="${{ inputs.mm_processing }}"
           if [ -n "$MM" ]; then
             SUFFIX="${SUFFIX}-mm-${MM}"
+          fi
+          # A Rust-servicer leg runs the same suite as the engine's Python
+          # servicer leg; keep their log artifacts apart.
+          IMPL="${{ inputs.servicer_impl }}"
+          if [ -n "$IMPL" ]; then
+            SUFFIX="${SUFFIX}-${IMPL}-servicer"
           fi
           ARTIFACT="e2e-worker-logs-${{ inputs.engine }}-gpu${{ inputs.gpu_tier }}-${LABEL}${SUFFIX}"
           bash scripts/ci_dump_worker_logs.sh e2e-logs "$ARTIFACT"

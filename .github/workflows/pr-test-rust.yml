@@ -721,8 +721,11 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
     secrets: inherit
 
-  # The SGLang chat and admin-op cases against the Rust gRPC servicer
-  # (SMG_SGLANG_SERVICER_IMPL=rust): the same workers, the Rust request path.
+  # The chat cases against the Rust gRPC servicer (SMG_SGLANG_SERVICER_IMPL=rust,
+  # SMG_VLLM_SERVICER_IMPL=rust): the same workers, the Rust request path. One
+  # row per engine with a Rust servicer: every other lane of that engine runs
+  # the Python servicer, so a launcher or binding change that breaks the Rust
+  # servicer's start fails here and nowhere else.
   e2e-1gpu-chat-rust-servicer:
     name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -748,6 +751,13 @@ jobs:
             # the wire's control calls.
             test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py
             min_selected: 204 # floor ≈ 95% of the chat lane's measured effective (215 of 223 ran on the Rust servicer; audit 2026-10-04)
+          # The vLLM chat suite on the Rust servicer: the suite, floor and
+          # budgets of e2e-1gpu-chat's vllm row (the harness deselects nothing
+          # for this servicer), so the two rows differ by the servicer only.
+          - engine: vllm
+            timeout: 32
+            test_timeout: 24
+            min_selected: 202 # the vllm chat row's floor: the same selection
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
