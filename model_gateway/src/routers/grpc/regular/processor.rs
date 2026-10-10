@@ -1221,6 +1221,76 @@ mod responses_finish_reason_tests {
     }
 
     #[tokio::test]
+    async fn vllm_json_tool_nonstream_keeps_prefilled_reasoning() {
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for (tool_choice, output) in [
+            (
+                serde_json::json!("required"),
+                r#"plan</think>[{"name":"lookup","parameters":{"q":"Paris"}}]"#,
+            ),
+            (
+                serde_json::json!({"type":"function", "function":{"name":"lookup"}}),
+                r#"plan</think>{"q":"Paris"}"#,
+            ),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"test-model", "messages":[], "separate_reasoning":true,
+                "tool_choice":tool_choice,
+                "tools":[{"type":"function","function":{"name":"lookup",
+                    "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
+            }))
+            .unwrap();
+            let mut spec = ChatResponseSpec::from(&request);
+            spec.reasoning_in_prefill = Some(true);
+            let tokenizer: Arc<dyn Tokenizer> =
+                Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: "stop".into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let (choice, _) = processor
+                .process_single_choice(
+                    &complete,
+                    0,
+                    &spec,
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    true,
+                    true,
+                    Some("qwen3"),
+                    Some("qwen_coder"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+            assert!(choice.message.content.is_none());
+            assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+            let calls = choice.message.tool_calls.unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].function.name, "lookup");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    calls[0].function.arguments.as_deref().unwrap()
+                )
+                .unwrap(),
+                serde_json::json!({"q":"Paris"})
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn gemma4_nonstream_native_tool_choices_preserve_reasoning_and_arguments() {
         let output = r#"<|channel>thought
 plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
@@ -1253,7 +1323,7 @@ plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
                 llm_tokenizer::StopSequenceConfig::default(),
                 false,
             );
-            let choice = processor
+            let (choice, _) = processor
                 .process_single_choice(
                     &complete,
                     0,
