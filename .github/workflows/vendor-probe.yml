@@ -1,0 +1,271 @@
+name: Vendor Probe
+
+# Record ground-truth behavior of the real OpenAI Responses and Anthropic
+# Messages APIs for SMG compatibility audits. Recordings (bodies, SSE
+# transcripts, error shapes, structural fingerprints) upload as artifacts;
+# full workflow_dispatch runs additionally archive them as assets on a
+# vendor-truth-<date> release so they outlive the artifact window (they feed
+# baseline refreshes — see vendor_probe/README.md).
+# Note: vendor_probe/** also feeds pr-test-rust.yml's `agentic` change family
+# so the vendor-conformance e2e suite (e2e_test/vendor_compat) revalidates
+# probe/baseline changes on a real engine.
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Which vendor(s) to probe
+        type: choice
+        options: [all, openai, anthropic]
+        default: all
+      openai_model:
+        description: OpenAI @MODEL override
+        type: string
+        default: gpt-5-nano
+      anthropic_model:
+        description: Anthropic @MODEL override
+        type: string
+        default: claude-haiku-4-5
+      probe_filter:
+        description: Optional regex over probe ids
+        type: string
+        default: ""
+      tier:
+        description: Probe tier (curated = hand-written, generated = genmatrix)
+        type: choice
+        options: [all, curated, generated]
+        default: all
+      concurrency:
+        description: Runner concurrency
+        type: string
+        default: "24"
+      budget:
+        description: Generated-tier probe budget (0 = unlimited)
+        type: string
+        default: "0"
+  pull_request:
+    paths:
+      - vendor_probe/**
+      - .github/workflows/vendor-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vendor-probe-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PROVIDER_SEL: ${{ inputs.provider || 'all' }}
+  OPENAI_MODEL: ${{ inputs.openai_model || 'gpt-5-nano' }}
+  ANTHROPIC_MODEL: ${{ inputs.anthropic_model || 'claude-haiku-4-5' }}
+  PROBE_FILTER: ${{ inputs.probe_filter || '' }}
+  # pull_request runs stay cheap (curated tier, low concurrency); dispatch
+  # defaults to the full generated matrix at concurrency 24
+  PROBE_TIER: ${{ inputs.tier || 'curated' }}
+  PROBE_CONCURRENCY: ${{ inputs.concurrency || '4' }}
+  PROBE_BUDGET: ${{ inputs.budget || '0' }}
+
+jobs:
+  probe:
+    runs-on: k8s-runner-cpu
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install httpx
+        run: pip install httpx
+
+      # Anthropic key comes from the runner pod env (mirror nightly-triage.yml).
+      - name: Export Anthropic API key from pod env
+        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic' }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not present in the runner pod environment"
+            exit 1
+          fi
+          echo "::add-mask::${ANTHROPIC_API_KEY}"
+          echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"
+
+      - name: Probe OpenAI
+        id: openai
+        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai' }}
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          FILTER_ARG=""
+          [ -n "$PROBE_FILTER" ] && FILTER_ARG="--filter $PROBE_FILTER"
+          python -m vendor_probe.runner --provider openai \
+            --tier "$PROBE_TIER" --budget "$PROBE_BUDGET" \
+            --concurrency "$PROBE_CONCURRENCY" \
+            --out results/openai $FILTER_ARG
+
+      - name: Compress OpenAI results if large
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai') }}
+        run: |
+          f=results/openai/results.jsonl
+          if [ -f "$f" ] && [ "$(stat -c%s "$f")" -gt 52428800 ]; then gzip "$f"; fi
+
+      - name: Upload OpenAI artifact
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vendor-probe-openai
+          path: results/openai
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Probe Anthropic
+        id: anthropic
+        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic' }}
+        continue-on-error: true
+        run: |
+          FILTER_ARG=""
+          [ -n "$PROBE_FILTER" ] && FILTER_ARG="--filter $PROBE_FILTER"
+          python -m vendor_probe.runner --provider anthropic \
+            --tier "$PROBE_TIER" --budget "$PROBE_BUDGET" \
+            --concurrency "$PROBE_CONCURRENCY" \
+            --out results/anthropic $FILTER_ARG
+
+      - name: Compress Anthropic results if large
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic') }}
+        run: |
+          f=results/anthropic/results.jsonl
+          if [ -f "$f" ] && [ "$(stat -c%s "$f")" -gt 52428800 ]; then gzip "$f"; fi
+
+      - name: Upload Anthropic artifact
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vendor-probe-anthropic
+          path: results/anthropic
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Print summaries
+        if: always()
+        run: |
+          for d in results/openai results/anthropic; do
+            if [ -f "$d/summary.json" ]; then
+              echo "===== $d/summary.json ====="
+              cat "$d/summary.json"
+              echo
+            fi
+          done
+
+      # Fail the job only on transport failures (network/timeout/persistent
+      # 5xx-429). Behavioral 4xx from error-probes are successful recordings.
+      # publish-truth below only archives runs that pass this gate.
+      - name: Health gate (>20% transport failures fails the job)
+        if: always()
+        env:
+          OPENAI_OUTCOME: ${{ steps.openai.outcome }}
+          ANTHROPIC_OUTCOME: ${{ steps.anthropic.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          sel = os.environ.get("PROVIDER_SEL", "all")
+          checks = []
+          if sel in ("all", "openai"):
+              checks.append(("openai", "results/openai/summary.json",
+                             os.environ.get("OPENAI_OUTCOME")))
+          if sel in ("all", "anthropic"):
+              checks.append(("anthropic", "results/anthropic/summary.json",
+                             os.environ.get("ANTHROPIC_OUTCOME")))
+          failed = False
+          for name, path, outcome in checks:
+              if not os.path.exists(path):
+                  # runner crashed before writing a summary -> treat as failure
+                  print(f"::error::{name}: no summary.json (runner outcome={outcome})")
+                  failed = True
+                  continue
+              s = json.load(open(path))
+              rate = s.get("transport_failure_rate", 0.0)
+              print(f"{name}: transport_failure_rate={rate} "
+                    f"recorded={s.get('recorded')} skipped={s.get('skipped')} "
+                    f"transport_failures={s.get('transport_failures')}")
+              if rate > 0.20:
+                  print(f"::error::{name}: transport failure rate {rate:.1%} exceeds 20%")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+  # Full workflow_dispatch runs preserve the raw recordings beyond the 14-day
+  # artifact window by attaching them (gzipped) to a release tagged
+  # vendor-truth-<date>. These archives are the input for refreshing the
+  # checked-in baselines (vendor_probe/baselines/ — see the README). Runs only
+  # when the probe job passed its health gate: unhealthy runs are not truth.
+  publish-truth:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'all' }}
+    needs: probe
+    runs-on: k8s-runner-cpu
+    timeout-minutes: 15
+    # WIDER THAN THE WORKFLOW DEFAULT (contents: read): creating the
+    # vendor-truth-<date> release and uploading its assets needs
+    # contents: write. Scoped to this job only — the probe job that holds the
+    # vendor API keys keeps read-only. Documented in vendor_probe/README.md.
+    permissions:
+      contents: write
+    steps:
+      - name: Install gh CLI
+        run: |
+          if ! command -v gh &>/dev/null; then
+            mkdir -p "$HOME/.local/bin"
+            GH_VERSION="2.74.0"
+            GH_SHA256="e55c9d49dc49c0b0fef0a9acd3510482fd9e27ff52ae80f8a6e838cd25b4cd89"
+            curl -fsSL --connect-timeout 10 --max-time 120 -o /tmp/gh.tgz \
+              "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+            echo "${GH_SHA256}  /tmp/gh.tgz" | sha256sum --check --quiet
+            tar xzf /tmp/gh.tgz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Download recording artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: vendor-probe-*
+          path: recordings
+
+      - name: Publish recordings to vendor-truth release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TAG="vendor-truth-$(date -u +%F)"
+          # Idempotent: reuse the tag if a run already created it today;
+          # --clobber below replaces same-named assets from earlier runs.
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" \
+              --notes "Raw vendor ground-truth recordings from the full probe matrix (vendor-probe workflow run ${RUN_ID}, commit ${SHA}). Inputs for vendor_probe/baselines/ refreshes — see vendor_probe/README.md."
+          fi
+          assets=()
+          for prov in openai anthropic; do
+            dir="recordings/vendor-probe-${prov}"
+            [ -d "$dir" ] || continue
+            for f in results.jsonl fingerprints.jsonl; do
+              if [ -f "$dir/$f" ]; then gzip -f "$dir/$f"; fi
+            done
+            for f in results.jsonl.gz fingerprints.jsonl.gz summary.json; do
+              if [ -f "$dir/$f" ]; then
+                cp "$dir/$f" "recordings/${prov}-${f}"
+                assets+=("recordings/${prov}-${f}")
+              fi
+            done
+          done
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::no recording artifacts found to publish"
+            exit 1
+          fi
+          gh release upload "$TAG" "${assets[@]}" --repo "$REPO" --clobber
+          echo "published ${#assets[@]} assets to release $TAG"
