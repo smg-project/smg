@@ -543,7 +543,9 @@ impl ResponseStorage for HookedResponseStorage {
     /// `GetResponse` hooks run on the found response's id, the policy of
     /// [`get_response`](Self::get_response); no hook operation of its own, so a
     /// hook that never heard of the lookup still sees it as the response read
-    /// it is, and one that rejects the read answers an error.
+    /// it is. The id has to be found before a hook can judge it, so a read the
+    /// hook rejects is answered as a miss: the caller learns no more about an
+    /// item it may not read than about one that does not exist.
     async fn find_response_by_output_item(
         &self,
         item_id: &str,
@@ -552,13 +554,16 @@ impl ResponseStorage for HookedResponseStorage {
             return Ok(None);
         };
         let payload = serde_json::to_value(&found.id).unwrap_or_default();
-        let extra = run_before(
+        let Ok(extra) = run_before(
             &*self.hook,
             StorageOperation::GetResponse,
             &payload,
             ResponseStorageError::StorageError,
         )
-        .await?;
+        .await
+        else {
+            return Ok(None);
+        };
 
         let result = Some(found);
         let result_json = serde_json::to_value(&result).unwrap_or_default();
@@ -875,12 +880,11 @@ mod tests {
         hook.set_reject("denied");
         let hooked = HookedResponseStorage::new(inner, hook.clone());
 
-        let err = hooked
-            .find_response_by_output_item("msg_1")
-            .await
-            .unwrap_err();
-
-        assert!(err.to_string().contains("denied"));
+        // A read the hook rejects is a miss, not an error: the caller cannot
+        // tell a response it may not read from one that does not exist.
+        let denied = hooked.find_response_by_output_item("msg_1").await.unwrap();
+        assert!(denied.is_none());
+        assert_eq!(hook.before_calls(), 1);
         assert_eq!(hook.after_calls(), 0);
     }
 

@@ -532,7 +532,7 @@ pub(super) async fn resolve_item_references(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 warn!(
-                    "item_reference '{id}' names a stored output item that cannot be used as input: {e}. Item: {candidate}"
+                    "item_reference '{id}' (type '{item_type}') names a stored output item that cannot be used as input: {e}"
                 );
                 return Err(error::bad_request(
                     "item_not_usable_as_input",
