@@ -243,7 +243,9 @@ fn describe(error: &reqwest::Error) -> String {
 }
 
 /// Test support: run one `#[test]` of this binary in a child process whose
-/// certificate environment names no root certificate at all.
+/// certificate environment names no root certificate at all. This only removes
+/// native roots on platforms using the file-based verifier; Apple, Windows and
+/// Android use their system trust APIs instead and ignore these variables.
 #[cfg(test)]
 pub(crate) mod no_root_store {
     use std::process::Command;
@@ -363,6 +365,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(target_vendor = "apple", windows, target_os = "android"),
+        ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
+    )]
     fn plaintext_worker_clients_build_without_a_native_root_store() {
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_builds_without_native_roots"),
@@ -371,6 +377,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(target_vendor = "apple", windows, target_os = "android"),
+        ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
+    )]
     fn a_missing_root_store_is_named_when_tls_is_configured() {
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_builds_without_native_roots"),

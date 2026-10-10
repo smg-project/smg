@@ -3073,6 +3073,7 @@ async fn concurrent_streams_keep_their_own_chunk_sequences() {
     }
     let mut h = harness(model_info(), None).await;
     let mut streams = Vec::with_capacity(STREAMS);
+    let mut ids = BTreeSet::new();
     for i in 0..STREAMS {
         let mut request = generate_request(&format!("c{i}"), true, Vec::new());
         request.sampling_params.as_mut().unwrap().max_tokens = Some(STEPS);
@@ -3083,9 +3084,9 @@ async fn concurrent_streams_keep_their_own_chunk_sequences() {
                 .expect("generate")
                 .into_inner(),
         );
-    }
-    let mut ids = BTreeSet::new();
-    for _ in 0..STREAMS {
+        // Drain each ADD before opening the next stream: a socket buffer need
+        // not hold all 48 requests (in particular on macOS). All streams remain
+        // live together, and no output is sent until every request is received.
         ids.insert(recv_add(&mut h.engine_in).await.request_id);
     }
     assert_eq!(ids.len(), STREAMS);

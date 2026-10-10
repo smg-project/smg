@@ -1005,6 +1005,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(target_vendor = "apple", windows, target_os = "android"),
+        ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
+    )]
     fn the_gateway_client_builds_without_a_native_root_store() {
         use crate::worker::http_client::no_root_store;
 
