@@ -154,6 +154,7 @@ impl RouterConfigBuilder {
     pub fn power_of_two_policy(mut self, load_check_interval_secs: u64) -> Self {
         self.config.policy = PolicyConfig::PowerOfTwo {
             load_check_interval_secs,
+            load_metric: Default::default(),
         };
         self
     }

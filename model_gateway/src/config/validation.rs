@@ -654,6 +654,7 @@ impl ConfigValidator {
             }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
+                ..
             } => {
                 if *load_check_interval_secs == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -1281,7 +1282,8 @@ impl ConfigValidator {
 
         Self::validate_mtls(config)?;
 
-        if !has_service_discovery {
+        // Under dp_aware each URL registers one worker per DP rank.
+        if !has_service_discovery && !config.dp_aware {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
                 if worker_count < 2 {
@@ -2206,6 +2208,7 @@ mod tests {
             },
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             },
         );
 
@@ -2244,6 +2247,7 @@ mod tests {
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }),
             },
             PolicyConfig::Random, // Main policy as fallback
@@ -2255,7 +2259,7 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        let config = RouterConfig::new(
+        let mut config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
                 decode_urls: vec![
@@ -2264,6 +2268,7 @@ mod tests {
                 ],
                 prefill_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }), // Requires 2+ workers
                 decode_policy: None,
             },
@@ -2275,6 +2280,9 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+
+        config.dp_aware = true;
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]
@@ -2296,6 +2304,7 @@ mod tests {
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }),
             },
             PolicyConfig::Random, // Main policy as fallback

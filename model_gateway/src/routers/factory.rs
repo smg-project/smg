@@ -424,6 +424,7 @@ mod grpc_router_type_tests {
                 decode_urls: vec![],
                 encode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
+                    load_metric: Default::default(),
                 }),
                 prefill_policy: Some(PolicyConfig::RoundRobin),
                 decode_policy: Some(PolicyConfig::Passthrough),

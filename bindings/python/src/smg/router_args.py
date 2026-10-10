@@ -337,6 +337,7 @@ class RouterArgs:
     mesh_tls_ca_cert: str | None = None
     mesh_tls_cert: str | None = None
     mesh_tls_key: str | None = None
+    power_of_two_load_metric: str = "expected_wait"
 
     @staticmethod
     def add_cli_args(
@@ -615,6 +616,13 @@ class RouterArgs:
                 " reported waiting requests (plus dispatches since their last"
                 " poll) have reached this count; 0 disables"
             ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}power-of-two-load-metric",
+            type=str,
+            choices=["expected_wait", "requests", "least_requests"],
+            default=RouterArgs.power_of_two_load_metric,
+            help="What power_of_two compares: expected_wait, requests or least_requests",
         )
         routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
