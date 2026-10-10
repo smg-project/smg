@@ -13,7 +13,7 @@ use chrono::{
 use minijinja::{
     context,
     machinery::{
-        ast::{Call, CallArg, Expr, ForLoop, Macro, Set, Stmt},
+        ast::{BinOpKind, Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
         parse, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
@@ -121,11 +121,7 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
     }
 
     let has_enable_thinking = template.contains("enable_thinking");
-    // Trailing space prevents matching "thinking_mode", "thinking_budget", etc.
-    let has_thinking_var = template.contains("if thinking ")
-        || template.contains("thinking is ")
-        || template.contains("thinking ==")
-        || template.contains("set thinking ");
+    let has_thinking_var = mentions_thinking_variable(template);
 
     if !has_enable_thinking && !has_thinking_var {
         return (ThinkingToggle::None, None);
@@ -151,6 +147,28 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 
     // All other models default to thinking ON
     (ThinkingToggle::DefaultOn, Some(key_name))
+}
+
+/// Whether the template reads a variable named exactly `thinking` (`if
+/// thinking ...`, `thinking is ...`, `thinking == ...`, `set thinking ...`).
+/// The word must stand alone: `clear_thinking is defined` (GLM-5.3) or
+/// `thinking_mode`/`thinking_budget` name other variables, and a template
+/// that only reads those has no thinking switch.
+fn mentions_thinking_variable(template: &str) -> bool {
+    template.match_indices("thinking").any(|(start, matched)| {
+        let before = &template[..start];
+        let after = &template[start + matched.len()..];
+        if before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        after.starts_with(" is ")
+            || after.starts_with(" ==")
+            || ((before.ends_with("if ") || before.ends_with("set ")) && after.starts_with(' '))
+    })
 }
 
 /// Detect the content format expected by a Jinja2 chat template
@@ -518,18 +536,26 @@ fn iterates_message_content(ast: &Stmt<'_>) -> Result<bool, NotAName> {
 /// Whether `<think>` appears inside an `add_generation_prompt` if-block.
 struct ThinkDetector {
     think_in_prefill: bool,
+    /// Whether the `add_generation_prompt` if-block opens a `<think>` block
+    /// it does not close, so a completion starts inside reasoning.
+    prefill_opens_think_block: bool,
 }
 
 impl ThinkDetector {
-    fn run(ast: &Stmt<'_>) -> bool {
+    fn run(ast: &Stmt<'_>) -> (bool, bool) {
         let mut detector = Self {
             think_in_prefill: false,
+            prefill_opens_think_block: false,
         };
         detector.walk_stmt(ast);
-        detector.think_in_prefill
+        (
+            detector.think_in_prefill,
+            detector.prefill_opens_think_block,
+        )
     }
 
-    /// Check if an expression references a variable by name (walks through BinOp/UnaryOp).
+    /// Check if an expression references a variable by name (walks through
+    /// BinOp/UnaryOp/Test).
     fn expr_references_var(expr: &Expr, name: &str) -> bool {
         match expr {
             Expr::Var(v) => v.id == name,
@@ -538,6 +564,7 @@ impl ThinkDetector {
                     || Self::expr_references_var(&b.right, name)
             }
             Expr::UnaryOp(u) => Self::expr_references_var(&u.expr, name),
+            Expr::Test(t) => Self::expr_references_var(&t.expr, name),
             _ => false,
         }
     }
@@ -566,6 +593,125 @@ impl ThinkDetector {
         false
     }
 
+    /// Whether a `<think>` block is open after the generation prompt an `if`
+    /// writes, starting from `open` (the state the generation-prompt blocks
+    /// before it left; a template may write the prompt in several of them).
+    /// A block whose condition is decided by `add_generation_prompt` alone
+    /// (see [`Self::generation_prompt_truth`]) carries the state through the
+    /// body that runs for a generation prompt; a block whose condition also
+    /// depends on something else may run either body, so the block is open
+    /// after it when either body leaves it open; `None` for a condition that
+    /// does not mention the variable.
+    fn generation_prompt_open_after(ic: &IfCond, open: bool) -> Option<bool> {
+        match Self::generation_prompt_truth(&ic.expr) {
+            Some(true) => Some(Self::think_block_open_after(&ic.true_body, open)),
+            Some(false) => Some(Self::think_block_open_after(&ic.false_body, open)),
+            None if Self::expr_references_var(&ic.expr, "add_generation_prompt") => Some(
+                Self::think_block_open_after(&ic.true_body, open)
+                    || Self::think_block_open_after(&ic.false_body, open),
+            ),
+            None => None,
+        }
+    }
+
+    /// The truth of a condition when `add_generation_prompt` is true: `Some`
+    /// when the variable alone decides it (the variable itself, `not`, `and`,
+    /// `or`, `==` / `!=` against a boolean, `is true` / `is false` /
+    /// `is defined`), `None` when it depends on anything else.
+    fn generation_prompt_truth(expr: &Expr) -> Option<bool> {
+        match expr {
+            Expr::Var(v) if v.id == "add_generation_prompt" => Some(true),
+            Expr::UnaryOp(u) if matches!(u.op, UnaryOpKind::Not) => {
+                Self::generation_prompt_truth(&u.expr).map(|truth| !truth)
+            }
+            Expr::BinOp(b) => match b.op {
+                BinOpKind::ScAnd => match (
+                    Self::generation_prompt_truth(&b.left),
+                    Self::generation_prompt_truth(&b.right),
+                ) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                BinOpKind::ScOr => match (
+                    Self::generation_prompt_truth(&b.left),
+                    Self::generation_prompt_truth(&b.right),
+                ) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+                BinOpKind::Eq | BinOpKind::Ne => {
+                    let (side, constant) = match (&b.left, &b.right) {
+                        (side, Expr::Const(constant)) | (Expr::Const(constant), side) => {
+                            (side, constant)
+                        }
+                        _ => return None,
+                    };
+                    if !matches!(constant.value.kind(), ValueKind::Bool) {
+                        return None;
+                    }
+                    let equal = Self::generation_prompt_truth(side)? == constant.value.is_true();
+                    Some(if matches!(b.op, BinOpKind::Eq) {
+                        equal
+                    } else {
+                        !equal
+                    })
+                }
+                _ => None,
+            },
+            Expr::Test(t) => {
+                let truth = Self::generation_prompt_truth(&t.expr)?;
+                match t.name {
+                    "defined" => Some(true),
+                    "undefined" | "none" => Some(false),
+                    "true" => Some(truth),
+                    "false" => Some(!truth),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the literal text a list of statements writes leaves a
+    /// `<think>` block open at its end, starting from `open`: the text is
+    /// read in order, a `<think>` opens and a `</think>` closes; either
+    /// branch of a nested `if` may run, so the block is open after it when
+    /// either branch leaves it open, and text after the `if` still counts.
+    /// A closed `<think>\n\n</think>` (a non-thinking template) opens nothing.
+    fn think_block_open_after(stmts: &[Stmt], mut open: bool) -> bool {
+        for stmt in stmts {
+            match stmt {
+                Stmt::EmitRaw(raw) => open = Self::think_block_open_after_text(raw.raw, open),
+                Stmt::EmitExpr(e) => {
+                    if let Expr::Const(c) = &e.expr {
+                        if let Some(s) = c.value.as_str() {
+                            open = Self::think_block_open_after_text(s, open);
+                        }
+                    }
+                }
+                Stmt::IfCond(ic) => {
+                    open = Self::think_block_open_after(&ic.true_body, open)
+                        || Self::think_block_open_after(&ic.false_body, open);
+                }
+                _ => {}
+            }
+        }
+        open
+    }
+
+    /// `open` after `text`: the later of its last `<think>` and its last
+    /// `</think>` decides; a text with neither leaves it as it was.
+    fn think_block_open_after_text(text: &str, open: bool) -> bool {
+        match (text.rfind("<think>"), text.rfind("</think>")) {
+            (None, None) => open,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(start), Some(end)) => start > end,
+        }
+    }
+
     fn walk_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Template(t) => {
@@ -584,6 +730,11 @@ impl ThinkDetector {
                     && Self::expr_references_var(&ic.expr, "add_generation_prompt")
                 {
                     self.think_in_prefill = Self::body_has_think_tag(&ic.true_body);
+                }
+                if let Some(open) =
+                    Self::generation_prompt_open_after(ic, self.prefill_opens_think_block)
+                {
+                    self.prefill_opens_think_block = open;
                 }
 
                 for b in &ic.true_body {
@@ -606,19 +757,23 @@ fn detect_all(
     bool,
     ThinkingToggle,
     Option<ThinkingKeyName>,
+    bool,
 ) {
     let (thinking_toggle, thinking_key_name) = detect_thinking_toggle(template);
-    let (content_format, think_in_prefill) = detect_all_with_ast(template);
+    let (content_format, think_in_prefill, prefill_opens_think_block) =
+        detect_all_with_ast(template);
     (
         content_format,
         think_in_prefill,
         thinking_toggle,
         thinking_key_name,
+        prefill_opens_think_block,
     )
 }
 
-/// AST detection of content format and think-in-prefill.
-fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool) {
+/// AST detection of content format, think-in-prefill and whether the
+/// generation prompt leaves a think block open.
+fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool, bool) {
     let template = plain_generation_blocks(template);
     let ast = match parse(
         &template,
@@ -627,14 +782,15 @@ fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool) {
         WhitespaceConfig::default(),
     ) {
         Ok(ast) => ast,
-        Err(_) => return (ChatTemplateContentFormat::String, false),
+        Err(_) => return (ChatTemplateContentFormat::String, false, false),
     };
 
     let content_format = match iterates_message_content(&ast) {
         Ok(true) => ChatTemplateContentFormat::OpenAI,
         Ok(false) | Err(NotAName) => ChatTemplateContentFormat::String,
     };
-    (content_format, ThinkDetector::run(&ast))
+    let (think_in_prefill, prefill_opens_think_block) = ThinkDetector::run(&ast);
+    (content_format, think_in_prefill, prefill_opens_think_block)
 }
 
 /// Parameters for chat template application
@@ -1504,6 +1660,10 @@ pub struct ChatTemplateState {
     thinking_key_name: Option<ThinkingKeyName>,
     /// Whether the template injects `<think>` in the generation prompt.
     think_in_prefill: bool,
+    /// Whether the generation prompt opens a `<think>` block it does not
+    /// close, so a completion starts inside reasoning; a closed block (a
+    /// non-thinking template) does not count.
+    prefill_opens_think_block: bool,
     /// Whether the template has a branch for the `developer` role. When it
     /// has none, `apply` renders developer messages as system messages, as
     /// the engine's HF renderer does, instead of letting the template drop them.
@@ -1523,8 +1683,13 @@ impl std::fmt::Debug for ChatTemplateState {
 
 impl ChatTemplateState {
     pub fn new(template: Option<String>) -> Result<Self> {
-        let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
-            template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
+        let (
+            content_format,
+            think_in_prefill,
+            thinking_toggle,
+            thinking_key_name,
+            prefill_opens_think_block,
+        ) = template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
         let developer_role_supported = template
             .as_deref()
             .is_none_or(detect_developer_role_support);
@@ -1535,6 +1700,7 @@ impl ChatTemplateState {
             thinking_toggle,
             thinking_key_name,
             think_in_prefill,
+            prefill_opens_think_block,
             developer_role_supported,
         })
     }
@@ -1550,6 +1716,7 @@ impl ChatTemplateState {
             thinking_toggle: ThinkingToggle::None,
             thinking_key_name: None,
             think_in_prefill: false,
+            prefill_opens_think_block: false,
             developer_role_supported: true,
         }
     }
@@ -1639,8 +1806,13 @@ impl ChatTemplateState {
     }
 
     pub fn set(&mut self, template: String) -> Result<()> {
-        let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
-            detect_all(&template);
+        let (
+            content_format,
+            think_in_prefill,
+            thinking_toggle,
+            thinking_key_name,
+            prefill_opens_think_block,
+        ) = detect_all(&template);
         let developer_role_supported = detect_developer_role_support(&template);
         let env = build_environment(template)?;
         self.developer_role_supported = developer_role_supported;
@@ -1648,6 +1820,7 @@ impl ChatTemplateState {
         self.thinking_toggle = thinking_toggle;
         self.thinking_key_name = thinking_key_name;
         self.think_in_prefill = think_in_prefill;
+        self.prefill_opens_think_block = prefill_opens_think_block;
         self.env = Some(env);
         Ok(())
     }
@@ -1682,6 +1855,12 @@ impl ChatTemplateState {
 
     pub fn think_in_prefill(&self) -> bool {
         self.think_in_prefill
+    }
+
+    /// Whether the generation prompt opens a `<think>` block it does not
+    /// close (see `Tokenizer::prefill_opens_think_block`).
+    pub fn prefill_opens_think_block(&self) -> bool {
+        self.prefill_opens_think_block
     }
 }
 
@@ -1928,6 +2107,152 @@ mod tests {
             .apply(&messages, ChatTemplateParams::default())
             .unwrap();
         assert_eq!(rendered, "<dev>Be terse.</dev><usr>hi</usr>");
+    }
+
+    /// A non-thinking template without a switch whose generation prompt
+    /// writes an empty, closed think block: `<think>` is in the prefill, but
+    /// the completion starts in content, so the parser must not be armed.
+    #[test]
+    fn a_closed_think_block_in_the_generation_prompt_does_not_open_reasoning() {
+        let closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                      {%- if add_generation_prompt -%}<|im_start|>assistant\n<think>\n\n</think>\n\n{%- endif -%}";
+        let state = ChatTemplateState::new(Some(closed.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+        assert!(
+            state.think_in_prefill(),
+            "the loose flag still sees the tag"
+        );
+        assert!(!state.prefill_opens_think_block());
+
+        // Opened in one branch, closed in another: the open branch counts.
+        let branched = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|>\
+                        {%- if clear_thinking is defined and clear_thinking -%}<think></think>\
+                        {%- else -%}<think>{%- endif -%}{%- endif -%}";
+        let state = ChatTemplateState::new(Some(branched.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // Both branches open a block and the prompt closes it after them.
+        let closed_after_branches = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|>\
+                        {%- if clear_thinking is defined and clear_thinking -%}<think>\
+                        {%- else -%}<think>\n{%- endif -%}</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(closed_after_branches.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+
+        // A block opened only when there is no generation prompt is not the
+        // prompt's; the else branch of that condition is.
+        let not_prompt = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not add_generation_prompt -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(not_prompt.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let else_prompt = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not add_generation_prompt -%}done{%- else -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(else_prompt.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // A comparison is not a positive reference either: this true body
+        // runs without a generation prompt.
+        let compared = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt == false -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(compared.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let conjunction = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt and messages -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(conjunction.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // The prompt written in two generation-prompt blocks: the second may
+        // close what the first opened, or open what the first left closed.
+        let open_then_closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt -%}\n\n</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(open_then_closed.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let closed_then_open = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think></think>{%- endif -%}\
+                        {%- if add_generation_prompt -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(closed_then_open.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // Two blocks that run on different requests (a conjunction each):
+        // either may leave the block open, so the prompt counts as opening
+        // whichever order they come in; a block that always runs still closes
+        // what an earlier one opened.
+        let exclusive = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt and thinking -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt and not thinking -%}<|assistant|><think></think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(exclusive.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+        let maybe_then_closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt and thinking -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt -%}</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(maybe_then_closed.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+
+        // Conditions the variable alone decides: `not (add_generation_prompt
+        // == false)` (the parse of the unparenthesised form) and
+        // `add_generation_prompt == true` run their true body for a
+        // generation prompt; `add_generation_prompt or x` always runs too, so
+        // it closes what an earlier block opened; `not (add_generation_prompt
+        // or x)` always runs its false body.
+        let negated_comparison = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not add_generation_prompt == false -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(negated_comparison.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+        let eq_true = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt == true -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(eq_true.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+        let or_closes = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt or continue_final_message -%}</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(or_closes.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let not_or = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not (add_generation_prompt or continue_final_message) -%}done\
+                        {%- else -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(not_or.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // A test on the variable inside a condition something else also
+        // decides: the block may run, so what it opens counts.
+        let is_true_and = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt is true and not tools -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(is_true_and.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+    }
+
+    #[test]
+    fn clear_thinking_is_not_a_thinking_switch() {
+        // GLM-5.3: the template reads `clear_thinking` and `reasoning_effort`
+        // and always opens the think block; it has no switch.
+        let template =
+            "{%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}\
+                        {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}";
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::None, None)
+        );
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+        assert!(state.think_in_prefill());
+        assert!(state.prefill_opens_think_block());
+
+        // A real `thinking` variable is still a switch, in each spelling.
+        for template in [
+            "{% if thinking is defined and not thinking %}off{% endif %}",
+            "{% if thinking == false %}off{% endif %}",
+            "{% if thinking %}on{% endif %}",
+            "{% set thinking = thinking %}",
+        ] {
+            assert_eq!(
+                detect_thinking_toggle(template),
+                (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking)),
+                "{template}"
+            );
+        }
     }
 
     #[test]
