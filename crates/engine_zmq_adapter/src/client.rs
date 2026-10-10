@@ -1010,7 +1010,12 @@ impl ZmqEngineClient {
 
 pub(crate) fn zmq_status(error: engine_zmq_client::Error) -> tonic::Status {
     match error {
-        engine_zmq_client::Error::EngineCoreDead => tonic::Status::unavailable(error.to_string()),
+        // The engine is gone, or is not taking input right now: either way
+        // this request is better served elsewhere.
+        engine_zmq_client::Error::EngineCoreDead
+        | engine_zmq_client::Error::EngineInputBlocked { .. } => {
+            tonic::Status::unavailable(error.to_string())
+        }
         other => tonic::Status::internal(other.to_string()),
     }
 }

@@ -212,8 +212,14 @@ struct RoutingState {
 }
 
 struct ClientInner<P: EngineProtocol> {
-    /// Shared input ROUTER send half (serialized across concurrent submits).
-    input_send: tokio::sync::Mutex<RouterSendHalf>,
+    /// Shared input ROUTER send half, serialized across concurrent submits and
+    /// shared with the hand-off tasks [`Self::send_to_engine`] spawns, which
+    /// outlive a caller that stopped waiting for a frame the engine is not
+    /// reading yet.
+    input_send: Arc<tokio::sync::Mutex<RouterSendHalf>>,
+    /// How long a caller waits for the engine to accept one frame:
+    /// [`ENGINE_SEND_TIMEOUT`] unless [`Client::set_send_timeout`] changed it.
+    send_timeout: Mutex<Duration>,
     engines: Vec<ConnectedEngine>,
     registry: Mutex<RequestRegistry<P::Output>>,
     routing: Mutex<RoutingState>,
@@ -354,13 +360,22 @@ impl<P: EngineProtocol> ClientInner<P> {
 
     /// Send an encoded request frame to one engine over the shared input socket.
     ///
-    /// The send is bounded by [`ENGINE_SEND_TIMEOUT`]: a healthy engine drains its
-    /// input continuously, so a send that cannot complete in that window means the
-    /// engine's event loop is wedged. Because the timeout cancels the send
-    /// mid-frame (leaving the shared socket unusable), the timeout is fatal — it
-    /// fails every in-flight request and closes the client so health checks evict
-    /// this worker, instead of the untimed send freezing the dispatcher (starving
-    /// the death watchdog) and every concurrent submit behind the shared lock.
+    /// The caller waits at most the send timeout ([`ENGINE_SEND_TIMEOUT`] by
+    /// default) for the engine to accept the frame. A healthy engine drains
+    /// its input continuously, so a frame not accepted in that window is
+    /// behind input the engine is not reading (a frozen or stalled core: the
+    /// socket buffer absorbs small frames meanwhile, but not a large prompt),
+    /// and the caller's request fails with [`Error::EngineInputBlocked`]. That
+    /// is the failure of one request, not of the client: the requests the
+    /// engine already holds keep their streams, and the client closes only on
+    /// the signs of the engine's death the output side sees.
+    ///
+    /// The hand-off itself runs as its own task, so a caller that stopped
+    /// waiting never cancels a write half-way through the socket's buffer:
+    /// the frame stays queued, whole and in submission order (the lock is
+    /// fair), and is delivered when the engine reads again. A caller that gave
+    /// up on an add-request therefore aborts it on the engine as well (see
+    /// [`Client::submit_with_aux`]).
     async fn send_to_engine(
         &self,
         engine_id: &EngineId,
@@ -368,25 +383,42 @@ impl<P: EngineProtocol> ClientInner<P> {
         payload: Vec<u8>,
         aux_frames: Vec<Bytes>,
     ) -> Result<()> {
-        let mut input_send = self.input_send.lock().await;
-        let send = send_message(
-            &mut input_send,
-            engine_id,
-            request_type,
-            payload.into(),
-            aux_frames,
-        );
-        match tokio::time::timeout(ENGINE_SEND_TIMEOUT, send).await {
-            Ok(result) => result,
+        let timeout = *self.send_timeout.lock();
+        let input_send = Arc::clone(&self.input_send);
+        let engine_id = engine_id.clone();
+        let (done_tx, done_rx) = oneshot::channel();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the hand-off must outlive a caller that stopped waiting: it ends \
+                      with the frame written or the socket failed"
+        )]
+        let hand_off = tokio::spawn(async move {
+            let mut input_send = input_send.lock().await;
+            let result = send_message(
+                &mut input_send,
+                &engine_id,
+                request_type,
+                payload.into(),
+                aux_frames,
+            )
+            .await;
+            drop(input_send);
+            // A caller that stopped waiting has failed its request already.
+            let _ = done_tx.send(result);
+        });
+        drop(hand_off);
+        match tokio::time::timeout(timeout, done_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_task_gone)) => Err(Error::ClientClosed {
+                message: "the input send task ended without a result".to_string(),
+            }),
             Err(_elapsed) => {
                 warn!(
-                    timeout = ?ENGINE_SEND_TIMEOUT,
-                    "engine input send timed out; treating engine as dead"
+                    ?timeout,
+                    "engine did not accept a request frame within the send window; \
+                     failing this request, the frame is delivered when the engine reads again"
                 );
-                self.registry
-                    .lock()
-                    .fail_all(Arc::new(Error::EngineCoreDead));
-                Err(Error::EngineCoreDead)
+                Err(Error::EngineInputBlocked { timeout })
             }
         }
     }
@@ -517,7 +549,8 @@ impl<P: EngineProtocol> Client<P> {
 
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(ClientInner {
-            input_send: tokio::sync::Mutex::new(input_send),
+            input_send: Arc::new(tokio::sync::Mutex::new(input_send)),
+            send_timeout: Mutex::new(ENGINE_SEND_TIMEOUT),
             engines,
             registry: Mutex::new(RequestRegistry::default()),
             routing: Mutex::new(RoutingState::default()),
@@ -556,6 +589,14 @@ impl<P: EngineProtocol> Client<P> {
     /// closing. No RPC — this is a local liveness flag.
     pub fn is_alive(&self) -> bool {
         !self.inner.registry.lock().closed
+    }
+
+    /// Bound how long a submit, abort or utility call waits for the engine to
+    /// accept its frame on the input socket ([`ENGINE_SEND_TIMEOUT`] by
+    /// default). Past it the call fails with [`Error::EngineInputBlocked`];
+    /// the frame is still delivered when the engine reads again.
+    pub fn set_send_timeout(&self, timeout: Duration) {
+        *self.inner.send_timeout.lock() = timeout;
     }
 
     /// The latest per-rank load for one engine index (DP routing signal), if
@@ -619,6 +660,12 @@ impl<P: EngineProtocol> Client<P> {
             // Roll back the registry entry so a failed send doesn't leak it.
             self.inner.registry.lock().remove_all([&request_id]);
             self.inner.release_one(&engine_id, &request_id);
+            if matches!(error, Error::EngineInputBlocked { .. }) {
+                // The frame is still queued for the engine; the abort queues
+                // behind it, so the engine drops the request on arrival
+                // instead of serving it for nobody.
+                let _ = self.inner.abort_tx.send((engine_id, request_id));
+            }
             return Err(error);
         }
 
@@ -720,11 +767,12 @@ impl<P: EngineProtocol> Drop for PendingUtilityCall<'_, P> {
     }
 }
 
-/// Maximum time to wait for a single request frame to be accepted by an engine's
-/// input socket before treating the engine as wedged. A healthy engine drains its
-/// input continuously; a send that blocks this long means its event loop is stuck.
-/// Bounds an otherwise unbounded await under the shared input lock (see
-/// [`ClientInner::send_to_engine`]).
+/// How long a caller waits for the engine to accept one request frame on the
+/// input socket. A healthy engine drains its input continuously; a frame not
+/// accepted in this window is behind input the engine is not reading, and the
+/// caller's request fails with [`Error::EngineInputBlocked`] while the frame
+/// stays queued for the engine's return (see [`ClientInner::send_to_engine`]).
+/// The client itself stays up: its death is decided on the output side.
 const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// If the engine emits no output for this long while requests are in flight, the
@@ -818,13 +866,22 @@ async fn run_dispatcher<P: EngineProtocol>(
                 if let Some((engine_id, request_id)) = abort {
                     inner.registry.lock().remove_all([&request_id]);
                     inner.release_one(&engine_id, &request_id);
-                    if let Err(error) = inner.abort(&engine_id, &request_id).await {
-                        warn!(%error, %request_id, "failed to send abort");
-                        if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
-                            // The engine is dead — send_to_engine already failed all
-                            // in-flight requests; stop dispatching.
+                    match inner.abort(&engine_id, &request_id).await {
+                        Ok(()) => {}
+                        // The abort is queued behind input the engine is not
+                        // reading; it goes out when the engine reads again.
+                        Err(Error::EngineInputBlocked { .. }) => {
+                            warn!(%request_id, "abort waits on a blocked engine input");
+                        }
+                        Err(error @ (Error::EngineCoreDead | Error::Transport(_))) => {
+                            // The socket is gone with the engine: fail what is
+                            // in flight and stop dispatching.
+                            warn!(%error, %request_id, "failed to send abort; engine gone");
+                            inner.registry.lock().fail_all(Arc::new(error));
+                            inner.routing.lock().inflight.clear();
                             return;
                         }
+                        Err(error) => warn!(%error, %request_id, "failed to send abort"),
                     }
                 }
             }
@@ -1913,5 +1970,186 @@ mod tests {
         );
         assert!(matches!(result, Err(Error::Shared(_))), "{result:?}");
         assert!(!client.is_alive());
+    }
+    /// The window a caller waits for the engine to accept a frame in the
+    /// frozen-core cases below: short, so they run in milliseconds.
+    const SEND_WINDOW: Duration = Duration::from_millis(300);
+
+    /// An add-request no socket buffer absorbs: a 64 MiB aux frame stands in
+    /// for the huge prompt of production.
+    fn large_request(request_id: &str) -> (EngineCoreRequest, Vec<Bytes>) {
+        (
+            request_for(request_id, 0),
+            vec![Bytes::from(vec![0u8; 64 << 20])],
+        )
+    }
+
+    /// A finished one-token output for `request_id` on rank 0.
+    fn finished_output(request_id: &str) -> Vec<Bytes> {
+        batch(
+            0,
+            EngineCoreOutput {
+                request_id: request_id.into(),
+                new_token_ids: vec![7],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Read the engine's input until the abort of `request_id` arrives;
+    /// everything received, in order, as (kind, request id).
+    async fn drain_until_aborted(
+        engine: &mut MockEngine,
+        request_id: &str,
+    ) -> Vec<(&'static str, String)> {
+        let mut seen = Vec::new();
+        loop {
+            match engine.recv().await.unwrap() {
+                EngineInbound::Add(request) => seen.push(("add", request.request_id)),
+                EngineInbound::Abort(ids) => {
+                    let done = ids.iter().any(|id| id == request_id);
+                    seen.extend(ids.into_iter().map(|id| ("abort", id)));
+                    if done {
+                        return seen;
+                    }
+                }
+                other => panic!("unexpected inbound {other:?}"),
+            }
+        }
+    }
+
+    /// A small request to an engine that is not reading its input (a frozen
+    /// core) fits the socket buffer and simply waits: the engine serves it
+    /// when it reads again, and the client never closed.
+    #[tokio::test]
+    async fn a_small_request_to_a_frozen_engine_waits_and_is_served_on_resume() {
+        let (client, mut engine, _ns) = connect().await;
+        client.set_send_timeout(SEND_WINDOW);
+        // The engine reads nothing until told to below.
+        let mut stream = client.submit(request_for("req-small", 0)).await.unwrap();
+        tokio::time::sleep(SEND_WINDOW).await;
+        assert!(
+            client.is_alive(),
+            "the frame fit the socket buffer: nothing failed"
+        );
+
+        // The engine resumes: the frame is there and the request is served.
+        let inbound = engine.recv().await.unwrap();
+        assert!(
+            matches!(inbound, EngineInbound::Add(ref request) if request.request_id == "req-small"),
+            "{inbound:?}"
+        );
+        engine
+            .send_output(finished_output("req-small"))
+            .await
+            .unwrap();
+        assert!(stream.next().await.unwrap().unwrap().finished());
+        assert!(stream.next().await.is_none());
+        assert!(client.is_alive());
+    }
+
+    /// A frame the engine is not reading and the socket buffer cannot absorb
+    /// fails its own request once the send window passes, and nothing else:
+    /// the client stays up, the request already in flight keeps its stream,
+    /// a request behind the blocked one fails within the window too instead
+    /// of hanging, and every queued frame still reaches the engine when it
+    /// reads again, each abandoned add-request followed by its abort.
+    #[tokio::test]
+    async fn a_large_request_a_frozen_engine_does_not_read_fails_alone() {
+        let (client, mut engine, _ns) = connect().await;
+        client.set_send_timeout(SEND_WINDOW);
+        let mut in_flight = client.submit(request_for("req-small", 0)).await.unwrap();
+
+        let (request, aux) = large_request("req-large");
+        let started = std::time::Instant::now();
+        let error = client
+            .submit_with_aux(request, aux)
+            .await
+            .err()
+            .expect("the engine is not reading a frame this large");
+        let waited = started.elapsed();
+        assert!(
+            matches!(error, Error::EngineInputBlocked { timeout } if timeout == SEND_WINDOW),
+            "{error:?}"
+        );
+        assert!(
+            waited >= SEND_WINDOW && waited < TIMEOUT,
+            "waited {waited:?}"
+        );
+        assert!(client.is_alive(), "one request failed, not the client");
+
+        let error = client
+            .submit(request_for("req-behind", 0))
+            .await
+            .err()
+            .expect("the input is still blocked");
+        assert!(
+            matches!(error, Error::EngineInputBlocked { .. }),
+            "{error:?}"
+        );
+        assert!(client.is_alive());
+
+        let seen = drain_until_aborted(&mut engine, "req-behind").await;
+        let position = |kind: &str, id: &str| {
+            seen.iter()
+                .position(|(k, i)| *k == kind && i == id)
+                .unwrap_or_else(|| panic!("no {kind} of {id} in {seen:?}"))
+        };
+        assert_eq!(position("add", "req-small"), 0, "{seen:?}");
+        assert!(
+            position("add", "req-large") < position("abort", "req-large"),
+            "{seen:?}"
+        );
+        assert!(
+            position("add", "req-behind") < position("abort", "req-behind"),
+            "{seen:?}"
+        );
+
+        engine
+            .send_output(finished_output("req-small"))
+            .await
+            .unwrap();
+        assert!(in_flight.next().await.unwrap().unwrap().finished());
+        assert!(client.is_alive());
+    }
+
+    /// Once the engine reads again, the client (never closed) serves the next
+    /// request as before.
+    #[tokio::test]
+    async fn a_request_after_the_engine_resumes_is_served() {
+        let (client, mut engine, _ns) = connect().await;
+        client.set_send_timeout(SEND_WINDOW);
+        let (request, aux) = large_request("req-large");
+        let error = client
+            .submit_with_aux(request, aux)
+            .await
+            .err()
+            .expect("the engine is not reading a frame this large");
+        assert!(
+            matches!(error, Error::EngineInputBlocked { .. }),
+            "{error:?}"
+        );
+
+        // The engine resumes and drains what was queued: the add and its abort.
+        let seen = drain_until_aborted(&mut engine, "req-large").await;
+        assert_eq!(
+            seen.iter().filter(|(kind, _)| *kind == "add").count(),
+            1,
+            "{seen:?}"
+        );
+
+        let mut stream = client.submit(request_for("req-next", 0)).await.unwrap();
+        let inbound = engine.recv().await.unwrap();
+        assert!(
+            matches!(inbound, EngineInbound::Add(ref request) if request.request_id == "req-next"),
+            "{inbound:?}"
+        );
+        engine
+            .send_output(finished_output("req-next"))
+            .await
+            .unwrap();
+        assert!(stream.next().await.unwrap().unwrap().finished());
+        assert!(client.is_alive());
     }
 }
