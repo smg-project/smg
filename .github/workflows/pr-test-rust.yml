@@ -1006,7 +1006,6 @@ jobs:
       runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/router
-      test_filter: "--ignore=e2e_test/router/test_pd_mmlu.py"
       min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
