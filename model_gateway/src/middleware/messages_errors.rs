@@ -10,7 +10,7 @@ use axum::{
     body::{Body, Bytes},
     extract::Request,
     http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
         HeaderMap, HeaderValue, StatusCode,
     },
     middleware::Next,
@@ -37,8 +37,9 @@ pub fn wants_messages_envelope(headers: &HeaderMap, path: &str) -> bool {
     is_messages_route(path) || headers.contains_key("anthropic-version")
 }
 
-/// Anthropic's `error.type` for a status: the documented vocabulary, the
-/// other 4xx as `invalid_request_error`, the other 5xx as `api_error`.
+/// Anthropic's `error.type` for a status: the documented vocabulary (504 is
+/// its `timeout_error`), the other 4xx as `invalid_request_error`, the other
+/// 5xx as `api_error`.
 pub fn messages_error_type(status: StatusCode) -> &'static str {
     match status {
         StatusCode::UNAUTHORIZED => "authentication_error",
@@ -48,6 +49,7 @@ pub fn messages_error_type(status: StatusCode) -> &'static str {
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
         StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
         status if status.as_u16() == 529 => "overloaded_error",
+        StatusCode::GATEWAY_TIMEOUT => "timeout_error",
         status if status.is_server_error() => "api_error",
         _ => "invalid_request_error",
     }
@@ -55,7 +57,10 @@ pub fn messages_error_type(status: StatusCode) -> &'static str {
 
 /// Re-shapes every error answered on a Messages route into the Messages
 /// API's envelope. Sits outside the route's other middleware so that an
-/// authentication, admission or body-size refusal is covered as well.
+/// authentication, admission or body-timeout refusal is covered as well, and
+/// once more at the edge, outside the body-size limit, so a declared
+/// over-limit length (refused before any route layer runs) is covered too;
+/// a body already in the shape passes the second pass unchanged.
 pub async fn messages_error_envelope_middleware(request: Request, next: Next) -> Response {
     if !is_messages_route(request.uri().path()) {
         return next.run(request).await;
@@ -108,6 +113,10 @@ pub async fn into_messages_envelope(response: Response, request_id: String) -> R
     parts
         .headers
         .insert(CONTENT_LENGTH, HeaderValue::from(json.len()));
+    // The body is rebuilt as plain JSON: an encoding or framing the inside
+    // declared for its own body no longer applies.
+    parts.headers.remove(CONTENT_ENCODING);
+    parts.headers.remove(TRANSFER_ENCODING);
     Response::from_parts(parts, Body::from(json))
 }
 
@@ -212,6 +221,17 @@ mod tests {
             )
             .route("/v1/messages/ok", get(|| async { Json(json!({"id": "msg_1"})) }))
             .route(
+                "/v1/messages/encoded",
+                get(|| async {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        [(CONTENT_ENCODING, "gzip")],
+                        Json(json!({"error": {"message": "upstream body", "type": "api_error"}})),
+                    )
+                        .into_response()
+                }),
+            )
+            .route(
                 "/v1/chat/completions",
                 post(|| async { route_error::bad_request("json_parse_error", "nope") }),
             )
@@ -303,6 +323,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rebuilt_body_carries_no_stale_encoding_headers() {
+        let (status, headers, json) = call("GET", "/v1/messages/encoded", &[]).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_envelope(&json, "api_error", "upstream body");
+        assert!(headers.get(CONTENT_ENCODING).is_none(), "{headers:?}");
+        assert!(headers.get(TRANSFER_ENCODING).is_none(), "{headers:?}");
+    }
+
+    #[tokio::test]
     async fn request_id_is_the_one_echoed_in_the_header() {
         let (_, headers, json) = call("POST", "/v1/messages", &[]).await;
         assert_eq!(
@@ -354,7 +383,7 @@ mod tests {
             (StatusCode::NOT_IMPLEMENTED, "api_error"),
             (StatusCode::BAD_GATEWAY, "api_error"),
             (StatusCode::SERVICE_UNAVAILABLE, "overloaded_error"),
-            (StatusCode::GATEWAY_TIMEOUT, "api_error"),
+            (StatusCode::GATEWAY_TIMEOUT, "timeout_error"),
             (StatusCode::from_u16(529).unwrap(), "overloaded_error"),
         ] {
             assert_eq!(messages_error_type(status), expected, "{status}");

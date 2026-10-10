@@ -1168,6 +1168,12 @@ where
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
+        // The Messages envelope once more, outside the body-size limit: a
+        // declared over-limit length is refused by the limit layer before any
+        // route layer runs, and still leaves in the envelope.
+        .layer(axum::middleware::from_fn(
+            middleware::messages_error_envelope_middleware,
+        ))
         .layer(axum::middleware::from_fn(
             middleware::trace_context_response,
         ))
@@ -2001,14 +2007,23 @@ mod tests {
         use tower::ServiceExt;
 
         let app = attach_edge_layers(
-            Router::new().route(
-                "/v1/chat/completions",
-                post(
-                    |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
-                        StatusCode::OK
-                    },
+            Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
+                )
+                .route(
+                    "/v1/messages",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
                 ),
-            ),
             1024,
             InFlightRequestTracker::new(),
             vec![],
@@ -2053,6 +2068,32 @@ mod tests {
             pulled <= 5 && pulled < total_frames,
             "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
         );
+
+        // Declared length on a Messages route: refused by the limit layer
+        // before the body, and still the Messages envelope.
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_LENGTH, oversized.len())
+                    .body(Body::from(oversized.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["type"], "error", "{json}");
+        assert_eq!(json["error"]["type"], "request_too_large", "{json}");
+        assert_eq!(json["request_id"], request_id, "{json}");
 
         // Declared length: refused by the limit layer before the body.
         let response = app
