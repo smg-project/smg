@@ -318,6 +318,21 @@ impl HuggingFaceTokenizer {
         })
     }
 
+    fn byte_fallback_piece(&self, token_id: TokenIdType, skip_special_tokens: bool) -> bool {
+        self.reverse_vocab.get(&token_id).is_some_and(|token| {
+            let byte_token = token.len() == 6
+                && token.starts_with("<0x")
+                && token.ends_with('>')
+                && token.as_bytes()[3..5].iter().all(u8::is_ascii_hexdigit);
+            byte_token
+                || (skip_special_tokens
+                    && self
+                        .tokenizer
+                        .get_added_vocabulary()
+                        .is_special_token(token))
+        })
+    }
+
     /// Check if the tokenizer's post_processor adds special tokens (e.g., BOS)
     fn tokenizer_adds_special_tokens(tokenizer: &HfTokenizer) -> bool {
         tokenizer
@@ -615,24 +630,21 @@ impl Decoder for HuggingFaceTokenizer {
         if self.has_byte_fallback {
             if prefix.is_empty() && *prefix_index > 0 {
                 let prefill = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
-                if !prefill.ends_with('�') {
+                if prefill.ends_with('�') {
+                    // Keep an unfinished seed byte run as decode context, but
+                    // suppress the stable prompt text before it.
+                    *prefix_index = ids[..*prefix_index]
+                        .iter()
+                        .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
+                        .map_or(0, |index| index + 1);
+                    *prefix = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+                } else {
                     *prefix = prefill;
                 }
             }
-            if let Some(token) = self.reverse_vocab.get(&token_id) {
-                let byte_token = token.len() == 6
-                    && token.starts_with("<0x")
-                    && token.ends_with('>')
-                    && token.as_bytes()[3..5].iter().all(u8::is_ascii_hexdigit);
-                let skipped = skip_special_tokens
-                    && self
-                        .tokenizer
-                        .get_added_vocabulary()
-                        .is_special_token(token);
-                if byte_token || skipped {
-                    ids.push(token_id);
-                    return Ok(None);
-                }
+            if self.byte_fallback_piece(token_id, skip_special_tokens) {
+                ids.push(token_id);
+                return Ok(None);
             }
         }
         let tokens = if self.has_byte_fallback && prefix.is_empty() {
@@ -648,6 +660,25 @@ impl Decoder for HuggingFaceTokenizer {
         step_decode_stream(
             &self.tokenizer,
             tokens,
+            skip_special_tokens,
+            ids,
+            prefix,
+            prefix_index,
+        )
+        .map_err(|e| Error::msg(format!("Decode stream error: {e}")))
+    }
+
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        step_decode_stream(
+            &self.tokenizer,
+            vec![token_id],
             skip_special_tokens,
             ids,
             prefix,

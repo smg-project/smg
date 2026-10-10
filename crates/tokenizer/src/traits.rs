@@ -161,6 +161,19 @@ pub trait Decoder: Send + Sync {
         }
     }
 
+    /// Eager text observation for engine-side stop matching. Unlike client
+    /// output, this must observe a stop at its original generated-token count.
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
     /// A dedicated per-stream decoder, when the backend has a cheaper
     /// algorithm than [`decode_step`](Self::decode_step) (byte-level BPE
     /// vocabularies do). `None`, the default, means callers use `decode_step`.

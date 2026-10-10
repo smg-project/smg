@@ -513,10 +513,36 @@ pub(crate) async fn convert_proto_chunk_to_openai(
         }
         Some(Complete(complete)) => {
             let index = complete.index;
+            let (pending_text, stopped_at_finish, local_matched_stop) =
+                if let Some(decoder) = &handle.stop_decoder {
+                    let mut decoder = decoder.lock().await;
+                    let tail = decoder
+                        .finish()
+                        .map_err(|error| format!("Failed to finish token decoding: {error}"))?;
+                    let stopped = matches!(
+                        tail,
+                        SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
+                    );
+                    let matched = stopped
+                        .then(|| {
+                            decoder
+                                .matched_stop()
+                                .map(|stop| Value::String(stop.to_string()))
+                        })
+                        .flatten();
+                    let text = match tail {
+                        SequenceDecoderOutput::Text(text)
+                        | SequenceDecoderOutput::StoppedWithText(text) => text,
+                        _ => String::new(),
+                    };
+                    (text, stopped, matched)
+                } else {
+                    (String::new(), false, None)
+                };
 
             // Get and remove state for this index
             let removed_state = handle.stream_state.remove(index);
-            let (final_text, has_tool_calls, state_prompt_tokens, state_completion_tokens) =
+            let (mut final_text, has_tool_calls, state_prompt_tokens, state_completion_tokens) =
                 if let Some(mut state) = removed_state {
                     // Flush decode stream
                     let mut text = std::mem::take(&mut state.text_buffer);
@@ -535,20 +561,26 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     (String::new(), false, 0, 0)
                 };
 
+            final_text.push_str(&pending_text);
+
             // Determine finish reason
+            let engine_finish_reason = if stopped_at_finish {
+                "stop"
+            } else {
+                complete.finish_reason.as_str()
+            };
             let finish_reason = if has_tool_calls
-                && (complete.finish_reason == "stop" || complete.finish_reason.is_empty())
+                && (engine_finish_reason == "stop" || engine_finish_reason.is_empty())
             {
                 "tool_calls".to_string()
-            } else if complete.finish_reason.is_empty() || complete.finish_reason.trim().is_empty()
-            {
+            } else if engine_finish_reason.is_empty() || engine_finish_reason.trim().is_empty() {
                 "stop".to_string()
             } else {
-                complete.finish_reason.clone()
+                engine_finish_reason.to_string()
             };
 
             // Extract matched_stop
-            let matched_stop = match &complete.matched_stop {
+            let matched_stop = local_matched_stop.or_else(|| match &complete.matched_stop {
                 Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => {
                     Some(Value::Number(serde_json::Number::from(*token_id)))
                 }
@@ -556,7 +588,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     Some(Value::String(stop_str.clone()))
                 }
                 None => None,
-            };
+            });
 
             // Build usage from state or complete message
             let mut prompt_tokens = if state_prompt_tokens > 0 {
@@ -634,5 +666,93 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_free(
 ) {
     if !handle.is_null() {
         let _ = Box::from_raw(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
+        let path =
+            std::env::temp_dir().join(format!("smg-byte-fallback-{}.json", uuid::Uuid::now_v7()));
+        let definition = serde_json::json!({
+            "version":"1.0", "added_tokens":[],
+            "model":{"type":"WordLevel", "unk_token":"[UNK]", "vocab":{
+                "[UNK]":0, "<0xC3>":1, "<0xA9>":2
+            }},
+            "decoder":{"type":"Sequence", "decoders":[
+                {"type":"ByteFallback"}, {"type":"Fuse"}
+            ]}
+        });
+        std::fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+        let tokenizer =
+            llm_tokenizer::HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        Arc::new(tokenizer)
+    }
+
+    #[tokio::test]
+    async fn byte_fallback_complete_releases_tail_and_enforces_stop() {
+        let tokenizer = byte_fallback_tokenizer();
+        for stop in ["NEVER", "é"] {
+            let decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default().with_stop_sequence(stop),
+                true,
+            );
+            let mut handle = GrpcResponseConverterHandle {
+                tokenizer: tokenizer.clone(),
+                tool_parser: None,
+                stop_decoder: Some(Arc::new(TokioMutex::new(decoder))),
+                model: "byte-fallback-test".into(),
+                request_id: "test".into(),
+                created: 0,
+                system_fingerprint: None,
+                tools: None,
+                tool_choice: None,
+                history_tool_calls_count: 0,
+                stream_state: StreamStateManager::new(),
+                initial_prompt_tokens: None,
+                skip_special_tokens: true,
+            };
+            let chunk = proto::GenerateResponse {
+                response: Some(proto::generate_response::Response::Chunk(
+                    proto::GenerateStreamChunk {
+                        token_ids: vec![1, 2],
+                        completion_tokens: 2,
+                        ..Default::default()
+                    },
+                )),
+            };
+            assert!(
+                convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let complete = proto::GenerateResponse {
+                response: Some(proto::generate_response::Response::Complete(
+                    proto::GenerateComplete {
+                        completion_tokens: 2,
+                        finish_reason: "length".into(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .unwrap();
+            let choice = &response.choices[0];
+            if stop == "é" {
+                assert!(choice.delta.content.is_none());
+                assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+                assert_eq!(choice.matched_stop, Some(Value::String("é".into())));
+            } else {
+                assert_eq!(choice.delta.content.as_deref(), Some("é"));
+                assert_eq!(choice.finish_reason.as_deref(), Some("length"));
+            }
+        }
     }
 }

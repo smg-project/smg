@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use llm_tokenizer::{
-    stop::{StopSequenceDecoder, StopSequenceDecoderBuilder},
+    stop::{StopSequenceConfig, StopSequenceDecoder},
     traits::Tokenizer,
 };
 use tonic::Status;
@@ -26,12 +26,15 @@ pub(crate) fn stop_decoder(
              load; start it with a local tokenizer directory",
         ));
     };
-    let mut builder = StopSequenceDecoderBuilder::new(Arc::clone(tokenizer))
-        .skip_special_tokens(skip_special_tokens);
+    let mut config = StopSequenceConfig::default();
     for stop in stops {
-        builder = builder.stop_sequence(stop.clone());
+        config = config.with_stop_sequence(stop.clone());
     }
-    Ok(Some(builder.build()))
+    Ok(Some(StopSequenceDecoder::for_stop_matching(
+        Arc::clone(tokenizer),
+        config,
+        skip_special_tokens,
+    )))
 }
 
 /// One choice's stop matcher: feeds generated tokens to the decoder and
@@ -79,5 +82,59 @@ impl StopMatcher {
             return Ok(Some(decoder.matched_stop().unwrap_or_default().to_string()));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
+        let definition = serde_json::json!({
+            "version":"1.0", "added_tokens":[],
+            "model":{"type":"WordLevel", "unk_token":"[UNK]", "vocab":{
+                "[UNK]":0, "<0x74>":1, "<0xC3>":2, "<0xA9>":3,
+                "<0xF2>":4, " suffix":5
+            }},
+            "decoder":{"type":"Sequence", "decoders":[
+                {"type":"ByteFallback"}, {"type":"Fuse"}
+            ]}
+        });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), serde_json::to_vec(&definition).unwrap()).unwrap();
+        Arc::new(
+            llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().unwrap()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn byte_fallback_stop_observation_honors_min_tokens() {
+        for cached in [false, true] {
+            let native = byte_fallback_tokenizer();
+            let tokenizer: Arc<dyn Tokenizer> = if cached {
+                Arc::new(llm_tokenizer::CachedTokenizer::new(
+                    native,
+                    llm_tokenizer::CacheConfig::default(),
+                ))
+            } else {
+                native
+            };
+            // "t" ends inside min_tokens. Closing the byte run later must
+            // not make that old stop eligible.
+            let decoder = stop_decoder(Some(&tokenizer), &["t".into()], true).unwrap();
+            let mut matcher = StopMatcher::new(decoder, 1);
+            assert_eq!(
+                matcher.feed(&[1, 2, 3, 5]).unwrap(),
+                None,
+                "cached={cached}"
+            );
+
+            // A stop beginning inside the window but ending past it still
+            // matches; the incomplete UTF-8 character crosses the boundary.
+            let decoder = stop_decoder(Some(&tokenizer), &["té".into()], true).unwrap();
+            let mut matcher = StopMatcher::new(decoder, 1);
+            assert_eq!(matcher.feed(&[1, 2]).unwrap(), None);
+            assert_eq!(matcher.feed(&[3]).unwrap(), Some("té".into()));
+        }
     }
 }

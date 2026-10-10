@@ -495,7 +495,13 @@ impl ResponseProcessor {
                 complete.completion_tokens(),
             );
 
-            let matched_stop = complete.matched_stop_json();
+            let matched_stop = if stopped_at_finish {
+                stop_decoder
+                    .matched_stop()
+                    .map(|stop| serde_json::Value::String(stop.to_string()))
+            } else {
+                complete.matched_stop_json()
+            };
 
             // Extract logprobs if requested (convert proto types to Generate format)
             let input_token_logprobs = if request_logprobs {

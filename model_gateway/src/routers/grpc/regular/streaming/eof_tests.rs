@@ -264,8 +264,7 @@ fn dispatch() -> context::DispatchMetadata {
     }
 }
 
-#[tokio::test]
-async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
+fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
     let definition = serde_json::json!({
         "version":"1.0", "added_tokens":[],
         "model":{"type":"WordLevel", "unk_token":"[UNK]", "vocab":{
@@ -277,9 +276,12 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
     });
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), serde_json::to_vec(&definition).unwrap()).unwrap();
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(
-        llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().unwrap()).unwrap(),
-    );
+    Arc::new(llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().unwrap()).unwrap())
+}
+
+#[tokio::test]
+async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
+    let tokenizer = byte_fallback_tokenizer();
     for (ids, stop) in [
         (vec![1, 2, 3], None),
         (vec![1, 2], None),
@@ -368,6 +370,42 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
     }
 }
 
+#[tokio::test]
+async fn byte_fallback_generate_eof_reports_gateway_stop() {
+    let tokenizer = byte_fallback_tokenizer();
+    let mut terminal = complete(0, "length");
+    if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
+        complete.output_ids = vec![1, 2];
+        complete.completion_tokens = 2;
+    }
+    let (stream, server) = scripted_stream(vec![terminal], "0").await;
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer,
+        llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("�"),
+        true,
+    );
+    let processor = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    );
+    let responses = processor
+        .process_non_streaming_generate_response(
+            context::ExecutionResult::Single { stream },
+            dispatch(),
+            &mut decoder,
+            false,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+    server.abort();
+    let wire = serde_json::to_value(&responses[0]).unwrap();
+    assert_eq!(wire["text"], "");
+    assert_eq!(wire["meta_info"]["finish_reason"]["type"], "stop");
+    assert_eq!(wire["meta_info"]["matched_stop"], "�");
+}
+
 fn chat_spec(with_tools: bool) -> ChatResponseSpec {
     chat_spec_with(with_tools, None)
 }
@@ -452,6 +490,99 @@ fn chat_text(events: &[Value], index: u32, field: &str) -> String {
             }
         })
         .collect()
+}
+
+fn byte_fallback_eof_frames() -> Vec<proto::GenerateResponse> {
+    let chunk = proto::GenerateResponse {
+        response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
+            token_ids: vec![1, 2],
+            completion_tokens: 2,
+            ..Default::default()
+        })),
+    };
+    let mut terminal = complete(0, "length");
+    if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
+        complete.completion_tokens = 2;
+    }
+    vec![chunk, terminal]
+}
+
+#[tokio::test]
+async fn byte_fallback_chat_eof_emits_exact_text_before_finish() {
+    let (stream, server) = scripted_stream(byte_fallback_eof_frames(), "0").await;
+    let (tx, rx) = sse_channel();
+    let mut spec = chat_spec(false);
+    spec.separate_reasoning = false;
+    spec.expected_choices = 1;
+    let result = processor(false)
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            byte_fallback_tokenizer(),
+            (None, None, false, false, true),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "content"), "��");
+    let content = events
+        .iter()
+        .position(|event| event["choices"][0]["delta"]["content"].as_str() == Some("��"))
+        .unwrap();
+    let finish = events
+        .iter()
+        .position(|event| event["choices"][0]["finish_reason"].as_str() == Some("length"))
+        .unwrap();
+    assert!(content < finish);
+}
+
+#[tokio::test]
+async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
+    let (stream, server) = scripted_stream(byte_fallback_eof_frames(), "0").await;
+    let (tx, rx) = sse_channel();
+    let spec = MessagesResponseSpec {
+        thinking: None,
+        tool_choice: None,
+        has_tools: false,
+        history_tool_calls_count: 0,
+        chat_tools: Vec::new(),
+        stop_sequences: None,
+    };
+    let result = processor(false)
+        .process_messages_streaming_chunks(
+            stream,
+            dispatch(),
+            byte_fallback_tokenizer(),
+            (None, None, false, false, true),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    let text: String = events
+        .iter()
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "��");
+    let content = events
+        .iter()
+        .position(|event| event["delta"]["text"].as_str() == Some("��"))
+        .unwrap();
+    let stop = events
+        .iter()
+        .position(|event| event["type"].as_str() == Some("content_block_stop"))
+        .unwrap();
+    assert!(content < stop);
+    assert!(events.iter().any(|event| event["type"] == "message_stop"));
 }
 
 #[tokio::test]

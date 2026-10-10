@@ -40,6 +40,7 @@ pub struct Sequence {
     /// The backend's own per-stream decoder, when it has one. Then
     /// `token_ids`, `prefix_index` and `cached_prefix` stay unused.
     incremental: Option<Box<dyn IncrementalDecoder>>,
+    eager_stop_matching: bool,
 }
 
 impl std::fmt::Debug for Sequence {
@@ -76,6 +77,7 @@ impl Sequence {
     pub fn new_with_options(tokenizer: Arc<dyn TokenizerTrait>, skip_special_tokens: bool) -> Self {
         Self {
             incremental: tokenizer.incremental_decoder(skip_special_tokens),
+            eager_stop_matching: false,
             tokenizer,
             token_ids: Vec::new(),
             total_tokens: 0,
@@ -83,6 +85,15 @@ impl Sequence {
             cached_prefix: String::new(),
             skip_special_tokens,
         }
+    }
+
+    pub(crate) fn for_stop_matching(
+        tokenizer: Arc<dyn TokenizerTrait>,
+        skip_special_tokens: bool,
+    ) -> Self {
+        let mut sequence = Self::new_with_options(tokenizer, skip_special_tokens);
+        sequence.eager_stop_matching = true;
+        sequence
     }
 
     /// Create a sequence with initial tokens
@@ -107,6 +118,7 @@ impl Sequence {
         }
         Self {
             incremental,
+            eager_stop_matching: false,
             tokenizer,
             token_ids,
             total_tokens: len,
@@ -172,13 +184,23 @@ impl Sequence {
             self.total_tokens += 1;
             return Ok(text);
         }
-        let result = self.tokenizer.decode_step(
-            token_id,
-            &mut self.token_ids,
-            &mut self.cached_prefix,
-            &mut self.prefix_index,
-            self.skip_special_tokens,
-        )?;
+        let result = if self.eager_stop_matching {
+            self.tokenizer.decode_step_eager(
+                token_id,
+                &mut self.token_ids,
+                &mut self.cached_prefix,
+                &mut self.prefix_index,
+                self.skip_special_tokens,
+            )?
+        } else {
+            self.tokenizer.decode_step(
+                token_id,
+                &mut self.token_ids,
+                &mut self.cached_prefix,
+                &mut self.prefix_index,
+                self.skip_special_tokens,
+            )?
+        };
         self.total_tokens += 1;
         match result {
             Some(text) => Ok(text),

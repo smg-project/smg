@@ -89,6 +89,26 @@ impl StopSequenceDecoder {
         config: StopSequenceConfig,
         skip_special_tokens: bool,
     ) -> Self {
+        Self::with_sequence(
+            Sequence::new_with_options(tokenizer, skip_special_tokens),
+            config,
+        )
+    }
+
+    /// Observe stops at their generated-token position on the engine side.
+    /// Client text uses `new`, which buffers byte runs for exact batch parity.
+    pub fn for_stop_matching(
+        tokenizer: Arc<dyn traits::Tokenizer>,
+        config: StopSequenceConfig,
+        skip_special_tokens: bool,
+    ) -> Self {
+        Self::with_sequence(
+            Sequence::for_stop_matching(tokenizer, skip_special_tokens),
+            config,
+        )
+    }
+
+    fn with_sequence(sequence: Sequence, config: StopSequenceConfig) -> Self {
         // Build Aho-Corasick automaton from all stop sequences
         // Hidden sequences come first, then visible sequences
         let mut patterns: Vec<&str> = config
@@ -121,7 +141,7 @@ impl StopSequenceDecoder {
         let token_only = aho_corasick.is_none();
 
         StopSequenceDecoder {
-            sequence: Sequence::new_with_options(tokenizer, skip_special_tokens),
+            sequence,
             config,
             aho_corasick,
             visible_boundary_idx,
