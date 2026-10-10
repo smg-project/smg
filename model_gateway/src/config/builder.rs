@@ -839,6 +839,21 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn maybe_token_dump_dir(mut self, dir: Option<impl Into<String>>) -> Self {
+        self.config.token_dump_dir = dir.map(|d| d.into());
+        self
+    }
+
+    pub fn token_dump_on_start(mut self, on_start: bool) -> Self {
+        self.config.token_dump_on_start = on_start;
+        self
+    }
+
+    pub fn token_dump_max_mb(mut self, max_mb: u64) -> Self {
+        self.config.token_dump_max_mb = max_mb;
+        self
+    }
+
     pub fn maybe_log_level(mut self, level: Option<impl Into<String>>) -> Self {
         self.config.log_level = level.map(|l| l.into());
         self

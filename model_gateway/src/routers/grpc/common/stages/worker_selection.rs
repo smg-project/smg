@@ -2096,6 +2096,7 @@ mod tests {
             multimodal_inflight: None,
             pd_prefill_guard: None,
             response: Default::default(),
+            token_dump: None,
         }
     }
 
@@ -2876,6 +2877,7 @@ mod tests {
             reasoning_parser_factory: Default::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
+            token_dump: None,
         });
         let mut ctx = RequestContext::for_generate(
             Arc::new(request),

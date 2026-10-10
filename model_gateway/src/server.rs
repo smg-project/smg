@@ -7,6 +7,7 @@ use std::{
 };
 
 use axum::{
+    body::Bytes,
     extract::{Extension, Path, Query, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -58,7 +59,7 @@ use crate::{
         inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
-        metrics_server, otel_trace, runtime_metrics,
+        metrics_server, otel_trace, runtime_metrics, token_dump,
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
@@ -655,6 +656,36 @@ async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
+/// `POST /start_token_dump`: start recording every engine call into a new
+/// file under `--token-dump-dir` (see [`token_dump`]).
+async fn start_token_dump(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let Some(dump) = state.context.token_dump.clone() else {
+        return token_dump::not_configured();
+    };
+    // Raw bytes, not `Option<Json>`: that reads a body sent without a
+    // content type as no body, and would start a wider dump than asked for.
+    let request = match token_dump::parse_start_body(&body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    match token_dump::start_blocking(dump, request).await {
+        Ok(started) => Json(started).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `POST /stop_token_dump`: stop the running token dump session and report
+/// its counters.
+async fn stop_token_dump(State(state): State<Arc<AppState>>) -> Response {
+    let Some(dump) = state.context.token_dump.as_ref() else {
+        return token_dump::not_configured();
+    };
+    match dump.stop() {
+        Ok(stopped) => Json(stopped).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn get_loads(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -1056,6 +1087,8 @@ pub fn build_app(
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
         .route("/heap_profile", post(dump_heap_profile))
+        .route("/start_token_dump", post(start_token_dump))
+        .route("/stop_token_dump", post(stop_token_dump))
         // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
@@ -1767,6 +1800,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // This triggers background task cancellation, waits for tools, and denies approvals
     if let Some(orchestrator) = app_context.mcp_orchestrator.get() {
         orchestrator.shutdown().await;
+    }
+
+    // Close the token dump file, so a boot-time session ends with its
+    // session_end line.
+    if let Some(dump) = &app_context.token_dump {
+        dump.shutdown().await;
     }
 
     info!("Cleanup complete. Process exiting.");

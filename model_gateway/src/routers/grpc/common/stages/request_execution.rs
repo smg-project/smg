@@ -15,6 +15,7 @@ use crate::{
     observability::{
         cache_trace,
         metrics::{metrics_labels, Metrics},
+        token_dump::{CallMeta, CallRecorder, EndStatus, Leg, Session, Transport},
     },
     routers::{
         common::{
@@ -28,6 +29,7 @@ use crate::{
         },
         error,
         grpc::{
+            backend_client::BackendClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
@@ -277,6 +279,75 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
     }
 }
 
+/// The token dump session one dispatch records into: set when a session runs
+/// for the request's model.
+pub(crate) struct DumpScope {
+    session: Arc<Session>,
+    model: String,
+    root_request_id: Option<String>,
+}
+
+impl DumpScope {
+    fn for_dispatch(ctx: &DispatchContext) -> Option<Self> {
+        let session = ctx.token_dump.as_ref()?.session_for(&ctx.model_id)?;
+        Some(Self {
+            session,
+            model: ctx.model_id.clone(),
+            root_request_id: ctx.root_request_id.clone(),
+        })
+    }
+
+    /// Record the call `request` is about to make to `worker` through
+    /// `client`: writes its `request` line now.
+    fn begin(
+        &self,
+        client: &BackendClient,
+        worker: Option<&Arc<dyn Worker>>,
+        leg: Leg,
+        request: &ProtoGenerateRequest,
+    ) -> CallRecorder {
+        let meta = CallMeta {
+            model: self.model.clone(),
+            worker: worker
+                .map(|worker| worker.url().to_string())
+                .unwrap_or_default(),
+            runtime: client.runtime_type().as_str(),
+            transport: if client.is_zmq() {
+                Transport::Zmq
+            } else {
+                Transport::Grpc
+            },
+            leg,
+            root_request_id: self.root_request_id.clone(),
+        };
+        let mut call = self
+            .session
+            .begin_call(&meta, request.dump_min_len(), || request.dump_event());
+        call.expect_completes(request.sampling_n());
+        call
+    }
+}
+
+/// Start one engine call, recorded into `call` when a token dump runs: a call
+/// the engine refuses ends `start_failed`, and the stream of one it starts
+/// records each response and the call's end. Every engine call of this
+/// module goes through here.
+async fn start_generate(
+    client: &mut BackendClient,
+    request: ProtoGenerateRequest,
+    call: Option<CallRecorder>,
+) -> Result<ProtoStream, tonic::Status> {
+    let result = client.generate(request).await;
+    match (result, call) {
+        (Ok(stream), Some(call)) => Ok(stream.recorded(call)),
+        (Err(status), Some(mut call)) => {
+            call.finish(EndStatus::StartFailed, Some(&status));
+            Err(status)
+        }
+        (result, None) => result,
+    }
+}
+
 /// Dispatch one attempt of the retained plan: create the attempt's load
 /// guards, fan out encode jobs on the first EPD dispatch, and store the
 /// execution result on the context for response processing.
@@ -318,6 +389,8 @@ pub(crate) async fn execute_plan(
     // here: dispatch consumes them, while an early error before dispatch
     // drops them and reclaims the SHM.
     let encode_dispatch = ctx.encode_outputs.take().map(|o| o.dispatch);
+    // The token dump session this attempt records into, if any.
+    let dump = DumpScope::for_dispatch(ctx);
 
     let clients = ctx.clients.as_mut().ok_or_else(|| {
         error!(
@@ -391,14 +464,25 @@ pub(crate) async fn execute_plan(
     let result = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => execute_single(req, clients, workers, ledger).await,
+                ProtoRequest::Generate(req) => {
+                    execute_single(req, clients, workers, ledger, dump.as_ref()).await
+                }
                 ProtoRequest::Embed(req) => {
                     execute_single_embed(req, clients, workers, ledger).await
                 }
             },
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
+                execute_pd_dispatch(
+                    req,
+                    clients,
+                    workers,
+                    model,
+                    prefill_guard,
+                    ledger,
+                    dump.as_ref(),
+                )
+                .await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 // Bootstrap info was injected into the prefill request during
@@ -413,6 +497,7 @@ pub(crate) async fn execute_plan(
                     encode_dispatch,
                     prefill_guard,
                     ledger,
+                    dump.as_ref(),
                 )
                 .await
             }
@@ -425,6 +510,7 @@ pub(crate) async fn execute_plan(
                     model,
                     prefill_guard,
                     ledger,
+                    dump.as_ref(),
                 )
                 .await
             }
@@ -476,6 +562,7 @@ async fn execute_pd_dispatch(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    dump: Option<&DumpScope>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -511,6 +598,7 @@ async fn execute_pd_dispatch(
                 model,
                 prefill_guard,
                 ledger,
+                dump,
             )
             .await
         }
@@ -524,6 +612,7 @@ async fn execute_pd_dispatch(
                     protocol,
                     prefill_guard,
                     ledger,
+                    dump,
                 )
                 .await
             }
@@ -535,6 +624,7 @@ async fn execute_pd_dispatch(
                     protocol,
                     prefill_guard,
                     ledger,
+                    dump,
                 )
                 .await
             }
@@ -546,6 +636,7 @@ async fn execute_pd_dispatch(
 /// with its own rendezvous room, and merge their legs into one PD result
 /// whose responses carry the sample index. Fail-fast: the first pair that
 /// fails to start fails the request, and dropping the others aborts them.
+#[expect(clippy::too_many_arguments)]
 async fn execute_fanout_pd(
     proto_request: ProtoGenerateRequest,
     n: u32,
@@ -554,6 +645,7 @@ async fn execute_fanout_pd(
     protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    dump: Option<&DumpScope>,
 ) -> Result<ExecutionResult, Response> {
     let subs = fan_out_pd_request(&proto_request, n, |sub| {
         maybe_inject_pd_metadata(sub, workers);
@@ -570,7 +662,7 @@ async fn execute_fanout_pd(
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
         async move {
-            execute_parallel_pd(sub, &mut clients, workers, protocol, guard, ledger).await
+            execute_parallel_pd(sub, &mut clients, workers, protocol, guard, ledger, dump).await
         }
     });
     let results = try_join_all(dispatches).await?;
@@ -623,6 +715,7 @@ async fn execute_fanout_pd(
     })
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -631,6 +724,7 @@ async fn execute_epd_dispatch(
     encode_dispatch: Option<EncodeDispatchPlan>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    dump: Option<&DumpScope>,
 ) -> Result<ExecutionResult, Response> {
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
@@ -643,6 +737,7 @@ async fn execute_epd_dispatch(
         model,
         prefill_guard,
         ledger,
+        dump,
     )
     .await
 }
@@ -694,6 +789,7 @@ fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
 /// Dispatch one backend request per batched prompt concurrently, preserving
 /// prompt order. Fail-fast: the first failed dispatch fails the batch and
 /// drops the remaining streams (abort-on-drop reclaims them backend-side).
+#[expect(clippy::too_many_arguments)]
 async fn execute_batch_dispatch(
     kind: ExecutionPlanKind,
     requests: Vec<ProtoGenerateRequest>,
@@ -702,6 +798,7 @@ async fn execute_batch_dispatch(
     model: &str,
     prefill_guard: Option<PrefillLoadGuard>,
     ledger: &AttemptLedger,
+    dump: Option<&DumpScope>,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -722,7 +819,7 @@ async fn execute_batch_dispatch(
             async move {
                 match kind {
                     ExecutionPlanKind::Single => {
-                        execute_single(request, &mut clients, workers, ledger).await
+                        execute_single(request, &mut clients, workers, ledger, dump).await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
@@ -734,6 +831,7 @@ async fn execute_batch_dispatch(
                             model,
                             prefill_guard,
                             ledger,
+                            dump,
                         )
                         .await
                     }
@@ -750,6 +848,7 @@ async fn execute_single(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
+    dump: Option<&DumpScope>,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_mut().ok_or_else(|| {
         error!(
@@ -771,7 +870,8 @@ async fn execute_single(
     if let Some(worker) = workers.single() {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    let result = client.generate(proto_request).await;
+    let call = dump.map(|dump| dump.begin(client, workers.single(), Leg::Single, &proto_request));
+    let result = start_generate(client, proto_request, call).await;
     workers.record_outcome(ledger, result.cb_status_code());
 
     let stream = result.map_err(|e| {
@@ -866,6 +966,7 @@ async fn execute_parallel_pd(
     protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    dump: Option<&DumpScope>,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -919,10 +1020,29 @@ async fn execute_parallel_pd(
     {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    let prefill_dispatch: PdLegDispatch =
-        Box::pin(async move { prefill_client.generate(prefill_request).await });
+    let prefill_call = dump.map(|dump| {
+        dump.begin(
+            &prefill_client,
+            workers.prefill_worker(),
+            Leg::Prefill,
+            &prefill_request,
+        )
+    });
+    let decode_call = dump.map(|dump| {
+        dump.begin(
+            &decode_client,
+            workers.decode_worker(),
+            Leg::Decode,
+            &decode_request,
+        )
+    });
+    let prefill_dispatch: PdLegDispatch = Box::pin(async move {
+        start_generate(&mut prefill_client, prefill_request, prefill_call).await
+    });
     let decode_dispatch: PdLegDispatch =
-        Box::pin(async move { decode_client.generate(decode_request).await });
+        Box::pin(
+            async move { start_generate(&mut decode_client, decode_request, decode_call).await },
+        );
 
     match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
@@ -1205,6 +1325,7 @@ async fn execute_sequential_pd(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    dump: Option<&DumpScope>,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -1355,8 +1476,15 @@ async fn execute_sequential_pd(
     if let Some(prefill) = workers.prefill_worker() {
         Metrics::record_worker_request(prefill.url(), prefill.model_id());
     }
-    let mut prefill_stream = prefill_client
-        .generate(prefill_request)
+    let prefill_call = dump.map(|dump| {
+        dump.begin(
+            prefill_client,
+            workers.prefill_worker(),
+            Leg::Prefill,
+            &prefill_request,
+        )
+    });
+    let mut prefill_stream = start_generate(prefill_client, prefill_request, prefill_call)
         .await
         .map_err(|e| {
             workers.record_outcome_prefill(ledger, e.http_status().as_u16());
@@ -1516,20 +1644,30 @@ async fn execute_sequential_pd(
     if let Some(decode) = workers.decode_worker() {
         Metrics::record_worker_request(decode.url(), decode.model_id());
     }
-    let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
-        workers.record_outcome_decode(ledger, e.http_status().as_u16());
-        Metrics::record_worker_error(
-            metrics_labels::WORKER_DECODE,
-            decode_label,
-            metrics_labels::ERROR_BACKEND,
-        );
-        start_failure_response(
-            &e,
-            "execute_sequential_pd",
-            PdLeg::Decode.error_message(),
-            PdLeg::Decode.error_code(),
+    let decode_call = dump.map(|dump| {
+        dump.begin(
+            decode_client,
+            workers.decode_worker(),
+            Leg::Decode,
+            &decode_request,
         )
-    })?;
+    });
+    let decode_stream = start_generate(decode_client, decode_request, decode_call)
+        .await
+        .map_err(|e| {
+            workers.record_outcome_decode(ledger, e.http_status().as_u16());
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_DECODE,
+                decode_label,
+                metrics_labels::ERROR_BACKEND,
+            );
+            start_failure_response(
+                &e,
+                "execute_sequential_pd",
+                PdLeg::Decode.error_message(),
+                PdLeg::Decode.error_code(),
+            )
+        })?;
 
     workers.record_outcome_decode(ledger, 200);
     // Decode established: record the success-only PD metrics here.
@@ -1581,6 +1719,25 @@ mod tests {
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+
+    /// Every engine call this module makes goes through `start_generate`, so
+    /// a running token dump records every one of them.
+    #[test]
+    fn engine_calls_go_through_start_generate() {
+        let source = include_str!("request_execution.rs");
+        let direct_call = concat!(".gen", "erate(");
+        let calls: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains(direct_call))
+            .map(str::trim)
+            .collect();
+        // Spelled in pieces, like `direct_call`, so this test is not a match.
+        assert_eq!(
+            calls,
+            [concat!("let result = client.gen", "erate(request).await;")],
+            "call the engine through start_generate"
+        );
+    }
 
     fn tokenspeed_request(n: u32, seed: Option<u64>) -> ProtoGenerateRequest {
         ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {

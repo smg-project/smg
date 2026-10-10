@@ -122,6 +122,7 @@ impl GrpcRouter {
                 ctx.configured_reasoning_parser.clone(),
             ),
             multimodal,
+            token_dump: ctx.token_dump.clone(),
         });
 
         // The admission queue's timeout also bounds how long an accepted

@@ -89,7 +89,8 @@ pub(crate) fn open_posture_warning(
              URL), GET /workers and GET /get_loads (the backends' addresses), POST /flush_cache \
              (drops the engines' prefix caches), POST /start_profile and POST /stop_profile (the \
              engines' profilers), POST /heap_profile (writes this gateway's heap profile to \
-             disk), /parse/*, /wasm and /v1/tokenizers; protect them with \
+             disk), POST /start_token_dump and POST /stop_token_dump (record every engine call, \
+             prompts included, to disk), /parse/*, /wasm and /v1/tokenizers; protect them with \
              --control-plane-api-keys id:name:admin:<key> or --jwt-issuer/--jwt-audience (the \
              shared --api-key gates them too)"
                 .to_string(),
@@ -196,6 +197,7 @@ mod tests {
             "/start_profile",
             "/stop_profile",
             "/heap_profile",
+            "/start_token_dump",
             "--control-plane-api-keys",
             "--jwt-issuer",
             "/v1/chat/completions",

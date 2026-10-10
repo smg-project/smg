@@ -442,6 +442,9 @@ struct Router {
     prometheus_host: Option<String>,
     prometheus_duration_buckets: Option<Vec<f64>>,
     jemalloc_prof_dir: Option<String>,
+    token_dump_dir: Option<String>,
+    token_dump_on_start: bool,
+    token_dump_max_mb: u64,
     request_timeout_secs: u64,
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
@@ -1071,6 +1074,9 @@ impl Router {
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
             .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
+            .maybe_token_dump_dir(self.token_dump_dir.as_ref())
+            .token_dump_on_start(self.token_dump_on_start)
+            .token_dump_max_mb(self.token_dump_max_mb)
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .trust_tenant_header(self.trust_tenant_header)
@@ -1326,6 +1332,9 @@ impl Router {
         tenant_rate_limit_config = None,
         jemalloc_prof_dir = None,
         tokenizer_cache_l0_max_memory = 268435456,
+        token_dump_dir = None,
+        token_dump_on_start = false,
+        token_dump_max_mb = 1024,
         // Keyword-only, so it never takes a positional slot.
         *,
         mesh_tls_ca_cert = None,
@@ -1518,6 +1527,9 @@ impl Router {
         tenant_rate_limit_config: Option<String>,
         jemalloc_prof_dir: Option<String>,
         tokenizer_cache_l0_max_memory: usize,
+        token_dump_dir: Option<String>,
+        token_dump_on_start: bool,
+        token_dump_max_mb: u64,
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
@@ -1602,6 +1614,9 @@ impl Router {
             prometheus_host,
             prometheus_duration_buckets,
             jemalloc_prof_dir,
+            token_dump_dir,
+            token_dump_on_start,
+            token_dump_max_mb,
             request_timeout_secs,
             shutdown_grace_period_secs,
             request_id_headers,

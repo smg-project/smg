@@ -277,6 +277,17 @@ pub struct RouterConfig {
     /// answers 404.
     #[serde(default)]
     pub jemalloc_prof_dir: Option<String>,
+    /// Directory for token dumps (`POST /start_token_dump`,
+    /// `--token-dump-on-start`); unset, the token dump routes answer 404.
+    #[serde(default)]
+    pub token_dump_dir: Option<String>,
+    /// Record every engine call from startup until shutdown; needs
+    /// `token_dump_dir`.
+    #[serde(default)]
+    pub token_dump_on_start: bool,
+    /// Size cap of one token dump file, in MiB.
+    #[serde(default = "default_token_dump_max_mb")]
+    pub token_dump_max_mb: u64,
     pub request_id_headers: Option<Vec<String>>,
     #[serde(default)]
     pub storage_context_headers: HashMap<String, String>,
@@ -464,6 +475,10 @@ pub struct TokenizerCacheConfig {
     pub enable_l1: bool,
     #[serde(default = "default_l1_max_memory")]
     pub l1_max_memory: usize,
+}
+
+fn default_token_dump_max_mb() -> u64 {
+    1024
 }
 
 fn default_load_monitor_interval_secs() -> u64 {
@@ -1504,6 +1519,9 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             jemalloc_prof_dir: None,
+            token_dump_dir: None,
+            token_dump_on_start: false,
+            token_dump_max_mb: default_token_dump_max_mb(),
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
             tenant_resolution: TenantResolutionConfig::default(),
