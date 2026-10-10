@@ -3,7 +3,7 @@
 //! This module provides Rust types for the Anthropic Messages API.
 //! See: https://docs.anthropic.com/en/api/messages
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -11,6 +11,7 @@ use validator::Validate;
 
 use crate::{
     common::{CachePartition, GenerationRequest},
+    model_card::ModelCard,
     validated::Normalizable,
 };
 
@@ -1232,12 +1233,14 @@ pub enum ApiError {
 
 /// Request to count tokens in a message
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 pub struct CountMessageTokensRequest {
     /// The model to use for token counting
+    #[validate(length(min = 1, message = "model field is required and cannot be empty"))]
     pub model: String,
 
     /// Input messages
+    #[validate(length(min = 1, message = "at least one message is required"))]
     pub messages: Vec<InputMessage>,
 
     /// System prompt
@@ -1255,6 +1258,10 @@ pub struct CountMessageTokensRequest {
     /// Additional backend-specific token counting options.
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+impl Normalizable for CountMessageTokensRequest {
+    // Use default no-op implementation
 }
 
 impl GenerationRequest for CountMessageTokensRequest {
@@ -1298,6 +1305,24 @@ pub struct ModelInfo {
     pub created_at: String,
 }
 
+impl ModelInfo {
+    /// The entry a self-hosted model card makes in the Anthropic-shaped
+    /// inventory. The display name falls back to the id; a card carries no
+    /// creation time, so `created_at` is the epoch, the counterpart of the
+    /// OpenAI-shaped list's `created: 0`.
+    pub fn from_model_card(card: &ModelCard) -> Self {
+        Self {
+            model_type: "model".to_owned(),
+            id: card.id.clone(),
+            display_name: card.display_name.clone().unwrap_or_else(|| card.id.clone()),
+            created_at: UNKNOWN_CREATED_AT.to_owned(),
+        }
+    }
+}
+
+/// `created_at` of a model whose creation time nobody recorded.
+const UNKNOWN_CREATED_AT: &str = "1970-01-01T00:00:00Z";
+
 /// List of models response
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ListModelsResponse {
@@ -1305,6 +1330,25 @@ pub struct ListModelsResponse {
     pub has_more: bool,
     pub first_id: Option<String>,
     pub last_id: Option<String>,
+}
+
+impl ListModelsResponse {
+    /// The whole inventory in one page, deduplicated by model id (the first
+    /// card of an id wins), with the page markers the public list carries.
+    pub fn from_model_cards(cards: impl IntoIterator<Item = ModelCard>) -> Self {
+        let mut seen = HashSet::new();
+        let data: Vec<ModelInfo> = cards
+            .into_iter()
+            .filter(|card| seen.insert(card.id.clone()))
+            .map(|card| ModelInfo::from_model_card(&card))
+            .collect();
+        Self {
+            first_id: data.first().map(|m| m.id.clone()),
+            last_id: data.last().map(|m| m.id.clone()),
+            has_more: false,
+            data,
+        }
+    }
 }
 
 // ============================================================================
@@ -2621,5 +2665,53 @@ mod tests {
         assert_eq!(partition.cache_salt, Some("tenant-a"));
         assert!(partition.extra_key.is_none());
         assert!(partition.lora_path.is_none());
+    }
+
+    #[test]
+    fn count_tokens_request_is_validated_like_a_message_request() {
+        let empty: CountMessageTokensRequest =
+            serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+        let err = empty.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one message"), "{err}");
+
+        let ok: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn anthropic_model_list_is_built_from_model_cards() {
+        let mut named = ModelCard::new("m1");
+        named.display_name = Some("Model One".to_owned());
+        let list = ListModelsResponse::from_model_cards(vec![
+            named,
+            ModelCard::new("m2"),
+            ModelCard::new("m1"),
+        ]);
+        let v = serde_json::to_value(&list).unwrap();
+        assert_eq!(v["has_more"], false);
+        assert_eq!(v["first_id"], "m1");
+        assert_eq!(v["last_id"], "m2");
+        assert_eq!(
+            v["data"].as_array().unwrap().len(),
+            2,
+            "duplicates collapse"
+        );
+        assert_eq!(
+            v["data"][0],
+            json!({
+                "type": "model",
+                "id": "m1",
+                "display_name": "Model One",
+                "created_at": "1970-01-01T00:00:00Z"
+            })
+        );
+        assert_eq!(
+            v["data"][1]["display_name"], "m2",
+            "the id stands in for a missing name"
+        );
     }
 }
