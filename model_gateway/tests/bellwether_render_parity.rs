@@ -81,6 +81,12 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// when no loaded case is under it at all.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
+        "hunyuan-a13b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "iquest-q1/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -114,6 +120,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "k2-horizon-36b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "k2-horizon-36b/render/tools-schema-with-defs",
         "the template merges a tool's `$defs` into its parameters with `dict()` over a list of \
          (key, value) pairs, which the gateway's template engine does not accept, so the \
@@ -137,6 +149,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "laguna-xs.2/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "laguna-xs.2/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -153,6 +171,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "lfm2.5-1.2b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "lfm2.5-1.2b-instruct/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -161,6 +185,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "llava-1.5-7b-hf/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "llava-1.5-7b-hf/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "llava-1.5-7b-hf/render/tools-call-arguments-object",
@@ -187,6 +217,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "deepseek-r1/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always appended \
          (smg-project/smg#2780)",
+    ),
+    (
+        "deepseek-r1/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "deepseek-r1/render/tools-history-single-call",
@@ -233,6 +269,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-omni-30b-a3b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-omni-30b-a3b-thinking/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -250,6 +292,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-omni-30b-a3b-thinking/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "glm-5.3-flash/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -265,6 +313,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "glm-5.3-flash/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "glm-5.3-flash/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "glm-5.3-flash/render/tools-call-arguments-object",
@@ -289,6 +343,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "hy4-preview/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "hy4-preview/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -309,6 +369,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "minimax-m2.7/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "minimax-m2.7/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "minimax-m2.7/render/tools-call-arguments-object",
@@ -349,6 +415,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "ai21-jamba2-3b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "apertus-8b-instruct-2509/render/*",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -366,6 +438,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "deepseek-v3-0324/render/hermes-glaive-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template concatenates them as text, so the render fails (smg-project/smg#2783)",
+    ),
+    (
+        "deepseek-v3-0324/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "deepseek-v3-0324/render/tools-history-content-and-call",
@@ -401,6 +479,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "deepseek-v3.1/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "deepseek-v3.1/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "deepseek-v3.1/render/tools-history-content-and-call",
@@ -447,6 +531,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "dots3-note-prev/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "dots3-note-prev/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -462,6 +552,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
          template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "ernie-4.5-21b-a3b-thinking/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "ernie-4.5-21b-a3b-thinking/render/tools-call-arguments-object",
@@ -502,6 +598,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "glm-4.6/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "glm-4.6/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -524,6 +626,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "glm-4.7-flash/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "glm-4.7-flash/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -538,6 +646,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "granite-4.1-3b/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "granite-4.1-3b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "granite-4.1-3b/render/tools-call-arguments-object",
@@ -566,6 +680,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "hermes-4-14b/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "hermes-4-14b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "hermes-4-14b/render/tools-call-arguments-object",
@@ -648,6 +768,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "ling-3.0-flash/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "ling-3.0-flash/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -674,6 +800,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "llama-xlam-2-8b-fc-r/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "llama-xlam-2-8b-fc-r/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "llama-xlam-2-8b-fc-r/render/tools-call-arguments-object",
@@ -718,6 +850,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "mimo-v2.5/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "minicpm5-2b/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -733,6 +871,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "minicpm5-2b/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "minicpm5-2b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "minicpm5-2b/render/tools-call-arguments-object",
@@ -755,6 +899,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "minimax-m2/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "minimax-m2/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "minimax-m2/render/tools-call-arguments-object",
@@ -802,6 +952,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "nanbeige4.2-3b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "nanbeige4.2-3b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -822,6 +978,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "nvidia-nemotron-3-nano-30b-a3b-bf16/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "nvidia-nemotron-3-nano-30b-a3b-bf16/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "nvidia-nemotron-3-nano-30b-a3b-bf16/render/tools-call-arguments-object",
@@ -847,6 +1009,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "phi-4-mini-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "phi-4-mini-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "phi-4-multimodal-instruct/render/*",
@@ -896,6 +1064,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen2.5-7b-instruct-1m/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen2.5-7b-instruct-1m/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -926,14 +1100,32 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen2.5-omni-7b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen2.5-vl-32b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen2.5-vl-32b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen2.5-vl-7b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen2.5-vl-7b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "qwen3-30b-a3b-instruct-2507/render/bfcl-multi-turn-*",
@@ -945,6 +1137,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-30b-a3b-instruct-2507/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3-30b-a3b-instruct-2507/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "qwen3-30b-a3b-instruct-2507/render/tools-call-arguments-object",
@@ -969,6 +1167,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-30b-a3b-thinking-2507/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-30b-a3b-thinking-2507/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -991,6 +1195,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-30b-a3b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-30b-a3b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -1005,6 +1215,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-4b-instruct-2507/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3-4b-instruct-2507/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "qwen3-4b-instruct-2507/render/tools-call-arguments-object",
@@ -1029,6 +1245,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-4b-saferl/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-4b-saferl/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -1051,6 +1273,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-4b-thinking-2507/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-4b-thinking-2507/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -1062,6 +1290,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          object verbatim (smg-project/smg-lab#105)",
     ),
     (
+        "qwen3-8b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-coder-30b-a3b-instruct/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -1071,6 +1305,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-coder-30b-a3b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3-coder-30b-a3b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "qwen3-coder-30b-a3b-instruct/render/tools-call-arguments-object",
@@ -1089,6 +1329,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-coder-next/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-coder-next/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -1103,6 +1349,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-next-80b-a3b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3-next-80b-a3b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "qwen3-next-80b-a3b-instruct/render/tools-call-arguments-object",
@@ -1127,6 +1379,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-next-80b-a3b-thinking/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-next-80b-a3b-thinking/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -1149,6 +1407,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-vl-235b-a22b-thinking/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-vl-30b-a3b-instruct/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -1160,6 +1424,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwen3-vl-30b-a3b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwen3-vl-8b-instruct/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -1169,6 +1439,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-vl-8b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3-vl-8b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "qwen3-vl-8b-thinking/render/bfcl-multi-turn-*",
@@ -1186,6 +1462,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-vl-8b-thinking/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3-vl-8b-thinking/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "qwen3.5-27b/render/*",
@@ -1322,6 +1604,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template's continued turn (smg-project/smg#2779)",
     ),
     (
+        "qwen3guard-gen-0.6b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwq-32b/render/bfcl-multi-turn-*",
         "the typed tool definitions drop the fields outside the function schema, here the \
          `response` field of the BFCL multi-turn tools, and this template renders the tool \
@@ -1351,6 +1639,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "qwq-32b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "qwq-32b/render/tools-history-content-and-call",
         "the gateway parses tool-call arguments into objects before rendering, which this \
          template does not render as the reference does (smg-project/smg#2783)",
@@ -1359,6 +1653,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "seed-oss-36b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "seed-oss-36b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "seed-oss-36b-instruct/render/tools-call-arguments-object",
@@ -1383,6 +1683,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "step-3.5-flash/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "step-3.5-flash/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -1403,6 +1709,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "step3/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "step3/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "step3/render/tools-call-arguments-object",
@@ -1435,6 +1747,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "trinity-mini/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
         "trinity-mini/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
@@ -1450,6 +1768,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
          template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "webworld-32b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "webworld-32b/render/no-generation-prompt",
