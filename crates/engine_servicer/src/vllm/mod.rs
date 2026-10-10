@@ -135,6 +135,17 @@ pub struct VllmModelInfo {
     /// rooms against. The handshake's figure is the fallback for a launcher
     /// that reported none.
     pub max_num_seqs: i32,
+    /// The engine's reasoning parser (`--reasoning-parser`, "glm45", ...),
+    /// advertised as the `engine_reasoning_parser` label; empty when it runs
+    /// none.
+    pub engine_reasoning_parser: String,
+    /// Where the engine starts a request's grammar on a thinking prompt, as
+    /// the launcher read it off the structured-outputs config and the Router
+    /// shapes a forced tool call's grammar by (`structured_outputs_start`
+    /// label): `after_reasoning` when the engine waits for its reasoning
+    /// parser to see the thought's end, `first_token` when the grammar runs
+    /// from the first generated token; empty when the config does not say.
+    pub structured_outputs_start: String,
 }
 
 /// How to bind, where the engine dials in, and what to advertise.
