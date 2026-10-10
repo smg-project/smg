@@ -287,7 +287,7 @@ dependency closure; ~380 requests total) against the PR lane's real gateway +
 engine, and asserts every baseline cluster still holds structurally. One test
 per (surface, cluster); grandfathered divergences xfail; a new divergent
 cluster or a known one getting *worse* fails with a ready-to-paste
-`TO-TRIAGE` allowlist line. It rides the `e2e-1gpu-responses` lane in
+`TO-TRIAGE` allowlist line. It rides the Responses e2e lane in
 `pr-test-rust.yml` (gated on the `common`/`agentic` change families, which
 include `crates/protocols`, `model_gateway`, and `vendor_probe/**`).
 
@@ -310,7 +310,7 @@ VENDOR_COMPAT_TIMEOUT=120 VENDOR_COMPAT_STREAM_TIMEOUT=240
 
 The CPU-side logic (representative selection, cluster judgment) is
 unit-tested in `e2e_test/vendor_compat/test_conformance_unit.py`, which runs
-in the harness unit-test job without a GPU.
+in the harness unit-test job without an engine.
 
 ### CI permission note
 

@@ -11,7 +11,7 @@ outcomes.
 
 Everything here is CPU-pure except :func:`run_replay` (network against a
 running gateway); the pure parts are unit-tested in
-``test_conformance_unit.py`` without a GPU.
+``test_conformance_unit.py`` without an engine.
 
 Selection: up to ``REPRESENTATIVES_PER_CLUSTER`` member probes per cluster
 (first / middle / last of the sorted member ids — deterministic, spreads
