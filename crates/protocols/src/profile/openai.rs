@@ -1,5 +1,7 @@
-//! OpenAI baseline: the public Chat Completions contract's own rules, applied
-//! to every model that selects no vendor profile.
+//! OpenAI's own contract: the public Chat Completions API's structured-output
+//! and tool-message rules, applied to OpenAI-named models only. The default
+//! profile ([`super::ProviderProfile::Generic`]) passes these shapes through
+//! to the engine, whose grammar compiler validates what it needs.
 
 use std::collections::HashSet;
 
@@ -278,6 +280,53 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" | ")
         })
+    }
+
+    /// The same shapes under the default profile (a self-hosted model) are
+    /// not judged here: strict schemas without the pin, an unprompted
+    /// `json_object` and a loose tool history go through to the engine,
+    /// while the structural rules of core validation still apply.
+    #[test]
+    fn the_default_profile_passes_the_openai_only_rules_through() {
+        let generic = |extra: Value| {
+            let mut value = json!({
+                "model": "qwen3-8b",
+                "messages": [{"role": "user", "content": "Say hi in one word."}],
+                "max_completion_tokens": 64
+            });
+            value
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            serde_json::from_value::<ChatCompletionRequest>(value).expect("request deserializes")
+        };
+        assert_eq!(
+            super::super::ProviderProfile::for_model("qwen3-8b"),
+            super::super::ProviderProfile::Generic
+        );
+        let strict_open = generic(json!({"tools": [{"type": "function", "function": {
+            "name": "sub", "strict": true,
+            "parameters": {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}
+        }}]}));
+        assert_eq!(code(&strict_open), None);
+        let strict_format = generic(
+            json!({"response_format": {"type": "json_schema", "json_schema": {
+            "name": "person", "strict": true,
+            "schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}}}),
+        );
+        assert_eq!(code(&strict_format), None);
+        let unprompted = generic(json!({"response_format": {"type": "json_object"}}));
+        assert_eq!(code(&unprompted), None);
+        let loose_history = generic(json!({"messages": [
+            {"role": "user", "content": "Weather?"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "18C"}
+        ]}));
+        assert_eq!(code(&loose_history), None);
+        // Structural rules are not profile-scoped.
+        let bad_parameters = generic(
+            json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": "oops"}}]}),
+        );
+        assert!(code(&bad_parameters).is_some_and(|e| e.contains("invalid_type")));
     }
 
     #[test]

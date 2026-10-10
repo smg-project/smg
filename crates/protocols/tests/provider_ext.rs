@@ -1000,24 +1000,27 @@ fn minimax_profile_rejects_a_second_answer_to_an_answered_call() {
 }
 
 #[test]
-fn kimi_tolerates_loose_tool_history() {
-    // KVV requires invalid-JSON history arguments to be ACCEPTED for Kimi
-    assert!(
-        tool_history_request("kimi-k3", "call_1", "{invalid json}")
-            .validate()
-            .is_ok(),
-        "kimi-k3 must tolerate loose tool history"
-    );
-    assert!(
-        tool_history_request("kimi-k3", "call_999", "{}")
-            .validate()
-            .is_ok(),
-        "kimi-k3 must tolerate id mismatch"
-    );
-    assert!(
-        unanswered_request("kimi-k3").validate().is_ok(),
-        "kimi-k3 must tolerate unanswered tool calls"
-    );
+fn kimi_and_the_default_profile_tolerate_loose_tool_history() {
+    // KVV requires invalid-JSON history arguments to be ACCEPTED for Kimi;
+    // a self-hosted model (no vendor profile) leaves the history to the engine.
+    for model in ["kimi-k3", "qwen3-8b"] {
+        assert!(
+            tool_history_request(model, "call_1", "{invalid json}")
+                .validate()
+                .is_ok(),
+            "{model} must tolerate loose tool history"
+        );
+        assert!(
+            tool_history_request(model, "call_999", "{}")
+                .validate()
+                .is_ok(),
+            "{model} must tolerate id mismatch"
+        );
+        assert!(
+            unanswered_request(model).validate().is_ok(),
+            "{model} must tolerate unanswered tool calls"
+        );
+    }
 }
 
 #[test]

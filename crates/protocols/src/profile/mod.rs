@@ -44,8 +44,15 @@ fn alias_profiles() -> &'static RwLock<HashMap<String, ProviderProfile>> {
 /// Provider dialect for a request, selected from the model id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProfile {
-    /// OpenAI baseline: the public API's structured-output rules on top of
-    /// core validation.
+    /// The default: a model whose id selects no vendor contract, which is
+    /// every self-hosted deployment. Only the structural rules of core
+    /// validation apply; strict schemas, `json_object` prompts and tool-message
+    /// pairing go through to the engine, whose grammar compiler validates
+    /// what it needs.
+    Generic,
+    /// OpenAI's own hosted models ([`is_openai_vendor_model`]): the public
+    /// API's structured-output and tool-message rules on top of core
+    /// validation.
     OpenAi,
     /// Kimi/Moonshot contract (Kimi-Vendor-Verifier).
     Kimi,
@@ -71,7 +78,8 @@ impl ProviderProfile {
             ProviderProfile::DeepSeek
             | ProviderProfile::Minimax
             | ProviderProfile::Zai
-            | ProviderProfile::OpenAi => Box::new(std::iter::empty()),
+            | ProviderProfile::OpenAi
+            | ProviderProfile::Generic => Box::new(std::iter::empty()),
         }
     }
 
@@ -90,27 +98,28 @@ impl ProviderProfile {
     /// Matches the way the tool and reasoning parser factories do: any
     /// `/`-separated segment that starts with a vendor marker selects the
     /// profile, so `kimi-k3`, `/models/Kimi-K3`, `moonshotai/kimi-k2` and
-    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. A served model id
-    /// that names no vendor takes the profile of a vendor-named alias it was
-    /// registered with (see [`Self::register_model_aliases`]), so the profile
-    /// stays the same before and after an alias is resolved into the served
-    /// name. Without such an alias, an opaque served name keeps the OpenAI
-    /// baseline: any extension a request carried is dropped with a warning,
-    /// and a `root` message is rejected outright, so that role needs a
+    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi; `gpt-4o`,
+    /// `openai/gpt-4o`, `chatgpt-4o-latest` and `o3-mini` resolve to OpenAI. A
+    /// served model id that names no vendor takes the profile of a vendor-named
+    /// alias it was registered with (see [`Self::register_model_aliases`]), so
+    /// the profile stays the same before and after an alias is resolved into
+    /// the served name. Without such an alias, an opaque served name keeps the
+    /// default profile: any extension a request carried is dropped with a
+    /// warning, and a `root` message is rejected outright, so that role needs a
     /// MiniMax model id.
     /// DeepSeek is narrower: only the calibrated V4 / V4.1 model segments
     /// and `deepseek-flash` alias select its profile; older versions and
-    /// unrecognized suffixes keep the baseline.
+    /// unrecognized suffixes keep the default.
     pub fn for_model(model: &str) -> Self {
         let profile = Self::from_model_segments(model);
-        if profile != ProviderProfile::OpenAi {
+        if profile != ProviderProfile::Generic {
             return profile;
         }
         let aliased = alias_profiles().read().unwrap_or_else(|e| e.into_inner());
         aliased
             .get(model)
             .copied()
-            .unwrap_or(ProviderProfile::OpenAi)
+            .unwrap_or(ProviderProfile::Generic)
     }
 
     /// Record the configured model aliases (`alias -> served model id`). A
@@ -123,7 +132,7 @@ impl ProviderProfile {
         let mut map = alias_profiles().write().unwrap_or_else(|e| e.into_inner());
         for (alias, canonical) in aliases {
             let profile = Self::from_model_segments(alias);
-            if profile == ProviderProfile::OpenAi {
+            if profile == ProviderProfile::Generic {
                 continue;
             }
             match map.get(canonical) {
@@ -165,7 +174,10 @@ impl ProviderProfile {
                 return ProviderProfile::Zai;
             }
         }
-        ProviderProfile::OpenAi
+        if is_openai_vendor_model(model) {
+            return ProviderProfile::OpenAi;
+        }
+        ProviderProfile::Generic
     }
 
     /// Shape the request for dispatch under this profile: the provider's own
@@ -185,7 +197,8 @@ impl ProviderProfile {
             ProviderProfile::DeepSeek
             | ProviderProfile::Kimi
             | ProviderProfile::Zai
-            | ProviderProfile::OpenAi => {}
+            | ProviderProfile::OpenAi
+            | ProviderProfile::Generic => {}
         }
         let mut dropped: Vec<&'static str> = Vec::new();
         for message in &mut req.messages {
@@ -220,7 +233,7 @@ impl ProviderProfile {
             ProviderProfile::DeepSeek => deepseek::normalize_chat(req),
             ProviderProfile::Kimi => kimi::normalize_chat(req),
             ProviderProfile::Zai => zai::normalize_chat(req),
-            ProviderProfile::OpenAi | ProviderProfile::Minimax => {}
+            ProviderProfile::OpenAi | ProviderProfile::Generic | ProviderProfile::Minimax => {}
         }
     }
 
@@ -247,6 +260,7 @@ impl ProviderProfile {
                 reject_root(req)?;
                 openai::validate_chat(req)
             }
+            ProviderProfile::Generic => reject_root(req),
         }
     }
 }
@@ -378,7 +392,7 @@ mod tests {
         );
         assert_eq!(
             ProviderProfile::for_model("served-model-gamma"),
-            ProviderProfile::OpenAi
+            ProviderProfile::Generic
         );
 
         // A request that entered under the vendor name and had its model id
@@ -408,6 +422,7 @@ mod tests {
         assert!(!ProviderProfile::Kimi.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::Zai.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::OpenAi.parses_tool_calls_without_tools());
+        assert!(!ProviderProfile::Generic.parses_tool_calls_without_tools());
     }
 
     #[test]
@@ -484,17 +499,37 @@ mod tests {
         }
         for model in [
             "gpt-4o-mini",
+            "GPT-5-nano",
+            "openai/gpt-4o",
+            "openrouter/openai/o3-mini",
+            "chatgpt-4o-latest",
+            "codex-mini-latest",
+            "o1",
+            "o4-mini-2025-04-16",
+        ] {
+            assert_eq!(
+                ProviderProfile::for_model(model),
+                ProviderProfile::OpenAi,
+                "{model}"
+            );
+        }
+        for model in [
             "",
             "/models/llama-3",
+            "qwen3-8b",
+            "Qwen/Qwen3-VL-8B-Instruct",
+            "gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "olmo-3-7b-instruct",
+            "o1js-chat",
             "my-kimi-alias",
-            "openai/gpt-4o",
             "my-glm-alias",
             // ChatGLM predates the z.ai chat contract.
             "THUDM/chatglm3-6b",
         ] {
             assert_eq!(
                 ProviderProfile::for_model(model),
-                ProviderProfile::OpenAi,
+                ProviderProfile::Generic,
                 "{model}"
             );
         }
