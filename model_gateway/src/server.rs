@@ -58,7 +58,7 @@ use crate::{
         inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
-        metrics_server, otel_trace, runtime_metrics,
+        metrics_server, otel_trace, runtime_metrics, token_dump,
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
@@ -628,6 +628,34 @@ async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
+/// `POST /start_token_dump`: start recording every engine call into a new
+/// file under `--token-dump-dir` (see [`token_dump`]).
+async fn start_token_dump(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<token_dump::StartRequest>>,
+) -> Response {
+    let Some(dump) = state.context.token_dump.clone() else {
+        return token_dump::not_configured();
+    };
+    let request = body.map(|Json(body)| body).unwrap_or_default();
+    match token_dump::start_blocking(dump, request).await {
+        Ok(started) => Json(started).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `POST /stop_token_dump`: stop the running token dump session and report
+/// its counters.
+async fn stop_token_dump(State(state): State<Arc<AppState>>) -> Response {
+    let Some(dump) = state.context.token_dump.as_ref() else {
+        return token_dump::not_configured();
+    };
+    match dump.stop() {
+        Ok(stopped) => Json(stopped).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn get_loads(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -1024,6 +1052,8 @@ pub fn build_app(
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
         .route("/heap_profile", post(dump_heap_profile))
+        .route("/start_token_dump", post(start_token_dump))
+        .route("/stop_token_dump", post(stop_token_dump))
         // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
