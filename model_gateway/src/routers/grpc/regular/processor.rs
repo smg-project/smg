@@ -237,6 +237,7 @@ impl ResponseProcessor {
             // Whitespace-only residual (e.g. "\n\n" between </think> and <tool_call>)
             // must be None, not Some("\n\n") — see normalize_assistant_content.
             content: normalize_assistant_content(processed_text),
+            refusal: None,
             tool_calls,
             reasoning_content: reasoning_text,
         };
@@ -338,12 +339,14 @@ impl ResponseProcessor {
         }
 
         // Build usage from gRPC response counters, with the reasoning tokens
-        // the gateway's parser split off when it ran (zero included).
+        // the gateway's parser split off when it ran (zero included), and
+        // every detail counter present as the OpenAI API sends it.
         let usage = response_formatting::with_parsed_reasoning_tokens(
             response_formatting::build_usage(&all_responses)
                 .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens),
             reasoning_parser_available.then_some(parsed_reasoning_tokens),
-        );
+        )
+        .with_complete_details();
 
         // Build final ChatCompletionResponse
         Ok(

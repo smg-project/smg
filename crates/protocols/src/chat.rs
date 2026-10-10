@@ -871,6 +871,17 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<ChatChoice>,
     pub usage: Option<Usage>,
     pub system_fingerprint: Option<String>,
+    /// The service tier the completion ran under. Always present, as the
+    /// OpenAI API sends it; the gateway has one tier, `default`.
+    #[serde(default = "default_service_tier")]
+    pub service_tier: String,
+}
+
+/// The one service tier the gateway serves.
+pub const DEFAULT_SERVICE_TIER: &str = "default";
+
+fn default_service_tier() -> String {
+    DEFAULT_SERVICE_TIER.to_string()
 }
 
 impl ChatCompletionResponse {
@@ -889,18 +900,23 @@ pub struct ChatCompletionMessage {
     pub role: String, // Always "assistant" for responses
     /// Always present, `null` on a tool-call turn (as the OpenAI API sends it).
     pub content: Option<String>,
+    /// Always present, as the OpenAI API sends it; the gateway produces no
+    /// refusals, so it is `null`.
+    #[serde(default)]
+    pub refusal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     pub reasoning_content: Option<String>,
     // Note: function_call is deprecated and not included
-    // Note: refusal, annotations, audio are not added yet
+    // Note: annotations, audio are not added yet
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatChoice {
     pub index: u32,
     pub message: ChatCompletionMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present (`null` unless log probabilities were requested), as
+    /// the OpenAI API sends it.
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "tool_calls", "content_filter", "function_call"
     /// Information about which stop condition was matched
@@ -1287,6 +1303,7 @@ mod tests {
         let message = super::ChatCompletionMessage {
             role: "assistant".to_string(),
             content: None,
+            refusal: None,
             tool_calls: Some(vec![crate::common::ToolCall {
                 id: "call_1".to_string(),
                 tool_type: "function".to_string(),

@@ -3007,6 +3007,7 @@ impl ResponseUsage {
             reasoning_tokens: Some(self.output_tokens_details.reasoning_tokens),
             prompt_tokens_details: Some(PromptTokenUsageInfo {
                 cached_tokens: self.input_tokens_details.cached_tokens,
+                audio_tokens: None,
             }),
         }
     }

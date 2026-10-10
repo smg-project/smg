@@ -1138,6 +1138,7 @@ fn test_usage_conversion() {
         reasoning_tokens: Some(8),
         prompt_tokens_details: Some(openai_protocol::common::PromptTokenUsageInfo {
             cached_tokens: 3,
+            audio_tokens: None,
         }),
     };
     let response_usage = usage_info.to_response_usage();

@@ -694,6 +694,7 @@ mod tests {
                 message: ChatCompletionMessage {
                     role: "assistant".to_string(),
                     content: Some("done".to_string()),
+                    refusal: None,
                     tool_calls: None,
                     reasoning_content: None,
                 },
@@ -745,6 +746,7 @@ mod tests {
                 message: ChatCompletionMessage {
                     role: "assistant".to_string(),
                     content: Some("done".to_string()),
+                    refusal: None,
                     tool_calls: None,
                     reasoning_content: None,
                 },

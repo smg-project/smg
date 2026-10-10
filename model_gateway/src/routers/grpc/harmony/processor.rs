@@ -146,6 +146,7 @@ impl HarmonyResponseProcessor {
             let message = ChatCompletionMessage {
                 role: "assistant".to_string(),
                 content: (!final_text.is_empty()).then_some(final_text),
+                refusal: None,
                 tool_calls,
                 reasoning_content: analysis,
             };
@@ -163,9 +164,11 @@ impl HarmonyResponseProcessor {
             });
         }
 
-        // Build usage from proto fields
+        // Build usage from proto fields, every detail counter present as the
+        // OpenAI API sends it
         let usage = response_formatting::build_usage(&all_responses)
-            .with_reasoning_tokens(total_reasoning_tokens);
+            .with_reasoning_tokens(total_reasoning_tokens)
+            .with_complete_details();
 
         // Final ChatCompletionResponse
         Ok(

@@ -742,7 +742,10 @@ impl Usage {
         // Calling this builder means the backend supplied cache accounting.
         // Zero is therefore evidence of a cold miss, not absence of support,
         // and must remain distinguishable from `prompt_tokens_details: None`.
-        self.prompt_tokens_details = Some(PromptTokenUsageInfo { cached_tokens });
+        self.prompt_tokens_details = Some(PromptTokenUsageInfo {
+            cached_tokens,
+            audio_tokens: None,
+        });
         self
     }
 
@@ -775,12 +778,35 @@ impl Usage {
         }
         self
     }
+
+    /// Every detail counter present, zero where nothing was counted: the
+    /// shape the OpenAI API sends on every chat completion
+    /// (`prompt_tokens_details.{cached_tokens,audio_tokens}` and
+    /// `completion_tokens_details.{reasoning_tokens,audio_tokens,
+    /// accepted_prediction_tokens,rejected_prediction_tokens}`), which typed
+    /// clients read without a presence check. Counters already set are kept.
+    pub fn with_complete_details(mut self) -> Self {
+        let prompt = self
+            .prompt_tokens_details
+            .get_or_insert(PromptTokenUsageInfo {
+                cached_tokens: 0,
+                audio_tokens: None,
+            });
+        prompt.audio_tokens.get_or_insert(0);
+        let completion = self.completion_tokens_details.get_or_insert_default();
+        completion.reasoning_tokens.get_or_insert(0);
+        completion.audio_tokens.get_or_insert(0);
+        completion.accepted_prediction_tokens.get_or_insert(0);
+        completion.rejected_prediction_tokens.get_or_insert(0);
+        self
+    }
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionTokensDetails {
     pub reasoning_tokens: Option<u32>,
+    pub audio_tokens: Option<u32>,
     pub accepted_prediction_tokens: Option<u32>,
     pub rejected_prediction_tokens: Option<u32>,
 }
@@ -796,9 +822,12 @@ pub struct UsageInfo {
     pub prompt_tokens_details: Option<PromptTokenUsageInfo>,
 }
 
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PromptTokenUsageInfo {
     pub cached_tokens: u32,
+    #[serde(default)]
+    pub audio_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1217,7 +1246,10 @@ mod tests {
         let usage = Usage::from_counts(16, 1).with_cached_tokens(0);
         assert!(matches!(
             usage.prompt_tokens_details,
-            Some(PromptTokenUsageInfo { cached_tokens: 0 })
+            Some(PromptTokenUsageInfo {
+                cached_tokens: 0,
+                audio_tokens: None,
+            })
         ));
     }
 
