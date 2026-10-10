@@ -1101,6 +1101,31 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+/// The body of an error on the Messages API:
+/// `{"type": "error", "error": {"type", "message"}, "request_id": "..."}`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MessagesErrorEnvelope")]
+pub struct ErrorEnvelope {
+    /// Always `"error"`.
+    #[serde(rename = "type")]
+    pub envelope_type: String,
+
+    pub error: ErrorResponse,
+
+    /// The id of the request the error answers (also the `x-request-id` header).
+    pub request_id: String,
+}
+
+impl ErrorEnvelope {
+    pub fn new(error: ErrorResponse, request_id: impl Into<String>) -> Self {
+        Self {
+            envelope_type: "error".to_string(),
+            error,
+            request_id: request_id.into(),
+        }
+    }
+}
+
 /// API error types
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]

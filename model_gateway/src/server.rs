@@ -62,6 +62,7 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
+        error as route_error,
         gateway::Gateway,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
@@ -105,8 +106,34 @@ async fn parse_reasoning(
     parse::parse_reasoning(&state.context, &req).await
 }
 
-async fn sink_handler() -> Response {
-    StatusCode::NOT_FOUND.into_response()
+/// An unknown URL: a JSON envelope, never an empty body.
+async fn sink_handler(request: Request) -> Response {
+    unknown_route(StatusCode::NOT_FOUND, "unknown_url", request).await
+}
+
+/// A known URL with the wrong method (axum adds the `Allow` header).
+async fn method_not_allowed_handler(request: Request) -> Response {
+    unknown_route(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        request,
+    )
+    .await
+}
+
+/// The envelope of the API the request speaks: the Messages API's on a
+/// Messages route or when the request carries `anthropic-version` (a model
+/// lookup by an Anthropic SDK), the OpenAI-shaped one otherwise.
+async fn unknown_route(status: StatusCode, code: &str, request: Request) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let response =
+        route_error::create_error(status, code, format!("Invalid URL ({method} {path})"));
+    if middleware::wants_messages_envelope(request.headers(), &path) {
+        middleware::into_messages_envelope(response, middleware::request_id_of(&request)).await
+    } else {
+        response
+    }
 }
 
 async fn liveness() -> Response {
@@ -967,6 +994,11 @@ pub fn build_app(
     .route_layer(axum::middleware::from_fn_with_state(
         app_state.clone(),
         middleware::wasm_middleware,
+    ))
+    // Outermost on these routes: a refusal by any layer inside (authentication,
+    // admission, the body timeout) leaves in the Messages envelope as well.
+    .route_layer(axum::middleware::from_fn(
+        middleware::messages_error_envelope_middleware,
     ));
 
     // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
@@ -1131,6 +1163,7 @@ where
     S: Clone + Send + Sync + 'static,
 {
     app.fallback(sink_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -1861,6 +1894,92 @@ mod tests {
                 response.headers().contains_key("x-request-id"),
                 "{path} skipped the edge middleware"
             );
+        }
+    }
+
+    /// An unknown URL and a wrong method answer a JSON envelope in the shape
+    /// of the API the request speaks: the Messages envelope on a Messages
+    /// route or with the `anthropic-version` header, the OpenAI-shaped one
+    /// otherwise; never an empty body.
+    #[tokio::test]
+    async fn unknown_routes_answer_the_envelope_of_the_api_spoken() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new().route("/v1/chat/completions", post(|| async { StatusCode::OK })),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        for (method, path, version, status, messages_shape) in [
+            (
+                "GET",
+                "/v1/models/claude-x",
+                None,
+                StatusCode::NOT_FOUND,
+                false,
+            ),
+            (
+                "GET",
+                "/v1/models/claude-x",
+                Some("2023-06-01"),
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+            (
+                "GET",
+                "/v1/messages/batches",
+                None,
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+            (
+                "GET",
+                "/v1/chat/completions",
+                None,
+                StatusCode::METHOD_NOT_ALLOWED,
+                false,
+            ),
+        ] {
+            let mut request = http::Request::builder().method(method).uri(path);
+            if let Some(version) = version {
+                request = request.header("anthropic-version", version);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{method} {path}");
+            let request_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| panic!("{method} {path}: not JSON: {body:?}"));
+            if messages_shape {
+                assert_eq!(json["type"], "error", "{json}");
+                let expected = if status == StatusCode::NOT_FOUND {
+                    "not_found_error"
+                } else {
+                    "invalid_request_error"
+                };
+                assert_eq!(json["error"]["type"], expected, "{json}");
+                assert_eq!(json["request_id"], request_id, "{json}");
+            } else {
+                assert!(json["error"].is_object(), "{json}");
+                assert!(
+                    json["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains(path)),
+                    "{json}"
+                );
+            }
         }
     }
 
