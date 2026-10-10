@@ -262,6 +262,11 @@ fn dispatch() -> context::DispatchMetadata {
 }
 
 fn chat_spec(with_tools: bool) -> ChatResponseSpec {
+    chat_spec_with(with_tools, None)
+}
+
+/// [`chat_spec`] with a `tool_choice` (`"required"`, a named function, ...).
+fn chat_spec_with(with_tools: bool, tool_choice: Option<Value>) -> ChatResponseSpec {
     let mut request = serde_json::json!({
         "model": "eof-test", "messages": [], "stream": true,
         "separate_reasoning": true, "n": 2
@@ -272,6 +277,9 @@ fn chat_spec(with_tools: bool) -> ChatResponseSpec {
                 "name": "lookup", "parameters": {"type": "object", "properties": {}}
             }
         }]);
+    }
+    if let Some(tool_choice) = tool_choice {
+        request["tool_choice"] = tool_choice;
     }
     ChatResponseSpec::from(
         &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
@@ -297,6 +305,15 @@ async fn chat_events(
     with_tools: bool,
     grpc_status: &'static str,
 ) -> (Result<(), String>, Vec<Value>) {
+    chat_events_with_spec(responses, with_tools, chat_spec(with_tools), grpc_status).await
+}
+
+async fn chat_events_with_spec(
+    responses: Vec<proto::GenerateResponse>,
+    with_tools: bool,
+    spec: ChatResponseSpec,
+    grpc_status: &'static str,
+) -> (Result<(), String>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, grpc_status).await;
     let (tx, rx) = sse_channel();
     let result = processor(with_tools)
@@ -305,7 +322,7 @@ async fn chat_events(
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             (None, None, false, false, false),
-            chat_spec(with_tools),
+            spec,
             &tx,
             None,
         )
@@ -424,9 +441,11 @@ async fn chat_eof_preserves_reasoning_and_normal_tails_per_choice() {
     }
 }
 
-/// A stream carries `role` once, in a first delta shaped like the engine's
-/// (`{"role": "assistant", "content": ""}`); later deltas carry neither the
-/// role nor a `reasoning_content: null` placeholder.
+/// A stream carries `role` once, in the first delta the OpenAI API opens a
+/// text stream with (`{"role": "assistant", "content": "", "refusal": null}`,
+/// whether the model then answers with text, reasoning or a tool call it
+/// chose itself); later deltas carry neither the role nor a
+/// `reasoning_content: null` placeholder.
 #[tokio::test]
 async fn chat_stream_sends_role_once_in_an_empty_first_content_delta() {
     let text = vec![chunk(0, "Hi"), chunk(0, "!"), complete(0, "stop")];
@@ -450,11 +469,15 @@ async fn chat_stream_sends_role_once_in_an_empty_first_content_delta() {
         assert!(deltas.len() > 2, "{events:?}");
         assert_eq!(
             deltas[0],
-            &serde_json::json!({"role": "assistant", "content": ""}),
+            &serde_json::json!({"role": "assistant", "content": "", "refusal": null}),
             "{events:?}"
         );
         for delta in &deltas[1..] {
             assert!(delta.get("role").is_none(), "role repeated: {events:?}");
+            assert!(
+                delta.get("refusal").is_none(),
+                "refusal repeated: {events:?}"
+            );
             assert!(
                 delta.get("reasoning_content").is_none_or(Value::is_string),
                 "null reasoning placeholder: {events:?}"
@@ -466,6 +489,34 @@ async fn chat_stream_sends_role_once_in_an_empty_first_content_delta() {
             with_tools,
             "{events:?}"
         );
+    }
+}
+
+/// A request that forces a tool call (`tool_choice: "required"`, a named
+/// function) opens as the OpenAI API opens a tool-call stream:
+/// `{"role": "assistant", "content": null}`, no `refusal`; the opening chunk
+/// still goes out on the engine's first output.
+#[tokio::test]
+async fn chat_stream_opens_a_forced_tool_call_with_a_null_content() {
+    for tool_choice in [
+        serde_json::json!("required"),
+        serde_json::json!({"type": "function", "function": {"name": "lookup"}}),
+    ] {
+        let frames = vec![
+            chunk(0, r#"{"name": "lookup", "arguments": {}}"#),
+            complete(0, "stop"),
+        ];
+        let spec = chat_spec_with(true, Some(tool_choice.clone()));
+        let (result, events) = chat_events_with_spec(frames, true, spec, "0").await;
+        assert!(result.is_ok(), "{result:?}");
+        let first = &events[0]["choices"][0];
+        assert_eq!(first["index"], 0, "{events:?}");
+        assert_eq!(
+            first["delta"],
+            serde_json::json!({"role": "assistant", "content": null}),
+            "{tool_choice}: {events:?}"
+        );
+        assert!(first["logprobs"].is_null() && first["finish_reason"].is_null());
     }
 }
 

@@ -496,6 +496,10 @@ impl StreamingProcessor {
         let is_specific_function =
             used_json_schema && matches!(tool_choice, Some(ToolChoice::Function { .. }));
 
+        // The first delta's shape: a forced tool call opens as the public API
+        // opens a tool-call stream; anything else as a text stream.
+        let opens_tool_call = forces_tool_call(&original_request);
+
         let tool_parser_available = tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
@@ -593,6 +597,7 @@ impl StreamingProcessor {
                             &mut sse_buffer,
                             &chunk_frame,
                             index,
+                            opens_tool_call,
                             usage.as_ref(),
                             emit_usage_null,
                         )
@@ -727,6 +732,7 @@ impl StreamingProcessor {
                     &mut sse_buffer,
                     &chunk_frame,
                     index,
+                    opens_tool_call,
                     usage.as_ref(),
                     emit_usage_null,
                 )
@@ -1913,11 +1919,11 @@ impl StreamingProcessor {
     /// to the channel as one frame, without a copy, by [`Self::flush_chunks`]
     /// once the engine has nothing more ready, or here once it holds
     /// [`CHUNK_FLUSH_BYTES`].
-    async fn push_chunk(
+    async fn push_chunk<C: Serialize>(
         tx: &SseSender,
         buffer: &mut BytesMut,
         frame: &ChatChunkFrame,
-        choice: &ChatStreamChoice,
+        choice: &C,
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) -> Result<(), ()> {
@@ -1938,17 +1944,19 @@ impl StreamingProcessor {
             .map_err(|_| "Failed to send chunks".to_string())
     }
 
-    /// The chunk that opens a choice: the assistant role and no content.
+    /// The chunk that opens a choice: the assistant role with the public
+    /// API's first delta ([`opening_choice`]).
     async fn send_role_chunk(
         tx: &SseSender,
         buffer: &mut BytesMut,
         frame: &ChatChunkFrame,
         index: u32,
+        opens_tool_call: bool,
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) -> Result<(), String> {
-        let role_choice = role_choice(index);
-        Self::push_chunk(tx, buffer, frame, &role_choice, usage, emit_usage_null)
+        let opening = opening_choice(index, opens_tool_call);
+        Self::push_chunk(tx, buffer, frame, &opening, usage, emit_usage_null)
             .await
             .map_err(|()| "Failed to send first chunk".to_string())
     }
@@ -3757,10 +3765,10 @@ impl ChatChunkFrame {
 
     /// Append `data: {...}\n\n` for `choice` (and `usage`, or the `null`
     /// placeholder when `emit_usage_null`) to `buffer`.
-    fn write_chunk(
+    fn write_chunk<C: Serialize>(
         &self,
         buffer: &mut BytesMut,
-        choice: &ChatStreamChoice,
+        choice: &C,
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) {
@@ -3788,22 +3796,61 @@ impl ChatChunkFrame {
     }
 }
 
-/// The stream's first choice: the role, once, with an empty content, the
-/// shape the engines' own OpenAI-compatible servers send. Later deltas carry
-/// only what changed ([`assistant_choice`]).
-fn role_choice(index: u32) -> ChatStreamChoice {
-    ChatStreamChoice {
+/// The stream's first choice: the role, once, with the delta the OpenAI API
+/// opens a stream with. A stream that may answer with text opens with
+/// `{"role":"assistant","content":"","refusal":null}`; one the request forces
+/// into a tool call opens with `{"role":"assistant","content":null}`. Later
+/// deltas carry only what changed ([`assistant_choice`]). Serialized by the
+/// same frame as a [`ChatStreamChoice`], so the bytes around the delta are
+/// those of every other chunk.
+#[derive(Serialize)]
+struct OpeningChoice {
+    index: u32,
+    delta: OpeningDelta,
+    logprobs: (),
+    finish_reason: (),
+}
+
+#[derive(Serialize)]
+struct OpeningDelta {
+    role: &'static str,
+    content: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<()>,
+}
+
+fn opening_choice(index: u32, opens_tool_call: bool) -> OpeningChoice {
+    OpeningChoice {
         index,
-        delta: ChatMessageDelta {
-            role: Some("assistant".to_string()),
-            content: Some(String::new()),
-            tool_calls: None,
-            reasoning_content: None,
+        delta: if opens_tool_call {
+            OpeningDelta {
+                role: "assistant",
+                content: None,
+                refusal: None,
+            }
+        } else {
+            OpeningDelta {
+                role: "assistant",
+                content: Some(""),
+                refusal: Some(()),
+            }
         },
-        logprobs: None,
-        finish_reason: None,
-        matched_stop: None,
+        logprobs: (),
+        finish_reason: (),
     }
+}
+
+/// Whether the request leaves the model no choice but a tool call (a named
+/// function, `required`, or allowed tools in `required` mode, with tools to
+/// call), so the stream's first delta is a tool call's, not text's.
+fn forces_tool_call(spec: &ChatResponseSpec) -> bool {
+    spec.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        && match &spec.tool_choice {
+            Some(ToolChoice::Function { .. }) => true,
+            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
+            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
+            _ => false,
+        }
 }
 
 /// A streamed choice carrying whichever of `content`, `reasoning_content` and
