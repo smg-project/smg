@@ -1072,23 +1072,24 @@ fn in_order<I: Sync, T: Send>(items: &[I], each: impl Fn(&I) -> T + Sync, then: 
         .map_or(1, NonZeroUsize::get)
         .min(items.len())
         .max(1);
-    in_order_on(threads, items, each, then);
+    in_order_on(threads, &AtomicBool::new(false), items, each, then);
 }
 
-/// [`in_order`] on `threads` threads.
+/// [`in_order`] on `threads` threads, with `stop` as the flag the thread that panics raises as it
+/// unwinds; no thread takes an item once it is up.
 fn in_order_on<I: Sync, T: Send>(
     threads: usize,
+    stop: &AtomicBool,
     items: &[I],
     each: impl Fn(&I) -> T + Sync,
     mut then: impl FnMut(T),
 ) {
     let next = AtomicUsize::new(0);
-    let stop = AtomicBool::new(false);
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let tx = tx.clone();
-            let (next, stop, each) = (&next, &stop, &each);
+            let (next, each) = (&next, &each);
             scope.spawn(move || {
                 let _raised_on_panic = StopOnPanic(stop);
                 while !stop.load(Ordering::Relaxed) {
@@ -1916,6 +1917,16 @@ fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
         .all(|known| known.id != REASONING_PROBE.id));
 }
 
+/// Spins until `ready` holds, for at most ten seconds, so that a test waiting on another thread's
+/// progress fails with `never` rather than hangs.
+fn wait_until(ready: impl Fn() -> bool, never: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(Instant::now() < deadline, "{never}");
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
     // Item 0 waits until item 1 is done, so on two threads item 1 finishes first and items 2
@@ -1925,14 +1936,14 @@ fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
     let mut handed = Vec::new();
     in_order_on(
         2,
+        &AtomicBool::new(false),
         &items,
         |&item| {
             if item == 0 {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !item_1_done.load(Ordering::Relaxed) {
-                    assert!(Instant::now() < deadline, "item 1 never finished");
-                    std::thread::yield_now();
-                }
+                wait_until(
+                    || item_1_done.load(Ordering::Relaxed),
+                    "item 1 never finished",
+                );
             }
             if item == 1 {
                 item_1_done.store(true, Ordering::Relaxed);
@@ -1946,38 +1957,43 @@ fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
 
 #[test]
 fn a_panic_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_more() {
-    // Item 0 panics at once; every other item waits for that panic and then a while longer, so
-    // the flag is up before any other thread looks for its next item: on two threads, the
-    // other thread finishes the one item it had and takes none of the six left.
-    let item_0_panicked = AtomicBool::new(false);
+    // On two threads, item 0 panics once the other thread has an item in flight, and that item
+    // ends once the panic has raised the flag: the other thread finishes the one item it had,
+    // finds the flag up when it looks for the next, and takes none of the six left. Nothing
+    // here waits a length of time; the item in flight waits for the flag itself, however long
+    // the unwind takes on a loaded host.
+    let stop = AtomicBool::new(false);
     let started = AtomicUsize::new(0);
     let items: Vec<usize> = (0..8).collect();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         in_order_on(
             2,
+            &stop,
             &items,
             |&item| {
                 if item == 0 {
-                    item_0_panicked.store(true, Ordering::Relaxed);
+                    wait_until(
+                        || started.load(Ordering::Relaxed) >= 1,
+                        "the other thread never started an item",
+                    );
                     panic!("item 0");
                 }
                 started.fetch_add(1, Ordering::Relaxed);
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !item_0_panicked.load(Ordering::Relaxed) {
-                    assert!(Instant::now() < deadline, "item 0 never panicked");
-                    std::thread::yield_now();
-                }
-                std::thread::sleep(Duration::from_millis(200));
+                wait_until(
+                    || stop.load(Ordering::Relaxed),
+                    "item 0's panic never raised the flag",
+                );
                 item
             },
             |_| {},
         );
     }));
     assert!(outcome.is_err(), "the panic reaches the caller");
-    let started = started.load(Ordering::Relaxed);
-    assert!(
-        started <= 1,
-        "{started} items started beside the one that panicked; the other thread had one in flight"
+    assert!(stop.load(Ordering::Relaxed), "the panic raised the flag");
+    assert_eq!(
+        started.load(Ordering::Relaxed),
+        1,
+        "the other thread finishes the item it had in flight and takes no more"
     );
 }
 
