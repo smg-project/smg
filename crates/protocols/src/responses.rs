@@ -270,15 +270,6 @@ impl Default for ResponsesToolChoice {
 }
 
 impl ResponsesToolChoice {
-    /// Serialize tool_choice to string for ResponsesResponse payloads.
-    ///
-    /// Returns the JSON-serialized tool_choice or `"auto"` as default.
-    pub fn serialize_to_string(tool_choice: Option<&ResponsesToolChoice>) -> String {
-        tool_choice
-            .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
-            .unwrap_or_else(|| "auto".to_string())
-    }
-
     /// Return the pinned function name for the `Function` variant, regardless
     /// of which wire shape (spec-flat `name` or legacy nested `function.name`)
     /// was used at deserialize time. `None` for any non-`Function` variant.
@@ -4167,9 +4158,12 @@ pub struct ResponsesResponse {
     #[serialize_always]
     pub text: Option<TextConfig>,
 
-    /// Tool choice setting
-    #[serde(default = "default_tool_choice")]
-    pub tool_choice: String,
+    /// Tool choice setting, echoed as the request sent it: a bare string
+    /// (`"auto"`, `"none"`, `"required"`) or the object form (`{"type":
+    /// "function", "name": ...}`, `{"type": "allowed_tools", ...}`, a hosted
+    /// tool type), as the public API returns it.
+    #[serde(default)]
+    pub tool_choice: ResponsesToolChoice,
 
     /// Available tools
     #[serde(default)]
@@ -4217,10 +4211,6 @@ pub struct ResponsesResponse {
 
 fn default_object_type() -> String {
     "response".to_string()
-}
-
-fn default_tool_choice() -> String {
-    "auto".to_string()
 }
 
 impl ResponsesResponse {

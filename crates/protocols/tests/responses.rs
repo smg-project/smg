@@ -4732,3 +4732,59 @@ fn top_logprobs_without_include_is_accepted() {
     let request = plain_request(json!({"model": "m", "input": "hi", "top_logprobs": 5})).unwrap();
     assert!(request.validate().is_ok());
 }
+
+/// The Response object echoes `tool_choice` as the request sent it, as the
+/// public API does: the object forms stay objects (`{"type": "function",
+/// "name": ...}`, not a string containing that JSON), the bare strings stay
+/// bare strings (`"required"`, not `"\"required\""`), and a request without a
+/// `tool_choice` echoes `"auto"`.
+#[test]
+fn responses_response_echoes_tool_choice_as_sent() {
+    let echo = |request: serde_json::Value| {
+        let request: ResponsesRequest =
+            serde_json::from_value(request).expect("request should deserialize");
+        let wire = serde_json::to_value(
+            ResponsesResponse::builder("resp_tc", "m")
+                .copy_from_request(&request)
+                .build(),
+        )
+        .expect("serialize response");
+        wire["tool_choice"].clone()
+    };
+    let tools = json!([{
+        "type": "function",
+        "name": "get_weather",
+        "parameters": {"type": "object", "properties": {}}
+    }]);
+
+    for choice in [
+        json!({"type": "function", "name": "get_weather"}),
+        json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [{"type": "function", "name": "get_weather"}]
+        }),
+        json!({"type": "web_search"}),
+        json!("required"),
+        json!("none"),
+    ] {
+        let echoed = echo(json!({
+            "model": "m",
+            "input": "hi",
+            "tools": tools,
+            "tool_choice": choice
+        }));
+        assert_eq!(
+            echoed, choice,
+            "tool_choice {choice} must be echoed as sent"
+        );
+    }
+
+    // No tool_choice on the request: the public API's default, with and
+    // without tools (normalisation fills `"auto"` when tools are present).
+    assert_eq!(
+        echo(json!({"model": "m", "input": "hi", "tools": tools})),
+        json!("auto")
+    );
+    assert_eq!(echo(json!({"model": "m", "input": "hi"})), json!("auto"));
+}
