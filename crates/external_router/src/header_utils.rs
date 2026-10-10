@@ -411,6 +411,8 @@ pub fn should_forward_request_header(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use rustls::crypto::ring;
+
     use super::*;
 
     #[test]
@@ -428,6 +430,7 @@ mod tests {
 
     #[test]
     fn apply_forwarded_request_headers_user_auth_wins_without_duplicate() {
+        let _ = ring::default_provider().install_default();
         let client = reqwest::Client::new();
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -462,6 +465,7 @@ mod tests {
 
     #[test]
     fn apply_forwarded_request_headers_falls_back_to_worker_key() {
+        let _ = ring::default_provider().install_default();
         let client = reqwest::Client::new();
         let headers = HeaderMap::new(); // caller sent no Authorization
         let worker_key = "worker-key".to_string();

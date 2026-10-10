@@ -17,6 +17,7 @@ use llm_multimodal::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
 use reqwest::Client;
+use rustls::crypto::ring;
 use tokio::process::Command;
 
 /// One HTTP/1.1 response for the first connection: the headers after
@@ -67,6 +68,7 @@ fn serve_once(
 }
 
 fn connector(config: MediaConnectorConfig) -> MediaConnector {
+    let _ = ring::default_provider().install_default();
     let client = Client::builder().no_proxy().build().expect("client");
     MediaConnector::new(client, config).expect("media connector")
 }

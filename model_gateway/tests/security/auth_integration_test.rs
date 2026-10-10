@@ -116,6 +116,9 @@ fn create_claims(sub: &str, roles: Vec<&str>) -> TestClaims {
 /// Start a mock JWKS server using the generated test key pair
 #[expect(clippy::unwrap_used, clippy::disallowed_methods)]
 async fn start_mock_jwks_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    // The validator fetches the keys with an HTTP client that needs the
+    // process-level TLS provider installed first.
+    smg::tls::install_crypto_provider();
     // Use the generated key pair components
     let jwks_response = json!({
         "keys": [{

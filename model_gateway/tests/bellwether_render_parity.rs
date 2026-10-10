@@ -2288,6 +2288,7 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     }
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    smg::tls::install_crypto_provider();
     let client = reqwest::blocking::Client::new();
     download(&client, model, revision, &dir, "tokenizer_config.json", 100)?
         .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;

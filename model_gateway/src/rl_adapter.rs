@@ -96,6 +96,7 @@ mod tests {
     /// worker (HTTP version, TLS identity, pool tuning), not a second one.
     #[test]
     fn view_hands_out_the_worker_negotiated_http_client() {
+        crate::tls::install_crypto_provider();
         let client = Arc::new(reqwest::Client::new());
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://engine:30000")

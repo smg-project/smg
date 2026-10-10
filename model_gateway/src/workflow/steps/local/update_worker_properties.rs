@@ -229,6 +229,7 @@ mod tests {
         }
         let job_queue = Arc::new(std::sync::OnceLock::new());
 
+        crate::tls::install_crypto_provider();
         Arc::new(AppContext {
             gateway_auth: AuthConfig::new(None),
             client: reqwest::Client::new(),
@@ -571,6 +572,7 @@ mod tests {
     /// entry the old worker was keeping alive.
     #[tokio::test]
     async fn http_update_adopts_the_materialized_shared_client() {
+        crate::tls::install_crypto_provider();
         let client = Arc::new(reqwest::Client::new());
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w:8080")
@@ -595,6 +597,7 @@ mod tests {
     /// describing it correctly.
     #[tokio::test]
     async fn http_update_preserves_http2() {
+        crate::tls::install_crypto_provider();
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w:8080")
                 .http_client(Arc::new(reqwest::Client::new()))

@@ -349,6 +349,7 @@ mod grpc_router_type_tests {
             ))
             .ok();
 
+        crate::tls::install_crypto_provider();
         Arc::new(
             AppContext::builder()
                 .router_config(config)

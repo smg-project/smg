@@ -18,6 +18,7 @@ use std::{
 
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use parking_lot::{Mutex, RwLock};
+use rustls::crypto::{ring, CryptoProvider};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -228,6 +229,19 @@ pub(crate) struct JwksProvider {
     last_fetch_attempt: Mutex<Option<Instant>>,
 }
 
+/// Installs `ring` as the process-level TLS crypto provider unless one is
+/// installed already. The HTTP client takes the process provider (reqwest's
+/// `rustls-no-provider` feature) and panics at build time when there is
+/// none, so the constructors install it before building their client; a
+/// provider the embedding process installed earlier stays.
+fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // An error here means another thread installed one in between,
+        // which is the outcome wanted.
+        let _ = ring::default_provider().install_default();
+    }
+}
+
 impl JwksProvider {
     /// Create a new JWKS provider with explicit JWKS URI.
     /// The URL is validated for SSRF protection.
@@ -237,6 +251,7 @@ impl JwksProvider {
         // Validate URL for SSRF protection
         validate_url(&jwks_uri)?;
 
+        install_crypto_provider();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF via redirects
@@ -262,6 +277,7 @@ impl JwksProvider {
         // Validate discovery URL for SSRF protection
         validate_url(&discovery_url)?;
 
+        install_crypto_provider();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())

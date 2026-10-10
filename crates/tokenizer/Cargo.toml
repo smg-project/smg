@@ -48,7 +48,8 @@ unicode-normalization = "0.1"
 [dev-dependencies]
 criterion = "0.8"
 openai-protocol.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27"
 # The bellwether fixtures test reads the fixture manifests (TOML).
 toml = "1.1"

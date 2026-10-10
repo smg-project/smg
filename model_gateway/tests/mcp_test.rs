@@ -54,6 +54,7 @@ async fn test_mcp_server_initialization() {
     };
 
     // Should succeed but with no connected servers (empty config is allowed)
+    smg::tls::install_crypto_provider();
     let result = McpOrchestrator::new(config).await;
     assert!(result.is_ok(), "Should succeed with empty config");
 
@@ -90,6 +91,7 @@ async fn test_server_connection_with_mock() {
         policy: Default::default(),
     };
 
+    smg::tls::install_crypto_provider();
     let result = McpOrchestrator::new(config).await;
     assert!(result.is_ok(), "Should connect to mock server");
 
@@ -134,6 +136,7 @@ async fn test_tool_availability_checking() {
         policy: Default::default(),
     };
 
+    smg::tls::install_crypto_provider();
     let manager = McpOrchestrator::new(config).await.unwrap();
 
     let test_tools = vec!["brave_web_search", "brave_local_search", "calculator"];
@@ -204,6 +207,7 @@ async fn test_multi_server_connection() {
 
     // Note: This will fail to connect to both servers in the current implementation
     // since they return the same tools. The manager will connect to the first one.
+    smg::tls::install_crypto_provider();
     let result = McpOrchestrator::new(config).await;
 
     if let Ok(manager) = result {
@@ -243,6 +247,7 @@ async fn test_tool_execution_with_mock() {
         policy: Default::default(),
     };
 
+    smg::tls::install_crypto_provider();
     let manager = McpOrchestrator::new(config).await.unwrap();
 
     let session = McpToolSession::new(
@@ -314,6 +319,7 @@ async fn test_web_search_transform_handles_openai_search_response_with_mock() {
         policy: Default::default(),
     };
 
+    smg::tls::install_crypto_provider();
     let manager = McpOrchestrator::new(config).await.unwrap();
 
     let session = McpToolSession::new(
@@ -389,6 +395,7 @@ async fn test_web_search_transform_sets_action_query_for_brave_search_with_mock(
         policy: Default::default(),
     };
 
+    smg::tls::install_crypto_provider();
     let manager = McpOrchestrator::new(config).await.unwrap();
 
     let session = McpToolSession::new(
@@ -454,6 +461,7 @@ async fn test_concurrent_tool_execution() {
         policy: Default::default(),
     };
 
+    smg::tls::install_crypto_provider();
     let manager = McpOrchestrator::new(config).await.unwrap();
 
     let session = McpToolSession::new(
@@ -517,6 +525,7 @@ async fn test_tool_execution_errors() {
         policy: Default::default(),
     };
 
+    smg::tls::install_crypto_provider();
     let manager = McpOrchestrator::new(config).await.unwrap();
 
     let session = McpToolSession::new(
@@ -569,6 +578,7 @@ async fn test_connection_without_server() {
         policy: Default::default(),
     };
 
+    smg::tls::install_crypto_provider();
     let result = McpOrchestrator::new(config).await;
     // Manager succeeds but no servers are connected (errors are logged)
     assert!(
@@ -609,6 +619,7 @@ async fn test_tool_info_structure() {
         policy: Default::default(),
     };
 
+    smg::tls::install_crypto_provider();
     let manager = McpOrchestrator::new(config).await.unwrap();
 
     let tools = manager.list_tools(None);
@@ -657,6 +668,7 @@ async fn test_sse_connection() {
     };
 
     // Manager succeeds but no servers are connected (errors are logged)
+    smg::tls::install_crypto_provider();
     let result = McpOrchestrator::new(config).await;
     assert!(
         result.is_ok(),
@@ -754,6 +766,7 @@ async fn test_complete_workflow() {
     };
 
     // 2. Connect to server
+    smg::tls::install_crypto_provider();
     let manager = McpOrchestrator::new(config)
         .await
         .expect("Should connect to mock server");
@@ -820,6 +833,7 @@ async fn test_complete_workflow() {
 #[tokio::test]
 async fn internal_mcp_visibility_preserves_namespaced_client_function() {
     let mut server = MockMCPServer::start().await.unwrap();
+    smg::tls::install_crypto_provider();
     let manager = McpOrchestrator::new(McpConfig {
         servers: vec![McpServerConfig {
             name: "internal".into(),

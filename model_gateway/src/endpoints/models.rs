@@ -254,6 +254,7 @@ mod tests {
         );
         registry.register(internal_worker);
 
+        crate::tls::install_crypto_provider();
         let client = reqwest::Client::new();
         let gateway_auth = AuthConfig::with_tenant_keys(
             Some("shared-secret".to_string()),

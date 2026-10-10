@@ -269,6 +269,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use openai_protocol::worker::{ConnectionMode, RuntimeType};
+    use rustls::crypto::ring;
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -462,6 +463,7 @@ mod tests {
     async fn control_timeout_is_applied_per_request_on_the_worker_client() {
         let slow_engine = FakeEngine::start(StatusCode::OK, json!({}), 1500).await;
         let mut w = worker("slow", &slow_engine.url, RuntimeType::Sglang);
+        let _ = ring::default_provider().install_default();
         w.http_client = Some(Arc::new(reqwest::Client::new()));
         let app = crate::router::<()>(state(vec![w], 1));
 

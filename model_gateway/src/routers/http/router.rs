@@ -2458,6 +2458,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_recovers_on_second_connection() {
         let (addr, accepted) = flaky_upstream(1).await;
+        crate::tls::install_crypto_provider();
         let client = reqwest::Client::new();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
@@ -2469,6 +2470,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_is_bounded_to_one() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
+        crate::tls::install_crypto_provider();
         let client = reqwest::Client::new();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
@@ -2480,6 +2482,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_skips_unclonable_bodies() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
+        crate::tls::install_crypto_provider();
         let client = reqwest::Client::new();
         let stream_body = reqwest::Body::wrap_stream(stream::once(async {
             Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
@@ -3928,6 +3931,7 @@ mod tests {
         // timeout fires.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        crate::tls::install_crypto_provider();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(100))
             .build()
@@ -3955,6 +3959,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
+        crate::tls::install_crypto_provider();
         let err = reqwest::Client::new()
             .get(format!("http://{addr}/generate"))
             .send()
@@ -4035,6 +4040,7 @@ mod upstream_span_tests {
             }
             socket.write_all(b"0\r\n\r\n").await.expect("last chunk");
         });
+        crate::tls::install_crypto_provider();
         let client = reqwest::Client::new();
         let response =
             send_with_stale_conn_retry(client.get(format!("http://{addr}/v1/chat/completions")))
