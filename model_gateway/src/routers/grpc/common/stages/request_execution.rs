@@ -632,6 +632,7 @@ async fn execute_pd_dispatch(
 /// with its own rendezvous room, and merge their legs into one PD result
 /// whose responses carry the sample index. Fail-fast: the first pair that
 /// fails to start fails the request, and dropping the others aborts them.
+#[expect(clippy::too_many_arguments)]
 async fn execute_fanout_pd(
     proto_request: ProtoGenerateRequest,
     n: u32,
@@ -710,6 +711,7 @@ async fn execute_fanout_pd(
     })
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -783,6 +785,7 @@ fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
 /// Dispatch one backend request per batched prompt concurrently, preserving
 /// prompt order. Fail-fast: the first failed dispatch fails the batch and
 /// drops the remaining streams (abort-on-drop reclaims them backend-side).
+#[expect(clippy::too_many_arguments)]
 async fn execute_batch_dispatch(
     kind: ExecutionPlanKind,
     requests: Vec<ProtoGenerateRequest>,

@@ -4181,7 +4181,7 @@ mod token_dump_tests {
         assert_eq!((event.index, event.token_ids), (1, &[7, 8][..]));
         assert_eq!(event.finish_reason, Some("stop"));
 
-        let empty = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse::default()));
+        let empty = ProtoGenerateResponse::Vllm(Box::default());
         assert_eq!(empty.dump_event().part, Part::Empty);
     }
 
