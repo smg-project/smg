@@ -8,8 +8,8 @@ Sequence: pause_generation -> update_weights_from_disk -> continue_generation,
 each as one fan-out, then one /generate through SMG to confirm the engine
 reports the new meta_info.weight_version. The pause/resume pair is
 `smg.rl.paused`, so a failure at any stage still resumes the engines that did
-pause. Only HTTP workers can be proxied: a gRPC or ZMQ worker matched by
-`--selector` fails the fan-out with `unsupported_connection_mode`.
+pause. A worker with no control endpoint (a gRPC or ZMQ worker without an
+`rl.control_url` label) fails the fan-out with `no_control_endpoint`.
 """
 
 from __future__ import annotations

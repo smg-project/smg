@@ -1,6 +1,6 @@
 //! Runtime configuration for the mock worker fleet, parsed from CLI flags.
 
-use std::{path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use crate::engine::{Calibration, EngineParams, LoadsLike, TimingModel};
 
@@ -38,6 +38,12 @@ pub struct Config {
     pub realistic: bool,
     /// Engine-simulator parameters (only used when `realistic`).
     pub engine: EngineParams,
+    /// Extra `server_args` entries the gRPC `GetServerInfo` advertises, as
+    /// string values (e.g. `rl.control_url`). Empty leaves `server_args` unset.
+    pub server_args: BTreeMap<String, String>,
+    /// Weight version stamped on every gRPC generate chunk and completion;
+    /// `None` leaves the field unset, like an engine that predates it.
+    pub weight_version: Option<String>,
     /// Port of the process-wide admin API (fleet, request records, cache
     /// dumps, resets); off when `None`.
     pub admin_port: Option<u16>,
@@ -156,6 +162,8 @@ impl Default for Config {
             output_tokens: 8,
             realistic: false,
             engine: EngineParams::default(),
+            server_args: BTreeMap::new(),
+            weight_version: None,
             admin_port: None,
             context_length: 32768,
             grpc_max_message_bytes: usize::MAX,

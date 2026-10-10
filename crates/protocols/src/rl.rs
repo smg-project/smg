@@ -48,7 +48,7 @@ pub struct RlWorkerEntry {
     pub id: String,
     /// Registry URL; carries an `@<rank>` suffix for DP-aware workers.
     pub url: String,
-    /// The address control calls are sent to.
+    /// `Worker::base_url()`; see `control_url` for where control calls go.
     pub base_url: String,
     /// Engine name (`sglang`, `vllm`, ...); `unknown` when undetected.
     pub engine: String,
@@ -56,6 +56,10 @@ pub struct RlWorkerEntry {
     pub model_id: String,
     pub worker_type: String,
     pub connection_mode: String,
+    /// Base URL of the worker's RL control routes: the worker itself for an
+    /// HTTP worker, the engine-advertised or operator-supplied
+    /// `rl.control_url` otherwise; `null` when the worker has none.
+    pub control_url: Option<String>,
     pub tp_size: Option<u64>,
     pub dp_size: Option<u64>,
     pub pp_size: Option<u64>,
@@ -110,13 +114,13 @@ pub struct RlFailedCall {
     pub worker_id: String,
     pub url: String,
     /// `upstream_error`, `upstream_unreachable`, `upstream_timeout`, or
-    /// `unsupported_connection_mode`.
+    /// `no_control_endpoint`.
     pub error: String,
     pub message: String,
     /// The engine's HTTP status, for `upstream_error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// The worker's connection mode, for `unsupported_connection_mode`.
+    /// The worker's connection mode, for `no_control_endpoint`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_mode: Option<String>,
 }
@@ -150,6 +154,7 @@ mod tests {
             model_id: "m".to_string(),
             worker_type: "regular".to_string(),
             connection_mode: "http".to_string(),
+            control_url: Some("http://a:1".to_string()),
             tp_size: Some(1),
             dp_size: None,
             pp_size: None,

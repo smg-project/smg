@@ -31,6 +31,15 @@ fn static_for(runtime: RuntimeType) -> RlCapabilities {
             sleep_wake: true,
             reports_weight_version: false,
         },
+        RuntimeType::TokenSpeed => RlCapabilities {
+            source: RlCapabilitySource::Static,
+            pause_modes: strings(&["wait", "abort"]),
+            update_from: strings(&["distributed"]),
+            abort: true,
+            flush_cache: true,
+            sleep_wake: true,
+            reports_weight_version: true,
+        },
         _ => RlCapabilities {
             source: RlCapabilitySource::Static,
             pause_modes: Vec::new(),
@@ -124,7 +133,6 @@ mod tests {
     fn other_runtimes_have_no_capabilities() {
         for rt in [
             RuntimeType::Trtllm,
-            RuntimeType::TokenSpeed,
             RuntimeType::Mlx,
             RuntimeType::Generic,
             RuntimeType::External,
@@ -166,5 +174,33 @@ mod tests {
         assert!(!c.abort);
         assert!(c.flush_cache);
         assert_eq!(c.pause_modes, ["abort", "retract", "in_place"]);
+    }
+
+    /// The fallback for TokenSpeed builds that predate advertisement. `keep`
+    /// is absent on purpose: pre-advertisement builds cannot reach it over
+    /// HTTP, and an advertising engine overrides this row anyway. `disk` and
+    /// `tensor` are absent too: the scheduler has no receive path for
+    /// either, only the trainer-driven NCCL broadcast (`distributed`) works.
+    #[test]
+    fn tokenspeed_static_row() {
+        let t = capabilities_for(RuntimeType::TokenSpeed, &HashMap::new());
+        assert_eq!(t.source, RlCapabilitySource::Static);
+        assert_eq!(t.pause_modes, ["wait", "abort"]);
+        assert_eq!(t.update_from, ["distributed"]);
+        assert!(t.abort && t.flush_cache && t.sleep_wake && t.reports_weight_version);
+    }
+
+    #[test]
+    fn engine_advertised_labels_override_the_tokenspeed_row() {
+        let t = capabilities_for(
+            RuntimeType::TokenSpeed,
+            &labels(&[
+                ("rl.pause_modes", "wait,abort,keep"),
+                ("rl.update_from", "distributed"),
+            ]),
+        );
+        assert_eq!(t.source, RlCapabilitySource::Label);
+        assert_eq!(t.pause_modes, ["wait", "abort", "keep"]);
+        assert_eq!(t.update_from, ["distributed"]);
     }
 }

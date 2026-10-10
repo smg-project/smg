@@ -187,6 +187,7 @@ impl TokenSpeedScheduler for MockScheduler {
             // gateway and the engine, as a backlog in transit would hold it;
             // the load record does not see it until it lands.
             engine.admit().await;
+            let weight_version = self.cfg.weight_version.clone();
             let (tx, rx) = mpsc::unbounded_channel();
             engine.submit(NewRequest {
                 request_id: request_id.clone(),
@@ -199,6 +200,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 stream_chunks,
                 request_id,
                 cut,
+                weight_version,
             )));
         }
 
@@ -220,7 +222,7 @@ impl TokenSpeedScheduler for MockScheduler {
                     cached_tokens: 0,
                     output_logprobs: None,
                     index: 0,
-                    weight_version: None,
+                    weight_version: self.cfg.weight_version.clone(),
                 })),
             }));
         }
@@ -235,6 +237,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 output_logprobs: None,
                 matched_stop: None,
                 index: 0,
+                weight_version: self.cfg.weight_version.clone(),
                 ..Default::default()
             })),
         }));
@@ -289,8 +292,23 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetServerInfoRequest>,
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
+        let server_args = (!self.cfg.server_args.is_empty()).then(|| prost_types::Struct {
+            fields: self
+                .cfg
+                .server_args
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue(v.clone())),
+                        },
+                    )
+                })
+                .collect(),
+        });
         Ok(Response::new(ts::GetServerInfoResponse {
-            server_args: None,
+            server_args,
             scheduler_info: None,
             active_requests: 0,
             is_paused: false,
@@ -421,6 +439,9 @@ struct Generating {
     /// The fault hook's cut: the stream ends with the status once the engine
     /// has produced more than this many tokens; the counter records the cut.
     cut: Option<(u32, Status, Arc<AtomicU64>)>,
+    /// Stamped on every chunk and the completion; `None` leaves the field
+    /// unset, like an engine that predates it.
+    weight_version: Option<String>,
     ended: bool,
 }
 
@@ -430,12 +451,14 @@ struct Generating {
 /// engine has dropped the sender, so the next `recv()` yields `None` and the
 /// stream ends. With `cut`, the stream ends with that status instead once the
 /// engine has produced more than the given number of tokens (the fault hook's
-/// `after_tokens`); an output no longer than that completes as usual.
+/// `after_tokens`); an output no longer than that completes as usual. Every
+/// chunk and the completion carry `weight_version`, as an engine stamps them.
 fn generate_stream(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     stream_chunks: bool,
     request_id: String,
     cut: Option<(u32, Status, Arc<AtomicU64>)>,
+    weight_version: Option<String>,
 ) -> GenStream {
     let init = Generating {
         rx,
@@ -443,6 +466,7 @@ fn generate_stream(
         stream_chunks,
         request_id,
         cut,
+        weight_version,
         ended: false,
     };
     Box::pin(stream::unfold(init, |mut st| async move {
@@ -475,7 +499,7 @@ fn generate_stream(
                                 cached_tokens,
                                 output_logprobs: None,
                                 index: 0,
-                                weight_version: None,
+                                weight_version: st.weight_version.clone(),
                             })),
                         };
                         return Some((Ok(resp), st));
@@ -499,6 +523,7 @@ fn generate_stream(
                             output_logprobs: None,
                             matched_stop: None,
                             index: 0,
+                            weight_version: st.weight_version.clone(),
                             ..Default::default()
                         })),
                     };
@@ -756,7 +781,7 @@ mod tests {
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
         let cut = Some((2, Status::unavailable("injected"), Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        let mut stream = generate_stream(rx, true, "r".to_string(), cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
@@ -773,7 +798,7 @@ mod tests {
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
         let cut = Some((1, Status::internal("injected"), Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        let mut stream = generate_stream(rx, true, "r".to_string(), cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         let complete = stream.next().await.expect("complete").expect("ok");
         assert!(matches!(complete.response, Some(GenResp::Complete(_))));
