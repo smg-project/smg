@@ -122,7 +122,11 @@ impl crate::kv_events::LoadSource for LoadFromState {
         let load = response.loads.first()?;
         // The engine reports no queued token-work on this wire yet: the
         // record's `waiting_uncached_tokens` stays unset.
-        Some(smg_grpc_client::common_proto::EngineLoad::from(load))
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
+        Some(record)
     }
 }
 

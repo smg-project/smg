@@ -236,6 +236,11 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
             let delta = (last.gen_throughput - current.gen_throughput).abs();
             delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
         }
+        // A growing engine silence goes out once a second, so a subscriber's
+        // wedge bound is met within a second of the engine crossing it.
+        || last.engine_silence_ms.map(|ms| ms / 1000) != current.engine_silence_ms.map(|ms| ms / 1000)
+        || last.engine_reports_steps != current.engine_reports_steps
+        || last.prefill_pending_tokens != current.prefill_pending_tokens
 }
 
 /// Whether [`RELAY_START_ENV`] set to `value` keeps the start at boot.
@@ -1985,6 +1990,23 @@ mod tests {
 
     fn load_only_marker(batch: &common::KvEventBatch) -> bool {
         batch.load.as_ref().is_some_and(|load| load.load_only)
+    }
+
+    /// A frozen engine's record changes in nothing but its silence; that goes
+    /// out once a second, so a subscriber's wedge threshold is met within a
+    /// second of the engine crossing it instead of at the heartbeat backoff.
+    #[test]
+    fn a_growing_engine_silence_changes_the_record_once_a_second() {
+        let mut last = common::EngineLoad::default();
+        let mut current = last.clone();
+        current.engine_silence_ms = Some(900);
+        assert!(load_changed(&last, &current), "a silence appearing");
+        last.engine_silence_ms = Some(100);
+        assert!(!load_changed(&last, &current), "within the same second");
+        current.engine_silence_ms = Some(1_000);
+        assert!(load_changed(&last, &current), "a whole second crossed");
+        current.engine_silence_ms = None;
+        assert!(load_changed(&last, &current), "the silence ending");
     }
 
     /// A relay whose replay socket is not bound yet: the relay keeps asking

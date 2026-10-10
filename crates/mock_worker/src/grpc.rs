@@ -78,6 +78,7 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
         cfg,
         engine,
         capture,
+        prefill_pending: Arc::new(AtomicU64::new(0)),
     };
     let server = async {
         // tonic's 4 MiB default would refuse the Generate of a long prompt (a
@@ -128,6 +129,9 @@ struct MockScheduler {
     engine: Option<Engine>,
     /// Present iff `--capture` is set: every `Generate` request is recorded.
     capture: Option<Arc<Capture>>,
+    /// Prompt tokens of the requests handed to the engine with no token yet:
+    /// the prefill work in hand, as a servicer reports it on its load record.
+    prefill_pending: Arc<AtomicU64>,
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -188,6 +192,11 @@ impl TokenSpeedScheduler for MockScheduler {
             // the load record does not see it until it lands.
             engine.admit().await;
             let (tx, rx) = mpsc::unbounded_channel();
+            let pending = (
+                Arc::clone(&self.prefill_pending),
+                prompt_token_ids.len() as u64,
+            );
+            pending.0.fetch_add(pending.1, Ordering::Relaxed);
             engine.submit(NewRequest {
                 request_id: request_id.clone(),
                 prompt_token_ids,
@@ -198,6 +207,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 rx,
                 stream_chunks,
                 request_id,
+                Some(pending),
                 cut,
             )));
         }
@@ -348,6 +358,8 @@ impl TokenSpeedScheduler for MockScheduler {
                 Ok(Response::new(with_load_records(
                     engine.clone(),
                     self.cfg.loads_like,
+                    self.cfg.step_reports,
+                    Arc::clone(&self.prefill_pending),
                     engine.subscribe_kv(start),
                 )))
             }
@@ -421,7 +433,26 @@ struct Generating {
     /// The fault hook's cut: the stream ends with the status once the engine
     /// has produced more than this many tokens; the counter records the cut.
     cut: Option<(u32, Status, Arc<AtomicU64>)>,
+    /// The worker's pending-prefill counter and this request's share of it,
+    /// settled at the first token (or at the end, if none came).
+    pending: Option<(Arc<AtomicU64>, u64)>,
     ended: bool,
+}
+
+impl Generating {
+    /// The prompt is prefilled (a first token, or the stream's end): it no
+    /// longer counts as pending prefill.
+    fn settle_prefill(&mut self) {
+        if let Some((counter, tokens)) = self.pending.take() {
+            counter.fetch_sub(tokens, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Generating {
+    fn drop(&mut self) {
+        self.settle_prefill();
+    }
 }
 
 /// Map the engine's [`engine::GenEvent`] channel to the gRPC generate stream.
@@ -435,6 +466,7 @@ fn generate_stream(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     stream_chunks: bool,
     request_id: String,
+    pending: Option<(Arc<AtomicU64>, u64)>,
     cut: Option<(u32, Status, Arc<AtomicU64>)>,
 ) -> GenStream {
     let init = Generating {
@@ -442,6 +474,7 @@ fn generate_stream(
         output_ids: Vec::new(),
         stream_chunks,
         request_id,
+        pending,
         cut,
         ended: false,
     };
@@ -456,6 +489,7 @@ fn generate_stream(
                     prompt_tokens,
                     cached_tokens,
                 }) => {
+                    st.settle_prefill();
                     st.output_ids.push(token_id);
                     if let Some((after, status, cut_total)) = &st.cut {
                         if st.output_ids.len() > *after as usize {
@@ -539,9 +573,23 @@ fn load_record(
     }
 }
 
+/// The worker's pending prefill as the record carries it.
+fn pending_u32(counter: &AtomicU64) -> u32 {
+    u32::try_from(counter.load(Ordering::Relaxed)).unwrap_or(u32::MAX)
+}
+
+/// The engine's silence on its in-flight requests, as the Rust servicer's
+/// record carries it (`EngineLoad.engine_silence_ms`).
+fn silence_ms(engine: &engine::Engine) -> Option<u32> {
+    engine
+        .output_silence()
+        .map(|silence| u32::try_from(silence.as_millis()).unwrap_or(u32::MAX))
+}
+
 /// Whether a record moved enough from `last` to be worth a `load_only`
 /// batch: the Rust relay's rule (any queue, running or window change, KV
-/// usage by half a percent, the rate by 5 % or 50 tokens per second).
+/// usage by half a percent, the rate by 5 % or 50 tokens per second, the
+/// engine's silence by a whole second).
 fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
     last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
@@ -552,6 +600,9 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
             let delta = (last.gen_throughput - current.gen_throughput).abs();
             delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
         }
+        || last.engine_silence_ms.map(|ms| ms / 1000)
+            != current.engine_silence_ms.map(|ms| ms / 1000)
+        || last.prefill_pending_tokens != current.prefill_pending_tokens
 }
 
 /// How often the stream checks the record while no batch flows, the silence
@@ -565,6 +616,10 @@ struct LoadRecords {
     stream: KvEventStream,
     engine: engine::Engine,
     like: LoadsLike,
+    /// What the record says of the wire (`--step-reports`).
+    step_reports: bool,
+    /// The worker's prompt tokens handed to the engine with no token yet.
+    prefill_pending: Arc<AtomicU64>,
     last_seq: u64,
     last_rank: Option<i32>,
     last_record: Option<common::EngineLoad>,
@@ -587,6 +642,9 @@ impl LoadRecords {
         self.sample += 1;
         let snapshot = self.engine.load().as_reported_by(self.like);
         let mut record = load_record(&snapshot, self.like, self.sample);
+        record.engine_silence_ms = silence_ms(&self.engine);
+        record.engine_reports_steps = Some(self.step_reports);
+        record.prefill_pending_tokens = Some(pending_u32(&self.prefill_pending));
         record.load_only = load_only;
         // As the Rust relay: telemetry on heartbeats and the first record.
         if !load_only && self.sample > 1 {
@@ -601,7 +659,10 @@ impl LoadRecords {
     /// unchanged heartbeats); it repeats the last sequence sent, as the
     /// gateway expects.
     fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
-        let current = load_record(&self.engine.load().as_reported_by(self.like), self.like, 0);
+        let mut current = load_record(&self.engine.load().as_reported_by(self.like), self.like, 0);
+        current.engine_silence_ms = silence_ms(&self.engine);
+        current.engine_reports_steps = Some(self.step_reports);
+        current.prefill_pending_tokens = Some(pending_u32(&self.prefill_pending));
         let changed = self
             .last_record
             .as_ref()
@@ -638,12 +699,16 @@ impl LoadRecords {
 fn with_load_records(
     engine: engine::Engine,
     like: LoadsLike,
+    step_reports: bool,
+    prefill_pending: Arc<AtomicU64>,
     stream: KvEventStream,
 ) -> KvEventStream {
     let records = LoadRecords {
         stream,
         engine,
         like,
+        step_reports,
+        prefill_pending,
         last_seq: 0,
         last_rank: Some(0),
         last_record: None,
@@ -756,7 +821,7 @@ mod tests {
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
         let cut = Some((2, Status::unavailable("injected"), Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
@@ -773,7 +838,7 @@ mod tests {
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
         let cut = Some((1, Status::internal("injected"), Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         let complete = stream.next().await.expect("complete").expect("ok");
         assert!(matches!(complete.response, Some(GenResp::Complete(_))));

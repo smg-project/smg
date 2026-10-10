@@ -79,6 +79,25 @@ message EngineLoad {
   optional EngineSpeculative speculative = 15;
   optional EngineLora lora = 16;
   optional EngineDisaggregation disaggregation = 17;
+  // Milliseconds since the engine last produced any output (a token, a
+  // completion, a scheduler step's stats) while the servicer held requests in
+  // flight on it; unset while nothing is in flight or when the servicer
+  // cannot tell. The servicer sees the engine's silence before any one
+  // request does: a subscriber that finds it past its wedge bound vetoes the
+  // worker without needing a pile of its own requests on it.
+  optional uint32 engine_silence_ms = 19;
+  // Whether the engine's wire has shown a scheduler step without any token
+  // (a stats-only step report), so `engine_silence_ms` is the scheduler's own
+  // silence; unset or false on a wire that carries token batches only, where
+  // the silence may be a prefill in progress and the subscriber allows for
+  // the prefill it knows to be pending.
+  optional bool engine_reports_steps = 20;
+  // Prompt tokens of the requests the servicer has handed to the engine
+  // that have produced no output yet: the engine's prefill work in hand,
+  // across every client of the servicer. A subscriber judging a token-batch
+  // wire's silence allows for it at the prefill rate it has measured on the
+  // worker, whatever it has in flight there itself.
+  optional uint32 prefill_pending_tokens = 21;
 }
 
 // The sections below mirror the SGLang scheduler's GetLoads messages field

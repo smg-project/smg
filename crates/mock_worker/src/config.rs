@@ -63,6 +63,11 @@ pub struct Config {
     pub kv_events_wire: crate::kv_zmq::Wire,
     /// Which backend's load report the workers imitate (`GetLoads`, `/v1/loads`).
     pub loads_like: LoadsLike,
+    /// What the load record says of the mock's wire: `true` imitates an
+    /// engine that reports every scheduler step (vLLM's stats-only step
+    /// batches), `false` (the default) a wire that carries token batches
+    /// only, whose silence the gateway judges against its prefill bound.
+    pub step_reports: bool,
     /// Settings for replay testing (gRPC workers only).
     pub replay: ReplayConfig,
 }
@@ -165,6 +170,7 @@ impl Default for Config {
             kv_events_buffer_steps: 10_000,
             kv_events_wire: crate::kv_zmq::Wire::Vllm,
             loads_like: LoadsLike::Mock,
+            step_reports: false,
             replay: ReplayConfig::default(),
         }
     }
@@ -266,6 +272,7 @@ impl Config {
                 }
                 "--kv-events-wire" => cfg.kv_events_wire = value(&mut args, &flag)?.parse()?,
                 "--loads-like" => cfg.loads_like = value(&mut args, &flag)?.parse()?,
+                "--step-reports" => cfg.step_reports = parse(value(&mut args, &flag)?, &flag)?,
                 "--block-size" => {
                     cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?;
                     block_size_given = true;
@@ -412,6 +419,10 @@ fn usage() -> String {
        --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
        --loads-like <mock|vllm>  load report: everything the simulator knows, or only what the\n\
                                 vLLM servicer reports (running, waiting, token_usage, maxima)\n\
+       --step-reports <bool>    the load record says the wire reports every scheduler step (as\n\
+                                vLLM's stats-only step batches do) instead of token batches only\n\
+                                (default false): decides which bound the gateway judges the\n\
+                                engine's silence against\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)"
         .to_string()

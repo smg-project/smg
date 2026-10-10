@@ -536,7 +536,15 @@ impl WorkerMonitor {
             .iter()
             .map(|rank| i64::from(rank.num_waiting_reqs))
             .sum();
-        liveness::on_load_report(worker, waiting);
+        liveness::on_load_report(
+            worker,
+            waiting,
+            record
+                .engine_silence_ms
+                .map(|ms| Duration::from_millis(u64::from(ms))),
+            record.engine_reports_steps.unwrap_or(false),
+            record.prefill_pending_tokens.map(u64::from),
+        );
         let single: HashMap<String, WorkerLoadResponse> =
             HashMap::from([(url.clone(), (*response).clone())]);
         for policy in self.policy_registry.get_all_load_aware_policies() {
@@ -1451,7 +1459,7 @@ async fn poll_group_once(
                 .iter()
                 .map(|rank| i64::from(rank.num_waiting_reqs))
                 .sum();
-            liveness::on_load_report(&worker, waiting);
+            liveness::on_load_report(&worker, waiting, None, false, None);
             // Only feed the DP-rank cache from responses that carry real
             // absolute per-rank token counts. Ratio-only snapshots,
             // which would otherwise poison with a fake `{0: 0}`
@@ -2000,6 +2008,30 @@ mod worker_monitor_tests {
             sample: 1,
             ..Default::default()
         }
+    }
+
+    /// A pushed record that carries the engine's own silence past the wedge
+    /// threshold vetoes the worker with nothing of this gateway's in flight
+    /// on it; the record that shows the engine producing again lifts it.
+    #[tokio::test]
+    async fn a_pushed_record_with_the_engines_silence_vetoes_the_worker() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let mut record = pushed(1);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.stall_reason().is_none(), "no silence reported");
+        record.engine_silence_ms = Some(5_000);
+        record.engine_reports_steps = Some(true);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged)
+        );
+        assert!(!worker.is_healthy_and_eligible());
+        record.engine_silence_ms = None;
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.stall_reason().is_none(), "the engine produces again");
     }
 
     /// A record's telemetry feeds the `smg_engine_*` gauges, the PD gauges

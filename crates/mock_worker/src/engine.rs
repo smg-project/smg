@@ -26,7 +26,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -534,6 +534,21 @@ struct EngineShared {
     faults: Faults,
     /// Wakes a paused actor.
     resume: Notify,
+    /// The actor's last pass (or the dispatch onto an idle engine), in
+    /// milliseconds on `output_clock`, and the requests it holds (running or
+    /// queued): what a servicer's own bookkeeping knows about a frozen
+    /// engine, read by [`Engine::output_silence`].
+    output_clock: Instant,
+    last_output_ms: AtomicU64,
+    in_flight: AtomicUsize,
+}
+
+impl EngineShared {
+    /// Stamp a pass (or a dispatch onto an idle engine) now.
+    fn note_output(&self) {
+        let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_output_ms.store(millis, Ordering::Relaxed);
+    }
 }
 
 /// Fault hooks the admin API switches on: batches lost on the wire, delayed
@@ -769,6 +784,9 @@ impl Engine {
             cache_mirror: RwLock::new(HashSet::new()),
             faults: Faults::default(),
             resume: Notify::new(),
+            output_clock: Instant::now(),
+            last_output_ms: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
         });
         // The publisher task releases batches in order at their release time
         // (the delay hook) and ends with the actor, which owns its sender.
@@ -870,6 +888,19 @@ impl Engine {
     pub(crate) fn resume(&self) {
         self.shared.faults.paused.store(false, Ordering::Relaxed);
         self.shared.resume.notify_one();
+    }
+
+    /// How long the engine has produced nothing while it holds requests
+    /// (running or queued): the time since its last pass, counted from the
+    /// dispatch when it was idle before; `None` while nothing is in flight.
+    /// What a servicer reads off its own bookkeeping when the engine behind
+    /// it freezes, and puts on the load record it pushes.
+    pub fn output_silence(&self) -> Option<Duration> {
+        if self.shared.in_flight.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let since = Duration::from_millis(self.shared.last_output_ms.load(Ordering::Relaxed));
+        Some(self.shared.output_clock.elapsed().saturating_sub(since))
     }
 
     /// Arm a request fault (`None` clears it).
@@ -1101,9 +1132,11 @@ async fn run(
             handle_msg(&mut state, &shared, &params, msg);
         }
         // A paused engine takes messages (requests queue, scored at arrival)
-        // but runs no pass until resumed.
+        // but runs no pass until resumed, and its load report stands as it
+        // was: a frozen engine reports nothing, so the servicer relaying it
+        // shows the last figures it had, with the engine's silence beside
+        // them (`Engine::output_silence`).
         while shared.faults.paused.load(Ordering::Relaxed) {
-            *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) = state.snapshot(&params);
             tokio::select! {
                 _ = shared.resume.notified() => {}
                 msg = rx.recv() => match msg {
@@ -1183,6 +1216,8 @@ async fn run(
             };
             let _ = shared.publish_tx.send((item, release_at));
         }
+        shared.note_output();
+        shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
         *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) = step.snapshot;
     }
 }
@@ -1238,7 +1273,13 @@ fn handle_msg(
             } else {
                 0
             };
+            // The silence a request sees counts from its dispatch: an engine
+            // idle until now had nothing to produce.
+            if state.is_idle() {
+                shared.note_output();
+            }
             state.enqueue_with_oracle(req, params, oracle_tokens);
+            shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
         }
         EngineMsg::Reset => state.reset(),
         EngineMsg::RestartPublisher(ack) => {
@@ -1542,6 +1583,11 @@ impl SchedulerState {
 
     fn is_idle(&self) -> bool {
         self.running.is_empty() && self.waiting.is_empty() && !self.reset_pending
+    }
+
+    /// Requests the engine holds: running or queued.
+    fn in_flight(&self) -> usize {
+        self.running.len() + self.waiting.len()
     }
 
     /// Queue a request with no oracle information (tests).
@@ -3289,7 +3335,19 @@ mod tests {
             "no token while paused"
         );
         assert!(engine.fault_status().paused);
-        assert_eq!(engine.load().num_waiting_reqs, 1, "the request queued");
+        // The request queued, but a frozen engine reports nothing: its last
+        // load report stands, as the servicer relaying it would show, and
+        // its silence on the request grows beside it.
+        assert_eq!(
+            engine.load().num_waiting_reqs,
+            0,
+            "the report from before the pause stands"
+        );
+        let silence = engine.output_silence().expect("a request is in flight");
+        assert!(
+            silence >= Duration::from_millis(150),
+            "counted from the dispatch: {silence:?}"
+        );
         engine.resume();
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -3297,6 +3355,39 @@ mod tests {
             .expect("stream open");
         assert!(matches!(event, GenEvent::Token { .. }));
         assert!(!engine.fault_status().paused);
+        tokio::task::yield_now().await;
+        assert!(
+            engine
+                .output_silence()
+                .is_none_or(|silence| silence < Duration::from_millis(150)),
+            "a pass ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_silence_is_none_while_idle_and_counts_from_the_dispatch() {
+        let engine = live();
+        assert_eq!(engine.output_silence(), None, "nothing in flight");
+        let mut rx = submit(&engine, "a", vec![3; 32]);
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a token")
+            .expect("stream open");
+        assert!(matches!(first, GenEvent::Token { .. }));
+        tokio::task::yield_now().await;
+        assert!(
+            engine
+                .output_silence()
+                .is_none_or(|silence| silence < Duration::from_secs(1)),
+            "a running engine is never silent for long"
+        );
+        while let Some(event) = rx.recv().await {
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(engine.output_silence(), None, "nothing in flight again");
     }
 
     #[tokio::test]

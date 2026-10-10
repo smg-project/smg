@@ -893,6 +893,38 @@ impl ZmqEngineClient {
         }
     }
 
+    /// The engine's silence on the requests in flight on it (the ZMQ client's
+    /// `output_silence`): the time since its last output of any kind, `None`
+    /// while nothing is in flight.
+    pub fn output_silence(&self) -> Option<Duration> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.output_silence(),
+            ZmqBackend::TokenSpeed(client) => client.output_silence(),
+            ZmqBackend::Sglang(client) => client.output_silence(),
+        }
+    }
+
+    /// Whether the engine's wire has shown a scheduler step without any
+    /// token, so its silence is the scheduler's own (the ZMQ client's
+    /// `reports_steps`).
+    pub fn reports_steps(&self) -> bool {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.reports_steps(),
+            ZmqBackend::TokenSpeed(client) => client.reports_steps(),
+            ZmqBackend::Sglang(client) => client.reports_steps(),
+        }
+    }
+
+    /// Prompt tokens of the in-flight requests without a first output yet
+    /// (the ZMQ client's `prefill_pending_tokens`).
+    pub fn prefill_pending_tokens(&self) -> u64 {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.prefill_pending_tokens(),
+            ZmqBackend::TokenSpeed(client) => client.prefill_pending_tokens(),
+            ZmqBackend::Sglang(client) => client.prefill_pending_tokens(),
+        }
+    }
+
     /// Per-rank load from the piggybacked scheduler stats (SMG's DP routing
     /// signal), in the same shape as the gRPC `GetLoads` response. A rank that
     /// has not reported yet has no entry.
