@@ -85,16 +85,15 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// when no loaded case is under it at all.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
+        "apertus-8b-instruct-2509/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
         "hunyuan-a13b-instruct/render/text-developer-role",
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
-    ),
-    (
-        "iquest-q1/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "iquest-q1/render/continue-final-message",
@@ -113,12 +112,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "k2-horizon-36b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "k2-horizon-36b/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -134,12 +127,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the template merges a tool's `$defs` into its parameters with `dict()` over a list of \
          (key, value) pairs, which the gateway's template engine does not accept, so the \
          render fails (smg-project/smg-lab#119)",
-    ),
-    (
-        "laguna-xs.2/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "laguna-xs.2/render/continue-final-message",
@@ -162,12 +149,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "laguna-xs.2/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "lfm2.5-1.2b-instruct/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "lfm2.5-1.2b-instruct/render/no-generation-prompt",
@@ -198,6 +179,28 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "llava-1.5-7b-hf/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "muse-glimmer-30b/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "muse-glimmer-30b/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "muse-glimmer-30b/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
+        "muse-glimmer-30b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
@@ -253,14 +256,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "SMG's request schema types tool-call arguments as a string, as the API and the engines do; \
          the Qwen3 template accepts an object (smg-project/bellwether#12, needs:simo)",
     ),
-    // The two Qwen3-Omni models load since smg-project/smg#3006: the same classes as
-    // their siblings, nothing from tokenization.
-    (
-        "qwen3-omni-30b-a3b-instruct/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
     (
         "qwen3-omni-30b-a3b-instruct/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
@@ -279,12 +274,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
-        "qwen3-omni-30b-a3b-thinking/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-omni-30b-a3b-thinking/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -300,12 +289,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
-    ),
-    (
-        "glm-5.3-flash/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "glm-5.3-flash/render/continue-final-message",
@@ -330,12 +313,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "hy4-preview/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "hy4-preview/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -356,12 +333,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "hy4-preview/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "minimax-m2.7/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "minimax-m2.7/render/continue-final-message",
@@ -386,12 +357,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "minimax-m3/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "minimax-m3/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -408,12 +373,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "ai21-jamba2-3b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "ai21-jamba2-3b/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -423,15 +382,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
-    ),
-    (
-        "apertus-8b-instruct-2509/render/*",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779); and add_generation_prompt is not a \
-         field of SMG's chat request; the header is always appended (smg-project/smg#2780); \
-         and the template calls strftime_now, which the gateway's template environment does \
-         not provide (smg-project/smg-lab#106)",
     ),
     (
         "deepseek-v3-0324/render/hermes-func-calling-*",
@@ -524,12 +474,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          render as the reference does (smg-project/smg#2783)",
     ),
     (
-        "dots3-note-prev/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "dots3-note-prev/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -544,12 +488,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "dots3-note-prev/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "ernie-4.5-21b-a3b-thinking/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "ernie-4.5-21b-a3b-thinking/render/continue-final-message",
@@ -569,12 +507,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "gemma-4-e4b-it/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "gemma-4-e4b-it/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -583,12 +515,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "gemma-4-e4b-it/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "glm-4.6/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "glm-4.6/render/continue-final-message",
@@ -613,12 +539,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "glm-4.7-flash/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "glm-4.7-flash/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -641,12 +561,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "granite-4.1-3b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "granite-4.1-3b/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -661,12 +575,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "granite-4.1-3b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "hermes-4-14b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "hermes-4-14b/render/hermes-func-calling-*",
@@ -733,12 +641,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "k-exaone-236b-a23b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "k-exaone-236b-a23b/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -753,12 +655,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "k-exaone-236b-a23b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "ling-3.0-flash/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "ling-3.0-flash/render/continue-final-message",
@@ -781,12 +677,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "ling-3.0-flash/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "llama-xlam-2-8b-fc-r/render/hermes-func-calling-*",
@@ -837,12 +727,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
-        "mimo-v2.5/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "mimo-v2.5/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -858,12 +742,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
-    ),
-    (
-        "minicpm5-2b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "minicpm5-2b/render/continue-final-message",
@@ -888,12 +766,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "minimax-m2/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "minimax-m2/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -916,33 +788,10 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "mistral-7b-instruct-v0.3/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "mistral-7b-instruct-v0.3/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
          template's continued turn (smg-project/smg#2779)",
-    ),
-    (
-        "muse-glimmer-30b/render/*",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779); and add_generation_prompt is not a \
-         field of SMG's chat request; the header is always appended (smg-project/smg#2780); \
-         and the template calls strftime_now, which the gateway's template environment does \
-         not provide (smg-project/smg-lab#106); and SMG's request schema types tool-call \
-         arguments as a string, as the API and the engines do; the template accepts an object \
-         (smg-project/bellwether#12)",
-    ),
-    (
-        "nanbeige4.2-3b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "nanbeige4.2-3b/render/continue-final-message",
@@ -965,12 +814,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "nanbeige4.2-3b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "nvidia-nemotron-3-nano-30b-a3b-bf16/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "nvidia-nemotron-3-nano-30b-a3b-bf16/render/continue-final-message",
@@ -996,18 +839,16 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "olmo-3-7b-instruct/render/*",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779); and add_generation_prompt is not a \
-         field of SMG's chat request; the header is always appended (smg-project/smg#2780); \
-         and the gateway's system prompt for this template is not the reference's: the \
-         function-calling preamble is rendered for a request without tools, where the \
-         template writes that no functions are available, and a system message is placed \
-         differently (smg-project/smg-lab#107); and the typed tool definitions drop the \
-         fields outside the function schema, here the `response` field of the BFCL multi-turn \
-         tools, and this template renders the tool object verbatim (smg-project/smg-lab#105); \
-         and SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "the gateway renders continue_final_message by popping the assistant turn and appending \
+         its text after the generation header, which does not reproduce this template's \
+         continued turn (smg-project/smg#2779); and add_generation_prompt is not a field of \
+         SMG's chat request; the header is always appended (smg-project/smg#2780); and the \
+         gateway's system prompt for this template is not the reference's: the function-calling \
+         preamble is rendered for a request without tools, where the template writes that no \
+         functions are available, and a system message is placed differently \
+         (smg-project/smg-lab#107); and SMG's request schema types tool-call arguments as a \
+         string, as the API and the engines do; the template accepts an object \
+         (smg-project/bellwether#12)",
     ),
     (
         "phi-4-mini-instruct/render/no-generation-prompt",
@@ -1043,12 +884,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          (smg-project/smg-lab#56); re-recorded with the file's encoder in \
          smg-project/bellwether#104, the pin bump removes this entry; the model's other \
          render differences are listed again once the pin moves",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "qwen2.5-7b-instruct-1m/render/hermes-func-calling-*",
@@ -1132,12 +967,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
-        "qwen3-30b-a3b-instruct-2507/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-30b-a3b-instruct-2507/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -1152,12 +981,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-30b-a3b-instruct-2507/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-30b-a3b-thinking-2507/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "qwen3-30b-a3b-thinking-2507/render/continue-final-message",
@@ -1182,12 +1005,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3-30b-a3b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-30b-a3b/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -1210,12 +1027,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3-4b-instruct-2507/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-4b-instruct-2507/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -1230,12 +1041,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-4b-instruct-2507/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-4b-saferl/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "qwen3-4b-saferl/render/continue-final-message",
@@ -1260,12 +1065,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3-4b-thinking-2507/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-4b-thinking-2507/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -1288,22 +1087,10 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3-8b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-8b/render/text-developer-role",
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
-    ),
-    (
-        "qwen3-coder-30b-a3b-instruct/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "qwen3-coder-30b-a3b-instruct/render/no-generation-prompt",
@@ -1322,12 +1109,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3-coder-next/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-coder-next/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -1344,12 +1125,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3-next-80b-a3b-instruct/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-next-80b-a3b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -1364,12 +1139,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-next-80b-a3b-instruct/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-next-80b-a3b-thinking/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "qwen3-next-80b-a3b-thinking/render/continue-final-message",
@@ -1394,12 +1163,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3-vl-235b-a22b-thinking/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-vl-235b-a22b-thinking/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -1417,12 +1180,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
-        "qwen3-vl-30b-a3b-instruct/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-vl-30b-a3b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -1434,12 +1191,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
-        "qwen3-vl-8b-instruct/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3-vl-8b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -1449,12 +1200,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
-    ),
-    (
-        "qwen3-vl-8b-thinking/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "qwen3-vl-8b-thinking/render/continue-final-message",
@@ -1490,12 +1235,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          render differences are listed again once the pin moves",
     ),
     (
-        "qwen3.5-35b-a3b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3.5-35b-a3b/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -1520,12 +1259,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          render differences are listed again once the pin moves",
     ),
     (
-        "qwen3.6-27b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "qwen3.6-27b/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -1540,12 +1273,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3.6-27b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3.6-35b-a3b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "qwen3.6-35b-a3b/render/continue-final-message",
@@ -1570,12 +1297,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          (smg-project/smg-lab#56); re-recorded with the file's encoder in \
          smg-project/bellwether#104, the pin bump removes this entry; the model's other \
          render differences are listed again once the pin moves",
-    ),
-    (
-        "qwen3.8-27b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "qwen3.8-27b/render/continue-final-message",
@@ -1612,12 +1333,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
-    ),
-    (
-        "qwq-32b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "qwq-32b/render/continue-final-message",
@@ -1670,12 +1385,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "step-3.5-flash/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "step-3.5-flash/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -1696,12 +1405,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "step-3.5-flash/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "step3/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "step3/render/continue-final-message",
@@ -1734,12 +1437,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          render differences are listed again once the pin moves",
     ),
     (
-        "trinity-mini/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
-    ),
-    (
         "trinity-mini/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -1760,12 +1457,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "trinity-mini/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "webworld-32b/render/bfcl-multi-turn-*",
-        "the typed tool definitions drop the fields outside the function schema, here the \
-         `response` field of the BFCL multi-turn tools, and this template renders the tool \
-         object verbatim (smg-project/smg-lab#105)",
     ),
     (
         "webworld-32b/render/continue-final-message",
