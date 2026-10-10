@@ -1217,7 +1217,7 @@ fn render_instant() -> DateTime<FixedOffset> {
         .unwrap_or_else(|| Local::now().fixed_offset())
 }
 
-/// Whether the template mentions the `developer` role at all (vLLM's
+/// Whether the template mentions the `developer` role at all (the engine's
 /// `_detect_developer_role_support`): a template that never names it has no
 /// branch for it, and the renderer rewrites developer messages to system ones.
 fn detect_developer_role_support(template: &str) -> bool {
@@ -1225,9 +1225,9 @@ fn detect_developer_role_support(template: &str) -> bool {
 }
 
 /// The messages with every `developer` message rewritten as a `system`
-/// message without its `tools` field (vLLM's `_convert_developer_to_system`),
+/// message without its `tools` field (the engine's `_convert_developer_to_system`),
 /// then the system messages merged into one at the front when a system
-/// message is not the first message (vLLM's `_consolidate_system_messages`,
+/// message is not the first message (the engine's `_consolidate_system_messages`,
 /// which follows the rewrite in its renderer). `None` when no message has
 /// the role, so the caller keeps its slice.
 fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
@@ -1256,7 +1256,7 @@ fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<se
     Some(consolidate_system_messages(rewritten))
 }
 
-/// vLLM's `_consolidate_system_messages`, for the templates that want the
+/// The engine's `_consolidate_system_messages`, for the templates that want the
 /// system message first: the messages unchanged when the only system message
 /// is the first one; otherwise one system message at the front carrying the
 /// non-empty system texts joined by blank lines (a parts list contributes its
@@ -1493,7 +1493,7 @@ pub struct ChatTemplateState {
     think_in_prefill: bool,
     /// Whether the template has a branch for the `developer` role. When it
     /// has none, `apply` renders developer messages as system messages, as
-    /// vLLM's HF renderer does, instead of letting the template drop them.
+    /// the engine's HF renderer does, instead of letting the template drop them.
     developer_role_supported: bool,
 }
 
@@ -1555,21 +1555,21 @@ impl ChatTemplateState {
             )
         })?;
 
-        // vLLM hands an "openai"-format template every message's string content
+        // The serving engine hands an "openai"-format template every message's string content
         // as a one-item text part list (`_parse_chat_message_content`: a `str`
         // becomes `[{"type": "text", "text": ...}]`, and in that format the
         // parts stay dicts), so such a template always takes its parts branch.
         // Render the same way, so that a template whose two branches differ (a
         // separator after every part, a truthiness check on the content)
         // produces the engine's prompt for string content too. A tool result
-        // stays a string: vLLM joins its text parts back into one.
+        // stays a string: the engine joins its text parts back into one.
         let wrapped = (self.content_format == ChatTemplateContentFormat::OpenAI)
             .then(|| string_content_as_text_parts(messages))
             .flatten();
         let messages = wrapped.as_deref().unwrap_or(messages);
 
         // A template without a `developer` branch renders nothing for a
-        // developer message; vLLM's renderer hands such a template the message
+        // developer message; the engine's renderer hands such a template the message
         // as a system message, and so does this one (`tools` on it dropped).
         let converted;
         let messages: &[serde_json::Value] = if self.developer_role_supported {
@@ -1808,7 +1808,7 @@ mod tests {
     #[test]
     fn developer_message_renders_as_system_when_the_template_has_no_developer_branch() {
         // The template names system/user/assistant only: a developer message
-        // would render nothing. vLLM's renderer turns it into a system message.
+        // would render nothing. The engine's renderer turns it into a system message.
         let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
                         {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}\
                         {% if messages[0].tools is defined %}TOOLS{% endif %}";
@@ -1825,7 +1825,7 @@ mod tests {
 
     /// With a system message of its own in the request, the rewritten
     /// developer message is no longer the first message: the two merge into
-    /// one system turn at the front, as vLLM's renderer merges them.
+    /// one system turn at the front, as the engine's renderer merges them.
     #[test]
     fn a_developer_message_after_a_system_message_merges_into_one_system_turn() {
         let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\

@@ -671,11 +671,11 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             // kwarg, default off. The Jinja processor has no knowledge of
             // the native encoder so we must report it directly.
             Renderer::DeepseekV32 => ThinkingToggle::DefaultOff,
-            // V4 defaults thinking ON like the engine's own server (vLLM's
+            // V4 defaults thinking ON like the engine's own server (its
             // `tokenizers/deepseek_v4.py`): `thinking: false`, its
             // `enable_thinking` alias or `reasoning_effort: "none"` turns it
             // off. V4.1 defaults thinking ON: `reasoning_effort: "none"` or an
-            // explicit `thinking: false` (or vLLM's `enable_thinking` alias,
+            // explicit `thinking: false` (or the engine's `enable_thinking` alias,
             // see `renderer_capabilities`) turns it off.
             Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => ThinkingToggle::DefaultOn,
             Renderer::Jinja => self.chat_template.thinking_toggle(),
@@ -703,7 +703,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         match self.renderer {
             // V4 reads `reasoning_effort` as the engine's own server does:
             // `"none"` is chat mode, every other value (`"minimal"` included,
-            // which vLLM maps to the low effort) keeps thinking on. Declaring
+            // which the engine maps to the low effort) keeps thinking on. Declaring
             // the off word keeps the gateway's parser arming on that rule.
             Renderer::DeepseekV4(_) => &["none"],
             // The native V3.2/V4.1 renderers switch off on the protocol's
@@ -725,7 +725,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
         match self.renderer {
-            // The V4.1 shim honours vLLM's `enable_thinking` alias, renders a
+            // The V4.1 shim honours the engine's `enable_thinking` alias, renders a
             // trailing assistant message itself when `add_generation_prompt`
             // is false, and parses tool-call `arguments` strings with the
             // reference's tolerance.
@@ -734,7 +734,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 native_assistant_continuation: true,
                 raw_tool_call_arguments: true,
             },
-            // The V4 shim reads vLLM's `enable_thinking` alias too.
+            // The V4 shim reads the engine's `enable_thinking` alias too.
             Renderer::DeepseekV4(_) => crate::traits::RendererCapabilities {
                 enable_thinking_alias: true,
                 ..crate::traits::RendererCapabilities::default()
@@ -809,7 +809,7 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
 /// original effort table), so the only discriminator is the shipped
 /// `encoding/encoding_dsv4.py`. Without it (a tokenizer directory streamed
 /// from a worker carries no `encoding/`), render the table the engine's own
-/// server renders: vLLM's port of the encoder carries the refreshed table for
+/// server renders: its port of the encoder carries the refreshed table for
 /// every V4 checkpoint.
 fn detect_dsv4_effort_encoding(dir: &Path) -> deepseek_v4::EffortEncoding {
     match std::fs::read_to_string(dir.join("encoding").join("encoding_dsv4.py")) {
@@ -858,7 +858,7 @@ fn resolve_drop_thinking(messages: &[serde_json::Value]) -> bool {
 }
 /// Attach `tools` to a leading system/developer message so the V3.2/V4
 /// encoder can render the tools block. Mirrors the wrapper step in
-/// vllm's `vllm/tokenizers/deepseek_v32.py` and sglang's V4 serving path.
+/// one engine's `tokenizers/deepseek_v32.py` and another engine's V4 serving path.
 /// Returns `None` when no rewrite is needed so callers can pass the input
 /// slice directly in the common path.
 fn inject_tools_into_messages(
@@ -897,7 +897,7 @@ fn apply_deepseek_v32(
     deepseek_v32::encode_messages(msgs, thinking_mode, &encode_params)
         .map_err(|e| Error::msg(format!("DeepSeek V3.2 encode failed: {e}")))
 }
-/// V4's explicit thinking toggle: `template_kwargs["thinking"]`, else vLLM's
+/// V4's explicit thinking toggle: `template_kwargs["thinking"]`, else the engine's
 /// `enable_thinking` alias (the gateway reads the two keys in the same order
 /// when it arms the reasoning parser, see `renderer_capabilities`).
 fn explicit_thinking_v4(params: &ChatTemplateParams) -> Option<bool> {
@@ -913,7 +913,7 @@ fn explicit_thinking_v4(params: &ChatTemplateParams) -> Option<bool> {
 }
 
 /// DeepSeek V4 chat-template shim, rendering what the engine's own server
-/// renders (vLLM's `tokenizers/deepseek_v4.py`): thinking is on unless the
+/// renders (its `tokenizers/deepseek_v4.py`): thinking is on unless the
 /// request says otherwise, and a thinking prompt carries the `high` effort
 /// unless `reasoning_effort` names another level.
 ///
@@ -928,12 +928,12 @@ fn explicit_thinking_v4(params: &ChatTemplateParams) -> Option<bool> {
 ///    effective `reasoning_effort`);
 /// 4. else on ([`ThinkingToggle::DefaultOn`]).
 ///
-/// `reasoning_effort` maps as vLLM maps it: `max` is the top level, `low`,
+/// `reasoning_effort` maps as the engine maps it: `max` is the top level, `low`,
 /// `minimal` and `medium` the bottom one (which renders no prefix), every
 /// other string and an absent value `high`. Which text a level renders is
 /// the detected revision's table (see `detect_dsv4_effort_encoding`).
 ///
-/// Deliberate divergence from vLLM's Python: there `reasoning_effort: "none"`
+/// Deliberate divergence from the engine's Python renderer: there `reasoning_effort: "none"`
 /// forces chat mode even over an explicit `thinking: true`. Here the explicit
 /// toggle wins, because the gateway arms the reasoning parser from the
 /// explicit toggle first, and rendering chat mode for that contradictory
@@ -982,7 +982,7 @@ fn apply_deepseek_v4(
 // DeepSeek V4.1 dispatch shim
 // ---------------------------------------------------------------------------
 /// Attach `tools` to the FIRST message whose role is `system`, wherever it
-/// appears in the conversation — vLLM's V4.1 rule. This differs from V3.2/V4's
+/// appears in the conversation — the engine's V4.1 rule. This differs from V3.2/V4's
 /// [`inject_tools_into_messages`], which only rewrites a *leading*
 /// system/developer message. Synthesizes an empty leading system message when
 /// none exists.
@@ -1023,7 +1023,7 @@ fn boolean_kwarg_v41(params: &ChatTemplateParams, key: &str) -> Result<Option<bo
 }
 
 /// V4.1's explicit thinking toggle: `template_kwargs["thinking"]` (the key
-/// this tokenizer reports through `thinking_key_name()`) or vLLM's
+/// this tokenizer reports through `thinking_key_name()`) or the engine's
 /// `enable_thinking` alias, both read with the strict [`boolean_kwarg_v41`]
 /// rule. The gateway reads the same two keys when it arms the reasoning
 /// parser (`renderer_capabilities().enable_thinking_alias`), so the prompt
@@ -1057,7 +1057,7 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 }
 
 /// DeepSeek V4.1 chat-template shim. Order: attach tools to the first system
-/// message (vLLM's rule) -> resolve `reasoning_effort` -> resolve the
+/// message (the engine's rule) -> resolve `reasoning_effort` -> resolve the
 /// thinking mode -> `drop_thinking` -> stamp `wo_eos` on a trailing assistant
 /// message when `add_generation_prompt` is false -> encode.
 ///
@@ -1070,7 +1070,7 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 ///
 /// The shim reads the merged template kwargs, so an explicit
 /// `chat_template_kwargs.reasoning_effort` wins over the projected top-level
-/// `reasoning_effort` (SMG's global contract; vLLM prefers the top-level
+/// `reasoning_effort` (SMG's global contract; the engine prefers the top-level
 /// field — a divergence only on contradictory requests).
 ///
 /// The thinking mode mirrors the gateway's parser-arming precedence
@@ -1087,7 +1087,7 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 ///    effective `reasoning_effort`);
 /// 4. else on ([`ThinkingToggle::DefaultOn`]).
 ///
-/// Deliberate divergence from vLLM's Python: there `reasoning_effort: "none"`
+/// Deliberate divergence from the engine's Python renderer: there `reasoning_effort: "none"`
 /// forces chat mode even over an explicit `thinking: true`. Here the explicit
 /// toggle wins, because the gateway arms the reasoning parser from the
 /// explicit toggle first, and rendering chat mode for that contradictory input
@@ -1100,7 +1100,7 @@ fn apply_deepseek_v41(
     params: &ChatTemplateParams,
 ) -> Result<String> {
     // `template_kwargs["response_format"]` is deliberately not attached to a
-    // message: vLLM Python never renders V4.1's `## Response Format:` block
+    // message: the engine's Python renderer never renders V4.1's `## Response Format:` block
     // (structured output is enforced by the constraint), so the gateway's
     // projected kwarg is ignored here too. The encoder still renders a
     // per-message `response_format` for direct callers.

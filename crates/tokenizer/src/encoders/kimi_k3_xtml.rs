@@ -92,7 +92,7 @@ pub(crate) struct RenderedXtml {
 /// The effort the reference applies when a request names none.
 ///
 /// `build_chat_segments` injects no directive; the served entry point above it
-/// (`tokenization_kimi.apply_chat_template`, which vLLM calls) first runs
+/// (`tokenization_kimi.apply_chat_template`, which the serving engine calls) first runs
 /// `kwargs.setdefault("thinking_effort", "max")`.
 pub const DEFAULT_THINKING_EFFORT: &str = "max";
 
@@ -104,7 +104,7 @@ pub const DEFAULT_THINKING_EFFORT: &str = "max";
 /// `params.tools` (when non-empty) produces the leading `tool-declare` system
 /// message. `params.add_generation_prompt` appends the assistant generation
 /// prompt tail. Thinking mode is resolved from `template_kwargs["thinking"]`,
-/// then vLLM's `enable_thinking` alias and a `reasoning_effort` of `"none"` in
+/// then the engine's `enable_thinking` alias and a `reasoning_effort` of `"none"` in
 /// the kwargs (the rewrites the engine's own server applies before rendering),
 /// then `params.thinking`, defaulting to `true` to match the Python
 /// `build_chat_segments(thinking=True)` default; it selects `think` vs
@@ -132,7 +132,7 @@ pub fn apply_kimi_k3_xtml_with_effort_default(
 /// plus the caller's `continue_final_message` prefill, appended as one control
 /// piece so marker strings in the prefill keep their control ids. That is
 /// what the flat encode of `rendered + prefill` produced before segments
-/// existed and what SGLang's prefix append does: the rendering always ends in
+/// existed and what the serving engine's prefix append does: the rendering always ends in
 /// a control piece (`<|sep|>` after the generation prompt), so no BPE merge
 /// crosses the seam and the prefill's ids equal the flat encode of the same
 /// prefill byte for byte. A prefill of ordinary text encodes the same either
@@ -151,8 +151,8 @@ pub(crate) fn render_kimi_k3_xtml_prompt(
 
 /// The thinking mode the renderer renders, resolved as the engine's own
 /// server resolves it before calling the checkpoint's `apply_chat_template`
-/// (vLLM's K3 renderer rewrites the kwargs first): an explicit `thinking`
-/// kwarg wins, then vLLM's `enable_thinking` alias, then a `reasoning_effort`
+/// (the engine's K3 renderer rewrites the kwargs first): an explicit `thinking`
+/// kwarg wins, then the engine's `enable_thinking` alias, then a `reasoning_effort`
 /// of `"none"` in the kwargs, then the request-level toggle the gateway
 /// derived; absent all of them, the encoder's `build_chat_segments(thinking=True)`
 /// default. Any other effort word leaves the mode alone (it only picks the
@@ -1494,7 +1494,7 @@ mod tests {
     }
 
     // --- Thinking toggles the engine's own server honours before rendering ----
-    // vLLM's K3 renderer rewrites the kwargs before `apply_chat_template`:
+    // The engine's K3 renderer rewrites the kwargs before `apply_chat_template`:
     // `enable_thinking` becomes `thinking` and a `reasoning_effort` of `"none"`
     // switches thinking off; an explicit `thinking` kwarg outranks both.
 
