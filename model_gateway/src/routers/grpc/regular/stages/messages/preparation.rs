@@ -271,15 +271,13 @@ impl MessagePreparationStage {
                         multimodal_intermediate = Some(output.intermediate);
                     }
                     Err(e) => {
+                        let message = multimodal::processing_failed_message(&e);
                         error!(
                             function = "MessagePreparationStage::execute",
-                            error = %e,
+                            error = %message,
                             "Multimodal processing failed"
                         );
-                        return Err(error::bad_request(
-                            "multimodal_processing_failed",
-                            format!("Multimodal processing failed: {e}"),
-                        ));
+                        return Err(error::bad_request("multimodal_processing_failed", message));
                     }
                 }
             }
