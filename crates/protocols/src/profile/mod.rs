@@ -17,6 +17,7 @@
 mod deepseek;
 mod kimi;
 mod minimax;
+mod openai;
 mod zai;
 
 use std::{
@@ -43,7 +44,8 @@ fn alias_profiles() -> &'static RwLock<HashMap<String, ProviderProfile>> {
 /// Provider dialect for a request, selected from the model id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProfile {
-    /// OpenAI baseline: no extra rules beyond core validation.
+    /// OpenAI baseline: the public API's structured-output rules on top of
+    /// core validation.
     OpenAi,
     /// Kimi/Moonshot contract (Kimi-Vendor-Verifier).
     Kimi,
@@ -241,7 +243,10 @@ impl ProviderProfile {
                 reject_root(req)?;
                 deepseek::validate_chat(req)
             }
-            ProviderProfile::OpenAi => reject_root(req),
+            ProviderProfile::OpenAi => {
+                reject_root(req)?;
+                openai::validate_chat(req)
+            }
         }
     }
 }

@@ -282,8 +282,9 @@ pub struct ChatCompletionRequest {
     #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
-    /// Verbosity level for debugging
-    pub verbosity: Option<i32>,
+    /// How verbose the answer should be: `low`, `medium` or `high`
+    #[validate(custom(function = "validate_verbosity"))]
+    pub verbosity: Option<String>,
 
     // =============================================================================
     // Engine-Specific Sampling Parameters
@@ -500,6 +501,25 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::Validati
     Ok(())
 }
 
+fn invalid(code: &'static str, message: String) -> validator::ValidationError {
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    e
+}
+
+fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError> {
+    match verbosity {
+        "low" | "medium" | "high" => Ok(()),
+        other => Err(invalid(
+            "unsupported_value",
+            format!(
+                "Invalid value: '{other}' for parameter 'verbosity'; supported values are 'low', \
+                 'medium' and 'high'"
+            ),
+        )),
+    }
+}
+
 /// Schema-level validation for cross-field dependencies
 fn validate_chat_cross_parameters(
     req: &ChatCompletionRequest,
@@ -668,10 +688,67 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 8. Provider-profile contract rules, selected from the model id
+    // 8. A function's `parameters` is a JSON Schema object (null was already
+    //    read as the empty schema)
+    for (index, tool) in req.tools.iter().flatten().enumerate() {
+        if !tool.function.parameters.is_object() {
+            return Err(invalid(
+                "invalid_type",
+                format!(
+                    "Invalid 'tools[{index}].function.parameters': expected an object, but got {} \
+                     instead",
+                    json_type_name(&tool.function.parameters)
+                ),
+            ));
+        }
+    }
+
+    // 9. `logit_bias` is keyed by token ids
+    if let Some(key) = req
+        .logit_bias
+        .iter()
+        .flatten()
+        .map(|(key, _)| key)
+        .find(|key| key.parse::<u64>().is_err())
+    {
+        return Err(invalid(
+            "logit_bias_invalid_key",
+            format!(
+                "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
+                 ids"
+            ),
+        ));
+    }
+
+    // 10. `max_tokens` and `max_completion_tokens` are one setting: both at
+    //     once is a contradiction (normalization migrates the deprecated
+    //     name only when the current one is absent)
+    #[expect(deprecated)]
+    if req.max_tokens.is_some() && req.max_completion_tokens.is_some() {
+        return Err(invalid(
+            "invalid_parameter_combination",
+            "'max_tokens' and 'max_completion_tokens' cannot both be set; use \
+             'max_completion_tokens'"
+                .to_string(),
+        ));
+    }
+
+    // 11. Provider-profile contract rules, selected from the model id
     ProviderProfile::for_model(&req.model).validate_chat(req)?;
 
     Ok(())
+}
+
+/// The JSON type of a value, for error messages (`a string`, `an array`, ...).
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 impl ChatCompletionRequest {
@@ -1300,5 +1377,91 @@ mod tests {
         let value = serde_json::to_value(&message).expect("serialize");
         assert_eq!(value.get("content"), Some(&Value::Null), "{value}");
         assert_eq!(value["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+}
+
+#[cfg(test)]
+mod request_contract_tests {
+    use serde_json::{json, Value};
+    use validator::Validate;
+
+    use super::ChatCompletionRequest;
+
+    fn request(extra: Value) -> ChatCompletionRequest {
+        let mut value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Say hi in one word."}],
+            "max_completion_tokens": 64
+        });
+        value
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        serde_json::from_value(value).expect("request deserializes")
+    }
+
+    /// The validation error codes and messages, joined, or `None` when valid.
+    fn rejection(req: &ChatCompletionRequest) -> Option<String> {
+        req.validate().err().map(|errors| {
+            errors
+                .field_errors()
+                .values()
+                .flat_map(|errors| errors.iter())
+                .map(|error| {
+                    format!(
+                        "{}: {}",
+                        error.code,
+                        error.message.as_deref().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+    }
+
+    #[test]
+    fn verbosity_is_the_public_enum() {
+        for level in ["low", "medium", "high"] {
+            let req = request(json!({"verbosity": level}));
+            assert_eq!(req.verbosity.as_deref(), Some(level));
+            assert_eq!(rejection(&req), None, "{level}");
+        }
+        let bogus = request(json!({"verbosity": "extreme"}));
+        assert!(rejection(&bogus).is_some_and(|e| e.contains("unsupported_value")));
+        assert!(serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "verbosity": 3
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn function_parameters_must_be_an_object() {
+        let bad = request(
+            json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": "oops"}}]}),
+        );
+        let error = rejection(&bad).expect("rejected");
+        assert!(
+            error.contains("invalid_type") && error.contains("tools[0].function.parameters"),
+            "{error}"
+        );
+        let empty = request(json!({"tools": [{"type": "function", "function": {"name": "f"}}]}));
+        assert_eq!(rejection(&empty), None);
+    }
+
+    #[test]
+    fn logit_bias_is_keyed_by_token_ids() {
+        let bad = request(json!({"logit_bias": {"not-a-token": 1}}));
+        assert!(rejection(&bad).is_some_and(|e| e.contains("logit_bias_invalid_key")));
+        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5}}));
+        assert_eq!(rejection(&good), None);
+    }
+
+    #[test]
+    fn max_tokens_and_max_completion_tokens_together_are_rejected() {
+        let both = request(json!({"max_tokens": 32, "max_completion_tokens": 64}));
+        assert!(rejection(&both).is_some_and(|e| e.contains("invalid_parameter_combination")));
+        // The deprecated name alone still migrates.
+        let legacy = request(json!({"max_tokens": 32, "max_completion_tokens": null}));
+        assert_eq!(rejection(&legacy), None);
     }
 }
