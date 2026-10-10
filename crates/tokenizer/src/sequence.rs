@@ -110,7 +110,7 @@ impl Sequence {
             tokenizer,
             token_ids,
             total_tokens: len,
-            prefix_index: 0,
+            prefix_index: len,
             cached_prefix: String::new(),
             skip_special_tokens,
         }
@@ -184,6 +184,16 @@ impl Sequence {
             Some(text) => Ok(text),
             None => Ok(String::new()),
         }
+    }
+
+    /// Finish incremental decoding without inventing an extra token.
+    pub fn finish(&mut self) -> Result<String> {
+        self.tokenizer.finish_decode(
+            &mut self.token_ids,
+            &mut self.cached_prefix,
+            &mut self.prefix_index,
+            self.skip_special_tokens,
+        )
     }
 
     /// Get a reference to the tokenizer

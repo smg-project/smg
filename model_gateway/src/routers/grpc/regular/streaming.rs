@@ -667,16 +667,31 @@ impl StreamingProcessor {
                 Some(ProtoResponseVariant::Complete(complete)) => {
                     let index = complete.index();
 
-                    // Release whatever the stop decoder still holds. It only ever
-                    // retains a partial stop-sequence match, and it is routed through
-                    // the same parsers as every other chunk rather than straight out.
-                    let flushed =
-                        stop_decoders
-                            .get_mut(&index)
-                            .and_then(|decoder| match decoder.flush() {
-                                SequenceDecoderOutput::Text(text) if !text.is_empty() => Some(text),
+                    // Complete byte decoding before routing held text through the
+                    // same reasoning/tool parsers as ordinary chunks.
+                    let flushed = match stop_decoders.get_mut(&index) {
+                        Some(decoder) => {
+                            let tail = decoder.finish().map_err(|e| e.to_string())?;
+                            if decoder.is_stopped() {
+                                stopped_indices.insert(index);
+                                finish_reasons.insert(index, "stop".to_string());
+                                matched_stops.insert(
+                                    index,
+                                    decoder.matched_stop().map(|s| Value::String(s.to_string())),
+                                );
+                            }
+                            match tail {
+                                SequenceDecoderOutput::Text(text)
+                                | SequenceDecoderOutput::StoppedWithText(text)
+                                    if !text.is_empty() =>
+                                {
+                                    Some(text)
+                                }
                                 _ => None,
-                            });
+                            }
+                        }
+                        None => None,
+                    };
 
                     // Store metadata
                     prompt_tokens.insert(index, complete.prompt_tokens());
@@ -2482,11 +2497,21 @@ impl StreamingProcessor {
                     Some(chunk_text)
                 }
                 Some(ProtoResponseVariant::Complete(complete)) => {
-                    // Release whatever the stop decoder still holds. It only ever
-                    // retains a partial stop-sequence match, and it is routed through
-                    // the same parsers as every other chunk rather than straight out.
-                    let flushed = match stop_decoder.flush() {
-                        SequenceDecoderOutput::Text(text) if !text.is_empty() => Some(text),
+                    let tail = stop_decoder.finish().map_err(|e| e.to_string())?;
+                    if stop_decoder.is_stopped() {
+                        stopped = true;
+                        finish_reason_str = "stop".to_string();
+                        matched_stop = stop_decoder
+                            .matched_stop()
+                            .map(|s| Value::String(s.to_string()));
+                    }
+                    let flushed = match tail {
+                        SequenceDecoderOutput::Text(text)
+                        | SequenceDecoderOutput::StoppedWithText(text)
+                            if !text.is_empty() =>
+                        {
+                            Some(text)
+                        }
                         _ => None,
                     };
 
@@ -3525,7 +3550,13 @@ impl StreamingProcessor {
                     }
 
                     if let Some(decoder) = stop_decoders.get_mut(&index) {
-                        if let SequenceDecoderOutput::Text(text) = decoder.flush() {
+                        let tail = decoder.finish().map_err(|e| e.to_string())?;
+                        if decoder.is_stopped() {
+                            stopped_indices.insert(index);
+                        }
+                        if let SequenceDecoderOutput::Text(text)
+                        | SequenceDecoderOutput::StoppedWithText(text) = tail
+                        {
                             if !text.is_empty() {
                                 let stream_resp = CompletionStreamResponse {
                                     id: request_id.clone(),
@@ -3570,7 +3601,9 @@ impl StreamingProcessor {
                             .map_err(|_| "Channel closed".to_string())?;
                     }
 
-                    let finish_reason = {
+                    let finish_reason = if stopped_indices.contains(&index) {
+                        Some("stop".to_string())
+                    } else {
                         let reason = complete.finish_reason();
                         if reason.is_empty() || reason == "stop" {
                             Some("stop".to_string())
@@ -4111,6 +4144,16 @@ mod tests {
         fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
             Err(anyhow::anyhow!("tokenizer decode failed"))
         }
+
+        fn finish_decode(
+            &self,
+            _ids: &mut Vec<u32>,
+            _prefix: &mut String,
+            _prefix_index: &mut usize,
+            _skip_special_tokens: bool,
+        ) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("pending token decode failed"))
+        }
     }
 
     impl Tokenizer for FailingTokenizer {
@@ -4149,5 +4192,21 @@ mod tests {
 
         let err = result.expect_err("decode failure must propagate");
         assert!(err.contains("Stop decoder failed to process token"));
+    }
+
+    #[test]
+    fn finish_preserves_pending_decode_errors() {
+        let tokenizer = Arc::new(FailingTokenizer {
+            special_tokens: llm_tokenizer::SpecialTokens::default(),
+        });
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer,
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let error = decoder
+            .finish()
+            .expect_err("EOF decode error must propagate");
+        assert!(error.to_string().contains("pending token decode failed"));
     }
 }

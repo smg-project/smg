@@ -304,6 +304,17 @@ impl Decoder for CachedTokenizer {
             .decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
     }
 
+    fn finish_decode(
+        &self,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<String> {
+        self.inner
+            .finish_decode(ids, prefix, prefix_index, skip_special_tokens)
+    }
+
     fn incremental_decoder(
         &self,
         skip_special_tokens: bool,

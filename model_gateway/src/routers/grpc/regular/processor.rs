@@ -103,16 +103,19 @@ impl ResponseProcessor {
             }
         }
 
-        // Flush remaining text. The decoder held it back for a partial stop
-        // match; the last token takes it, so the tokens' ends reach the end
-        // of the text, and the held tokens before it stay zero-width inside
-        // the span it closes.
-        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+        // Complete token decoding, including bytes and a partial stop match.
+        // The last token takes the tail so the token spans reach the text end.
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
+            stop_decoder
+                .finish()
+                .map_err(|e| format!("Failed to finish token decoding: {e}"))?
+        {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
             }
         }
+        stopped |= stop_decoder.is_stopped();
 
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
@@ -464,7 +467,18 @@ impl ResponseProcessor {
             }
 
             // Flush remaining text
-            if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+            let tail = stop_decoder.finish().map_err(|e| {
+                error::internal_error(
+                    "process_tokens_failed",
+                    format!("Failed to finish token decoding: {e}"),
+                )
+            })?;
+            let stopped_at_finish = matches!(
+                tail,
+                SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
+            );
+            if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail
+            {
                 decoded_text.push_str(&t);
             }
 
@@ -472,8 +486,14 @@ impl ResponseProcessor {
             let finish_reason_str = complete.finish_reason();
 
             // Parse finish_reason from string to proper type
-            let finish_reason =
-                utils::parse_finish_reason(finish_reason_str, complete.completion_tokens());
+            let finish_reason = utils::parse_finish_reason(
+                if stopped_at_finish {
+                    "stop"
+                } else {
+                    finish_reason_str
+                },
+                complete.completion_tokens(),
+            );
 
             let matched_stop = complete.matched_stop_json();
 
@@ -648,12 +668,20 @@ impl ResponseProcessor {
                 break;
             }
         }
-        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
+            stop_decoder.finish().map_err(|e| {
+                error::internal_error(
+                    "process_tokens_failed",
+                    format!("Failed to finish token decoding: {e}"),
+                )
+            })?
+        {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
             }
         }
+        stopped |= stop_decoder.is_stopped();
 
         // Step 1: Parse reasoning content
         let mut reasoning_text: Option<String> = None;
@@ -931,9 +959,17 @@ impl ResponseProcessor {
                     }
                 }
 
-                if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+                if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
+                    stop_decoder.finish().map_err(|e| {
+                        error::internal_error(
+                            "process_tokens_failed",
+                            format!("Failed to finish token decoding: {e}"),
+                        )
+                    })?
+                {
                     decoded_text.push_str(&t);
                 }
+                stopped |= stop_decoder.is_stopped();
 
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
                 total_completion += complete.completion_tokens();

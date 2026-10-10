@@ -264,6 +264,110 @@ fn dispatch() -> context::DispatchMetadata {
     }
 }
 
+#[tokio::test]
+async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
+    let definition = serde_json::json!({
+        "version":"1.0", "added_tokens":[],
+        "model":{"type":"WordLevel", "unk_token":"[UNK]", "vocab":{
+            "[UNK]":0, "<0x74>":1, "<0xF2>":2, " suffix":3
+        }},
+        "decoder":{"type":"Sequence", "decoders":[
+            {"type":"ByteFallback"}, {"type":"Fuse"}
+        ]}
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), serde_json::to_vec(&definition).unwrap()).unwrap();
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+        llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().unwrap()).unwrap(),
+    );
+    for (ids, stop) in [
+        (vec![1, 2, 3], None),
+        (vec![1, 2], None),
+        (vec![1, 1], None),
+        (vec![1, 2], Some("�")),
+    ] {
+        let mut frames: Vec<_> = ids
+            .iter()
+            .map(|id| proto::GenerateResponse {
+                response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
+                    token_ids: vec![*id],
+                    completion_tokens: 1,
+                    ..Default::default()
+                })),
+            })
+            .collect();
+        let mut terminal = complete(0, "length");
+        if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
+            complete.completion_tokens = ids.len() as u32;
+        }
+        frames.push(terminal);
+        let (stream, server) = scripted_stream(frames, "0").await;
+        let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(
+            serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true,
+                "ignore_eos":true, "max_tokens":ids.len(), "stop":stop,
+                "stream_options":{"include_usage":true}}),
+        )
+        .unwrap();
+        let response = Arc::new(processor(false))
+            .process_completion_streaming_response(
+                context::ExecutionResult::Single { stream },
+                CompletionResponseSpec::from(&request),
+                dispatch(),
+                tokenizer.clone(),
+                None,
+            )
+            .await;
+        let body = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), 65536),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        let wire = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(wire.matches("data: [DONE]").count(), 1, "{wire}");
+        let events: Vec<Value> = wire
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("data: ")
+                    .filter(|json| *json != "[DONE]")
+                    .map(|json| serde_json::from_str(json).unwrap())
+            })
+            .collect();
+        assert!(
+            !events.iter().any(|event| event.get("error").is_some()),
+            "{wire}"
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|event| event["choices"][0]["text"].as_str())
+            .collect();
+        assert_eq!(
+            text,
+            if stop.is_some() {
+                String::new()
+            } else {
+                tokenizer.decode(&ids, true).unwrap()
+            }
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["choices"][0]["finish_reason"]
+                    == if stop.is_some() { "stop" } else { "length" }),
+            "{wire}"
+        );
+        let usages: Vec<_> = events
+            .iter()
+            .filter(|event| event["usage"].is_object())
+            .collect();
+        assert_eq!(usages.len(), 1, "{wire}");
+        assert_eq!(usages[0]["usage"]["completion_tokens"], ids.len());
+        assert_eq!(usages[0]["usage"]["prompt_tokens"], 1);
+    }
+}
+
 fn chat_spec(with_tools: bool) -> ChatResponseSpec {
     chat_spec_with(with_tools, None)
 }

@@ -100,6 +100,17 @@ pub trait IncrementalDecoder: Send + Sync {
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
 
+    /// Release text buffered by incremental decoding at end of input.
+    fn finish_decode(
+        &self,
+        _ids: &mut Vec<TokenIdType>,
+        _prefix: &mut String,
+        _prefix_index: &mut usize,
+        _skip_special_tokens: bool,
+    ) -> Result<String> {
+        Ok(String::new())
+    }
+
     /// Incremental decode step — called once per generated token.
     ///
     /// Maintains mutable state (`ids`, `prefix`, `prefix_index`) across calls to
