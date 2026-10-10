@@ -592,18 +592,26 @@ impl ThinkDetector {
 
     /// Whether a `<think>` block is open after the generation prompt an `if`
     /// writes, starting from `open` (the state the generation-prompt blocks
-    /// before it left; a template may write the prompt in several of them):
-    /// the true body when the condition reads `add_generation_prompt` (alone
-    /// or through `and` / `or`), the false body when it reads
-    /// `not add_generation_prompt`; `None` for any other condition.
+    /// before it left; a template may write the prompt in several of them).
+    /// A block that always runs for a generation prompt (`add_generation_prompt`
+    /// alone, or `not add_generation_prompt` for its false body) carries the
+    /// state through its text; a block that may run (`add_generation_prompt
+    /// and ...`) can only leave the block open, since its text runs on some
+    /// requests and not on others; `None` for any other condition.
     fn generation_prompt_open_after(ic: &IfCond, open: bool) -> Option<bool> {
+        const VAR: &str = "add_generation_prompt";
         match &ic.expr {
-            Expr::UnaryOp(u) if matches!(u.op, UnaryOpKind::Not) => {
-                Self::expr_references_var_positively(&u.expr, "add_generation_prompt")
-                    .then(|| Self::think_block_open_after(&ic.false_body, open))
+            Expr::Var(v) if v.id == VAR => Some(Self::think_block_open_after(&ic.true_body, open)),
+            Expr::UnaryOp(u) if matches!(u.op, UnaryOpKind::Not) => match &u.expr {
+                Expr::Var(v) if v.id == VAR => {
+                    Some(Self::think_block_open_after(&ic.false_body, open))
+                }
+                _ => None,
+            },
+            expr if Self::expr_references_var_positively(expr, VAR) => {
+                Some(open || Self::think_block_open_after(&ic.true_body, open))
             }
-            expr => Self::expr_references_var_positively(expr, "add_generation_prompt")
-                .then(|| Self::think_block_open_after(&ic.true_body, open)),
+            _ => None,
         }
     }
 
@@ -2121,6 +2129,21 @@ mod tests {
                         {%- if add_generation_prompt -%}<think>{%- endif -%}";
         let state = ChatTemplateState::new(Some(closed_then_open.to_string())).unwrap();
         assert!(state.prefill_opens_think_block());
+
+        // Two blocks that run on different requests (a conjunction each):
+        // either may leave the block open, so the prompt counts as opening
+        // whichever order they come in; a block that always runs still closes
+        // what an earlier one opened.
+        let exclusive = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt and thinking -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt and not thinking -%}<|assistant|><think></think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(exclusive.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+        let maybe_then_closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt and thinking -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt -%}</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(maybe_then_closed.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
 
         // A negated comparison is no branch of the prompt either.
         let negated_comparison = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
