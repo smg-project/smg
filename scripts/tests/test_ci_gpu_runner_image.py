@@ -86,33 +86,35 @@ class ImageTagTests(unittest.TestCase):
         for name in BUILD_INPUTS:
             self.assertIn(f"- '{name}'", workflow)
 
-    def test_cuda_layout_probe_rejects_each_global_nvcc_path(self):
+    def test_cuda_layout_probe_requires_the_compatible_toolkit_alias(self):
         workflow = (ROOT / ".github/workflows/ci-gpu-runner-image.yml").read_text()
         guard = re.search(
-            r"(?ms)^ +test ! -x /usr/local/cuda/bin/nvcc.*?^ +test -x /usr/local/cuda-13.0/bin/nvcc$",
+            r"(?ms)^ +test /usr/local/cuda -ef /usr/local/cuda-13.0.*?^ +test -x /usr/local/cuda/bin/nvcc$",
             workflow,
         ).group()
-        for index, (global_nvcc, path_nvcc, expected) in enumerate(
-            ((False, False, 0), (True, False, 1), (False, True, 1))
-        ):
-            with self.subTest(global_nvcc=global_nvcc, path_nvcc=path_nvcc):
-                folder = self.root / str(index)
-                folder.mkdir()
-                toolkit = folder / "versioned-nvcc"
-                toolkit.touch()
-                toolkit.chmod(0o755)
-                unversioned = folder / "unversioned-nvcc"
-                if global_nvcc:
-                    unversioned.touch()
-                    unversioned.chmod(0o755)
-                if path_nvcc:
-                    (folder / "nvcc").touch()
-                    (folder / "nvcc").chmod(0o755)
-                script = guard.replace("/usr/local/cuda/bin/nvcc", shlex.quote(str(unversioned)))
-                script = script.replace("/usr/local/cuda-13.0/bin/nvcc", shlex.quote(str(toolkit)))
+        for layout, expected in (("compatible", 0), ("missing", 1), ("wrong", 1), ("broken", 1)):
+            with self.subTest(layout=layout):
+                folder = self.root / layout
+                toolkit = folder / "cuda-13.0"
+                (toolkit / "bin").mkdir(parents=True)
+                compiler = toolkit / "bin/nvcc"
+                if layout != "broken":
+                    compiler.touch()
+                    compiler.chmod(0o755)
+                alias = folder / "cuda"
+                if layout == "wrong":
+                    other = folder / "other-toolkit"
+                    (other / "bin").mkdir(parents=True)
+                    other_compiler = other / "bin/nvcc"
+                    other_compiler.touch()
+                    other_compiler.chmod(0o755)
+                    alias.symlink_to(other)
+                elif layout != "missing":
+                    alias.symlink_to(toolkit)
+                script = guard.replace("/usr/local/cuda-13.0", shlex.quote(str(toolkit)))
+                script = script.replace("/usr/local/cuda", shlex.quote(str(alias)))
                 result = subprocess.run(
                     ["/bin/bash", "-euo", "pipefail", "-c", script],
-                    env={"PATH": str(folder)},
                     capture_output=True,
                 )
                 self.assertEqual(result.returncode, expected, result.stderr)

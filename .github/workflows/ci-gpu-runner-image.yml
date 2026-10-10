@@ -128,12 +128,8 @@ jobs:
               touch "$venv/.write-canary"
               rm "$venv/.write-canary"
             done
-            test ! -x /usr/local/cuda/bin/nvcc
-            if command -v nvcc >/dev/null; then
-              echo "Unexpected nvcc on the default PATH" >&2
-              exit 1
-            fi
-            test -x /usr/local/cuda-13.0/bin/nvcc
+            test /usr/local/cuda -ef /usr/local/cuda-13.0
+            test -x /usr/local/cuda/bin/nvcc
           '
 
       - name: Publish validated image
