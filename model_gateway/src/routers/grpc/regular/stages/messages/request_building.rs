@@ -130,8 +130,8 @@ impl BuildStage for MessageRequestBuildingStage {
         }
 
         // On a thinking prompt the engine defers a grammar past the model's
-        // own `</think>` (SGLang's `require_reasoning`; vLLM does so by itself
-        // when it runs a reasoning parser). A forced-call tag owes nothing
+        // own `</think>` (the request's `require_reasoning`; an engine that runs
+        // a reasoning parser does so by itself). A forced-call tag owes nothing
         // before the calls, so it reads the same with or without the deferral.
         let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
             utils::messages_reasoning_starts_in_prefill(&messages_request, tokenizer.as_ref())

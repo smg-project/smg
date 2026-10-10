@@ -151,8 +151,8 @@ impl Glm4MoeParser {
     /// `sequence[prefix, calls]`. The text is the model's thought and its
     /// `</think>` where the engine applies the grammar from the first token,
     /// and a newline or nothing where the engine runs a reasoning parser and
-    /// applies the grammar only after the model's own `</think>` (vLLM,
-    /// SGLang). Nothing is owed at its end: xgrammar's built-in `glm_4_7`
+    /// applies the grammar only after the model's own `</think>`. Nothing is
+    /// owed at its end: xgrammar's built-in `glm_4_7`
     /// prefix (`reasoning=True`) closes the text with `</think>`, and an
     /// engine that has already consumed the model's `</think>` then holds
     /// the model to a second one, with a fabricated observation and answer

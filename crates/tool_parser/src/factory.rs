@@ -141,7 +141,7 @@ impl ParserRegistry {
     /// set, the parser's tag becomes `sequence[prefix, tag.format]`: free
     /// text, then the forced call. Unlike xgrammar's built-in tags with
     /// `reasoning=True`, the prefix is not closed by the thought's end token:
-    /// an engine that runs a reasoning parser (vLLM, SGLang) applies the
+    /// an engine that runs a reasoning parser applies the
     /// grammar only after the model's own `</think>` and would hold the
     /// model to a second one. Parsers without a prefix keep their unwrapped
     /// tag whatever `reasoning` says.

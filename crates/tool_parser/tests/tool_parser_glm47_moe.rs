@@ -299,7 +299,7 @@ async fn test_glm47_nested_json_in_arg_values() {
 
 /// On a thinking prompt the forced call's grammar must not hold the model to
 /// anything it may already have written. An engine that runs a reasoning
-/// parser (vLLM, SGLang) applies the grammar only once the model has closed
+/// parser applies the grammar only once the model has closed
 /// its own `</think>`, so a reasoning block in front of the calls, closed by
 /// `</think>`, is owed a second time: the model can neither call nor end the
 /// turn until it has written another `</think>`, and fills the gap with a
