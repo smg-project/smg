@@ -91,6 +91,76 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          appended (smg-project/smg#2780)",
     ),
     (
+        "gemma-4-e4b-it/render/bfcl-live-irrelevance-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "gemma-4-e4b-it/render/bfcl-live-multiple-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "gemma-4-e4b-it/render/bfcl-live-parallel-3-0-3",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "gemma-4-e4b-it/render/bfcl-live-relevance-6-6-0",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "gemma-4-e4b-it/render/bfcl-live-simple-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "gemma-4-e4b-it/render/hermes-glaive-func-calling-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "gemma-4-e4b-it/render/swebench-test-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "gemma-4-e4b-it/render/swebench-verified-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "gemma-4-e4b-it/render/text-developer-role",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "gemma-4-e4b-it/render/text-system-user",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
         "hunyuan-a13b-instruct/render/text-developer-role",
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
@@ -111,6 +181,13 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "iquest-q1/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "k2-horizon-36b/render/*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
     ),
     (
         "k2-horizon-36b/render/no-generation-prompt",
@@ -166,6 +243,13 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "lfm2.5-1.2b-instruct/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "llava-1.5-7b-hf/render/*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
     ),
     (
         "llava-1.5-7b-hf/render/no-generation-prompt",
@@ -291,6 +375,41 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
+        "qwen3-omni-30b-a3b-thinking/render/bfcl-live-irrelevance-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking/render/bfcl-live-multiple-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking/render/bfcl-live-parallel-3-0-3",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking/render/bfcl-live-relevance-6-6-0",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking/render/bfcl-live-simple-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
         "qwen3-omni-30b-a3b-thinking/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -300,6 +419,20 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "qwen3-omni-30b-a3b-thinking/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking/render/swebench-test-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking/render/swebench-verified-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
     ),
     (
         "qwen3-omni-30b-a3b-thinking/render/text-developer-role",
@@ -1184,6 +1317,20 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
+        "qwen3-vl-30b-a3b-instruct/render/hermes-func-calling-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "qwen3-vl-30b-a3b-instruct/render/hermes-glaive-func-calling-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
         "qwen3-vl-30b-a3b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -1193,6 +1340,20 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
+    ),
+    (
+        "qwen3-vl-8b-instruct/render/hermes-func-calling-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
+    ),
+    (
+        "qwen3-vl-8b-instruct/render/hermes-glaive-func-calling-*",
+        "the gateway hands this template the request's string content as a one-item text part \
+         list, as the engine's own server does, and the template renders the parts differently \
+         from the string the reference was recorded with through transformers' \
+         apply_chat_template (smg-project/smg-lab#147)",
     ),
     (
         "qwen3-vl-8b-instruct/render/no-generation-prompt",
