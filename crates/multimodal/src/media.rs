@@ -56,11 +56,26 @@ use super::{
     },
 };
 
+/// Budget for one image or audio fetch by URL, from connecting to the last
+/// byte of the body.
+pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for one video fetch by URL, from connecting to the last byte of
+/// the body. A clip is many times the size of an image, and the serving
+/// engine's own loader gives a video several times what it gives an image
+/// (30 s against 5 s): under an image-sized budget a clip the engine's own
+/// server answers times out here.
+pub const DEFAULT_VIDEO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct MediaConnectorConfig {
     pub allowed_domains: Option<Vec<String>>,
     pub allowed_local_media_path: Option<PathBuf>,
+    /// Budget for one image or audio fetch by URL, connect to last byte;
+    /// zero leaves only the HTTP client's own timeout.
     pub fetch_timeout: Duration,
+    /// Budget for one video fetch by URL, connect to last byte; zero leaves
+    /// only the HTTP client's own timeout.
+    pub video_fetch_timeout: Duration,
 }
 
 impl Default for MediaConnectorConfig {
@@ -68,7 +83,8 @@ impl Default for MediaConnectorConfig {
         Self {
             allowed_domains: None,
             allowed_local_media_path: None,
-            fetch_timeout: Duration::from_secs(10),
+            fetch_timeout: DEFAULT_FETCH_TIMEOUT,
+            video_fetch_timeout: DEFAULT_VIDEO_FETCH_TIMEOUT,
         }
     }
 }
@@ -210,6 +226,7 @@ pub struct MediaConnector {
     allowed_domains: Option<HashSet<String>>,
     allowed_local_media_path: Option<PathBuf>,
     fetch_timeout: Duration,
+    video_fetch_timeout: Duration,
 }
 
 impl MediaConnector {
@@ -232,6 +249,7 @@ impl MediaConnector {
             allowed_domains,
             allowed_local_media_path,
             fetch_timeout: config.fetch_timeout,
+            video_fetch_timeout: config.video_fetch_timeout,
         })
     }
 
@@ -316,21 +334,14 @@ impl MediaConnector {
             Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
         self.ensure_domain_allowed(&parsed)?;
 
-        let mut req = self.client.get(parsed.as_str());
-        if self.fetch_timeout > Duration::ZERO {
-            req = req.timeout(self.fetch_timeout);
-        }
-
-        let resp = req.send().await.map_err(|err| {
-            if err.is_timeout() {
-                MediaConnectorError::Timeout(self.fetch_timeout)
-            } else {
-                MediaConnectorError::Http(err)
-            }
-        })?;
-
-        let resp = resp.error_for_status()?;
-        let bytes = collect_http_body_with_limit(resp, image_max_input_bytes(), "image").await?;
+        let bytes = self
+            .fetch_http_bytes(
+                &parsed,
+                self.fetch_timeout,
+                image_max_input_bytes(),
+                "image",
+            )
+            .await?;
         Self::decode_image(
             bytes,
             cfg.detail,
@@ -441,21 +452,14 @@ impl MediaConnector {
             Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
         self.ensure_domain_allowed(&parsed)?;
 
-        let mut req = self.client.get(parsed.as_str());
-        if self.fetch_timeout > Duration::ZERO {
-            req = req.timeout(self.fetch_timeout);
-        }
-
-        let resp = req.send().await.map_err(|err| {
-            if err.is_timeout() {
-                MediaConnectorError::Timeout(self.fetch_timeout)
-            } else {
-                MediaConnectorError::Http(err)
-            }
-        })?;
-
-        let resp = resp.error_for_status()?;
-        let bytes = collect_http_body_with_limit(resp, video_max_input_bytes(), "video").await?;
+        let bytes = self
+            .fetch_http_bytes(
+                &parsed,
+                self.video_fetch_timeout,
+                video_max_input_bytes(),
+                "video",
+            )
+            .await?;
         self.decode_video(
             bytes,
             cfg,
@@ -471,21 +475,14 @@ impl MediaConnector {
             Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
         self.ensure_domain_allowed(&parsed)?;
 
-        let mut req = self.client.get(parsed.as_str());
-        if self.fetch_timeout > Duration::ZERO {
-            req = req.timeout(self.fetch_timeout);
-        }
-
-        let resp = req.send().await.map_err(|err| {
-            if err.is_timeout() {
-                MediaConnectorError::Timeout(self.fetch_timeout)
-            } else {
-                MediaConnectorError::Http(err)
-            }
-        })?;
-
-        let resp = resp.error_for_status()?;
-        let bytes = collect_http_body_with_limit(resp, audio_max_input_bytes(), "audio").await?;
+        let bytes = self
+            .fetch_http_bytes(
+                &parsed,
+                self.fetch_timeout,
+                audio_max_input_bytes(),
+                "audio",
+            )
+            .await?;
         self.decode_audio(
             bytes,
             AudioSource::Url {
@@ -493,6 +490,43 @@ impl MediaConnector {
             },
         )
         .await
+    }
+
+    /// `GET` `url` under `budget`, from connecting to the last byte of the
+    /// body, with the body held to `limit` bytes. Running out of the budget
+    /// in either phase (before the headers, or while the body arrives) is
+    /// reported as the timeout it is, with the URL and the budget.
+    async fn fetch_http_bytes(
+        &self,
+        url: &Url,
+        budget: Duration,
+        limit: usize,
+        media: &'static str,
+    ) -> Result<Bytes, MediaConnectorError> {
+        let mut req = self.client.get(url.as_str());
+        if budget > Duration::ZERO {
+            req = req.timeout(budget);
+        }
+        let timed_out = || MediaConnectorError::Timeout {
+            url: url.to_string(),
+            budget,
+        };
+
+        let resp = req.send().await.map_err(|err| {
+            if err.is_timeout() {
+                timed_out()
+            } else {
+                MediaConnectorError::Http(err)
+            }
+        })?;
+
+        let resp = resp.error_for_status()?;
+        collect_http_body_with_limit(resp, limit, media)
+            .await
+            .map_err(|err| match err {
+                MediaConnectorError::Http(http) if http.is_timeout() => timed_out(),
+                other => other,
+            })
     }
 
     async fn fetch_video_file(
@@ -3693,9 +3727,10 @@ mod video_sampling_tests {
         assert!(!is_video_command_timeout(
             &MediaConnectorError::VideoDecode("ffmpeg produced 31 frames, expected 32".to_string())
         ));
-        assert!(!is_video_command_timeout(&MediaConnectorError::Timeout(
-            Duration::from_secs(30)
-        )));
+        assert!(!is_video_command_timeout(&MediaConnectorError::Timeout {
+            url: "https://media.example/clip.mp4".to_string(),
+            budget: Duration::from_secs(30),
+        }));
     }
 
     #[test]

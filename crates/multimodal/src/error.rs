@@ -64,8 +64,8 @@ pub enum MediaConnectorError {
     AudioDecode(String),
     #[error("video decode error: {0}")]
     VideoDecode(String),
-    #[error("media fetch timed out after {0:?}")]
-    Timeout(Duration),
+    #[error("media fetch of {url} timed out after {budget:?}")]
+    Timeout { url: String, budget: Duration },
 }
 
 #[derive(Debug, Error)]
