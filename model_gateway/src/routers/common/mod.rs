@@ -35,7 +35,7 @@
 //!   used by every router for transport-level retries. Has zero
 //!   coupling to the `Worker` trait — it lived in `worker/` for
 //!   historical reasons before this extraction.
-//! - [`sglang_fields`] — the SGLang-only request fields the HTTP proxy
+//! - [`sglang_fields`] — the engine-specific request fields the HTTP proxy
 //!   strips at their defaults and the provider transformers drop outright
 //! - [`sse`] — shared SSE codec (encoder + decoder) for streaming
 //!   responses to clients and parsing upstream SSE byte streams

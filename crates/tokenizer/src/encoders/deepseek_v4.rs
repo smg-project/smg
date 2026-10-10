@@ -26,7 +26,7 @@ pub use super::deepseek_v32::ThinkingMode;
 /// Which reasoning-effort prompt revision the checkpoint was trained with.
 ///
 /// The 0731 refresh shifted the levels down one: the original's `max` text
-/// became 0731's `high`, and 0731's `max` is a new, stronger prompt. vLLM's
+/// became 0731's `high`, and 0731's `max` is a new, stronger prompt. The engine's
 /// port of the encoder renders the refreshed table for every V4 checkpoint,
 /// so it is also what a checkpoint directory without its own encoder gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -195,7 +195,7 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
 // ---------------------------------------------------------------------------
 // Python's `to_json` is `json.dumps(value, ensure_ascii=False)`: spaced
 // separators, raw UTF-8. Compact `serde_json::to_string` would change the
-// prompt bytes vLLM trained on.
+// prompt bytes the model was trained on.
 fn to_json(value: &Value) -> String {
     crate::json_dumps::to_string(value)
 }

@@ -1687,6 +1687,10 @@ impl WorkerRegistry {
             removed
         };
         if let Some((_, worker)) = removed {
+            // Retire the URL's series while the URL still maps to this id: a
+            // registration of the same URL cannot slip in between and have its
+            // fresh series retired under it.
+            Metrics::remove_worker_metrics(worker.url());
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -1714,8 +1718,6 @@ impl WorkerRegistry {
             {
                 conn_workers.retain(|id| id != worker_id);
             }
-
-            Metrics::remove_worker_metrics(worker.url());
 
             // Release background work owned by this instance — notably the ZMQ
             // handshake driver, whose bound sockets would otherwise block a
@@ -1921,6 +1923,16 @@ impl WorkerRegistry {
             self.workers.insert(worker_id.clone(), worker.clone());
             self.bump_global_routing_epoch();
         }
+
+        // The worker's series are kept for the time its address is
+        // registered (see `observability::worker_metrics`). The builder's
+        // writes for health, HTTP/2 and breaker state preceded this
+        // registration and were dropped if the address was retired by an
+        // earlier removal, so they are repeated here.
+        Metrics::worker_registered(worker.url());
+        Metrics::set_worker_health(worker.url(), worker.is_healthy());
+        Metrics::set_worker_http2(worker.url(), worker.http2());
+        Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
 
         // The worker's request counter starts at zero with its registration,
         // so a worker that gets no traffic shows as such.

@@ -255,7 +255,9 @@ impl Router {
 
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
-    /// (generate endpoint without model), considers all HTTP workers.
+    /// (generate endpoint without model), considers all HTTP workers. `tried`
+    /// are the engines the request's failed attempts dispatched to (see
+    /// `PlacementInputs::tried`).
     #[expect(
         clippy::too_many_arguments,
         reason = "selection threads every routing input the policy consumes"
@@ -269,6 +271,7 @@ impl Router {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         candidate_filter: Option<CandidateFilter<'_>>,
+        tried: &[String],
     ) -> Option<Arc<dyn Worker>> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -285,6 +288,7 @@ impl Router {
                 rid_key,
                 cache_namespace,
                 candidate_filter,
+                tried,
             },
         )
     }
@@ -413,6 +417,9 @@ impl Router {
             },
             ReleasePoint::from_retry_config(retry_config),
         );
+        // The engines a failed attempt of this request dispatched to; a retry
+        // re-selects away from them while another available worker is left.
+        let tried = parking_lot::Mutex::new(Vec::new());
 
         // The request's bookkeeping across attempts: each worker is charged
         // one breaker failure at most, and a worker whose answer was
@@ -431,6 +438,7 @@ impl Router {
                     canonical_model.as_deref(),
                     is_stream,
                     &ledger,
+                    &tried,
                 )
                 .await;
             Metrics::record_router_upstream_response(
@@ -460,6 +468,7 @@ impl Router {
                             canonical_model.as_deref(),
                             is_stream,
                             &ledger,
+                            &tried,
                         )
                         .await;
 
@@ -517,7 +526,7 @@ impl Router {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "one dispatch attempt takes the request's lease, its route and its attempt ledger"
+        reason = "one dispatch attempt takes the request's lease, its route, its attempt ledger and the engines it tried"
     )]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
@@ -528,10 +537,14 @@ impl Router {
         canonical_model: Option<&str>,
         is_stream: bool,
         ledger: &AttemptLedger,
+        tried: &parking_lot::Mutex<Vec<String>>,
     ) -> Response {
         // A retry never goes back to a worker whose answer was definitive.
         let admits = |worker: &dyn Worker| ledger.admits(worker);
         let worker = match lease.with_view(|view| {
+            // A retry re-selects away from the engines this request already
+            // tried, while another available worker is left to take it.
+            let tried = tried.lock();
             self.select_worker_for_model(
                 model_id,
                 view.text,
@@ -540,6 +553,7 @@ impl Router {
                 view.rid_key,
                 view.cache_namespace,
                 Some(&admits),
+                &tried,
             )
         }) {
             Some(w) => w,
@@ -701,6 +715,14 @@ impl Router {
                 .get_routing_pool(model_id, RoutingPool::HttpRegular)
                 .iter(),
         );
+        // A replayable failure: the retry re-selects away from this engine
+        // while another available worker is left to take the request.
+        if is_retryable_response(&response) {
+            let mut tried = tried.lock();
+            if !tried.iter().any(|engine| engine == worker.base_url()) {
+                tried.push(worker.base_url().to_string());
+            }
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -934,6 +956,7 @@ impl Router {
                 rid_key: None,
                 cache_namespace: None,
                 candidate_filter: None,
+                tried: &[],
             },
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
@@ -1876,6 +1899,7 @@ impl Router {
             None,
             None,
             None,
+            &[],
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
@@ -2587,6 +2611,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
             )
             .unwrap();
         assert!(selected.is_available());
@@ -2603,12 +2628,13 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
             )
             .is_none());
     }
 
     #[tokio::test]
-    async fn unavailable_workers_keep_generic_503_without_retry_after() {
+    async fn unavailable_workers_answer_503_with_retry_after() {
         let router = create_test_regular_router();
         for worker in router.worker_registry.get_all() {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
@@ -2634,7 +2660,13 @@ mod tests {
                 .expect("gateway error code header"),
             "no_available_workers"
         );
-        assert!(response.headers().get(RETRY_AFTER).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
     }
 
     /// Loopback POST /generate stub answering `status` with a JSON body on
@@ -3785,6 +3817,88 @@ mod tests {
             assert_eq!(body["top_p"], json!(0.9));
             assert_eq!(body["seed"], json!(7));
         }
+    }
+
+    /// A request pinned by a routing key whose worker answers a transient
+    /// 503 is retried on another worker, not replayed on the one that just
+    /// failed: one attempt there, the second on the other worker, 200.
+    #[tokio::test]
+    async fn a_keyed_retry_moves_to_another_worker_after_a_transient_failure() {
+        async fn stub(status: StatusCode, body: &'static str) -> (String, Arc<AtomicUsize>) {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&hits);
+            let app = axum::Router::new().route(
+                "/generate",
+                axum::routing::post(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, AtomicOrdering::SeqCst);
+                        (status, body).into_response()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "test stub server lives for the duration of the test process"
+            )]
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (format!("http://{addr}"), hits)
+        }
+        let (refusing, refused) = stub(StatusCode::SERVICE_UNAVAILABLE, "busy").await;
+        let (serving, served) = stub(StatusCode::OK, "{}").await;
+
+        let mut router = streaming_router(
+            PolicyConfig::ConsistentHashing,
+            1024 * 1024,
+            vec![plain_worker(&refusing), plain_worker(&serving)],
+        );
+        router.retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            ..Default::default()
+        };
+
+        // Keys hash to either worker; the first one owned by the refusing
+        // worker is the case under test (the others succeed in one attempt).
+        for key in (0..64).map(|i| format!("session-{i}")) {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            let refused_before = refused.load(AtomicOrdering::SeqCst);
+            let served_before = served.load(AtomicOrdering::SeqCst);
+            let response = router
+                .route_typed_request(
+                    Some(&headers),
+                    DropProbeRequest {
+                        text: "pinned".to_string(),
+                        _probe: Arc::new(()),
+                    },
+                    "/generate",
+                    crate::worker::UNKNOWN_MODEL_ID,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "key {key}");
+            let refused_now = refused.load(AtomicOrdering::SeqCst) - refused_before;
+            let served_now = served.load(AtomicOrdering::SeqCst) - served_before;
+            if refused_now == 0 {
+                assert_eq!(
+                    served_now, 1,
+                    "a key owned by the serving worker: one attempt"
+                );
+                continue;
+            }
+            assert_eq!(
+                refused_now, 1,
+                "the refusing worker sees the request once, not once per retry"
+            );
+            assert_eq!(served_now, 1, "the retry landed on the other worker");
+            return;
+        }
+        panic!("no key hashed to the refusing worker");
     }
 
     #[tokio::test]

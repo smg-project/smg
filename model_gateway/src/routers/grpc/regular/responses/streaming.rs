@@ -1155,6 +1155,7 @@ impl ChatResponseAccumulator {
                     } else {
                         Some(self.content)
                     },
+                    refusal: None,
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {

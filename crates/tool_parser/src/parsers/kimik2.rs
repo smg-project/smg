@@ -53,7 +53,7 @@ pub struct KimiK2Parser {
 impl KimiK2Parser {
     /// Build structural tag for Kimi K2 tool call format.
     ///
-    /// Uses dual triggers following sglang's approach:
+    /// Uses dual triggers following the serving engine's approach:
     /// - `<|tool_calls_section_begin|>` for the first tool call
     /// - `<|tool_call_begin|>` for subsequent parallel tool calls
     pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {

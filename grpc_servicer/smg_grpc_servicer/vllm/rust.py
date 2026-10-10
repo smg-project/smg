@@ -188,7 +188,16 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     processor would run); a knob the pipeline has no field for is refused
     at launch rather than silently ignored. The engine's own per-prompt media
     limits (``--limit-mm-per-prompt``) go along too: the pipeline refuses
-    above them as the engine's own server does, whatever its own caps say.
+    above them as the engine's own server does, whatever its own caps say. So
+    does the engine's video frame budget (``--media-io-kwargs``
+    ``video.num_frames``, else its loader's default), so a clip costs the same
+    tokens as on the engine's own server for the families whose processor
+    takes the loader's frames (unless ``SMG_VLLM_MM_MAX_VIDEO_FRAMES`` caps the
+    budget below the engine's count, when the pipeline samples fewer frames
+    than the engine's server would, as the cap intends); a sampling rule of
+    the loader the pipeline cannot follow goes along by name
+    (``video_loader_rule``), and the pipeline refuses it for those families
+    only.
     """
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
@@ -220,6 +229,8 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         "max_items": settings.max_items,
         "engine_item_limits": engine_item_limits(model_config),
         "max_item_bytes": settings.max_item_bytes,
+        "video_frame_budget": video_frame_budget(model_config),
+        "video_loader_rule": video_loader_rule(model_config),
         "source": settings.source,
     }
 
@@ -234,6 +245,77 @@ def engine_item_limits(model_config) -> dict[str, int] | None:
     if not callable(get_limit):
         return None
     return {modality: int(get_limit(modality)) for modality in FETCHABLE_MODALITIES}
+
+
+def video_frame_budget(model_config, environ: Mapping[str, str] | None = None) -> int | None:
+    """The number of frames the engine's own loader samples a video to: its
+    ``--media-io-kwargs`` ``video.num_frames`` when set (``0`` for a non-positive
+    count, which vLLM reads as every frame), else the loader's default, under
+    the same ``SMG_VLLM_MM_MAX_VIDEO_FRAMES`` cap the other processors apply
+    (``clamp_video_frames``); ``None`` when neither is known, which leaves the
+    pipeline's spec to its own constant. A sampling rule of the loader that the
+    pipeline cannot follow is reported by ``video_loader_rule``, not here."""
+    from smg_grpc_servicer.vllm.mm_processor import (
+        DEFAULT_MAX_VIDEO_FRAMES,
+        ENV_MAX_VIDEO_FRAMES,
+        clamp_video_frames,
+        env_int,
+        vllm_default_video_frames,
+    )
+
+    source = os.environ if environ is None else environ
+    mm_config = getattr(model_config, "multimodal_config", None)
+    kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
+    if not isinstance(kwargs, Mapping):
+        kwargs = {}
+    default = vllm_default_video_frames()
+    max_frames = env_int(source, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0)
+    capped = clamp_video_frames(kwargs, max_frames, default) or {}
+    video = capped.get("video") if isinstance(capped, Mapping) else None
+    num_frames = video.get("num_frames") if isinstance(video, Mapping) else None
+    if num_frames is None:
+        num_frames = default
+    if num_frames is None:
+        return None
+    return max(int(num_frames), 0)
+
+
+def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) -> str | None:
+    """A sampling rule of the engine's video loader that the smg pipeline
+    cannot follow, named the way the launcher was given it, or ``None``: a
+    loader other than the default ``opencv`` (``video.video_backend`` in
+    ``--media-io-kwargs``, else ``VLLM_VIDEO_LOADER_BACKEND``, in vLLM's own
+    order of precedence), or a ``video.fps``
+    above zero, which thins the frames by the clip's duration (vLLM's default
+    ``-1`` and ``0`` do not). The pipeline refuses the rule at launch for a
+    family that samples the way the loader does (Gemma 4); the families with a
+    rate-based sampler of their own never followed the loader and start as
+    before, so a fleet-wide loader setting does not block them."""
+    source = os.environ if environ is None else environ
+    mm_config = getattr(model_config, "multimodal_config", None)
+    kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
+    video = kwargs.get("video") if isinstance(kwargs, Mapping) else None
+    video = video if isinstance(video, Mapping) else {}
+    rules: list[str] = []
+    # vLLM takes the kwarg over the environment (`kwargs.pop("video_backend")
+    # or envs.VLLM_VIDEO_LOADER_BACKEND`), so only the loader it ends up with
+    # counts: a kwarg naming opencv silences a fleet-wide environment setting.
+    backend = video.get("video_backend")
+    loader = (source.get("VLLM_VIDEO_LOADER_BACKEND") or "").strip()
+    if backend is not None:
+        if str(backend).strip().lower() != "opencv":
+            rules.append(f"--media-io-kwargs video.video_backend={backend}")
+    elif loader and loader.lower() != "opencv":
+        rules.append(f"VLLM_VIDEO_LOADER_BACKEND={loader}")
+    fps = video.get("fps")
+    if fps is not None:
+        try:
+            thins = float(fps) > 0
+        except (TypeError, ValueError):
+            thins = True
+        if thins:
+            rules.append(f"--media-io-kwargs video.fps={fps}")
+    return "; ".join(rules) or None
 
 
 # ---------------------------------------------------------------------------

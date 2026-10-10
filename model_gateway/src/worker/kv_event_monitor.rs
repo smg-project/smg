@@ -28,7 +28,7 @@ use std::{
     },
 };
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use futures::FutureExt as _;
 use tokio::{
     sync::{oneshot, watch, Mutex},
@@ -69,6 +69,19 @@ const STATS_INTERVAL_SECS: u64 = 30;
 /// Each gRPC worker gets a dedicated tokio task that subscribes to the backend's
 /// KV cache event stream and feeds events into a shared [`KvIndex`]
 /// (one per `model_id`). Workers serving the same model share the same indexer.
+/// A model's KV block size as the monitor knows it: provisional until a
+/// stored event names it. A provisional size (a `WorkerSpec` seed or
+/// `set_block_size`) is replaced by the first stored block; a size the
+/// events named is only ever raised. Hybrid engines publish, beside their
+/// full blocks, partial entries at their hash granularity (a fraction of
+/// the block), and a request hashed at that size would never match a full
+/// block, so the size of record is the largest block the events carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KvBlockSize {
+    pub(crate) tokens: usize,
+    pub(crate) from_events: bool,
+}
+
 pub struct KvEventMonitor {
     /// Per-model KV indexes: model_id → shared indexer.
     /// Arc-wrapped so the prune task can share the map WITHOUT holding (even
@@ -79,7 +92,7 @@ pub struct KvEventMonitor {
     /// Per-model block sizes learned from KV events or set via WorkerSpec.
     /// Used by CacheAwarePolicy to chunk request tokens at query time.
     /// Arc-wrapped so subscription tasks can update it from events.
-    block_sizes: Arc<DashMap<String, usize>>,
+    block_sizes: Arc<DashMap<String, KvBlockSize>>,
     /// Per-worker subscription slots: worker_url → the live subscription, or
     /// the reservation a removal leaves until the old task has cleaned up.
     /// Mutex matches LoadMonitor pattern for atomic abort + remove; Arc so a
@@ -217,11 +230,18 @@ impl KvEventMonitor {
     /// 30 s cadence and never on a request.
     fn publish_stats(indexers: &DashMap<String, Arc<KvIndex>>) {
         for entry in indexers {
-            let index = entry.value();
-            Metrics::set_kv_index_size(entry.key(), index.current_size(), index.entry_count());
-            if let Some(stats) = index.chain_stats() {
-                Metrics::set_kv_index_chain_stats(entry.key(), &stats);
-            }
+            Self::publish_index(entry.key(), entry.value());
+        }
+    }
+
+    /// One model's index size and chain shape as gauges: the periodic
+    /// publication's unit, and what a new index publishes at once, so the
+    /// model's series exist (at zero) from its first worker rather than
+    /// from the first tick.
+    fn publish_index(model_id: &str, index: &KvIndex) {
+        Metrics::set_kv_index_size(model_id, index.current_size(), index.entry_count());
+        if let Some(stats) = index.chain_stats() {
+            Metrics::set_kv_index_chain_stats(model_id, &stats);
         }
     }
 
@@ -327,16 +347,29 @@ impl KvEventMonitor {
             let _ = done.changed().await;
         };
 
-        let indexer = self
-            .indexers
-            .entry(model_id.clone())
-            .or_insert_with(|| Arc::new(KvIndex::new(self.kind, self.jump_size)))
-            .clone();
+        let (indexer, created) = match self.indexers.entry(model_id.clone()) {
+            Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+            Entry::Vacant(entry) => {
+                let index = Arc::new(KvIndex::new(self.kind, self.jump_size));
+                entry.insert(Arc::clone(&index));
+                (index, true)
+            }
+        };
+        if created {
+            Self::publish_index(&model_id, &indexer);
+        }
+        // The worker's integrity series exist before its stream does.
+        Metrics::init_kv_event_series(&url);
         // Seed block_size provisionally from WorkerSpec. The event stream will
         // overwrite this with the backend's actual page size once received.
         if let Some(bs) = worker.metadata().spec.kv_block_size {
             if bs > 0 {
-                self.block_sizes.entry(model_id.clone()).or_insert(bs);
+                self.block_sizes
+                    .entry(model_id.clone())
+                    .or_insert(KvBlockSize {
+                        tokens: bs,
+                        from_events: false,
+                    });
             } else {
                 warn!(worker_url = %url, "Worker reports kv_block_size=0, ignoring");
             }
@@ -436,7 +469,7 @@ impl KvEventMonitor {
     async fn complete_removal(
         slots: &Mutex<HashMap<String, Slot>>,
         indexers: &DashMap<String, Arc<KvIndex>>,
-        block_sizes: &DashMap<String, usize>,
+        block_sizes: &DashMap<String, KvBlockSize>,
         kind: KvIndexKind,
         worker_url: &str,
         id: u64,
@@ -579,7 +612,7 @@ impl KvEventMonitor {
 
     /// Get the block size for a model (learned from events or set via `set_block_size`).
     pub fn block_size(&self, model_id: &str) -> Option<usize> {
-        self.block_sizes.get(model_id).map(|v| *v)
+        self.block_sizes.get(model_id).map(|v| v.tokens)
     }
 
     /// Set the block size for a model (e.g. from WorkerSpec during registration).
@@ -587,7 +620,10 @@ impl KvEventMonitor {
     pub fn set_block_size(&self, model_id: &str, block_size: usize) {
         self.block_sizes
             .entry(model_id.to_string())
-            .or_insert(block_size);
+            .or_insert(KvBlockSize {
+                tokens: block_size,
+                from_events: false,
+            });
     }
 
     /// Normalize model_id to match routing's `normalize_model_key`.
@@ -1037,6 +1073,94 @@ mod tests {
             assert!(gauge(&handle, "smg_kv_index_arena_bytes", "chain").is_some_and(|b| b > 0.0));
             assert!(gauge(&handle, "smg_kv_index_slab_bytes", "chain").is_some_and(|b| b > 0.0));
             assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "pos"), None);
+        });
+    }
+
+    /// A worker's integrity series and its model's index gauges exist from
+    /// the subscription's start, at zero: a scrape of a fresh gateway tells
+    /// "nothing happened" from "nothing exported".
+    #[test]
+    fn a_new_subscription_publishes_its_series_at_zero() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        fn sample(body: &str, family: &str, labels: &[(&str, &str)]) -> Option<f64> {
+            let prefix = format!("{family}{{");
+            body.lines()
+                .find(|line| {
+                    line.starts_with(&prefix)
+                        && labels
+                            .iter()
+                            .all(|(key, value)| line.contains(&format!("{key}=\"{value}\"")))
+                })
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let monitor = KvEventMonitor::with_kind(KvIndexKind::Chain, None);
+                let worker = refusing_grpc_worker();
+                monitor.on_worker_added(&worker).await;
+                let body = handle.render();
+                let url = worker.url();
+                for (family, labels) in [
+                    (
+                        "smg_kv_event_gaps_total",
+                        vec![("worker", url), ("outcome", "replay_requested")],
+                    ),
+                    (
+                        "smg_kv_event_gaps_total",
+                        vec![("worker", url), ("outcome", "unrecovered_cleared")],
+                    ),
+                    ("smg_kv_event_missed_batches_total", vec![("worker", url)]),
+                    (
+                        "smg_kv_event_resyncs_total",
+                        vec![("worker", url), ("reason", "snapshot")],
+                    ),
+                    (
+                        "smg_kv_event_resyncs_total",
+                        vec![("worker", url), ("reason", "publisher_restart")],
+                    ),
+                    (
+                        "smg_kv_event_subscription_failures_total",
+                        vec![("worker", url), ("reason", "panic")],
+                    ),
+                    (
+                        "smg_kv_event_parentless_stores_total",
+                        vec![("worker", url)],
+                    ),
+                    (
+                        "smg_kv_event_parentless_blocks_total",
+                        vec![("worker", url)],
+                    ),
+                    ("smg_kv_event_degraded_ranks", vec![("worker", url)]),
+                    (
+                        "smg_kv_index_moved_hashes",
+                        vec![("model", UNKNOWN_MODEL_ID)],
+                    ),
+                    (
+                        "smg_kv_index_engine_conflicts",
+                        vec![("model", UNKNOWN_MODEL_ID)],
+                    ),
+                    (
+                        "smg_kv_index_memberships",
+                        vec![("model", UNKNOWN_MODEL_ID)],
+                    ),
+                ] {
+                    assert_eq!(
+                        sample(&body, family, &labels),
+                        Some(0.0),
+                        "{family} {labels:?} on a fresh gateway:\n{body}"
+                    );
+                }
+                monitor.stop().await;
+            });
         });
     }
 

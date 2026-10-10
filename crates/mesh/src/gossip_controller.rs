@@ -38,12 +38,12 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use rand::seq::{IndexedRandom, SliceRandom};
 use tokio::sync::{mpsc, watch, Mutex};
-use tonic::transport::{ClientTlsConfig, Endpoint};
+use tonic::transport::Endpoint;
 use tracing as log;
 use tracing::{instrument, Instrument};
 
 use super::{
-    mtls::MTLSManager,
+    mtls::{tls_server_name, MTLSManager},
     service::{
         broadcast_node_states,
         gossip::{
@@ -733,22 +733,16 @@ impl GossipController {
             .map_err(|e| anyhow::anyhow!("Invalid peer endpoint {connect_url}: {e}"))?;
 
         if let Some(mtls_manager) = self.mtls_manager.clone() {
-            let tls_domain = endpoint
-                .uri()
-                .host()
-                .map(str::to_owned)
-                .unwrap_or_else(|| peer_name.clone());
-            let ca_certificate = mtls_manager
-                .load_ca_certificate()
+            let tls_domain = endpoint.uri().host().map_or_else(
+                || peer_name.clone(),
+                |host| tls_server_name(host).to_owned(),
+            );
+            let tls = mtls_manager
+                .client_tls_config(&tls_domain)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to load mTLS CA certificate: {e}"))?;
-
+                .map_err(|e| anyhow::anyhow!("Failed to load the mTLS identity: {e}"))?;
             endpoint = endpoint
-                .tls_config(
-                    ClientTlsConfig::new()
-                        .domain_name(tls_domain)
-                        .ca_certificate(ca_certificate),
-                )
+                .tls_config(tls)
                 .map_err(|e| anyhow::anyhow!("Failed to configure TLS endpoint: {e}"))?;
         }
 

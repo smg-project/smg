@@ -56,6 +56,8 @@ prost-build = "0.14.4"
 
 [dev-dependencies]
 lazy_static = "1.5"
+openssl = "0.10.81"
+tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber.workspace = true
 

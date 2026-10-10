@@ -290,6 +290,10 @@ pub(crate) struct DispatchContext {
     /// The request's bookkeeping across attempts: circuit-breaker charges
     /// and the workers whose answer was definitive.
     pub ledger: AttemptLedger,
+    /// Engines (base URLs) a failed attempt of this request dispatched to;
+    /// a retry's re-selection skips them while another available worker is
+    /// left (see `placement::PlacementInputs::tried`).
+    pub tried: Vec<String>,
     /// Canonical model ID (routing, registries).
     pub model_id: String,
     /// Model the response reports, captured from the request at the build
@@ -923,6 +927,7 @@ impl RequestContext {
             cache_trace: None,
             attempt: 0,
             ledger: AttemptLedger::default(),
+            tried: Vec::new(),
             model_id,
             dispatch_model,
             streaming,
@@ -1189,6 +1194,12 @@ impl WorkerSelection {
         std::iter::once(first).chain(second)
     }
 
+    /// The engines (base URLs) this selection dispatches to: the one worker,
+    /// or the prefill and decode legs.
+    pub fn engines(&self) -> impl Iterator<Item = &str> {
+        self.workers().map(|worker| worker.base_url())
+    }
+
     /// Record an attempt's circuit-breaker outcome on every worker, through
     /// the request's ledger (one failure charge per request per worker).
     pub fn record_outcome(&self, ledger: &AttemptLedger, status_code: u16) {
@@ -1395,8 +1406,8 @@ pub(crate) enum FinalResponse {
     Embedding(EmbeddingResponse),
     /// Classification response
     Classify(ClassifyResponse),
-    /// Messages API response
-    Messages(Message),
+    /// Messages API response (boxed: the object outgrew the other variants)
+    Messages(Box<Message>),
     /// Transcription: the decoded transcript plus its wire format.
     Transcription {
         text: String,

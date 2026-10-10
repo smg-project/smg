@@ -14,7 +14,10 @@
 
 use std::sync::Arc;
 
-use axum::{http::HeaderMap, response::Response};
+use axum::{
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
+    response::Response,
+};
 use rand::RngExt;
 use tracing::{debug, warn};
 
@@ -81,6 +84,14 @@ pub(crate) struct PlacementInputs<'a> {
     /// selected (e.g. only workers that process media references themselves,
     /// or none that already answered this request definitively).
     pub candidate_filter: Option<CandidateFilter<'a>>,
+    /// Engines (by base URL) a failed attempt of this request already
+    /// dispatched to. A retry skips them while another available candidate
+    /// is left to take the request, so a policy that would re-select the
+    /// same worker deterministically (a routing key, a cached prefix) moves
+    /// on instead of replaying on the worker that just failed. A pool with
+    /// nothing else left is used whole, so a single worker is retried as
+    /// before.
+    pub tried: &'a [String],
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -237,6 +248,34 @@ pub(crate) fn select_from(
             .collect::<Vec<_>>();
         &filtered
     };
+    // The engines this request already tried step aside for its retry while
+    // another available candidate remains; otherwise the pool is used whole.
+    // An explicit target under consistent hashing indexes this slice and
+    // stays strict (as `admission_prefilters` keeps it), so it is never
+    // narrowed: the retry goes back to the targeted worker.
+    let strict_target = policy.name() == "consistent_hashing"
+        && header_utils::extract_target_worker(inputs.headers).is_some();
+    let untried;
+    let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() || strict_target {
+        available
+    } else {
+        untried = available
+            .iter()
+            .filter(|worker| {
+                worker.is_available()
+                    && !inputs
+                        .tried
+                        .iter()
+                        .any(|engine| engine == worker.base_url())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if untried.is_empty() {
+            available
+        } else {
+            &untried
+        }
+    };
     if available.is_empty() {
         return overload_fallback(registry, policy.name(), model_id, candidates);
     }
@@ -336,14 +375,26 @@ pub(crate) fn failure_from(
     PlacementFailure::Unavailable
 }
 
+/// Seconds a client is told to wait before retrying a request every worker
+/// refused. A pacing hint, not a recovery estimate: the breaker timeout and
+/// the health interval are far longer, and the fleet may be back sooner.
+pub(crate) const NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS: u32 = 1;
+
 /// The 503 for a pool whose every worker is unavailable (unhealthy or its
 /// circuit breaker open). Terminal for the retry layer: the verdict clears at
 /// the health interval or the breaker timeout, never inside a backoff window,
 /// so retrying it in-process only adds the backoffs to every client's latency
-/// while the pool is down. The client retries on its own schedule.
+/// while the pool is down. The client retries on its own schedule, paced by
+/// `Retry-After` like the gateway's other refusals (admission sheds, the
+/// overload shed, tenant limits): a client that honours the header does not
+/// hammer a fleet that is down and gets the same bounded hint on every path.
 pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
     let mut response = error::service_unavailable("no_available_workers", message);
     mark_non_retryable(&mut response);
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from(NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS),
+    );
     response
 }
 
@@ -711,6 +762,7 @@ pub(crate) fn select_pair(
 mod tests {
     use std::collections::BTreeMap;
 
+    use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
@@ -1285,5 +1337,253 @@ mod tests {
             single_failure(&registry, MODEL, RoutingPool::GrpcPipelineRegular, None),
             PlacementFailure::NoCandidates
         ));
+    }
+
+    fn cache_aware_policy() -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
+        }
+    }
+
+    fn http_registry(urls: &[&str]) -> WorkerRegistry {
+        let typed: Vec<_> = urls
+            .iter()
+            .map(|url| (*url, ConnectionMode::Http, RuntimeType::Sglang))
+            .collect();
+        registry_with(&typed)
+    }
+
+    fn pick(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        inputs: PlacementInputs<'_>,
+    ) -> Arc<dyn Worker> {
+        select_single(
+            registry,
+            policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            inputs,
+        )
+        .expect("a worker is selectable")
+    }
+
+    /// A routing key pins consistent hashing to one worker; once that worker
+    /// was tried, the retry falls through to the next node on the ring, and
+    /// a pool with nothing untried left is used whole.
+    #[test]
+    fn a_retry_under_consistent_hashing_falls_through_to_the_next_ring_node() {
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "session-7".parse().unwrap());
+        let inputs = PlacementInputs {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let owner = pick(&registry, &policies, inputs);
+        assert_eq!(
+            pick(&registry, &policies, inputs).url(),
+            owner.url(),
+            "the key re-selects its owner deterministically"
+        );
+
+        let tried = vec![owner.base_url().to_string()];
+        let moved = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..inputs
+            },
+        );
+        assert_ne!(
+            moved.url(),
+            owner.url(),
+            "the retry leaves the tried worker"
+        );
+        assert_eq!(
+            pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..inputs
+                },
+            )
+            .url(),
+            moved.url(),
+            "the fall-through is deterministic too"
+        );
+
+        let all: Vec<String> = ["http://h:1", "http://h:2", "http://h:3"]
+            .iter()
+            .map(|url| (*url).to_string())
+            .collect();
+        assert_eq!(
+            pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &all,
+                    ..inputs
+                },
+            )
+            .url(),
+            owner.url(),
+            "with every worker tried the pool is used whole again"
+        );
+    }
+
+    /// Cache-aware routing pins a prompt to the worker holding its prefix;
+    /// a retry moves to the next-best worker and comes back only when no
+    /// other worker is left.
+    #[test]
+    fn a_retry_under_cache_aware_routing_moves_to_the_next_best_worker() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(cache_aware_policy());
+        let text = "the one prompt whose prefix lives on a single worker after the first request";
+        let inputs = PlacementInputs {
+            text: Some(text),
+            ..Default::default()
+        };
+
+        let holder = pick(&registry, &policies, inputs);
+        assert_eq!(
+            pick(&registry, &policies, inputs).url(),
+            holder.url(),
+            "the prefix pins the prompt to its holder"
+        );
+
+        let tried = vec![holder.base_url().to_string()];
+        let moved = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..inputs
+            },
+        );
+        assert_ne!(moved.url(), holder.url(), "the retry leaves the holder");
+
+        let both = vec![holder.base_url().to_string(), moved.base_url().to_string()];
+        assert!(select_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                tried: &both,
+                ..inputs
+            },
+        )
+        .is_some());
+    }
+
+    /// An explicit target under consistent hashing indexes the unfiltered
+    /// set and stays strict: its retry goes back to the targeted worker
+    /// (never to whichever worker a narrowed slice puts at that index), even
+    /// though that worker was tried.
+    #[test]
+    fn an_explicit_target_under_consistent_hashing_keeps_its_worker_on_retry() {
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        for index in 0..3 {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", index.to_string().parse().unwrap());
+            let inputs = PlacementInputs {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+
+            let target = pick(&registry, &policies, inputs);
+            let tried = vec![target.base_url().to_string()];
+            let retried = pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..inputs
+                },
+            );
+            assert_eq!(
+                retried.url(),
+                target.url(),
+                "target {index}: the retry stays on the targeted worker"
+            );
+        }
+    }
+
+    /// Round robin never re-selects a tried worker while another is left,
+    /// and a single-worker pool keeps retrying its one worker.
+    #[test]
+    fn a_retry_under_round_robin_skips_the_tried_worker_and_a_lone_worker_is_kept() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let tried = vec!["http://h:1".to_string()];
+        for _ in 0..4 {
+            let selected = pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(selected.url(), "http://h:2");
+        }
+
+        let lone = http_registry(&["http://h:9"]);
+        let tried = vec!["http://h:9".to_string()];
+        let selected = pick(
+            &lone,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            selected.url(),
+            "http://h:9",
+            "nothing else is left: the one worker takes the retry"
+        );
+    }
+
+    /// The all-unavailable 503 tells the client when to come back, like the
+    /// gateway's other refusals.
+    #[test]
+    fn no_available_workers_answers_503_with_retry_after() {
+        let response = no_available_workers("every worker is down");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
     }
 }

@@ -109,6 +109,7 @@ mod tests {
                     "cart": {"type": "object", "properties": {"item": {"type": "string"}}},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }
@@ -157,6 +158,7 @@ mod tests {
                 description: None,
                 parameters,
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }

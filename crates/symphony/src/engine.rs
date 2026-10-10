@@ -473,8 +473,26 @@ impl Engine {
             &mut self.scanner,
             Scanner::new(self.format.terminal_texts()),
         );
+        // What the scanner held back as a possible terminal is text now that no more bytes come,
+        // except a tail that begins with a whole structural token and is the beginning of a
+        // terminal the state has a row for: a tag the end of the output cut short
+        // (`<|close|>message` with no `<|sep|>` after it), which the model cannot have written as
+        // text and which is dropped as the whole tag would have been. Inside a call the
+        // assembler still holds the call's bytes, which came before the tail: the call ends
+        // first, so every byte leaves in order.
         for piece in scanner.finish() {
-            self.take(piece, out);
+            match piece {
+                Piece::Text(text) if self.format.is_cut_tag(self.state, &text) => {
+                    if self.emits() == Emits::Arguments {
+                        self.close_call(Closed::ByEnd, "", out);
+                    }
+                    out.push(Event::Dropped {
+                        text: self.tokens.text(&text),
+                        why: DropReason::Wrapper,
+                    });
+                }
+                piece => self.take(piece, out),
+            }
         }
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),

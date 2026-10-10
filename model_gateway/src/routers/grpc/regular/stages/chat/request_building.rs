@@ -115,19 +115,13 @@ pub(crate) async fn build_chat_backed_plan(
         .await?;
     }
 
-    // A structural tag that already opens with the reasoning block runs from
-    // the first token; asking SGLang to also defer the grammar past `</think>`
-    // would make the model owe a second one.
+    // On a thinking prompt the engine defers a grammar past the model's own
+    // `</think>` (the request's `require_reasoning`; an engine that runs a
+    // reasoning parser does so by itself). A forced-call tag owes nothing before the
+    // calls, so it reads the same with or without the deferral.
     let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
         utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
-    }) && !utils::constraint_covers_reasoning(
-        &ctx.components.tool_parser_factory,
-        ctx.components
-            .parser_resolver
-            .tool_parser(&chat_request.model)
-            .as_deref(),
-        tool_constraints.as_ref(),
-    );
+    });
 
     // The ids are the prompt; the text rides along only when the request
     // carries media (see `helpers::wire_prompt_text`).

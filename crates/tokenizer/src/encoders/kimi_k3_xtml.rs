@@ -15,9 +15,8 @@
 //! `<|sep|>`, `<|end_of_msg|>` and media anchors with special tokens allowed,
 //! everything else — tag names, attribute pieces, message text of every role,
 //! reasoning, tool arguments, internal system messages — as ordinary BPE. A
-//! marker string inside message text therefore never becomes a control id
-//! (the one exception is the gateway's `<|media_pad|>` anchor, see below), and
-//! attribute pieces (`" role"`, `="`, value, `"`) are separate BPE units.
+//! marker string inside message text therefore never becomes a control id,
+//! and attribute pieces (`" role"`, `="`, value, `"`) are separate BPE units.
 //! `render_kimi_k3_xtml_prompt` reproduces that segmentation piece by piece
 //! for the tiktoken backend, which encodes it and hands the caller a deferred
 //! encode; [`apply_kimi_k3_xtml_with_effort_default`] is that prompt joined
@@ -33,7 +32,10 @@
 //! gateway passes content parts through (OpenAI format), each image part
 //! becomes one `<|media_pad|>` control anchor at its authored position, and
 //! prompt expansion replaces it — see `llm_multimodal::registry::kimi_k3`. A
-//! literal anchor inside string content is kept as a control segment too.
+//! literal anchor spelled inside message text stays text, as the checkpoint's
+//! own encoder keeps it.
+
+use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
@@ -90,7 +92,7 @@ pub(crate) struct RenderedXtml {
 /// The effort the reference applies when a request names none.
 ///
 /// `build_chat_segments` injects no directive; the served entry point above it
-/// (`tokenization_kimi.apply_chat_template`, which vLLM calls) first runs
+/// (`tokenization_kimi.apply_chat_template`, which the serving engine calls) first runs
 /// `kwargs.setdefault("thinking_effort", "max")`.
 pub const DEFAULT_THINKING_EFFORT: &str = "max";
 
@@ -102,7 +104,7 @@ pub const DEFAULT_THINKING_EFFORT: &str = "max";
 /// `params.tools` (when non-empty) produces the leading `tool-declare` system
 /// message. `params.add_generation_prompt` appends the assistant generation
 /// prompt tail. Thinking mode is resolved from `template_kwargs["thinking"]`,
-/// then vLLM's `enable_thinking` alias and a `reasoning_effort` of `"none"` in
+/// then the engine's `enable_thinking` alias and a `reasoning_effort` of `"none"` in
 /// the kwargs (the rewrites the engine's own server applies before rendering),
 /// then `params.thinking`, defaulting to `true` to match the Python
 /// `build_chat_segments(thinking=True)` default; it selects `think` vs
@@ -130,7 +132,7 @@ pub fn apply_kimi_k3_xtml_with_effort_default(
 /// plus the caller's `continue_final_message` prefill, appended as one control
 /// piece so marker strings in the prefill keep their control ids. That is
 /// what the flat encode of `rendered + prefill` produced before segments
-/// existed and what SGLang's prefix append does: the rendering always ends in
+/// existed and what the serving engine's prefix append does: the rendering always ends in
 /// a control piece (`<|sep|>` after the generation prompt), so no BPE merge
 /// crosses the seam and the prefill's ids equal the flat encode of the same
 /// prefill byte for byte. A prefill of ordinary text encodes the same either
@@ -145,6 +147,38 @@ pub(crate) fn render_kimi_k3_xtml_prompt(
         push_control(&mut out.segments, prefix);
     }
     Ok(out)
+}
+
+/// The thinking mode the renderer renders, resolved as the engine's own
+/// server resolves it before calling the checkpoint's `apply_chat_template`
+/// (the engine's K3 renderer rewrites the kwargs first): an explicit `thinking`
+/// kwarg wins, then the engine's `enable_thinking` alias, then a `reasoning_effort`
+/// of `"none"` in the kwargs, then the request-level toggle the gateway
+/// derived; absent all of them, the encoder's `build_chat_segments(thinking=True)`
+/// default. Any other effort word leaves the mode alone (it only picks the
+/// `thinking-effort` directive). The gateway arms its reasoning parser from
+/// this answer too (`Tokenizer::native_thinking_mode`), so the prompt and the
+/// parser never disagree.
+pub fn resolve_thinking(
+    template_kwargs: Option<&HashMap<String, Value>>,
+    thinking: Option<bool>,
+) -> bool {
+    let kwarg_bool = |key: &str| {
+        template_kwargs
+            .and_then(|k| k.get(key))
+            .and_then(Value::as_bool)
+    };
+    kwarg_bool("thinking")
+        .or_else(|| kwarg_bool("enable_thinking"))
+        .or_else(|| {
+            template_kwargs
+                .and_then(|k| k.get("reasoning_effort"))
+                .and_then(Value::as_str)
+                .filter(|effort| *effort == "none")
+                .map(|_| false)
+        })
+        .or(thinking)
+        .unwrap_or(true)
 }
 
 fn render_xtml(
@@ -164,30 +198,7 @@ fn render_xtml(
         .filter(|t| !t.is_empty())
         .map(|t| deep_sort(&Value::Array(t.to_vec())));
 
-    // Thinking mode, resolved as the engine's own server resolves it before
-    // calling the checkpoint's `apply_chat_template` (vLLM's K3 renderer
-    // rewrites the kwargs first): an explicit `thinking` kwarg wins, then
-    // vLLM's `enable_thinking` alias, then a `reasoning_effort` of `"none"` in
-    // the kwargs, then the request-level toggle the gateway derived; absent
-    // all of them, the encoder's `build_chat_segments(thinking=True)` default.
-    let kwarg_bool = |key: &str| {
-        params
-            .template_kwargs
-            .and_then(|k| k.get(key))
-            .and_then(Value::as_bool)
-    };
-    let thinking = kwarg_bool("thinking")
-        .or_else(|| kwarg_bool("enable_thinking"))
-        .or_else(|| {
-            params
-                .template_kwargs
-                .and_then(|k| k.get("reasoning_effort"))
-                .and_then(Value::as_str)
-                .filter(|effort| *effort == "none")
-                .map(|_| false)
-        })
-        .or(params.thinking)
-        .unwrap_or(true);
+    let thinking = resolve_thinking(params.template_kwargs, params.thinking);
 
     let mut out: Vec<PromptSegment> = Vec::new();
 
@@ -397,17 +408,12 @@ fn push_text(out: &mut Vec<PromptSegment>, text: &str) {
     }
 }
 
-/// Message text (`_append_text` in the reference): ordinary BPE, except that
-/// the gateway's `<|media_pad|>` anchors must survive as control tokens for
-/// prompt expansion, so the text is split around them.
+/// Message text (`_append_text` in the reference): ordinary BPE, special
+/// spellings included. A `<|media_pad|>` typed in a message stays text, as
+/// the checkpoint's own encoder keeps it; the anchors the media pipeline
+/// expands come from image parts only (`push_content`).
 fn push_message_text(out: &mut Vec<PromptSegment>, text: &str) {
-    let mut rest = text;
-    while let Some(pos) = rest.find(MEDIA_ANCHOR) {
-        push_text(out, &rest[..pos]);
-        push_control(out, MEDIA_ANCHOR);
-        rest = &rest[pos + MEDIA_ANCHOR.len()..];
-    }
-    push_text(out, rest);
+    push_text(out, text);
 }
 
 fn escape_attr_value(value: &str) -> String {
@@ -536,7 +542,7 @@ fn push_thinking_effort(out: &mut Vec<PromptSegment>, effort: &str) {
 fn push_response_format(
     out: &mut Vec<PromptSegment>,
     response_format: &Value,
-    template_kwargs: Option<&std::collections::HashMap<String, Value>>,
+    template_kwargs: Option<&HashMap<String, Value>>,
 ) -> Result<()> {
     let response_type = response_format
         .get("type")
@@ -1019,6 +1025,45 @@ mod tests {
         }
     }
 
+    /// The rule the prompt is rendered with, which the parser is armed from:
+    /// `none` is the only effort word that switches thinking off, so a typed
+    /// `disabled` beats an on word and a kwargs `minimal` keeps the default.
+    #[test]
+    fn thinking_is_resolved_by_the_renderer_s_own_rule() {
+        let kw = |pairs: &[(&str, Value)]| -> HashMap<String, Value> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect()
+        };
+        assert!(resolve_thinking(None, None));
+        assert!(!resolve_thinking(None, Some(false)));
+        let high = kw(&[("reasoning_effort", json!("high"))]);
+        assert!(!resolve_thinking(Some(&high), Some(false)));
+        assert!(resolve_thinking(Some(&high), None));
+        let minimal = kw(&[("reasoning_effort", json!("minimal"))]);
+        assert!(resolve_thinking(Some(&minimal), None));
+        let none = kw(&[("reasoning_effort", json!("none"))]);
+        assert!(!resolve_thinking(Some(&none), Some(true)));
+        let off = kw(&[
+            ("thinking", json!(false)),
+            ("reasoning_effort", json!("high")),
+        ]);
+        assert!(!resolve_thinking(Some(&off), Some(true)));
+        let alias = kw(&[
+            ("enable_thinking", json!(true)),
+            ("reasoning_effort", json!("none")),
+        ]);
+        assert!(resolve_thinking(Some(&alias), Some(false)));
+
+        // The rendered tail follows the same answer.
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let rendered = apply_kimi_k3_xtml(&messages, &params_kw(Some(false), &high, true)).unwrap();
+        assert!(rendered.ends_with("<|open|>response<|sep|>"), "{rendered}");
+        let rendered = apply_kimi_k3_xtml(&messages, &params_kw(None, &minimal, true)).unwrap();
+        assert!(rendered.ends_with("<|open|>think<|sep|>"), "{rendered}");
+    }
+
     #[test]
     fn thinking_defaults_on_when_unspecified() {
         let messages = vec![json!({"role": "user", "content": "Hi"})];
@@ -1153,20 +1198,24 @@ mod tests {
         assert_eq!(&segments[..expected.len()], &expected[..]);
     }
 
+    /// A `<|media_pad|>` spelling typed in message text stays text, as the
+    /// checkpoint's own encoder keeps it (it scans message text for no
+    /// marker and encodes it with special tokens disallowed); the anchor
+    /// segment the media pipeline expands comes from an image part only.
     #[test]
-    fn media_anchors_in_message_text_are_control_segments() {
+    fn media_anchor_spellings_in_message_text_stay_text() {
         let messages = vec![json!({"role": "user", "content": "see <|media_pad|> here"})];
         let segments = render_xtml(&messages, &params(Some(true), None), None)
             .unwrap()
             .segments;
         assert_eq!(
-            segments[7..10].to_vec(),
+            segments[7..9].to_vec(),
             vec![
-                PromptSegment::text("see "),
-                PromptSegment::control(MEDIA_ANCHOR),
-                PromptSegment::text(" here"),
+                PromptSegment::text("see <|media_pad|> here"),
+                PromptSegment::control(CLOSE_TOKEN),
             ]
         );
+        assert!(!control_texts(&segments).contains(&MEDIA_ANCHOR));
     }
 
     #[test]
@@ -1444,7 +1493,7 @@ mod tests {
     }
 
     // --- Thinking toggles the engine's own server honours before rendering ----
-    // vLLM's K3 renderer rewrites the kwargs before `apply_chat_template`:
+    // The engine's K3 renderer rewrites the kwargs before `apply_chat_template`:
     // `enable_thinking` becomes `thinking` and a `reasoning_effort` of `"none"`
     // switches thinking off; an explicit `thinking` kwarg outranks both.
 

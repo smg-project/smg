@@ -579,6 +579,7 @@ mod tests {
                     "ns": {"type": ["string", "null"]},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }

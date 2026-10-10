@@ -219,22 +219,14 @@ class TestResponsesInputValidation:
             f"status={resp.status_code} body={resp.text!r}"
         )
 
-    def test_message_with_invalid_role_not_rejected_by_body_parser(self, setup_backend):
-        """Invalid role strings pass the body parser unchanged (E7 case 3).
+    def test_message_with_invalid_role_rejected_400(self, setup_backend):
+        """An input message with an unknown role is refused before generation
+        (E7 case 3), as the public API refuses it: only ``assistant``,
+        ``system``, ``developer`` and ``user`` are input roles.
 
-        Audit §E7 lists ``{"type": "message", "role": "martian"}`` as a 400,
-        but role validation is **outside P5's scope**: ``SimpleInputMessage.role``
-        is ``String`` (responses.rs:1239), not an enum, and the regular
-        gRPC conversion at
-        model_gateway/src/routers/grpc/regular/responses/conversions.rs:264-270
-        silently maps unknown roles to ``User``. The body parser therefore
-        accepts ``role: "martian"`` today; any rejection is upstream policy,
-        not gateway policy.
-
-        This test captures that observation so a future reviewer sees E7's
-        role-validation case as a known gap rather than a regression. If the
-        protocol later tightens ``role`` to an enum, flip the assertion to
-        require 400.
+        The rejection comes from the request validator (``validate()`` after
+        the body parser), so the envelope is the validator's
+        ``invalid_request_error``, not the parser's ``json_parse_error``.
         """
         _, model_path, _, gw = setup_backend
         body = {
@@ -245,16 +237,12 @@ class TestResponsesInputValidation:
             "max_output_tokens": 16,
         }
         resp = _post_responses(gw, body)
-        # As in the extra-field test, we target the parser-specific envelope
-        # rather than any 400: upstream or auth 4xx responses are allowed,
-        # but the gateway's own json_parse_error path must stay silent on
-        # an arbitrary role string today.
-        assert not _is_validation_400(resp), (
-            f"role='martian' unexpectedly rejected by body parser: "
-            f"status={resp.status_code} body={resp.text!r} — if this is "
-            f"intentional, update the test to expect 400 and cite the "
-            f"protocol change."
+        assert resp.status_code == 400, (
+            f"role='martian' must be rejected: status={resp.status_code} body={resp.text!r}"
         )
+        err = resp.json()["error"]
+        assert err["type"] == "invalid_request_error", err
+        assert "martian" in err["message"], err
 
     def test_content_part_array_with_empty_type_rejected_400(self, setup_backend):
         """Empty-string ``type`` on a content part must fail-fast (E7 case 4).

@@ -488,11 +488,11 @@ fn test_validate_repetition_penalty_range() {
     }
 }
 
-/// Test max_output_tokens minimum validation
+/// Test max_output_tokens minimum validation (the public API's minimum is 16)
 #[test]
 fn test_validate_max_output_tokens() {
     // Valid values
-    for val in [1, 100, 1000] {
+    for val in [16, 100, 1000] {
         let request = ResponsesRequest {
             input: ResponseInput::Text("test".to_string()),
             max_output_tokens: Some(val),
@@ -505,15 +505,17 @@ fn test_validate_max_output_tokens() {
     }
 
     // Invalid values
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        max_output_tokens: Some(0),
-        ..Default::default()
-    };
-    assert!(
-        request.validate().is_err(),
-        "max_output_tokens 0 should be invalid"
-    );
+    for val in [0, 1, 15] {
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("test".to_string()),
+            max_output_tokens: Some(val),
+            ..Default::default()
+        };
+        assert!(
+            request.validate().is_err(),
+            "max_output_tokens {val} should be invalid"
+        );
+    }
 }
 
 /// Test max_tool_calls minimum validation
@@ -816,6 +818,7 @@ fn test_validate_text_format_json_schema_empty_name() {
                 description: None,
                 strict: None,
             }),
+            verbosity: None,
         }),
         ..Default::default()
     };
@@ -839,6 +842,7 @@ fn test_validate_text_format_json_schema_schema_not_object() {
                     description: None,
                     strict: None,
                 }),
+                verbosity: None,
             }),
             ..Default::default()
         }
@@ -874,6 +878,7 @@ fn test_validate_tool_choice_requires_tools() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
@@ -918,46 +923,28 @@ fn test_validate_tool_choice_requires_tools() {
     }
 }
 
-/// Test top_logprobs requires include field
+/// `top_logprobs` is accepted with or without the logprobs include entry, as
+/// the public API accepts it (without the include entry the logprobs are
+/// simply not attached to the output text).
 #[test]
-fn test_validate_top_logprobs_requires_include() {
-    // Valid: top_logprobs with correct include field
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        top_logprobs: Some(5),
-        include: Some(vec![IncludeField::MessageOutputTextLogprobs]),
-        ..Default::default()
-    };
-    assert!(
-        request.validate().is_ok(),
-        "top_logprobs with include field should be valid"
-    );
-
-    // Invalid: top_logprobs without include field
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        top_logprobs: Some(5),
-        include: None,
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "top_logprobs without include field should be invalid"
-    );
-
-    // Invalid: top_logprobs with wrong include field
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        top_logprobs: Some(5),
-        include: Some(vec![IncludeField::ReasoningEncryptedContent]),
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "top_logprobs with wrong include field should be invalid"
-    );
+fn test_validate_top_logprobs_does_not_require_include() {
+    for include in [
+        Some(vec![IncludeField::MessageOutputTextLogprobs]),
+        None,
+        Some(vec![IncludeField::ReasoningEncryptedContent]),
+    ] {
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("test".to_string()),
+            top_logprobs: Some(5),
+            include,
+            ..Default::default()
+        };
+        assert!(
+            request.validate().is_ok(),
+            "top_logprobs must validate regardless of include: {:?}",
+            request.include
+        );
+    }
 }
 
 /// Test previous_response_id format validation
@@ -1173,6 +1160,7 @@ fn test_normalize_tool_choice_auto() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: None,
@@ -1234,6 +1222,7 @@ fn test_normalize_tool_choice_no_override() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
@@ -1264,6 +1253,7 @@ fn test_normalize_parallel_tool_calls() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         parallel_tool_calls: None,
@@ -1316,6 +1306,7 @@ fn test_normalize_parallel_tool_calls_no_override() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         parallel_tool_calls: Some(false),

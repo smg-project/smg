@@ -223,7 +223,7 @@ Metrics added: `smg_kv_index_lookup_seconds{index}`, `smg_kv_event_apply_seconds
 ## Routing evidence per request
 
 Two opt-in switches on the gateway expose the evidence behind each dispatch; either one turns the
-capture on, and they are independent of each other.
+capture on, and they are independent of each other. A request header asks for it on one request.
 
 - `SMG_CACHE_TRACE=1` logs the full evidence of every dispatch as one INFO line (target
   `smg::cache_trace`, field `evidence`): ids, the candidates with their load and health, the scores,
@@ -240,15 +240,21 @@ capture on, and they are independent of each other.
   ```json
   {"schema": 1, "root_id": "<x-request-id>", "dispatch_id": "<uuid>", "attempt": 0,
    "engine_ids": ["<request id the engine saw>"], "engine_ids_complete": true, "truncated": false,
-   "selections": [{"policy": "cache_aware", "origin": "policy",
+   "selections": [{"policy": "cache_aware", "origin": "policy", "worker": "grpc://10.0.0.7:50051",
      "prediction": {"source": "event_index_overlap", "branch": "event_hit",
                     "overlap_blocks": 4, "request_blocks": 6, "block_size": 128}}]}
   ```
 
   `attempt` counts the request's dispatches from 0, `origin` is `policy` or the routing-key branch
-  that placed the request, and `prediction` is the policy's estimate for the chosen worker: on the
-  event index `overlap_blocks` of `request_blocks`, on the approximate tree `matched_units` of
-  `input_units` with the `credited_units` the chosen worker is expected to have cached.
+  that placed the request, `worker` is the URL of the worker that selection chose (the last one is
+  the response's `x-smg-routed-worker-id`), and `prediction` is the policy's estimate for that
+  worker: on the event index `overlap_blocks` of `request_blocks`, on the approximate tree
+  `matched_units` of `input_units` with the `credited_units` the chosen worker is expected to have
+  cached.
+- A request that carries the header `x-smg-cache-trace: 1` gets the same response header whatever
+  the two switches say: one request's evidence on a running gateway, without a restart. The header
+  alone writes no log line; `SMG_CACHE_TRACE=1` keeps logging every dispatch, the opted-in ones
+  included, and both switches keep their meaning for every other request.
 
 ## Testing without engines
 

@@ -199,12 +199,28 @@ fn native_encode_matches_tokenizers_on_real_vocabularies() {
         let mut compared = 0usize;
         let mut check = |text: &str| {
             let encoding = ours.encode(text, false).expect("encode");
-            if matches!(encoding, Encoding::Plain(_)) {
-                native += 1;
-            }
             let expected = reference.encode(text, false).expect("reference encode");
             assert_eq!(encoding.token_ids(), expected.get_ids(), "{dir}: {text:?}");
             compared += 1;
+            if matches!(encoding, Encoding::Plain(_)) {
+                native += 1;
+                // A tokenizer on the native path has no post-processor that
+                // adds tokens, so the path serves a request for special
+                // tokens too, with the ids `tokenizers` gives for it.
+                let with = ours.encode(text, true).expect("encode with special tokens");
+                let expected = reference
+                    .encode(text, true)
+                    .expect("reference encode with special tokens");
+                assert_eq!(
+                    with.token_ids(),
+                    expected.get_ids(),
+                    "{dir}: {text:?} (special)"
+                );
+                assert!(
+                    matches!(with, Encoding::Plain(_)),
+                    "{dir}: {text:?} with special tokens requested left the native path"
+                );
+            }
         };
         for text in TEXTS {
             check(text);

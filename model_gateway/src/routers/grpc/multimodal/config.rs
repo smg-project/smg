@@ -253,6 +253,10 @@ pub(crate) struct MultimodalComponents {
     pub processing: MmProcessingMode,
     /// Cap on preprocessed media bytes in flight; `None` leaves it unbounded.
     pub inflight: Option<Arc<MultimodalInflight>>,
+    /// The engine's own video frame budget, for the specs that sample a clip
+    /// the way its loader does (the worker-side pipeline knows it; `None`
+    /// keeps each spec's own constant).
+    pub video_frame_budget: Option<usize>,
 }
 
 impl MultimodalComponents {
@@ -309,6 +313,7 @@ impl MultimodalComponents {
                 .unwrap_or_default(),
             processing,
             inflight,
+            video_frame_budget: None,
         })
     }
 }

@@ -29,7 +29,7 @@ use super::{
     SchedulerError, SchedulerGuardBody, HEADER_X_SMG_PREEMPTED, PRIORITY_HEADER,
 };
 use crate::{
-    middleware::RouteRequestMeta,
+    middleware::{tenant_resolution::restamp_accepted_at, RouteRequestMeta},
     observability::metrics::{metrics_labels, Metrics},
     tenant::TenantKey,
 };
@@ -137,6 +137,9 @@ pub async fn priority_admission_middleware(
         AdmitOutcome::Admitted(permit) => {
             // Hand the handler the cancel token (for preemption select!).
             req.extensions_mut().insert(permit.cancel_token());
+            // The class's queue wait was the scheduler's, bounded by its own
+            // timeout; the bound ahead of worker selection counts from here.
+            restamp_accepted_at(req.extensions_mut());
             let response = next.run(req).await;
             // Best-effort: the handler's PreemptionGuard tags a *pre-response*
             // preemption (a 503 carrying this header), which we count as

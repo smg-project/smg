@@ -196,6 +196,9 @@ pub mod metrics_labels {
     // Admission rejection reasons
     pub const ADMISSION_REJECTED_FULL: &str = "full";
     pub const ADMISSION_REJECTED_TIMEOUT: &str = "timeout";
+    /// Admitted, then held inside the gateway ahead of worker selection for
+    /// longer than the queue timeout.
+    pub const ADMISSION_REJECTED_SELECTION_TIMEOUT: &str = "selection_timeout";
 
     // Circuit breaker states
     pub const CB_CLOSED: &str = "closed";

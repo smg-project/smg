@@ -44,6 +44,7 @@ fn update_task_tools() -> Vec<Tool> {
                 "required": ["taskId", "subject"]
             }),
             strict: None,
+            extra: Default::default(),
         },
     }]
 }
@@ -179,6 +180,7 @@ async fn test_m3_nested_schema_types_respected() {
                 }
             }),
             strict: None,
+            extra: Default::default(),
         },
     }];
     let params = format!(
@@ -279,6 +281,7 @@ async fn test_m3_nested_object_and_array_arguments() {
                 }
             }),
             strict: None,
+            extra: Default::default(),
         },
     }];
 
@@ -941,6 +944,7 @@ fn container_tools() -> Vec<Tool> {
                 }
             }),
             strict: None,
+            extra: Default::default(),
         },
     }]
 }
@@ -1062,6 +1066,7 @@ fn composite_schema_tools(combinator: &str) -> Vec<Tool> {
             description: None,
             parameters,
             strict: None,
+            extra: Default::default(),
         },
     }]
 }
@@ -1185,6 +1190,7 @@ async fn test_m3_missing_empty_container_close_in_nested_array() {
                 "timezone": {"type": "string"}
             }}),
             strict: None,
+            extra: Default::default(),
         },
     }];
     let days = format!(
@@ -1283,6 +1289,7 @@ async fn test_m3_empty_container_recovery_requires_schema_and_parent_close() {
                     }}
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }];
         let text = tool_block(&[(
@@ -1364,6 +1371,7 @@ async fn test_m3_composed_container_recovery() {
                     "rows": wrap(json!({"type": "array", "items": item_schema}))
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }];
         let rows = format!(
@@ -1429,6 +1437,7 @@ async fn test_m3_composed_container_recovery_rejects_ambiguous_schemas() {
                     "parent": {"type": "object", "properties": {"empty": schema}}
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }];
         let text = tool_block(&[("test", format!("{NS}<parent>{NS}<empty>{NS}</parent>"))]);

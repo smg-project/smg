@@ -492,6 +492,19 @@ pub trait ResponseStorage: Send + Sync {
         Ok(chain)
     }
 
+    /// Find the stored response whose `raw_response.output` carries an item
+    /// with the given id (the lookup behind `item_reference` input items).
+    ///
+    /// The default answers `None`: a backend without an index over output
+    /// items reports the item as unknown rather than scanning a table.
+    async fn find_response_by_output_item(
+        &self,
+        item_id: &str,
+    ) -> ResponseResult<Option<StoredResponse>> {
+        let _ = item_id;
+        Ok(None)
+    }
+
     /// List recent responses for a safety identifier
     async fn list_identifier_responses(
         &self,

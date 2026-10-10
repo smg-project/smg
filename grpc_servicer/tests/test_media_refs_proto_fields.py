@@ -53,12 +53,14 @@ class TestGetServerInfoResponseMediaFields:
         assert fields["mm_processor"].number == 16
         assert fields["mm_media_ref_schemes"].number == 17
         assert fields["mm_item_limits"].number == 21
+        assert fields["multimodal_encoder_dtype"].number == 22
 
     def test_empty_by_default(self):
         info = vllm_engine_pb2.GetServerInfoResponse()
         assert info.mm_processor == ""
         assert info.mm_media_ref_schemes == ""
         assert info.mm_item_limits == ""
+        assert info.multimodal_encoder_dtype == ""
 
     def test_roundtrip(self):
         info = vllm_engine_pb2.GetServerInfoResponse(

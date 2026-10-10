@@ -4,12 +4,14 @@ use std::{
 };
 
 use llm_tokenizer::registry::TokenizerRegistry;
+use openai_protocol::profile::ProviderProfile;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
 use smg_data_connector::{
     create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     StorageFactoryConfig,
 };
+use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -533,6 +535,14 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
+        // A served model aliased under a vendor name keeps that vendor's
+        // contract profile after the alias is resolved into the served name.
+        ProviderProfile::register_model_aliases(
+            router_config
+                .model_aliases
+                .iter()
+                .map(|(alias, canonical)| (alias.as_str(), canonical.as_str())),
+        );
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
@@ -551,7 +561,9 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
-            .webrtc_bind_addr(webrtc_bind_addr)
+            .webrtc_bind_addr(
+                webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
+            )
             .webrtc_stun_server(
                 webrtc_stun_server.or_else(|| Some("stun.l.google.com:19302".to_string())),
             )
@@ -574,7 +586,7 @@ impl AppContextBuilder {
         let tls_required = has_tls_config || has_https_worker(config);
 
         // Idle pooled connections must expire before the backend server's
-        // keep-alive closes them (vLLM/SGLang default: 5s), or checkout races
+        // keep-alive closes them (the engines' default: 5s), or checkout races
         // the server's FIN and non-idempotent sends fail.
         let pool_idle_timeout = match config.upstream_pool_idle_timeout_secs {
             0 => None,

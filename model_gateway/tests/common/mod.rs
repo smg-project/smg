@@ -736,6 +736,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -753,6 +754,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -768,6 +770,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -784,6 +787,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -799,6 +803,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -814,6 +819,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -829,6 +835,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -838,6 +845,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Ping service".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -847,6 +855,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Test function".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -865,6 +874,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -881,6 +891,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -895,6 +906,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -911,6 +923,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -927,6 +940,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -942,6 +956,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -957,6 +972,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -971,6 +987,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -980,6 +997,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Function 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -994,6 +1012,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -1003,6 +1022,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Tool 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -1017,6 +1037,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
     ]

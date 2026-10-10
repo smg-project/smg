@@ -104,6 +104,9 @@ pub struct EngineCoreReadyResponse {
     /// KV-event publisher configuration, if configured.
     #[serde(default)]
     pub kv_events_config: Option<KvEventsConfig>,
+    /// Optional TokenSpeed diagnostic capture identities; absent on older engines.
+    #[serde(default)]
+    pub cache_trace_epochs: Vec<String>,
 }
 
 /// Frontend-owned ZMQ addresses sent to the engine during handshake init.
@@ -209,9 +212,11 @@ mod tests {
             "world_size": 2u64,
             "data_parallel_size": 2u64,
             "kv_cache_size_tokens": 426176u64,
+            "cache_trace_epochs": ["capture-epoch"],
         });
         let bytes = rmp_serde::to_vec_named(&json).unwrap();
         let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
         assert_eq!(resp.block_size, 64);
+        assert_eq!(resp.cache_trace_epochs, vec!["capture-epoch"]);
     }
 }

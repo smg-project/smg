@@ -1,24 +1,36 @@
 //! `smg_kv_event_lag_seconds` is exported as a histogram, not a summary.
 //!
-//! Drives the recorder `start_prometheus` installs, so the bucket matchers
-//! under test are the production ones. This file is its own test binary
-//! (process), so installing the global Prometheus recorder here does not
-//! collide with other suites.
+//! Drives the recorder `start_prometheus` installs and scrapes the metrics
+//! HTTP server, so the bucket matchers under test are the production ones
+//! and the per-worker series render as they do for `/metrics`. This file is
+//! its own test binary (process), so installing the global Prometheus
+//! recorder here does not collide with other suites.
 
-use smg::observability::metrics::{start_prometheus, Metrics, PrometheusConfig};
+use smg::observability::{
+    metrics::{start_prometheus, Metrics, PrometheusConfig},
+    metrics_server::start_metrics_server,
+};
 
-#[test]
-fn kv_event_lag_renders_histogram_buckets() {
+#[tokio::test]
+async fn kv_event_lag_renders_histogram_buckets() {
     let handle = start_prometheus(PrometheusConfig {
         port: 0,
         host: "127.0.0.1".to_string(),
         duration_buckets: None,
     });
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+        .await
+        .expect("metrics server binds an ephemeral port");
 
     Metrics::record_kv_event_lag("grpc://worker-a:50051", 0.004);
     Metrics::record_kv_event_lag("grpc://worker-b:50051", 2.0);
 
-    let body = handle.render();
+    let body = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .expect("metrics endpoint reachable")
+        .text()
+        .await
+        .expect("metrics body");
     let lag_lines: Vec<&str> = body
         .lines()
         .filter(|line| line.contains("smg_kv_event_lag_seconds"))

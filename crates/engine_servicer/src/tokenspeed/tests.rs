@@ -15,9 +15,12 @@ use engine_zmq_client::{
         connect_to_frontend, default_ready_response, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
     },
-    protocol::tokenspeed::{
-        output::BatchTokenIDOutSlim,
-        request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
+    protocol::{
+        handshake::EngineCoreReadyResponse,
+        tokenspeed::{
+            output::BatchTokenIDOutSlim,
+            request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
+        },
     },
     EngineId,
 };
@@ -146,7 +149,10 @@ async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer
     let engine = connect_to_frontend(
         &handshake,
         EngineId::from_engine_index(0),
-        default_ready_response(),
+        EngineCoreReadyResponse {
+            cache_trace_epochs: vec!["capture-epoch".to_string()],
+            ..default_ready_response()
+        },
     )
     .await
     .expect("mock scheduler handshake");
@@ -743,6 +749,14 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         Some(Kind::StringValue("p1".to_string()))
     );
     let scheduler_info = info.scheduler_info.expect("scheduler_info");
+    assert_eq!(
+        scheduler_info.fields["cache_trace_epochs"].kind,
+        Some(Kind::ListValue(prost_types::ListValue {
+            values: vec![prost_types::Value {
+                kind: Some(Kind::StringValue("capture-epoch".to_string()))
+            }]
+        }))
+    );
     assert_eq!(
         scheduler_info.fields["shm_namespace_id"].kind,
         Some(Kind::StringValue("boot:1".to_string()))

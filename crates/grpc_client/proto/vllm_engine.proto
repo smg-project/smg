@@ -460,6 +460,11 @@ message GetServerInfoResponse {
   // engine has none (a text model). Flattened into the `mm_item_limits`
   // worker label, which the router's own media pipeline holds requests to.
   string mm_item_limits = 21;
+
+  // Multimodal encoder input dtype, without the torch. prefix (e.g. bfloat16).
+  // Uses the model dtype, matching TokenSpeed; empty when unknown.
+  // Flattened into the worker label used to cast multimodal input tensors.
+  string multimodal_encoder_dtype = 22;
 }
 
 // =====================
