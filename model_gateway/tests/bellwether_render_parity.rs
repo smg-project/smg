@@ -205,6 +205,22 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
+        "olmo-3-7b-instruct/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "olmo-3-7b-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
+        "olmo-3-7b-instruct/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
         "qwen3-8b/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and appending its \
          text after the generation header, which drops the empty think block the template writes \
@@ -836,19 +852,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "nvidia-nemotron-3-nano-30b-a3b-bf16/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "olmo-3-7b-instruct/render/*",
-        "the gateway renders continue_final_message by popping the assistant turn and appending \
-         its text after the generation header, which does not reproduce this template's \
-         continued turn (smg-project/smg#2779); and add_generation_prompt is not a field of \
-         SMG's chat request; the header is always appended (smg-project/smg#2780); and the \
-         gateway's system prompt for this template is not the reference's: the function-calling \
-         preamble is rendered for a request without tools, where the template writes that no \
-         functions are available, and a system message is placed differently \
-         (smg-project/smg-lab#107); and SMG's request schema types tool-call arguments as a \
-         string, as the API and the engines do; the template accepts an object \
-         (smg-project/bellwether#12)",
     ),
     (
         "phi-4-mini-instruct/render/no-generation-prompt",
