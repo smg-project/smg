@@ -24,8 +24,10 @@ use crate::{
 /// multimodal architecture means the engine runs `--language-model-only`:
 /// no vision encoder, encoder-cache budget 0, so no multimodal payload may
 /// reach it. A multimodal model reports `"true"`; a text-only model also
-/// reports `"false"`, which is harmless — its requests carry no mm payload
-/// to strip in the first place.
+/// reports `"false"`. The label is tri-state: only the vLLM servicer sets
+/// the field on purpose, so for the other runtimes a proto-default `false`
+/// is not turned into a label at all (`ModelInfo::to_labels`), and an
+/// absent label reads as unknown, never as a refusal.
 pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
 
 /// Whether the worker's engine accepts no multimodal inputs at all (a vLLM

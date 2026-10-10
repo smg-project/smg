@@ -1675,7 +1675,7 @@ mod request_release_tests {
         completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
     };
     use portpicker::pick_unused_port;
-    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
+    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts, vllm_proto};
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -1686,9 +1686,12 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::grpc::multimodal::{
-            MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
-            SUPPORTS_VISION_LABEL,
+        routers::grpc::{
+            client::ModelInfo,
+            multimodal::{
+                MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+                SUPPORTS_VISION_LABEL,
+            },
         },
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
@@ -1703,6 +1706,21 @@ mod request_release_tests {
     /// The worker label of an engine without a vision encoder (vLLM
     /// `--language-model-only`, or a text-only model).
     const LANGUAGE_MODEL_ONLY: &[(&str, &str)] = &[(SUPPORTS_VISION_LABEL, "false")];
+
+    /// The labels discovery derives from a servicer's `GetModelInfo`, as
+    /// `(key, value)` pairs for the worker builders of these tests.
+    fn labels_of(info: &ModelInfo) -> Vec<(String, String)> {
+        let mut labels: Vec<(String, String)> = info.to_labels().into_iter().collect();
+        labels.sort();
+        labels
+    }
+
+    fn label_pairs(labels: &[(String, String)]) -> Vec<(&str, &str)> {
+        labels
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
+    }
 
     /// The `(offset, length)` placeholder ranges of one generate call.
     type PlaceholderRanges = Vec<(u32, u32)>;
@@ -2102,6 +2120,83 @@ mod request_release_tests {
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal,
         })
+    }
+
+    /// A worker whose servicer left `supports_vision` unset (the SGLang and
+    /// TokenSpeed protos carry the field; only vLLM's servicer sets it on
+    /// purpose) is not a language-model-only worker: its labels carry no
+    /// vision verdict, and an image request goes on past the refusal into
+    /// multimodal processing (here, to the config lookup the mock tokenizer
+    /// cannot satisfy) instead of a `multimodal_not_supported`.
+    #[tokio::test]
+    async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
+        let labels = labels_of(&ModelInfo::Sglang(Box::default()));
+        assert!(
+            labels.iter().all(|(key, _)| key != SUPPORTS_VISION_LABEL),
+            "{labels:?}"
+        );
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_with_labels(
+            &worker_registry,
+            port,
+            WorkerType::Regular,
+            &label_pairs(&labels),
+        );
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        let request: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }))
+            .expect("chat request"),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the mock path answers");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        assert_eq!(
+            body["error"]["code"], "invalid_multimodal_request",
+            "{body}"
+        );
     }
 
     /// An image to a model whose only worker runs without a vision encoder
@@ -3558,6 +3653,65 @@ mod request_release_tests {
         assert!(body.contains("language model only"), "{body}");
         assert!(ids.is_empty(), "nothing must reach the worker");
         assert!(mm.is_empty(), "nothing must be preprocessed");
+    }
+
+    /// The same image with the worker labels discovery derives from each
+    /// servicer's `GetModelInfo`: a servicer that left `supports_vision`
+    /// unset (SGLang, TokenSpeed) gives no verdict, so the image is
+    /// preprocessed and dispatched as to any vision worker; vLLM's deliberate
+    /// `false` refuses it.
+    #[tokio::test]
+    async fn deepseek_v41_image_follows_the_servicer_vision_verdict() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let request = || {
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": {"url": format!(
+                            "data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG))}}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            })
+        };
+        for (name, info) in [
+            ("sglang", ModelInfo::Sglang(Box::default())),
+            ("tokenspeed", ModelInfo::TokenSpeed(Box::default())),
+        ] {
+            let labels = labels_of(&info);
+            let (status, body, ids, mm) =
+                v41_run_chat_on(&dir, request(), true, &label_pairs(&labels)).await;
+            assert_eq!(
+                status,
+                http::StatusCode::OK,
+                "{name}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(ids.len(), 1, "{name}: dispatched once");
+            assert_eq!(
+                mm.iter().map(Vec::len).sum::<usize>(),
+                1,
+                "{name}: the image span reached the worker"
+            );
+        }
+
+        let labels = labels_of(&ModelInfo::Vllm(vllm_proto::GetModelInfoResponse {
+            supports_vision: false,
+            ..Default::default()
+        }));
+        let (status, body, ids, _) =
+            v41_run_chat_on(&dir, request(), true, &label_pairs(&labels)).await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("multimodal_not_supported"), "{body}");
+        assert!(ids.is_empty(), "nothing must reach the worker");
     }
 }
 

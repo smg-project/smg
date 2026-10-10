@@ -12,6 +12,7 @@ use smg_grpc_client::{
     TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
 };
 
+use super::multimodal::SUPPORTS_VISION_LABEL;
 use crate::{
     observability::otel_trace::OtelTraceInjector,
     routers::grpc::{
@@ -805,13 +806,32 @@ pub enum ServerInfo {
 impl ModelInfo {
     pub fn to_labels(&self) -> HashMap<String, String> {
         match self {
-            ModelInfo::Sglang(info) => flat_labels(info),
+            // The vLLM servicer answers `supports_vision` deliberately (the
+            // engine's own verdict; `false` = `--language-model-only` or a
+            // text model), so its `false` is a fact worth a label.
             ModelInfo::Vllm(info) => flat_labels(info),
-            ModelInfo::Trtllm(info) => flat_labels(info),
-            ModelInfo::Mlx(info) => flat_labels(info),
-            ModelInfo::TokenSpeed(info) => flat_labels(info),
+            ModelInfo::Sglang(info) => without_unset_vision(flat_labels(info)),
+            ModelInfo::Trtllm(info) => without_unset_vision(flat_labels(info)),
+            ModelInfo::Mlx(info) => without_unset_vision(flat_labels(info)),
+            ModelInfo::TokenSpeed(info) => without_unset_vision(flat_labels(info)),
         }
     }
+}
+
+/// A proto3 `bool` cannot tell "unset" from `false`, and only the vLLM
+/// servicer sets `supports_vision` on purpose; the other servicers may leave
+/// the field at its default even for a vision model (a vision model served
+/// by SGLang was refused images on it). Their `false` therefore means
+/// "unknown": no label, so nothing downstream reads a refusal into it; a
+/// `true` is kept.
+fn without_unset_vision(mut labels: HashMap<String, String>) -> HashMap<String, String> {
+    if labels
+        .get(SUPPORTS_VISION_LABEL)
+        .is_some_and(|value| value == "false")
+    {
+        labels.remove(SUPPORTS_VISION_LABEL);
+    }
+    labels
 }
 
 impl ServerInfo {
@@ -1028,7 +1048,7 @@ mod tests {
 
     use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto};
 
-    use super::{trtllm_status_healthy, ModelInfo, ServerInfo};
+    use super::{trtllm_status_healthy, ModelInfo, ServerInfo, SUPPORTS_VISION_LABEL};
 
     /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
     /// are: the engine's per-prompt media limits arrive as `mm_item_limits`,
@@ -1047,6 +1067,67 @@ mod tests {
         );
         let text_only = ServerInfo::Vllm(Box::default());
         assert!(!text_only.to_labels().contains_key("mm_item_limits"));
+    }
+
+    /// `supports_vision` is a label only when a servicer set it on purpose:
+    /// vLLM's `false` stays (language-model-only / text model); the SGLang
+    /// and TokenSpeed protos carry the same `bool`, which their servicers may
+    /// leave at the proto default even for a vision model, so their `false`
+    /// yields no label (unknown) and their `true` is kept.
+    #[test]
+    fn model_info_to_labels_keeps_only_a_deliberate_vision_verdict() {
+        let vllm_text = ModelInfo::Vllm(vllm_proto::GetModelInfoResponse {
+            supports_vision: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            vllm_text
+                .to_labels()
+                .get(SUPPORTS_VISION_LABEL)
+                .map(String::as_str),
+            Some("false")
+        );
+        let vllm_vision = ModelInfo::Vllm(vllm_proto::GetModelInfoResponse {
+            supports_vision: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            vllm_vision
+                .to_labels()
+                .get(SUPPORTS_VISION_LABEL)
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let sglang_unset = ModelInfo::Sglang(Box::default());
+        assert!(!sglang_unset.to_labels().contains_key(SUPPORTS_VISION_LABEL));
+        let sglang_vision = ModelInfo::Sglang(Box::new(sglang_proto::GetModelInfoResponse {
+            supports_vision: true,
+            ..Default::default()
+        }));
+        assert_eq!(
+            sglang_vision
+                .to_labels()
+                .get(SUPPORTS_VISION_LABEL)
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let tokenspeed_unset = ModelInfo::TokenSpeed(Box::default());
+        assert!(!tokenspeed_unset
+            .to_labels()
+            .contains_key(SUPPORTS_VISION_LABEL));
+        // Other booleans keep flattening as before, `false` included.
+        assert_eq!(
+            ModelInfo::Sglang(Box::new(sglang_proto::GetModelInfoResponse {
+                is_generation: false,
+                ..Default::default()
+            }))
+            .to_labels()
+            .get("is_generation")
+            .map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]
@@ -1322,7 +1403,8 @@ mod tests {
 
     /// `GetModelInfoResponse` is flat for every backend, so it serializes via
     /// `flat_labels`: empty strings and zero numbers are skipped, booleans are
-    /// kept, arrays are JSON-encoded.
+    /// kept (except a non-vLLM `supports_vision: false`, which is no verdict),
+    /// arrays are JSON-encoded.
     #[test]
     fn model_info_to_labels_tokenspeed_flat_serializes_skipping_empty_and_zero() {
         let info = ModelInfo::TokenSpeed(Box::new(tokenspeed_proto::GetModelInfoResponse {
@@ -1334,6 +1416,7 @@ mod tests {
             vocab_size: 151_936,
             pad_token_id: 0, // zero — skipped
             supports_vision: false,
+            supports_multimodal: false,
             ..Default::default()
         }));
 
@@ -1356,8 +1439,11 @@ mod tests {
             labels.get("architectures").map(String::as_str),
             Some(r#"["Qwen3ForCausalLM"]"#)
         );
+        // A proto-default `false` is no vision verdict on this runtime...
+        assert!(!labels.contains_key("supports_vision"));
+        // ...while other booleans flatten as before, `false` included.
         assert_eq!(
-            labels.get("supports_vision").map(String::as_str),
+            labels.get("supports_multimodal").map(String::as_str),
             Some("false")
         );
         assert!(!labels.contains_key("tokenizer_path"));
